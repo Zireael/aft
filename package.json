@@ -18,9 +18,14 @@
     "test:windows-e2e": "bun run scripts/windows-vm/test.ts",
     "windows-vm:setup": "bun run scripts/windows-vm/setup.ts",
     "version-sync": "node scripts/version-sync.mjs",
-    "bench": "bun run benchmarks/src/runner.ts"
-  },
-  "devDependencies": {
+    "bench": "bun run benchmarks/src/runner.ts",
+    "docker:rust:fmt": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 fmt",
+    "docker:rust:check": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 check",
+    "docker:rust:clippy": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 clippy",
+    "docker:rust:test": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 test",
+    "docker:rust:validate": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 validate",
+    "docker:rust:shell": "powershell -ExecutionPolicy Bypass -File scripts/docker-rust.ps1 shell"
+  },  "devDependencies": {
     "@biomejs/biome": "^2.4.7",
     "@types/node": "^25.8.0",
     "bun-types": "^1.3.13",

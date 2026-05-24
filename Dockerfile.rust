@@ -1,0 +1,23 @@
+# Dockerfile for Rust validation
+#
+# Used by scripts/docker-rust.ps1 to run Rust fmt/check/clippy/test
+# inside a container, avoiding the need for native MSVC Build Tools
+# on Windows.
+#
+# This is a minimal image: just Rust + rustfmt + clippy.
+# If native dependencies fail during validation, add only the required
+# apt packages and document why.
+#
+# Build (optional — the script pulls rust:1-bookworm directly):
+#   docker build -t aft-rust -f Dockerfile.rust .
+#
+# Override the default image via AFT_RUST_DOCKER_IMAGE:
+#   $env:AFT_RUST_DOCKER_IMAGE = 'aft-rust'
+
+FROM rust:1-bookworm
+
+WORKDIR /work
+
+RUN rustup component add rustfmt clippy
+
+ENV CARGO_TARGET_DIR=/target
