@@ -129,6 +129,10 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
         base_url: "none".to_string(),
         dimension: 1,
         chunking_version: 2,
+        output_encoding: "float".to_string(),
+        storage_strategy: "native_f32".to_string(),
+        distance_metric: "auto".to_string(),
+        input_mode: "flat_texts".to_string(),
     };
     index.set_fingerprint(fingerprint.clone());
     index.write_to_disk(storage.path(), "file-summary-roundtrip");

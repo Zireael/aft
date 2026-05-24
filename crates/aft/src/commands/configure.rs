@@ -23,7 +23,7 @@ use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
     CacheLock, SearchIndex,
 };
-use crate::semantic_index::{SemanticIndex, SemanticIndexLock};
+use crate::semantic_index::{EmbeddingModelProfile, SemanticIndex, SemanticIndexLock};
 use crate::{slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -1650,7 +1650,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         });
                         let mut model =
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                        let fingerprint = model.fingerprint(&semantic_config)?;
+                        let profile = EmbeddingModelProfile::from_config(&semantic_config);
+                        let fingerprint = model.fingerprint(&semantic_config, profile.as_ref())?;
                         let fingerprint_key = fingerprint.as_string();
                         let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                             .then(|| ())

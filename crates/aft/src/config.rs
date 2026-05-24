@@ -37,6 +37,103 @@ impl SemanticBackend {
     }
 }
 
+/// The encoding format returned by the embedding provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputEncoding {
+    /// Standard float32 embeddings (default for most providers).
+    Float,
+    /// Base64-encoded signed int8 embeddings (e.g. Perplexity, some OpenAI-compatible).
+    #[serde(rename = "base64_int8")]
+    Base64Int8,
+    /// Base64-encoded binary packed embeddings (e.g. Perplexity binary).
+    #[serde(rename = "base64_binary")]
+    Base64Binary,
+}
+
+impl OutputEncoding {
+    /// Default encoding for a given backend.
+    pub fn default_for_backend(backend: SemanticBackend) -> Self {
+        match backend {
+            SemanticBackend::Fastembed => Self::Float,
+            SemanticBackend::OpenAiCompatible => Self::Float,
+            SemanticBackend::Ollama => Self::Float,
+        }
+    }
+}
+
+/// How embedding inputs are structured for the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputMode {
+    /// Simple array of text strings.
+    #[serde(rename = "flat_texts")]
+    FlatTexts,
+    /// Grouped document-chunk inputs (e.g. Perplexity contextualized).
+    #[serde(rename = "document_chunks")]
+    DocumentChunks,
+}
+
+impl InputMode {
+    pub fn default_for_backend(backend: SemanticBackend) -> Self {
+        match backend {
+            SemanticBackend::Fastembed => Self::FlatTexts,
+            SemanticBackend::OpenAiCompatible => Self::FlatTexts,
+            SemanticBackend::Ollama => Self::FlatTexts,
+        }
+    }
+}
+
+/// How vectors are stored in the local index after retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageStrategy {
+    /// Native f32 vectors stored as-is (default for Float output encoding).
+    #[serde(rename = "native_f32")]
+    NativeF32,
+    /// Decode int8 to f32 and L2-normalize before storage (compatibility path for base64_int8).
+    #[serde(rename = "decode_normalize_f32")]
+    DecodeNormalizeF32,
+}
+
+impl StorageStrategy {
+    pub fn default_for_backend(backend: SemanticBackend) -> Self {
+        match backend {
+            SemanticBackend::Fastembed => Self::NativeF32,
+            SemanticBackend::OpenAiCompatible => Self::NativeF32,
+            SemanticBackend::Ollama => Self::NativeF32,
+        }
+    }
+}
+
+/// Distance metric for similarity search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistanceMetric {
+    /// Resolve from provider/model profile and storage strategy.
+    #[serde(rename = "auto")]
+    Auto,
+    /// Cosine similarity (default for normalized dense vectors).
+    Cosine,
+    /// Dot product.
+    #[serde(rename = "dot_product")]
+    DotProduct,
+    /// Euclidean distance.
+    Euclidean,
+    /// Hamming distance (for binary vectors).
+    Hamming,
+}
+
+impl DistanceMetric {
+    pub fn default_for_backend(backend: SemanticBackend) -> Self {
+        match backend {
+            SemanticBackend::Fastembed => Self::Auto,
+            SemanticBackend::OpenAiCompatible => Self::Auto,
+            SemanticBackend::Ollama => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
     pub backend: SemanticBackend,
@@ -45,8 +142,28 @@ pub struct SemanticBackendConfig {
     pub api_key_env: Option<String>,
     pub timeout_ms: u64,
     pub max_batch_size: usize,
+    /// Optional user-requested embedding dimensions. When set, the provider
+    /// is asked to return vectors of this dimension (if supported).
+    /// When unset, the provider's default dimension is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    /// Optional output encoding format from the provider.
+    /// Defaults to `float` for all built-in backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_encoding: Option<OutputEncoding>,
+    /// Optional input mode for the provider.
+    /// Defaults to `flat_texts` for all built-in backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_mode: Option<InputMode>,
+    /// Optional storage strategy for how vectors are stored locally.
+    /// Defaults to `native_f32` for all built-in backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_strategy: Option<StorageStrategy>,
+    /// Optional distance metric for similarity search.
+    /// Defaults to `auto` which resolves from provider/model profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_metric: Option<DistanceMetric>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserServerDef {
     pub id: String,
@@ -70,10 +187,14 @@ impl Default for SemanticBackendConfig {
             // semantic_search requests when callers do not set an explicit timeout.
             timeout_ms: 25_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
         }
     }
 }
-
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {

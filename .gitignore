@@ -81,3 +81,9 @@ packages/npm/*/bin/aft.exe
 smoke-tests/
 .aft-windows-vm
 benchmarks/aft-search/.bench/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

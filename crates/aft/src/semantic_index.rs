@@ -1,5 +1,8 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::config::{SemanticBackend, SemanticBackendConfig};
+use crate::config::{
+    DistanceMetric, InputMode, OutputEncoding, SemanticBackend, SemanticBackendConfig,
+    StorageStrategy,
+};
 use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
 use crate::search_index::{cache_relative_path, cached_path_under_root};
@@ -49,7 +52,284 @@ const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
-// Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
+
+// ---- Typed vector representation types ----
+
+/// The kind of vector as emitted by the embedding provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorKind {
+    /// Standard dense f32 vector (most providers).
+    DenseF32,
+    /// Dense int8 vector (e.g. Perplexity base64_int8).
+    DenseInt8,
+    /// Binary packed vector (e.g. Perplexity base64_binary).
+    BinaryPacked,
+}
+
+/// Normalization policy for stored vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationPolicy {
+    /// Vector is already L2-normalized by the provider.
+    AlreadyNormalized,
+    /// AFT must L2-normalize on insert and query.
+    NormalizeOnInsertQuery,
+    /// Normalization is not applicable (e.g. binary vectors).
+    NotApplicable,
+}
+
+/// A profile describing the capabilities and expected output of an embedding model.
+///
+/// Used to validate that user configuration is compatible with the selected
+/// provider/model before indexing starts.
+#[derive(Debug, Clone)]
+pub struct EmbeddingModelProfile {
+    /// Which semantic backend this profile applies to.
+    pub backend: SemanticBackend,
+    /// Model name (may be empty for generic profiles).
+    pub model: Option<String>,
+    /// Supported input mode.
+    pub input_mode: InputMode,
+    /// Expected output encoding from the provider.
+    pub output_encoding: OutputEncoding,
+    /// The kind of vectors the provider emits.
+    pub source_vector_kind: VectorKind,
+    /// The kind of vectors stored after AFT conversion.
+    pub stored_vector_kind: VectorKind,
+    /// Metric that should be used for similarity search.
+    pub metric: DistanceMetric,
+    /// Normalization policy for stored vectors.
+    pub normalization: NormalizationPolicy,
+    /// Supported dimension range: (min, max). None if unknown.
+    pub dimension_range: Option<(usize, usize)>,
+    /// Default dimension when not specified. None if unknown.
+    pub default_dimensions: Option<usize>,
+    /// Whether Matryoshka Representation Learning (reduced dimensions) is supported.
+    pub mrl_supported: bool,
+    /// Whether contextualized document-chunk inputs are supported.
+    pub contextualized_supported: bool,
+}
+
+impl EmbeddingModelProfile {
+    /// Returns a profile for the fastembed all-MiniLM-L6-v2 model.
+    pub fn fastembed_minilm() -> Self {
+        Self {
+            backend: SemanticBackend::Fastembed,
+            model: Some("all-MiniLM-L6-v2".to_string()),
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            dimension_range: Some((384, 384)),
+            default_dimensions: Some(384),
+            mrl_supported: false,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Returns a generic profile for OpenAI-compatible embedding providers.
+    /// These may support `dimensions` depending on the model.
+    pub fn openai_compatible_generic() -> Self {
+        Self {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: None,
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Auto,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: true,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Returns a generic profile for Ollama embedding models.
+    pub fn ollama_generic() -> Self {
+        Self {
+            backend: SemanticBackend::Ollama,
+            model: None,
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Auto,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Look up a profile for the given config.
+    /// Returns `None` if no specific profile is known (caller should use defaults).
+    pub fn from_config(config: &SemanticBackendConfig) -> Option<Self> {
+        match config.backend {
+            SemanticBackend::Fastembed => {
+                if config.model == "all-MiniLM-L6-v2" {
+                    Some(Self::fastembed_minilm())
+                } else {
+                    None
+                }
+            }
+            SemanticBackend::OpenAiCompatible => Some(Self::openai_compatible_generic()),
+            SemanticBackend::Ollama => Some(Self::ollama_generic()),
+        }
+    }
+
+    /// Validate that the configured options are compatible with this profile.
+    /// Returns `Ok(())` or a list of validation errors.
+    pub fn validate_config(&self, config: &SemanticBackendConfig) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let cfg_prefix = "semantic";
+
+        // Resolve effective output encoding
+        let output_encoding = config
+            .output_encoding
+            .unwrap_or(OutputEncoding::default_for_backend(config.backend));
+
+        // Resolve effective storage strategy
+        let storage_strategy = config
+            .storage_strategy
+            .unwrap_or(StorageStrategy::default_for_backend(config.backend));
+
+        // Check input mode compatibility
+        let input_mode = config
+            .input_mode
+            .unwrap_or(InputMode::default_for_backend(config.backend));
+        if input_mode == InputMode::DocumentChunks && !self.contextualized_supported {
+            errors.push(format!(
+                "{}.input_mode=document_chunks is not supported by backend {}",
+                cfg_prefix,
+                config.backend.as_str()
+            ));
+        }
+
+        // Check output encoding compatibility
+        if output_encoding != self.output_encoding
+            && !(output_encoding == OutputEncoding::Base64Int8
+                && matches!(config.backend, SemanticBackend::OpenAiCompatible))
+        {
+            // Allow base64_int8 for OpenAI-compatible (e.g. Perplexity)
+            if !matches!(
+                (output_encoding, self.output_encoding),
+                (OutputEncoding::Float, OutputEncoding::Float)
+                    | (OutputEncoding::Base64Int8, OutputEncoding::Float)
+            ) {
+                errors.push(format!(
+                    "{}.output_encoding={:?} is not supported by backend {}",
+                    cfg_prefix,
+                    output_encoding,
+                    config.backend.as_str()
+                ));
+            }
+        }
+
+        // Check storage strategy compatibility
+        match (output_encoding, storage_strategy) {
+            (OutputEncoding::Float, StorageStrategy::NativeF32) => {}
+            (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32) => {}
+            (OutputEncoding::Base64Binary, _) => {
+                errors.push(format!(
+                    "{}.output_encoding=base64_binary requires a native binary vector store, not available in MVP",
+                    cfg_prefix
+                ));
+            }
+            _ => {
+                errors.push(format!(
+                    "{}.storage_strategy={:?} is not compatible with output_encoding={:?}",
+                    cfg_prefix, storage_strategy, output_encoding
+                ));
+            }
+        }
+
+        // Check dimensions against profile
+        if let Some(dimensions) = config.dimensions {
+            if let Some((min_dim, max_dim)) = self.dimension_range {
+                if dimensions < min_dim || dimensions > max_dim {
+                    errors.push(format!(
+                        "{}.dimensions={} is outside supported range {}-{} for {} {}",
+                        cfg_prefix,
+                        dimensions,
+                        min_dim,
+                        max_dim,
+                        config.backend.as_str(),
+                        config.model
+                    ));
+                }
+            }
+            if !self.mrl_supported && config.dimensions.is_some() {
+                errors.push(format!(
+                    "{}.dimensions is set but the model does not support reduced dimensions",
+                    cfg_prefix
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Resolve an effective distance metric from config and profile.
+/// When `DistanceMetric::Auto` is configured, returns the profile's recommended metric.
+pub fn resolve_distance_metric(
+    config: &SemanticBackendConfig,
+    profile: Option<&EmbeddingModelProfile>,
+) -> DistanceMetric {
+    if let Some(metric) = config.distance_metric {
+        if metric != DistanceMetric::Auto {
+            return metric;
+        }
+    }
+    // Auto: resolve from profile
+    if let Some(profile) = profile {
+        profile.metric
+    } else {
+        // Fallback to cosine for unknown profiles
+        DistanceMetric::Cosine
+    }
+}
+
+/// Resolve effective output encoding from config.
+pub fn resolve_output_encoding(config: &SemanticBackendConfig) -> OutputEncoding {
+    config
+        .output_encoding
+        .unwrap_or(OutputEncoding::default_for_backend(config.backend))
+}
+
+/// Resolve effective storage strategy from config.
+pub fn resolve_storage_strategy(config: &SemanticBackendConfig) -> StorageStrategy {
+    config
+        .storage_strategy
+        .unwrap_or(StorageStrategy::default_for_backend(config.backend))
+}
+
+/// Resolve effective input mode from config.
+pub fn resolve_input_mode(config: &SemanticBackendConfig) -> InputMode {
+    config
+        .input_mode
+        .unwrap_or(InputMode::default_for_backend(config.backend))
+}
+
+/// Resolve effective dimensions from config with profile fallback.
+pub fn resolve_dimensions(
+    config: &SemanticBackendConfig,
+    profile: Option<&EmbeddingModelProfile>,
+) -> Option<usize> {
+    config
+        .dimensions
+        .or_else(|| profile.and_then(|p| p.default_dimensions))
+} // Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
 const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
@@ -90,14 +370,34 @@ pub struct SemanticIndexFingerprint {
     pub dimension: usize,
     #[serde(default = "default_chunking_version")]
     pub chunking_version: u32,
+    /// Output encoding used for this index.
+    #[serde(default)]
+    pub output_encoding: String,
+    /// Storage strategy used for this index.
+    #[serde(default)]
+    pub storage_strategy: String,
+    /// Resolved distance metric for this index.
+    #[serde(default = "default_dot_auto")]
+    pub distance_metric: String,
+    /// Input mode used for this index.
+    #[serde(default)]
+    pub input_mode: String,
 }
 
 fn default_chunking_version() -> u32 {
     2
 }
 
+fn default_dot_auto() -> String {
+    "auto".to_string()
+}
+
 impl SemanticIndexFingerprint {
-    fn from_config(config: &SemanticBackendConfig, dimension: usize) -> Self {
+    fn from_config(
+        config: &SemanticBackendConfig,
+        dimension: usize,
+        profile: Option<&EmbeddingModelProfile>,
+    ) -> Self {
         // Use normalized URL for fingerprinting so cosmetic differences
         // (e.g. "http://host/v1" vs "http://host/v1/") don't cause rebuilds.
         let base_url = config
@@ -111,6 +411,10 @@ impl SemanticIndexFingerprint {
             base_url,
             dimension,
             chunking_version: default_chunking_version(),
+            output_encoding: resolve_output_encoding(config).to_string(),
+            storage_strategy: resolve_storage_strategy(config).to_string(),
+            distance_metric: resolve_distance_metric(config, profile).to_string(),
+            input_mode: resolve_input_mode(config).to_string(),
         }
     }
 
@@ -146,6 +450,16 @@ pub struct SemanticEmbeddingModel {
     timeout_ms: u64,
     max_batch_size: usize,
     dimension: Option<usize>,
+    /// User-requested dimension from config (None = use provider default).
+    config_dimensions: Option<usize>,
+    /// Resolved output encoding for this model.
+    output_encoding: OutputEncoding,
+    /// Resolved storage strategy for this model.
+    storage_strategy: StorageStrategy,
+    /// Resolved distance metric for this model.
+    distance_metric: DistanceMetric,
+    /// Resolved input mode for this model.
+    input_mode: InputMode,
     engine: SemanticEmbeddingEngine,
     query_embedding_cache: HashMap<String, Vec<f32>>,
     query_embedding_cache_order: VecDeque<String>,
@@ -406,6 +720,68 @@ where
     unreachable!("embedding request retries exhausted without returning")
 }
 
+// ---- Display impls for capability types ----
+
+impl std::fmt::Display for VectorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DenseF32 => write!(f, "dense_f32"),
+            Self::DenseInt8 => write!(f, "dense_int8"),
+            Self::BinaryPacked => write!(f, "binary_packed"),
+        }
+    }
+}
+
+impl std::fmt::Display for NormalizationPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyNormalized => write!(f, "already_normalized"),
+            Self::NormalizeOnInsertQuery => write!(f, "normalize_on_insert_query"),
+            Self::NotApplicable => write!(f, "not_applicable"),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Float => write!(f, "float"),
+            Self::Base64Int8 => write!(f, "base64_int8"),
+            Self::Base64Binary => write!(f, "base64_binary"),
+        }
+    }
+}
+
+impl std::fmt::Display for InputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlatTexts => write!(f, "flat_texts"),
+            Self::DocumentChunks => write!(f, "document_chunks"),
+        }
+    }
+}
+
+impl std::fmt::Display for StorageStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeF32 => write!(f, "native_f32"),
+            Self::DecodeNormalizeF32 => write!(f, "decode_normalize_f32"),
+        }
+    }
+}
+
+impl std::fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Cosine => write!(f, "cosine"),
+            Self::DotProduct => write!(f, "dot_product"),
+            Self::Euclidean => write!(f, "euclidean"),
+            Self::Hamming => write!(f, "hamming"),
+        }
+    }
+}
+
 impl SemanticEmbeddingModel {
     pub fn from_config(config: &SemanticBackendConfig) -> Result<Self, String> {
         let timeout_ms = if config.timeout_ms == 0 {
@@ -475,6 +851,11 @@ impl SemanticEmbeddingModel {
             timeout_ms,
             max_batch_size,
             dimension: None,
+            config_dimensions: config.dimensions,
+            output_encoding: resolve_output_encoding(config),
+            storage_strategy: resolve_storage_strategy(config),
+            distance_metric: DistanceMetric::Auto,
+            input_mode: resolve_input_mode(config),
             engine,
             query_embedding_cache: HashMap::new(),
             query_embedding_cache_order: VecDeque::new(),
@@ -506,9 +887,14 @@ impl SemanticEmbeddingModel {
     pub fn fingerprint(
         &mut self,
         config: &SemanticBackendConfig,
+        profile: Option<&EmbeddingModelProfile>,
     ) -> Result<SemanticIndexFingerprint, String> {
         let dimension = self.dimension()?;
-        Ok(SemanticIndexFingerprint::from_config(config, dimension))
+        // Resolve distance metric (auto -> profile)
+        self.distance_metric = resolve_distance_metric(config, profile);
+        Ok(SemanticIndexFingerprint::from_config(
+            config, dimension, profile,
+        ))
     }
 
     pub fn dimension(&mut self) -> Result<usize, String> {
@@ -600,10 +986,16 @@ impl SemanticEmbeddingModel {
             } => {
                 let expected_text_count = texts.len();
                 let endpoint = build_openai_embeddings_endpoint(base_url);
-                let body = serde_json::json!({
+
+                let mut body = serde_json::json!({
                     "input": texts,
                     "model": model,
                 });
+                // Conditionally add dimensions when user-configured or when
+                // we already know the dimension from a previous probe.
+                if let Some(dims) = self.config_dimensions.or(self.dimension) {
+                    body["dimensions"] = serde_json::json!(dims);
+                }
 
                 let raw = send_embedding_request(
                     || {
@@ -2648,6 +3040,10 @@ mod tests {
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 4,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
         });
 
         let bytes = index.to_bytes();
@@ -3223,6 +3619,10 @@ mod tests {
             base_url: "http://127.0.0.1:1234/v1".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -3242,6 +3642,10 @@ mod tests {
             base_url: "http://127.0.0.1:11434".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
         }
         .as_string();
         assert!(SemanticIndex::read_from_disk(
@@ -3286,6 +3690,10 @@ mod tests {
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
         };
         index.set_fingerprint(fingerprint.clone());
 
