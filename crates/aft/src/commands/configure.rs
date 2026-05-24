@@ -737,37 +737,13 @@ fn resolve_tool_uncached(tool: &str, project_root: Option<&Path>) -> bool {
         return ruff_format_available(project_root);
     }
 
-    if let Some(root) = project_root {
-        if root.join("node_modules").join(".bin").join(tool).exists() {
-            return true;
-        }
-    }
-
-    let mut child = match std::process::Command::new(tool)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => return false,
-        }
-    }
+    // Delegate to format.rs's full three-step resolution:
+    // 1. node_modules/.bin/<tool> (project-local npm)
+    // 2. PATH via spawn --version (the fast common path)
+    // 3. Well-known install locations (Homebrew /opt/homebrew/bin on macOS,
+    //    /usr/local/bin on Linux, C:\Go\bin on Windows, .cargo/bin, go/bin,
+    //    .local/bin) — GitHub issue #47
+    crate::format::resolve_tool_uncached(tool, project_root).is_some()
 }
 
 fn ruff_format_available(project_root: Option<&Path>) -> bool {
