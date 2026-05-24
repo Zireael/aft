@@ -690,8 +690,59 @@ describe("loadAftConfig", () => {
       },
     });
     expect(result.stderr).toContain(
-      "Ignoring semantic.backend/base_url/api_key_env from project config (security: use user config for external backends)",
+      "Ignoring semantic.backend, base_url, api_key_env from project config (security: these semantic settings only honor user-level config)",
     );
+  });
+
+  test("strips new semantic fields from project config with warning", () => {
+    const fixture = createConfigFixture();
+    // User config with a backend
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        semantic: {
+          backend: "ollama",
+          base_url: "http://localhost:11434",
+          model: "mxbai-embed-large",
+        },
+      }),
+    );
+    // Project config tries to set all the new restricted fields
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        semantic: {
+          output_encoding: "binary",
+          storage_strategy: "binary_pack",
+          input_mode: "contextualized",
+          dimensions: 256,
+          distance_metric: "dot",
+          query_prompt_template: "inject {{query}}",
+          document_prompt_template: "inject {{document}}",
+        },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    // User's settings must survive
+    expect(config.semantic.backend).toBe("ollama");
+    expect(config.semantic.model).toBe("mxbai-embed-large");
+    // Project's new fields must be stripped
+    expect(config.semantic.output_encoding).toBeUndefined();
+    expect(config.semantic.storage_strategy).toBeUndefined();
+    expect(config.semantic.input_mode).toBeUndefined();
+    expect(config.semantic.dimensions).toBeUndefined();
+    expect(config.semantic.distance_metric).toBeUndefined();
+    expect(config.semantic.query_prompt_template).toBeUndefined();
+    expect(config.semantic.document_prompt_template).toBeUndefined();
+    // Warning must mention the new fields
+    expect(result.stderr).toContain("Ignoring semantic.output_encoding, storage_strategy, input_mode");
+    expect(result.stderr).toContain("Ignoring semantic.");
   });
 
   test("blocks exfiltration when project config has ONLY sensitive semantic fields (no safe fields)", () => {
@@ -730,11 +781,10 @@ describe("loadAftConfig", () => {
     expect(config.semantic.base_url).toBe("http://localhost:11434");
     expect(config.semantic.model).toBe("mxbai-embed-large");
     expect(config.semantic.api_key_env).toBeUndefined();
-    expect(result.stderr).toContain("Ignoring semantic.backend/base_url/api_key_env");
+    expect(result.stderr).toContain("Ignoring semantic.backend, base_url, api_key_env");
   });
 
-  test("partial safe-field override preserves user model", () => {
-    const fixture = createConfigFixture();
+  test("partial safe-field override preserves user model", () => {    const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({

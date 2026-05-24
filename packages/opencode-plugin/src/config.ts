@@ -36,6 +36,18 @@ const CheckerEnum = z.enum([
 
 const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
 
+/** Output encoding mode for embeddings. */
+const SemanticOutputEncodingEnum = z.enum(["float", "binary", "ubinary", "int8", "uint8"]);
+
+/** Storage strategy for embedding vectors. */
+const SemanticStorageStrategyEnum = z.enum(["flat", "binary_pack"]);
+
+/** Input mode for document chunking before embedding. */
+const SemanticInputModeEnum = z.enum(["flat_texts", "chunk_extracts", "contextualized"]);
+
+/** Distance metric for similarity search. */
+const SemanticDistanceMetricEnum = z.enum(["cosine", "dot", "hamming"]);
+
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
   backend: SemanticBackendEnum.optional(),
@@ -49,8 +61,21 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
+  /** Output encoding for embedding vectors: "float" (default), "binary", "ubinary", "int8", or "uint8". */
+  output_encoding: SemanticOutputEncodingEnum.optional(),
+  /** Storage strategy: "flat" (default) or "binary_pack". */
+  storage_strategy: SemanticStorageStrategyEnum.optional(),
+  /** Input mode for document processing: "flat_texts" (default), "chunk_extracts", or "contextualized". */
+  input_mode: SemanticInputModeEnum.optional(),
+  /** Embedding dimension count (for providers that support variable dimensions). */
+  dimensions: z.number().int().positive().optional(),
+  /** Distance metric: "cosine" (default), "dot", or "hamming". */
+  distance_metric: SemanticDistanceMetricEnum.optional(),
+  /** Optional query prompt template (applied before embedding queries). */
+  query_prompt_template: z.string().optional(),
+  /** Optional document prompt template (applied before embedding documents). */
+  document_prompt_template: z.string().optional(),
 });
-
 const LspExtensionSchema = z
   .string()
   .trim()
@@ -1027,8 +1052,31 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
 }
 
 /**
- * Top-level fields that are SAFE to inherit from project config.
+ * Semantic config fields that are USER-ONLY (security boundary).
+ * These fields control remote endpoints, vector storage, and prompt behavior —
+ * a hostile project config could weaponize any of them.
  *
+ * Returns a comma-separated list of the offending field names found in `semantic`,
+ * so the caller can generate a warning. Empty string means no restricted fields.
+ */
+function getStrippedSemanticKeys(semantic: AftConfig["semantic"]): string {
+  if (!semantic) return "";
+  const stripped: string[] = [];
+  if (semantic.backend !== undefined) stripped.push("backend");
+  if (semantic.base_url !== undefined) stripped.push("base_url");
+  if (semantic.api_key_env !== undefined) stripped.push("api_key_env");
+  if (semantic.output_encoding !== undefined) stripped.push("output_encoding");
+  if (semantic.storage_strategy !== undefined) stripped.push("storage_strategy");
+  if (semantic.input_mode !== undefined) stripped.push("input_mode");
+  if (semantic.dimensions !== undefined) stripped.push("dimensions");
+  if (semantic.distance_metric !== undefined) stripped.push("distance_metric");
+  if (semantic.query_prompt_template !== undefined) stripped.push("query_prompt_template");
+  if (semantic.document_prompt_template !== undefined) stripped.push("document_prompt_template");
+  return stripped.join(", ");
+}
+
+/**
+ * Top-level fields that are SAFE to inherit from project config. *
  * Anything NOT in this list flows from user config only. This is the
  * strict-allowlist trust boundary — adding a new field requires explicit
  * security review of whether a hostile repo could weaponize it.
@@ -1177,13 +1225,10 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   // Override with project config
   const projectConfig = loadConfigFromPath(projectConfigPath);
   if (projectConfig) {
-    if (
-      projectConfig.semantic?.backend !== undefined ||
-      projectConfig.semantic?.base_url !== undefined ||
-      projectConfig.semantic?.api_key_env !== undefined
-    ) {
+    const strippedSemanticKeys = getStrippedSemanticKeys(projectConfig.semantic);
+    if (strippedSemanticKeys) {
       warn(
-        "Ignoring semantic.backend/base_url/api_key_env from project config (security: use user config for external backends)",
+        `Ignoring semantic.${strippedSemanticKeys} from project config (security: these semantic settings only honor user-level config)`,
       );
     }
     const strippedLspKeys = getProjectLspStrippedKeys(projectConfig.lsp);
