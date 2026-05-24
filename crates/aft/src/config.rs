@@ -163,6 +163,16 @@ pub struct SemanticBackendConfig {
     /// Defaults to `auto` which resolves from provider/model profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_metric: Option<DistanceMetric>,
+    /// Optional template applied to user queries before embedding.
+    /// Use `{query}` as the placeholder for the raw query text.
+    /// Example: "Instruct: Given a code search query, retrieve relevant code snippet that answer the query\nQuery: {query}"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prompt_template: Option<String>,
+    /// Optional template applied to document/chunk text before embedding.
+    /// Use `{text}` as the placeholder for the raw chunk text.
+    /// Example: "Represent this code snippet for retrieval: {text}"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prompt_template: Option<String>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserServerDef {
@@ -192,6 +202,8 @@ impl Default for SemanticBackendConfig {
             input_mode: None,
             storage_strategy: None,
             distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
         }
     }
 }

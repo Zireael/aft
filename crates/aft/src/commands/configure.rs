@@ -1701,7 +1701,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 }
 
                                 let mut cached = cached;
-                                let mut embed = |texts: Vec<String>| model.embed(texts);
+                                let doc_template = semantic_config.document_prompt_template.clone();
+                                let mut embed = move |texts: Vec<String>| {
+                                    let texts = if let Some(ref tpl) = doc_template {
+                                        texts
+                                            .iter()
+                                            .map(|t| {
+                                                crate::semantic_index::apply_document_template(
+                                                    t,
+                                                    Some(tpl),
+                                                )
+                                            })
+                                            .collect()
+                                    } else {
+                                        texts
+                                    };
+                                    model.embed(texts)
+                                };
                                 let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                     stage: "refreshing_stale_files".to_string(),
                                     files: None,
@@ -1790,7 +1806,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             ));
                         }
 
-                        let mut embed = |texts: Vec<String>| model.embed(texts);
+                        let doc_template = semantic_config.document_prompt_template.clone();
+                        let mut embed = move |texts: Vec<String>| {
+                            let texts = if let Some(ref tpl) = doc_template {
+                                texts
+                                    .iter()
+                                    .map(|t| {
+                                        crate::semantic_index::apply_document_template(t, Some(tpl))
+                                    })
+                                    .collect()
+                            } else {
+                                texts
+                            };
+                            model.embed(texts)
+                        };
 
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "extracting_symbols".to_string(),

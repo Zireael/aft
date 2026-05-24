@@ -133,6 +133,7 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
         storage_strategy: "native_f32".to_string(),
         distance_metric: "auto".to_string(),
         input_mode: "flat_texts".to_string(),
+        document_prompt_hash: String::new(),
     };
     index.set_fingerprint(fingerprint.clone());
     index.write_to_disk(storage.path(), "file-summary-roundtrip");

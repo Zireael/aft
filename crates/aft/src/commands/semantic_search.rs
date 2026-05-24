@@ -178,9 +178,8 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
     let query_vector = model
-        .embed_query_cached(query)
+        .embed_query_cached(query, semantic_config.query_prompt_template.as_deref())
         .map_err(|error| format!("failed to embed query: {error}"))?;
-
     if let Some(index) = ctx.semantic_index().borrow().as_ref() {
         if index.dimension() != query_vector.len() {
             return Err(format!(

@@ -336,6 +336,38 @@ const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
+
+/// Apply a query prompt template to a raw query string.
+/// Replaces `{query}` with the raw query text.
+/// Returns the template with `{query}` replaced, or the raw query if template is None or missing placeholder.
+pub fn apply_query_template(query: &str, template: Option<&str>) -> String {
+    match template {
+        Some(tpl) if tpl.contains("{query}") => tpl.replace("{query}", query),
+        Some(_) => query.to_string(),
+        None => query.to_string(),
+    }
+}
+
+/// Apply a document prompt template to raw chunk text.
+/// Replaces `{text}` with the raw chunk text.
+/// Returns the template with `{text}` replaced, or the raw text if template is None or missing placeholder.
+pub fn apply_document_template(text: &str, template: Option<&str>) -> String {
+    match template {
+        Some(tpl) if tpl.contains("{text}") => tpl.replace("{text}", text),
+        Some(_) => text.to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// Compute a stable hash for a prompt template. Returns empty string when None.
+pub fn prompt_template_hash(template: Option<&str>) -> String {
+    template.map_or(String::new(), |t| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        t.hash(&mut hasher);
+        hasher.finish().to_string()
+    })
+}
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SemanticIndexLock {
@@ -382,6 +414,9 @@ pub struct SemanticIndexFingerprint {
     /// Input mode used for this index.
     #[serde(default)]
     pub input_mode: String,
+    /// Hash of the document prompt template (empty string when no document prompt is configured).
+    #[serde(default)]
+    pub document_prompt_hash: String,
 }
 
 fn default_chunking_version() -> u32 {
@@ -415,6 +450,7 @@ impl SemanticIndexFingerprint {
             storage_strategy: resolve_storage_strategy(config).to_string(),
             distance_metric: resolve_distance_metric(config, profile).to_string(),
             input_mode: resolve_input_mode(config).to_string(),
+            document_prompt_hash: prompt_template_hash(config.document_prompt_template.as_deref()),
         }
     }
 
@@ -938,14 +974,26 @@ impl SemanticEmbeddingModel {
         self.embed_texts(texts)
     }
 
-    pub fn embed_query_cached(&mut self, query: &str) -> Result<Vec<f32>, String> {
-        if let Some(vector) = self.query_embedding_cache.get(query) {
+    pub fn embed_query_cached(
+        &mut self,
+        query: &str,
+        query_prompt_template: Option<&str>,
+    ) -> Result<Vec<f32>, String> {
+        let prompt_hash = prompt_template_hash(query_prompt_template);
+        let cache_key = if prompt_hash.is_empty() {
+            query.to_string()
+        } else {
+            format!("{prompt_hash}:{query}")
+        };
+
+        if let Some(vector) = self.query_embedding_cache.get(&cache_key) {
             self.query_embedding_cache_hits += 1;
             return Ok(vector.clone());
         }
 
         self.query_embedding_cache_misses += 1;
-        let embeddings = self.embed_texts(vec![query.to_string()])?;
+        let prefixed_query = apply_query_template(query, query_prompt_template);
+        let embeddings = self.embed_texts(vec![prefixed_query])?;
         let vector = embeddings
             .first()
             .cloned()
@@ -957,9 +1005,8 @@ impl SemanticEmbeddingModel {
             }
         }
         self.query_embedding_cache
-            .insert(query.to_string(), vector.clone());
-        self.query_embedding_cache_order
-            .push_back(query.to_string());
+            .insert(cache_key.clone(), vector.clone());
+        self.query_embedding_cache_order.push_back(cache_key);
 
         Ok(vector)
     }
@@ -3044,6 +3091,7 @@ mod tests {
             storage_strategy: "native_f32".to_string(),
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
         });
 
         let bytes = index.to_bytes();
@@ -3623,6 +3671,7 @@ mod tests {
             storage_strategy: "native_f32".to_string(),
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -3646,6 +3695,7 @@ mod tests {
             storage_strategy: "native_f32".to_string(),
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
         }
         .as_string();
         assert!(SemanticIndex::read_from_disk(
@@ -3694,6 +3744,7 @@ mod tests {
             storage_strategy: "native_f32".to_string(),
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
         };
         index.set_fingerprint(fingerprint.clone());
 
