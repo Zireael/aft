@@ -90,6 +90,14 @@ pub enum SemanticIndexStatus {
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
+    /// Index is partially built — semantic search works but results may be incomplete.
+    /// `completeness` is 0.0–1.0 representing the fraction of chunks indexed.
+    Partial {
+        stage: String,
+        entries_done: usize,
+        entries_total: usize,
+        completeness: f64,
+    },
     Ready,
     Failed(String),
 }
@@ -101,8 +109,50 @@ pub enum SemanticIndexEvent {
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
+    /// Intermediate event: index is usable but still building.
+    /// The receiver should make the index available for search
+    /// while the build continues in the background.
+    PartialReady(SemanticIndex),
     Ready(SemanticIndex),
     Failed(String),
+}
+
+/// Cooperative cancellation token for semantic index builds.
+/// Uses an `AtomicU64` generation counter: the build thread captures
+/// the generation at start and checks it before each embedding batch.
+/// When a reconfigure increments the generation, the old build detects
+/// the mismatch and exits early.
+#[derive(Clone)]
+pub struct SemanticCancellationToken {
+    generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SemanticCancellationToken {
+    pub fn new() -> Self {
+        Self {
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Capture the current generation. The build thread calls this once at start
+    /// and then uses `is_cancelled(generation)` to check cooperatively.
+    pub fn capture_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check if the captured generation is still current. Returns `true` if
+    /// a reconfigure has superseded this build.
+    pub fn is_cancelled(&self, captured_generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed) != captured_generation
+    }
+
+    /// Increment the generation counter, cancelling any in-flight build.
+    /// Returns the new generation value.
+    pub fn cancel_and_advance(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
 }
 
 /// Normalize a path by resolving `.` and `..` components lexically,
@@ -305,6 +355,9 @@ pub struct AppContext {
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
+    /// Cancellation token for the semantic index build. Incremented on reconfigure
+    /// to cooperatively cancel any in-flight build thread.
+    semantic_cancel_token: SemanticCancellationToken,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -373,6 +426,7 @@ impl AppContext {
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
             semantic_embedding_model: RefCell::new(None),
+            semantic_cancel_token: SemanticCancellationToken::new(),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
@@ -810,6 +864,11 @@ impl AppContext {
         &self,
     ) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
+    }
+
+    /// Access the cancellation token for the semantic index build.
+    pub fn semantic_cancel_token(&self) -> &SemanticCancellationToken {
+        &self.semantic_cancel_token
     }
 
     /// Access the file watcher handle (kept alive to continue watching).

@@ -11,6 +11,7 @@ use crate::search_index::SearchIndex;
 use crate::semantic_index::{
     is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
 };
+use crate::slog_info;
 use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 10;
@@ -92,6 +93,22 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         SemanticIndexStatus::Failed(error) => {
             return semantic_error_response(&req.id, error);
+        }
+        SemanticIndexStatus::Partial {
+            stage: _,
+            entries_done,
+            entries_total,
+            completeness,
+        } => {
+            // Index is usable but still building — allow search but flag results
+            // as potentially incomplete. Fall through to normal search below.
+            let pct = (*completeness * 100.0) as usize;
+            slog_info!(
+                "semantic search: index partially built ({}%, {}/{})",
+                pct,
+                entries_done,
+                entries_total
+            );
         }
         SemanticIndexStatus::Ready => {}
     }

@@ -734,6 +734,19 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 keep_receiver = false;
                 status_changed = true;
             }
+            SemanticIndexEvent::PartialReady(index) => {
+                let entry_count = index.len();
+                *ctx.semantic_index().borrow_mut() = Some(index);
+                // Keep the receiver open — the build thread is still running
+                // and will send Ready or Failed when it finishes.
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Partial {
+                    stage: "embedding_symbols".to_string(),
+                    entries_done: entry_count,
+                    entries_total: entry_count, // will be updated by next Progress event
+                    completeness: 1.0,          // will be refined by next Progress event
+                };
+                status_changed = true;
+            }
             SemanticIndexEvent::Failed(error) => {
                 *ctx.semantic_index().borrow_mut() = None;
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);

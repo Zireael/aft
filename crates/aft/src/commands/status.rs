@@ -108,6 +108,20 @@ impl AppContext {
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
+                    SemanticIndexStatus::Partial {
+                        stage,
+                        entries_done,
+                        entries_total,
+                        completeness,
+                    } => serde_json::json!({
+                        "status": "partial",
+                        "stage": stage,
+                        "entries_done": entries_done,
+                        "entries_total": entries_total,
+                        "completeness": completeness,
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
                     SemanticIndexStatus::Failed(error) => serde_json::json!({
                         "status": "failed",
                         "error": error,

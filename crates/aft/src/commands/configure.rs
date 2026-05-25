@@ -1544,9 +1544,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "configure called while search index build is still in progress; previous build will continue detached"
         );
     }
+    // Cancel any in-flight semantic build by advancing the generation counter.
+    // The old thread will detect the mismatch and exit early on its next
+    // cooperative cancellation check (before the next embedding batch).
     if semantic_build_in_progress {
-        slog_warn!(
-            "configure called while semantic index build is still in progress; previous build will continue detached"
+        let new_gen = ctx.semantic_cancel_token().cancel_and_advance();
+        slog_info!(
+            "configure: cancelling in-flight semantic build (advancing generation to {})",
+            new_gen
         );
     }
 
@@ -1724,6 +1729,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let session_id_for_bg2 = log_ctx::current_session();
+        let cancel_token = ctx.semantic_cancel_token().clone();
+        let captured_generation = cancel_token.capture_generation();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
                 // Cap file count to prevent OOM on huge project roots (e.g., /home/user).
@@ -1733,6 +1740,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
                 let build_result = catch_unwind(AssertUnwindSafe(
                     || -> Result<SemanticIndex, String> {
+                        // Helper: check if this build has been superseded by a reconfigure.
+                        let cancelled =
+                            || -> bool { cancel_token.is_cancelled(captured_generation) };
+
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
                             files: None,
@@ -1748,6 +1759,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             &semantic_files_config,
                         )?;
                         let fingerprint_key = fingerprint.as_string();
+
+                        if cancelled() {
+                            return Err("semantic build cancelled (reconfigured)".to_string());
+                        }
 
                         // Create embed closure once and reuse for both incremental refresh
                         // and full rebuild. Must be created before model is moved.
@@ -1880,6 +1895,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
+                        if cancelled() {
+                            return Err("semantic build cancelled (reconfigured)".to_string());
+                        }
+
                         let filters = build_path_filters(&[], &[]).unwrap_or_default();
                         let files = walk_project_files(&root_clone, &filters);
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
@@ -1909,6 +1928,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             entries_done: None,
                             entries_total: None,
                         });
+
+                        if cancelled() {
+                            return Err("semantic build cancelled (reconfigured)".to_string());
+                        }
+
                         let mut progress = |done: usize, total: usize| {
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                 stage: "embedding_symbols".to_string(),

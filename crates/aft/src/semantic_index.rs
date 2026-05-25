@@ -2050,7 +2050,7 @@ impl SemanticIndex {
                 .map(|c| c.embed_text.clone())
                 .collect();
 
-            let vectors = embed_fn(batch_texts)?;
+            let vectors = embed_with_retry(&mut *embed_fn, batch_texts)?;
             validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
 
             // Track consistent dimension across all batches
@@ -2122,6 +2122,67 @@ impl SemanticIndex {
     }
 
     /// Build the semantic index and report embedding progress using entry counts.
+    /// Sort files for cold-start priority: README/docs first, then core source,
+    /// then tests, then remaining. This makes the most useful content available
+    /// earliest when the index is partially built.
+    pub fn sort_files_by_priority(files: &mut [PathBuf]) {
+        fn priority(p: &Path) -> u8 {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let path_str = p.to_str().unwrap_or("");
+
+            // README and top-level docs → highest priority (0)
+            if name.eq_ignore_ascii_case("readme.md")
+                || name.eq_ignore_ascii_case("readme")
+                || name.eq_ignore_ascii_case("readme.txt")
+            {
+                return 0;
+            }
+            // docs/ adr/ .github/ directories → high priority (1)
+            if path_str.contains("/docs/")
+                || path_str.contains("\\docs\\")
+                || path_str.contains("/adr/")
+                || path_str.contains("\\adr\\")
+                || path_str.contains("/.github/")
+                || path_str.contains("\\.github\\")
+                || path_str.contains("/architecture/")
+                || path_str.contains("\\architecture\\")
+            {
+                return 1;
+            }
+            // Other markdown → medium-high (2)
+            if ext == "md" || ext == "mdx" || ext == "rst" || ext == "txt" {
+                return 2;
+            }
+            // Core source (src/, lib/, crates/) → medium (3)
+            if path_str.contains("/src/")
+                || path_str.contains("\\src\\")
+                || path_str.contains("/lib/")
+                || path_str.contains("\\lib\\")
+                || path_str.contains("/crates/")
+                || path_str.contains("\\crates\\")
+                || path_str.contains("/packages/")
+                || path_str.contains("\\packages\\")
+            {
+                return 3;
+            }
+            // Tests → lower (4)
+            if path_str.contains("/tests/")
+                || path_str.contains("\\tests\\")
+                || path_str.contains("/test/")
+                || path_str.contains("\\test\\")
+                || path_str.contains("/__tests__/")
+                || path_str.contains("\\__tests__\\")
+                || name.contains("test")
+            {
+                return 4;
+            }
+            // Everything else → lowest (5)
+            5
+        }
+        files.sort_by_key(|p| priority(p));
+    }
+
     pub fn build_with_progress<F, P>(
         project_root: &Path,
         files: &[PathBuf],
@@ -2134,7 +2195,9 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, file_policy);
+        let mut files = files.to_vec();
+        Self::sort_files_by_priority(&mut files);
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, &files, file_policy);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let snapshot = Self::build_from_chunks(
@@ -2900,6 +2963,54 @@ impl SemanticIndex {
             fingerprint,
         })
     }
+}
+
+/// Embed texts with exponential backoff retry for transient remote provider errors
+/// (rate limits, timeouts, server errors). Up to 3 retries with base delay of 1s,
+/// capped at 8s max. Non-transient errors (dimension mismatch, config errors) are
+/// returned immediately without retry.
+fn embed_with_retry<F>(embed_fn: &mut F, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_MS: u64 = 1000;
+    const MAX_DELAY_MS: u64 = 8000;
+
+    let mut last_err = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        match embed_fn(texts.clone()) {
+            Ok(vectors) => return Ok(vectors),
+            Err(e) => {
+                last_err = e.clone();
+                // Only retry on transient errors (rate limit, timeout, server)
+                let is_transient = e.to_lowercase().contains("rate")
+                    || e.to_lowercase().contains("limit")
+                    || e.to_lowercase().contains("timeout")
+                    || e.to_lowercase().contains("429")
+                    || e.to_lowercase().contains("503")
+                    || e.to_lowercase().contains("502")
+                    || e.to_lowercase().contains("500")
+                    || e.to_lowercase().contains("connection")
+                    || e.to_lowercase().contains("reset")
+                    || e.to_lowercase().contains("network");
+
+                if !is_transient || attempt == MAX_RETRIES {
+                    return Err(last_err);
+                }
+                let delay = (BASE_DELAY_MS * 2u64.pow(attempt)).min(MAX_DELAY_MS);
+                slog_warn!(
+                    "embedding batch failed (attempt {}/{}): {}. Retrying in {}ms...",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    e,
+                    delay
+                );
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Build enriched embedding text from a symbol with cAST-style context
