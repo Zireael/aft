@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
-use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
+use crate::config::{SemanticBackend, SemanticBackendConfig, SemanticFilePolicy, UserServerDef};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -232,6 +232,86 @@ fn parse_semantic_config(
     }
 
     Ok(semantic)
+}
+
+fn parse_semantic_files_config(
+    value: &serde_json::Value,
+    current: &SemanticFilePolicy,
+) -> Result<SemanticFilePolicy, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: semantic_files must be an object".to_string());
+    };
+
+    let mut policy = current.clone();
+
+    if let Some(raw) = obj.get("include_code") {
+        policy.include_code = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.include_code must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("include_docs") {
+        policy.include_docs = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.include_docs must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("include_configs") {
+        policy.include_configs = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.include_configs must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("respect_gitignore") {
+        policy.respect_gitignore = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.respect_gitignore must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("include_gitignored_docs") {
+        policy.include_gitignored_docs = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.include_gitignored_docs must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("include_globs") {
+        let arr = raw.as_array().ok_or_else(|| {
+            "configure: semantic_files.include_globs must be an array of strings".to_string()
+        })?;
+        policy.include_globs = arr
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    "configure: semantic_files.include_globs entries must be strings".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    if let Some(raw) = obj.get("exclude_globs") {
+        let arr = raw.as_array().ok_or_else(|| {
+            "configure: semantic_files.exclude_globs must be an array of strings".to_string()
+        })?;
+        policy.exclude_globs = arr
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    "configure: semantic_files.exclude_globs entries must be strings".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    if let Some(raw) = obj.get("max_file_size_bytes") {
+        policy.max_file_size_bytes = raw.as_u64().ok_or_else(|| {
+            "configure: semantic_files.max_file_size_bytes must be an unsigned integer".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("binary_detection") {
+        policy.binary_detection = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.binary_detection must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("generated_file_detection") {
+        policy.generated_file_detection = raw.as_bool().ok_or_else(|| {
+            "configure: semantic_files.generated_file_detection must be a boolean".to_string()
+        })?;
+    }
+
+    Ok(policy)
 }
 
 fn parse_lsp_servers(value: &Value) -> Result<Vec<UserServerDef>, String> {
@@ -1288,6 +1368,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         ctx.config_mut().semantic = semantic;
     }
+    if let Some(v) = params.get("semantic_files") {
+        let current = ctx.config().semantic_files.clone();
+        let semantic_files = match parse_semantic_files_config(v, &current) {
+            Ok(config) => config,
+            Err(error) => {
+                return Response::error(&req.id, "invalid_request", error);
+            }
+        };
+        ctx.config_mut().semantic_files = semantic_files;
+    }
     if let Some(raw) = params.get("max_callgraph_files") {
         // Reject invalid values explicitly so user typos surface instead of
         // being silently swallowed (Oracle v0.15.1 review blocker).
@@ -1630,6 +1720,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
         let semantic_config = semantic_config.clone();
+        let semantic_files_config = ctx.config().semantic_files.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let session_id_for_bg2 = log_ctx::current_session();
@@ -1651,7 +1742,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         let mut model =
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
                         let profile = EmbeddingModelProfile::from_config(&semantic_config);
-                        let fingerprint = model.fingerprint(&semantic_config, profile.as_ref())?;
+                        let fingerprint = model.fingerprint(
+                            &semantic_config,
+                            profile.as_ref(),
+                            &semantic_files_config,
+                        )?;
                         let fingerprint_key = fingerprint.as_string();
 
                         // Create embed closure once and reuse for both incremental refresh
@@ -1740,6 +1835,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     &mut embed,
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
+                                    &semantic_files_config,
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -1827,6 +1923,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             &mut embed,
                             semantic_config.max_batch_size.max(1),
                             &mut progress,
+                            &semantic_files_config,
                         )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);

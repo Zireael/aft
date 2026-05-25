@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use aft::semantic_index::SemanticIndex;
+use aft::semantic_index::{SemanticFilePolicy, SemanticIndex};
 
 /// Stub embedder that returns vectors based on text content.
 /// Tracks all calls so we can assert which files (and how many) got embedded.
@@ -126,6 +126,7 @@ fn refresh_is_noop_when_nothing_changed() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -161,6 +162,7 @@ fn refresh_re_embeds_only_changed_file() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -204,6 +206,7 @@ fn refresh_drops_entries_for_files_no_longer_in_walk() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -244,6 +247,7 @@ fn refresh_embeds_new_files_added_to_walk() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -296,6 +300,7 @@ fn refresh_handles_changed_plus_deleted_plus_new_in_one_call() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 

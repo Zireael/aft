@@ -186,6 +186,130 @@ pub struct UserServerDef {
     pub disabled: bool,
 }
 
+/// Configures which files are considered for semantic indexing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticFilePolicy {
+    /// Index code files (default: true).
+    pub include_code: bool,
+    /// Index documentation files (default: true).
+    pub include_docs: bool,
+    /// Index config files (default: false).
+    pub include_configs: bool,
+    /// Respect .gitignore when walking files (default: true).
+    pub respect_gitignore: bool,
+    /// Include gitignored docs when `respect_gitignore` is true (default: true).
+    pub include_gitignored_docs: bool,
+    /// Extra include globs for docs/configs beyond defaults.
+    #[serde(default)]
+    pub include_globs: Vec<String>,
+    /// Exclude globs for junk/output directories and file types.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Maximum file size in bytes to consider for indexing (default: 1 MiB).
+    pub max_file_size_bytes: u64,
+    /// Skip binary files by content inspection (default: true).
+    pub binary_detection: bool,
+    /// Skip files that look auto-generated (default: true).
+    pub generated_file_detection: bool,
+    /// Docs chunker version — bump when chunking logic changes.
+    #[serde(default = "default_docs_chunker_version")]
+    pub docs_chunker_version: u8,
+    /// Globs that are always included when `include_docs` is true (baked-in, not overridable).
+    #[serde(skip)]
+    pub(crate) builtin_doc_globs: Vec<String>,
+    /// Globs that are always excluded (baked-in, not overridable).
+    #[serde(skip)]
+    pub(crate) builtin_exclude_globs: Vec<String>,
+}
+
+const fn default_docs_chunker_version() -> u8 {
+    1
+}
+
+impl Default for SemanticFilePolicy {
+    fn default() -> Self {
+        Self {
+            include_code: true,
+            include_docs: true,
+            include_configs: false,
+            respect_gitignore: true,
+            include_gitignored_docs: true,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            max_file_size_bytes: 1_048_576, // 1 MiB
+            binary_detection: true,
+            generated_file_detection: true,
+            docs_chunker_version: default_docs_chunker_version(),
+            builtin_doc_globs: vec![
+                "README.md".into(),
+                "README.rst".into(),
+                "docs/**/*.md".into(),
+                "docs/**/*.rst".into(),
+                "adr/**/*.md".into(),
+                ".github/**/*.md".into(),
+                "CONTRIBUTING.md".into(),
+                "CHANGELOG.md".into(),
+                "CHANGELOG*.md".into(),
+            ],
+            builtin_exclude_globs: vec![
+                "**/node_modules/**".into(),
+                "**/dist/**".into(),
+                "**/build/**".into(),
+                "**/target/**".into(),
+                "**/.next/**".into(),
+                "**/.turbo/**".into(),
+                "**/.cache/**".into(),
+                "**/coverage/**".into(),
+                "**/vendor/**".into(),
+                "**/.git/**".into(),
+                "**/__pycache__/**".into(),
+                "**/.tox/**".into(),
+                "**/.venv/**".into(),
+                "**/venv/**".into(),
+                "**/*.min.js".into(),
+                "**/*.min.css".into(),
+                "**/*.map".into(),
+                "**/*.lock".into(),
+                "**/*.svg".into(),
+                "**/*.png".into(),
+                "**/*.jpg".into(),
+                "**/*.jpeg".into(),
+                "**/*.gif".into(),
+                "**/*.ico".into(),
+                "**/*.woff".into(),
+                "**/*.woff2".into(),
+                "**/*.ttf".into(),
+                "**/*.eot".into(),
+                "**/*.otf".into(),
+                "**/*.pdf".into(),
+                "**/*.zip".into(),
+                "**/*.tar".into(),
+                "**/*.gz".into(),
+                "**/*.bz2".into(),
+                "**/*.xz".into(),
+                "**/*.7z".into(),
+                "**/*.rar".into(),
+                "**/*.wasm".into(),
+                "**/*.parquet".into(),
+                "**/*.onnx".into(),
+                "**/*.bin".into(),
+                "**/*.dll".into(),
+                "**/*.dylib".into(),
+                "**/*.so".into(),
+                "**/*.exe".into(),
+                "**/*.o".into(),
+                "**/*.obj".into(),
+                "**/*.a".into(),
+                "**/*.lib".into(),
+                "**/*.class".into(),
+                "**/*.jar".into(),
+                "generated/**".into(),
+            ],
+        }
+    }
+}
+
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
@@ -273,6 +397,8 @@ pub struct Config {
     /// very large projects if you accept multi-minute per-call latency).
     pub max_callgraph_files: usize,
     pub semantic: SemanticBackendConfig,
+    /// File inclusion/exclusion policy for semantic indexing.
+    pub semantic_files: SemanticFilePolicy,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -358,6 +484,7 @@ impl Default for Config {
             // it only gates `aft_navigate` and `aft_refactor op="move"`.
             max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
+            semantic_files: SemanticFilePolicy::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

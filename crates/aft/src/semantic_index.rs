@@ -1,11 +1,12 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+pub use crate::config::SemanticFilePolicy;
 use crate::config::{
     DistanceMetric, InputMode, OutputEncoding, SemanticBackend, SemanticBackendConfig,
     StorageStrategy,
 };
 use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
-use crate::search_index::{cache_relative_path, cached_path_under_root};
+use crate::search_index::{cache_relative_path, cached_path_under_root, is_binary_bytes};
 use crate::symbols::{Symbol, SymbolKind};
 use crate::{slog_info, slog_warn};
 
@@ -391,6 +392,32 @@ pub fn prompt_template_hash(template: Option<&str>) -> String {
         hasher.finish().to_string()
     })
 }
+
+/// Compute a stable hash of the file policy settings.
+/// Changes to any policy field will produce a different hash,
+/// triggering a rebuild of the semantic index.
+fn compute_file_policy_hash(policy: &SemanticFilePolicy) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Version prefix so we can bump the hash algorithm independently
+    b"file_policy_v1".hash(&mut hasher);
+    policy.include_code.hash(&mut hasher);
+    policy.include_docs.hash(&mut hasher);
+    policy.include_configs.hash(&mut hasher);
+    policy.respect_gitignore.hash(&mut hasher);
+    policy.include_gitignored_docs.hash(&mut hasher);
+    for glob in &policy.include_globs {
+        glob.hash(&mut hasher);
+    }
+    for glob in &policy.exclude_globs {
+        glob.hash(&mut hasher);
+    }
+    policy.max_file_size_bytes.hash(&mut hasher);
+    policy.binary_detection.hash(&mut hasher);
+    policy.generated_file_detection.hash(&mut hasher);
+    hasher.finish().to_string()
+}
+
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SemanticIndexLock {
@@ -452,6 +479,13 @@ pub struct SemanticIndexFingerprint {
     /// Hash of the query prompt template (empty string when no query prompt is configured).
     #[serde(default)]
     pub query_prompt_hash: String,
+    /// Fingerprint of the file policy that determines which files are indexed.
+    /// Changes here trigger a full rebuild since the set of indexed files changes.
+    #[serde(default)]
+    pub file_policy_hash: String,
+    /// Version of the docs chunker. Bumped when docs chunking logic changes.
+    #[serde(default = "default_docs_fp_version")]
+    pub docs_chunker_version: u8,
 }
 
 impl Default for SemanticIndexFingerprint {
@@ -471,12 +505,18 @@ impl Default for SemanticIndexFingerprint {
             stored_vector_kind: String::new(),
             normalization: String::new(),
             query_prompt_hash: String::new(),
+            file_policy_hash: String::new(),
+            docs_chunker_version: default_docs_fp_version(),
         }
     }
 }
 
 fn default_chunking_version() -> u32 {
     2
+}
+
+const fn default_docs_fp_version() -> u8 {
+    1
 }
 
 fn default_dot_auto() -> String {
@@ -488,6 +528,7 @@ impl SemanticIndexFingerprint {
         config: &SemanticBackendConfig,
         dimension: usize,
         profile: Option<&EmbeddingModelProfile>,
+        file_policy: &SemanticFilePolicy,
     ) -> Self {
         // Use normalized URL for fingerprinting so cosmetic differences
         // (e.g. "http://host/v1" vs "http://host/v1/") don't cause rebuilds.
@@ -511,6 +552,8 @@ impl SemanticIndexFingerprint {
             stored_vector_kind: profile.map_or(String::new(), |p| p.stored_vector_kind.to_string()),
             normalization: profile.map_or(String::new(), |p| p.normalization.to_string()),
             query_prompt_hash: prompt_template_hash(config.query_prompt_template.as_deref()),
+            file_policy_hash: compute_file_policy_hash(file_policy),
+            docs_chunker_version: file_policy.docs_chunker_version,
         }
     }
 
@@ -553,6 +596,8 @@ impl SemanticIndexFingerprint {
                 && a.normalization == b.normalization
                 && a.input_mode == b.input_mode
                 && a.document_prompt_hash == b.document_prompt_hash
+                && a.file_policy_hash == b.file_policy_hash
+                && a.docs_chunker_version == b.docs_chunker_version
         }
 
         if !rebuild_fields_match(self, other) {
@@ -1040,12 +1085,16 @@ impl SemanticEmbeddingModel {
         &mut self,
         config: &SemanticBackendConfig,
         profile: Option<&EmbeddingModelProfile>,
+        file_policy: &SemanticFilePolicy,
     ) -> Result<SemanticIndexFingerprint, String> {
         let dimension = self.dimension()?;
         // Resolve distance metric (auto -> profile)
         self.distance_metric = resolve_distance_metric(config, profile);
         Ok(SemanticIndexFingerprint::from_config(
-            config, dimension, profile,
+            config,
+            dimension,
+            profile,
+            file_policy,
         ))
     }
 
@@ -1828,7 +1877,9 @@ impl SemanticIndex {
     fn collect_chunks(
         project_root: &Path,
         files: &[PathBuf],
+        file_policy: &SemanticFilePolicy,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
+        let policy = file_policy.clone();
         let per_file: Vec<(
             PathBuf,
             Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
@@ -1836,6 +1887,90 @@ impl SemanticIndex {
             .par_iter()
             .map_init(HashMap::new, |parsers, file| {
                 let result = collect_file_metadata(file).and_then(|metadata| {
+                    // Apply file policy checks
+                    let file_type = classify_semantic_file(file);
+                    match file_type {
+                        SemanticFileType::Code => {
+                            if !policy.include_code {
+                                return Err("code files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Doc => {
+                            if !policy.include_docs {
+                                return Err("docs files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Config => {
+                            if !policy.include_configs {
+                                return Err("config files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Unknown => {
+                            return Err("unknown file type".to_string());
+                        }
+                    }
+
+                    // Binary detection
+                    if policy.binary_detection {
+                        let bytes = match std::fs::read(file) {
+                            Ok(b) => b,
+                            Err(e) => return Err(e.to_string()),
+                        };
+                        if is_binary_bytes(&bytes) {
+                            return Err("binary file".to_string());
+                        }
+                        // File size check
+                        if bytes.len() as u64 > policy.max_file_size_bytes {
+                            return Err(format!(
+                                "file too large ({} bytes, limit {})",
+                                bytes.len(),
+                                policy.max_file_size_bytes
+                            ));
+                        }
+                        // For doc/config files, chunk from text
+                        if file_type == SemanticFileType::Doc
+                            || file_type == SemanticFileType::Config
+                        {
+                            let text = match String::from_utf8(bytes) {
+                                Ok(t) => t,
+                                Err(_) => return Err("non-utf8 file".to_string()),
+                            };
+                            if file_type == SemanticFileType::Doc {
+                                return Ok((metadata, collect_docs_chunks(&text, file)));
+                            } else {
+                                // Config files: single chunk
+                                let name = file
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "config".to_string());
+                                let body = text.trim().to_string();
+                                if body.is_empty() {
+                                    return Ok((metadata, Vec::new()));
+                                }
+                                return Ok((
+                                    metadata,
+                                    vec![SemanticChunk {
+                                        file: file.to_path_buf(),
+                                        name,
+                                        kind: SymbolKind::FileSummary,
+                                        start_line: 0,
+                                        end_line: text.lines().count().saturating_sub(1) as u32,
+                                        exported: false,
+                                        embed_text: body.clone(),
+                                        snippet: truncate_snippet(&body),
+                                    }],
+                                ));
+                            }
+                        }
+                        // Code files fall through to tree-sitter chunking below
+                        drop(bytes); // release the raw bytes
+                    }
+
+                    // Generated file detection
+                    if policy.generated_file_detection && is_generated_file(file) {
+                        return Err("generated file".to_string());
+                    }
+
                     collect_file_chunks(project_root, file, parsers)
                         .map(|chunks| (metadata, chunks))
                 });
@@ -1853,12 +1988,19 @@ impl SemanticIndex {
                     chunks.extend(file_chunks);
                 }
                 Err(error) => {
-                    // "unsupported file extension" is expected for non-code files
-                    // (json, xml, .gitignore, etc.) that get included in the
-                    // project walk. Pre-fix this was swallowed by .unwrap_or_default();
-                    // we now skip silently to keep the log clean. Only real read/parse
-                    // errors are worth surfacing.
-                    if error == "unsupported file extension" {
+                    // Skip expected/normal skip reasons silently
+                    if matches!(
+                        error.as_str(),
+                        "unsupported file extension"
+                            | "binary file"
+                            | "generated file"
+                            | "code files disabled by policy"
+                            | "docs files disabled by policy"
+                            | "config files disabled by policy"
+                            | "unknown file type"
+                            | "non-utf8 file"
+                    ) || error.starts_with("file too large")
+                    {
                         continue;
                     }
                     slog_warn!(
@@ -1961,7 +2103,8 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let (chunks, file_mtimes) =
+            Self::collect_chunks(project_root, files, &SemanticFilePolicy::default());
         let snapshot = Self::build_from_chunks(
             project_root,
             chunks,
@@ -1985,12 +2128,13 @@ impl SemanticIndex {
         embed_fn: &mut F,
         max_batch_size: usize,
         progress: &mut P,
+        file_policy: &SemanticFilePolicy,
     ) -> Result<Self, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, file_policy);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let snapshot = Self::build_from_chunks(
@@ -2026,6 +2170,7 @@ impl SemanticIndex {
         embed_fn: &mut F,
         max_batch_size: usize,
         progress: &mut P,
+        file_policy: &SemanticFilePolicy,
     ) -> Result<RefreshSummary, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -2126,7 +2271,7 @@ impl SemanticIndex {
             });
         }
 
-        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
+        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed, file_policy);
 
         if chunks.is_empty() {
             progress(0, 0);
@@ -3169,6 +3314,325 @@ fn read_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
     Ok(s)
 }
 
+// ---------------------------------------------------------------------------
+// File policy helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a file path looks auto-generated based on name and directory heuristics.
+pub(crate) fn is_generated_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
+
+    // Generated file name patterns
+    name_lower.ends_with(".generated.rs")
+        || name_lower.ends_with(".generated.go")
+        || name_lower.ends_with(".generated.ts")
+        || name_lower.ends_with(".pb.go") // protobuf
+        || name_lower.ends_with(".pb.rs") // protobuf
+        || name_lower.ends_with("_pb2.py") // protobuf
+        || name_lower.starts_with(".generated")
+        || name_lower.contains(".min.") // minified
+        || name_lower.ends_with(".snap") // jest snapshots
+        || name_lower.ends_with(".g.dart") // generated dart
+        || name_lower.ends_with(".freezed.dart")
+        || path
+            .ancestors()
+            .any(|a| {
+                let s = a
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                matches!(
+                    s.as_ref(),
+                    "generated" | "__generated__" | ".graphql" | "dist" | "build"
+                )
+            })
+}
+
+/// Check if a file extension suggests it is a documentation file.
+pub(crate) fn is_doc_extension(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .map(|ext| {
+            matches!(
+                ext.as_str(),
+                "md" | "markdown" | "rst" | "txt" | "adoc" | "org" | "creole" | "mediawiki"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Check if a file extension or name suggests it is a configuration file.
+pub(crate) fn is_config_extension(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
+
+    // Dotfiles that are config-like
+    if name_lower.starts_with('.') && !name_lower.starts_with("..") {
+        return matches!(
+            name_lower.as_str(),
+            ".env"
+                | ".eslintrc"
+                | ".prettierrc"
+                | ".babelrc"
+                | ".tsconfig"
+                | ".editorconfig"
+                | ".gitignore"
+                | ".dockerignore"
+                | ".npmrc"
+                | ".yarnrc"
+                | ".nvmrc"
+                | ".python-version"
+                | ".tool-versions"
+                | ".rubocop"
+                | ".stylelintrc"
+        );
+    }
+
+    // Config extensions (but exclude lockfiles)
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .map(|ext| {
+            matches!(
+                ext.as_str(),
+                "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf"
+            )
+        })
+        .unwrap_or(false)
+        && !name_lower.contains("package-lock")
+        && !name_lower.contains("yarn.lock")
+        && !name_lower.contains("bun.lock")
+        && !name_lower.contains("pnpm-lock")
+}
+
+/// Statistics about files skipped by the file policy during indexing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FilePolicyStats {
+    pub skipped_binary: usize,
+    pub skipped_generated: usize,
+    pub skipped_too_large: usize,
+    pub skipped_excluded: usize,
+    pub skipped_code_disabled: usize,
+    pub skipped_docs_disabled: usize,
+    pub skipped_configs_disabled: usize,
+    pub skipped_unknown_type: usize,
+    pub docs_files_indexed: usize,
+    pub config_files_indexed: usize,
+}
+
+/// Classify a file's type for the semantic indexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticFileType {
+    Code,
+    Doc,
+    Config,
+    Unknown,
+}
+
+/// Determine the semantic file type based on extension and path.
+pub(crate) fn classify_semantic_file(path: &Path) -> SemanticFileType {
+    if is_doc_extension(path) {
+        return SemanticFileType::Doc;
+    }
+    if is_config_extension(path) {
+        return SemanticFileType::Config;
+    }
+    // If it has a known code language, it's code
+    if detect_language(path).is_some() {
+        return SemanticFileType::Code;
+    }
+    // Fall back: check if it's text-ish but not classified
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "md" | "rst" | "txt") {
+        SemanticFileType::Doc
+    } else {
+        SemanticFileType::Unknown
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docs chunker — splits Markdown files into heading-based chunks
+// ---------------------------------------------------------------------------
+
+/// Maximum characters per chunk before splitting at paragraph boundaries.
+const MAX_CHUNK_CHARS: usize = 8000;
+
+/// Split a documentation file (primarily Markdown) into semantic chunks.
+/// Each `##` heading (h2 or deeper) starts a new chunk. Content before the
+/// first heading becomes a "summary" chunk. Overly large chunks are split
+/// further at paragraph boundaries.
+pub(crate) fn collect_docs_chunks(text: &str, file_path: &Path) -> Vec<SemanticChunk> {
+    let ext = file_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if matches!(ext.as_str(), "md" | "markdown") {
+        collect_markdown_chunks(text, file_path)
+    } else {
+        // Non-markdown docs: single chunk
+        let body = text.trim().to_string();
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let file_name = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "doc".to_string());
+        vec![SemanticChunk {
+            file: file_path.to_path_buf(),
+            name: file_name,
+            kind: SymbolKind::Heading,
+            start_line: 0,
+            end_line: text.lines().count().saturating_sub(1) as u32,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        }]
+    }
+}
+
+fn collect_markdown_chunks(text: &str, file_path: &Path) -> Vec<SemanticChunk> {
+    let mut chunks = Vec::new();
+    let mut current_heading = "Summary".to_string();
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut line_num: u32 = 0;
+    let mut chunk_start_line: u32 = 0;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Detect ATX headings: ## or deeper (level >= 2)
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            if level >= 2 && !current_lines.is_empty() {
+                // Flush previous chunk
+                let body = current_lines.join("\n").trim().to_string();
+                if !body.is_empty() {
+                    chunks.push(SemanticChunk {
+                        file: file_path.to_path_buf(),
+                        name: current_heading.clone(),
+                        kind: SymbolKind::Heading,
+                        start_line: chunk_start_line,
+                        end_line: line_num.saturating_sub(1),
+                        exported: false,
+                        embed_text: body.clone(),
+                        snippet: truncate_snippet(&body),
+                    });
+                }
+                chunk_start_line = line_num;
+                current_lines.clear();
+            }
+            if level >= 1 {
+                current_heading = trimmed.trim_start_matches('#').trim().to_string();
+            }
+        }
+        current_lines.push(line.to_string());
+        line_num += 1;
+    }
+
+    // Flush remaining
+    let body = current_lines.join("\n").trim().to_string();
+    if !body.is_empty() {
+        chunks.push(SemanticChunk {
+            file: file_path.to_path_buf(),
+            name: current_heading.clone(),
+            kind: SymbolKind::Heading,
+            start_line: chunk_start_line,
+            end_line: line_num.saturating_sub(1),
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    // Split overly large chunks at paragraph boundaries
+    let mut result = Vec::new();
+    for chunk in chunks {
+        if chunk.embed_text.len() <= MAX_CHUNK_CHARS {
+            result.push(chunk);
+        } else {
+            result.append(&mut split_large_chunk(&chunk));
+        }
+    }
+
+    result
+}
+
+/// Truncate text to a short snippet for display in search results.
+fn truncate_snippet(text: &str) -> String {
+    let s = text.trim();
+    if s.len() <= 200 {
+        s.to_string()
+    } else {
+        let mut truncated: String = s.chars().take(197).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+fn split_large_chunk(chunk: &SemanticChunk) -> Vec<SemanticChunk> {
+    let mut result = Vec::new();
+    let mut current_body = String::new();
+    let mut chunk_start = chunk.start_line;
+    let mut current_lines: u32 = 0;
+    let mut total_lines: u32 = 0;
+
+    for para in chunk.embed_text.split("\n\n") {
+        if !current_body.is_empty() && current_body.len() + para.len() > MAX_CHUNK_CHARS {
+            // Flush current sub-chunk
+            let body = current_body.trim().to_string();
+            result.push(SemanticChunk {
+                file: chunk.file.clone(),
+                name: format!("{} (cont.)", chunk.name),
+                kind: chunk.kind.clone(),
+                start_line: chunk_start,
+                end_line: chunk_start + current_lines,
+                exported: false,
+                embed_text: body.clone(),
+                snippet: truncate_snippet(&body),
+            });
+            chunk_start += current_lines + 1;
+            current_body.clear();
+            current_lines = 0;
+        }
+        if !current_body.is_empty() {
+            current_body.push_str("\n\n");
+        }
+        current_body.push_str(para);
+        current_lines += para.lines().count() as u32;
+        total_lines += para.lines().count() as u32;
+    }
+
+    if !current_body.trim().is_empty() {
+        let body = current_body.trim().to_string();
+        result.push(SemanticChunk {
+            file: chunk.file.clone(),
+            name: if result.is_empty() {
+                chunk.name.clone()
+            } else {
+                format!("{} (cont.)", chunk.name)
+            },
+            kind: chunk.kind.clone(),
+            start_line: chunk_start,
+            end_line: chunk.start_line + total_lines,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3584,6 +4048,7 @@ mod tests {
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
             )
             .unwrap();
 
@@ -3626,6 +4091,7 @@ mod tests {
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
             )
             .unwrap();
 
@@ -3656,6 +4122,7 @@ mod tests {
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
             )
             .unwrap();
 
@@ -3681,7 +4148,14 @@ mod tests {
         let mut embed = test_vector_for_texts;
         let mut progress = |_done: usize, _total: usize| {};
         let summary = index
-            .refresh_stale_files(project_root, &[], &mut embed, 8, &mut progress)
+            .refresh_stale_files(
+                project_root,
+                &[],
+                &mut embed,
+                8,
+                &mut progress,
+                &SemanticFilePolicy::default(),
+            )
             .unwrap();
 
         assert_eq!(summary.deleted, 1);
@@ -3713,6 +4187,7 @@ mod tests {
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
             )
             .unwrap();
 
@@ -3753,6 +4228,7 @@ mod tests {
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
             )
             .unwrap();
 
@@ -4326,6 +4802,8 @@ mod fingerprint_invalidation_tests {
             stored_vector_kind: "dense_f32".to_string(),
             normalization: "already_normalized".to_string(),
             query_prompt_hash: String::new(),
+            file_policy_hash: String::new(),
+            docs_chunker_version: 1,
         }
     }
 
