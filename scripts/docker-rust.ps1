@@ -29,7 +29,7 @@ Defaults to rust:1-bookworm.
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('fmt', 'check', 'clippy', 'test', 'validate', 'shell')]
+    [ValidateSet('fmt', 'autofmt', 'check', 'clippy', 'test', 'validate', 'shell')]
     [string]$Task = 'validate'
 )
 
@@ -79,13 +79,23 @@ foreach ($vol in 'aft-cargo-registry', 'aft-cargo-git', 'aft-target') {
 
 # --- Task dispatch ---
 switch ($Task) {
+    'autofmt' {
+        Write-Host "=== cargo fmt (auto-format) ===" -ForegroundColor Green
+        Invoke-DockerTask -DockerArgs @(
+            '--volume', "${RepoRoot}:/work",
+            $Image,
+            'sh', '-c',
+            'rustup component add rustfmt && cargo fmt'
+        )
+    }
+
     'fmt' {
         Write-Host "=== cargo fmt --check ===" -ForegroundColor Green
         Invoke-DockerTask -DockerArgs @(
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'rustup component add rustfmt && cargo fmt --check'
+            'rustup component add rustfmt && useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo fmt --check'''
         )
     }
 
@@ -95,7 +105,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'cargo check --workspace --all-targets'
+            'useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo check --workspace --all-targets'''
         )
     }
 
@@ -105,7 +115,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'rustup component add clippy && cargo clippy --workspace --all-targets --all-features -- -D warnings'
+            'rustup component add clippy && useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo clippy --workspace --all-targets --all-features -- -D warnings'''
         )
     }
 
@@ -115,7 +125,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'cargo test --workspace --all-targets'
+            'useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo test --workspace --all-targets'''
         )
     }
 
@@ -127,7 +137,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'rustup component add rustfmt && cargo fmt --check'
+            'rustup component add rustfmt && useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo fmt --check'''
         )
 
         Write-Host "`n--- Step 2/4: cargo check --workspace --all-targets ---" -ForegroundColor Cyan
@@ -135,7 +145,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'cargo check --workspace --all-targets'
+            'useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo check --workspace --all-targets'''
         )
 
         Write-Host "`n--- Step 3/4: cargo clippy --workspace --all-targets --all-features -- -D warnings ---" -ForegroundColor Cyan
@@ -143,7 +153,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'rustup component add clippy && cargo clippy --workspace --all-targets --all-features -- -D warnings'
+            'rustup component add clippy && useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo clippy --workspace --all-targets --all-features -- -D warnings'''
         )
 
         Write-Host "`n--- Step 4/4: cargo test --workspace --all-targets ---" -ForegroundColor Cyan
@@ -151,7 +161,7 @@ switch ($Task) {
             '--volume', "${RepoRoot}:/work",
             $Image,
             'sh', '-c',
-            'cargo test --workspace --all-targets'
+            'useradd -m testuser 2>/dev/null; chown -R testuser /usr/local/cargo /target 2>/dev/null; su testuser -c ''cargo test --workspace --all-targets'''
         )
 
         Write-Host "`n=== All validation steps passed ===" -ForegroundColor Green
