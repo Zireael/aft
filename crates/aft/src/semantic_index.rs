@@ -18,7 +18,7 @@ use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::SystemTime;
 use tree_sitter::Parser;
@@ -479,6 +479,7 @@ enum SemanticEmbeddingEngine {
     },
 }
 
+#[allow(dead_code)]
 pub struct SemanticEmbeddingModel {
     backend: SemanticBackend,
     model: String,
@@ -1393,25 +1394,178 @@ pub struct SemanticChunk {
 }
 
 /// A stored embedding entry — chunk metadata + vector
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EmbeddingEntry {
     chunk: SemanticChunk,
     vector: Vec<f32>,
 }
 
-/// The semantic index — stores embeddings for all symbols in a project
-#[derive(Debug)]
-pub struct SemanticIndex {
+/// Lifecycle state of a [`SemanticIndex`].
+///
+/// State machine transitions:
+///   Disabled → (no transitions)
+///   ColdStart → ScanningFiles → Chunking → Embedding → Ready
+///   Ready → Refreshing → Ready (or Degraded on partial failure)
+///   Ready → RebuildRequired → ColdStart → ... → Ready
+///   Ready → Failed → ColdStart → ... → Ready
+///   Degraded → Refreshing → Ready (or Failed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SemanticIndexLifecycle {
+    /// Semantic search is disabled by configuration.
+    Disabled,
+    /// Freshly constructed — no embedded data yet.
+    ColdStart,
+    /// Currently scanning the file system.
+    ScanningFiles,
+    /// Parsing and chunking files.
+    Chunking,
+    /// Sending chunks to the embedding backend.
+    Embedding,
+    /// Index is complete and ready for search.
+    Ready,
+    /// Incremental refresh in progress.
+    Refreshing,
+    /// Config or fingerprint changed; a full rebuild is required.
+    RebuildRequired,
+    /// Index is usable but some files failed to embed.
+    Degraded,
+    /// Build or refresh failed entirely.
+    Failed,
+}
+
+/// Immutable snapshot of the core semantic index data.
+///
+/// Held behind `Arc<SemanticIndexSnapshot>` inside [`SemanticIndex`].
+/// Clone + mutate + swap is the only mutation path, which keeps the
+/// snapshot structurally immutable once published.
+#[derive(Debug, Clone)]
+pub struct SemanticIndexSnapshot {
     entries: Vec<EmbeddingEntry>,
-    /// Track which files are indexed and their mtime for staleness detection
-    file_mtimes: HashMap<PathBuf, SystemTime>,
-    /// Track indexed file sizes alongside mtimes for staleness detection
-    file_sizes: HashMap<PathBuf, u64>,
-    file_hashes: HashMap<PathBuf, blake3::Hash>,
+    /// Track indexed files and their metadata for staleness detection
+    file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
-    fingerprint: Option<SemanticIndexFingerprint>,
     project_root: PathBuf,
+}
+
+impl SemanticIndexSnapshot {
+    /// Search the index with a query embedding, returning top-K results sorted by relevance
+    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {
+        if self.entries.is_empty() || query_vector.len() != self.dimension {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(f32, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let mut score = cosine_similarity(query_vector, &entry.vector);
+                if entry.chunk.exported {
+                    score *= 1.1;
+                }
+                (score, i)
+            })
+            .collect();
+
+        // Sort descending by score
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored
+            .into_iter()
+            .take(top_k)
+            .map(|(score, idx)| {
+                let entry = &self.entries[idx];
+                SemanticResult {
+                    file: entry.chunk.file.clone(),
+                    name: entry.chunk.name.clone(),
+                    kind: entry.chunk.kind.clone(),
+                    start_line: entry.chunk.start_line,
+                    end_line: entry.chunk.end_line,
+                    exported: entry.chunk.exported,
+                    snippet: entry.chunk.snippet.clone(),
+                    score,
+                    source: "semantic",
+                }
+            })
+            .collect()
+    }
+
+    /// Number of indexed entries
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Get the embedding dimension
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Check if a file needs re-indexing based on mtime/size/hash
+    pub fn is_file_stale(&self, file: &Path) -> bool {
+        let Some(metadata) = self.file_metadata.get(file) else {
+            return true;
+        };
+        let cached = FileFreshness {
+            mtime: metadata.mtime,
+            size: metadata.size,
+            content_hash: metadata.content_hash,
+        };
+        match cache_freshness::verify_file(file, &cached) {
+            FreshnessVerdict::HotFresh => false,
+            FreshnessVerdict::ContentFresh { .. } => false,
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
+        }
+    }
+
+    /// Remove stale/zero-norm vectors from the snapshot.
+    pub fn prune_stale_vectors(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            let norm = entry.vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+            norm > 0.0
+        });
+        before - self.entries.len()
+    }
+
+    /// Mutable entry access for the inner `entries` field (test-only).
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn entries_mut_inner(&mut self) -> &mut Vec<EmbeddingEntry> {
+        &mut self.entries
+    }
+
+    /// Mutable file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata_mut_inner(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
+        &mut self.file_metadata
+    }
+}
+
+/// The semantic index — stores embeddings for all symbols in a project.
+///
+/// Read-only data lives in [`SemanticIndexSnapshot`], accessible through
+/// [`Deref`]. Mutation follows a clone–swap pattern: clone the inner
+/// snapshot, apply changes, atomically swap.
+#[derive(Debug)]
+pub struct SemanticIndex {
+    snapshot: Arc<SemanticIndexSnapshot>,
+    lifecycle: SemanticIndexLifecycle,
+    last_error: Option<String>,
+    fingerprint: Option<SemanticIndexFingerprint>,
+}
+
+impl std::ops::Deref for SemanticIndex {
+    type Target = SemanticIndexSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1456,13 +1610,15 @@ impl SemanticIndex {
     pub fn new(project_root: PathBuf, dimension: usize) -> Self {
         debug_assert!(project_root.is_absolute());
         Self {
-            entries: Vec::new(),
-            file_mtimes: HashMap::new(),
-            file_sizes: HashMap::new(),
-            file_hashes: HashMap::new(),
-            dimension,
+            snapshot: Arc::new(SemanticIndexSnapshot {
+                entries: Vec::new(),
+                file_metadata: HashMap::new(),
+                dimension,
+                project_root,
+            }),
+            lifecycle: SemanticIndexLifecycle::ColdStart,
+            last_error: None,
             fingerprint: None,
-            project_root,
         }
     }
 
@@ -1478,6 +1634,80 @@ impl SemanticIndex {
         } else {
             "ready"
         }
+    }
+
+    /// Access the current lifecycle state.
+    #[allow(dead_code)]
+    pub(crate) fn lifecycle(&self) -> &SemanticIndexLifecycle {
+        &self.lifecycle
+    }
+
+    /// Mark the index with a new lifecycle state.
+    #[allow(dead_code)]
+    pub(crate) fn set_lifecycle(&mut self, lifecycle: SemanticIndexLifecycle) {
+        self.lifecycle = lifecycle;
+    }
+
+    /// Convenience: extract the error string when lifecycle is `Failed`.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Convenience: set lifecycle to `Failed` with a message.
+    pub fn set_last_error(&mut self, error: String) {
+        self.last_error = Some(error);
+        self.lifecycle = SemanticIndexLifecycle::Failed;
+    }
+
+    /// Access the inner snapshot.
+    pub fn snapshot(&self) -> &SemanticIndexSnapshot {
+        &self.snapshot
+    }
+
+    /// Atomically swap the inner snapshot. The only mutation path.
+    fn swap_snapshot(&mut self, new_snapshot: SemanticIndexSnapshot) {
+        self.snapshot = Arc::new(new_snapshot);
+    }
+
+    /// Remove stale/zero-norm vectors from the current snapshot.
+    pub fn prune_stale_vectors(&mut self) -> usize {
+        let mut new_snapshot = (*self.snapshot).clone();
+        let count = new_snapshot.prune_stale_vectors();
+        self.swap_snapshot(new_snapshot);
+        count
+    }
+
+    /// Mutable entry access (read-only via Deref) — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn entries_mut(&mut self) -> &mut Vec<EmbeddingEntry> {
+        Arc::make_mut(&mut self.snapshot).entries_mut_inner()
+    }
+
+    /// Replace the entire snapshot atomically — only available in tests.
+    #[cfg(test)]
+    pub fn set_snapshot(&mut self, snapshot: SemanticIndexSnapshot) {
+        self.snapshot = Arc::new(snapshot);
+    }
+
+    /// Mutable file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata_mut(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
+        Arc::make_mut(&mut self.snapshot).file_metadata_mut_inner()
+    }
+
+    /// Read-only file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata(&self) -> &HashMap<PathBuf, IndexedFileMetadata> {
+        &self.snapshot.file_metadata
+    }
+
+    /// Set dimension — only available in tests.
+    #[cfg(test)]
+    pub fn set_dimension(&mut self, dim: usize) {
+        Arc::make_mut(&mut self.snapshot).dimension = dim;
     }
 
     fn collect_chunks(
@@ -1535,7 +1765,7 @@ impl SemanticIndex {
         embed_fn: &mut F,
         max_batch_size: usize,
         mut progress: Option<&mut P>,
-    ) -> Result<Self, String>
+    ) -> Result<SemanticIndexSnapshot, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
@@ -1544,22 +1774,10 @@ impl SemanticIndex {
         let total_chunks = chunks.len();
 
         if chunks.is_empty() {
-            return Ok(Self {
+            return Ok(SemanticIndexSnapshot {
                 entries: Vec::new(),
-                file_mtimes: file_metadata
-                    .iter()
-                    .map(|(path, metadata)| (path.clone(), metadata.mtime))
-                    .collect(),
-                file_sizes: file_metadata
-                    .iter()
-                    .map(|(path, metadata)| (path.clone(), metadata.size))
-                    .collect(),
-                file_hashes: file_metadata
-                    .into_iter()
-                    .map(|(path, metadata)| (path, metadata.content_hash))
-                    .collect(),
+                file_metadata,
                 dimension: DEFAULT_DIMENSION,
-                fingerprint: None,
                 project_root: project_root.to_path_buf(),
             });
         }
@@ -1609,22 +1827,10 @@ impl SemanticIndex {
             .map(|e| e.vector.len())
             .unwrap_or(DEFAULT_DIMENSION);
 
-        Ok(Self {
+        Ok(SemanticIndexSnapshot {
             entries,
-            file_mtimes: file_metadata
-                .iter()
-                .map(|(path, metadata)| (path.clone(), metadata.mtime))
-                .collect(),
-            file_sizes: file_metadata
-                .iter()
-                .map(|(path, metadata)| (path.clone(), metadata.size))
-                .collect(),
-            file_hashes: file_metadata
-                .into_iter()
-                .map(|(path, metadata)| (path, metadata.content_hash))
-                .collect(),
+            file_metadata,
             dimension,
-            fingerprint: None,
             project_root: project_root.to_path_buf(),
         })
     }
@@ -1641,14 +1847,20 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
-        Self::build_from_chunks(
+        let snapshot = Self::build_from_chunks(
             project_root,
             chunks,
             file_mtimes,
             embed_fn,
             max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
-        )
+        )?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint: None,
+        })
     }
 
     /// Build the semantic index and report embedding progress using entry counts.
@@ -1666,14 +1878,20 @@ impl SemanticIndex {
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
-        Self::build_from_chunks(
+        let snapshot = Self::build_from_chunks(
             project_root,
             chunks,
             file_mtimes,
             embed_fn,
             max_batch_size,
             Some(progress),
-        )
+        )?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint: None,
+        })
     }
 
     /// Incrementally refresh entries for changed/new files only, preserving cached
@@ -1698,13 +1916,14 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
-        self.backfill_missing_file_sizes();
+        // Clone the current snapshot to mutate it (clone-swap pattern).
+        let mut snapshot = (*self.snapshot).clone();
 
         // 1. Bucket files into deleted / changed / added.
         let current_set: HashSet<&Path> = current_files.iter().map(PathBuf::as_path).collect();
-        let total_processed = current_set.len() + self.file_mtimes.len()
-            - self
-                .file_mtimes
+        let total_processed = current_set.len() + snapshot.file_metadata.len()
+            - snapshot
+                .file_metadata
                 .keys()
                 .filter(|path| current_set.contains(path.as_path()))
                 .count();
@@ -1713,32 +1932,31 @@ impl SemanticIndex {
         // walked set. Both cases need their entries dropped.
         let mut deleted: Vec<PathBuf> = Vec::new();
         let mut changed: Vec<PathBuf> = Vec::new();
-        let indexed_paths: Vec<PathBuf> = self.file_mtimes.keys().cloned().collect();
+        let indexed_paths: Vec<PathBuf> = snapshot.file_metadata.keys().cloned().collect();
         for indexed_path in &indexed_paths {
             if !current_set.contains(indexed_path.as_path()) {
                 deleted.push(indexed_path.clone());
                 continue;
             }
-            let cached = match (
-                self.file_mtimes.get(indexed_path),
-                self.file_sizes.get(indexed_path),
-                self.file_hashes.get(indexed_path),
-            ) {
-                (Some(mtime), Some(size), Some(hash)) => Some(FileFreshness {
-                    mtime: *mtime,
-                    size: *size,
-                    content_hash: *hash,
-                }),
-                _ => None,
-            };
+            let cached = snapshot
+                .file_metadata
+                .get(indexed_path)
+                .map(|meta| FileFreshness {
+                    mtime: meta.mtime,
+                    size: meta.size,
+                    content_hash: meta.content_hash,
+                });
             match cached.map(|freshness| cache_freshness::verify_file(indexed_path, &freshness)) {
                 Some(FreshnessVerdict::HotFresh) => {}
                 Some(FreshnessVerdict::ContentFresh {
                     new_mtime,
                     new_size,
                 }) => {
-                    self.file_mtimes.insert(indexed_path.clone(), new_mtime);
-                    self.file_sizes.insert(indexed_path.clone(), new_size);
+                    // Update mtime/size in metadata — content_hash unchanged.
+                    if let Some(meta) = snapshot.file_metadata.get_mut(indexed_path) {
+                        meta.mtime = new_mtime;
+                        meta.size = new_size;
+                    }
                 }
                 Some(FreshnessVerdict::Stale | FreshnessVerdict::Deleted) | None => {
                     changed.push(indexed_path.clone());
@@ -1749,7 +1967,7 @@ impl SemanticIndex {
         // Files in walk that were never indexed.
         let mut added: Vec<PathBuf> = Vec::new();
         for path in current_files {
-            if !self.file_mtimes.contains_key(path) {
+            if !snapshot.file_metadata.contains_key(path) {
                 added.push(path.clone());
             }
         }
@@ -1768,12 +1986,11 @@ impl SemanticIndex {
         //    read/parse errors keep the stale-but-valid cache entry.
         if !deleted.is_empty() {
             let deleted_set: HashSet<&Path> = deleted.iter().map(PathBuf::as_path).collect();
-            self.entries
+            snapshot
+                .entries
                 .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
             for path in &deleted {
-                self.file_mtimes.remove(path);
-                self.file_sizes.remove(path);
-                self.file_hashes.remove(path);
+                snapshot.file_metadata.remove(path);
             }
         }
 
@@ -1785,6 +2002,7 @@ impl SemanticIndex {
         if to_embed.is_empty() {
             // Only deletions happened.
             progress(0, 0);
+            self.swap_snapshot(snapshot);
             return Ok(RefreshSummary {
                 changed: 0,
                 added: 0,
@@ -1799,7 +2017,8 @@ impl SemanticIndex {
             progress(0, 0);
             let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
             if !successful_files.is_empty() {
-                self.entries
+                snapshot
+                    .entries
                     .retain(|entry| !successful_files.contains(&entry.chunk.file));
             }
             let changed_count = changed
@@ -1810,11 +2029,8 @@ impl SemanticIndex {
                 .iter()
                 .filter(|path| successful_files.contains(*path))
                 .count();
-            for (file, metadata) in fresh_metadata {
-                self.file_mtimes.insert(file.clone(), metadata.mtime);
-                self.file_sizes.insert(file.clone(), metadata.size);
-                self.file_hashes.insert(file.clone(), metadata.content_hash);
-            }
+            snapshot.file_metadata.extend(fresh_metadata);
+            self.swap_snapshot(snapshot);
             return Ok(RefreshSummary {
                 changed: changed_count,
                 added: added_count,
@@ -1827,10 +2043,10 @@ impl SemanticIndex {
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let batch_size = max_batch_size.max(1);
-        let existing_dimension = if self.entries.is_empty() {
+        let existing_dimension = if snapshot.entries.is_empty() {
             None
         } else {
-            Some(self.dimension)
+            Some(snapshot.dimension)
         };
         let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
         let mut observed_dimension: Option<usize> = existing_dimension;
@@ -1873,19 +2089,18 @@ impl SemanticIndex {
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         if !successful_files.is_empty() {
-            self.entries
+            snapshot
+                .entries
                 .retain(|entry| !successful_files.contains(&entry.chunk.file));
         }
 
-        self.entries.extend(new_entries);
-        for (file, metadata) in fresh_metadata {
-            self.file_mtimes.insert(file.clone(), metadata.mtime);
-            self.file_sizes.insert(file.clone(), metadata.size);
-            self.file_hashes.insert(file, metadata.content_hash);
-        }
+        snapshot.entries.extend(new_entries);
+        snapshot.file_metadata.extend(fresh_metadata);
         if let Some(dim) = observed_dimension {
-            self.dimension = dim;
+            snapshot.dimension = dim;
         }
+
+        self.swap_snapshot(snapshot);
 
         Ok(RefreshSummary {
             changed: changed
@@ -1901,108 +2116,16 @@ impl SemanticIndex {
         })
     }
 
-    /// Search the index with a query embedding, returning top-K results sorted by relevance
-    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {
-        if self.entries.is_empty() || query_vector.len() != self.dimension {
-            return Vec::new();
-        }
-
-        let mut scored: Vec<(f32, usize)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let mut score = cosine_similarity(query_vector, &entry.vector);
-                if entry.chunk.exported {
-                    score *= 1.1;
-                }
-                (score, i)
-            })
-            .collect();
-
-        // Sort descending by score
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        scored
-            .into_iter()
-            .take(top_k)
-            // Keep the sort → take → map ordering explicit: removing the old
-            // `> 0.0` floor cannot evict positive hits because top_k has already
-            // been selected, but it can surface zero-score noise in the tail.
-            .map(|(score, idx)| {
-                let entry = &self.entries[idx];
-                SemanticResult {
-                    file: entry.chunk.file.clone(),
-                    name: entry.chunk.name.clone(),
-                    kind: entry.chunk.kind.clone(),
-                    start_line: entry.chunk.start_line,
-                    end_line: entry.chunk.end_line,
-                    exported: entry.chunk.exported,
-                    snippet: entry.chunk.snippet.clone(),
-                    score,
-                    source: "semantic",
-                }
-            })
-            .collect()
-    }
-
-    /// Number of indexed entries
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if a file needs re-indexing based on mtime/size
-    pub fn is_file_stale(&self, file: &Path) -> bool {
-        let Some(stored_mtime) = self.file_mtimes.get(file) else {
-            return true;
-        };
-        let Some(stored_size) = self.file_sizes.get(file) else {
-            return true;
-        };
-        let Some(stored_hash) = self.file_hashes.get(file) else {
-            return true;
-        };
-        let cached = FileFreshness {
-            mtime: *stored_mtime,
-            size: *stored_size,
-            content_hash: *stored_hash,
-        };
-        match cache_freshness::verify_file(file, &cached) {
-            FreshnessVerdict::HotFresh => false,
-            FreshnessVerdict::ContentFresh { .. } => false,
-            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
-        }
-    }
-
-    fn backfill_missing_file_sizes(&mut self) {
-        for path in self.file_mtimes.keys() {
-            if self.file_sizes.contains_key(path) {
-                continue;
-            }
-            if let Ok(metadata) = fs::metadata(path) {
-                self.file_sizes.insert(path.clone(), metadata.len());
-                if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(path, metadata.len()) {
-                    self.file_hashes.insert(path.clone(), hash);
-                }
-            }
-        }
-    }
-
-    /// Remove entries for a specific file
+    /// Remove entries for a specific file (clone–swap pattern)
     pub fn remove_file(&mut self, file: &Path) {
         self.invalidate_file(file);
     }
 
     pub fn invalidate_file(&mut self, file: &Path) {
-        self.entries.retain(|e| e.chunk.file != file);
-        self.file_mtimes.remove(file);
-        self.file_sizes.remove(file);
-        self.file_hashes.remove(file);
-    }
-
-    /// Get the embedding dimension
-    pub fn dimension(&self) -> usize {
-        self.dimension
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.entries.retain(|e| e.chunk.file != file);
+        snapshot.file_metadata.remove(file);
+        self.snapshot = Arc::new(snapshot);
     }
 
     pub fn fingerprint(&self) -> Option<&SemanticIndexFingerprint> {
@@ -2155,14 +2278,6 @@ impl SemanticIndex {
                 Some(encoded.into_bytes())
             }
         });
-        let file_mtimes: Vec<_> = self
-            .file_mtimes
-            .iter()
-            .filter_map(|(path, mtime)| {
-                cache_relative_path(&self.project_root, path)
-                    .map(|relative| (relative, path, mtime))
-            })
-            .collect();
         let entries: Vec<_> = self
             .entries
             .iter()
@@ -2192,26 +2307,29 @@ impl SemanticIndex {
         buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
         buf.extend_from_slice(fp_bytes_ref);
 
-        // File mtime table: count(4) + entries
-        // V3 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4)
-        buf.extend_from_slice(&(file_mtimes.len() as u32).to_le_bytes());
-        for (relative, path, mtime) in &file_mtimes {
+        // File metadata table: count(4) + entries
+        // V6 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4) + size(u64) + blake3(32).
+        //     Preserves full APFS/ext4/NTFS precision and catches mtime ties.
+        let file_metadata_entries: Vec<_> = self
+            .file_metadata
+            .iter()
+            .filter_map(|(path, meta)| {
+                cache_relative_path(&self.project_root, path).map(|relative| (relative, meta))
+            })
+            .collect();
+        buf.extend_from_slice(&(file_metadata_entries.len() as u32).to_le_bytes());
+        for (relative, meta) in &file_metadata_entries {
             let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
             buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&path_bytes);
-            let duration = mtime
+            let duration = meta
+                .mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
             buf.extend_from_slice(&duration.as_secs().to_le_bytes());
             buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
-            let size = self.file_sizes.get(*path).copied().unwrap_or_default();
-            buf.extend_from_slice(&size.to_le_bytes());
-            let hash = self
-                .file_hashes
-                .get(*path)
-                .copied()
-                .unwrap_or_else(cache_freshness::zero_hash);
-            buf.extend_from_slice(hash.as_bytes());
+            buf.extend_from_slice(&meta.size.to_le_bytes());
+            buf.extend_from_slice(meta.content_hash.as_bytes());
         }
 
         // Entries: each is metadata + vector
@@ -2338,9 +2456,8 @@ impl SemanticIndex {
             return Err("semantic index vectors exceed available data".to_string());
         }
 
-        let mut file_mtimes = HashMap::with_capacity(mtime_count);
-        let mut file_sizes = HashMap::with_capacity(mtime_count);
-        let mut file_hashes = HashMap::with_capacity(mtime_count);
+        let mut file_metadata: HashMap<PathBuf, IndexedFileMetadata> =
+            HashMap::with_capacity(mtime_count);
         for _ in 0..mtime_count {
             let path = read_string(data, &mut pos)?;
             let secs = read_u64(data, &mut pos)?;
@@ -2402,9 +2519,14 @@ impl SemanticIndex {
             } else {
                 PathBuf::from(path)
             };
-            file_mtimes.insert(path.clone(), mtime);
-            file_sizes.insert(path.clone(), size);
-            file_hashes.insert(path, content_hash);
+            file_metadata.insert(
+                path,
+                IndexedFileMetadata {
+                    mtime,
+                    size,
+                    content_hash,
+                },
+            );
         }
 
         // Entries
@@ -2474,7 +2596,7 @@ impl SemanticIndex {
             ));
         }
         for entry in &entries {
-            if !file_mtimes.contains_key(&entry.chunk.file) {
+            if !file_metadata.contains_key(&entry.chunk.file) {
                 return Err(format!(
                     "semantic cache metadata missing for entry file {}",
                     entry.chunk.file.display()
@@ -2482,14 +2604,17 @@ impl SemanticIndex {
             }
         }
 
-        Ok(Self {
+        let snapshot = SemanticIndexSnapshot {
             entries,
-            file_mtimes,
-            file_sizes,
-            file_hashes,
+            file_metadata,
             dimension,
-            fingerprint,
             project_root: current_canonical_root.to_path_buf(),
+        };
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint,
         })
     }
 }
@@ -2997,11 +3122,15 @@ mod tests {
     }
 
     fn set_file_metadata(index: &mut SemanticIndex, file: &Path, mtime: SystemTime, size: u64) {
-        index.file_mtimes.insert(file.to_path_buf(), mtime);
-        index.file_sizes.insert(file.to_path_buf(), size);
-        index
-            .file_hashes
-            .insert(file.to_path_buf(), cache_freshness::zero_hash());
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            file.to_path_buf(),
+            IndexedFileMetadata {
+                mtime,
+                size,
+                content_hash: hash,
+            },
+        );
     }
 
     #[test]
@@ -3010,14 +3139,16 @@ mod tests {
         let project = fs::canonicalize(dir.path()).expect("canonical project");
         let outside = project.join("..").join("outside.rs");
         let mut index = SemanticIndex::new(project.clone(), 3);
-        index
-            .file_mtimes
-            .insert(outside.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(outside.clone(), 1);
-        index
-            .file_hashes
-            .insert(outside.clone(), cache_freshness::zero_hash());
-        index.entries.push(EmbeddingEntry {
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            outside.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: hash,
+            },
+        );
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: outside,
                 name: "outside".to_string(),
@@ -3034,7 +3165,7 @@ mod tests {
         let bytes = index.to_bytes();
         let loaded = SemanticIndex::from_bytes(&bytes, &project).expect("load serialized index");
         assert_eq!(loaded.entries.len(), 0);
-        assert!(loaded.file_mtimes.is_empty());
+        assert!(loaded.file_metadata().is_empty());
     }
 
     #[test]
@@ -3063,7 +3194,7 @@ mod tests {
         let project_root = test_project_root();
         let file = project_root.join("src/main.rs");
         let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
@@ -3076,11 +3207,16 @@ mod tests {
             },
             vector: vec![0.1, 0.2, 0.3, 0.4],
         });
-        index.dimension = 4;
-        index
-            .file_mtimes
-            .insert(file.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(file, 0);
+        index.set_dimension(4);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            file.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
             model: "all-MiniLM-L6-v2".to_string(),
@@ -3129,13 +3265,13 @@ mod tests {
     #[test]
     fn test_search_top_k() {
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.dimension = 3;
+        index.set_dimension(3);
 
         // Add entries with known vectors
         for (i, name) in ["auth", "database", "handler"].iter().enumerate() {
             let mut vec = vec![0.0f32; 3];
             vec[i] = 1.0; // orthogonal vectors
-            index.entries.push(EmbeddingEntry {
+            index.entries_mut().push(EmbeddingEntry {
                 chunk: SemanticChunk {
                     file: PathBuf::from("/src/lib.rs"),
                     name: name.to_string(),
@@ -3253,7 +3389,7 @@ mod tests {
     fn invalidate_file_removes_entries_and_mtime() {
         let target = PathBuf::from("/src/main.rs");
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: target.clone(),
                 name: "main".to_string(),
@@ -3266,16 +3402,20 @@ mod tests {
             },
             vector: vec![1.0; DEFAULT_DIMENSION],
         });
-        index
-            .file_mtimes
-            .insert(target.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(target.clone(), 0);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            target.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
 
         index.invalidate_file(&target);
 
         assert!(index.entries.is_empty());
-        assert!(!index.file_mtimes.contains_key(&target));
-        assert!(!index.file_sizes.contains_key(&target));
+        assert!(!index.file_metadata().contains_key(&target));
     }
 
     #[test]
@@ -3288,8 +3428,9 @@ mod tests {
 
         let mut index = build_test_index(project_root, std::slice::from_ref(&file));
         let original_entry_count = index.entries.len();
-        let original_mtime = *index.file_mtimes.get(&file).unwrap();
-        let original_size = *index.file_sizes.get(&file).unwrap();
+        let meta = index.file_metadata().get(&file).unwrap();
+        let original_mtime = meta.mtime;
+        let original_size = meta.size;
 
         let stale_mtime = SystemTime::UNIX_EPOCH;
         set_file_metadata(&mut index, &file, stale_mtime, original_size + 1);
@@ -3315,9 +3456,18 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.chunk.name == "kept_symbol"));
-        assert_eq!(index.file_mtimes.get(&file), Some(&stale_mtime));
-        assert_ne!(index.file_mtimes.get(&file), Some(&original_mtime));
-        assert_eq!(index.file_sizes.get(&file), Some(&(original_size + 1)));
+        assert_eq!(
+            index.file_metadata().get(&file).map(|m| m.mtime),
+            Some(stale_mtime)
+        );
+        assert_ne!(
+            index.file_metadata().get(&file).map(|m| m.mtime),
+            Some(original_mtime)
+        );
+        assert_eq!(
+            index.file_metadata().get(&file).map(|m| m.size),
+            Some(original_size + 1)
+        );
     }
 
     #[test]
@@ -3343,8 +3493,7 @@ mod tests {
         assert_eq!(summary.added, 0);
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.deleted, 0);
-        assert!(!index.file_mtimes.contains_key(&missing));
-        assert!(!index.file_sizes.contains_key(&missing));
+        assert!(!index.file_metadata().contains_key(&missing));
         assert!(index.entries.is_empty());
     }
 
@@ -3375,7 +3524,7 @@ mod tests {
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.total_processed, 2);
-        assert!(index.file_mtimes.contains_key(&added));
+        assert!(index.file_metadata().contains_key(&added));
         assert!(index.entries.iter().any(|entry| entry.chunk.file == added));
     }
 
@@ -3400,7 +3549,7 @@ mod tests {
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.added, 0);
         assert_eq!(summary.total_processed, 1);
-        assert!(!index.file_mtimes.contains_key(&deleted));
+        assert!(!index.file_metadata().contains_key(&deleted));
         assert!(index.entries.is_empty());
     }
 
@@ -3506,6 +3655,13 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -3579,6 +3735,13 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -3624,6 +3787,13 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -3643,7 +3813,7 @@ mod tests {
         let project_root = test_project_root();
         let file = project_root.join("src/main.rs");
         let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
@@ -3656,11 +3826,16 @@ mod tests {
             },
             vector: vec![0.1, 0.2, 0.3],
         });
-        index.dimension = 3;
-        index
-            .file_mtimes
-            .insert(file.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(file, 0);
+        index.set_dimension(3);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            file.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "openai_compatible".to_string(),
             model: "test-embedding".to_string(),
@@ -3716,7 +3891,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: PathBuf::from("/src/main.rs"),
                 name: "handle_request".to_string(),
@@ -3729,11 +3904,16 @@ mod tests {
             },
             vector: vec![0.1, 0.2, 0.3],
         });
-        index.dimension = 3;
-        index
-            .file_mtimes
-            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(PathBuf::from("/src/main.rs"), 0);
+        index.set_dimension(3);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_mut().insert(
+            PathBuf::from("/src/main.rs"),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         let fingerprint = SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
             model: "test".to_string(),

@@ -1653,6 +1653,24 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         let profile = EmbeddingModelProfile::from_config(&semantic_config);
                         let fingerprint = model.fingerprint(&semantic_config, profile.as_ref())?;
                         let fingerprint_key = fingerprint.as_string();
+
+                        // Create embed closure once and reuse for both incremental refresh
+                        // and full rebuild. Must be created before model is moved.
+                        let doc_template = semantic_config.document_prompt_template.clone();
+                        let mut embed = move |texts: Vec<String>| {
+                            let texts = if let Some(ref tpl) = doc_template {
+                                texts
+                                    .iter()
+                                    .map(|t| {
+                                        crate::semantic_index::apply_document_template(t, Some(tpl))
+                                    })
+                                    .collect()
+                            } else {
+                                texts
+                            };
+                            model.embed(texts)
+                        };
+
                         let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                             .then(|| ())
                             .and_then(|_| semantic_storage.as_ref())
@@ -1701,23 +1719,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 }
 
                                 let mut cached = cached;
-                                let doc_template = semantic_config.document_prompt_template.clone();
-                                let mut embed = move |texts: Vec<String>| {
-                                    let texts = if let Some(ref tpl) = doc_template {
-                                        texts
-                                            .iter()
-                                            .map(|t| {
-                                                crate::semantic_index::apply_document_template(
-                                                    t,
-                                                    Some(tpl),
-                                                )
-                                            })
-                                            .collect()
-                                    } else {
-                                        texts
-                                    };
-                                    model.embed(texts)
-                                };
                                 let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                     stage: "refreshing_stale_files".to_string(),
                                     files: None,
@@ -1805,21 +1806,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 MAX_SEMANTIC_FILES
                             ));
                         }
-
-                        let doc_template = semantic_config.document_prompt_template.clone();
-                        let mut embed = move |texts: Vec<String>| {
-                            let texts = if let Some(ref tpl) = doc_template {
-                                texts
-                                    .iter()
-                                    .map(|t| {
-                                        crate::semantic_index::apply_document_template(t, Some(tpl))
-                                    })
-                                    .collect()
-                            } else {
-                                texts
-                            };
-                            model.embed(texts)
-                        };
 
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "extracting_symbols".to_string(),
