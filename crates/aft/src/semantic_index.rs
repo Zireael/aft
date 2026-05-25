@@ -50,6 +50,9 @@ const SEMANTIC_INDEX_VERSION_V4: u8 = 4;
 const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 /// V6 stores paths relative to project_root and adds content hashes.
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
+/// V7 adds invalidation fields (source_vector_kind, stored_vector_kind,
+/// normalization, query_prompt_hash) to SemanticIndexFingerprint.
+const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 
@@ -77,6 +80,26 @@ pub enum NormalizationPolicy {
     NormalizeOnInsertQuery,
     /// Normalization is not applicable (e.g. binary vectors).
     NotApplicable,
+}
+
+impl std::fmt::Display for VectorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DenseF32 => write!(f, "dense_f32"),
+            Self::DenseInt8 => write!(f, "dense_int8"),
+            Self::BinaryPacked => write!(f, "binary_packed"),
+        }
+    }
+}
+
+impl std::fmt::Display for NormalizationPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyNormalized => write!(f, "already_normalized"),
+            Self::NormalizeOnInsertQuery => write!(f, "normalize_on_insert_query"),
+            Self::NotApplicable => write!(f, "not_applicable"),
+        }
+    }
 }
 
 /// A profile describing the capabilities and expected output of an embedding model.
@@ -417,6 +440,39 @@ pub struct SemanticIndexFingerprint {
     /// Hash of the document prompt template (empty string when no document prompt is configured).
     #[serde(default)]
     pub document_prompt_hash: String,
+    /// Source vector kind from the embedding model profile (e.g. "dense_f32").
+    #[serde(default)]
+    pub source_vector_kind: String,
+    /// Stored vector kind after AFT conversion (e.g. "dense_f32").
+    #[serde(default)]
+    pub stored_vector_kind: String,
+    /// Normalization policy (e.g. "already_normalized").
+    #[serde(default)]
+    pub normalization: String,
+    /// Hash of the query prompt template (empty string when no query prompt is configured).
+    #[serde(default)]
+    pub query_prompt_hash: String,
+}
+
+impl Default for SemanticIndexFingerprint {
+    fn default() -> Self {
+        Self {
+            backend: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            dimension: 0,
+            chunking_version: default_chunking_version(),
+            output_encoding: String::new(),
+            storage_strategy: String::new(),
+            distance_metric: default_dot_auto(),
+            input_mode: String::new(),
+            document_prompt_hash: String::new(),
+            source_vector_kind: String::new(),
+            stored_vector_kind: String::new(),
+            normalization: String::new(),
+            query_prompt_hash: String::new(),
+        }
+    }
 }
 
 fn default_chunking_version() -> u32 {
@@ -451,6 +507,10 @@ impl SemanticIndexFingerprint {
             distance_metric: resolve_distance_metric(config, profile).to_string(),
             input_mode: resolve_input_mode(config).to_string(),
             document_prompt_hash: prompt_template_hash(config.document_prompt_template.as_deref()),
+            source_vector_kind: profile.map_or(String::new(), |p| p.source_vector_kind.to_string()),
+            stored_vector_kind: profile.map_or(String::new(), |p| p.stored_vector_kind.to_string()),
+            normalization: profile.map_or(String::new(), |p| p.normalization.to_string()),
+            query_prompt_hash: prompt_template_hash(config.query_prompt_template.as_deref()),
         }
     }
 
@@ -461,6 +521,83 @@ impl SemanticIndexFingerprint {
     fn matches_expected(&self, expected: &str) -> bool {
         let encoded = self.as_string();
         !encoded.is_empty() && encoded == expected
+    }
+
+    /// Compute the semantic diff between this fingerprint and another.
+    ///
+    /// Returns [`FingerprintChange::Rebuild`] if any rebuild-triggering field
+    /// differs (backend, model, base_url, dimension, chunking_version,
+    /// output_encoding, storage_strategy, source_vector_kind, stored_vector_kind,
+    /// normalization, input_mode, document_prompt_hash).
+    ///
+    /// Returns [`FingerprintChange::ClearQueryCache`] if *only* the
+    /// `query_prompt_hash` differs (and no rebuild-triggering fields changed).
+    ///
+    /// Returns [`FingerprintChange::None`] if the fingerprints are identical
+    /// (differences in `distance_metric` are intentionally ignored — see matrix).
+    pub fn diff(&self, other: &Self) -> FingerprintChange {
+        /// Fields that trigger a full rebuild when they differ.
+        fn rebuild_fields_match(
+            a: &SemanticIndexFingerprint,
+            b: &SemanticIndexFingerprint,
+        ) -> bool {
+            a.backend == b.backend
+                && a.model == b.model
+                && a.base_url == b.base_url
+                && a.dimension == b.dimension
+                && a.chunking_version == b.chunking_version
+                && a.output_encoding == b.output_encoding
+                && a.storage_strategy == b.storage_strategy
+                && a.source_vector_kind == b.source_vector_kind
+                && a.stored_vector_kind == b.stored_vector_kind
+                && a.normalization == b.normalization
+                && a.input_mode == b.input_mode
+                && a.document_prompt_hash == b.document_prompt_hash
+        }
+
+        if !rebuild_fields_match(self, other) {
+            return FingerprintChange::Rebuild;
+        }
+
+        if self.query_prompt_hash != other.query_prompt_hash {
+            return FingerprintChange::ClearQueryCache;
+        }
+
+        // All other field differences (e.g. distance_metric) are intentionally
+        // ignored — they may require rescoring but not re-embedding.
+        FingerprintChange::None
+    }
+}
+
+/// The result of comparing two [`SemanticIndexFingerprint`] values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintChange {
+    /// Full index rebuild required — embeddings are invalidated.
+    Rebuild,
+    /// Only the query prompt changed; clear the query embedding cache.
+    ClearQueryCache,
+    /// No action needed.
+    None,
+}
+
+impl std::fmt::Display for FingerprintChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rebuild => write!(f, "rebuild"),
+            Self::ClearQueryCache => write!(f, "clear_query_cache"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FingerprintChange {
+    /// Returns a human-readable description of the change.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Rebuild => "full rebuild required (embedding parameters changed)",
+            Self::ClearQueryCache => "clear query embedding cache (query prompt changed)",
+            Self::None => "no action needed (fingerprint unchanged)",
+        }
     }
 }
 
@@ -755,28 +892,6 @@ where
     }
 
     unreachable!("embedding request retries exhausted without returning")
-}
-
-// ---- Display impls for capability types ----
-
-impl std::fmt::Display for VectorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DenseF32 => write!(f, "dense_f32"),
-            Self::DenseInt8 => write!(f, "dense_int8"),
-            Self::BinaryPacked => write!(f, "binary_packed"),
-        }
-    }
-}
-
-impl std::fmt::Display for NormalizationPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyNormalized => write!(f, "already_normalized"),
-            Self::NormalizeOnInsertQuery => write!(f, "normalize_on_insert_query"),
-            Self::NotApplicable => write!(f, "not_applicable"),
-        }
-    }
 }
 
 impl std::fmt::Display for OutputEncoding {
@@ -2144,6 +2259,17 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
+    /// Compare the current fingerprint with an old one and return the change.
+    pub fn fingerprint_change(
+        &self,
+        old_fingerprint: &SemanticIndexFingerprint,
+    ) -> FingerprintChange {
+        self.fingerprint
+            .as_ref()
+            .map(|current| current.diff(old_fingerprint))
+            .unwrap_or(FingerprintChange::Rebuild)
+    }
+
     /// Write the semantic index to disk using atomic temp+rename pattern
     pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) {
         // Don't persist empty indexes — they would be loaded on next startup
@@ -2218,11 +2344,11 @@ impl SemanticIndex {
 
         let bytes = fs::read(&data_path).ok()?;
         let version = bytes[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 {
+        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
             slog_info!(
                 "cached semantic index version {} is older than {}, rebuilding",
                 version,
-                SEMANTIC_INDEX_VERSION_V6
+                SEMANTIC_INDEX_VERSION_V7
             );
             if !is_worktree_bridge {
                 let _ = fs::remove_file(&data_path);
@@ -2289,7 +2415,8 @@ impl SemanticIndex {
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V6 is the single write format. Layout extends V5:
+        // V7 is the single write format (same binary layout as V6, just bumped
+        // version byte for fingerprint invalidation fields). Layout extends V5:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - paths are relative to project_root.
@@ -2299,7 +2426,7 @@ impl SemanticIndex {
         // V1/V2 remain readable for backward compatibility (see from_bytes).
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once.
-        let version = SEMANTIC_INDEX_VERSION_V6;
+        let version = SEMANTIC_INDEX_VERSION_V7;
         buf.push(version);
         buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -2390,20 +2517,22 @@ impl SemanticIndex {
             && version != SEMANTIC_INDEX_VERSION_V4
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
+            && version != SEMANTIC_INDEX_VERSION_V7
         {
             return Err(format!("unsupported version: {}", version));
         }
-        // V2 and newer share the same header layout (V3/V4/V5 only differ from
+        // V2 and newer share the same header layout (V3/V4/V5/V6/V7 only differ from
         // V2 in the per-mtime entry layout): version(1) + dimension(4) +
         // entry_count(4) + fingerprint_len(4) + fingerprint bytes.
         if (version == SEMANTIC_INDEX_VERSION_V2
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6)
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7)
             && data.len() < HEADER_BYTES_V2
         {
-            return Err("data too short for semantic index v2/v3/v4/v5/v6 header".to_string());
+            return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
         }
 
         let dimension = read_u32(data, &mut pos)? as usize;
@@ -2422,7 +2551,8 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6;
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7;
         let fingerprint = if has_fingerprint_field {
             let fingerprint_len = read_u32(data, &mut pos)? as usize;
             if pos + fingerprint_len > data.len() {
@@ -2470,28 +2600,32 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V4
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
             {
                 read_u32(data, &mut pos)?
             } else {
                 0
             };
-            let size =
-                if version == SEMANTIC_INDEX_VERSION_V5 || version == SEMANTIC_INDEX_VERSION_V6 {
-                    read_u64(data, &mut pos)?
-                } else {
-                    0
-                };
-            let content_hash = if version == SEMANTIC_INDEX_VERSION_V6 {
-                if pos + 32 > data.len() {
-                    return Err("unexpected end of data reading content hash".to_string());
-                }
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
-                pos += 32;
-                blake3::Hash::from_bytes(hash_bytes)
+            let size = if version == SEMANTIC_INDEX_VERSION_V5
+                || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
+                read_u64(data, &mut pos)?
             } else {
-                cache_freshness::zero_hash()
+                0
             };
+            let content_hash =
+                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
+                    if pos + 32 > data.len() {
+                        return Err("unexpected end of data reading content hash".to_string());
+                    }
+                    let mut hash_bytes = [0u8; 32];
+                    hash_bytes.copy_from_slice(&data[pos..pos + 32]);
+                    pos += 32;
+                    blake3::Hash::from_bytes(hash_bytes)
+                } else {
+                    cache_freshness::zero_hash()
+                };
             // Hardening against corrupt / maliciously crafted cache files
             // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
             // nanosecond carry overflows the second counter, and
@@ -2513,7 +2647,9 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let path = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
                 cached_path_under_root(current_canonical_root, &PathBuf::from(path))
                     .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
             } else {
@@ -2533,7 +2669,9 @@ impl SemanticIndex {
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string(data, &mut pos)?);
-            let file = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let file = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
                 cached_path_under_root(current_canonical_root, &raw_file)
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
             } else {
@@ -3228,6 +3366,7 @@ mod tests {
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
             document_prompt_hash: String::new(),
+            ..Default::default()
         });
 
         let bytes = index.to_bytes();
@@ -3847,6 +3986,7 @@ mod tests {
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
             document_prompt_hash: String::new(),
+            ..Default::default()
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -3871,6 +4011,7 @@ mod tests {
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
             document_prompt_hash: String::new(),
+            ..Default::default()
         }
         .as_string();
         assert!(SemanticIndex::read_from_disk(
@@ -3925,6 +4066,7 @@ mod tests {
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
             document_prompt_hash: String::new(),
+            ..Default::default()
         };
         index.set_fingerprint(fingerprint.clone());
 
@@ -4160,5 +4302,169 @@ mod tests {
             msg.contains("'/opt/homebrew/lib/libonnxruntime.dylib'"),
             "system path should be quoted in the auto-fix sentence: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_invalidation_tests {
+    use super::*;
+
+    /// Build a fingerprint with all fields set to predictable defaults.
+    fn fp() -> SemanticIndexFingerprint {
+        SemanticIndexFingerprint {
+            backend: "fastembed".to_string(),
+            model: "all-MiniLM-L6-v2".to_string(),
+            base_url: FALLBACK_BACKEND.to_string(),
+            dimension: 384,
+            chunking_version: 2,
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            source_vector_kind: "dense_f32".to_string(),
+            stored_vector_kind: "dense_f32".to_string(),
+            normalization: "already_normalized".to_string(),
+            query_prompt_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn backend_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.backend = "ollama".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn model_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn base_url_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.base_url = "http://other-host:11434".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn dimension_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.dimension = 768;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn chunking_version_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.chunking_version = 3;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn output_encoding_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.output_encoding = "base64_int8".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn storage_strategy_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.storage_strategy = "decode_normalize_f32".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn distance_metric_mismatch_does_not_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "cosine".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn input_mode_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.input_mode = "document_chunks".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn document_prompt_hash_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.document_prompt_hash = "abc123".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn source_vector_kind_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.source_vector_kind = "binary_packed".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn stored_vector_kind_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.stored_vector_kind = "dense_int8".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn normalization_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.normalization = "normalize_on_insert_query".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn query_prompt_hash_only_triggers_clear_cache() {
+        let a = fp();
+        let mut b = fp();
+        b.query_prompt_hash = "xyz789".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::ClearQueryCache);
+    }
+
+    #[test]
+    fn identical_fingerprint_is_noop() {
+        let a = fp();
+        let b = fp();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn reranker_fields_not_in_fingerprint_produces_no_diff() {
+        // distance_metric is in the fingerprint but explicitly excluded from
+        // rebuild triggers. Verify it produces None.
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "dot_product".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn display_implementation() {
+        assert_eq!(FingerprintChange::Rebuild.to_string(), "rebuild");
+        assert_eq!(
+            FingerprintChange::ClearQueryCache.to_string(),
+            "clear_query_cache"
+        );
+        assert_eq!(FingerprintChange::None.to_string(), "none");
     }
 }

@@ -291,6 +291,7 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
         distance_metric: "auto".to_string(),
         input_mode: "flat_texts".to_string(),
         document_prompt_hash: String::new(),
+        ..Default::default()
     }
     .as_string();
     assert!(SemanticIndex::read_from_disk(
@@ -389,6 +390,7 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
         distance_metric: "auto".to_string(),
         input_mode: "flat_texts".to_string(),
         document_prompt_hash: String::new(),
+        ..Default::default()
     };
     let fp_str = fingerprint.as_string();
     let fp_bytes = fp_str.as_bytes();
@@ -471,6 +473,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
             distance_metric: "auto".to_string(),
             input_mode: "flat_texts".to_string(),
             document_prompt_hash: String::new(),
+            ..Default::default()
         };
         let fp_bytes = fingerprint.as_string().into_bytes();
         let mut bytes = Vec::new();

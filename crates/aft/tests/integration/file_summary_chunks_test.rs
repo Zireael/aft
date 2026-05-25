@@ -134,6 +134,7 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
         distance_metric: "auto".to_string(),
         input_mode: "flat_texts".to_string(),
         document_prompt_hash: String::new(),
+        ..Default::default()
     };
     index.set_fingerprint(fingerprint.clone());
     index.write_to_disk(storage.path(), "file-summary-roundtrip");
