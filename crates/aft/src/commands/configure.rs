@@ -1,3 +1,4 @@
+use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -1356,6 +1357,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &canonical_cache_root,
         ));
     if let Some(storage_dir) = next_config.storage_dir.clone() {
+        // Ensure the storage root directory exists so subsystems (trust,
+        // backups, checkpoints, DB, persistence) can create their sub-trees
+        // without a separate create_dir_all per subsystem. On fresh installs
+        // this directory hasn't been created yet, and every subsystem
+        // currently creates its own subdirectory lazily — but the root must
+        // exist for status/diagnostics to report a valid path.
+        if let Err(err) = fs::create_dir_all(&storage_dir) {
+            slog_warn!(
+                "failed to create storage directory {}: {}",
+                storage_dir.display(),
+                err
+            );
+        }
         ctx.backup().borrow_mut().set_storage_dir_for_harness(
             storage_dir,
             harness,

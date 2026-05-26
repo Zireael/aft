@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, win32 } from "node:path";
+import { isAbsolute, join, resolve, win32 } from "node:path";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -59,22 +59,50 @@ function directoryContainsLibrary(dir: string, libName: string): boolean {
 
 export function findSystemOnnxRuntime(): string | null {
   const libName = getOnnxLibraryName();
-  const searchPaths =
-    process.platform === "darwin"
-      ? ["/opt/homebrew/lib", "/usr/local/lib"]
-      : process.platform === "linux"
-        ? ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/local/lib"]
-        : process.platform === "win32"
-          ? pathEntriesForPlatform()
-          : [];
+  const searchPaths: string[] = [];
 
+  if (process.platform === "darwin") {
+    searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");
+  } else if (process.platform === "linux") {
+    searchPaths.push(
+      "/usr/lib",
+      "/usr/lib/x86_64-linux-gnu",
+      "/usr/lib/aarch64-linux-gnu",
+      "/usr/local/lib",
+    );
+  } else if (process.platform === "win32") {
+    // Start with absolute PATH entries (via pathEntriesForPlatform) to
+    // discover Scoop/manual-zip installs, then add common install paths.
+    searchPaths.push(...pathEntriesForPlatform());
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    searchPaths.push(
+      join(programFiles, "onnxruntime", "lib"),
+      join(programFiles, "Microsoft ONNX Runtime", "lib"),
+      join(programFiles, "Microsoft Machine Learning", "lib"),
+      join(programFilesX86, "onnxruntime", "lib"),
+    );
+    // Also search PATH for onnxruntime.dll via raw string split
+    const pathEnv = process.env.PATH ?? "";
+    for (const dir of pathEnv.split(";")) {
+      const trimmed = dir.trim();
+      if (trimmed) searchPaths.push(trimmed);
+    }
+  }
+
+  // Deduplicate paths.
+  // On case-insensitive filesystems (Windows, macOS) normalize casing for
+  // comparison; on Linux the raw path casing is the authority.
+  const normalizeCase = process.platform === "win32" || process.platform === "darwin";
   const seen = new Set<string>();
-  for (const path of searchPaths) {
-    if (seen.has(path)) continue;
-    seen.add(path);
+  for (const dir of searchPaths) {
+    let key = resolve(dir).replace(/[/\\]+$/, "");
+    if (normalizeCase) key = key.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
     // Doctor only probes for presence here; the plugin's actual load path uses
     // the hardened bridge resolver in packages/aft-bridge/src/onnx-runtime.ts.
-    if (directoryContainsLibrary(path, libName)) return path;
+    if (directoryContainsLibrary(dir, libName)) return dir;
   }
   return null;
 }

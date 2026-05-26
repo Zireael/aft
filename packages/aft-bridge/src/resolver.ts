@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +54,14 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     copyFileSync(npmBinaryPath, tmpPath);
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
+    }
+    // Atomic rename — unlink first on Windows where renameSync fails if target exists
+    if (process.platform === "win32" && existsSync(cachedPath)) {
+      try {
+        unlinkSync(cachedPath);
+      } catch {
+        // best-effort; renameSync will surface the error if unlink fails
+      }
     }
     renameSync(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
