@@ -16,6 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -264,22 +265,18 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
     log(`Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
 
-    // Make executable
-    if (process.platform !== "win32") {
+    // Replace binary on Windows. Node's renameSync fails with EEXIST when the
+    // target exists, so use copyFileSync (which overwrites) + unlink the temp.
+    // This avoids a window where neither old nor new binary exists — if the
+    // copy fails the original binary at binaryPath is preserved. On POSIX
+    // renameSync atomically replaces the target, so use the direct path there.
+    if (process.platform === "win32") {
+      copyFileSync(tmpPath, binaryPath);
+      unlinkSync(tmpPath);
+    } else {
       chmodSync(tmpPath, 0o755);
+      renameSync(tmpPath, binaryPath);
     }
-
-    // Replace binary — on Windows renameSync fails (EEXIST) when the target
-    // exists, so unlink first. This creates a brief window where no binary
-    // exists at binaryPath — callers should handle a missing binary gracefully.
-    if (process.platform === "win32" && existsSync(binaryPath)) {
-      try {
-        unlinkSync(binaryPath);
-      } catch {
-        // best-effort; renameSync will surface the error if unlink fails
-      }
-    }
-    renameSync(tmpPath, binaryPath);
 
     log(`AFT binary ready at ${binaryPath}`);
     return binaryPath;
