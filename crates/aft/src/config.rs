@@ -16,6 +16,10 @@ pub enum SemanticBackend {
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     Ollama,
+    /// Perplexity contextualized embeddings — sends nested document/chunk
+    /// arrays and returns one embedding per chunk using surrounding context.
+    #[serde(rename = "perplexity")]
+    Perplexity,
 }
 
 impl SemanticBackend {
@@ -24,6 +28,7 @@ impl SemanticBackend {
             Self::Fastembed => "fastembed",
             Self::OpenAiCompatible => "openai_compatible",
             Self::Ollama => "ollama",
+            Self::Perplexity => "perplexity",
         }
     }
 
@@ -32,6 +37,7 @@ impl SemanticBackend {
             "fastembed" => Some(Self::Fastembed),
             "openai_compatible" => Some(Self::OpenAiCompatible),
             "ollama" => Some(Self::Ollama),
+            "perplexity" => Some(Self::Perplexity),
             _ => None,
         }
     }
@@ -58,6 +64,7 @@ impl OutputEncoding {
             SemanticBackend::Fastembed => Self::Float,
             SemanticBackend::OpenAiCompatible => Self::Float,
             SemanticBackend::Ollama => Self::Float,
+            SemanticBackend::Perplexity => Self::Float,
         }
     }
 }
@@ -80,6 +87,7 @@ impl InputMode {
             SemanticBackend::Fastembed => Self::FlatTexts,
             SemanticBackend::OpenAiCompatible => Self::FlatTexts,
             SemanticBackend::Ollama => Self::FlatTexts,
+            SemanticBackend::Perplexity => Self::DocumentChunks,
         }
     }
 }
@@ -102,6 +110,7 @@ impl StorageStrategy {
             SemanticBackend::Fastembed => Self::NativeF32,
             SemanticBackend::OpenAiCompatible => Self::NativeF32,
             SemanticBackend::Ollama => Self::NativeF32,
+            SemanticBackend::Perplexity => Self::NativeF32,
         }
     }
 }
@@ -130,6 +139,7 @@ impl DistanceMetric {
             SemanticBackend::Fastembed => Self::Auto,
             SemanticBackend::OpenAiCompatible => Self::Auto,
             SemanticBackend::Ollama => Self::Auto,
+            SemanticBackend::Perplexity => Self::Cosine,
         }
     }
 }

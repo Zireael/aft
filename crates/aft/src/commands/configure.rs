@@ -1764,22 +1764,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             return Err("semantic build cancelled (reconfigured)".to_string());
                         }
 
-                        // Create embed closure once and reuse for both incremental refresh
-                        // and full rebuild. Must be created before model is moved.
+                        // Keep doc_template for inline closures at each call site;
+                        // model stays borrowable for contextualized branching at full-build time.
                         let doc_template = semantic_config.document_prompt_template.clone();
-                        let mut embed = move |texts: Vec<String>| {
-                            let texts = if let Some(ref tpl) = doc_template {
-                                texts
-                                    .iter()
-                                    .map(|t| {
-                                        crate::semantic_index::apply_document_template(t, Some(tpl))
-                                    })
-                                    .collect()
-                            } else {
-                                texts
-                            };
-                            model.embed(texts)
-                        };
+                        let use_contextualized = semantic_config.input_mode
+                            == Some(crate::config::InputMode::DocumentChunks)
+                            && model.input_mode() == crate::config::InputMode::DocumentChunks;
 
                         let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                             .then(|| ())
@@ -1842,6 +1832,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                         entries_done: Some(done),
                                         entries_total: Some(total),
                                     });
+                                };
+
+                                let mut embed = |texts: Vec<String>| {
+                                    let texts = if let Some(ref tpl) = doc_template {
+                                        texts
+                                            .iter()
+                                            .map(|t| {
+                                                crate::semantic_index::apply_document_template(
+                                                    t,
+                                                    Some(tpl),
+                                                )
+                                            })
+                                            .collect()
+                                    } else {
+                                        texts
+                                    };
+                                    model.embed(texts)
                                 };
 
                                 match cached.refresh_stale_files(
@@ -1941,14 +1948,43 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 entries_total: Some(total),
                             });
                         };
-                        let index = SemanticIndex::build_with_progress(
-                            &root_clone,
-                            &files,
-                            &mut embed,
-                            semantic_config.max_batch_size.max(1),
-                            &mut progress,
-                            &semantic_files_config,
-                        )?;
+                        let index = if use_contextualized {
+                            let mut ctx_embed = |docs: crate::semantic_index::DocumentChunks| {
+                                model.embed_document_chunks(docs)
+                            };
+                            SemanticIndex::build_with_progress_contextualized(
+                                &root_clone,
+                                &files,
+                                &mut ctx_embed,
+                                &mut progress,
+                                &semantic_files_config,
+                            )?
+                        } else {
+                            let mut embed = |texts: Vec<String>| {
+                                let texts = if let Some(ref tpl) = doc_template {
+                                    texts
+                                        .iter()
+                                        .map(|t| {
+                                            crate::semantic_index::apply_document_template(
+                                                t,
+                                                Some(tpl),
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    texts
+                                };
+                                model.embed(texts)
+                            };
+                            SemanticIndex::build_with_progress(
+                                &root_clone,
+                                &files,
+                                &mut embed,
+                                semantic_config.max_batch_size.max(1),
+                                &mut progress,
+                                &semantic_files_config,
+                            )?
+                        };
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
                         slog_info!(

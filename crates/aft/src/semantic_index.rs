@@ -191,6 +191,26 @@ impl EmbeddingModelProfile {
         }
     }
 
+    /// Returns a profile for Perplexity contextualized embedding providers.
+    /// Perplexity uses the OpenAI-compatible API format but sends nested
+    /// document/chunk arrays instead of flat text arrays.
+    pub fn perplexity_generic() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
     /// Look up a profile for the given config.
     /// Returns `None` if no specific profile is known (caller should use defaults).
     pub fn from_config(config: &SemanticBackendConfig) -> Option<Self> {
@@ -204,6 +224,7 @@ impl EmbeddingModelProfile {
             }
             SemanticBackend::OpenAiCompatible => Some(Self::openai_compatible_generic()),
             SemanticBackend::Ollama => Some(Self::ollama_generic()),
+            SemanticBackend::Perplexity => Some(Self::perplexity_generic()),
         }
     }
 
@@ -659,6 +680,14 @@ enum SemanticEmbeddingEngine {
         model: String,
         base_url: String,
     },
+    /// Perplexity uses the same HTTP transport as OpenAI-compatible but
+    /// sends nested document/chunk arrays for contextualized embeddings.
+    Perplexity {
+        client: Client,
+        model: String,
+        base_url: String,
+        api_key: Option<String>,
+    },
 }
 
 #[allow(dead_code)]
@@ -1039,6 +1068,27 @@ impl SemanticEmbeddingModel {
                     base_url,
                 }
             }
+            SemanticBackend::Perplexity => {
+                let raw = config
+                    .base_url
+                    .as_ref()
+                    .ok_or_else(|| "base_url is required for perplexity backend".to_string())?;
+                let base_url = normalize_base_url(raw)?;
+
+                let api_key = match api_key_env {
+                    Some(var_name) => Some(env::var(&var_name).map_err(|_| {
+                        format!("missing api_key_env '{var_name}' for perplexity backend")
+                    })?),
+                    None => None,
+                };
+
+                SemanticEmbeddingEngine::Perplexity {
+                    client,
+                    model,
+                    base_url,
+                    api_key,
+                }
+            }
         };
 
         Ok(Self {
@@ -1098,6 +1148,11 @@ impl SemanticEmbeddingModel {
         ))
     }
 
+    /// Returns the resolved input mode for this model.
+    pub fn input_mode(&self) -> crate::config::InputMode {
+        self.input_mode
+    }
+
     pub fn dimension(&mut self) -> Result<usize, String> {
         if let Some(dimension) = self.dimension {
             return Ok(dimension);
@@ -1122,6 +1177,14 @@ impl SemanticEmbeddingModel {
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
             SemanticEmbeddingEngine::Ollama { .. } => {
+                let vectors =
+                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                vectors
+                    .first()
+                    .map(|v| v.len())
+                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+            }
+            SemanticEmbeddingEngine::Perplexity { .. } => {
                 let vectors =
                     self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
                 vectors
@@ -1274,6 +1337,74 @@ impl SemanticEmbeddingModel {
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
+            SemanticEmbeddingEngine::Perplexity {
+                client,
+                model,
+                base_url,
+                api_key,
+            } => {
+                let expected_text_count = texts.len();
+                let endpoint = build_openai_embeddings_endpoint(base_url);
+
+                let mut body = serde_json::json!({
+                    "input": texts,
+                    "model": model,
+                });
+                if let Some(dims) = self.config_dimensions.or(self.dimension) {
+                    body["dimensions"] = serde_json::json!(dims);
+                }
+
+                let raw = send_embedding_request(
+                    || {
+                        let mut req = client.post(&endpoint).json(&body);
+                        req = req.header(
+                            "Authorization",
+                            format!("Bearer {}", api_key.as_deref().unwrap_or("")),
+                        );
+                        req
+                    },
+                    "perplexity",
+                )?;
+
+                #[derive(Deserialize)]
+                struct PerplexityEmbedding {
+                    embedding: Vec<f32>,
+                    index: Option<u32>,
+                }
+
+                #[derive(Deserialize)]
+                struct PerplexityEmbedResponse {
+                    data: Vec<PerplexityEmbedding>,
+                }
+
+                let parsed: PerplexityEmbedResponse = serde_json::from_str(&raw)
+                    .map_err(|error| format!("invalid perplexity response: {error}"))?;
+                if parsed.data.len() != expected_text_count {
+                    return Err(format!(
+                        "perplexity response returned {} embeddings for {} inputs",
+                        parsed.data.len(),
+                        expected_text_count
+                    ));
+                }
+
+                let mut vectors = vec![Vec::new(); parsed.data.len()];
+                for (i, item) in parsed.data.into_iter().enumerate() {
+                    let index = item.index.unwrap_or(i as u32) as usize;
+                    if index >= vectors.len() {
+                        return Err("perplexity response contains invalid vector index".to_string());
+                    }
+                    vectors[index] = item.embedding;
+                }
+
+                for vector in &vectors {
+                    if vector.is_empty() {
+                        return Err("perplexity response contained missing vectors".to_string());
+                    }
+                }
+
+                self.dimension = vectors.first().map(Vec::len);
+                Ok(vectors)
+            }
             SemanticEmbeddingEngine::Ollama {
                 client,
                 model,
@@ -1333,6 +1464,140 @@ impl SemanticEmbeddingModel {
                 Ok(vectors)
             }
         }
+    }
+
+    pub fn embed_document_chunks(
+        &mut self,
+        docs: DocumentChunks,
+    ) -> Result<DocumentEmbeddings, String> {
+        let is_perplexity = matches!(&self.engine, SemanticEmbeddingEngine::Perplexity { .. });
+        if is_perplexity {
+            let (client, model, base_url, api_key) = match &self.engine {
+                SemanticEmbeddingEngine::Perplexity {
+                    client,
+                    model,
+                    base_url,
+                    api_key,
+                } => (
+                    client.clone(),
+                    model.clone(),
+                    base_url.clone(),
+                    api_key.clone(),
+                ),
+                _ => unreachable!(),
+            };
+            let dims = self.config_dimensions.or(self.dimension);
+            Self::embed_document_chunks_native(&client, &model, &base_url, &api_key, dims, docs)
+        } else {
+            let all_texts: Vec<String> = docs
+                .documents
+                .iter()
+                .flat_map(|d| d.chunks.clone())
+                .collect();
+            let vectors = self.embed_texts(all_texts)?;
+            let mut cursor = 0;
+            let embeddings = docs
+                .documents
+                .iter()
+                .map(|doc| {
+                    let count = doc.chunks.len();
+                    let vecs = vectors[cursor..cursor + count].to_vec();
+                    cursor += count;
+                    ChunkEmbeddings {
+                        file_path: doc.file_path.clone(),
+                        vectors: vecs,
+                    }
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    fn embed_document_chunks_native(
+        client: &reqwest::blocking::Client,
+        model: &str,
+        base_url: &str,
+        api_key: &Option<String>,
+        dims: Option<usize>,
+        docs: DocumentChunks,
+    ) -> Result<DocumentEmbeddings, String> {
+        #[derive(Serialize)]
+        struct DocumentPayload<'a> {
+            title: &'a str,
+            chunks: &'a [String],
+        }
+
+        let mut body = serde_json::json!({
+            "input": docs.documents.iter().map(|d| DocumentPayload {
+                title: &d.title,
+                chunks: &d.chunks,
+            }).collect::<Vec<_>>(),
+            "model": model,
+        });
+
+        if let Some(d) = dims {
+            body["dimensions"] = serde_json::json!(d);
+        }
+
+        let endpoint = build_openai_embeddings_endpoint(base_url);
+
+        let raw = send_embedding_request(
+            || {
+                let mut req = client.post(&endpoint).json(&body);
+                if let Some(key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
+                req
+            },
+            "perplexity",
+        )?;
+
+        #[derive(Deserialize)]
+        struct DocumentEmbeddingResponse {
+            data: Vec<PerDocumentEmbeddings>,
+        }
+
+        #[derive(Deserialize)]
+        struct PerDocumentEmbeddings {
+            embeddings: Vec<Vec<f32>>,
+            index: u32,
+        }
+
+        let parsed: DocumentEmbeddingResponse = serde_json::from_str(&raw)
+            .map_err(|error| format!("invalid perplexity document-chunk response: {error}"))?;
+
+        if parsed.data.len() != docs.documents.len() {
+            return Err(format!(
+                "perplexity document-chunk response returned {} documents for {} inputs",
+                parsed.data.len(),
+                docs.documents.len()
+            ));
+        }
+
+        let mut embeddings = vec![ChunkEmbeddings::default(); docs.documents.len()];
+        for item in parsed.data.into_iter() {
+            let index = item.index as usize;
+            if index >= embeddings.len() {
+                return Err(
+                    "perplexity document-chunk response contains invalid document index"
+                        .to_string(),
+                );
+            }
+            embeddings[index] = ChunkEmbeddings {
+                file_path: docs.documents[index].file_path.clone(),
+                vectors: item.embeddings,
+            };
+        }
+
+        for emb in &embeddings {
+            if emb.file_path.as_os_str().is_empty() {
+                return Err(
+                    "perplexity document-chunk response contained missing document".to_string(),
+                );
+            }
+        }
+
+        Ok(DocumentEmbeddings { embeddings })
     }
 }
 
@@ -1555,6 +1820,35 @@ pub struct SemanticChunk {
     pub embed_text: String,
     /// Short code snippet for display in results
     pub snippet: String,
+}
+
+/// A group of chunks from a single document, for contextualized embedding.
+/// Contextualized providers use surrounding chunks as context when embedding
+/// each chunk, so chunks must be grouped by source document and preserve order.
+#[derive(Debug, Clone)]
+pub struct DocumentChunks {
+    pub documents: Vec<PerDocumentChunks>,
+}
+
+/// Chunks from one source document.
+#[derive(Debug, Clone)]
+pub struct PerDocumentChunks {
+    pub file_path: PathBuf,
+    pub title: String,
+    pub chunks: Vec<String>,
+}
+
+/// Embeddings returned for a batch of documents after contextualized embedding.
+#[derive(Debug, Clone)]
+pub struct DocumentEmbeddings {
+    pub embeddings: Vec<ChunkEmbeddings>,
+}
+
+/// Embeddings for one document.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkEmbeddings {
+    pub file_path: PathBuf,
+    pub vectors: Vec<Vec<f32>>,
 }
 
 /// A stored embedding entry — chunk metadata + vector
@@ -2210,6 +2504,119 @@ impl SemanticIndex {
         )?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint: None,
+        })
+    }
+
+    /// Build the semantic index using a contextualized document-chunk embedding
+    /// function. Groups chunks by source document so the embedding provider can
+    /// use surrounding chunks as context.
+    pub fn build_with_progress_contextualized<F, P>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
+        P: FnMut(usize, usize),
+    {
+        let mut files = files.to_vec();
+        Self::sort_files_by_priority(&mut files);
+        let (chunks, file_metadata) = Self::collect_chunks(project_root, &files, file_policy);
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+
+        if chunks.is_empty() {
+            return Ok(Self {
+                snapshot: Arc::new(SemanticIndexSnapshot {
+                    entries: Vec::new(),
+                    file_metadata,
+                    dimension: DEFAULT_DIMENSION,
+                    project_root: project_root.to_path_buf(),
+                }),
+                lifecycle: SemanticIndexLifecycle::Ready,
+                last_error: None,
+                fingerprint: None,
+            });
+        }
+
+        // Group chunks by file path
+        let mut docs_map: HashMap<PathBuf, Vec<SemanticChunk>> = HashMap::new();
+        for chunk in chunks {
+            docs_map.entry(chunk.file.clone()).or_default().push(chunk);
+        }
+
+        let mut documents: Vec<PerDocumentChunks> = Vec::with_capacity(docs_map.len());
+        for (path, chunks) in &docs_map {
+            let title = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let chunk_texts: Vec<String> = chunks.iter().map(|c| c.embed_text.clone()).collect();
+            documents.push(PerDocumentChunks {
+                file_path: path.clone(),
+                title,
+                chunks: chunk_texts,
+            });
+        }
+
+        let doc_embeddings = embed_fn(DocumentChunks { documents })?;
+
+        let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(total_chunks);
+        let mut expected_dimension: Option<usize> = None;
+        let mut done = 0;
+
+        for emb in doc_embeddings.embeddings.into_iter() {
+            let file_chunks = docs_map.get(&emb.file_path).ok_or_else(|| {
+                format!(
+                    "embedding response returned unknown file path: {}",
+                    emb.file_path.display()
+                )
+            })?;
+
+            if emb.vectors.len() != file_chunks.len() {
+                return Err(format!(
+                    "embedding response returned {} vectors for {} chunks in file {}",
+                    emb.vectors.len(),
+                    file_chunks.len(),
+                    emb.file_path.display()
+                ));
+            }
+
+            for (chunk, vector) in file_chunks.iter().zip(emb.vectors) {
+                if let Some(dim) = expected_dimension {
+                    if vector.len() != dim {
+                        return Err(format!(
+                            "embedding dimension changed: expected {dim}, got {}",
+                            vector.len()
+                        ));
+                    }
+                } else {
+                    expected_dimension = Some(vector.len());
+                }
+
+                entries.push(EmbeddingEntry {
+                    chunk: chunk.clone(),
+                    vector,
+                });
+                done += 1;
+                progress(done, total_chunks);
+            }
+        }
+
+        let dimension = expected_dimension.unwrap_or(DEFAULT_DIMENSION);
+
+        Ok(Self {
+            snapshot: Arc::new(SemanticIndexSnapshot {
+                entries,
+                file_metadata,
+                dimension,
+                project_root: project_root.to_path_buf(),
+            }),
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint: None,
