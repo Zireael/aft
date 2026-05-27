@@ -969,7 +969,6 @@ fn extract_version_from_filename(name: &str) -> Option<String> {
     re.find(name).map(|m| m.as_str().to_string())
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn suggest_removal_command(lib_path: &str) -> String {
     if lib_path.starts_with("/usr/local/lib")
         || lib_path == "libonnxruntime.so"
@@ -990,7 +989,6 @@ fn suggest_removal_command(lib_path: &str) -> String {
 /// stability — the auto-fix recommendation must always come first because
 /// it's the only safe option, and the system-rm step must remain present
 /// because some users prefer the system-wide cleanup path.
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> String {
     format!(
         "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \

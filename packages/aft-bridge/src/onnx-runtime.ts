@@ -511,7 +511,12 @@ function findSystemOnnxRuntime(libName?: string): string | null {
   });
 
   for (const dir of uniquePaths) {
-    if (!existsSync(join(dir, libName))) continue;
+    const libPath = join(dir, libName);
+    if (process.platform === "win32") {
+      if (!directoryContainsLibrary(dir, libName)) continue;
+    } else if (!existsSync(libPath)) {
+      continue;
+    }
 
     // Skip the version check for PATH entries — version-suffixed filenames
     // are less common on Windows and we want PATH discovery to succeed.
