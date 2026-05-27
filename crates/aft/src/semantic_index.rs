@@ -797,7 +797,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
         let lib_name = dylib_path.as_deref().unwrap_or("onnxruntime.dll");
 
         // Use kernel32 LoadLibraryExW for the validation — built-in, no
-        // crate dependency required.
+        // crate dependency required. GetModuleFileNameW resolves the loaded
+        // DLL path for version probing via the version.dll API.
         #[link(name = "kernel32")]
         extern "system" {
             fn LoadLibraryExW(
@@ -806,6 +807,48 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                 dwFlags: u32,
             ) -> *mut std::ffi::c_void;
             fn FreeLibrary(hLibModule: *mut std::ffi::c_void) -> i32;
+            fn GetModuleFileNameW(
+                hModule: *mut std::ffi::c_void,
+                lpFilename: *mut u16,
+                nSize: u32,
+            ) -> u32;
+        }
+
+        #[link(name = "version")]
+        extern "system" {
+            fn GetFileVersionInfoSizeW(
+                lptstrFilename: *const u16,
+                lpdwHandle: *mut u32,
+            ) -> u32;
+            fn GetFileVersionInfoW(
+                lptstrFilename: *const u16,
+                dwHandle: u32,
+                dwLen: u32,
+                lpData: *mut std::ffi::c_void,
+            ) -> i32;
+            fn VerQueryValueW(
+                pBlock: *mut std::ffi::c_void,
+                lpSubBlock: *const u16,
+                lplpBuffer: *mut *mut std::ffi::c_void,
+                puLen: *mut u32,
+            ) -> i32;
+        }
+
+        #[repr(C)]
+        struct VS_FIXEDFILEINFO {
+            dw_signature: u32,
+            dw_struc_version: u32,
+            dw_file_version_ms: u32,   // HIWORD major, LOWORD minor
+            dw_file_version_ls: u32,   // HIWORD build, LOWORD revision
+            dw_product_version_ms: u32,
+            dw_product_version_ls: u32,
+            dw_file_flags_mask: u32,
+            dw_file_flags: u32,
+            dw_file_os: u32,
+            dw_file_type: u32,
+            dw_file_subtype: u32,
+            dw_file_date_ms: u32,
+            dw_file_date_ls: u32,
         }
 
         unsafe {
@@ -824,7 +867,58 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     lib_name, err
                 ));
             }
+
+            // Probe the file version from PE resources so we can reject
+            // outdated DLLs (e.g. v1.9.x) before the ort crate panics.
+            let mut detected_major: u32 = 0;
+            let mut detected_minor: u32 = 0;
+            let mut path_buf = [0u16; 260];
+            let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 260);
+            if path_len > 0 {
+                let mut dummy_handle: u32 = 0;
+                let info_size =
+                    GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
+                if info_size > 0 {
+                    let mut info = vec![0u8; info_size as usize];
+                    if GetFileVersionInfoW(
+                        path_buf.as_ptr(),
+                        0,
+                        info_size,
+                        info.as_mut_ptr() as *mut std::ffi::c_void,
+                    ) != 0
+                    {
+                        let sub_block = "\\\0".encode_utf16().collect::<Vec<u16>>();
+                        let mut vs_info: *mut std::ffi::c_void =
+                            std::ptr::null_mut();
+                        let mut vs_len: u32 = 0;
+                        if VerQueryValueW(
+                            info.as_mut_ptr() as *mut std::ffi::c_void,
+                            sub_block.as_ptr(),
+                            &mut vs_info,
+                            &mut vs_len,
+                        ) != 0
+                            && !vs_info.is_null()
+                        {
+                            let fixed = vs_info as *const VS_FIXEDFILEINFO;
+                            detected_major = (*fixed).dw_file_version_ms >> 16;
+                            detected_minor =
+                                (*fixed).dw_file_version_ms & 0xFFFF;
+                        }
+                    }
+                }
+            }
+
             FreeLibrary(handle);
+
+            // Version compatibility check (mirrors the Linux/macOS path).
+            // If version could not be detected (detected_major == 0) we let
+            // the load succeed — the ort crate will diagnose further.
+            if detected_major != 0
+                && (detected_major != 1 || detected_minor < 20)
+            {
+                let ver = format!("{}.{}", detected_major, detected_minor);
+                return Err(format_ort_version_mismatch(&ver, lib_name));
+            }
         }
     }
 

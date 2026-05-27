@@ -492,13 +492,9 @@ function findSystemOnnxRuntime(libName?: string): string | null {
         return nugetPaths;
       })(),
     );
-    // Also search PATH directories for onnxruntime.dll
-    const pathEnv = process.env.PATH ?? "";
-    for (const dir of pathEnv.split(";")) {
-      const trimmed = dir.trim();
-      if (!trimmed) continue;
-      searchPaths.push(trimmed);
-    }
+    // Also include absolute PATH entries (reuses the existing helper that
+    // validates absolute paths, rejects null bytes, strips quotes, excludes ".").
+    searchPaths.push(...pathEntriesForPlatform());
   }
 
   // Deduplicate paths while preserving order.

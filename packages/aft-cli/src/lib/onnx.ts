@@ -82,11 +82,16 @@ export function findSystemOnnxRuntime(): string | null {
       join(programFiles, "Microsoft Machine Learning", "lib"),
       join(programFilesX86, "onnxruntime", "lib"),
     );
-    // Also search PATH for onnxruntime.dll via raw string split
+    // Also include absolute PATH entries. Use the same filters that the bridge
+    // version's pathEntriesForPlatform() applies: absolute-path check, null-byte
+    // rejection, "." exclusion, quote-stripping.
+    const delimiter = ";";
     const pathEnv = process.env.PATH ?? "";
-    for (const dir of pathEnv.split(";")) {
+    for (const dir of pathEnv.split(delimiter)) {
       const trimmed = dir.trim();
-      if (trimmed) searchPaths.push(trimmed);
+      if (!trimmed || trimmed === "." || trimmed.includes("\0")) continue;
+      if (!isAbsolute(trimmed)) continue;
+      searchPaths.push(trimmed);
     }
   }
 

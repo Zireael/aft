@@ -55,7 +55,7 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
     }
-    // Atomic rename — unlink first on Windows where renameSync fails if target exists
+    // Best-effort replace — unlink first on Windows where renameSync fails if target exists
     if (process.platform === "win32" && existsSync(cachedPath)) {
       try {
         unlinkSync(cachedPath);
