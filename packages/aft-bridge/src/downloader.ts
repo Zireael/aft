@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -217,13 +218,23 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
     log(`Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
 
-    // Make executable
-    if (process.platform !== "win32") {
+    // Atomic rename (POSIX) or copy (Windows — renameSync fails with EEXIST
+    // when target exists). On Windows, copyFileSync overwrites the target;
+    // if it fails the original binary at binaryPath is preserved.
+    if (process.platform === "win32") {
+      copyFileSync(tmpPath, binaryPath);
+    } else {
       chmodSync(tmpPath, 0o755);
+      renameSync(tmpPath, binaryPath);
     }
 
-    // Atomic rename
-    renameSync(tmpPath, binaryPath);
+    // Binary was replaced successfully. Clean up the temp file best-effort;
+    // a cleanup failure should NOT propagate as a download failure.
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {
+      warn(`Could not clean up temporary download file ${tmpPath} — it can be removed manually.`);
+    }
 
     log(`AFT binary ready at ${binaryPath}`);
     return binaryPath;
