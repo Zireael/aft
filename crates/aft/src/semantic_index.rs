@@ -55,6 +55,8 @@ const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 /// V7 adds invalidation fields (source_vector_kind, stored_vector_kind,
 /// normalization, query_prompt_hash) to SemanticIndexFingerprint.
 const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
+/// V8 adds file manifest (FileRecord entries) and per-entry chunk_hash.
+const SEMANTIC_INDEX_VERSION_V8: u8 = 8;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 
@@ -1857,6 +1859,28 @@ pub struct ChunkEmbeddings {
 pub struct EmbeddingEntry {
     pub(crate) chunk: SemanticChunk,
     pub(crate) vector: Vec<f32>,
+    /// Deterministic hash of the chunk fields (file, name, kind, lines, snippet, embed_text).
+    /// Used to trace which version of a chunk produced a vector.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) chunk_hash: String,
+}
+
+/// Compute a deterministic chunk hash from SemanticChunk fields.
+/// Used to trace which version of a chunk produced a stored vector.
+pub(crate) fn compute_chunk_hash(chunk: &SemanticChunk) -> String {
+    let content_hash = blake3::hash(
+        format!(
+            "{}{}{}{}{}{}",
+            chunk.embed_text,
+            chunk.snippet,
+            chunk.start_line,
+            chunk.end_line,
+            chunk.exported,
+            symbol_kind_to_u8(&chunk.kind),
+        )
+        .as_bytes(),
+    );
+    content_hash.to_hex().to_string()
 }
 
 /// Lifecycle state of a [`SemanticIndex`].
@@ -1893,6 +1917,27 @@ pub(crate) enum SemanticIndexLifecycle {
     Failed,
 }
 
+/// Identity record for an indexed file in the file manifest.
+/// Tracks which files produced which vectors, enabling precise
+/// stale-vector pruning when files are edited, deleted, or excluded.
+#[derive(Debug, Clone)]
+pub(crate) struct FileRecord {
+    /// Content hash (blake3) at indexing time
+    pub(crate) content_hash: blake3::Hash,
+    /// File size at indexing time
+    pub(crate) size_bytes: u64,
+    /// Last modified time at indexing time
+    pub(crate) mtime: SystemTime,
+    /// Detected programming language (if applicable)
+    pub(crate) language: Option<String>,
+    /// Document kind identifier: "code", "docs", "config", "generated", "unknown"
+    pub(crate) document_kind: String,
+    /// Hash of the file policy that was active when this file was indexed
+    pub(crate) inclusion_policy_hash: String,
+    /// When this file was indexed
+    pub(crate) indexed_at: SystemTime,
+}
+
 /// Immutable snapshot of the core semantic index data.
 ///
 /// Held behind `Arc<SemanticIndexSnapshot>` inside [`SemanticIndex`].
@@ -1904,6 +1949,18 @@ pub struct SemanticIndexSnapshot {
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
     project_root: PathBuf,
+    /// File identity manifest — maps each indexed file path to its identity record.
+    /// Used by pruning to determine which entries belong to which file, enabling
+    /// precise stale-vector cleanup when files are edited, deleted, or excluded.
+    pub(crate) file_manifest: HashMap<PathBuf, FileRecord>,
+    /// Monotonic counter for assigning unique chunk IDs.
+    #[allow(dead_code)]
+    pub(crate) next_chunk_id: u64,
+    /// The fingerprint string at the time this snapshot was built.
+    /// Stored alongside the snapshot so search can report which index build
+    /// produced each result.
+    #[allow(dead_code)]
+    pub(crate) fingerprint_string: Option<String>,
 }
 
 impl SemanticIndexSnapshot {
@@ -1982,6 +2039,27 @@ impl SemanticIndexSnapshot {
     #[allow(private_interfaces)]
     pub fn file_metadata_mut_inner(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
         self.store.file_metadata_mut()
+    }
+
+    /// Build the file manifest from store entries and metadata.
+    /// Called after constructing or refreshing a snapshot to populate the
+    /// file_manifest from the store's existing IndexedFileMetadata.
+    pub(crate) fn build_manifest_from_store(&mut self) {
+        self.file_manifest.clear();
+        for (path, meta) in self.store.file_metadata().iter() {
+            self.file_manifest.insert(
+                path.clone(),
+                FileRecord {
+                    content_hash: meta.content_hash,
+                    size_bytes: meta.size,
+                    mtime: meta.mtime,
+                    language: None,
+                    document_kind: "code".to_string(),
+                    inclusion_policy_hash: String::new(),
+                    indexed_at: SystemTime::now(),
+                },
+            );
+        }
     }
 }
 
@@ -2068,6 +2146,9 @@ impl SemanticIndex {
                 store: crate::vector_store::FlatF32VectorStore::new(dimension),
                 dimension,
                 project_root,
+                file_manifest: HashMap::new(),
+                next_chunk_id: 0,
+                fingerprint_string: None,
             }),
             lifecycle: SemanticIndexLifecycle::ColdStart,
             last_error: None,
@@ -2326,6 +2407,9 @@ impl SemanticIndex {
                 store: crate::vector_store::FlatF32VectorStore::new(DEFAULT_DIMENSION),
                 dimension: DEFAULT_DIMENSION,
                 project_root: project_root.to_path_buf(),
+                file_manifest: HashMap::new(),
+                next_chunk_id: 0,
+                fingerprint_string: None,
             });
         }
 
@@ -2361,6 +2445,7 @@ impl SemanticIndex {
                 entries.push(EmbeddingEntry {
                     chunk: chunks[chunk_idx].clone(),
                     vector,
+                    chunk_hash: compute_chunk_hash(&chunks[chunk_idx]),
                 });
             }
 
@@ -2374,7 +2459,7 @@ impl SemanticIndex {
             .map(|e| e.vector.len())
             .unwrap_or(DEFAULT_DIMENSION);
 
-        Ok(SemanticIndexSnapshot {
+        let mut snapshot = SemanticIndexSnapshot {
             store: crate::vector_store::FlatF32VectorStore::from_parts(
                 entries,
                 dimension,
@@ -2382,7 +2467,12 @@ impl SemanticIndex {
             ),
             dimension,
             project_root: project_root.to_path_buf(),
-        })
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+        snapshot.build_manifest_from_store();
+        Ok(snapshot)
     }
 
     /// Build the semantic index from a set of files using the provided embedding function.
@@ -2539,6 +2629,9 @@ impl SemanticIndex {
                     ),
                     dimension: DEFAULT_DIMENSION,
                     project_root: project_root.to_path_buf(),
+                    file_manifest: HashMap::new(),
+                    next_chunk_id: 0,
+                    fingerprint_string: None,
                 }),
                 lifecycle: SemanticIndexLifecycle::Ready,
                 last_error: None,
@@ -2604,6 +2697,7 @@ impl SemanticIndex {
                 entries.push(EmbeddingEntry {
                     chunk: chunk.clone(),
                     vector,
+                    chunk_hash: compute_chunk_hash(&chunk),
                 });
                 done += 1;
                 progress(done, total_chunks);
@@ -2612,16 +2706,21 @@ impl SemanticIndex {
 
         let dimension = expected_dimension.unwrap_or(DEFAULT_DIMENSION);
 
-        Ok(Self {
-            snapshot: Arc::new(SemanticIndexSnapshot {
-                store: crate::vector_store::FlatF32VectorStore::from_parts(
-                    entries,
-                    dimension,
-                    file_metadata,
-                ),
+        let mut new_snapshot = SemanticIndexSnapshot {
+            store: crate::vector_store::FlatF32VectorStore::from_parts(
+                entries,
                 dimension,
-                project_root: project_root.to_path_buf(),
-            }),
+                file_metadata,
+            ),
+            dimension,
+            project_root: project_root.to_path_buf(),
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+        new_snapshot.build_manifest_from_store();
+        Ok(Self {
+            snapshot: Arc::new(new_snapshot),
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint: None,
@@ -2745,6 +2844,7 @@ impl SemanticIndex {
         if to_embed.is_empty() {
             // Only deletions happened.
             progress(0, 0);
+            snapshot.build_manifest_from_store();
             self.swap_snapshot(snapshot);
             return Ok(RefreshSummary {
                 changed: 0,
@@ -2777,6 +2877,7 @@ impl SemanticIndex {
                 .store_mut()
                 .file_metadata_mut()
                 .extend(fresh_metadata);
+            snapshot.build_manifest_from_store();
             self.swap_snapshot(snapshot);
             return Ok(RefreshSummary {
                 changed: changed_count,
@@ -2828,6 +2929,7 @@ impl SemanticIndex {
                 new_entries.push(EmbeddingEntry {
                     chunk: chunks[chunk_idx].clone(),
                     vector,
+                    chunk_hash: compute_chunk_hash(&chunks[chunk_idx]),
                 });
             }
 
@@ -2851,6 +2953,7 @@ impl SemanticIndex {
             snapshot.dimension = dim;
         }
 
+        snapshot.build_manifest_from_store();
         self.swap_snapshot(snapshot);
 
         Ok(RefreshSummary {
@@ -2983,11 +3086,14 @@ impl SemanticIndex {
 
         let bytes = fs::read(&data_path).ok()?;
         let version = bytes[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+        if version != SEMANTIC_INDEX_VERSION_V6
+            && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
+        {
             slog_info!(
                 "cached semantic index version {} is older than {}, rebuilding",
                 version,
-                SEMANTIC_INDEX_VERSION_V7
+                SEMANTIC_INDEX_VERSION_V8
             );
             if !is_worktree_bridge {
                 let _ = fs::remove_file(&data_path);
@@ -3052,18 +3158,20 @@ impl SemanticIndex {
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V7 is the single write format (same binary layout as V6, just bumped
-        // version byte for fingerprint invalidation fields). Layout extends V5:
+        // V8 is the single write format. V8 extends V7 with per-entry chunk_hash
+        // and a file manifest (FileRecord entries). Layout extends V5/V6/V7:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - paths are relative to project_root.
         //   - file metadata stored as secs(u64) + subsec_nanos(u32) + size(u64) + blake3(32).
         //     Preserves full APFS/ext4/NTFS precision and catches mtime ties.
+        //   - per-entry chunk_hash (V8+): hash_len(4) + hash bytes after each vector.
+        //   - file manifest (V8+): manifest_count(4) + entries after all entry vectors.
         //
         // V1/V2 remain readable for backward compatibility (see from_bytes).
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once.
-        let version = SEMANTIC_INDEX_VERSION_V7;
+        let version = SEMANTIC_INDEX_VERSION_V8;
         buf.push(version);
         buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -3133,6 +3241,68 @@ impl SemanticIndex {
             for &val in &entry.vector {
                 buf.extend_from_slice(&val.to_le_bytes());
             }
+
+            // chunk_hash (V8+)
+            let chunk_hash_str = if entry.chunk_hash.is_empty() {
+                compute_chunk_hash(&entry.chunk)
+            } else {
+                entry.chunk_hash.clone()
+            };
+            let hash_bytes = chunk_hash_str.as_bytes();
+            buf.extend_from_slice(&(hash_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(hash_bytes);
+        }
+
+        // File manifest (V8+): manifest_count(4) + entries
+        let manifest_entries: Vec<_> = self
+            .file_manifest
+            .iter()
+            .filter_map(|(path, record)| {
+                cache_relative_path(&self.project_root, path).map(|relative| (relative, record))
+            })
+            .collect();
+        buf.extend_from_slice(&(manifest_entries.len() as u32).to_le_bytes());
+        for (relative, record) in &manifest_entries {
+            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&path_bytes);
+
+            // content_hash (32 blake3 bytes)
+            buf.extend_from_slice(record.content_hash.as_bytes());
+
+            // size (8 bytes)
+            buf.extend_from_slice(&record.size_bytes.to_le_bytes());
+
+            // mtime
+            let mtime_duration = record
+                .mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            buf.extend_from_slice(&mtime_duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&mtime_duration.subsec_nanos().to_le_bytes());
+
+            // language
+            let lang_bytes = record.language.as_deref().unwrap_or("").as_bytes();
+            buf.extend_from_slice(&(lang_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(lang_bytes);
+
+            // document_kind
+            let doc_kind_bytes = record.document_kind.as_bytes();
+            buf.extend_from_slice(&(doc_kind_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(doc_kind_bytes);
+
+            // inclusion_policy_hash
+            let policy_hash_bytes = record.inclusion_policy_hash.as_bytes();
+            buf.extend_from_slice(&(policy_hash_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(policy_hash_bytes);
+
+            // indexed_at
+            let indexed_duration = record
+                .indexed_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            buf.extend_from_slice(&indexed_duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&indexed_duration.subsec_nanos().to_le_bytes());
         }
 
         buf
@@ -3156,6 +3326,7 @@ impl SemanticIndex {
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
             && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
         {
             return Err(format!("unsupported version: {}", version));
         }
@@ -3167,10 +3338,13 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7)
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8)
             && data.len() < HEADER_BYTES_V2
         {
-            return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
+            return Err(
+                "data too short for semantic index v2/v3/v4/v5/v6/v7/v8 header".to_string(),
+            );
         }
 
         let dimension = read_u32(data, &mut pos)? as usize;
@@ -3190,7 +3364,8 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7;
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8;
         let fingerprint = if has_fingerprint_field {
             let fingerprint_len = read_u32(data, &mut pos)? as usize;
             if pos + fingerprint_len > data.len() {
@@ -3239,6 +3414,7 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 read_u32(data, &mut pos)?
             } else {
@@ -3247,23 +3423,26 @@ impl SemanticIndex {
             let size = if version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 read_u64(data, &mut pos)?
             } else {
                 0
             };
-            let content_hash =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    if pos + 32 > data.len() {
-                        return Err("unexpected end of data reading content hash".to_string());
-                    }
-                    let mut hash_bytes = [0u8; 32];
-                    hash_bytes.copy_from_slice(&data[pos..pos + 32]);
-                    pos += 32;
-                    blake3::Hash::from_bytes(hash_bytes)
-                } else {
-                    cache_freshness::zero_hash()
-                };
+            let content_hash = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
+            {
+                if pos + 32 > data.len() {
+                    return Err("unexpected end of data reading content hash".to_string());
+                }
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                blake3::Hash::from_bytes(hash_bytes)
+            } else {
+                cache_freshness::zero_hash()
+            };
             // Hardening against corrupt / maliciously crafted cache files
             // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
             // nanosecond carry overflows the second counter, and
@@ -3287,6 +3466,7 @@ impl SemanticIndex {
                 })?;
             let path = if version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 cached_path_under_root(current_canonical_root, &PathBuf::from(path))
                     .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
@@ -3309,6 +3489,7 @@ impl SemanticIndex {
             let raw_file = PathBuf::from(read_string(data, &mut pos)?);
             let file = if version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
                 cached_path_under_root(current_canonical_root, &raw_file)
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
@@ -3349,6 +3530,19 @@ impl SemanticIndex {
                 pos += 4;
             }
 
+            // chunk_hash (V8+)
+            let chunk_hash = if version == SEMANTIC_INDEX_VERSION_V8 {
+                let hash_len = read_u32(data, &mut pos)? as usize;
+                if pos + hash_len > data.len() {
+                    return Err("unexpected end of data reading chunk_hash".to_string());
+                }
+                let hash_str = String::from_utf8_lossy(&data[pos..pos + hash_len]).to_string();
+                pos += hash_len;
+                hash_str
+            } else {
+                String::new()
+            };
+
             entries.push(EmbeddingEntry {
                 chunk: SemanticChunk {
                     file,
@@ -3361,6 +3555,7 @@ impl SemanticIndex {
                     snippet,
                 },
                 vector,
+                chunk_hash,
             });
         }
 
@@ -3380,7 +3575,114 @@ impl SemanticIndex {
             }
         }
 
-        let snapshot = SemanticIndexSnapshot {
+        // File manifest (V8+)
+        let file_manifest = if version == SEMANTIC_INDEX_VERSION_V8 {
+            let manifest_count = read_u32(data, &mut pos)? as usize;
+            let mut manifest = HashMap::with_capacity(manifest_count);
+            for _ in 0..manifest_count {
+                let relative_path = PathBuf::from(read_string(data, &mut pos)?);
+
+                // content_hash (32 blake3 bytes)
+                if pos + 32 > data.len() {
+                    return Err("unexpected end of data reading manifest content hash".to_string());
+                }
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                let content_hash = blake3::Hash::from_bytes(hash_bytes);
+
+                // size
+                let size = read_u64(data, &mut pos)?;
+
+                // mtime
+                let mtime_secs = read_u64(data, &mut pos)?;
+                let mtime_nanos = read_u32(data, &mut pos)?;
+                if mtime_nanos >= 1_000_000_000 {
+                    return Err(format!(
+                        "invalid manifest mtime: nanos {} >= 1_000_000_000",
+                        mtime_nanos
+                    ));
+                }
+                let mtime_duration = std::time::Duration::new(mtime_secs, mtime_nanos);
+                let mtime = SystemTime::UNIX_EPOCH
+                    .checked_add(mtime_duration)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid manifest mtime: secs={} nanos={} overflows SystemTime",
+                            mtime_secs, mtime_nanos
+                        )
+                    })?;
+
+                // language
+                let language = {
+                    let lang_len = read_u32(data, &mut pos)? as usize;
+                    if pos + lang_len > data.len() {
+                        return Err("unexpected end of data reading manifest language".to_string());
+                    }
+                    let lang_str = if lang_len > 0 {
+                        Some(String::from_utf8_lossy(&data[pos..pos + lang_len]).to_string())
+                    } else {
+                        None
+                    };
+                    pos += lang_len;
+                    lang_str
+                };
+
+                // document_kind
+                let document_kind = read_string(data, &mut pos)?;
+
+                // inclusion_policy_hash
+                let inclusion_policy_hash = read_string(data, &mut pos)?;
+
+                // indexed_at
+                let indexed_at_secs = read_u64(data, &mut pos)?;
+                let indexed_at_nanos = read_u32(data, &mut pos)?;
+                if indexed_at_nanos >= 1_000_000_000 {
+                    return Err(format!(
+                        "invalid manifest indexed_at: nanos {} >= 1_000_000_000",
+                        indexed_at_nanos
+                    ));
+                }
+                let indexed_at_duration =
+                    std::time::Duration::new(indexed_at_secs, indexed_at_nanos);
+                let indexed_at = SystemTime::UNIX_EPOCH
+                    .checked_add(indexed_at_duration)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid manifest indexed_at: secs={} nanos={} overflows SystemTime",
+                            indexed_at_secs, indexed_at_nanos
+                        )
+                    })?;
+
+                // Reconstruct absolute path
+                let abs_path = cached_path_under_root(current_canonical_root, &relative_path)
+                    .ok_or_else(|| "cached file manifest path escapes project root".to_string())?;
+
+                manifest.insert(
+                    abs_path,
+                    FileRecord {
+                        content_hash,
+                        size_bytes: size,
+                        mtime,
+                        language,
+                        document_kind,
+                        inclusion_policy_hash,
+                        indexed_at,
+                    },
+                );
+            }
+            manifest
+        } else {
+            HashMap::new()
+        };
+
+        let fingerprint_string = if version >= SEMANTIC_INDEX_VERSION_V7 {
+            fingerprint.as_ref().map(|fp| fp.as_string())
+        } else {
+            None
+        };
+
+        let mut snapshot = SemanticIndexSnapshot {
             store: crate::vector_store::FlatF32VectorStore::from_parts(
                 entries,
                 dimension,
@@ -3388,7 +3690,15 @@ impl SemanticIndex {
             ),
             dimension,
             project_root: current_canonical_root.to_path_buf(),
+            file_manifest,
+            next_chunk_id: 0,
+            fingerprint_string,
         };
+        // For pre-V8 cache data, the manifest was not serialized, so build it
+        // from the store's existing file_metadata.
+        if snapshot.file_manifest.is_empty() && !snapshot.store.file_metadata().is_empty() {
+            snapshot.build_manifest_from_store();
+        }
         Ok(Self {
             snapshot: Arc::new(snapshot),
             lifecycle: SemanticIndexLifecycle::Ready,
@@ -4306,6 +4616,7 @@ mod tests {
                 snippet: "outside".to_string(),
             },
             vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
         });
 
         let bytes = index.to_bytes();
@@ -4352,6 +4663,7 @@ mod tests {
                 snippet: "fn handle_request() {\n  // ...\n}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3, 0.4],
+            chunk_hash: String::new(),
         });
         index.set_dimension(4);
         let hash = cache_freshness::zero_hash();
@@ -4433,6 +4745,7 @@ mod tests {
                     snippet: format!("fn {}() {{}}", name),
                 },
                 vector: vec,
+                chunk_hash: String::new(),
             });
         }
 
@@ -4551,6 +4864,7 @@ mod tests {
                 snippet: "fn main() {}".to_string(),
             },
             vector: vec![1.0; DEFAULT_DIMENSION],
+            chunk_hash: String::new(),
         });
         let hash = cache_freshness::zero_hash();
         index.file_metadata_for_test().insert(
@@ -4990,6 +5304,7 @@ mod tests {
                 snippet: "fn handle_request() {}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3],
+            chunk_hash: String::new(),
         });
         index.set_dimension(3);
         let hash = cache_freshness::zero_hash();
@@ -5070,6 +5385,7 @@ mod tests {
                 snippet: "fn handle_request() {}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3],
+            chunk_hash: String::new(),
         });
         index.set_dimension(3);
         let hash = cache_freshness::zero_hash();
