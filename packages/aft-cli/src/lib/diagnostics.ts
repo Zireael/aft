@@ -61,7 +61,10 @@ export interface HarnessDiagnostic {
   pluginCache: ReturnType<HarnessAdapter["getPluginCacheInfo"]>;
   storageDir: {
     path: string;
+    /** True when the storage directory is present on disk. */
     exists: boolean;
+    /** True when the directory exists and is readable + writable. */
+    accessible: boolean;
     sizesByKey: Record<string, number>;
   };
   onnxRuntime: {
@@ -159,7 +162,8 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
     pluginCache,
     storageDir: {
       path: storage,
-      exists: storageAccessible,
+      exists: existsSync(storage),
+      accessible: storageAccessible,
       sizesByKey: describeStorage,
     },
     onnxRuntime: {
