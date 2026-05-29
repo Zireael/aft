@@ -22,7 +22,8 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
-import { sessionLog } from "./logger.js";
+import type { ConfigureWarningsDelivery } from "./config.js";
+import { sessionLog, warn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 
 // --- TUI toast helper ---
@@ -263,6 +264,7 @@ async function sendIgnoredMessage(
   client: unknown,
   sessionId: string,
   text: string,
+  options?: { includeAgent?: boolean },
 ): Promise<boolean> {
   try {
     const c = client as {
@@ -278,22 +280,18 @@ async function sendIgnoredMessage(
     // earlier attempts to pass model on this path caused OpenCode-side
     // crashes in some host versions.
     //
-    // `agent` IS needed for UI attribution: without it, OpenCode renders
-    // configure warnings / auto-update / startup announcements / status
-    // messages under the *default* agent rather than the agent the user
-    // has switched to (e.g. via oh-my-openagent). See issue #62. Passing
-    // agent is safe because OpenCode short-circuits on `noReply: true`
-    // before the LLM turn, but `createUserMessage` still records `agent`
-    // on the appended user message.
-    //
-    // model/variant forwarding still belongs ONLY on wake-style calls
-    // (noReply: false), which live in bg-notifications.ts.
-    const agent = await resolveCurrentAgent(c, sessionId);
+    // `agent` IS needed for UI attribution on announcements/status: without
+    // it, OpenCode renders those under the default agent (issue #62).
+    // Configure warnings intentionally omit `agent` so `createUserMessage`
+    // does not publish ModelSwitched / AgentSwitched mid-session.
     const body: Record<string, unknown> = {
       noReply: true,
       parts: [{ type: "text", text, ignored: true }],
     };
-    if (agent) body.agent = agent;
+    if (options?.includeAgent !== false) {
+      const agent = await resolveCurrentAgent(c, sessionId);
+      if (agent) body.agent = agent;
+    }
 
     const promptInput = {
       path: { id: sessionId },
@@ -315,6 +313,31 @@ async function sendIgnoredMessage(
     );
   }
   return false;
+}
+
+async function showToastViaHttp(
+  serverUrl: string,
+  title: string,
+  message: string,
+  variant: "info" | "warning" | "error" | "success",
+  duration: number,
+): Promise<boolean> {
+  const auth = getServerAuth();
+  const url = `${serverUrl.replace(/\/$/, "")}/tui/show-toast`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+      },
+      body: JSON.stringify({ title, message, variant, duration }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -389,6 +412,8 @@ export interface ConfigureWarningOptions {
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
+  serverUrl?: string;
+  delivery?: ConfigureWarningsDelivery;
 }
 
 /**
@@ -603,7 +628,7 @@ function warningTitle(warning: ConfigureWarning): string {
   }
 }
 
-function formatConfigureWarning(warning: ConfigureWarning): string {
+function formatConfigureWarningLine(warning: ConfigureWarning): string {
   const details: string[] = [];
   if (warning.language) details.push(`language: ${warning.language}`);
   if (warning.server) details.push(`server: ${warning.server}`);
@@ -613,7 +638,63 @@ function formatConfigureWarning(warning: ConfigureWarning): string {
   }
 
   const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-  return `${WARNING_MARKER} ${warningTitle(warning)}${suffix}\n${warning.hint}`;
+  return `• ${warningTitle(warning)}${suffix}\n  ${warning.hint}`;
+}
+
+function formatConfigureWarningChat(warning: ConfigureWarning): string {
+  return `${WARNING_MARKER} ${formatConfigureWarningLine(warning).replace(/^• /, "")}`;
+}
+
+function formatConfigureWarningsBatch(warnings: ConfigureWarning[]): string {
+  return warnings.map(formatConfigureWarningLine).join("\n\n");
+}
+
+async function deliverConfigureWarningBatch(
+  opts: ConfigureWarningOptions,
+  warnings: ConfigureWarning[],
+): Promise<boolean> {
+  const delivery = opts.delivery ?? "toast";
+  const message = formatConfigureWarningsBatch(warnings);
+  const title = warnings.length === 1 ? `AFT: ${warningTitle(warnings[0]!)}` : "AFT: Missing tools";
+
+  if (delivery === "log") {
+    warn(`[aft-plugin] configure warnings:\n${message}`);
+    sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+    return true;
+  }
+
+  if (delivery !== "chat") {
+    const toastSent = await showTuiToast(opts.client, title, message, "warning", 10_000);
+    if (toastSent) return true;
+
+    const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
+    if (effectiveServerUrl) {
+      const httpToast = await showToastViaHttp(
+        effectiveServerUrl,
+        title,
+        message,
+        "warning",
+        10_000,
+      );
+      if (httpToast) return true;
+    }
+
+    warn(`[aft-plugin] configure warnings (toast unavailable):\n${message}`);
+    sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+    return true;
+  }
+
+  let delivered = false;
+  for (const warning of warnings) {
+    const ok = await sendIgnoredMessage(
+      opts.client,
+      opts.sessionId,
+      formatConfigureWarningChat(warning),
+      { includeAgent: false },
+    );
+    delivered = delivered || ok;
+  }
+  return delivered;
 }
 
 export async function deliverConfigureWarnings(
@@ -628,22 +709,19 @@ export async function deliverConfigureWarnings(
   }
   if (warnings.length === 0) return;
 
-  // `warned_tools` now persists through the bridge DB state API. This loses the
-  // old file-lock read-modify-write mutex, so two same-process concurrent
-  // recordWarning calls could race and drop one key. Configure warnings are
-  // delivered sequentially in normal plugin flow; if this becomes observable,
-  // add a bridge-side atomic update command rather than reviving file locks.
+  const pending: ConfigureWarning[] = [];
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
     if (await hasWarnedFor(opts.bridge, key)) continue;
+    pending.push(warning);
+  }
+  if (pending.length === 0) return;
 
-    const delivered = await sendIgnoredMessage(
-      opts.client,
-      opts.sessionId,
-      formatConfigureWarning(warning),
-    );
-    if (!delivered) continue;
+  const delivered = await deliverConfigureWarningBatch(opts, pending);
+  if (!delivered) return;
 
+  for (const warning of pending) {
+    const key = warningKey(warning, opts.projectRoot);
     await recordWarning(opts.bridge, key);
   }
 }

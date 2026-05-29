@@ -64,6 +64,7 @@ describe("configure_warnings push-frame handler", () => {
       warnings: [baseWarning()],
       storageDir,
       pluginVersion: "1.0.0",
+      delivery: "chat",
     });
 
     expect(messages).toHaveLength(1);
