@@ -1,4 +1,4 @@
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readSync, statSync } from "node:fs";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
@@ -159,7 +159,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
     pluginCache,
     storageDir: {
       path: storage,
-      exists: existsSync(storage),
+      exists: storageAccessible,
       sizesByKey: describeStorage,
     },
     onnxRuntime: {
