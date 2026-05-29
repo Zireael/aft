@@ -295,7 +295,10 @@ fn semantic_search_returns_not_ready_without_an_index() {
         json!({
             "id": "semantic-not-ready",
             "command": "semantic_search",
-            "query": "request handling",
+            // Natural-language phrasing so auto mode does not classify this as an
+            // Identifier (which triggers lexical grep fallback with status "ready"
+            // when semantic search is disabled).
+            "query": "how does request handling work",
         }),
     );
 
@@ -330,7 +333,7 @@ fn semantic_search_returns_disabled_when_feature_is_off() {
         json!({
             "id": "semantic-disabled",
             "command": "semantic_search",
-            "query": "request handling",
+            "query": "how does request handling work",
         }),
     );
 
