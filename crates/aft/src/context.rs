@@ -16,6 +16,7 @@ use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
+use crate::inspect::InspectManager;
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
@@ -81,8 +82,9 @@ fn status_debounce_loop(
         }
     }
 }
+use crate::cache_freshness::FileFreshness;
 use crate::search_index::SearchIndex;
-use crate::semantic_index::SemanticIndex;
+use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
 
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
@@ -142,6 +144,29 @@ pub enum SemanticIndexEvent {
     Ready(SemanticIndex),
     Failed(String),
 }
+
+#[derive(Debug, Clone)]
+pub struct SemanticRefreshRequest {
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum SemanticRefreshEvent {
+    Started {
+        paths: Vec<PathBuf>,
+    },
+    Completed {
+        added_entries: Vec<EmbeddingEntry>,
+        updated_metadata: Vec<(PathBuf, FileFreshness)>,
+        completed_paths: Vec<PathBuf>,
+    },
+    Failed {
+        paths: Vec<PathBuf>,
+        error: String,
+    },
+}
+
+pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 
 /// Normalize a path by resolving `.` and `..` components lexically,
 /// without touching the filesystem. This prevents path traversal
@@ -339,9 +364,13 @@ pub struct AppContext {
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     symbol_cache: SharedSymbolCache,
+    inspect_manager: Arc<InspectManager>,
     semantic_index: RefCell<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
+    semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
+    semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
+    semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
@@ -411,9 +440,13 @@ impl AppContext {
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
             symbol_cache,
+            inspect_manager: Arc::new(InspectManager::new()),
             semantic_index: RefCell::new(None),
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
+            semantic_refresh_tx: RefCell::new(None),
+            semantic_refresh_event_rx: RefCell::new(None),
+            semantic_refresh_worker: RefCell::new(None),
             semantic_embedding_model: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
@@ -755,6 +788,10 @@ impl AppContext {
         self.storage_dir().join(self.harness().as_str())
     }
 
+    pub fn inspect_dir(&self) -> PathBuf {
+        self.harness_dir().join("inspect")
+    }
+
     pub fn bash_tasks_dir(&self, session_id: &str) -> PathBuf {
         self.harness_dir()
             .join("bash-tasks")
@@ -846,6 +883,10 @@ impl AppContext {
         &self.search_index_rx
     }
 
+    pub fn inspect_manager(&self) -> Arc<InspectManager> {
+        Arc::clone(&self.inspect_manager)
+    }
+
     /// Access the shared symbol cache.
     pub fn symbol_cache(&self) -> SharedSymbolCache {
         Arc::clone(&self.symbol_cache)
@@ -873,6 +914,40 @@ impl AppContext {
 
     pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {
         &self.semantic_index_status
+    }
+
+    pub fn install_semantic_refresh_worker(
+        &self,
+        sender: crossbeam_channel::Sender<SemanticRefreshRequest>,
+        event_rx: crossbeam_channel::Receiver<SemanticRefreshEvent>,
+        worker_slot: SemanticRefreshWorkerSlot,
+    ) {
+        self.clear_semantic_refresh_worker();
+        *self.semantic_refresh_tx.borrow_mut() = Some(sender);
+        *self.semantic_refresh_event_rx.borrow_mut() = Some(event_rx);
+        *self.semantic_refresh_worker.borrow_mut() = Some(worker_slot);
+    }
+
+    pub fn clear_semantic_refresh_worker(&self) {
+        *self.semantic_refresh_tx.borrow_mut() = None;
+        *self.semantic_refresh_event_rx.borrow_mut() = None;
+        if let Some(worker_slot) = self.semantic_refresh_worker.borrow_mut().take() {
+            if let Ok(mut handle) = worker_slot.lock() {
+                drop(handle.take());
+            }
+        }
+    }
+
+    pub fn semantic_refresh_sender(
+        &self,
+    ) -> Option<crossbeam_channel::Sender<SemanticRefreshRequest>> {
+        self.semantic_refresh_tx.borrow().clone()
+    }
+
+    pub fn semantic_refresh_event_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>> {
+        &self.semantic_refresh_event_rx
     }
 
     /// Access the cached semantic embedding model.

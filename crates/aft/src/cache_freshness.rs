@@ -1,8 +1,13 @@
 use std::fs;
 use std::path::Path;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
+
+#[cfg(debug_assertions)]
+static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFreshness {
@@ -54,7 +59,21 @@ pub fn verify_file(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
 }
 
 pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
+    #[cfg(debug_assertions)]
+    STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
     verify_file_inner(path, cached, true)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_verify_file_strict_count_for_debug() {
+    STRICT_VERIFY_FILE_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn verify_file_strict_count_for_debug() -> usize {
+    STRICT_VERIFY_FILE_CALLS.load(Ordering::Relaxed)
 }
 
 fn verify_file_inner(

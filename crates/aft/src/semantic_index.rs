@@ -816,10 +816,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
         #[link(name = "version")]
         extern "system" {
-            fn GetFileVersionInfoSizeW(
-                lptstrFilename: *const u16,
-                lpdwHandle: *mut u32,
-            ) -> u32;
+            fn GetFileVersionInfoSizeW(lptstrFilename: *const u16, lpdwHandle: *mut u32) -> u32;
             fn GetFileVersionInfoW(
                 lptstrFilename: *const u16,
                 dwHandle: u32,
@@ -838,8 +835,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
         struct VS_FIXEDFILEINFO {
             dw_signature: u32,
             dw_struc_version: u32,
-            dw_file_version_ms: u32,   // HIWORD major, LOWORD minor
-            dw_file_version_ls: u32,   // HIWORD build, LOWORD revision
+            dw_file_version_ms: u32, // HIWORD major, LOWORD minor
+            dw_file_version_ls: u32, // HIWORD build, LOWORD revision
             dw_product_version_ms: u32,
             dw_product_version_ls: u32,
             dw_file_flags_mask: u32,
@@ -881,8 +878,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 32767);
             if path_len > 0 {
                 let mut dummy_handle: u32 = 0;
-                let info_size =
-                    GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
+                let info_size = GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
                 if info_size > 0 {
                     let mut info = vec![0u8; info_size as usize];
                     if GetFileVersionInfoW(
@@ -893,8 +889,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     ) != 0
                     {
                         let sub_block = "\\\0".encode_utf16().collect::<Vec<u16>>();
-                        let mut vs_info: *mut std::ffi::c_void =
-                            std::ptr::null_mut();
+                        let mut vs_info: *mut std::ffi::c_void = std::ptr::null_mut();
                         let mut vs_len: u32 = 0;
                         if VerQueryValueW(
                             info.as_mut_ptr() as *mut std::ffi::c_void,
@@ -906,8 +901,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                         {
                             let fixed = vs_info as *const VS_FIXEDFILEINFO;
                             detected_major = (*fixed).dw_file_version_ms >> 16;
-                            detected_minor =
-                                (*fixed).dw_file_version_ms & 0xFFFF;
+                            detected_minor = (*fixed).dw_file_version_ms & 0xFFFF;
                         }
                     }
                 }
@@ -918,9 +912,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             // Version compatibility check (mirrors the Linux/macOS path).
             // If version could not be detected (detected_major == 0) we let
             // the load succeed — the ort crate will diagnose further.
-            if detected_major != 0
-                && (detected_major != 1 || detected_minor < 20)
-            {
+            if detected_major != 0 && (detected_major != 1 || detected_minor < 20) {
                 let ver = format!("{}.{}", detected_major, detected_minor);
                 return Err(format_ort_version_mismatch(&ver, lib_name));
             }
@@ -1085,14 +1077,14 @@ pub struct SemanticChunk {
 }
 
 /// A stored embedding entry — chunk metadata + vector
-#[derive(Debug)]
-struct EmbeddingEntry {
+#[derive(Debug, Clone)]
+pub struct EmbeddingEntry {
     chunk: SemanticChunk,
     vector: Vec<f32>,
 }
 
 /// The semantic index — stores embeddings for all symbols in a project
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SemanticIndex {
     entries: Vec<EmbeddingEntry>,
     /// Track which files are indexed and their mtime for staleness detection
@@ -1128,6 +1120,14 @@ impl RefreshSummary {
     pub fn is_noop(&self) -> bool {
         self.changed == 0 && self.added == 0 && self.deleted == 0
     }
+}
+
+#[derive(Debug, Default)]
+pub struct InvalidatedFilesRefresh {
+    pub added_entries: Vec<EmbeddingEntry>,
+    pub updated_metadata: Vec<(PathBuf, FileFreshness)>,
+    pub completed_paths: Vec<PathBuf>,
+    pub summary: RefreshSummary,
 }
 
 /// Search result from a semantic query
@@ -1598,6 +1598,208 @@ impl SemanticIndex {
             deleted: deleted.len(),
             total_processed,
         })
+    }
+
+    /// Refresh exactly the files invalidated by the live watcher, without
+    /// treating the provided path list as the whole project. This is the
+    /// watcher-side counterpart to `refresh_stale_files`: it drops any stale
+    /// entries for the requested paths from this in-memory index, re-extracts
+    /// whatever still exists on disk, embeds those chunks, and returns the
+    /// delta needed for another in-memory index to apply the same update.
+    pub fn refresh_invalidated_files<F, P>(
+        &mut self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+    ) -> Result<InvalidatedFilesRefresh, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        self.backfill_missing_file_sizes();
+
+        let mut requested_paths = paths.to_vec();
+        requested_paths.sort();
+        requested_paths.dedup();
+        let total_processed = requested_paths.len();
+
+        if requested_paths.is_empty() {
+            progress(0, 0);
+            return Ok(InvalidatedFilesRefresh {
+                summary: RefreshSummary {
+                    total_processed,
+                    ..RefreshSummary::default()
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let previously_indexed: HashSet<PathBuf> = requested_paths
+            .iter()
+            .filter(|path| self.file_mtimes.contains_key(*path))
+            .cloned()
+            .collect();
+
+        // The watcher path has already invalidated these files in the request
+        // thread's live index. Mirror that behavior here before inserting any
+        // fresh chunks so parse/read failures do not resurrect stale entries.
+        self.remove_indexed_files(&requested_paths);
+
+        let existing_paths = requested_paths
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        let deleted = requested_paths
+            .iter()
+            .filter(|path| !path.exists() && previously_indexed.contains(path.as_path()))
+            .count();
+
+        if existing_paths.is_empty() {
+            progress(0, 0);
+            return Ok(InvalidatedFilesRefresh {
+                completed_paths: requested_paths,
+                summary: RefreshSummary {
+                    deleted,
+                    total_processed,
+                    ..RefreshSummary::default()
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+        let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+        let changed = successful_files
+            .iter()
+            .filter(|path| previously_indexed.contains(path.as_path()))
+            .count();
+        let added = successful_files.len().saturating_sub(changed);
+        let mut updated_metadata = Vec::with_capacity(fresh_metadata.len());
+
+        if chunks.is_empty() {
+            progress(0, 0);
+            for (file, metadata) in fresh_metadata {
+                let freshness = FileFreshness {
+                    mtime: metadata.mtime,
+                    size: metadata.size,
+                    content_hash: metadata.content_hash,
+                };
+                self.file_mtimes.insert(file.clone(), freshness.mtime);
+                self.file_sizes.insert(file.clone(), freshness.size);
+                self.file_hashes
+                    .insert(file.clone(), freshness.content_hash);
+                updated_metadata.push((file, freshness));
+            }
+
+            return Ok(InvalidatedFilesRefresh {
+                updated_metadata,
+                completed_paths: requested_paths,
+                summary: RefreshSummary {
+                    changed,
+                    added,
+                    deleted,
+                    total_processed,
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+        let batch_size = max_batch_size.max(1);
+        let mut observed_dimension = if self.entries.is_empty() && previously_indexed.is_empty() {
+            None
+        } else {
+            Some(self.dimension)
+        };
+        let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
+
+        for batch_start in (0..chunks.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(chunks.len());
+            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|chunk| chunk.embed_text.clone())
+                .collect();
+
+            let vectors = embed_fn(batch_texts)?;
+            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
+
+            if let Some(dim) = vectors.first().map(|vector| vector.len()) {
+                match observed_dimension {
+                    None => observed_dimension = Some(dim),
+                    Some(expected) if dim != expected => {
+                        return Err(format!(
+                            "embedding dimension changed during invalidated-file refresh: \
+                             cached index uses {expected}, new vectors use {dim}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (i, vector) in vectors.into_iter().enumerate() {
+                let chunk_idx = batch_start + i;
+                new_entries.push(EmbeddingEntry {
+                    chunk: chunks[chunk_idx].clone(),
+                    vector,
+                });
+            }
+
+            progress(new_entries.len(), total_chunks);
+        }
+
+        let added_entries = new_entries.clone();
+        self.entries.extend(new_entries);
+        for (file, metadata) in fresh_metadata {
+            let freshness = FileFreshness {
+                mtime: metadata.mtime,
+                size: metadata.size,
+                content_hash: metadata.content_hash,
+            };
+            self.file_mtimes.insert(file.clone(), freshness.mtime);
+            self.file_sizes.insert(file.clone(), freshness.size);
+            self.file_hashes
+                .insert(file.clone(), freshness.content_hash);
+            updated_metadata.push((file, freshness));
+        }
+        if let Some(dim) = observed_dimension {
+            self.dimension = dim;
+        }
+
+        Ok(InvalidatedFilesRefresh {
+            added_entries,
+            updated_metadata,
+            completed_paths: requested_paths,
+            summary: RefreshSummary {
+                changed,
+                added,
+                deleted,
+                total_processed,
+            },
+        })
+    }
+
+    pub fn apply_refresh_update(
+        &mut self,
+        added_entries: Vec<EmbeddingEntry>,
+        updated_metadata: Vec<(PathBuf, FileFreshness)>,
+        completed_paths: &[PathBuf],
+    ) {
+        self.remove_indexed_files(completed_paths);
+
+        let observed_dimension = added_entries.first().map(|entry| entry.vector.len());
+        self.entries.extend(added_entries);
+        for (file, freshness) in updated_metadata {
+            self.file_mtimes.insert(file.clone(), freshness.mtime);
+            self.file_sizes.insert(file.clone(), freshness.size);
+            self.file_hashes.insert(file, freshness.content_hash);
+        }
+        if let Some(dim) = observed_dimension {
+            self.dimension = dim;
+        }
     }
 
     fn remove_indexed_files(&mut self, files: &[PathBuf]) {

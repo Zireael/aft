@@ -236,9 +236,29 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // instead of omitting optional params. Use `isEmptyParam` so e.g.
         // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
         // against fields the agent didn't actually intend to provide.
+        // `targets` also accepts nested object/array shapes. Only treat
+        // `targets` as not-provided when EVERY entry is fully empty
+        // (`[{filePath: "", symbol: ""}]`, `{filePath: "", symbol: ""}`)
+        // — that's the GPT-class "I didn't intend this param" signal.
+        // If any entry has even one non-empty field, the agent intends
+        // targets mode; let the per-entry validation below surface the
+        // specific error ("targets[0].filePath must be non-empty" etc).
+        const hasTargetsProvided = (t: unknown): boolean => {
+          if (isEmptyParam(t)) return false;
+          const entryEmpty = (entry: unknown): boolean => {
+            if (!entry || typeof entry !== "object") return true;
+            const fp = (entry as { filePath?: unknown }).filePath;
+            const sym = (entry as { symbol?: unknown }).symbol;
+            const fpEmpty = typeof fp !== "string" || fp.length === 0;
+            const symEmpty = typeof sym !== "string" || sym.length === 0;
+            return fpEmpty && symEmpty;
+          };
+          if (Array.isArray(t)) return !t.every(entryEmpty);
+          return !entryEmpty(t);
+        };
         const hasFilePath = !isEmptyParam(args.filePath);
         const hasUrl = !isEmptyParam(args.url);
-        const hasTargets = !isEmptyParam(args.targets);
+        const hasTargets = hasTargetsProvided(args.targets);
         const hasSymbols = !isEmptyParam(args.symbols);
 
         // Set TUI title + scalar metadata BEFORE any bridge call so even

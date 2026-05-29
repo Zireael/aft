@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
@@ -14,11 +14,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
-use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+};
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
@@ -30,6 +33,8 @@ use crate::{slog_info, slog_warn};
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 const MAX_SEARCH_INDEX_FILES: usize = 20_000;
+const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
+const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -95,6 +100,111 @@ where
 
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
     let _ = install_project_watcher_with(ctx, root_path, create_project_watcher);
+}
+
+fn spawn_semantic_refresh_worker(
+    project_root: PathBuf,
+    mut index: SemanticIndex,
+    mut model: crate::semantic_index::EmbeddingModel,
+    max_batch_size: usize,
+    request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
+    event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
+    session_id: Option<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            while let Ok(first_request) = request_rx.recv() {
+                let mut paths = first_request.paths;
+                let mut disconnected = false;
+                let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
+                let mut deadline = Instant::now() + quiet_window;
+
+                while paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match request_rx.recv_timeout(remaining) {
+                        Ok(request) => {
+                            paths.extend(request.paths);
+                            if paths.len() >= SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                                break;
+                            }
+                            deadline = Instant::now() + quiet_window;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if disconnected {
+                    break;
+                }
+
+                paths.sort();
+                paths.dedup();
+                if paths.is_empty() {
+                    continue;
+                }
+
+                if event_tx
+                    .send(SemanticRefreshEvent::Started {
+                        paths: paths.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+
+                let mut embed = |texts: Vec<String>| model.embed(texts);
+                let mut progress = |_done: usize, _total: usize| {};
+                match index.refresh_invalidated_files(
+                    &project_root,
+                    &paths,
+                    &mut embed,
+                    max_batch_size,
+                    &mut progress,
+                ) {
+                    Ok(update) => {
+                        if !update.summary.is_noop() {
+                            slog_info!(
+                                "semantic refresh: {} changed, {} new, {} deleted, {} total processed",
+                                update.summary.changed,
+                                update.summary.added,
+                                update.summary.deleted,
+                                update.summary.total_processed,
+                            );
+                        }
+                        if event_tx
+                            .send(SemanticRefreshEvent::Completed {
+                                added_entries: update.added_entries,
+                                updated_metadata: update.updated_metadata,
+                                completed_paths: update.completed_paths,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        slog_warn!(
+                            "semantic refresh failed for {} file(s): {}",
+                            paths.len(),
+                            error
+                        );
+                        if event_tx
+                            .send(SemanticRefreshEvent::Failed { paths, error })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    })
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
@@ -1016,6 +1126,146 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     warnings
 }
 
+type SearchIndexSymbolFile = (PathBuf, SystemTime);
+
+fn search_index_symbol_files(index: &SearchIndex) -> Vec<SearchIndexSymbolFile> {
+    index
+        .files
+        .iter()
+        .filter(|entry| !entry.path.as_os_str().is_empty())
+        .map(|entry| (entry.path.clone(), entry.modified))
+        .collect()
+}
+
+fn spawn_symbol_cache_prewarm(
+    root: PathBuf,
+    symbol_cache: SharedSymbolCache,
+    symbol_storage: Option<PathBuf>,
+    symbol_project_key: String,
+    symbol_cache_generation: u64,
+    symbol_files: Vec<SearchIndexSymbolFile>,
+    is_worktree_bridge: bool,
+    session_id: Option<String>,
+) {
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            prewarm_symbol_cache_from_search_files(
+                root,
+                symbol_cache,
+                symbol_storage,
+                symbol_project_key,
+                symbol_cache_generation,
+                symbol_files,
+                is_worktree_bridge,
+            );
+        });
+    });
+}
+
+fn prewarm_symbol_cache_from_search_files(
+    root: PathBuf,
+    symbol_cache: SharedSymbolCache,
+    symbol_storage: Option<PathBuf>,
+    symbol_project_key: String,
+    symbol_cache_generation: u64,
+    symbol_files: Vec<SearchIndexSymbolFile>,
+    is_worktree_bridge: bool,
+) {
+    #[cfg(debug_assertions)]
+    delay_symbol_prewarm_for_debug();
+
+    let mut warmed_files = 0usize;
+    let mut skipped_files = 0usize;
+    if let Ok(mut cache) = symbol_cache.write() {
+        if !cache.set_project_root_for_generation(symbol_cache_generation, root.clone()) {
+            slog_info!("skipping stale symbol cache prewarm after reconfigure");
+            return;
+        }
+        if let Some(storage_dir) = symbol_storage.as_deref() {
+            let loaded_count = cache.load_from_disk_for_generation(
+                symbol_cache_generation,
+                storage_dir,
+                &symbol_project_key,
+                &root,
+            );
+            slog_info!("loaded symbol cache from disk: {} files", loaded_count);
+        }
+    } else {
+        return;
+    }
+
+    let mut parser = crate::parser::FileParser::with_symbol_cache_generation(
+        symbol_cache.clone(),
+        Some(symbol_cache_generation),
+    );
+    for (path, modified) in &symbol_files {
+        let cached = symbol_cache
+            .read()
+            .map(|cache| cache.contains_path_with_mtime(path, *modified))
+            .unwrap_or(false);
+        if cached {
+            skipped_files += 1;
+            continue;
+        }
+        if parser.extract_symbols(path).is_ok() {
+            warmed_files += 1;
+        }
+    }
+
+    let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
+    if !is_worktree_bridge {
+        if let Some(storage_dir) = symbol_storage.as_deref() {
+            if let Ok(cache) = symbol_cache.read() {
+                if cache.generation() != symbol_cache_generation {
+                    slog_info!("skipping stale symbol cache persistence after reconfigure");
+                    return;
+                }
+                match crate::symbol_cache_disk::write_to_disk(
+                    &cache,
+                    storage_dir,
+                    &symbol_project_key,
+                ) {
+                    Ok(()) => {
+                        slog_info!("persisted symbol cache: {} files", cache.len());
+                    }
+                    Err(error) => {
+                        slog_warn!("failed to persist symbol cache: {}", error);
+                    }
+                }
+            }
+        }
+    }
+    slog_info!(
+        "pre-warmed symbol cache: {} new, {} cached, {} files total",
+        warmed_files,
+        skipped_files,
+        total_files
+    );
+}
+
+#[cfg(debug_assertions)]
+fn delay_symbol_prewarm_for_debug() {
+    let Some(delay_ms) = std::env::var("AFT_TEST_SYMBOL_PREWARM_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay_ms));
+}
+
+#[cfg(debug_assertions)]
+fn mark_search_rebuild_spawn_for_debug() {
+    let Some(path) = std::env::var_os("AFT_TEST_SEARCH_REBUILD_THREAD_MARKER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"spawned");
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1468,6 +1718,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;
 
     // Snapshot accumulated degraded reasons on the context so status /
@@ -1487,132 +1738,94 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if search_index {
         let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
         let current_head = current_git_head(&canonical_cache_root);
-        let mut baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
+        let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
         search_index_cache_reused = baseline.is_some();
 
-        if let Some(index) = baseline.as_mut() {
-            if index.stored_git_head() == current_head.as_deref() {
-                index.verify_against_disk(current_head.clone());
-                *ctx.search_index().borrow_mut() = Some(index.clone());
-            } else {
-                index.set_ready(false);
-                *ctx.search_index().borrow_mut() = Some(index.clone());
-            }
-        }
-
-        let (tx, rx): (
-            crossbeam_channel::Sender<SearchIndex>,
-            crossbeam_channel::Receiver<SearchIndex>,
-        ) = unbounded();
-        *ctx.search_index_rx().borrow_mut() = Some(rx);
-
-        let root_clone = canonical_cache_root.clone();
+        let root_for_prewarm = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
         let symbol_project_key = project_cache_key(&canonical_cache_root);
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let session_id_for_bg = log_ctx::current_session();
-        thread::spawn(move || {
-            log_ctx::with_session(session_id_for_bg, || {
-                let _cache_lock = if is_worktree_bridge_for_search {
-                    None
-                } else {
-                    match CacheLock::acquire(&cache_dir) {
-                        Ok(lock) => Some(lock),
-                        Err(error) => {
-                            slog_warn!("failed to acquire search cache lock: {}", error);
-                            None
-                        }
-                    }
-                };
-                let index = SearchIndex::rebuild_or_refresh(
-                    &root_clone,
-                    search_index_max_file_size,
-                    current_head,
-                    baseline,
+
+        match baseline {
+            Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                index.verify_against_disk(current_head.clone());
+                let symbol_files = search_index_symbol_files(&index);
+                *ctx.search_index().borrow_mut() = Some(index);
+                spawn_symbol_cache_prewarm(
+                    root_for_prewarm,
+                    symbol_cache,
+                    symbol_storage,
+                    symbol_project_key,
+                    symbol_cache_generation,
+                    symbol_files,
+                    is_worktree_bridge_for_search,
+                    session_id_for_bg,
                 );
-                if !is_worktree_bridge_for_search {
-                    index.write_to_disk(&cache_dir, index.stored_git_head());
+            }
+            mut baseline => {
+                if let Some(index) = baseline.as_mut() {
+                    index.set_ready(false);
+                    *ctx.search_index().borrow_mut() = Some(index.clone());
                 }
 
-                // Pre-warm symbol cache from indexed files
-                let mut warmed_files = 0usize;
-                let mut skipped_files = 0usize;
-                if let Ok(mut cache) = symbol_cache.write() {
-                    if !cache.set_project_root_for_generation(
-                        symbol_cache_generation,
-                        root_clone.clone(),
-                    ) {
-                        slog_info!("skipping stale symbol cache prewarm after reconfigure");
-                        return;
-                    }
-                    if let Some(storage_dir) = symbol_storage.as_deref() {
-                        let loaded_count = cache.load_from_disk_for_generation(
+                let (tx, rx): (
+                    crossbeam_channel::Sender<SearchIndex>,
+                    crossbeam_channel::Receiver<SearchIndex>,
+                ) = unbounded();
+                *ctx.search_index_rx().borrow_mut() = Some(rx);
+
+                #[cfg(debug_assertions)]
+                mark_search_rebuild_spawn_for_debug();
+
+                let root_clone = canonical_cache_root.clone();
+                thread::spawn(move || {
+                    let session_id_for_prewarm = session_id_for_bg.clone();
+                    log_ctx::with_session(session_id_for_bg, || {
+                        let index = {
+                            let _cache_lock = if is_worktree_bridge_for_search {
+                                None
+                            } else {
+                                match CacheLock::acquire(&cache_dir) {
+                                    Ok(lock) => Some(lock),
+                                    Err(error) => {
+                                        slog_warn!(
+                                            "failed to acquire search cache lock: {}",
+                                            error
+                                        );
+                                        None
+                                    }
+                                }
+                            };
+                            let index = SearchIndex::rebuild_or_refresh(
+                                &root_clone,
+                                search_index_max_file_size,
+                                current_head,
+                                baseline,
+                            );
+                            if !is_worktree_bridge_for_search {
+                                index.write_to_disk(&cache_dir, index.stored_git_head());
+                            }
+                            index
+                        };
+
+                        let symbol_files = search_index_symbol_files(&index);
+                        let _ = tx.send(index);
+                        spawn_symbol_cache_prewarm(
+                            root_clone,
+                            symbol_cache,
+                            symbol_storage,
+                            symbol_project_key,
                             symbol_cache_generation,
-                            storage_dir,
-                            &symbol_project_key,
-                            &root_clone,
+                            symbol_files,
+                            is_worktree_bridge_for_search,
+                            session_id_for_prewarm,
                         );
-                        slog_info!("loaded symbol cache from disk: {} files", loaded_count);
-                    }
-                } else {
-                    return;
-                }
-                let mut parser = crate::parser::FileParser::with_symbol_cache_generation(
-                    symbol_cache.clone(),
-                    Some(symbol_cache_generation),
-                );
-                for file_entry in &index.files {
-                    let cached = symbol_cache
-                        .read()
-                        .map(|cache| {
-                            cache.contains_path_with_mtime(&file_entry.path, file_entry.modified)
-                        })
-                        .unwrap_or(false);
-                    if cached {
-                        skipped_files += 1;
-                        continue;
-                    }
-                    if parser.extract_symbols(&file_entry.path).is_ok() {
-                        warmed_files += 1;
-                    }
-                }
-
-                let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
-                if !is_worktree_bridge_for_search {
-                    if let Some(storage_dir) = symbol_storage.as_deref() {
-                        if let Ok(cache) = symbol_cache.read() {
-                            if cache.generation() != symbol_cache_generation {
-                                slog_info!(
-                                    "skipping stale symbol cache persistence after reconfigure"
-                                );
-                                return;
-                            }
-                            match crate::symbol_cache_disk::write_to_disk(
-                                &cache,
-                                storage_dir,
-                                &symbol_project_key,
-                            ) {
-                                Ok(()) => {
-                                    slog_info!("persisted symbol cache: {} files", cache.len());
-                                }
-                                Err(error) => {
-                                    slog_warn!("failed to persist symbol cache: {}", error);
-                                }
-                            }
-                        }
-                    }
-                }
-                slog_info!(
-                    "pre-warmed symbol cache: {} new, {} cached, {} files total",
-                    warmed_files,
-                    skipped_files,
-                    total_files
-                );
-
-                let _ = tx.send(index);
-            });
-        });
+                    });
+                });
+            }
+        }
     }
 
     if semantic_search {
@@ -1636,6 +1849,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ) = unbounded();
         *ctx.semantic_index_rx().borrow_mut() = Some(rx);
 
+        let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
+        let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
+        let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker(
+            refresh_tx,
+            refresh_event_rx,
+            Arc::clone(&refresh_worker_slot),
+        );
+
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
@@ -1651,7 +1873,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 const MAX_SEMANTIC_FILES: usize = 10_000;
 
                 let build_result = catch_unwind(AssertUnwindSafe(
-                    || -> Result<SemanticIndex, String> {
+                    || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
                             files: None,
@@ -1762,7 +1984,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             entries_done: Some(cached.entry_count()),
                                             entries_total: Some(cached.entry_count()),
                                         });
-                                        return Ok(cached);
+                                        return Ok((cached, model));
                                     }
                                     Err(error) => {
                                         // Hard failure (dimension mismatch, embed backend
@@ -1842,12 +2064,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
-                        Ok(index)
+                        Ok((index, model))
                     },
                 ));
 
                 let event = match build_result {
-                    Ok(Ok(index)) => SemanticIndexEvent::Ready(index),
+                    Ok(Ok((index, model))) => {
+                        let worker_index = index.clone();
+                        let worker_handle = spawn_semantic_refresh_worker(
+                            root_clone.clone(),
+                            worker_index,
+                            model,
+                            semantic_config.max_batch_size.max(1),
+                            refresh_rx,
+                            refresh_event_tx,
+                            log_ctx::current_session(),
+                        );
+                        if let Ok(mut slot) = refresh_worker_slot.lock() {
+                            *slot = Some(worker_handle);
+                        }
+                        SemanticIndexEvent::Ready(index)
+                    }
                     Ok(Err(error)) => {
                         slog_warn!("failed to build semantic index: {}", error);
                         SemanticIndexEvent::Failed(error)

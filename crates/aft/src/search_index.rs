@@ -1010,6 +1010,12 @@ impl SearchIndex {
         self.ready = true;
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
+        self.verify_against_disk(current_head);
+    }
+
     pub(crate) fn rebuild_or_refresh(
         root: &Path,
         max_file_size: u64,
@@ -1732,9 +1738,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(index: &mut SearchIndex) {
-    // Collect stale files (mtime mismatch or deleted)
     let mut stale_paths = Vec::new();
-    for entry in &index.files {
+
+    for entry in &mut index.files {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
         }
@@ -1744,29 +1750,17 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
             content_hash: entry.content_hash,
         };
         match cache_freshness::verify_file_strict(&entry.path, &cached) {
-            FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. } => {}
+            FreshnessVerdict::HotFresh => {}
+            FreshnessVerdict::ContentFresh {
+                new_mtime,
+                new_size,
+            } => {
+                entry.modified = new_mtime;
+                entry.size = new_size;
+            }
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
                 stale_paths.push(entry.path.clone())
             }
-        }
-    }
-
-    for entry in &mut index.files {
-        if entry.path.as_os_str().is_empty() {
-            continue;
-        }
-        let cached = FileFreshness {
-            mtime: entry.modified,
-            size: entry.size,
-            content_hash: entry.content_hash,
-        };
-        if let FreshnessVerdict::ContentFresh {
-            new_mtime,
-            new_size,
-        } = cache_freshness::verify_file_strict(&entry.path, &cached)
-        {
-            entry.modified = new_mtime;
-            entry.size = new_size;
         }
     }
 
