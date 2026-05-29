@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Forward-looking types (TypedVector, StoredVector, etc.) not yet wired.
+
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 pub use crate::config::SemanticFilePolicy;
 use crate::config::{
@@ -106,7 +108,189 @@ impl std::fmt::Display for NormalizationPolicy {
     }
 }
 
-/// A profile describing the capabilities and expected output of an embedding model.
+// ────────────────────────────
+// Typed / stored vector types
+// ────────────────────────────
+
+/// A source embedding vector as received from a provider.
+///
+/// Embeddings may arrive in different formats depending on the provider and
+/// configuration (plain f32 arrays, base64-encoded int8, base64-encoded
+/// binary, etc.).  `TypedVector` captures the raw form so that the correct
+/// conversion strategy can be applied before storage.
+#[allow(dead_code)]
+pub(crate) enum TypedVector {
+    /// Standard dense f32 vector.
+    DenseF32(Vec<f32>),
+    /// Dense int8 vector (e.g. Perplexity base64_int8).
+    DenseInt8(Vec<i8>),
+    /// Binary packed vector (e.g. Perplexity base64_binary).
+    #[allow(dead_code)]
+    BinaryPacked {
+        /// Packed bytes (`ceil(logical_dims / 8)` bytes).
+        bytes: Vec<u8>,
+        /// Number of *logical* dimensions (bits).
+        logical_dims: usize,
+    },
+}
+
+impl TypedVector {
+    /// Return the [`VectorKind`] that describes this variant.
+    pub(crate) fn kind(&self) -> VectorKind {
+        match self {
+            Self::DenseF32(_) => VectorKind::DenseF32,
+            Self::DenseInt8(_) => VectorKind::DenseInt8,
+            Self::BinaryPacked { .. } => VectorKind::BinaryPacked,
+        }
+    }
+
+    /// Number of dimensions (logical bits for binary).
+    pub(crate) fn dims(&self) -> usize {
+        match self {
+            Self::DenseF32(v) => v.len(),
+            Self::DenseInt8(v) => v.len(),
+            Self::BinaryPacked { logical_dims, .. } => *logical_dims,
+        }
+    }
+
+    /// Convert to a [`StoredVector`] using the supplied storage strategy.
+    pub(crate) fn into_stored(
+        self,
+        strategy: crate::config::StorageStrategy,
+    ) -> Result<StoredVector, String> {
+        use crate::config::StorageStrategy;
+        match self {
+            Self::DenseF32(v) => match strategy {
+                StorageStrategy::NativeF32 => Ok(StoredVector::DenseF32(v)),
+                StorageStrategy::DecodeNormalizeF32 => {
+                    let sv = StoredVector::DenseF32(v);
+                    Ok(sv.l2_normalize())
+                }
+            },
+            Self::DenseInt8(v) => match strategy {
+                StorageStrategy::NativeF32 => {
+                    let f32s = v.into_iter().map(|x| x as f32).collect();
+                    Ok(StoredVector::DenseF32(f32s))
+                }
+                StorageStrategy::DecodeNormalizeF32 => {
+                    let f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
+                    Ok(StoredVector::DenseF32(f32s).l2_normalize())
+                }
+            },
+            Self::BinaryPacked {
+                bytes: _,
+                logical_dims,
+            } => Err(format!(
+                "BinaryPacked vectors are not yet supported (logical_dims={})",
+                logical_dims
+            )),
+        }
+    }
+
+    /// Decode a base64-encoded int8 embedding string.
+    pub(crate) fn decode_base64_int8(data: &str) -> Result<Self, String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| format!("base64 decode error: {}", e))?;
+        let ints: Vec<i8> = bytes.into_iter().map(|b| b as i8).collect();
+        Ok(Self::DenseInt8(ints))
+    }
+
+    /// Decode a base64-encoded binary embedding string.
+    pub(crate) fn decode_base64_binary(data: &str, logical_dims: usize) -> Result<Self, String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| format!("base64 decode error: {}", e))?;
+        let expected = logical_dims.div_ceil(8);
+        if bytes.len() < expected {
+            return Err(format!(
+                "binary embedding too short: got {} bytes, need {} for {} dims",
+                bytes.len(),
+                expected,
+                logical_dims
+            ));
+        }
+        Ok(Self::BinaryPacked {
+            bytes,
+            logical_dims,
+        })
+    }
+}
+
+/// A vector as stored in the index after conversion.
+///
+/// This is the final form that is written to the snapshot / disk cache.
+pub(crate) enum StoredVector {
+    /// Stored as dense f32 (for cosine / dot-product search).
+    DenseF32(Vec<f32>),
+    /// Stored as binary packed (for Hamming distance search).
+    BinaryPacked { bytes: Vec<u8>, logical_dims: usize },
+}
+
+impl StoredVector {
+    /// Return the [`VectorKind`] that describes this variant.
+    pub(crate) fn kind(&self) -> VectorKind {
+        match self {
+            Self::DenseF32(_) => VectorKind::DenseF32,
+            Self::BinaryPacked { .. } => VectorKind::BinaryPacked,
+        }
+    }
+
+    /// Number of dimensions (logical bits for binary).
+    pub(crate) fn dims(&self) -> usize {
+        match self {
+            Self::DenseF32(v) => v.len(),
+            Self::BinaryPacked { logical_dims, .. } => *logical_dims,
+        }
+    }
+
+    /// Return a view as an f32 slice.
+    ///
+    /// Returns `Err` for binary vectors which are not representable as f32.
+    pub(crate) fn to_f32_slice(&self) -> Result<&[f32], String> {
+        match self {
+            Self::DenseF32(v) => Ok(v),
+            Self::BinaryPacked { logical_dims, .. } => Err(format!(
+                "binary vector ({} logical bits) cannot be viewed as f32 slice",
+                logical_dims
+            )),
+        }
+    }
+
+    /// Return a view as packed bytes + logical dims.
+    ///
+    /// Returns `Err` for dense vectors.
+    pub(crate) fn to_packed(&self) -> Result<(&[u8], usize), String> {
+        match self {
+            Self::DenseF32(_) => Err("dense vector cannot be viewed as packed binary".to_string()),
+            Self::BinaryPacked {
+                bytes,
+                logical_dims,
+            } => Ok((bytes, *logical_dims)),
+        }
+    }
+
+    /// L2-normalize a dense f32 vector in place.
+    ///
+    /// No-op for binary vectors (returns `self` unchanged).
+    pub(crate) fn l2_normalize(self) -> Self {
+        match self {
+            Self::DenseF32(mut v) => {
+                let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+                if norm_sq > 0.0 {
+                    let norm = norm_sq.sqrt();
+                    for x in &mut v {
+                        *x /= norm;
+                    }
+                }
+                Self::DenseF32(v)
+            }
+            binary => binary,
+        }
+    }
+}
 ///
 /// Used to validate that user configuration is compatible with the selected
 /// provider/model before indexing starts.
@@ -128,6 +312,8 @@ pub struct EmbeddingModelProfile {
     pub metric: DistanceMetric,
     /// Normalization policy for stored vectors.
     pub normalization: NormalizationPolicy,
+    /// Storage strategy for converting source vectors to stored form.
+    pub storage_strategy: StorageStrategy,
     /// Supported dimension range: (min, max). None if unknown.
     pub dimension_range: Option<(usize, usize)>,
     /// Default dimension when not specified. None if unknown.
@@ -150,6 +336,7 @@ impl EmbeddingModelProfile {
             stored_vector_kind: VectorKind::DenseF32,
             metric: DistanceMetric::Cosine,
             normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
             dimension_range: Some((384, 384)),
             default_dimensions: Some(384),
             mrl_supported: false,
@@ -169,6 +356,7 @@ impl EmbeddingModelProfile {
             stored_vector_kind: VectorKind::DenseF32,
             metric: DistanceMetric::Auto,
             normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
             dimension_range: None,
             default_dimensions: None,
             mrl_supported: true,
@@ -187,6 +375,7 @@ impl EmbeddingModelProfile {
             stored_vector_kind: VectorKind::DenseF32,
             metric: DistanceMetric::Auto,
             normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
             dimension_range: None,
             default_dimensions: None,
             mrl_supported: false,
@@ -207,6 +396,7 @@ impl EmbeddingModelProfile {
             stored_vector_kind: VectorKind::DenseF32,
             metric: DistanceMetric::Cosine,
             normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
             dimension_range: None,
             default_dimensions: None,
             mrl_supported: false,
@@ -325,6 +515,70 @@ impl EmbeddingModelProfile {
         } else {
             Err(errors)
         }
+    }
+
+    /// Convert a source [`TypedVector`] into a [`StoredVector`] using this
+    /// profile's declared `source_vector_kind` and `stored_vector_kind`.
+    pub(crate) fn convert_vector(&self, typed: TypedVector) -> Result<StoredVector, String> {
+        let actual_kind = typed.kind();
+        if actual_kind != self.source_vector_kind {
+            return Err(format!(
+                "vector kind mismatch: got {:?}, expected {:?} per profile",
+                actual_kind, self.source_vector_kind
+            ));
+        }
+        let stored = typed.into_stored(self.storage_strategy)?;
+        if stored.kind() != self.stored_vector_kind {
+            return Err(format!(
+                "stored vector kind mismatch: got {:?}, expected {:?} per profile",
+                stored.kind(),
+                self.stored_vector_kind
+            ));
+        }
+        match self.normalization {
+            NormalizationPolicy::AlreadyNormalized | NormalizationPolicy::NotApplicable => {
+                Ok(stored)
+            }
+            NormalizationPolicy::NormalizeOnInsertQuery => Ok(stored.l2_normalize()),
+        }
+    }
+
+    /// Validate that the profile's own configuration is internally consistent.
+    pub(crate) fn validate_compatible(&self) -> Result<(), String> {
+        match (&self.source_vector_kind, &self.stored_vector_kind) {
+            (VectorKind::DenseF32, VectorKind::DenseF32)
+            | (VectorKind::DenseInt8, VectorKind::DenseF32) => Ok(()),
+            (VectorKind::BinaryPacked, VectorKind::BinaryPacked) => Ok(()),
+            (src, dst) => Err(format!(
+                "unsupported source→stored vector conversion: {:?} → {:?}",
+                src, dst
+            )),
+        }?;
+        match (&self.stored_vector_kind, &self.metric) {
+            (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Cosine)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::DotProduct)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Euclidean)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Auto) => Ok(()),
+            (VectorKind::BinaryPacked, DistanceMetric::Hamming)
+            | (VectorKind::BinaryPacked, DistanceMetric::Auto) => Ok(()),
+            (kind, metric) => Err(format!(
+                "metric {:?} is not compatible with stored vector kind {:?}",
+                metric, kind
+            )),
+        }?;
+        match (&self.output_encoding, &self.storage_strategy) {
+            (OutputEncoding::Float, StorageStrategy::NativeF32) => Ok(()),
+            (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32)
+            | (OutputEncoding::Base64Int8, StorageStrategy::NativeF32) => Ok(()),
+            (OutputEncoding::Base64Binary, _) => {
+                Err("base64_binary output encoding is not yet supported".to_string())
+            }
+            (enc, strat) => Err(format!(
+                "output encoding {:?} is not compatible with storage strategy {:?}",
+                enc, strat
+            )),
+        }?;
+        Ok(())
     }
 }
 
