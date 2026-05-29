@@ -39,7 +39,7 @@ fn path_looks_like_tool(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return metadata.permissions().mode() & 0o111 != 0;
+        metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
