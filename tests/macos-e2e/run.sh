@@ -105,10 +105,11 @@ export PATH="$HOME/.opencode/bin:$PATH"
 opencode --version
 
 # ---- Install aimock --------------------------------------------------------
-# Pinned to 1.17.0 to match the Linux harness — 1.18.0 renamed mock.onTurn(...)
-# and breaks our fixtures with `mock.onTurn is not a function`.
+# Pinned to the same version as bun.lock and the Linux harness. The mock server
+# relies on function-valued LLMock responses for turn logging and sequenceIndex
+# sibling progression for scripted turns; older 1.17.x installs lack that.
 echo "── Installing aimock ──"
-npm install -g @copilotkit/aimock@1.17.0
+npm install -g @copilotkit/aimock@1.24.0
 
 # ---- Set up test project ---------------------------------------------------
 # Mirror the structure Dockerfile.linux-x64 builds at /test/project.

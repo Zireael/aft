@@ -482,8 +482,19 @@ fn extract_impl_name(node: &Node, source: &str) -> Option<String> {
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+            if child.kind() == "type_identifier" {
                 type_names.push(node_text(source, &child).to_string());
+            } else if child.kind() == "generic_type" {
+                // `impl<T> Config<T>` parses the implemented type as a
+                // `generic_type` whose full text is "Config<T>". Descend to its
+                // base `type_identifier` ("Config") so the impl matches a scope
+                // requested as "Config" — otherwise the bare-name struct (whose
+                // type_identifier is "Config") wins the fallback and the method
+                // gets inserted into the struct's field list (invalid Rust).
+                let base = find_child_by_kind(&child, "type_identifier")
+                    .map(|id| node_text(source, &id).to_string())
+                    .unwrap_or_else(|| node_text(source, &child).to_string());
+                type_names.push(base);
             }
             if !cursor.goto_next_sibling() {
                 break;

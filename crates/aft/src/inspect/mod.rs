@@ -1,5 +1,7 @@
 pub mod cache;
+pub(crate) mod diagnostics_category;
 pub mod dispatch;
+mod entry_points;
 pub mod freshness;
 pub mod job;
 mod manager;

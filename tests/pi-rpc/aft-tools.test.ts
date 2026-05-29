@@ -78,10 +78,10 @@ async function withPiTool(
 }
 
 describe("AFT Pi tools (real Pi RPC)", () => {
-  test("aft_navigate trace_to_symbol returns a reachable path", async () => {
+  test("aft_callgraph trace_to_symbol returns a reachable path", async () => {
     const toolEnd = await withPiTool(
       {
-        name: "aft_navigate",
+        name: "aft_callgraph",
         arguments: {
           op: "trace_to_symbol",
           filePath: "trace.ts",

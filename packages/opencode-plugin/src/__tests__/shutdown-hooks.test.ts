@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { registerShutdownCleanup } from "../shutdown-hooks.js";
+import { registerShutdownCleanup, runCleanups } from "../shutdown-hooks.js";
 
 // Drain the globalThis guard between tests so we can simulate independent loads.
 function resetShutdownHookState(): void {
@@ -54,6 +54,22 @@ describe("registerShutdownCleanup", () => {
       }
     ).__aftShutdownHooks__;
     if (state) state.cleanups.clear();
+  });
+
+  test("runCleanups executes registered cleanups and allows later cleanup runs", async () => {
+    const calls: string[] = [];
+    registerShutdownCleanup(() => {
+      calls.push("first");
+    });
+
+    await runCleanups("test");
+
+    registerShutdownCleanup(() => {
+      calls.push("second");
+    });
+    await runCleanups("test-again");
+
+    expect(calls).toEqual(["first", "second"]);
   });
 
   test("unregister prevents the cleanup from being tracked", () => {

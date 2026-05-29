@@ -80,6 +80,8 @@ export interface LspConfig {
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
   python?: "pyright" | "ty" | "auto";
+  /** Restore legacy inline LSP waits on edit/write unless the tool call overrides diagnostics. */
+  diagnostics_on_edit?: boolean;
   auto_install?: boolean;
   grace_days?: number;
   versions?: Record<string, string>;
@@ -337,6 +339,11 @@ const LspConfigSchema = z.object({
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
+  /**
+   * Restore legacy edit behavior by waiting for inline LSP diagnostics on every
+   * edit/write call unless the tool call overrides diagnostics. Default: false.
+   */
+  diagnostics_on_edit: z.boolean().optional(),
   /**
    * Auto-install npm-distributed and GitHub-release language servers when
    * the project needs them. Default: true.
@@ -861,8 +868,14 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   // either — a hostile repo could silently disable LSP servers the user
   // relies on, suppressing diagnostics for its own malicious code
   // (audit v0.17 #5).
+  //
+  // SAFE project-level fields: python (per-language preference) and
+  // diagnostics_on_edit (agent workflow/latency preference only).
   const projectSafe: LspConfig = {};
   if (override?.python !== undefined) projectSafe.python = override.python;
+  if (override?.diagnostics_on_edit !== undefined) {
+    projectSafe.diagnostics_on_edit = override.diagnostics_on_edit;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = base?.disabled ?? [];

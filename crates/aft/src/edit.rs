@@ -138,11 +138,69 @@ pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
 }
 
 /// Check if the caller requested diff info in the response.
+///
+/// `include_diff` yields a compact counts-only diff (`additions`/`deletions`),
+/// which is what agent-facing/raw consumers should use — the payload does not
+/// scale with file size. Full before/after content requires the separate
+/// `include_diff_content` flag (UI metadata only); see [`wants_diff_content`].
 pub fn wants_diff(params: &serde_json::Value) -> bool {
     params
         .get("include_diff")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+        || wants_diff_content(params)
+}
+
+/// Check if the caller requested the full before/after file contents in the
+/// diff. This is for UI rendering only (e.g. the OpenCode/Pi plugins building a
+/// diff view in tool metadata) and is deliberately NOT the default: full
+/// content makes the response scale with file size, not edit size, which floods
+/// agent context on large files. Agent-facing/raw consumers should pass
+/// `include_diff` (counts only) instead.
+pub fn wants_diff_content(params: &serde_json::Value) -> bool {
+    params
+        .get("include_diff_content")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Compute compact diff counts (additions/deletions) without echoing any file
+/// content. This is the agent-facing default — the payload is constant-size
+/// regardless of how large the edited file is.
+pub fn compute_diff_counts(before: &str, after: &str) -> serde_json::Value {
+    use similar::ChangeTag;
+
+    let diff = similar::TextDiff::from_lines(before, after);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    serde_json::json!({
+        "additions": additions,
+        "deletions": deletions,
+    })
+}
+
+/// Pick the right diff shape for a response based on request flags.
+///
+/// Default (`include_diff`): compact counts only — constant-size payload that
+/// never floods agent context. Full before/after content is returned only when
+/// the caller explicitly opts in with `include_diff_content` (UI metadata path).
+pub fn compute_diff_for_response(
+    params: &serde_json::Value,
+    before: &str,
+    after: &str,
+) -> serde_json::Value {
+    if wants_diff_content(params) {
+        compute_diff_info(before, after)
+    } else {
+        compute_diff_counts(before, after)
+    }
 }
 
 /// Compute diff info between before/after content for UI metadata.

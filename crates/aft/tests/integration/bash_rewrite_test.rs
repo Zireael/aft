@@ -11,7 +11,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::sync::{Mutex, Once, OnceLock};
 
 use aft::bash_rewrite::{parser, try_rewrite};
 use aft::commands::edit_match::handle_edit_match;
@@ -19,53 +18,12 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
-use log::{Level, LevelFilter, Log, Metadata, Record};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static LOGGER_INIT: Once = Once::new();
-
-struct TestLogger;
-
-impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Warn
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            TEST_LOGS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .expect("lock test logs")
-                .push(format!("{}", record.args()));
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_test_logger() {
-    LOGGER_INIT.call_once(|| {
-        log::set_boxed_logger(Box::new(TestLogger)).expect("install test logger");
-        log::set_max_level(LevelFilter::Warn);
-    });
-    TEST_LOGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("lock test logs")
-        .clear();
-}
-
-fn take_logs() -> Vec<String> {
-    std::mem::take(
-        &mut *TEST_LOGS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("lock test logs"),
-    )
-}
+// Warn-level log capture is shared across all integration test modules via a
+// single process-global, thread-local-capturing logger. See test_helpers.
+use crate::test_helpers::{init_test_logger, take_logs};
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(

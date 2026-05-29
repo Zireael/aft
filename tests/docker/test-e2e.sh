@@ -160,8 +160,15 @@ trap 'cleanup; exit 143' TERM
 
 configure_opencode_mock_port
 
+# Turn log: the mock appends a line each time it actually serves a turn
+# fixture. The harness reads it to prove the agent loop progressed beyond the
+# first request (tool result consumed → next request issued), which a hung or
+# no-op session that merely hits the timeout cannot do.
+TURN_LOG="$AIMOCK_RUN_DIR/turns.log"
+
 start_aimock() {
-    AIMOCK_PORT="$AIMOCK_PORT" node "$MOCK_SERVER" > "$AIMOCK_LOG" 2>&1 &
+    : > "$TURN_LOG"
+    AIMOCK_PORT="$AIMOCK_PORT" AFT_E2E_TURN_LOG="$TURN_LOG" node "$MOCK_SERVER" > "$AIMOCK_LOG" 2>&1 &
     AIMOCK_PID=$!
     for i in $(seq 1 15); do
         if curl -s "$AIMOCK_BASE_URL/v1/models" > /dev/null 2>&1; then
@@ -188,7 +195,8 @@ run_opencode_session() {
     local timeout_secs="${3:-30}"
 
     set +e
-    # OPENAI_API_KEY required for OpenCode's openai adapter to make requests
+    # OPENAI_API_KEY required for OpenCode's openai adapter to make requests.
+    # `timeout` is only a safety bound; a healthy scripted session must exit 0.
     TMPDIR="$AIMOCK_RUN_DIR" \
     OPENAI_API_KEY=sk-mock-e2e-test \
     timeout --signal=KILL "$timeout_secs" opencode run \
@@ -197,13 +205,11 @@ run_opencode_session() {
         > "$result_file" 2>&1
     local exit_code=$?
     set -e
-    # exit 137 = SIGKILL from timeout (expected — opencode hangs after session)
-    # exit 0 = clean exit
-    # exit 124 = SIGTERM timeout (also ok)
-    if [ $exit_code -eq 137 ] || [ $exit_code -eq 0 ] || [ $exit_code -eq 124 ]; then
-        return 0
+
+    if [ $exit_code -eq 124 ] || [ $exit_code -eq 137 ]; then
+        echo "OpenCode timed out after ${timeout_secs}s (exit ${exit_code})" >&2
     fi
-    return $exit_code
+    return "$exit_code"
 }
 
 echo "════════════════════════════════════════"
@@ -247,16 +253,34 @@ RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario1.txt"
 # `started, pid` log lines never appear because the bridge never
 # actually got invoked. 90s gives realistic headroom for cold-cache
 # runs while still bounding total runtime.
-run_opencode_session \
+if run_opencode_session \
     "Explore this project: outline src, read main.py, grep for functions, glob for python files, search for greeting logic, edit main.py, then undo the edit." \
     "$RESULT_FILE" \
     90
+then
+    EXIT_CODE=0
+else
+    EXIT_CODE=$?
+fi
 
-EXIT_CODE=$?
+echo "  OpenCode exit code: $EXIT_CODE"
 
-# Basic health
-check "session completed" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+# Basic health. exit 0 = clean. A timeout/SIGKILL is now a failure because
+# OpenCode exits cleanly after the scripted session; the turn-progression check
+# below remains the positive gate proving the agent loop actually ran multiple
+# turns (consumed a tool result and issued the next request), which a hung/no-op
+# session cannot fake.
+check "clean OpenCode exit" "[ $EXIT_CODE -eq 0 ]"
 check "no crash" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+
+# Agent loop actually progressed: the mock must have served at least the first
+# few turns (outline → read → grep), which requires each tool call to round-trip
+# through the bridge and return a usable result. This is the positive signal
+# that replaces "session completed on timeout" false greens.
+TURNS_SERVED=$(wc -l < "$TURN_LOG" 2>/dev/null | tr -d ' ')
+echo "  Turns served by mock: ${TURNS_SERVED:-0} ($(tr '\n' ' ' < "$TURN_LOG" 2>/dev/null))"
+check "agent loop progressed (>=3 turns served)" "[ \"${TURNS_SERVED:-0}\" -ge 3 ]"
+check "first tool turn served (outline)" "grep -q 'turn-1-outline' '$TURN_LOG' 2>/dev/null"
 
 # Plugin startup
 check "plugin loaded" "grep -q 'Resolved binary\|Copied npm binary' '$PLUGIN_LOG' 2>/dev/null"
@@ -328,19 +352,29 @@ RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario2.txt"
 # without sudo, we point ORT_DYLIB_PATH directly at our fake instead.
 # Linux scenario keeps the implicit /usr/local/lib detection path.
 if [ "$PLATFORM" = "macos" ]; then
-    ORT_DYLIB_PATH="$FAKE_ORT_PATH" \
-    run_opencode_session \
-        "Read the file src/main.py and then grep for all function definitions." \
-        "$RESULT_FILE"
+    if ORT_DYLIB_PATH="$FAKE_ORT_PATH" \
+        run_opencode_session \
+            "Read the file src/main.py and then grep for all function definitions." \
+            "$RESULT_FILE"
+    then
+        EXIT_CODE=0
+    else
+        EXIT_CODE=$?
+    fi
 else
-    run_opencode_session \
+    if run_opencode_session \
         "Read the file src/main.py and then grep for all function definitions." \
         "$RESULT_FILE"
+    then
+        EXIT_CODE=0
+    else
+        EXIT_CODE=$?
+    fi
 fi
 
-EXIT_CODE=$?
+echo "  OpenCode exit code: $EXIT_CODE"
 
-check "session completed (broken lib)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+check "clean exit (broken lib)" "[ $EXIT_CODE -eq 0 ]"
 check "no crash (broken lib)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
 check "no plugin crash (broken lib)" "! grep -qi 'SIGABRT\|thread.*panicked' '$PLUGIN_LOG' 2>/dev/null"
 
@@ -375,13 +409,19 @@ start_aimock
 check "aimock started (s3)" "curl -s '$AIMOCK_BASE_URL/v1/models' > /dev/null 2>&1"
 
 RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario3.txt"
-ORT_DYLIB_PATH="$MISSING_ORT_PATH" \
-run_opencode_session \
-    "Read src/main.py" \
-    "$RESULT_FILE"
-EXIT_CODE=$?
+if ORT_DYLIB_PATH="$MISSING_ORT_PATH" \
+    run_opencode_session \
+        "Read src/main.py" \
+        "$RESULT_FILE"
+then
+    EXIT_CODE=0
+else
+    EXIT_CODE=$?
+fi
 
-check "session completed (missing ORT)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+echo "  OpenCode exit code: $EXIT_CODE"
+
+check "clean exit (missing ORT)" "[ $EXIT_CODE -eq 0 ]"
 check "no crash (missing ORT)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
 # ORT_DYLIB_PATH propagation is covered structurally by scenario 2's
 # "system ORT detected" assertion. The s3 path-grep is brittle because

@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names, wake_client_path metadata,
@@ -146,6 +146,10 @@ mock.module("../shared/live-server-client.js", () => ({
     perUrlAvailability.clear();
   },
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import {
   __resetBgNotificationStateForTests,

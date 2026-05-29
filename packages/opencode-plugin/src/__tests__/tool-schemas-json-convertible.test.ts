@@ -7,7 +7,6 @@ import { astTools } from "../tools/ast.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { aftPrefixedTools, createReadTool, hoistedTools } from "../tools/hoisted.js";
-import { lspTools } from "../tools/lsp.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
 import { refactoringTools } from "../tools/refactoring.js";
@@ -70,7 +69,6 @@ function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
     read: createReadTool(ctx),
     ...hoistedTools(ctx),
     ...aftPrefixedTools(ctx),
-    ...lspTools(ctx),
     ...navigationTools(ctx),
     ...readingTools(ctx),
     ...refactoringTools(ctx),

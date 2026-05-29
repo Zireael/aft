@@ -1,8 +1,9 @@
 use std::cell::{Ref, RefCell, RefMut};
+use std::collections::BTreeMap;
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lsp_types::FileChangeType;
@@ -86,6 +87,41 @@ use crate::cache_freshness::FileFreshness;
 use crate::search_index::SearchIndex;
 use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
 
+// `SemanticIndexStatus::Ready` exposes a unique `refreshing` path list. Keep
+// per-path queue accounting separately so repeated edits to the same file do not
+// let an older refresh completion remove the path while newer work is pending.
+#[derive(Debug, Default)]
+struct SemanticRefreshAccounting {
+    pending: usize,
+    in_flight: usize,
+}
+
+static SEMANTIC_REFRESH_ACCOUNTING: OnceLock<Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>>> =
+    OnceLock::new();
+
+fn semantic_refresh_accounting() -> &'static Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>> {
+    SEMANTIC_REFRESH_ACCOUNTING.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn clear_semantic_refresh_accounting() {
+    if let Some(accounting) = SEMANTIC_REFRESH_ACCOUNTING.get() {
+        if let Ok(mut accounting) = accounting.lock() {
+            accounting.clear();
+        }
+    }
+}
+
+fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
+    if !refreshing.iter().any(|existing| existing == &path) {
+        refreshing.push(path);
+        refreshing.sort();
+    }
+}
+
+fn remove_refreshing_path(refreshing: &mut Vec<PathBuf>, path: &Path) {
+    refreshing.retain(|existing| existing != path);
+}
+
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
     Disabled,
@@ -106,6 +142,7 @@ pub enum SemanticIndexStatus {
 
 impl SemanticIndexStatus {
     pub fn ready() -> Self {
+        clear_semantic_refresh_accounting();
         Self::Ready {
             refreshing: Vec::new(),
         }
@@ -113,16 +150,69 @@ impl SemanticIndexStatus {
 
     pub fn add_refreshing_file(&mut self, path: PathBuf) {
         if let Self::Ready { refreshing } = self {
-            if !refreshing.iter().any(|existing| existing == &path) {
-                refreshing.push(path);
-                refreshing.sort();
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                let state = accounting.entry(path.clone()).or_default();
+                state.pending = state.pending.saturating_add(1);
             }
+            ensure_refreshing_path(refreshing, path);
         }
     }
 
-    pub fn remove_refreshing_file(&mut self, path: &Path) {
+    pub fn start_refreshing_file(&mut self, path: PathBuf) {
         if let Self::Ready { refreshing } = self {
-            refreshing.retain(|existing| existing != path);
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                let state = accounting.entry(path.clone()).or_default();
+                if state.pending == 0 {
+                    state.pending = 1;
+                }
+                if state.in_flight == 0 {
+                    state.in_flight = state.pending;
+                }
+            }
+            ensure_refreshing_path(refreshing, path);
+        }
+    }
+
+    pub fn cancel_refreshing_file(&mut self, path: &Path) {
+        self.finish_refreshing_file(path, false);
+    }
+
+    pub fn complete_refreshing_file(&mut self, path: &Path) {
+        self.finish_refreshing_file(path, true);
+    }
+
+    pub fn remove_refreshing_file(&mut self, path: &Path) {
+        self.complete_refreshing_file(path);
+    }
+
+    fn finish_refreshing_file(&mut self, path: &Path, complete_in_flight: bool) {
+        if let Self::Ready { refreshing } = self {
+            let mut keep_refreshing = false;
+            let mut accounting_checked = false;
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                accounting_checked = true;
+                if let Some(state) = accounting.get_mut(path) {
+                    let finished = if complete_in_flight {
+                        state.in_flight.max(1)
+                    } else {
+                        1
+                    };
+                    state.pending = state.pending.saturating_sub(finished);
+                    if complete_in_flight {
+                        state.in_flight = 0;
+                    } else {
+                        state.in_flight = state.in_flight.min(state.pending);
+                    }
+                    keep_refreshing = state.pending > 0;
+                    if !keep_refreshing {
+                        accounting.remove(path);
+                    }
+                }
+            }
+
+            if !accounting_checked || !keep_refreshing {
+                remove_refreshing_path(refreshing, path);
+            }
         }
     }
 

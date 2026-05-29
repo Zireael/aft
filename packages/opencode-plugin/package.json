@@ -2,7 +2,7 @@
   "name": "@cortexkit/aft-opencode",
   "version": "0.32.0",
   "type": "module",
-  "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter and lsp powered code analysis",
+  "description": "OpenCode plugin for Agent File Tools (AFT) \u2014 tree-sitter and lsp powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",
@@ -20,7 +20,7 @@
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk && bun build src/tui/index.tsx --outfile dist/tui.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opencode-ai/sdk --external @opentui/solid --external solid-js && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
-    "pretest": "cd ../.. && cargo build",
+    "pretest": "node -e \"if (process.env.CI !== 'true') { const { spawnSync } = require('node:child_process'); const result = spawnSync('cargo', ['build'], { cwd: '../..', stdio: 'inherit', shell: process.platform === 'win32' }); process.exit(result.status ?? 1); } else { console.log('Skipping cargo build in CI; workflow builds agent-file-tools before tests.'); }\"",
     "test": "bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
     "lint": "biome check src",
@@ -30,8 +30,6 @@
   "dependencies": {
     "@clack/prompts": "^1.2.0",
     "@cortexkit/aft-bridge": "0.32.0",
-    "@opencode-ai/plugin": "^1.15.5",
-    "@opencode-ai/sdk": "^1.15.5",
     "@xterm/headless": "^5.5.0",
     "comment-json": "^4.6.2",
     "undici": "^7.25.0",
@@ -46,6 +44,8 @@
     "@cortexkit/aft-win32-x64": "0.32.0"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.15.11",
+    "@opencode-ai/sdk": "^1.15.11",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },

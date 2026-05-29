@@ -117,25 +117,29 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
-  const previousCacheDir = process.env.AFT_CACHE_DIR;
-  // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
   let bridge: BinaryBridge | undefined;
   try {
     await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
+    // Redirect the search index cache to a temp dir so tests don't pollute the
+    // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child
+    // env instead of mutating process.env: the child spawns lazily on the first
+    // send(), so a process.env mutation scoped to construction would be restored
+    // before the child ever inherits it — and process.env is process-global, so
+    // concurrent harnesses would race. childEnv is applied at spawn time, scoped
+    // to this child only.
     bridge = new BinaryBridge(
       preparedBinary.binaryPath,
       tempDir,
       {
         timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
         ...(options?.bridgeOptions ?? {}),
       },
       { harness: "opencode" },
     );
   } catch (err) {
-    restoreAftCacheDir(previousCacheDir);
     await rm(tempDir, { recursive: true, force: true });
     throw err;
   }
@@ -152,22 +156,10 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        try {
-          await rm(tempDir, { recursive: true, force: true });
-        } finally {
-          restoreAftCacheDir(previousCacheDir);
-        }
+        await rm(tempDir, { recursive: true, force: true });
       }
     },
   };
-}
-
-function restoreAftCacheDir(previous: string | undefined): void {
-  if (previous === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = previous;
-  }
 }
 
 export async function cleanupHarnesses(harnesses: E2EHarness[]): Promise<void> {
@@ -337,13 +329,28 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
     };
   }
 
+  const skipReason = build.ok
+    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    : `cargo build failed and no fallback aft binary was found\n${build.output}`;
+
+  // In CI the aft binary is always built before the Bun suites run, so a missing
+  // binary there means the build/setup broke — fail loud instead of letting 25+
+  // e2e files silently `describe.skipIf(!binaryPath)` into a false green. Locally
+  // (CI unset) keep the quiet-skip behavior so contributors without a built
+  // binary can still run the non-e2e suites.
+  if (process.env.CI === "true") {
+    throw new Error(
+      `e2e setup failed: ${skipReason}\n` +
+        "The aft binary must be present in CI (built before Bun tests run). " +
+        "Refusing to silently skip e2e coverage.",
+    );
+  }
+
   return {
     binaryPath: null,
     source: null,
     buildAttempted: true,
-    skipReason: build.ok
-      ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
-      : `cargo build failed and no fallback aft binary was found\n${build.output}`,
+    skipReason,
   };
 }
 

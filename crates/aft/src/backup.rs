@@ -290,6 +290,11 @@ impl BackupStore {
         op_id: Option<&str>,
     ) -> Result<String, AftError> {
         let key = canonicalize_key(path);
+        // Hydrate any prior on-disk history before appending, so a snapshot
+        // taken on a fresh store (post-restart) extends the existing stack and
+        // advances the id counter instead of overwriting history with a single
+        // entry and reusing backup-0.
+        self.ensure_stack_hydrated(session, &key);
         let (id, order) = self.next_id_and_order();
         let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
 
@@ -318,6 +323,7 @@ impl BackupStore {
         description: &str,
     ) -> Result<String, AftError> {
         let key = canonicalize_key(path);
+        self.ensure_stack_hydrated(session, &key);
         let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
@@ -1396,6 +1402,31 @@ impl BackupStore {
         true
     }
 
+    /// Ensure the in-memory undo stack for `(session, key)` reflects any prior
+    /// on-disk history before a new snapshot is appended.
+    ///
+    /// Without this, a fresh `BackupStore` (e.g. after a bridge/process
+    /// restart, which clears `self.entries` and resets `counter` to 0) would
+    /// append a new snapshot onto an EMPTY in-memory stack and then
+    /// `write_snapshot_to_disk` would overwrite the file's `meta.json`/`.bak`
+    /// set with that single entry — silently discarding all undo history
+    /// captured before the restart, and reusing `backup-0` because the counter
+    /// was never advanced past the persisted entries. Hydrating here preserves
+    /// the prior stack AND advances the counter via
+    /// `update_counter_from_entries`. Only loads when nothing is in memory yet,
+    /// so it never clobbers a stack already mutated in this run and adds at
+    /// most one disk read per file per session.
+    fn ensure_stack_hydrated(&mut self, session: &str, key: &Path) {
+        let already_in_memory = self
+            .entries
+            .get(session)
+            .and_then(|files| files.get(key))
+            .is_some_and(|stack| !stack.is_empty());
+        if !already_in_memory {
+            self.load_from_disk_if_needed(session, key);
+        }
+    }
+
     fn load_all_disk_backups(&mut self, session: &str) {
         let disk_keys: Vec<PathBuf> = self
             .disk_index
@@ -2438,6 +2469,70 @@ mod tests {
         assert_eq!(entry.content, "original");
         assert!(warning.is_some()); // modified externally
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_after_restart_preserves_history_and_unique_ids() {
+        // Regression (bug #8): after a restart the BackupStore is fresh
+        // (entries cleared, counter reset to 0). A new snapshot must EXTEND the
+        // persisted undo stack — not overwrite it with a single entry — and must
+        // not reuse backup-0. Two undo levels must remain available across the
+        // restart boundary.
+        let dir = std::env::temp_dir().join("aft_backup_restart_history_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = temp_file("restart_history.txt", "v0");
+
+        // Run 1: edit v0 -> v1 (snapshot captures "v0"), then write v1.
+        let first_id = {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(dir.clone(), 72);
+            let id = store
+                .snapshot(DEFAULT_SESSION_ID, &file_path, "edit 1")
+                .unwrap();
+            fs::write(&file_path, "v1").unwrap();
+            id
+        };
+
+        // Restart: fresh store, same storage dir. Edit v1 -> v2 (snapshot
+        // captures "v1"), then write v2.
+        let second_id = {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(dir.clone(), 72);
+            let id = store
+                .snapshot(DEFAULT_SESSION_ID, &file_path, "edit 2")
+                .unwrap();
+            fs::write(&file_path, "v2").unwrap();
+            id
+        };
+
+        // The post-restart snapshot must NOT reuse the first id (counter
+        // advanced past persisted entries).
+        assert_ne!(
+            first_id, second_id,
+            "post-restart snapshot reused backup id {first_id}"
+        );
+
+        // Both undo levels survive: a fresh store sees 2 entries on disk, and
+        // two sequential restores walk v1 then v0.
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 72);
+        assert_eq!(
+            store.history(DEFAULT_SESSION_ID, &file_path).len(),
+            2,
+            "prior history was overwritten by the post-restart snapshot"
+        );
+
+        let (entry1, _) = store
+            .restore_latest(DEFAULT_SESSION_ID, &file_path)
+            .unwrap();
+        assert_eq!(entry1.content, "v1", "first undo should restore v1");
+        let (entry0, _) = store
+            .restore_latest(DEFAULT_SESSION_ID, &file_path)
+            .unwrap();
+        assert_eq!(entry0.content, "v0", "second undo should restore v0");
 
         let _ = fs::remove_dir_all(&dir);
     }

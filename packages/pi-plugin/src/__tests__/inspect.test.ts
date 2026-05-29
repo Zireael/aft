@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { __test__ } from "../index.js";
-import { registerInspectTool } from "../tools/inspect.js";
+import { buildInspectSections, registerInspectTool } from "../tools/inspect.js";
 import {
   executeTool,
   makeExtContext,
@@ -38,12 +38,13 @@ describe("Pi aft_inspect adapter", () => {
 
     const inspect = tools.get("aft_inspect")!;
     const description = inspect.description ?? "";
-    expect(description).not.toContain("diagnostics");
+    expect(description).toContain("diagnostics");
     expect(description).not.toContain("triggered on session idle");
     expect(description).not.toContain("prewarm");
     expect(description).toContain("asynchronously on demand");
     expect(description).toContain("quietly starts a background Tier 2 warmup");
-    expect(description).toContain("next call can use cached data");
+    expect(description).toContain("at most once every 4 minutes");
+    expect(description).toContain("later call can use cached data");
 
     const parameters = inspect.parameters as {
       properties?: Record<string, Record<string, unknown>>;
@@ -54,6 +55,35 @@ describe("Pi aft_inspect adapter", () => {
       maximum: 100,
       default: 20,
     });
+  });
+
+  test("renders diagnostics counts, sentinels, and details defensively", () => {
+    const counted = buildInspectSections(
+      {
+        summary: {
+          diagnostics: { errors: 2, warnings: 1, info: 0, hints: 0 },
+          metrics: { files: 3, symbols: 4 },
+        },
+        details: {
+          diagnostics: [{ file: "src/app.ts", line: 4, severity: "error", message: "bad type" }],
+        },
+      },
+      { fg: (_name: string, text: string) => text } as never,
+    ).join("\n");
+    expect(counted).toContain("diagnostics 2 errors/1 warnings/0 info/0 hints");
+    expect(counted).toContain("src/app.ts:4 error bad type");
+
+    const pending = buildInspectSections(
+      {
+        summary: {
+          diagnostics: { status: "pending", servers_pending: ["tsserver"] },
+        },
+      },
+      { fg: (_name: string, text: string) => text } as never,
+    ).join("\n");
+    expect(pending).toContain("diagnostics pending");
+    expect(pending).toContain("tsserver");
+    expect(pending).not.toContain("0 errors");
   });
 
   test("sends corrected inspect field names to the bridge", async () => {
@@ -125,6 +155,39 @@ describe("Pi aft_inspect adapter", () => {
     expect(calls[1].command).toBe("inspect_tier2_run");
     expect(calls[1].params).toEqual({
       categories: ["dead_code", "unused_exports", "duplicates"],
+      session_id: "pi-session",
+    });
+  });
+
+  test("fires a quiet Tier 2 run when inspect returns stale categories", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: ["unused_exports"],
+          pending_categories: [],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    const result = (await executeTool(
+      tools.get("aft_inspect")!,
+      {},
+      makeExtContext("/repo", "pi-session"),
+    )) as { details: { scanner_state: { stale_categories: string[] } } };
+
+    expect(result.details.scanner_state.stale_categories).toEqual(["unused_exports"]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].command).toBe("inspect");
+    expect(calls[1].command).toBe("inspect_tier2_run");
+    expect(calls[1].params).toEqual({
+      categories: ["unused_exports"],
       session_id: "pi-session",
     });
   });
@@ -202,6 +265,94 @@ describe("Pi aft_inspect adapter", () => {
 
     expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
     expect(calls[1].params.categories).toEqual(["dead_code", "unused_exports", "duplicates"]);
+  });
+
+  test("does not double-trigger a stale Tier 2 category already in flight", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: ["dead_code"],
+          pending_categories: [],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+
+    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls[1].params.categories).toEqual(["dead_code"]);
+  });
+
+  test("does not immediately re-trigger a Tier 2 category after a completed run", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return { success: true };
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: ["dead_code"],
+          pending_categories: [],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await Promise.resolve();
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+
+    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls[1].params.categories).toEqual(["dead_code"]);
+  });
+
+  test("re-triggers a still-stale Tier 2 category after the cooldown window", async () => {
+    const realNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    try {
+      const { api, tools } = makeMockApi();
+      const { bridge, calls } = makeMockBridge((command) => {
+        if (command === "inspect_tier2_run") {
+          return { success: true };
+        }
+        return {
+          success: true,
+          summary: {},
+          scanner_state: {
+            stale_categories: ["dead_code"],
+            pending_categories: [],
+          },
+        };
+      });
+      registerInspectTool(api, makePluginContext(bridge));
+
+      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+      await Promise.resolve();
+      now += 4 * 60 * 1000 + 1;
+      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+
+      expect(calls.map((call) => call.command)).toEqual([
+        "inspect",
+        "inspect_tier2_run",
+        "inspect",
+        "inspect_tier2_run",
+      ]);
+      expect(calls[1].params.categories).toEqual(["dead_code"]);
+      expect(calls[3].params.categories).toEqual(["dead_code"]);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   test("rejects invalid topK without coercion", async () => {

@@ -32,11 +32,11 @@ RUN OPENCODE_VERSION="${OPENCODE_VERSION:-$(tr -d '[:space:]' < /tmp/opencode-ve
     rm /tmp/opencode-version.txt
 ENV PATH="/root/.opencode/bin:$PATH"
 
-# Install aimock globally
-# Pin aimock to a known-good version. 1.18.0 (published 2026-05-04) renamed
-# `mock.onTurn(...)` and broke our fixtures with `mock.onTurn is not a
-# function`. The Windows E2E harness pins the same version.
-RUN npm install -g @copilotkit/aimock@1.17.0
+# Install aimock globally.
+# Pin to the same version as bun.lock: tests/docker/mock-server.js relies on
+# function-valued LLMock responses for turn logging, plus sequenceIndex sibling
+# progression for scripted turns. Older 1.17.x installs do not support that.
+RUN npm install -g @copilotkit/aimock@1.24.0
 
 # Git config for commits
 RUN git config --global user.email "test@test.com" && \

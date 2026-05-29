@@ -297,6 +297,23 @@ describe("loadAftConfig", () => {
     );
   });
 
+  test("preserves project lsp.diagnostics_on_edit", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { diagnostics_on_edit: false } }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ lsp: { diagnostics_on_edit: true } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.lsp.diagnostics_on_edit).toBe(true);
+    expect(result.stderr).not.toContain("these LSP settings only honor user-level config");
+  });
+
   test("preserves project lsp.python", () => {
     const fixture = createConfigFixture();
     writeFileSync(

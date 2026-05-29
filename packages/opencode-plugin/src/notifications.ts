@@ -275,22 +275,32 @@ async function sendIgnoredMessage(
     };
 
     // `noReply: true` means OpenCode appends this as a synthetic user
-    // message and does NOT trigger an assistant turn. No LLM call
-    // happens, so model/variant passthrough is unnecessary here, and
-    // earlier attempts to pass model on this path caused OpenCode-side
-    // crashes in some host versions.
+    // message and does NOT trigger an assistant turn — no LLM call happens
+    // now. But OpenCode's `createUserMessage` still RECORDS prompt context
+    // on the appended message, and that recorded context becomes the
+    // session's active model/agent for the NEXT real turn.
     //
-    // `agent` IS needed for UI attribution on announcements/status: without
-    // it, OpenCode renders those under the default agent (issue #62).
-    // Configure warnings intentionally omit `agent` so `createUserMessage`
-    // does not publish ModelSwitched / AgentSwitched mid-session.
+    // Pin agent AND model/variant from the previous assistant turn for
+    // announcements/status (issue #62). Configure warnings pass
+    // `{ includeAgent: false }` to skip all context pinning and avoid
+    // ModelSwitched / AgentSwitched on the first tool turn.
     const body: Record<string, unknown> = {
       noReply: true,
       parts: [{ type: "text", text, ignored: true }],
     };
     if (options?.includeAgent !== false) {
-      const agent = await resolveCurrentAgent(c, sessionId);
-      if (agent) body.agent = agent;
+      const promptContext = await resolvePromptContext(
+        c as Parameters<typeof resolvePromptContext>[0],
+        sessionId,
+      );
+      if (promptContext?.agent) body.agent = promptContext.agent;
+      if (promptContext?.model) {
+        body.model = {
+          providerID: promptContext.model.providerID,
+          modelID: promptContext.model.modelID,
+        };
+      }
+      if (promptContext?.variant) body.variant = promptContext.variant;
     }
 
     const promptInput = {
@@ -337,29 +347,6 @@ async function showToastViaHttp(
     return response.ok;
   } catch {
     return false;
-  }
-}
-
-/**
- * Resolve the agent the user is currently using for this session, so
- * notifications render under the right agent in the OpenCode UI.
- *
- * Reads the most recent assistant message's `info.agent`. Returns
- * `undefined` on any failure — the caller falls back to OpenCode's
- * default-agent behavior, which is the safest legacy path.
- */
-async function resolveCurrentAgent(
-  client: unknown,
-  sessionId: string,
-): Promise<string | undefined> {
-  try {
-    const ctx = await resolvePromptContext(
-      client as Parameters<typeof resolvePromptContext>[0],
-      sessionId,
-    );
-    return ctx?.agent;
-  } catch {
-    return undefined;
   }
 }
 
@@ -567,31 +554,72 @@ function persistAnnouncedVersion(storageDir: string | undefined, version: string
   markAnnouncementSeen(storageDir, "opencode", version);
 }
 
+/**
+ * Reads the persisted `warned_tools` dedup map.
+ *
+ * Returns `null` when the state could NOT be read (bridge not configured yet,
+ * RPC error, or a throw) — distinct from `{}` which means "read succeeded, no
+ * warnings recorded yet". The caller MUST treat `null` as "unknown" and NOT as
+ * "never warned": conflating the two is what caused the same `lsp_binary_missing`
+ * warning to re-fire on every session. The dedup row persists fine (record runs
+ * once the bridge is configured), but a read that raced the not-configured
+ * window returned `{}`, the gate read "never warned", and the warning was
+ * re-delivered every time.
+ */
 async function readWarnedTools(
   bridge: Pick<BinaryBridge, "send">,
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
+  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
   try {
-    const resp = await bridge.send("db_get_state", { key: "warned_tools" });
-    if (resp.success === false) return {};
+    resp = await bridge.send("db_get_state", { key: "warned_tools" });
+  } catch {
+    // The RPC itself failed (bridge not ready / transport error). State is
+    // UNKNOWN — caller must not treat this as "never warned".
+    return null;
+  }
+  // success:false means the bridge couldn't serve the read (e.g. not
+  // configured yet). UNKNOWN — same as a throw.
+  if (resp.success === false) return null;
 
-    const value = (resp.data as { value?: unknown } | undefined)?.value;
-    if (typeof value !== "string") return {};
-
+  // From here the read SUCCEEDED. Any malformed/absent/corrupt value is a
+  // genuine empty `{}` (recoverable): we deliver once and recordWarning then
+  // overwrites the bad value with a fresh valid map. Returning null here would
+  // suppress the warning forever AND never repair the corruption.
+  const value = (resp.data as { value?: unknown } | undefined)?.value;
+  if (typeof value !== "string") return {};
+  try {
     const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
   } catch {
+    // Corrupt JSON, but the read succeeded — treat as empty/recoverable.
     return {};
   }
 }
 
-async function hasWarnedFor(bridge: Pick<BinaryBridge, "send">, key: string): Promise<boolean> {
+/**
+ * Tri-state dedup check:
+ *   - "warned": the key is recorded — skip delivery.
+ *   - "fresh": state read OK, key absent — deliver + record.
+ *   - "unknown": state could not be read — do NOT deliver (can't dedup, so
+ *     delivering would risk spamming). The next configured call retries.
+ */
+async function warnedStatus(
+  bridge: Pick<BinaryBridge, "send">,
+  key: string,
+): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
-  return warned[key] === true || typeof warned[key] === "string";
+  if (warned === null) return "unknown";
+  return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
 async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
+  // Read-modify-write. If the read failed (null), do NOT write — a blind
+  // `{}` write would clobber previously-recorded keys and re-open the
+  // re-fire window. We only reach here after a "fresh" status, which means
+  // the read succeeded, so null is not expected; guard anyway.
   const warned = await readWarnedTools(bridge);
+  if (warned === null) return;
   warned[key] = true;
 
   try {
@@ -663,38 +691,24 @@ async function deliverConfigureWarningBatch(
     return true;
   }
 
-  if (delivery !== "chat") {
-    const toastSent = await showTuiToast(opts.client, title, message, "warning", 10_000);
-    if (toastSent) return true;
+  const toastSent = await showTuiToast(opts.client, title, message, "warning", 10_000);
+  if (toastSent) return true;
 
-    const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
-    if (effectiveServerUrl) {
-      const httpToast = await showToastViaHttp(
-        effectiveServerUrl,
-        title,
-        message,
-        "warning",
-        10_000,
-      );
-      if (httpToast) return true;
-    }
-
-    warn(`[aft-plugin] configure warnings (toast unavailable):\n${message}`);
-    sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
-    return true;
-  }
-
-  let delivered = false;
-  for (const warning of warnings) {
-    const ok = await sendIgnoredMessage(
-      opts.client,
-      opts.sessionId,
-      formatConfigureWarningChat(warning),
-      { includeAgent: false },
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
+  if (effectiveServerUrl) {
+    const httpToast = await showToastViaHttp(
+      effectiveServerUrl,
+      title,
+      message,
+      "warning",
+      10_000,
     );
-    delivered = delivered || ok;
+    if (httpToast) return true;
   }
-  return delivered;
+
+  warn(`[aft-plugin] configure warnings (toast unavailable):\n${message}`);
+  sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+  return true;
 }
 
 export async function deliverConfigureWarnings(
@@ -712,17 +726,38 @@ export async function deliverConfigureWarnings(
   const pending: ConfigureWarning[] = [];
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
-    if (await hasWarnedFor(opts.bridge, key)) continue;
+    const status = await warnedStatus(opts.bridge, key);
+    // "warned": already delivered once — skip.
+    // "unknown": dedup state couldn't be read (bridge not configured yet /
+    //   RPC error). Do NOT deliver — delivering here is exactly what caused
+    //   the warning to re-fire on every session. The next configured call
+    //   reads real state and delivers once.
+    if (status !== "fresh") continue;
     pending.push(warning);
   }
   if (pending.length === 0) return;
+
+  const delivery = opts.delivery ?? "toast";
+  if (delivery === "chat") {
+    for (const warning of pending) {
+      const ok = await sendIgnoredMessage(
+        opts.client,
+        opts.sessionId,
+        formatConfigureWarningChat(warning),
+        { includeAgent: false },
+      );
+      if (ok) {
+        await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
+      }
+    }
+    return;
+  }
 
   const delivered = await deliverConfigureWarningBatch(opts, pending);
   if (!delivered) return;
 
   for (const warning of pending) {
-    const key = warningKey(warning, opts.projectRoot);
-    await recordWarning(opts.bridge, key);
+    await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
   }
 }
 

@@ -221,15 +221,14 @@ fn append_includes_diff_when_requested() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, dir.path());
 
+    // `include_diff` is the compact, agent-facing default: counts only, NEVER
+    // full before/after content (which would scale the payload with file size).
     let mut req = append_request("append-diff", &target, "line2\n");
     req["include_diff"] = json!(true);
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
     assert_eq!(resp["success"], true, "append failed: {resp:?}");
 
-    // Append now honors include_diff like the other write-style handlers.
-    // Diff is computed against the file's pre-append content, so additions
-    // reflect the lines added and deletions stay 0.
     let diff = resp
         .get("diff")
         .expect("append should include diff when include_diff: true");
@@ -241,6 +240,36 @@ fn append_includes_diff_when_requested() {
         diff["deletions"], 0,
         "append never deletes existing content: {resp:?}"
     );
+    // Counts-only contract: no before/after content echoed to the agent.
+    assert!(
+        diff.get("before").is_none() && diff.get("after").is_none(),
+        "include_diff must be counts-only (no before/after): {resp:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn append_include_diff_content_returns_full_before_after() {
+    // The UI/plugin path opts into full content with `include_diff_content`.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("diff-content.txt");
+    fs::write(&target, "line1\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+
+    let mut req = append_request("append-diff-content", &target, "line2\n");
+    req["include_diff_content"] = json!(true);
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "append failed: {resp:?}");
+    let diff = resp
+        .get("diff")
+        .expect("include_diff_content should include diff");
+    assert_eq!(diff["additions"], 1);
+    assert_eq!(diff["deletions"], 0);
     assert_eq!(diff["before"], "line1\n");
     assert_eq!(diff["after"], "line1\nline2\n");
 

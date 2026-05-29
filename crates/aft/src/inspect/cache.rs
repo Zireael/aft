@@ -1,12 +1,13 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cache_freshness::FileFreshness;
+use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 
 use super::job::{FileContribution, InspectCategory, JobKey};
 
@@ -78,6 +79,201 @@ pub struct ContributionRecord {
 struct MemoryAggregate {
     payload: serde_json::Value,
     generated_at: i64,
+    contribution_set_hash: Option<String>,
+}
+
+const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
+
+#[derive(Debug, Clone)]
+struct Tier1MemoEntry<T> {
+    freshness: FileFreshness,
+    value: T,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LruNode {
+    path: PathBuf,
+    generation: u64,
+}
+
+#[derive(Debug)]
+struct Tier1MemoState<T> {
+    entries: HashMap<PathBuf, Tier1MemoEntry<T>>,
+    lru: VecDeque<LruNode>,
+    next_generation: u64,
+}
+
+impl<T> Default for Tier1MemoState<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            next_generation: 0,
+        }
+    }
+}
+
+impl<T> Tier1MemoState<T> {
+    fn insert(&mut self, path: PathBuf, mut entry: Tier1MemoEntry<T>) {
+        let generation = self.allocate_generation();
+        entry.generation = generation;
+        self.entries.insert(path.clone(), entry);
+        self.lru.push_back(LruNode { path, generation });
+        self.compact_lru_if_needed();
+        self.evict_lru();
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.compact_lru_if_needed();
+    }
+
+    fn touch(&mut self, path: &Path) {
+        if !self.entries.contains_key(path) {
+            return;
+        }
+
+        let generation = self.allocate_generation();
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.generation = generation;
+            self.lru.push_back(LruNode {
+                path: path.to_path_buf(),
+                generation,
+            });
+        }
+        self.compact_lru_if_needed();
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.rebuild_lru();
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
+    }
+
+    fn compact_lru_if_needed(&mut self) {
+        let max_lru_nodes = TIER1_FILE_MEMO_MAX_ENTRIES
+            .saturating_mul(2)
+            .max(self.entries.len());
+        if self.lru.len() > max_lru_nodes {
+            self.rebuild_lru();
+        }
+    }
+
+    fn rebuild_lru(&mut self) {
+        let mut live_nodes = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (entry.generation, path.clone()))
+            .collect::<Vec<_>>();
+        live_nodes.sort_by_key(|(generation, _)| *generation);
+
+        self.lru.clear();
+        for (generation, (_, path)) in live_nodes.into_iter().enumerate() {
+            let generation = generation as u64;
+            if let Some(entry) = self.entries.get_mut(&path) {
+                entry.generation = generation;
+            }
+            self.lru.push_back(LruNode { path, generation });
+        }
+        self.next_generation = self.lru.len() as u64;
+    }
+
+    fn evict_lru(&mut self) {
+        while self.entries.len() > TIER1_FILE_MEMO_MAX_ENTRIES {
+            let Some(node) = self.lru.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&node.path)
+                .is_some_and(|entry| entry.generation == node.generation)
+            {
+                self.entries.remove(&node.path);
+            }
+        }
+        self.compact_lru_if_needed();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Tier1FileMemo<T> {
+    state: Mutex<Tier1MemoState<T>>,
+}
+
+impl<T> Default for Tier1FileMemo<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(Tier1MemoState::default()),
+        }
+    }
+}
+
+impl<T: Clone> Tier1FileMemo<T> {
+    pub(crate) fn get_or_insert_with<F>(&self, path: &Path, scan: F) -> T
+    where
+        F: FnOnce(&Path) -> (Option<FileFreshness>, T),
+    {
+        if let Some(cached) = self.cached_value(path) {
+            return cached;
+        }
+
+        let (freshness, value) = scan(path);
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(freshness) = freshness {
+                state.insert(
+                    path.to_path_buf(),
+                    Tier1MemoEntry {
+                        freshness,
+                        value: value.clone(),
+                        generation: 0,
+                    },
+                );
+            } else {
+                state.remove(path);
+            }
+        }
+        value
+    }
+
+    fn cached_value(&self, path: &Path) -> Option<T> {
+        let mut cached = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.entries.get(path).cloned())?;
+
+        match crate::cache_freshness::verify_file(path, &cached.freshness) {
+            FreshnessVerdict::HotFresh => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.touch(path);
+                }
+                Some(cached.value)
+            }
+            FreshnessVerdict::ContentFresh {
+                new_mtime,
+                new_size,
+            } => {
+                cached.freshness.mtime = new_mtime;
+                cached.freshness.size = new_size;
+                let value = cached.value.clone();
+                if let Ok(mut state) = self.state.lock() {
+                    state.insert(path.to_path_buf(), cached);
+                }
+                Some(value)
+            }
+            FreshnessVerdict::Stale => None,
+            FreshnessVerdict::Deleted => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.remove(path);
+                }
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +291,7 @@ impl InspectCache {
         let project_key = crate::search_index::project_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
+        configure_connection(&conn)?;
         initialize_schema(&conn)?;
         Ok(Self {
             project_root,
@@ -122,6 +319,15 @@ impl InspectCache {
         key: JobKey,
         payload: serde_json::Value,
     ) -> Result<(), InspectCacheError> {
+        self.store_memory_aggregate(key, payload, None)
+    }
+
+    fn store_memory_aggregate(
+        &self,
+        key: JobKey,
+        payload: serde_json::Value,
+        contribution_set_hash: Option<String>,
+    ) -> Result<(), InspectCacheError> {
         self.memory
             .write()
             .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
@@ -130,6 +336,7 @@ impl InspectCache {
                 MemoryAggregate {
                     payload,
                     generated_at: unix_seconds_now(),
+                    contribution_set_hash,
                 },
             );
         Ok(())
@@ -139,18 +346,43 @@ impl InspectCache {
         &self,
         key: &JobKey,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
-        if let Some(entry) = self
-            .memory
-            .read()
-            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-            .get(key)
-            .cloned()
-        {
-            return Ok(Some(entry.payload));
+        if !key.category.is_tier2() {
+            return Ok(self
+                .memory
+                .read()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .get(key)
+                .map(|entry| entry.payload.clone()));
         }
 
-        if !key.category.is_tier2() {
-            return Ok(None);
+        let current_hash = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            contribution_set_hash_with_conn(
+                &conn,
+                key.category,
+                &self.project_key,
+                &self.project_root,
+            )?
+        };
+
+        let memory_entry = {
+            self.memory
+                .read()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .get(key)
+                .cloned()
+        };
+        if let Some(entry) = memory_entry {
+            if entry.contribution_set_hash.as_deref() == Some(current_hash.as_str()) {
+                return Ok(Some(entry.payload));
+            }
+            self.memory
+                .write()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .remove(key);
         }
 
         let payload = {
@@ -159,8 +391,9 @@ impl InspectCache {
                 .lock()
                 .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
             conn.query_row(
-                "SELECT aggregate FROM tier2_aggregates WHERE category = ?1 AND project_key = ?2",
-                params![key.category.as_str(), self.project_key],
+                "SELECT aggregate FROM tier2_aggregates \
+                 WHERE category = ?1 AND project_key = ?2 AND contribution_set_hash = ?3",
+                params![key.category.as_str(), self.project_key, current_hash],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?
@@ -169,7 +402,7 @@ impl InspectCache {
         match payload {
             Some(bytes) => {
                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-                self.store_aggregated(key.clone(), value.clone())?;
+                self.store_memory_aggregate(key.clone(), value.clone(), Some(current_hash))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -235,8 +468,12 @@ impl InspectCache {
             )?;
         }
 
-        let contribution_set_hash =
-            contribution_set_hash_with_conn(&tx, key.category, &self.project_key)?;
+        let contribution_set_hash = contribution_set_hash_with_conn(
+            &tx,
+            key.category,
+            &self.project_key,
+            &self.project_root,
+        )?;
         let aggregate_blob = serde_json::to_vec(&aggregate)?;
         tx.execute(
             "INSERT INTO tier2_aggregates \
@@ -261,7 +498,7 @@ impl InspectCache {
         )?;
         tx.commit()?;
 
-        self.store_aggregated(key, aggregate)
+        self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
 
     pub(crate) fn apply_contribution_updates(
@@ -330,7 +567,7 @@ impl InspectCache {
         }
 
         let contribution_set_hash =
-            contribution_set_hash_with_conn(&tx, category, &self.project_key)?;
+            contribution_set_hash_with_conn(&tx, category, &self.project_key, &self.project_root)?;
         tx.commit()?;
 
         self.memory
@@ -363,9 +600,40 @@ impl InspectCache {
         match payload {
             Some(bytes) => {
                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-                self.store_aggregated(JobKey::for_project_category(category), value.clone())?;
+                self.store_memory_aggregate(
+                    JobKey::for_project_category(category),
+                    value.clone(),
+                    Some(contribution_set_hash.to_string()),
+                )?;
                 Ok(Some(value))
             }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        let payload = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            conn.query_row(
+                "SELECT aggregate FROM tier2_aggregates \
+                 WHERE category = ?1 AND project_key = ?2 \
+                 ORDER BY generated_at DESC LIMIT 1",
+                params![category.as_str(), self.project_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        };
+
+        match payload {
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(Some)
+                .map_err(InspectCacheError::from),
             None => Ok(None),
         }
     }
@@ -437,7 +705,7 @@ impl InspectCache {
         )?;
         tx.commit()?;
 
-        self.store_aggregated(key, aggregate)
+        self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash.to_string()))
     }
 
     pub fn load_tier2_contributions(
@@ -526,6 +794,82 @@ impl InspectCache {
         Ok(())
     }
 
+    pub(crate) fn contribution_fingerprint(
+        &self,
+        category: InspectCategory,
+    ) -> Result<(usize, String), InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_mtime_ns, file_size \
+             FROM tier2_contributions \
+             WHERE category = ?1 AND project_key = ?2 \
+             ORDER BY file_path ASC",
+        )?;
+        let rows = stmt.query_map(params![category.as_str(), self.project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut count = 0usize;
+        let mut hasher = blake3::Hasher::new();
+        for row in rows {
+            let (file_path, mtime_ns, file_size) = row?;
+            count += 1;
+            update_contribution_fingerprint_hash(
+                &mut hasher,
+                &file_path,
+                mtime_ns.max(0),
+                file_size.max(0) as u64,
+            );
+        }
+
+        Ok((count, hasher.finalize().to_hex().to_string()))
+    }
+
+    pub(crate) fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_mtime_ns, file_size, file_hash \
+             FROM tier2_contributions \
+             WHERE category = ?1 AND project_key = ?2 \
+             ORDER BY file_path ASC",
+        )?;
+        let rows = stmt.query_map(params![category.as_str(), self.project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (file_path, mtime_ns, file_size, file_hash) = row?;
+            records.push((
+                PathBuf::from(file_path),
+                FileFreshness {
+                    mtime: ns_to_system_time(mtime_ns),
+                    size: file_size.max(0) as u64,
+                    content_hash: hash_from_hex(&file_hash)?,
+                },
+            ));
+        }
+        Ok(records)
+    }
+
     pub fn contribution_set_hash(
         &self,
         category: InspectCategory,
@@ -534,7 +878,7 @@ impl InspectCache {
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
-        contribution_set_hash_with_conn(&conn, category, &self.project_key)
+        contribution_set_hash_with_conn(&conn, category, &self.project_key, &self.project_root)
     }
 
     pub fn last_full_run(
@@ -562,6 +906,12 @@ impl InspectCache {
             .get(key)
             .map(|entry| entry.generated_at))
     }
+}
+
+fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    Ok(())
 }
 
 fn initialize_schema(conn: &Connection) -> Result<(), InspectCacheError> {
@@ -616,6 +966,7 @@ fn contribution_set_hash_with_conn(
     conn: &Connection,
     category: InspectCategory,
     project_key: &str,
+    project_root: &Path,
 ) -> Result<String, InspectCacheError> {
     let mut stmt = conn.prepare(
         "SELECT file_path, file_hash FROM tier2_contributions \
@@ -626,6 +977,7 @@ fn contribution_set_hash_with_conn(
     })?;
 
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tier2-contributions\0");
     for row in rows {
         let (file_path, file_hash) = row?;
         hasher.update(file_path.as_bytes());
@@ -633,7 +985,42 @@ fn contribution_set_hash_with_conn(
         hasher.update(file_hash.as_bytes());
         hasher.update(b"\0");
     }
+    update_manifest_fingerprint_hash(&mut hasher, project_root)?;
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_manifest_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    project_root: &Path,
+) -> Result<(), InspectCacheError> {
+    let manifest_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    hasher.update(b"entry-point-manifests\0");
+    for manifest in super::entry_points::collect_entry_point_manifests(project_root) {
+        let relative_path = manifest
+            .strip_prefix(&manifest_root)
+            .unwrap_or(manifest.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content_hash = blake3::hash(&fs::read(&manifest)?);
+        hasher.update(relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(())
+}
+
+fn update_contribution_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    relative_path: &str,
+    mtime_ns: i64,
+    file_size: u64,
+) {
+    hasher.update(relative_path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&mtime_ns.to_le_bytes());
+    hasher.update(&file_size.to_le_bytes());
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
@@ -679,4 +1066,130 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
         .min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs;
+    use std::path::Path;
+
+    fn collect_freshness(path: &Path) -> FileFreshness {
+        crate::cache_freshness::collect(path).unwrap()
+    }
+
+    #[test]
+    fn tier1_file_memo_evicts_lru_and_keeps_recent_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+        let mut paths = Vec::with_capacity(TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        for index in 0..TIER1_FILE_MEMO_MAX_ENTRIES {
+            let path = temp.path().join(format!("file-{index}.txt"));
+            fs::write(&path, index.to_string()).unwrap();
+            let value =
+                memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), index));
+            assert_eq!(value, index);
+            paths.push(path);
+        }
+
+        let recent_path = paths[0].clone();
+        let recent_value = memo.get_or_insert_with(&recent_path, |_| {
+            panic!("recently inserted entry should hit before eviction")
+        });
+        assert_eq!(recent_value, 0);
+
+        let evicting_path = temp.path().join("new-file.txt");
+        fs::write(&evicting_path, "new").unwrap();
+        let evicting_value = memo.get_or_insert_with(&evicting_path, |path| {
+            (Some(collect_freshness(path)), TIER1_FILE_MEMO_MAX_ENTRIES)
+        });
+        assert_eq!(evicting_value, TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        let state = memo.state.lock().unwrap();
+        assert_eq!(state.entries.len(), TIER1_FILE_MEMO_MAX_ENTRIES);
+        assert!(state.entries.contains_key(&recent_path));
+        assert!(state.entries.contains_key(&evicting_path));
+        assert!(!state.entries.contains_key(&paths[1]));
+        drop(state);
+
+        let recent_value = memo.get_or_insert_with(&recent_path, |_| {
+            panic!("recently used entry should survive eviction")
+        });
+        assert_eq!(recent_value, 0);
+    }
+
+    #[test]
+    fn tier1_file_memo_repeated_touches_keep_lazy_lru_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+        let mut paths = Vec::with_capacity(TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        for index in 0..TIER1_FILE_MEMO_MAX_ENTRIES {
+            let path = temp.path().join(format!("file-{index}.txt"));
+            fs::write(&path, index.to_string()).unwrap();
+            memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), index));
+            paths.push(path);
+        }
+
+        for _ in 0..(TIER1_FILE_MEMO_MAX_ENTRIES * 3) {
+            let value = memo.get_or_insert_with(&paths[0], |_| {
+                panic!("hot entry should stay cached while it is repeatedly touched")
+            });
+            assert_eq!(value, 0);
+        }
+
+        let evicting_path = temp.path().join("new-file.txt");
+        fs::write(&evicting_path, "new").unwrap();
+        memo.get_or_insert_with(&evicting_path, |path| {
+            (Some(collect_freshness(path)), TIER1_FILE_MEMO_MAX_ENTRIES)
+        });
+
+        let state = memo.state.lock().unwrap();
+        assert_eq!(state.entries.len(), TIER1_FILE_MEMO_MAX_ENTRIES);
+        assert!(state.entries.contains_key(&paths[0]));
+        assert!(state.entries.contains_key(&evicting_path));
+        assert!(!state.entries.contains_key(&paths[1]));
+        assert!(
+            state.lru.len() <= TIER1_FILE_MEMO_MAX_ENTRIES * 2,
+            "lazy LRU queue should be compacted instead of growing without bound"
+        );
+    }
+
+    #[test]
+    fn tier1_file_memo_reuses_fresh_entries_and_rescans_stale_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("memo.txt");
+        fs::write(&path, "first").unwrap();
+
+        let memo = Tier1FileMemo::<String>::default();
+        let scans = Cell::new(0);
+
+        let first = memo.get_or_insert_with(&path, |path| {
+            scans.set(scans.get() + 1);
+            (Some(collect_freshness(path)), "first scan".to_string())
+        });
+        assert_eq!(first, "first scan");
+        assert_eq!(scans.get(), 1);
+
+        let unchanged =
+            memo.get_or_insert_with(&path, |_| panic!("unchanged file should reuse Tier-1 memo"));
+        assert_eq!(unchanged, "first scan");
+        assert_eq!(scans.get(), 1);
+
+        fs::write(&path, "changed file contents").unwrap();
+        let changed = memo.get_or_insert_with(&path, |path| {
+            scans.set(scans.get() + 1);
+            (Some(collect_freshness(path)), "second scan".to_string())
+        });
+        assert_eq!(changed, "second scan");
+        assert_eq!(scans.get(), 2);
+
+        let fresh_after_rescan = memo.get_or_insert_with(&path, |_| {
+            panic!("rescanned file should reuse refreshed Tier-1 memo")
+        });
+        assert_eq!(fresh_after_rescan, "second scan");
+        assert_eq!(scans.get(), 2);
+    }
 }

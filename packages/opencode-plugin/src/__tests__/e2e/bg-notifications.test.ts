@@ -1,6 +1,6 @@
 /// <reference path="../../bun-test.d.ts" />
 
-import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
@@ -38,6 +38,10 @@ mock.module("../../shared/live-server-client.js", () => ({
   },
   __resetLiveServerWakeForTests: () => {},
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import {
   __resetBgNotificationStateForTests,

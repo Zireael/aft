@@ -77,6 +77,22 @@ impl EnsureServerOutcomes {
     pub fn no_server_registered(&self) -> bool {
         self.attempts.is_empty()
     }
+
+    /// True when servers matched the file's extension but none actually apply
+    /// to this project — i.e. nothing started and every attempt failed the root
+    /// marker check (e.g. oxlint registered for `.ts` with no `.oxlintrc.json`).
+    /// Distinct from `no_server_registered` (extension unsupported) and from a
+    /// real outage (binary missing / spawn failed): a missing root marker is a
+    /// filesystem fact that never changes mid-scan, so such a file will never
+    /// produce diagnostics and must not be reported as "pending".
+    pub fn only_inapplicable_root_markers(&self) -> bool {
+        self.successful.is_empty()
+            && !self.attempts.is_empty()
+            && self
+                .attempts
+                .iter()
+                .all(|attempt| matches!(attempt.result, ServerAttemptResult::NoRootMarker { .. }))
+    }
 }
 
 /// Outcome of a post-edit diagnostics wait. Reports the per-server status
@@ -1344,6 +1360,29 @@ impl LspManager {
 
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
         self.diagnostics.all()
+    }
+
+    /// True if any LSP server has reported diagnostics at least once, including
+    /// an empty report that proves a checked-clean file. This lets callers avoid
+    /// treating an empty flattened diagnostic list as trustworthy when no server
+    /// has actually run.
+    pub fn has_any_diagnostic_reports(&self) -> bool {
+        !self.diagnostics.is_empty()
+    }
+
+    /// True if any server has reported for this file, including an empty
+    /// checked-clean report.
+    pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics.has_any_report_for_file(&normalized)
+    }
+
+    /// True if this exact server/file pair has a diagnostic report, including
+    /// an empty checked-clean report.
+    pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics
+            .has_report_for_server_file(server, &normalized)
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {

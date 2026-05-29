@@ -88,8 +88,9 @@ maybeDescribe("hoisted tools (real bridge)", () => {
     const text = harness.text(result);
     expect(text).toMatch(/Edited .*edit-target\.ts \(\+\d+\/-\d+, 1 replacement\)/);
 
-    // Diff text uses Pi's line-numbered format: "+NN content" / "-NN content".
-    expect(text).toMatch(/^[+-]\s*\d+ /m);
+    // Agent text is summary-only: the diff body is NOT echoed (it would scale
+    // the payload with file size). The line-numbered diff lives in details.
+    expect(text).not.toMatch(/^[+-]\s*\d+ /m);
 
     // Details carry the diff and firstChangedLine for the renderer.
     const details = result.details as

@@ -17,7 +17,7 @@
     "lint:fix": "biome check --write .",
     "format": "biome format --write . && cargo fmt",
     "format:check": "biome format . && cargo fmt --check",
-    "test": "bun run --filter '*' test",
+    "test": "bun run --filter './packages/*' test",
     "pi-rpc-e2e": "cd tests/pi-rpc && bun test",
     "test:rust": "cargo test",
     "test:windows-e2e": "bun run scripts/windows-vm/test.ts",

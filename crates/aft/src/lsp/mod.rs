@@ -9,6 +9,7 @@ pub mod pull_params;
 pub mod registry;
 pub mod roots;
 pub mod transport;
+pub mod tsconfig_membership;
 
 /// LSP subsystem error type.
 #[derive(Debug)]

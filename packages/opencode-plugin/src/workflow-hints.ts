@@ -47,8 +47,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasGrep = opts.toolSurface !== "minimal" && !opts.disabledTools.has(grepName);
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.disabledTools.has("aft_search");
-  // aft_navigate is "all"-tier only.
-  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_navigate");
+  // aft_callgraph is "all"-tier only.
+  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_callgraph");
   const hasInspect = opts.toolSurface !== "minimal" && !opts.disabledTools.has("aft_inspect");
   const hasBash = !opts.disabledTools.has(bashName);
   const hasBgBash =
@@ -68,7 +68,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         ? ` Use \`${grepName}\` directly only when you need exhaustive enumeration of literal text (every TODO, every import of X) without ranking.`
         : "";
       sections.push(
-        `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`,
+        `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Very short queries fall back to literal scans; pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`,
       );
     } else {
       sections.push(
@@ -77,18 +77,22 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     }
   }
 
-  // Codebase health — needs aft_inspect (recommended+).
+  // Codebase health & diagnostics — needs aft_inspect (recommended+).
+  // Lead with the behavioral change: AFT no longer auto-surfaces compile/type
+  // errors on edit, so the agent MUST pull them. Anchor to the edit→test/commit
+  // moment, and be explicit that aft_inspect diagnostics are a checkpoint, not
+  // the authority (the project checker is).
   if (hasInspect) {
     sections.push(
-      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, or to verify cleanup completeness. It summarizes TODOs, metrics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and check `stale_categories` when Tier 2 refreshes are still warming.",
+      "**Codebase health & diagnostics**: AFT does not surface compile/type errors automatically after edits — pull them with `aft_inspect`. Run it after a batch of edits and before you run tests or commit, when starting in unfamiliar code, or before a refactor/review. One call summarizes diagnostics (compile/type errors), TODOs, metrics, dead code, unused exports, and duplicates; pass `sections` for focused drill-down and `scope` to actively pull diagnostics for a specific file or directory. Its diagnostics are a fast checkpoint, not the authority — a clean `tsc` / `cargo check` / `pyright` run is the real gate. Treat `stale_categories` as a genuine stale-cache signal while an async Tier 2 refresh catches up.",
     );
   }
 
-  // Relationship questions — needs aft_navigate ("all" surface).
+  // Relationship questions — needs aft_callgraph ("all" surface).
   if (hasNavigate) {
     sections.push(
       [
-        "Use `aft_navigate` instead of grep + read chains for relationship questions:",
+        "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
         "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",

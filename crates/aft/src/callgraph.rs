@@ -31,8 +31,14 @@ type SharedPath = Arc<PathBuf>;
 type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
 type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
+type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
 static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
@@ -64,7 +70,7 @@ fn symbol_query_matches(symbol: &str, query: &str) -> bool {
     symbol == query || symbol_unqualified_name(symbol) == query
 }
 
-fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
+pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
     full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
 }
 
@@ -99,7 +105,7 @@ fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<S
     candidates
 }
 
-fn resolve_symbol_query_in_data(
+pub(crate) fn resolve_symbol_query_in_data(
     file_data: &FileCallData,
     file: &Path,
     symbol_name: &str,
@@ -179,6 +185,32 @@ pub enum EdgeResolution {
 struct ResolvedSymbol {
     file: PathBuf,
     symbol: String,
+}
+
+#[derive(Debug, Clone)]
+struct RustCrateInfo {
+    lib_name: String,
+    lib_root: Option<PathBuf>,
+    main_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RustModuleBase {
+    src_dir: PathBuf,
+    root_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RustUseEntry {
+    module_path: String,
+    local_name: String,
+    kind: RustUseKind,
+}
+
+#[derive(Debug, Clone)]
+enum RustUseKind {
+    Item { imported_name: String },
+    Module,
 }
 
 /// A single caller site: who calls a given symbol and from where.
@@ -684,6 +716,24 @@ impl CallGraph {
         D: FnMut(&Path) -> Option<String>,
     {
         let caller_dir = caller_file.parent().unwrap_or(Path::new("."));
+
+        // Rust uses `::` module paths rather than JS/TS specifiers. Keep this
+        // branch gated to `.rs` callers so the existing JS/TS resolver below
+        // remains unchanged.
+        if is_rust_source_file(caller_file) {
+            if let Some(target) = resolve_rust_cross_file_edge(
+                full_callee,
+                short_name,
+                caller_file,
+                import_block,
+                &mut file_exports_symbol,
+            ) {
+                return EdgeResolution::Resolved {
+                    file: target.file,
+                    symbol: target.symbol,
+                };
+            }
+        }
 
         // Check namespace imports: "utils.foo" where utils is a namespace import
         if full_callee.contains('.') {
@@ -3223,6 +3273,577 @@ fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<P
     resolve_package_entry(&package_root, &subpath)
 }
 
+fn is_rust_source_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+}
+
+fn resolve_rust_cross_file_edge<F>(
+    full_callee: &str,
+    short_name: &str,
+    caller_file: &Path,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if let Some(target) = resolve_rust_qualified_call(caller_file, full_callee, file_exports_symbol)
+    {
+        return Some(target);
+    }
+
+    resolve_rust_imported_call(
+        caller_file,
+        full_callee,
+        short_name,
+        import_block,
+        file_exports_symbol,
+    )
+}
+
+fn resolve_rust_qualified_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if !full_callee.contains("::") {
+        return None;
+    }
+
+    let segments = rust_path_segments(full_callee)?;
+    resolve_rust_call_segments(caller_file, &segments, file_exports_symbol)
+}
+
+fn resolve_rust_imported_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    short_name: &str,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let call_segments = rust_path_segments(full_callee).unwrap_or_default();
+    let bare_call_name = if call_segments.len() <= 1 {
+        call_segments
+            .first()
+            .map(String::as_str)
+            .unwrap_or(short_name)
+    } else {
+        short_name
+    };
+
+    for imp in &import_block.imports {
+        for entry in rust_use_entries(imp) {
+            match &entry.kind {
+                RustUseKind::Item { imported_name } if call_segments.len() <= 1 => {
+                    if entry.local_name != bare_call_name {
+                        continue;
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &entry.module_path)
+                    else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, imported_name) {
+                        return Some(ResolvedSymbol {
+                            file,
+                            symbol: imported_name.clone(),
+                        });
+                    }
+                }
+                RustUseKind::Module if call_segments.len() >= 2 => {
+                    if call_segments.first().map(String::as_str) != Some(entry.local_name.as_str())
+                    {
+                        continue;
+                    }
+                    let symbol = call_segments.last()?.clone();
+                    let mut module_path = entry.module_path.clone();
+                    for segment in &call_segments[1..call_segments.len().saturating_sub(1)] {
+                        module_path.push_str("::");
+                        module_path.push_str(segment);
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &module_path) else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, &symbol) {
+                        return Some(ResolvedSymbol { file, symbol });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_rust_call_segments<F>(
+    caller_file: &Path,
+    segments: &[String],
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let symbol = segments.last()?.clone();
+    let module_path = segments[..segments.len() - 1].join("::");
+    let file = resolve_rust_module_path(caller_file, &module_path)?;
+    if file_exports_symbol(&file, &symbol) {
+        Some(ResolvedSymbol { file, symbol })
+    } else {
+        None
+    }
+}
+
+fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<PathBuf> {
+    let segments = rust_path_segments(module_path)?;
+    let first = segments.first()?.as_str();
+
+    match first {
+        "std" | "core" | "alloc" => None,
+        "crate" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+        "self" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            if segments.len() == 1 {
+                return Some(canonicalize_path(caller_file));
+            }
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        "super" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.pop();
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        crate_name => {
+            let caller_dir = caller_file.parent().unwrap_or_else(|| Path::new("."));
+            let workspace_crates = rust_workspace_crates(caller_dir)?;
+            let crate_info = workspace_crates.get(crate_name)?;
+            let base = rust_lib_module_base(crate_info)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+    }
+}
+
+fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
+    let Some(body) = rust_use_body(&imp.raw_text) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    expand_rust_use_tree(body, &mut entries);
+    entries
+}
+
+fn rust_use_body(raw: &str) -> Option<&str> {
+    let use_pos = raw.find("use ")?;
+    let body = raw[use_pos + 4..].trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    (!body.is_empty()).then_some(body)
+}
+
+fn expand_rust_use_tree(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+
+    if let Some((prefix, inner)) = split_rust_use_braces(path) {
+        let prefix = prefix.trim().trim_end_matches("::").trim();
+        for part in split_top_level_commas(inner) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "self" {
+                if let Some(local_name) = rust_last_path_segment(prefix) {
+                    entries.push(RustUseEntry {
+                        module_path: prefix.to_string(),
+                        local_name,
+                        kind: RustUseKind::Module,
+                    });
+                }
+                continue;
+            }
+            let combined = if prefix.is_empty() {
+                part.to_string()
+            } else {
+                format!("{prefix}::{part}")
+            };
+            expand_rust_use_tree(&combined, entries);
+        }
+        return;
+    }
+
+    add_rust_use_leaf(path, entries);
+}
+
+fn split_rust_use_braces(path: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (idx, ch) in path.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let start = start?;
+                    if !path[idx + ch.len_utf8()..].trim().is_empty() {
+                        return None;
+                    }
+                    return Some((&path[..start], &path[start + 1..idx]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&value[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn add_rust_use_leaf(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let (path, alias) = split_rust_alias(path);
+    let Some(segments) = rust_path_segments(path) else {
+        return;
+    };
+    if segments.is_empty() || segments.last().map(String::as_str) == Some("*") {
+        return;
+    }
+
+    let imported_name = segments.last().cloned().unwrap_or_default();
+    let local_name = alias.unwrap_or(&imported_name).to_string();
+    if segments.len() >= 2 {
+        entries.push(RustUseEntry {
+            module_path: segments[..segments.len() - 1].join("::"),
+            local_name: local_name.clone(),
+            kind: RustUseKind::Item {
+                imported_name: imported_name.clone(),
+            },
+        });
+    }
+
+    entries.push(RustUseEntry {
+        module_path: segments.join("::"),
+        local_name,
+        kind: RustUseKind::Module,
+    });
+}
+
+fn split_rust_alias(path: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = path.rfind(" as ") {
+        let original = path[..idx].trim();
+        let alias = path[idx + 4..].trim();
+        if !original.is_empty() && !alias.is_empty() {
+            return (original, Some(alias));
+        }
+    }
+    (path.trim(), None)
+}
+
+fn rust_path_segments(path: &str) -> Option<Vec<String>> {
+    let path = path.trim().trim_end_matches(';').trim();
+    if path.is_empty() || path.contains('{') || path.contains('}') {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    for raw_segment in path.split("::") {
+        let segment = raw_segment.trim();
+        if segment.is_empty() || segment == "*" || segment.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let segment = segment.strip_prefix("r#").unwrap_or(segment);
+        if segment
+            .chars()
+            .any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        {
+            return None;
+        }
+        segments.push(segment.to_string());
+    }
+
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn rust_last_path_segment(path: &str) -> Option<String> {
+    rust_path_segments(path)?.last().cloned()
+}
+
+fn find_rust_crate_root(from: &Path) -> Option<PathBuf> {
+    let mut current = if from.is_file() {
+        from.parent()
+    } else {
+        Some(from)
+    };
+    while let Some(dir) = current {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let root = canonicalize_path(crate_root);
+    if let Some(cached) = RUST_CRATE_INFO_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&root).cloned())
+    {
+        return cached;
+    }
+
+    let resolved = read_rust_crate_info(&root);
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.insert(root, resolved.clone());
+    }
+    resolved
+}
+
+fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let cargo = rust_manifest_value(&crate_root.join("Cargo.toml"))?;
+    let package = cargo.get("package")?;
+    let package_name = package.get("name")?.as_str()?;
+    let lib_name = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(|name| name.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| package_name.replace('-', "_"));
+
+    let lib_root = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(|path| path.as_str())
+        .map(|path| crate_root.join(path))
+        .unwrap_or_else(|| crate_root.join("src/lib.rs"));
+    let lib_root = lib_root.is_file().then(|| canonicalize_path(&lib_root));
+
+    let main_root = crate_root.join("src/main.rs");
+    let main_root = main_root.is_file().then(|| canonicalize_path(&main_root));
+
+    Some(RustCrateInfo {
+        lib_name,
+        lib_root,
+        main_root,
+    })
+}
+
+fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
+    let source = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&source).ok()
+}
+
+fn rust_module_base_for_caller(
+    crate_info: &RustCrateInfo,
+    caller_file: &Path,
+) -> Option<RustModuleBase> {
+    let caller = canonicalize_path(caller_file);
+    if crate_info.main_root.as_ref() == Some(&caller) {
+        return rust_main_module_base(crate_info);
+    }
+    rust_lib_module_base(crate_info).or_else(|| rust_main_module_base(crate_info))
+}
+
+fn rust_lib_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.lib_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn rust_main_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.main_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn resolve_rust_module_segments(base: &RustModuleBase, segments: &[String]) -> Option<PathBuf> {
+    if segments.is_empty() {
+        return Some(base.root_file.clone());
+    }
+
+    let module_base = segments
+        .iter()
+        .fold(base.src_dir.clone(), |path, segment| path.join(segment));
+    let file_path = module_base.with_extension("rs");
+    if file_path.is_file() {
+        return Some(canonicalize_path(&file_path));
+    }
+
+    let mod_path = module_base.join("mod.rs");
+    if mod_path.is_file() {
+        return Some(canonicalize_path(&mod_path));
+    }
+
+    None
+}
+
+fn rust_module_segments_for_file(src_dir: &Path, file: &Path) -> Option<Vec<String>> {
+    let src_dir = canonicalize_path(src_dir);
+    let file = canonicalize_path(file);
+    let rel = file.strip_prefix(&src_dir).ok()?;
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let last = parts.pop()?;
+    if last == "lib.rs" || last == "main.rs" {
+        return Some(Vec::new());
+    }
+    if last == "mod.rs" {
+        return Some(parts);
+    }
+    let stem = Path::new(&last).file_stem()?.to_str()?.to_string();
+    parts.push(stem);
+    Some(parts)
+}
+
+fn rust_workspace_crates(from_dir: &Path) -> Option<HashMap<String, RustCrateInfo>> {
+    let workspace_root =
+        find_rust_workspace_root(from_dir).or_else(|| find_rust_crate_root(from_dir))?;
+    let workspace_root = canonicalize_path(&workspace_root);
+
+    if let Some(cached) = RUST_WORKSPACE_CRATE_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&workspace_root).cloned())
+    {
+        return Some(cached);
+    }
+
+    let mut crates = HashMap::new();
+    for member in rust_workspace_member_dirs(&workspace_root) {
+        if let Some(info) = rust_crate_info(&member) {
+            if info.lib_root.is_some() {
+                crates.insert(info.lib_name.clone(), info);
+            }
+        }
+    }
+    if let Some(info) = rust_crate_info(&workspace_root) {
+        if info.lib_root.is_some() {
+            crates.insert(info.lib_name.clone(), info);
+        }
+    }
+
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.insert(workspace_root, crates.clone());
+    }
+    Some(crates)
+}
+
+fn find_rust_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        let cargo = dir.join("Cargo.toml");
+        if rust_manifest_value(&cargo)
+            .and_then(|value| value.get("workspace").cloned())
+            .is_some()
+        {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(cargo) = rust_manifest_value(&workspace_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Some(members) = cargo
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut dirs = Vec::new();
+    for member in members.iter().filter_map(|member| member.as_str()) {
+        dirs.extend(expand_rust_workspace_member(workspace_root, member));
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<PathBuf> {
+    let member = member.trim();
+    if member.is_empty() {
+        return Vec::new();
+    }
+
+    if member.contains('*') || member.contains('?') || member.contains('[') {
+        let pattern = workspace_root.join(member).to_string_lossy().to_string();
+        return glob::glob(&pattern)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|path| path.join("Cargo.toml").is_file())
+            .map(|path| canonicalize_path(&path))
+            .collect();
+    }
+
+    let path = workspace_root.join(member);
+    if path.join("Cargo.toml").is_file() {
+        vec![canonicalize_path(&path)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn resolve_tsconfig_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
     let tsconfig_dir = find_tsconfig_dir(from_dir)?;
     let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"))?;
@@ -3337,6 +3958,12 @@ fn is_workspace_root(dir: &Path) -> bool {
 
 fn clear_workspace_package_cache() {
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
         cache.clear();
     }
 }

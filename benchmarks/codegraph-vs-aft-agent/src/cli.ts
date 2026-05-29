@@ -17,6 +17,9 @@ interface CliOptions {
   taskIds: string[];
   timeoutMs: number;
   dryRun: boolean;
+  providerBaseUrl?: string;
+  providerName?: string;
+  providerApiKey?: string;
 }
 
 async function main(): Promise<void> {
@@ -57,7 +60,7 @@ async function runTaskArm(task: AgentTask, arm: AgentArm, fixturePath: string, o
   const stderrPath = resolve(runDir, "opencode.stderr.log");
   mkdirSync(runDir, { recursive: true });
   copyFixture(fixturePath, repoPath);
-  await prepareArm(arm, repoPath, configRoot, options.timeoutMs, options.dryRun);
+  await prepareArm(arm, repoPath, configRoot, options.timeoutMs, options.dryRun, options.providerBaseUrl, options.providerName);
 
   const attemptedModel = options.model;
   let model = attemptedModel;
@@ -126,10 +129,12 @@ async function prepareArm(
   configRoot: string,
   timeoutMs: number,
   dryRun: boolean,
+  providerBaseUrl?: string,
+  providerName?: string,
 ): Promise<void> {
   const opencodeDir = resolve(configRoot, "opencode");
   mkdirSync(opencodeDir, { recursive: true });
-  const provider = zenProviderConfig();
+  const provider = providerBaseUrl ? customProviderConfig(providerBaseUrl, providerName) : zenProviderConfig();
 
   if (arm === "aft") {
     writeJson(resolve(opencodeDir, "opencode.json"), {
@@ -137,7 +142,41 @@ async function prepareArm(
       plugin: ["@cortexkit/aft-opencode@latest"],
       provider,
     });
-    writeFileSync(resolve(opencodeDir, "aft.jsonc"), '{\n  "search_index": true,\n  "semantic_search": true\n}\n');
+    // Fair-comparison surface: keep file/edit/grep/bash mechanics IDENTICAL to the
+    // codegraph arm (native OpenCode tools) so the only difference benchmarked is the
+    // code-intelligence layer — AFT's aft_search/aft_outline/aft_zoom/aft_navigate vs
+    // codegraph's codegraph_* tools.
+    //   - hoist_builtin_tools:false → native read/write/edit (AFT registers aft_* prefixed; disabled below)
+    //   - bash:false                → native bash on both arms (AFT otherwise hoists bash)
+    //   - grep/glob disabled         → native grep/glob (search_index stays true so aft_search keeps its lexical lane)
+    //   - tool_surface:"all"         → expose aft_navigate (the codegraph_trace/callers comparator)
+    //   - everything non-comparison disabled (safety/import/ast-grep/conflicts/lsp/refactor/transform/move/delete)
+    const aftBenchConfig = {
+      search_index: true,
+      semantic_search: true,
+      hoist_builtin_tools: false,
+      bash: false,
+      tool_surface: "all",
+      disabled_tools: [
+        "aft_read",
+        "aft_write",
+        "aft_edit",
+        "aft_apply_patch",
+        "grep",
+        "glob",
+        "aft_safety",
+        "aft_import",
+        "ast_grep_search",
+        "ast_grep_replace",
+        "aft_conflicts",
+        "lsp_diagnostics",
+        "aft_refactor",
+        "aft_transform",
+        "aft_move",
+        "aft_delete",
+      ],
+    };
+    writeFileSync(resolve(opencodeDir, "aft.jsonc"), `${JSON.stringify(aftBenchConfig, null, 2)}\n`);
     if (!dryRun) {
       const storageDir = cortexKitStorageRoot();
       const warmup = await runCommand(
@@ -177,8 +216,11 @@ async function prepareArm(
 }
 
 async function invokeOpencode(task: AgentTask, repoPath: string, configRoot: string, model: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const apiKey = nonEmpty(process.env.OPENCODE_API_KEY) ?? nonEmpty(process.env.OPENAI_API_KEY) ?? readOpencodeAuthKey("opencode-go");
-  if (!apiKey) {
+  const usingCustomProvider = nonEmpty(process.env.AGENT_PROVIDER_BASE_URL);
+  const apiKey = usingCustomProvider
+    ? nonEmpty(process.env.AGENT_PROVIDER_API_KEY) ?? "sk-benchmark-noop"
+    : nonEmpty(process.env.OPENCODE_API_KEY) ?? nonEmpty(process.env.OPENAI_API_KEY) ?? readOpencodeAuthKey("opencode-go");
+  if (!usingCustomProvider && !apiKey) {
     throw new Error("Missing opencode-go auth. Mount ~/.local/share/opencode/auth.json or set OPENCODE_API_KEY.");
   }
   const prompt = benchmarkPrompt(task);
@@ -205,8 +247,8 @@ async function invokeOpencode(task: AgentTask, repoPath: string, configRoot: str
       AFT_WAIT_FOR_SEMANTIC_READY: "1",
       AFT_WAIT_FOR_SEMANTIC_READY_MS: String(timeoutMs),
       FASTEMBED_CACHE_DIR: join(storageDir, "semantic", "models"),
-      OPENAI_API_KEY: apiKey,
-      OPENCODE_API_KEY: apiKey,
+      OPENAI_API_KEY: apiKey ?? undefined,
+      OPENCODE_API_KEY: apiKey ?? undefined,
       AFT_BENCHMARK: "1",
     },
   );
@@ -332,6 +374,9 @@ function parseCliArgs(): CliOptions {
       task: { type: "string", multiple: true },
       "timeout-ms": { type: "string", default: process.env.AGENT_TIMEOUT_MS ?? "240000" },
       "dry-run": { type: "boolean", default: process.env.AGENT_DRY_RUN === "1" },
+      "provider-base-url": { type: "string" },
+      "provider-name": { type: "string" },
+      "provider-api-key": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -362,6 +407,9 @@ Auth for real runs:
     taskIds: (values.task as string[] | undefined) ?? [],
     timeoutMs: positiveInt(String(values["timeout-ms"]), "--timeout-ms"),
     dryRun: values["dry-run"] === true,
+    providerBaseUrl: values["provider-base-url"] ? String(values["provider-base-url"]) : undefined,
+    providerName: values["provider-name"] ? String(values["provider-name"]) : undefined,
+    providerApiKey: values["provider-api-key"] ? String(values["provider-api-key"]) : undefined,
   };
 }
 
@@ -385,6 +433,21 @@ function zenProviderConfig(): Record<string, unknown> {
       models: {
         "deepseek-v4-flash-free": { name: "deepseek-v4-flash-free" },
         "deepseek-v4-pro": { name: "deepseek-v4-pro" },
+      },
+    },
+  };
+}
+
+function customProviderConfig(baseUrl: string, name?: string): Record<string, unknown> {
+  const providerId = "local";
+  const modelName = name || "default";
+  return {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible",
+      name: name || "Local LLM",
+      options: { baseURL: baseUrl },
+      models: {
+        [modelName]: { name: modelName },
       },
     },
   };

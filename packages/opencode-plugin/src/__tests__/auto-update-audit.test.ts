@@ -1,5 +1,5 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,10 @@ mock.module("../logger.js", () => ({
 }));
 mock.module("../hooks/auto-update-checker/checker.js", () => checkerMocks);
 mock.module("../hooks/auto-update-checker/cache.js", () => cacheMocks);
+
+afterAll(() => {
+  mock.restore();
+});
 
 let importCounter = 0;
 const tempRoots = new Set<string>();

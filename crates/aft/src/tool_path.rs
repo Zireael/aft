@@ -29,6 +29,25 @@ pub(crate) fn find_on_path_manual(binary: &str) -> Option<PathBuf> {
     None
 }
 
+fn path_looks_like_tool(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
 /// Check `dir/<binary>` and, on Windows, `dir/<binary>.exe|.cmd|.bat|.com`.
 pub(crate) fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
     if !dir.is_dir() {
@@ -36,14 +55,14 @@ pub(crate) fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
     }
 
     let direct = dir.join(binary);
-    if direct.is_file() {
+    if path_looks_like_tool(&direct) {
         return Some(direct);
     }
 
     if cfg!(windows) {
         for ext in ["exe", "cmd", "bat", "com"] {
             let candidate = dir.join(format!("{binary}.{ext}"));
-            if candidate.is_file() {
+            if path_looks_like_tool(&candidate) {
                 return Some(candidate);
             }
         }
@@ -85,10 +104,13 @@ pub(crate) fn well_known_windows_bin_dirs(_userprofile: Option<&std::ffi::OsStr>
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn find_on_path_manual_returns_null_when_path_unset() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("PATH");
         std::env::remove_var("PATH");
         assert!(find_on_path_manual("aft-nonexistent-tool-xyzzy").is_none());
@@ -100,10 +122,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn find_on_path_manual_finds_executable_in_single_dir() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let bin_path = dir.path().join("opencode-test-bin");
         fs::write(&bin_path, "#!/bin/sh\necho ok\n").unwrap();
         let mut perms = fs::metadata(&bin_path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
         fs::set_permissions(&bin_path, perms).unwrap();
 
@@ -117,6 +141,26 @@ mod tests {
         }
 
         assert_eq!(found.as_deref(), Some(bin_path.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_on_path_manual_skips_non_executable_file() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("opencode-test-bin");
+        fs::write(&bin_path, "not executable\n").unwrap();
+
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.path());
+        let found = find_on_path_manual("opencode-test-bin");
+        if let Some(path) = saved {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert!(found.is_none());
     }
 
     #[cfg(windows)]

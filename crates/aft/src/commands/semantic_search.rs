@@ -22,6 +22,8 @@ const MAX_TOP_K: usize = 100;
 const HYBRID_LEXICAL_BOOST: f32 = 1.1;
 const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
 const LEXICAL_ENUMERATION_LIMIT: usize = 50;
+const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
+const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 5_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 
@@ -37,6 +39,7 @@ pub struct HybridResult {
     pub source: &'static str,
     pub semantic_score: Option<f32>,
     pub lexical_score: Option<f32>,
+    pub hybrid_boosted: bool,
     pub snippet: String,
 }
 
@@ -147,6 +150,12 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn default_top_k() -> usize {
     DEFAULT_TOP_K
+}
+
+fn semantic_candidate_limit(top_k: usize) -> usize {
+    top_k
+        .saturating_mul(SEMANTIC_OVERFETCH_MULTIPLIER)
+        .clamp(SEMANTIC_OVERFETCH_FLOOR, MAX_TOP_K)
 }
 
 fn choose_mode(
@@ -261,10 +270,11 @@ fn handle_grep_search(
         warnings.push(degraded_warning(ctx));
     }
 
+    let result_source = if literal { "literal" } else { "regex" };
     let result_values = result
         .matches
         .iter()
-        .map(grep_match_to_json)
+        .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(mode);
     let text = format_grep_search_text(&result, project_root, interpreted_as);
@@ -360,6 +370,22 @@ fn handle_semantic_or_hybrid_search(
                 detail.push_str(&format!(" / {}", entries_total));
             }
 
+            if natural_language_degraded_fallback_available(params.hint, mode, &shape) {
+                return semantic_unavailable_grep_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    "building",
+                    detail,
+                    warnings,
+                    project_root,
+                    top_k,
+                );
+            }
+
+            let lexical_count = lexical.files.len();
+            let lexical_engine_capped = lexical.engine_capped;
             let results = fuse_hybrid_results(Vec::new(), lexical.files, &shape, top_k);
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let note = building_lexical_note(lexical.ready);
@@ -382,7 +408,12 @@ fn handle_semantic_or_hybrid_search(
                 req,
                 SearchResponseParts {
                     query: &params.query,
-                    interpreted_as: interpreted_as_label(mode),
+                    // While semantic rebuilds, only the lexical lane produced
+                    // these results (semantic input is empty here). Report
+                    // "lexical" when it ran; the "building" status + the
+                    // semantic_rebuilding/lexical_only_fallback extras tell the
+                    // agent semantic results are still coming.
+                    interpreted_as: fallback_executed_label(mode, lexical.ready),
                     query_kind: query_kind_label(shape.kind),
                     semantic_status: "building",
                     status: "building",
@@ -394,8 +425,8 @@ fn handle_semantic_or_hybrid_search(
                         lexical.ready,
                     ),
                     results: result_values,
-                    more_available: false,
-                    engine_capped: lexical.engine_capped,
+                    more_available: lexical_count > top_k || lexical_engine_capped,
+                    engine_capped: lexical_engine_capped,
                     fully_degraded: false,
                     warnings,
                     extras,
@@ -455,17 +486,31 @@ fn handle_semantic_or_hybrid_search(
         }
     };
 
-    let semantic_limit = top_k.clamp(50, MAX_TOP_K);
-    let semantic_results = {
+    let semantic_limit = semantic_candidate_limit(top_k);
+    let semantic_fetch_limit = semantic_limit.saturating_add(1);
+    let mut semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
         semantic_index
             .as_ref()
-            .map(|index| index.search(&query_vector, semantic_limit))
+            .map(|index| index.search(&query_vector, semantic_fetch_limit))
             .unwrap_or_default()
     };
+    let semantic_more_available = semantic_results.len() > semantic_limit;
+    if semantic_more_available {
+        semantic_results.truncate(semantic_limit);
+    }
 
-    let pre_fuse_count = semantic_results.len().saturating_add(lexical.files.len());
-    let results = fuse_hybrid_results(semantic_results, lexical.files, &shape, top_k);
+    let mut results = fuse_hybrid_results(
+        semantic_results,
+        lexical.files,
+        &shape,
+        top_k.saturating_add(1),
+    );
+    let fused_more_available = results.len() > top_k;
+    if fused_more_available {
+        results.truncate(top_k);
+    }
+    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
 
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
@@ -482,7 +527,7 @@ fn handle_semantic_or_hybrid_search(
             complete: true,
             text: format_semantic_text(&results, project_root),
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
-            more_available: pre_fuse_count > top_k,
+            more_available,
             engine_capped: lexical.engine_capped,
             fully_degraded: false,
             warnings,
@@ -592,14 +637,16 @@ fn semantic_unavailable_or_fallback_response(
             req,
             SearchResponseParts {
                 query: &params.query,
-                interpreted_as: interpreted_as_label(mode),
+                // The trigram lexical lane produced these results; semantic
+                // never ran. Report what executed, not the routed mode.
+                interpreted_as: fallback_executed_label(mode, true),
                 query_kind: query_kind_label(shape.kind),
                 semantic_status,
                 status: "ready",
                 complete: false,
                 text: format_lexical_unavailable_text(&detail, &results, project_root),
                 results: result_values,
-                more_available: lexical_count > top_k,
+                more_available: lexical_count > top_k || lexical_engine_capped,
                 engine_capped: lexical_engine_capped,
                 fully_degraded: false,
                 warnings,
@@ -613,7 +660,6 @@ fn semantic_unavailable_or_fallback_response(
             req,
             ctx,
             params,
-            mode,
             shape,
             semantic_status,
             detail,
@@ -670,17 +716,30 @@ fn semantic_degraded_fallback_available(
     shape: &QueryShape,
     lexical: &LexicalCollection,
 ) -> bool {
+    if natural_language_degraded_fallback_available(params.hint, mode, shape) {
+        return true;
+    }
+
     params.hint != SearchHint::Semantic
         && mode == SearchMode::Semantic
         && !lexical.ready
         && shape.weights.should_use_lexical
 }
 
+fn natural_language_degraded_fallback_available(
+    hint: SearchHint,
+    mode: SearchMode,
+    shape: &QueryShape,
+) -> bool {
+    hint != SearchHint::Semantic
+        && mode == SearchMode::Semantic
+        && shape.kind == QueryKind::NaturalLanguage
+}
+
 fn semantic_unavailable_grep_fallback_response(
     req: &RawRequest,
     ctx: &AppContext,
     params: &SemanticSearchParams,
-    mode: SearchMode,
     shape: &QueryShape,
     semantic_status: &'static str,
     detail: String,
@@ -701,7 +760,7 @@ fn semantic_unavailable_grep_fallback_response(
     let result_values = result
         .matches
         .iter()
-        .map(grep_match_to_json)
+        .map(|grep_match| grep_match_to_json(grep_match, "literal"))
         .collect::<Vec<_>>();
     let more_available = result.truncated || result.total_matches > result.matches.len();
 
@@ -709,7 +768,10 @@ fn semantic_unavailable_grep_fallback_response(
         req,
         SearchResponseParts {
             query: &params.query,
-            interpreted_as: lexical_fallback_interpreted_as(mode),
+            // This path ran a literal grep scan over the corpus (the results are
+            // GrepLine entries), so report "literal" — not the routed
+            // semantic/hybrid mode that never executed.
+            interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
             semantic_status,
             status: "ready",
@@ -723,14 +785,6 @@ fn semantic_unavailable_grep_fallback_response(
             extras: semantic_unavailable_extras(true),
         },
     )
-}
-
-fn lexical_fallback_interpreted_as(mode: SearchMode) -> &'static str {
-    if mode == SearchMode::Semantic {
-        "hybrid"
-    } else {
-        interpreted_as_label(mode)
-    }
 }
 
 fn execute_degraded_grep_fallback(
@@ -1050,7 +1104,7 @@ pub fn fuse_hybrid_results(
     if lexical_files.is_empty() {
         return semantic
             .into_iter()
-            .map(|result| hybrid_from_semantic(result, "semantic", None))
+            .map(|result| hybrid_from_semantic(result, None))
             .take(top_k)
             .collect();
     }
@@ -1063,21 +1117,26 @@ pub fn fuse_hybrid_results(
             .collect();
     }
 
-    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().take(20).cloned().collect();
+    // Use every collected lexical candidate, not a hidden sub-cap. The lexical
+    // lane already bounds enumeration at LEXICAL_ENUMERATION_LIMIT upstream and
+    // returns candidates pre-ranked by score; an additional `.take(20)` here
+    // silently dropped candidates 21..=50 from both the semantic-boost map and
+    // the standalone-lexical results without that loss being reflected in
+    // `more_available`/`engine_capped`. The final output is already bounded by
+    // cap_per_file + truncate(top_k), so honoring all collected candidates is
+    // both more correct and honest about what was considered.
+    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().cloned().collect();
     let mut results: Vec<HybridResult> = semantic
         .into_iter()
         .map(|result| {
-            if let Some(&lexical_score) = lexical_top_files.get(&result.file) {
-                hybrid_from_semantic(result, "hybrid", Some(lexical_score))
-            } else {
-                hybrid_from_semantic(result, "semantic", None)
-            }
+            let lexical_score = lexical_top_files.get(&result.file).copied();
+            hybrid_from_semantic(result, lexical_score)
         })
         .collect();
 
     let semantic_files: HashSet<PathBuf> =
         results.iter().map(|result| result.file.clone()).collect();
-    for (file, score) in lexical_files.iter().take(20) {
+    for (file, score) in &lexical_files {
         if !semantic_files.contains(file) {
             results.push(lexical_only_result(file.clone(), *score, shape));
         }
@@ -1102,13 +1161,10 @@ pub fn fuse_hybrid_results(
     results
 }
 
-fn hybrid_from_semantic(
-    result: SemanticResult,
-    source: &'static str,
-    lexical_score: Option<f32>,
-) -> HybridResult {
+fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> HybridResult {
     let semantic_score = result.score;
-    let score = if source == "hybrid" {
+    let hybrid_boosted = lexical_score.is_some();
+    let score = if hybrid_boosted {
         semantic_score * HYBRID_LEXICAL_BOOST
     } else {
         semantic_score
@@ -1123,9 +1179,10 @@ fn hybrid_from_semantic(
         exported: result.exported,
         snippet: result.snippet,
         score,
-        source,
+        source: "semantic",
         semantic_score: Some(semantic_score),
         lexical_score,
+        hybrid_boosted,
     }
 }
 
@@ -1145,6 +1202,7 @@ fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) ->
         source: "lexical",
         semantic_score: None,
         lexical_score: Some(lexical_score),
+        hybrid_boosted: false,
         snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
     }
 }
@@ -1348,13 +1406,15 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         "source": result.source,
         "semantic_score": result.semantic_score,
         "lexical_score": result.lexical_score,
+        "hybrid_boosted": result.hybrid_boosted,
         "snippet": result.snippet,
     })
 }
 
-fn grep_match_to_json(grep_match: &GrepMatch) -> serde_json::Value {
+fn grep_match_to_json(grep_match: &GrepMatch, source: &'static str) -> serde_json::Value {
     serde_json::json!({
         "kind": "GrepLine",
+        "source": source,
         "file": grep_match.file.display().to_string(),
         "line": grep_match.line,
         "column": grep_match.column,
@@ -1397,6 +1457,22 @@ fn interpreted_as_label(mode: SearchMode) -> &'static str {
         SearchMode::Literal => "literal",
         SearchMode::Semantic => "semantic",
         SearchMode::Hybrid => "hybrid",
+    }
+}
+
+/// Honest `interpreted_as` for a response built on a semantic-unavailable
+/// fallback path. The query may have been *routed* as semantic/hybrid, but if
+/// semantic never executed, the field must report what actually produced the
+/// results — otherwise an agent reads "hybrid" and trusts a semantic ranking
+/// that never ran. `lexical_ran` is true when the lexical (trigram) lane
+/// produced the returned results; otherwise we report the routed mode (the
+/// attempt), with the `semantic_unavailable`/`status` fields conveying that it
+/// could not run.
+fn fallback_executed_label(mode: SearchMode, lexical_ran: bool) -> &'static str {
+    if lexical_ran {
+        "lexical"
+    } else {
+        interpreted_as_label(mode)
     }
 }
 
@@ -1594,7 +1670,11 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["status"], "building");
         assert_eq!(response["semantic_status"], "building");
-        assert_eq!(response["interpreted_as"], "hybrid");
+        // While semantic builds, only the lexical lane produced results — so
+        // interpreted_as honestly reports "lexical", not the routed "hybrid"
+        // mode that hasn't executed yet. The "building" status + note convey
+        // that semantic results are still coming.
+        assert_eq!(response["interpreted_as"], "lexical");
         assert!(response["note"]
             .as_str()
             .expect("note")
@@ -1694,6 +1774,13 @@ mod tests {
     }
 
     #[test]
+    fn semantic_candidate_limit_scales_with_small_top_k() {
+        assert_eq!(semantic_candidate_limit(1), SEMANTIC_OVERFETCH_FLOOR);
+        assert_eq!(semantic_candidate_limit(5), 15);
+        assert_eq!(semantic_candidate_limit(100), MAX_TOP_K);
+    }
+
+    #[test]
     fn empty_semantic_index_skips_query_dimension_check() {
         let project = tempfile::tempdir().expect("create project dir");
         let (base_url, handle) = start_mock_embedding_server();
@@ -1746,6 +1833,7 @@ mod tests {
             source: "semantic",
             semantic_score: Some(0.75),
             lexical_score: None,
+            hybrid_boosted: false,
         }];
 
         let text = format_semantic_text(&results, project_root);
@@ -1768,6 +1856,7 @@ mod tests {
             source: "semantic",
             semantic_score: Some(0.75),
             lexical_score: None,
+            hybrid_boosted: false,
         };
 
         let json = result_to_json(&result);

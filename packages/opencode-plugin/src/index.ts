@@ -56,7 +56,7 @@ import {
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
-import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -66,7 +66,6 @@ import {
   inspectToolSurfaceEnabled,
   inspectTools,
 } from "./tools/inspect.js";
-import { lspTools } from "./tools/lsp.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
 import { refactoringTools } from "./tools/refactoring.js";
@@ -198,13 +197,13 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.32.0";
+const ANNOUNCEMENT_VERSION = "0.33.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "`aft_search` is now the primary code-search tool — auto-routes regex / literal / semantic / hybrid by query shape, with a `hint` override.",
-  'Semantic search stays queryable through edits — no more "rebuilding" fallback after every save.',
-  "Workflow hints promote `aft_search` as primary; `grep` is positioned as the specialized fallback.",
-  "Bare `\\n`, `\\t`, `\\r` queries correctly route to regex mode.",
-  'Empty params (`targets: []`, `url: ""`) no longer trigger misleading mutual-exclusion errors.',
+  "New `aft_inspect` — one call for codebase health: diagnostics, metrics, TODOs, dead code, unused exports, and duplicates.",
+  "Diagnostics now flow through `aft_inspect` (run it after a batch of edits) instead of arriving automatically on every edit.",
+  "`aft_navigate` is renamed to `aft_callgraph`; the Rust call graph now resolves cross-file callers.",
+  "Edits no longer echo the whole file back to the agent — much lower token cost per edit.",
+  "Batch of `aft_search` correctness fixes and undo-history/SSRF/Windows hardening.",
 ];
 
 /**
@@ -231,9 +230,8 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
  * - Safety: aft_safety
  * - Imports: aft_import
  * - Structure: aft_transform
- * - Navigation: aft_navigate
+ * - Navigation: aft_callgraph
  * - Refactoring: aft_refactor
- * - LSP: aft_lsp_diagnostics (inline diagnostics on edits are automatic)
  */
 // OpenCode currently calls this function more than once per process when a
 // single plugin is configured — see https://github.com/anomalyco/opencode/issues/26812.
@@ -657,9 +655,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // get an orderly shutdown when the Node host receives a termination signal.
   // Without this, OS propagates SIGTERM to children before OpenCode calls dispose,
   // and (together with bridge.ts signal handling) we want the shutdown path we
-  // control, not implicit process-group death. The returned unregister is called
-  // from dispose so plugin reloads don't leak stale cleanup callbacks.
-  const unregisterShutdown = registerShutdownCleanup(async () => {
+  // control, not implicit process-group death. Plugin dispose runs this same
+  // cleanup set through runCleanups("dispose") so reloads do not leak children.
+  let clearInspectTier2Idle = () => {};
+  registerShutdownCleanup(async () => {
+    autoUpdateAbort.abort();
+    clearInspectTier2Idle();
     await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
     try {
       rpcServer.stop();
@@ -828,13 +829,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
-  //   recommended: minimal + hoisted + lsp_diagnostics + ast_grep_* + aft_import (default)
-  //   all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
+  //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
+  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
   const ALL_ONLY_TOOLS = new Set([
-    "aft_navigate",
+    "aft_callgraph",
     "aft_delete",
     "aft_move",
     "aft_transform",
@@ -860,8 +861,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
-    // LSP diagnostics: recommended+
-    ...(surface !== "minimal" && lspTools(ctx)),
     // Git conflicts: recommended+
     ...(surface !== "minimal" && conflictTools(ctx)),
   });
@@ -911,7 +910,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_outline",
     "aft_zoom",
     "aft_search",
-    "aft_navigate",
+    "aft_callgraph",
     "aft_inspect",
     "grep",
     "aft_grep",
@@ -943,6 +942,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       }
     },
   });
+  clearInspectTier2Idle = () => inspectTier2Idle.clearAll();
 
   return {
     tool: allTools,
@@ -1073,13 +1073,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       };
     },
     dispose: async () => {
-      autoUpdateAbort.abort();
-      inspectTier2Idle.clearAll();
-      unregisterShutdown();
-      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      rpcServer.stop();
-      await disposeAllPtyTerminals();
-      await pool.shutdown();
+      await runCleanups("dispose");
     },
   };
 }

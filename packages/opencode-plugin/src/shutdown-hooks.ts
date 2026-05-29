@@ -35,25 +35,29 @@ function getState(): GlobalState {
   return g[GLOBAL_KEY]!;
 }
 
-let shuttingDown = false;
+let runningCleanups = false;
 
-async function runCleanups(reason: string): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  const state = getState();
-  if (state.cleanups.size === 0) return;
-  log(`Shutdown triggered by ${reason} — running ${state.cleanups.size} cleanup(s)`);
-  const cleanups = Array.from(state.cleanups);
-  state.cleanups.clear();
-  await Promise.allSettled(
-    cleanups.map(async (fn) => {
-      try {
-        await fn();
-      } catch (err) {
-        log(`Cleanup error: ${(err as Error).message}`);
-      }
-    }),
-  );
+export async function runCleanups(reason: string): Promise<void> {
+  if (runningCleanups) return;
+  runningCleanups = true;
+  try {
+    const state = getState();
+    if (state.cleanups.size === 0) return;
+    log(`Shutdown triggered by ${reason} — running ${state.cleanups.size} cleanup(s)`);
+    const cleanups = Array.from(state.cleanups);
+    state.cleanups.clear();
+    await Promise.allSettled(
+      cleanups.map(async (fn) => {
+        try {
+          await fn();
+        } catch (err) {
+          log(`Cleanup error: ${(err as Error).message}`);
+        }
+      }),
+    );
+  } finally {
+    runningCleanups = false;
+  }
 }
 
 function installProcessHandlers(): void {

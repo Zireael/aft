@@ -86,8 +86,15 @@ fn windows_bash_handles_powershell_pipe() {
 /// the actual sleep. This is the canary for "bridge gives up before bash
 /// returns" on Windows.
 ///
-/// Marked `#[ignore]` by default because it deliberately runs for ~30s.
-/// CI runs it explicitly via `cargo test -- --ignored bash_windows`.
+/// Marked `#[ignore]` by default because it deliberately runs for ~30s; run it
+/// locally on Windows with `cargo test -- --ignored bash_windows`.
+///
+/// NOTE: CI does NOT run this test — the Windows cargo job is lib-only
+/// (`cargo test --workspace --lib`, see `.github/workflows/_unit-suite.yml`).
+/// The issue #26 regression is gated in CI by the Windows native E2E job
+/// (`tests/windows-e2e/run.ps1` Scenario 2), which reproduces the same
+/// long-running-bash / transport-budget path end-to-end through OpenCode. This
+/// test is a faster local canary for the same failure mode.
 #[test]
 #[ignore]
 #[cfg(target_os = "windows")]

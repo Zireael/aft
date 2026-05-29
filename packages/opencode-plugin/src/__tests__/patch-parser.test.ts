@@ -220,3 +220,58 @@ describe("applyUpdateChunks error paths", () => {
     expect(message).toContain("unicode");
   });
 });
+
+describe("applyUpdateChunks pure-insertion (empty old_lines)", () => {
+  // Regression: a pure-insertion chunk (only `+` lines after a `@@` header,
+  // so old_lines is empty) WITH a change_context must insert at the context
+  // location, not at end-of-file. Previously lineIndex (set by change_context)
+  // was ignored and the lines were appended to EOF, silently corrupting files.
+  test("inserts at change_context location, not end-of-file", () => {
+    const original = "function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        change_context: "function foo() {",
+        old_lines: [],
+        new_lines: ["  const x = 42;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+
+    expect(result).toBe(
+      "function foo() {\n  const x = 42;\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n",
+    );
+    // Explicitly assert it did NOT land inside bar() at end-of-file.
+    expect(result).not.toContain("  return 2;\n  const x = 42;");
+  });
+
+  test("falls back to end-of-file when there is no change_context", () => {
+    const original = "alpha\nbeta\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: [],
+        new_lines: ["gamma"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+    expect(result).toBe("alpha\nbeta\ngamma\n");
+  });
+
+  test("inserts after context even when later content matches the new lines", () => {
+    // Guards against a naive 'already applied' style short-circuit: the
+    // inserted text appears elsewhere in the file but must still be placed
+    // right after its own context anchor.
+    const original = "import a;\nimport b;\n\nconst x = 1;\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        change_context: "import a;",
+        old_lines: [],
+        new_lines: ["import inserted;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+    expect(result).toBe("import a;\nimport inserted;\nimport b;\n\nconst x = 1;\n");
+  });
+});

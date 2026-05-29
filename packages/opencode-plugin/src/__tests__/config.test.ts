@@ -159,6 +159,24 @@ describe("loadAftConfig", () => {
   // `url_fetch_allow_private`, or `max_callgraph_files`. These are user-only
   // because a hostile repo opening in OpenCode could otherwise weaken the
   // file/network/resource boundary protecting the user's machine.
+  test("project config can override lsp.diagnostics_on_edit", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { diagnostics_on_edit: false } }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ lsp: { diagnostics_on_edit: true } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as { lsp?: { diagnostics_on_edit?: boolean } };
+    expect(config.lsp?.diagnostics_on_edit).toBe(true);
+    expect(result.stderr).not.toContain("diagnostics_on_edit from project config");
+  });
+
   test("project config cannot set restrict_to_project_root (strict allowlist)", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ restrict_to_project_root: true }));

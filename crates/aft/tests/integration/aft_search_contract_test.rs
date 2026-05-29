@@ -17,11 +17,15 @@ fn request(query: &str) -> RawRequest {
 }
 
 fn request_with(query: &str, hint: Option<&str>) -> RawRequest {
+    request_with_top_k(query, hint, 5)
+}
+
+fn request_with_top_k(query: &str, hint: Option<&str>, top_k: usize) -> RawRequest {
     let mut value = serde_json::json!({
         "id": "aft-search-contract",
         "command": "semantic_search",
         "query": query,
-        "top_k": 5,
+        "top_k": top_k,
     });
     if let Some(hint) = hint {
         value["hint"] = serde_json::json!(hint);
@@ -74,6 +78,35 @@ fn project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static str
 fn install_lexical_index(ctx: &AppContext, source_file: &Path, source: &str) {
     let mut index = SearchIndex::new();
     index.index_file(source_file, source.as_bytes());
+    index.ready = true;
+    *ctx.search_index().borrow_mut() = Some(index);
+}
+
+fn project_with_repeated_needle_files(
+    file_count: usize,
+) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
+    let project = tempfile::tempdir().expect("create project dir");
+    let src_dir = project.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create source dir");
+
+    let mut entries = Vec::with_capacity(file_count);
+    for index in 0..file_count {
+        let source_file = src_dir.join(format!("lib_{index}.rs"));
+        let source = format!(
+            "pub fn needle_symbol_{index}() -> &'static str {{\n    \"needle_symbol\"\n}}\n"
+        );
+        std::fs::write(&source_file, &source).expect("write source file");
+        entries.push((source_file, source));
+    }
+
+    (project, entries)
+}
+
+fn install_lexical_index_entries(ctx: &AppContext, entries: &[(std::path::PathBuf, String)]) {
+    let mut index = SearchIndex::new();
+    for (source_file, source) in entries {
+        index.index_file(source_file, source.as_bytes());
+    }
     index.ready = true;
     *ctx.search_index().borrow_mut() = Some(index);
 }
@@ -152,7 +185,10 @@ fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(response["semantic_unavailable"], true);
     assert_eq!(response["lexical_only_fallback"], true);
     assert_eq!(response["semantic_status"], semantic_status);
-    assert_eq!(response["interpreted_as"], "hybrid");
+    // Honesty: the trigram lexical lane produced these results; semantic never
+    // ran. interpreted_as must report what executed ("lexical"), not the routed
+    // hybrid mode that was attempted.
+    assert_eq!(response["interpreted_as"], "lexical");
     assert_eq!(response["status"], "ready");
     let results = response["results"].as_array().expect("results array");
     assert!(
@@ -180,7 +216,9 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(response["semantic_unavailable"], true);
     assert_eq!(response["lexical_only_fallback"], true);
     assert_eq!(response["semantic_status"], semantic_status);
-    assert_eq!(response["interpreted_as"], "hybrid");
+    // Honesty: this path ran a literal grep scan (results are GrepLine entries),
+    // so interpreted_as must report "literal", not the routed hybrid mode.
+    assert_eq!(response["interpreted_as"], "literal");
     assert_eq!(response["status"], "ready");
     assert_eq!(response["fully_degraded"], true);
     assert_eq!(response["engine_capped"], false);
@@ -209,6 +247,91 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
             .as_str()
             .is_some_and(|text| text.contains("degraded full-file-scan"))),
         "expected degraded full-file-scan warning, got {warnings:?}"
+    );
+}
+
+#[test]
+fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(
+        &source_file,
+        "pub fn retry() { /* how retry logic works */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request("how retry logic works"),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "natural-language fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["query_kind"], "NaturalLanguage");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["semantic_status"], "disabled");
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|result| result["kind"] == "GrepLine"
+                && result["line_text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("how retry logic works"))),
+        "expected literal degraded fallback result: {response:?}"
+    );
+}
+
+#[test]
+fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(
+        &source_file,
+        "pub fn retry() { /* how retry logic works */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        stage: "embedding".to_string(),
+        files: Some(1),
+        entries_done: Some(0),
+        entries_total: Some(1),
+    };
+
+    let response = response_value(handle_semantic_search(
+        &request("how retry logic works"),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "natural-language building fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["query_kind"], "NaturalLanguage");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["semantic_status"], "building");
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|result| result["kind"] == "GrepLine"
+                && result["line_text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("how retry logic works"))),
+        "expected literal degraded fallback result while building: {response:?}"
     );
 }
 
@@ -325,6 +448,241 @@ fn regex_grep_success_reports_ready_status_not_semantic_backend_status() {
     assert_eq!(response["semantic_status"], "disabled");
     assert_eq!(response["complete"], true);
     assert_eq!(response["results"][0]["kind"], "GrepLine");
+}
+
+#[test]
+fn grep_results_report_regex_or_literal_source() {
+    let (project, _source_file, _source) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    for (query, hint, expected_source) in [
+        ("^pub fn exported", "regex", "regex"),
+        ("needle_symbol", "literal", "literal"),
+    ] {
+        let response = response_value(handle_semantic_search(
+            &request_with(query, Some(hint)),
+            &ctx,
+        ));
+
+        assert_eq!(
+            response["success"], true,
+            "{hint} grep query should succeed: {response:?}"
+        );
+        assert_eq!(response["interpreted_as"], expected_source);
+        let results = response["results"].as_array().expect("results array");
+        assert!(!results.is_empty(), "expected {hint} grep results");
+        for result in results {
+            assert_eq!(result["kind"], "GrepLine");
+            assert_eq!(result["source"], expected_source);
+            assert_ne!(result["source"], "hybrid");
+            assert!(
+                result.get("line_text").is_some(),
+                "line_text field should remain present: {result:?}"
+            );
+            assert!(
+                result.get("match_text").is_some(),
+                "match_text field should remain present: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
+    let (project, source_file, source) = project_with_needle();
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&source_file),
+        &mut embed,
+        16,
+    )
+    .expect("build semantic index");
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index(&ctx, &source_file, source);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
+
+    assert_eq!(
+        response["success"], true,
+        "hybrid semantic query should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    let results = response["results"].as_array().expect("results array");
+    assert!(!results.is_empty(), "expected hybrid semantic results");
+
+    for result in results {
+        let source = result["source"].as_str().expect("result source string");
+        assert!(
+            matches!(source, "semantic" | "lexical"),
+            "hybrid response result source must be semantic or lexical, got {source:?}: {result:?}"
+        );
+        assert_ne!(source, "hybrid");
+    }
+
+    let boosted = results
+        .iter()
+        .find(|result| result["source"] == "semantic" && result["lexical_score"].is_number())
+        .expect("semantic result should carry separate lexical boost metadata");
+    assert_eq!(boosted["hybrid_boosted"], true);
+    assert!(boosted.get("hybrid_boosted").is_some());
+
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
+    let (project, entries) = project_with_repeated_needle_files(6);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 5),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "unavailable lexical fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert_eq!(response["engine_capped"], false);
+    assert_eq!(response["result_count"], 5);
+    assert_eq!(response["more_available"], true);
+
+    let (project, entries) = project_with_repeated_needle_files(210);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        stage: "embedding".to_string(),
+        files: Some(210),
+        entries_done: Some(0),
+        entries_total: Some(210),
+    };
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 100),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "building lexical fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "building");
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert_eq!(response["engine_capped"], true);
+    assert_eq!(response["more_available"], true);
+}
+
+#[test]
+fn hybrid_ready_reports_more_available_when_lexical_engine_capped() {
+    let (project, entries) = project_with_repeated_needle_files(210);
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 100),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready hybrid query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["engine_capped"], true);
+    assert_eq!(response["more_available"], true);
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
+    let (project, entries) = project_with_repeated_needle_files(101);
+    let files = entries
+        .iter()
+        .map(|(source_file, _)| source_file.clone())
+        .collect::<Vec<_>>();
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index =
+        SemanticIndex::build(project.path(), &files, &mut embed, 16).expect("build semantic index");
+    assert!(
+        semantic_index.entry_count() > 100,
+        "test setup must exceed the response limit"
+    );
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", Some("semantic"), 100),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready semantic query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "semantic");
+    assert_eq!(response["engine_capped"], false);
+    assert_eq!(response["result_count"], 100);
+    assert_eq!(response["more_available"], true);
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
+    let (project, source_file, source) = project_with_needle();
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&source_file),
+        &mut embed,
+        16,
+    )
+    .expect("build semantic index");
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index(&ctx, &source_file, source);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 5),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready hybrid query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["engine_capped"], false);
+    assert!(
+        response["result_count"].as_u64().expect("result_count") < 5,
+        "test setup should stay under top_k: {response:?}"
+    );
+    assert_eq!(response["more_available"], false);
+    handle.join().expect("embedding server thread");
 }
 
 #[test]

@@ -5,6 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { registerShutdownCleanup } from "../shutdown-hooks.js";
 
 type OpenCodePlugin = typeof import("../index.js").default;
 
@@ -111,6 +112,25 @@ describe.serial("OpenCode migration bootstrap", () => {
     expect(argv).toContain(join(process.env.XDG_DATA_HOME as string, "cortexkit", "aft"));
 
     await hooks.dispose?.();
+  });
+
+  test("opencode_plugin_exposes_dispose_that_runs_shutdown_cleanups", async () => {
+    const plugin = await loadPlugin();
+    const hooks = (await plugin({
+      directory: tempDir,
+      client: {},
+    } as Parameters<OpenCodePlugin>[0])) as {
+      dispose?: () => Promise<void>;
+    };
+    let cleanupRan = false;
+    registerShutdownCleanup(() => {
+      cleanupRan = true;
+    });
+
+    expect(typeof hooks.dispose).toBe("function");
+    await hooks.dispose?.();
+
+    expect(cleanupRan).toBe(true);
   });
 
   test("opencode_plugin_aborts_on_migration_error", async () => {

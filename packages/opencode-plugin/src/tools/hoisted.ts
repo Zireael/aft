@@ -343,7 +343,11 @@ function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): numbe
 
 const z = tool.schema;
 const DIAGNOSTICS_PARAM_DESCRIPTION =
-  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Default false — edits return as soon as the write completes. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
@@ -367,8 +371,7 @@ Examples:
   Read lines 50-100: { "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
   Read 30 lines from line 200: { "filePath": "src/app.ts", "offset": 200, "limit": 30 }
   List directory: { "filePath": "src/" }
-
-Returns: Line-numbered file content string. For directories: newline-joined sorted entries. For binary files: size/message string.`;
+`;
 
 /**
  * Creates the simple read tool. Registers as "read" when hoisted, "aft_read" when not.
@@ -546,20 +549,18 @@ function getWriteDescription(editToolName: string): string {
 
 Automatically creates parent directories. Backs up existing files before overwriting.
 If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
-is auto-formatted after writing. Edits return as soon as the write completes; LSP
-diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy
-sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a
-batch of edits.
+is auto-formatted after writing. Edits return as soon as the write completes unless
+the configured \`lsp.diagnostics_on_edit\` default or a per-call \`diagnostics: true\`
+asks for legacy sync-wait behavior. Call \`aft_inspect\` afterward to check
+diagnostics across a batch of edits.
 
 **Behavior:**
 - Creates parent directories automatically (no need to mkdir first)
 - Existing files are backed up before overwriting (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- LSP diagnostics are opt-in with \`diagnostics: true\`; otherwise they populate asynchronously
+- LSP diagnostics follow \`lsp.diagnostics_on_edit\` by default; pass \`diagnostics\` to override per call
 - Use this for creating new files or completely replacing file contents
-- For partial edits (find/replace), use the \`${editToolName}\` tool instead
-
-Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines when \`diagnostics: true\` is passed.`;
+- For partial edits (find/replace), use the \`${editToolName}\` tool instead`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -600,8 +601,8 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         file: filePath,
         content,
         create_dirs: true,
-        diagnostics: args.diagnostics ?? false,
-        include_diff: true,
+        diagnostics: args.diagnostics ?? diagnosticsOnEditDefault(ctx),
+        include_diff_content: true,
       });
 
       // Error response (e.g. path validation failure)
@@ -640,7 +641,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const pendingServers = data.lsp_pending_servers as string[] | undefined;
       const exitedServers = data.lsp_exited_servers as string[] | undefined;
       if (pendingServers && pendingServers.length > 0) {
-        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
+        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
       }
       if (exitedServers && exitedServers.length > 0) {
         output += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
@@ -730,14 +731,8 @@ Note: Modes 6 and 7 are options on mode 5 (find/replace) — they require \`oldS
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
-
-Returns: JSON string for the selected edit mode. Edits may append inline LSP error lines when \`diagnostics: true\` is passed.
-
-Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
-  // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
-  // vary by Rust command and documenting each would bloat the description for minimal gain.
-  // Agents can parse the JSON response generically — key fields include 'success' and 'diff'.
+- Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
+- Response is a JSON string for the selected edit mode; key fields include success, diff, backup_id, syntax_valid, and mode-specific fields.`;
 }
 
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
@@ -920,9 +915,9 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      params.diagnostics = args.diagnostics ?? false;
+      params.diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      params.include_diff = true;
+      params.include_diff_content = true;
 
       const data = await callBridge(ctx, context, command, params);
 
@@ -956,7 +951,18 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         }
       }
 
-      let result = JSON.stringify(data);
+      // Agent-facing result must NOT carry full before/after file contents.
+      // We requested `include_diff_content` purely for the UI metadata above;
+      // echoing it back to the model makes the payload scale with file size,
+      // not edit size (a 1-line change in a 600-line file = the whole file
+      // twice). Replace diff with counts-only for the agent — the model
+      // already knows what it changed.
+      const agentData = { ...data } as Record<string, unknown>;
+      if (agentData.diff && typeof agentData.diff === "object") {
+        const d = agentData.diff as { additions?: number; deletions?: number };
+        agentData.diff = { additions: d.additions ?? 0, deletions: d.deletions ?? 0 };
+      }
+      let result = JSON.stringify(agentData);
 
       const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
       if (globSkipNote) result += `\n\n${globSkipNote}`;
@@ -988,7 +994,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       const pendingServers = data.lsp_pending_servers as string[] | undefined;
       const exitedServers = data.lsp_exited_servers as string[] | undefined;
       if (pendingServers && pendingServers.length > 0) {
-        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
+        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
       }
       if (exitedServers && exitedServers.length > 0) {
         result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
@@ -1056,7 +1062,7 @@ Example patch:
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with \`+\` even when creating a new file
 
-Returns: Status message string listing created, updated, moved, deleted, or failed file operations. Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
+Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -1067,7 +1073,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context): Promise<string> => {
       const patchText = args.patchText as string;
-      const diagnostics = args.diagnostics ?? false;
+      const diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
@@ -1210,7 +1216,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content,
                 create_dirs: true,
                 diagnostics,
-                include_diff: true,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
               const wrDiff = writeResult.diff as
@@ -1238,7 +1244,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               const filePath = path.resolve(context.directory, hunk.path);
               if (fs.existsSync(filePath)) {
                 try {
-                  await callBridge(ctx, context, "delete_file", { file: filePath });
+                  fs.rmSync(filePath, { force: true });
                 } catch {
                   // ignore — surfaced through the parent failure already
                 }
@@ -1283,7 +1289,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content: newContent,
                 create_dirs: true,
                 diagnostics,
-                include_diff: true,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
 
@@ -1786,7 +1792,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             file: filePath,
             content: normalizedArgs.content as string,
             create_dirs: normalizedArgs.create_dirs !== false,
-            diagnostics: normalizedArgs.diagnostics ?? false,
+            diagnostics: normalizedArgs.diagnostics ?? diagnosticsOnEditDefault(ctx),
           };
           const response = await callBridge(ctx, context, "write", writeParams);
           if (response.success === false) {

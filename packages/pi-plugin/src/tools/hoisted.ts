@@ -33,7 +33,11 @@ import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } fro
 import { formatDiffForPi } from "./diff-format.js";
 
 const DIAGNOSTICS_PARAM_DESCRIPTION =
-  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Default false — edits return as soon as the write completes. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
@@ -311,9 +315,9 @@ export function registerHoistedTools(
       name: "write",
       label: "write",
       description:
-        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass `diagnostics: true` for legacy sync-wait behavior, or call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Create or overwrite files (uses filePath; auto-formats; diagnostics are async unless diagnostics: true)",
+        "Create or overwrite files (uses filePath; auto-formats; diagnostics follow lsp.diagnostics_on_edit unless overridden)",
       promptGuidelines: ["Use write only for new files or complete rewrites."],
       parameters: WriteParams,
       async execute(
@@ -333,8 +337,8 @@ export function registerHoistedTools(
           {
             file: params.filePath,
             content: params.content,
-            diagnostics: params.diagnostics ?? false,
-            include_diff: true,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            include_diff_content: true,
           },
           extCtx,
         );
@@ -354,9 +358,9 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass `diagnostics: true` for legacy sync-wait behavior, or call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics are async unless diagnostics: true.",
+        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics follow lsp.diagnostics_on_edit unless overridden.",
       promptGuidelines: [
         "Prefer edit over write when changing part of an existing file.",
         "Include enough surrounding context in oldString to make the match unique, or set replaceAll/occurrence explicitly.",
@@ -384,8 +388,8 @@ export function registerHoistedTools(
             op: "append",
             file: params.filePath,
             append_content: params.appendContent,
-            diagnostics: params.diagnostics ?? false,
-            include_diff: true,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            include_diff_content: true,
           };
           const response = await callBridge(bridge, "edit_match", req, extCtx);
           return buildMutationResult(params.filePath, response);
@@ -395,8 +399,8 @@ export function registerHoistedTools(
           file: params.filePath,
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
-          diagnostics: params.diagnostics ?? false,
-          include_diff: true,
+          diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+          include_diff_content: true,
         };
         if (params.replaceAll === true) req.replace_all = true;
         const occurrence = coerceOptionalInt(
@@ -528,11 +532,12 @@ export function buildMutationResult(
     replacements !== undefined
       ? `Edited ${filePath} (+${additions}/-${deletions}, ${replacements} replacement${replacements === 1 ? "" : "s"})`
       : `Wrote ${filePath} (+${additions}/-${deletions})`;
+  // Agent-facing text deliberately omits the diff body: the agent already
+  // knows what it changed (it supplied the edit), so echoing before/after into
+  // context wastes tokens proportional to file size. The line-numbered diff
+  // stays in `details.diff` for the TUI renderer only. Matches OpenCode native
+  // edit, which returns just "Edit applied successfully." to the model.
   let text = summaryHeader;
-  if (diffText) text += `\n\n${diffText}`;
-  if (truncated) {
-    text += "\n\n(diff truncated \u2014 file too large to include before/after content)";
-  }
   if (noOp) {
     // Surface the no-op signal explicitly so the agent can distinguish "the
     // tool failed silently" from "the edit matched but produced no net change".

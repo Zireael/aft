@@ -67,9 +67,9 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
 }
 
 #[test]
-fn inspect_engine_active_categories_defer_diagnostics() {
-    assert!(!InspectCategory::active().contains(&InspectCategory::Diagnostics));
-    assert!(!InspectCategory::Diagnostics.is_active());
+fn inspect_engine_active_categories_include_diagnostics() {
+    assert!(InspectCategory::active().contains(&InspectCategory::Diagnostics));
+    assert!(InspectCategory::Diagnostics.is_active());
 }
 
 #[test]
@@ -120,7 +120,6 @@ fn inspect_engine_cache_persists_tier2_contributions_and_aggregate() {
 }
 
 #[test]
-#[ignore = "timing-sensitive: flaky on Docker overlayfs where mtime precision causes HotFresh false positive after same-size write"]
 fn inspect_engine_freshness_treats_hot_and_content_fresh_as_fresh() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let file = temp_dir.path().join("a.rs");
@@ -137,7 +136,18 @@ fn inspect_engine_freshness_treats_hot_and_content_fresh_as_fresh() {
         other => panic!("expected content-fresh contribution, got {other:?}"),
     }
 
+    // Same-size content change. The non-strict fast path returns HotFresh
+    // WITHOUT hashing when (mtime, size) both match the cached snapshot — so to
+    // exercise the content-hash path that detects this change we must ensure the
+    // mtime differs from the cached snapshot. Set it explicitly to a fixed value
+    // distinct from the original collect time; otherwise on coarse-granularity
+    // filesystems (e.g. Docker overlayfs, 1s mtime resolution) the write can land
+    // in the same mtime bucket as the original collect and the fast path would
+    // report HotFresh, masking the content change. A fixed mtime makes the
+    // content-hash comparison deterministic on every filesystem.
     fs::write(&file, "bravo").expect("write changed same-size file");
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0))
+        .expect("set distinct mtime after same-size edit");
     assert_eq!(
         verify_contribution_file(&file, &freshness),
         ContributionFreshness::Stale
@@ -251,7 +261,15 @@ fn inspect_engine_command_returns_lane_a_shape() {
         response["success"], true,
         "inspect should succeed: {response:?}"
     );
-    assert!(response["summary"].get("diagnostics").is_none());
+    let diagnostics = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(
+        diagnostics.get("status").and_then(|value| value.as_str()),
+        Some("pending"),
+        "diagnostics should be active but not reported as clean until an LSP server runs: {response:?}"
+    );
+    assert!(response["details"]["diagnostics"].is_array());
     assert!(response["summary"]["metrics"].is_object());
     assert!(response["summary"]["todos"].is_object());
     assert!(response["details"]["dead_code"].is_array());

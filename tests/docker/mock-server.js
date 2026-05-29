@@ -13,6 +13,7 @@
  * lasts long enough for background threads to complete their work.
  */
 const { LLMock } = require("@copilotkit/aimock");
+const fs = require("node:fs");
 
 function parsePort(value) {
   const port = Number.parseInt(value || "0", 10);
@@ -24,13 +25,31 @@ function parsePort(value) {
 
 const port = parsePort(process.env.AIMOCK_PORT);
 
+// When AFT_E2E_TURN_LOG is set, append one line each time a turn fixture is
+// actually served. The harness reads this inline to prove the agent loop
+// round-tripped (a tool result was consumed and the next request issued) — a
+// hung or no-op session that merely times out cannot produce later turns, so
+// this defeats false-green "session completed on timeout" results.
+const TURN_LOG = process.env.AFT_E2E_TURN_LOG;
+function served(label, response) {
+  if (!TURN_LOG) return response;
+  return (_req) => {
+    try {
+      fs.appendFileSync(TURN_LOG, `${label}\n`);
+    } catch {
+      // best-effort: never fail a served response over turn-log bookkeeping
+    }
+    return response;
+  };
+}
+
 async function main() {
   const mock = new LLMock({ port });
 
   // Turn 1: outline the project (immediate)
   mock.on(
     { sequenceIndex: 0 },
-    {
+    served("turn-1-outline", {
       toolCalls: [
         {
           name: "aft_outline",
@@ -43,70 +62,70 @@ async function main() {
           arguments: JSON.stringify({ target: "src" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 100, tps: 50 } }
   );
 
   // Turn 2: read a file
   mock.on(
     { sequenceIndex: 1 },
-    {
+    served("turn-2-read", {
       toolCalls: [
         {
           name: "read",
           arguments: JSON.stringify({ filePath: "src/main.py" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 500, tps: 40 } }
   );
 
   // Turn 3: grep for a pattern (by now trigram index should be building/ready)
   mock.on(
     { sequenceIndex: 2 },
-    {
+    served("turn-3-grep", {
       toolCalls: [
         {
           name: "grep",
           arguments: JSON.stringify({ pattern: "def ", path: "src" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 2000, tps: 30 } }
   );
 
   // Turn 4: glob for files
   mock.on(
     { sequenceIndex: 3 },
-    {
+    served("turn-4-glob", {
       toolCalls: [
         {
           name: "glob",
           arguments: JSON.stringify({ pattern: "**/*.py" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 1000, tps: 30 } }
   );
 
   // Turn 5: semantic search (if available — exercises ONNX/fastembed path)
   mock.on(
     { sequenceIndex: 4 },
-    {
+    served("turn-5-aft_search", {
       toolCalls: [
         {
           name: "aft_search",
           arguments: JSON.stringify({ query: "greeting function" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 2000, tps: 30 } }
   );
 
   // Turn 6: edit a file (tests write path)
   mock.on(
     { sequenceIndex: 5 },
-    {
+    served("turn-6-edit", {
       toolCalls: [
         {
           name: "edit",
@@ -117,31 +136,31 @@ async function main() {
           }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 500, tps: 40 } }
   );
 
   // Turn 7: undo the edit (tests safety/backup path)
   mock.on(
     { sequenceIndex: 6 },
-    {
+    served("turn-7-undo", {
       toolCalls: [
         {
           name: "aft_safety",
           arguments: JSON.stringify({ op: "undo", filePath: "src/main.py" }),
         },
       ],
-    },
+    }),
     { streamingProfile: { ttft: 500, tps: 40 } }
   );
 
   // Turn 8: final response
   mock.on(
     { sequenceIndex: 7 },
-    {
+    served("turn-8-final", {
       content:
         "I've completed the project exploration. I outlined the structure, read files, searched with grep and semantic search, made an edit, and undid it. All tools are working correctly.",
-    },
+    }),
     { streamingProfile: { ttft: 500, tps: 50 } }
   );
 

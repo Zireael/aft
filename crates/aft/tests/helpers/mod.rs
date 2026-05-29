@@ -655,3 +655,64 @@ pub fn fixture_path(name: &str) -> PathBuf {
         .join("fixtures")
         .join(name)
 }
+
+// ---------------------------------------------------------------------------
+// Shared warn-level log capture for integration tests
+//
+// All integration tests compile into ONE binary, and `log` allows exactly one
+// global logger per process. Previously two test modules each installed their
+// own logger via `log::set_boxed_logger(...).expect(...)`; whichever ran second
+// panicked with `SetLoggerError`, and even without the panic only one module's
+// logger could win — the other module's `take_logs()` would read an empty
+// buffer because records routed to the winner's storage.
+//
+// Fix: a SINGLE process-global logger installed once, routing each record to a
+// THREAD-LOCAL buffer. Because every `#[test]` runs on its own thread, capture
+// is isolated per test and race-free under parallel execution. Tests call
+// `init_test_logger()` (installs once, clears this thread's buffer) and
+// `take_logs()` (drains this thread's buffer).
+// ---------------------------------------------------------------------------
+
+use std::sync::Once as StdOnce;
+
+thread_local! {
+    static THREAD_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+static SHARED_LOGGER_INIT: StdOnce = StdOnce::new();
+
+struct ThreadLocalTestLogger;
+
+impl log::Log for ThreadLocalTestLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let line = format!("{}", record.args());
+            THREAD_LOGS.with(|logs| logs.borrow_mut().push(line));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Install the shared thread-local-capturing logger (once per process) and
+/// clear the CURRENT thread's captured logs so each test starts clean.
+pub fn init_test_logger() {
+    SHARED_LOGGER_INIT.call_once(|| {
+        // Ignore an already-installed logger: another harness (or a prior
+        // `Once` in legacy code) may have installed one. We only need warn-level
+        // capture, and a failed install must never panic the test binary.
+        let _ = log::set_boxed_logger(Box::new(ThreadLocalTestLogger));
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+    THREAD_LOGS.with(|logs| logs.borrow_mut().clear());
+}
+
+/// Drain and return the warn-level logs captured on the CURRENT thread since
+/// the last `init_test_logger()` / `take_logs()`.
+pub fn take_logs() -> Vec<String> {
+    THREAD_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+}

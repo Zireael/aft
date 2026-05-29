@@ -4,7 +4,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::{
@@ -13,7 +13,6 @@ use crate::inspect::{
 };
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
 type ExportNode = (String, String);
 
@@ -29,11 +28,12 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         return InspectResult::success(job, success, started.elapsed());
     };
 
-    let entry_point_files = snapshot
+    let liveness_root_files = snapshot
         .entry_points
         .iter()
         .map(|file| relative_path(&job.project_root, file))
         .collect::<BTreeSet<_>>();
+    let public_api_files = collect_public_api_files(&job.project_root);
     let (exported_symbols_by_file, files_by_exported_symbol) =
         exported_symbol_indexes(job, snapshot);
 
@@ -47,12 +47,12 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
                 file,
                 &exported_symbols_by_file,
                 &files_by_exported_symbol,
-                &entry_point_files,
+                &liveness_root_files,
+                &public_api_files,
             )
         })
         .collect::<Vec<_>>();
 
-    let public_api_files = collect_public_api_files(&job.project_root);
     let aggregate = aggregate_dead_code_contributions(&contributions, &public_api_files);
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
@@ -94,21 +94,21 @@ fn gather_file_contribution(
     file: &Path,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
-    entry_point_files: &BTreeSet<String>,
+    liveness_root_files: &BTreeSet<String>,
+    public_api_files: &BTreeSet<String>,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
-    let is_entry_point_file = entry_point_files.contains(&file_name);
-    let exports = snapshot
+    let is_liveness_root_file = liveness_root_files.contains(&file_name);
+    let is_public_api_file = public_api_files.contains(&file_name);
+    let mut exports = snapshot
         .exported_symbols
         .iter()
         .filter(|export| same_file(&job.project_root, &export.file, file))
-        .map(|export| {
-            json!({
-                "symbol": export.symbol,
-                "kind": export.kind,
-                "line": export.line,
-                "is_entry_point": is_entry_point_file,
-            })
+        .map(|export| ExportContribution {
+            symbol: export.symbol.clone(),
+            kind: export.kind.clone(),
+            line: export.line,
+            is_entry_point: false,
         })
         .collect::<Vec<_>>();
 
@@ -127,14 +127,29 @@ fn gather_file_contribution(
         })
         .collect::<Vec<_>>();
     internal_calls.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
+        left.caller_symbol
+            .cmp(&right.caller_symbol)
+            .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.symbol.cmp(&right.symbol))
             .then_with(|| left.line.cmp(&right.line))
     });
     internal_calls.dedup_by(|left, right| {
-        left.file == right.file && left.symbol == right.symbol && left.line == right.line
+        left.caller_symbol == right.caller_symbol
+            && left.file == right.file
+            && left.symbol == right.symbol
+            && left.line == right.line
     });
+
+    let liveness_roots = liveness_roots_for_file(
+        &file_name,
+        &exports,
+        &internal_calls,
+        is_liveness_root_file,
+        is_public_api_file,
+    );
+    for export in &mut exports {
+        export.is_entry_point = liveness_roots.contains(&export.symbol);
+    }
 
     FileContribution::new(
         InspectCategory::DeadCode,
@@ -142,15 +157,25 @@ fn gather_file_contribution(
         collect_freshness(file),
         json!({
             "file": file_name,
-            "exports": exports,
+            "exports": exports
+                .iter()
+                .map(|export| json!({
+                    "symbol": export.symbol,
+                    "kind": export.kind,
+                    "line": export.line,
+                    "is_entry_point": export.is_entry_point,
+                }))
+                .collect::<Vec<_>>(),
             "internal_calls": internal_calls
                 .into_iter()
                 .map(|call| json!({
+                    "caller_symbol": call.caller_symbol,
                     "file": call.file,
                     "symbol": call.symbol,
                     "line": call.line,
                 }))
                 .collect::<Vec<_>>(),
+            "liveness_roots": liveness_roots,
         }),
     )
 }
@@ -171,6 +196,18 @@ pub(crate) fn aggregate_dead_code_contributions(
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
 ) -> serde_json::Value {
+    aggregate_dead_code_contributions_with_limit(
+        contributions,
+        public_api_files,
+        Some(MAX_DRILL_DOWN_ITEMS),
+    )
+}
+
+pub(crate) fn aggregate_dead_code_contributions_with_limit(
+    contributions: &[FileContribution],
+    public_api_files: &BTreeSet<String>,
+    drill_down_limit: Option<usize>,
+) -> serde_json::Value {
     let parsed = contributions
         .iter()
         .filter_map(|contribution| {
@@ -178,8 +215,7 @@ pub(crate) fn aggregate_dead_code_contributions(
         })
         .collect::<Vec<_>>();
 
-    let export_nodes = export_nodes(&parsed);
-    let edges_by_source = edges_by_source_export(&parsed, &export_nodes);
+    let edges_by_source = edges_by_source(&parsed);
     let reachable = reachable_exports(&parsed, &edges_by_source);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
@@ -205,8 +241,10 @@ pub(crate) fn aggregate_dead_code_contributions(
     }
 
     let count = dead_items.len();
-    let drill_down_capped = count > MAX_DRILL_DOWN_ITEMS;
-    dead_items.truncate(MAX_DRILL_DOWN_ITEMS);
+    let drill_down_capped = drill_down_limit.is_some_and(|limit| count > limit);
+    if let Some(limit) = drill_down_limit {
+        dead_items.truncate(limit);
+    }
 
     json!({
         "count": count,
@@ -218,67 +256,30 @@ pub(crate) fn aggregate_dead_code_contributions(
     })
 }
 
-fn export_nodes(contributions: &[DeadCodeContribution]) -> BTreeSet<ExportNode> {
-    contributions
-        .iter()
-        .flat_map(|contribution| {
-            contribution
-                .exports
-                .iter()
-                .map(|export| (contribution.file.clone(), export.symbol.clone()))
-        })
-        .collect()
-}
-
-fn edges_by_source_export(
+fn edges_by_source(
     contributions: &[DeadCodeContribution],
-    export_nodes: &BTreeSet<ExportNode>,
 ) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
     let mut edges: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
 
     for contribution in contributions {
         for call in &contribution.internal_calls {
-            let target = (call.file.clone(), call.symbol.clone());
-            if !export_nodes.contains(&target) {
+            // Keep EVERY resolved edge, regardless of whether the target is an
+            // exported symbol. Liveness must traverse through private
+            // intermediaries (a private router/helper that forwards a root to a
+            // public handler). Restricting targets to exports severed the chain
+            // at the first private hop and made every handler reachable only via
+            // a private function look dead. Node identity is (file, symbol);
+            // private and exported symbols share the same node space.
+            if call.caller_symbol.is_empty() {
                 continue;
             }
-
-            if let Some(source) = source_export_for_call(contribution, call.line)
-                .or_else(|| single_entry_point_export(contribution))
-            {
-                let source = (contribution.file.clone(), source.symbol.clone());
-                if export_nodes.contains(&source) {
-                    edges.entry(source).or_default().insert(target);
-                }
-            }
+            let target = (call.file.clone(), call.symbol.clone());
+            let source = (contribution.file.clone(), call.caller_symbol.clone());
+            edges.entry(source).or_default().insert(target);
         }
     }
 
     edges
-}
-
-fn source_export_for_call(
-    contribution: &DeadCodeContribution,
-    line: u32,
-) -> Option<&ExportContribution> {
-    contribution
-        .exports
-        .iter()
-        .filter(|export| export.line <= line)
-        .max_by_key(|export| export.line)
-}
-
-fn single_entry_point_export(contribution: &DeadCodeContribution) -> Option<&ExportContribution> {
-    let mut entry_exports = contribution
-        .exports
-        .iter()
-        .filter(|export| export.is_entry_point);
-    let first = entry_exports.next()?;
-    if entry_exports.next().is_none() {
-        Some(first)
-    } else {
-        None
-    }
 }
 
 fn reachable_exports(
@@ -289,6 +290,9 @@ fn reachable_exports(
     let mut queue = VecDeque::new();
 
     for contribution in contributions {
+        for root in &contribution.liveness_roots {
+            queue.push_back((contribution.file.clone(), root.clone()));
+        }
         for export in &contribution.exports {
             if export.is_entry_point {
                 queue.push_back((contribution.file.clone(), export.symbol.clone()));
@@ -322,16 +326,14 @@ fn project_internal_call(
     let target = parse_target(project_root, &call.target);
     let symbol = target.symbol?;
     let file = match target.file {
-        Some(file) => {
-            if exported_symbols_by_file
-                .get(&file)
-                .is_some_and(|symbols| symbols.contains(&symbol))
-            {
-                file
-            } else {
-                return None;
-            }
-        }
+        // Qualified target (file::symbol). The snapshot builder already
+        // resolved and validated this edge — cross-file targets are confirmed
+        // exports of the target file, and same-file targets are confirmed
+        // definitions (private functions included, e.g. `main.rs::dispatch`).
+        // Keep the edge regardless of the target's export visibility: liveness
+        // must flow THROUGH private intermediaries, otherwise a public handler
+        // reached only via a private router/helper looks unreachable.
+        Some(file) => file,
         None => resolve_unqualified_target(
             caller_file,
             &symbol,
@@ -341,6 +343,7 @@ fn project_internal_call(
     };
 
     Some(InternalCall {
+        caller_symbol: call.caller_symbol.clone(),
         file,
         symbol,
         line: call.line,
@@ -406,169 +409,62 @@ fn clean_symbol(symbol: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> {
-    let mut files = BTreeSet::new();
-    collect_package_public_api(project_root, project_root, &mut files);
-
-    let package_json = project_root.join("package.json");
-    let Ok(bytes) = std::fs::read(&package_json) else {
-        return files;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return files;
-    };
-
-    for workspace in workspace_dirs(project_root, &package) {
-        collect_package_public_api(project_root, &workspace, &mut files);
-    }
-
-    files
-}
-
-fn collect_package_public_api(
-    project_root: &Path,
-    package_dir: &Path,
-    files: &mut BTreeSet<String>,
-) {
-    let package_json = package_dir.join("package.json");
-    let Ok(bytes) = std::fs::read(package_json) else {
-        return;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-
-    if let Some(main) = package.get("main").and_then(Value::as_str) {
-        insert_public_api_path(project_root, package_dir, main, files);
-    }
-    if let Some(module) = package.get("module").and_then(Value::as_str) {
-        insert_public_api_path(project_root, package_dir, module, files);
-    }
-    if let Some(exports) = package.get("exports") {
-        collect_export_values(project_root, package_dir, exports, files);
-    }
-}
-
-fn collect_export_values(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &Value,
-    files: &mut BTreeSet<String>,
-) {
-    match value {
-        Value::String(path) => insert_public_api_path(project_root, package_dir, path, files),
-        Value::Array(values) => {
-            for value in values {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values() {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn insert_public_api_path(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &str,
-    files: &mut BTreeSet<String>,
-) {
-    if value.starts_with('#') || value.contains('*') {
-        return;
-    }
-
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    if let Some(path) = resolve_package_entry(package_dir, trimmed) {
-        files.insert(relative_path(project_root, &path));
-    }
-}
-
-fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
-    if entry.starts_with("node:") || entry.contains("://") {
-        return None;
-    }
-
-    let entry_path = if is_relative_module(entry) {
-        package_dir.join(entry)
-    } else {
-        package_dir.join(entry.trim_start_matches('/'))
-    };
-
-    candidate_paths(&entry_path)
-        .into_iter()
-        .map(|candidate| normalize_path(&candidate))
-        .find(|candidate| candidate.is_file())
-}
-
-fn candidate_paths(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.push(base.to_path_buf());
-
-    if base.extension().is_none() {
-        for extension in JS_MODULE_EXTENSIONS {
-            candidates.push(base.with_extension(extension));
-        }
-    }
-
-    for extension in JS_MODULE_EXTENSIONS {
-        candidates.push(base.join(format!("index.{extension}")));
-    }
-
-    candidates
-}
-
-fn is_relative_module(module_path: &str) -> bool {
-    module_path.starts_with("./")
-        || module_path.starts_with("../")
-        || module_path == "."
-        || module_path == ".."
-}
-
-fn workspace_dirs(project_root: &Path, package: &Value) -> Vec<PathBuf> {
-    let Some(workspaces) = package.get("workspaces") else {
+fn liveness_roots_for_file(
+    file_name: &str,
+    exports: &[ExportContribution],
+    internal_calls: &[InternalCall],
+    is_liveness_root_file: bool,
+    is_public_api_file: bool,
+) -> Vec<String> {
+    if !is_liveness_root_file {
         return Vec::new();
-    };
-
-    let patterns = match workspaces {
-        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
-        Value::Object(map) => map
-            .get("packages")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-
-    let mut dirs = Vec::new();
-    for pattern in patterns {
-        let pattern = pattern.trim_end_matches('/');
-        if let Some(prefix) = pattern.strip_suffix("/*") {
-            let parent = project_root.join(prefix);
-            let Ok(entries) = std::fs::read_dir(parent) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.join("package.json").is_file() {
-                    dirs.push(path);
-                }
-            }
-        } else {
-            let path = project_root.join(pattern);
-            if path.join("package.json").is_file() {
-                dirs.push(path);
-            }
-        }
     }
-    dirs
+
+    let mut roots = BTreeSet::new();
+    if is_public_api_file {
+        roots.extend(exports.iter().map(|export| export.symbol.clone()));
+    } else {
+        roots.extend(
+            exports
+                .iter()
+                .filter(|export| is_explicit_liveness_symbol(file_name, &export.symbol))
+                .map(|export| export.symbol.clone()),
+        );
+        roots.extend(
+            internal_calls
+                .iter()
+                .map(|call| call.caller_symbol.as_str())
+                .filter(|symbol| is_explicit_liveness_symbol(file_name, symbol))
+                .map(str::to_string),
+        );
+    }
+
+    roots.into_iter().collect()
+}
+
+fn is_explicit_liveness_symbol(file_name: &str, symbol: &str) -> bool {
+    let symbol = symbol.rsplit("::").next().unwrap_or(symbol);
+    if symbol == "<top-level>" {
+        return true;
+    }
+
+    let lower = symbol.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "main" | "init" | "setup" | "bootstrap" | "run"
+    ) {
+        return true;
+    }
+
+    Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == symbol)
+}
+
+pub(crate) fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> {
+    crate::inspect::entry_points::resolve_entry_points(project_root)
+        .public_api_files_relative(project_root)
 }
 
 fn language_for_file(file: &str) -> &'static str {
@@ -662,6 +558,8 @@ struct DeadCodeContribution {
     file: String,
     exports: Vec<ExportContribution>,
     internal_calls: Vec<InternalCallContribution>,
+    #[serde(default)]
+    liveness_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -675,13 +573,15 @@ struct ExportContribution {
 
 #[derive(Debug, Clone, Deserialize)]
 struct InternalCallContribution {
+    #[serde(default)]
+    caller_symbol: String,
     file: String,
     symbol: String,
-    line: u32,
 }
 
 #[derive(Debug, Clone)]
 struct InternalCall {
+    caller_symbol: String,
     file: String,
     symbol: String,
     line: u32,

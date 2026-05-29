@@ -307,6 +307,56 @@ fn add_member_rs_impl_method() {
     );
 }
 
+#[test]
+fn add_member_rs_generic_impl_method_not_struct() {
+    // Regression: for a generic type `Config<T>` with both `struct Config<T>`
+    // and `impl<T> Config<T>`, the implemented type parses as a `generic_type`
+    // ("Config<T>"). Before the fix, extract_impl_name returned "Config<T>" so
+    // the impl was skipped and the method was inserted into the struct's field
+    // list (invalid Rust). The method must land in the impl block.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("generic_member.rs");
+    fs::write(
+        &file,
+        "pub struct Config<T> {\n    value: T,\n}\n\nimpl<T> Config<T> {\n    pub fn value(&self) -> &T {\n        &self.value\n    }\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let resp = send_add_member(
+        &mut aft,
+        "1",
+        file.to_str().unwrap(),
+        "Config",
+        "pub fn run(&self) {}",
+        None,
+    );
+
+    assert_eq!(resp["success"], true, "response: {:?}", resp);
+    assert_eq!(
+        resp["syntax_valid"], true,
+        "method must produce valid Rust, not be inserted into struct fields: {:?}",
+        resp
+    );
+
+    let content = fs::read_to_string(&file).unwrap();
+    // The method must be inside the impl block (after the existing method),
+    // NOT inside the struct's field list.
+    let struct_body_start = content.find("pub struct Config<T> {").unwrap();
+    let struct_body_end = content[struct_body_start..].find('}').unwrap() + struct_body_start;
+    let struct_body = &content[struct_body_start..struct_body_end];
+    assert!(
+        !struct_body.contains("pub fn run"),
+        "method must NOT be inserted into the struct body: {}",
+        content
+    );
+    assert!(
+        content.contains("pub fn run"),
+        "method should be added: {}",
+        content
+    );
+}
+
 // --- Go tests ---
 
 #[test]

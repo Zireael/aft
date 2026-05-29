@@ -683,6 +683,21 @@ fn watcher_path_is_gitignore(path: &std::path::Path) -> bool {
     path.file_name().map(|n| n == ".gitignore").unwrap_or(false)
 }
 
+fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+
+    let parent = path.parent().map(std::path::Path::to_path_buf);
+    let file_name = path.file_name().map(std::ffi::OsStr::to_os_string);
+    match (parent, file_name) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or(path),
+        _ => path,
+    }
+}
+
 fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> HashSet<std::path::PathBuf>
 where
     I: IntoIterator<Item = std::path::PathBuf>,
@@ -698,7 +713,7 @@ where
 
     raw_paths
         .into_iter()
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .map(canonicalize_watcher_path)
         .filter(|path| {
             if watcher_path_is_infra_skip(path) {
                 return false;
@@ -848,7 +863,7 @@ fn drain_watcher_events(ctx: &AppContext) {
             );
             let mut status = ctx.semantic_index_status().borrow_mut();
             for path in &semantic_refresh_paths {
-                status.remove_refreshing_file(path);
+                status.cancel_refreshing_file(path);
             }
             semantic_status_changed = true;
         }
@@ -964,7 +979,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in paths {
-                        status.add_refreshing_file(path);
+                        status.start_refreshing_file(path);
                     }
                     status_changed = true;
                 }
@@ -980,7 +995,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in &completed_paths {
-                        status.remove_refreshing_file(path);
+                        status.complete_refreshing_file(path);
                     }
                     status_changed = true;
                 }
@@ -990,7 +1005,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in &paths {
-                        status.remove_refreshing_file(path);
+                        status.complete_refreshing_file(path);
                     }
                     status_changed = true;
                 }

@@ -7,7 +7,6 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { astTools } from "../../tools/ast.js";
 import { importTools } from "../../tools/imports.js";
-import { lspTools } from "../../tools/lsp.js";
 import { readingTools } from "../../tools/reading.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
@@ -86,7 +85,6 @@ maybeDescribe("e2e honest reporting surfaces", () => {
         ...readingTools(pluginContext),
         ...astTools(pluginContext),
         ...importTools(pluginContext),
-        ...lspTools(pluginContext),
       },
     };
   }
@@ -208,19 +206,5 @@ maybeDescribe("e2e honest reporting surfaces", () => {
     expect(String(response.message ?? response.reason ?? "")).toMatch(
       /not[_ ]found|absent|missing/i,
     );
-  });
-
-  test("lsp_diagnostics discloses when no server checked a file", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("notes.txt"), "plain text\n", "utf8");
-
-    const output = await tools.lsp_diagnostics.execute({ filePath: "notes.txt" }, sdkCtx);
-    const response = JSON.parse(output) as Record<string, unknown>;
-
-    expect(response.success).toBe(true);
-    expect(response.complete).toBe(true);
-    expect(response.total).toBe(0);
-    expect(response.lsp_servers_used).toEqual([]);
-    expect(String(response.note ?? "")).toMatch(/nothing was checked|no lsp server/i);
   });
 });

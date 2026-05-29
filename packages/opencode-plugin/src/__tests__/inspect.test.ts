@@ -6,6 +6,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import {
   createInspectTier2IdleScheduler,
   inspectTools,
+  renderInspectDiagnostics,
   shouldRegisterInspectTool,
 } from "../tools/inspect.js";
 import type { PluginContext } from "../types.js";
@@ -77,11 +78,11 @@ function createInspectHarness(
 }
 
 describe("aft_inspect tool", () => {
-  test("description omits deferred diagnostics and documents scope behavior", () => {
+  test("description documents diagnostics and scope behavior", () => {
     const { tools } = createInspectHarness(() => ({ success: true, summary: {} }));
     const inspect = tools.aft_inspect;
 
-    expect(inspect.description).not.toContain("diagnostics");
+    expect(inspect.description).toContain("diagnostics");
     expect(inspect.description).toContain("Tier 1 (todos, metrics)");
     expect(inspect.description).toContain("triggered on session idle");
     expect(schemaDescription(inspect.args.scope)).toContain("Tier 1 scopes the scan");
@@ -122,6 +123,59 @@ describe("aft_inspect tool", () => {
     expect(sendCalls[0]?.params.sections).toBeUndefined();
     expect(sendCalls[0]?.params.scope).toBeUndefined();
     expect(sendCalls[0]?.params.topK).toBeUndefined();
+  });
+
+  test("renders diagnostics counts, sentinels, and details defensively", () => {
+    expect(
+      renderInspectDiagnostics({
+        summary: { diagnostics: { errors: 1, warnings: 2, info: 0, hints: 3 } },
+        details: {
+          diagnostics: [
+            {
+              file: "src/app.ts",
+              line: 7,
+              column: 2,
+              severity: "error",
+              message: "bad type",
+              source: "tsserver",
+            },
+          ],
+        },
+      }),
+    ).toContain("diagnostics: 1 errors, 2 warnings, 0 info, 3 hints");
+
+    const pending = renderInspectDiagnostics({
+      summary: {
+        diagnostics: {
+          status: "pending",
+          servers_pending: ["typescript-language-server"],
+          servers_not_installed: ["pyright"],
+        },
+      },
+    });
+    expect(pending).toContain("diagnostics: pending");
+    expect(pending).toContain("typescript-language-server");
+    expect(pending).toContain("pyright");
+    expect(pending).not.toContain("0 errors");
+
+    // Partial result with counts-so-far AND a pending server: must show BOTH
+    // the already-found counts and the pending signal, so real errors found by
+    // one server aren't hidden while another server is still working.
+    const partial = renderInspectDiagnostics({
+      summary: {
+        diagnostics: {
+          errors: 2,
+          warnings: 0,
+          info: 0,
+          hints: 0,
+          status: "pending",
+          servers_pending: ["oxlint"],
+        },
+      },
+    });
+    expect(partial).toContain("2 errors");
+    expect(partial).toContain("so far");
+    expect(partial).toContain("oxlint");
   });
 
   test("registration gate follows surface, disabled_tools, and inspect.enabled", () => {

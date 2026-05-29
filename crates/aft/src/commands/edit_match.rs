@@ -289,7 +289,8 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         // For new files, before-content is empty; compute_diff_info handles
         // that correctly (additions = number of lines in append_content).
         // Diff reflects post-format content because we re-read after format.
-        result["diff"] = edit::compute_diff_info(&before_content, &final_content);
+        result["diff"] =
+            edit::compute_diff_for_response(&req.params, &before_content, &final_content);
     }
 
     // Reuse the standard WriteResult formatter so append's response carries
@@ -1017,7 +1018,7 @@ fn handle_single_file_edit_match(
     }
 
     if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_info(&source, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     Response::success(&req.id, result)

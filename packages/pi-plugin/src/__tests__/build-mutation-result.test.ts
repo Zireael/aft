@@ -21,13 +21,14 @@ describe("buildMutationResult", () => {
       },
     });
 
-    // Agent-facing text includes explicit truncation notice.
+    // Agent text is the compact summary only. The diff body (and therefore any
+    // truncation of it) is a TUI/details concern now — never echoed to the agent.
     const text = result.content
       .filter((c) => c.type === "text")
       .map((c) => (c as { text?: string }).text ?? "")
       .join("");
     expect(text).toContain("Edited src/big.ts (+42/-17, 1 replacement)");
-    expect(text).toContain("diff truncated");
+    expect(text).not.toContain("diff truncated");
     expect(text).not.toContain("\n+"); // no actual diff lines leaked
 
     // Details expose the truncation flag so the TUI renderer can surface it.
@@ -50,6 +51,7 @@ describe("buildMutationResult", () => {
       },
     });
 
+    // Diff body lives in details (TUI renderer) — NOT in agent-facing text.
     expect(result.details?.truncated).toBeUndefined();
     expect(result.details?.firstChangedLine).toBe(1);
     expect(result.details?.diff).toMatch(/^-\s*1 const a = 1;$/m);
@@ -59,9 +61,12 @@ describe("buildMutationResult", () => {
       .filter((c) => c.type === "text")
       .map((c) => (c as { text?: string }).text ?? "")
       .join("");
+    // Agent text is the compact summary only — the diff body is intentionally
+    // omitted so the payload doesn't scale with file size (the agent already
+    // knows what it changed).
     expect(text).toContain("Edited src/small.ts (+1/-1, 1 replacement)");
-    expect(text).toContain("-1 const a = 1;");
-    expect(text).toContain("+1 const a = 2;");
+    expect(text).not.toContain("const a = 1;");
+    expect(text).not.toContain("const a = 2;");
     expect(text).not.toContain("diff truncated");
   });
 

@@ -30,7 +30,8 @@ pub enum InspectCategory {
 }
 
 impl InspectCategory {
-    pub const ACTIVE: [InspectCategory; 5] = [
+    pub const ACTIVE: [InspectCategory; 6] = [
+        InspectCategory::Diagnostics,
         InspectCategory::Metrics,
         InspectCategory::Todos,
         InspectCategory::DeadCode,
@@ -343,6 +344,7 @@ pub struct CallgraphExport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallgraphOutboundCall {
     pub caller_file: PathBuf,
+    pub caller_symbol: String,
     pub target: String,
     pub line: u32,
 }
@@ -457,6 +459,15 @@ impl JobOutcome {
 
     pub fn is_pending(&self) -> bool {
         matches!(self, JobOutcome::Pending { .. })
+    }
+
+    pub fn summary_status(&self) -> Option<&'static str> {
+        match self {
+            JobOutcome::Fresh { .. } => None,
+            JobOutcome::Stale { .. } => Some("stale"),
+            JobOutcome::Pending { .. } => Some("pending"),
+            JobOutcome::Failed { .. } => Some("failed"),
+        }
     }
 }
 

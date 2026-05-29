@@ -100,8 +100,8 @@ impl SearchIndex {
             .files
     }
 
-    /// Score-rank file candidates and report whether candidate enumeration hit
-    /// the internal 200/500 cap before ranking.
+    /// Score-rank file candidates and report whether pre-filter candidate
+    /// enumeration hit the internal 200/500 cap before ranking.
     pub fn lexical_rank_with_stats(
         &self,
         query_trigrams: &[u32],
@@ -137,18 +137,26 @@ impl SearchIndex {
                 }
             }
         }
-        let engine_capped = candidate_ids.len() > candidate_cap;
+        let pre_filter_candidate_count = candidate_ids.len();
+        let engine_capped = pre_filter_candidate_count > candidate_cap;
+        let filtered_candidates = candidate_ids
+            .into_iter()
+            .filter_map(|file_id| {
+                self.files
+                    .get(file_id as usize)
+                    .map(|entry| (file_id, entry))
+            })
+            .filter(|(_, entry)| {
+                if let Some(filter) = candidate_filter {
+                    filter(&entry.path)
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
 
         let mut ranked = Vec::new();
-        for file_id in candidate_ids.into_iter().take(candidate_cap) {
-            let Some(entry) = self.files.get(file_id as usize) else {
-                continue;
-            };
-            if let Some(filter) = candidate_filter {
-                if !filter(&entry.path) {
-                    continue;
-                }
-            }
+        for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
             let score = lexical_score(self, query_trigrams, file_id);
             if score > 0.0 {
                 ranked.push((entry.path.clone(), score));
@@ -345,7 +353,15 @@ impl SearchIndex {
     }
 
     pub fn remove_file(&mut self, path: &Path) {
-        let Some(file_id) = self.path_to_id.remove(path) else {
+        let canonical_path = canonicalize_existing_or_deleted_path(path);
+        let file_id = if let Some(file_id) = self.path_to_id.remove(path) {
+            file_id
+        } else if canonical_path.as_path() != path {
+            let Some(file_id) = self.path_to_id.remove(&canonical_path) else {
+                return;
+            };
+            file_id
+        } else {
             return;
         };
 
@@ -1733,6 +1749,23 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    fs::canonicalize(parent)
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed

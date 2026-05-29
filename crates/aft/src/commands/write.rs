@@ -190,7 +190,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_info(&original, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &original, &final_content);
     }
 
     Response::success(&req.id, result)

@@ -17,14 +17,13 @@
  *   - aft_outline    Structural outline (symbols, headings) for files/URLs
  *   - aft_zoom       Symbol-level inspection with call-graph annotations
  *   - aft_search     Semantic search (when semantic_search=true)
- *   - aft_navigate   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
+ *   - aft_callgraph   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
  *   - aft_conflicts  One-call merge conflict inspection
  *   - aft_import     Language-aware import add/remove/organize
  *   - aft_safety     Per-file undo, checkpoints, restore
  *   - aft_delete     Delete file with backup
  *   - aft_move       Move/rename file
  *   - ast_grep_search / ast_grep_replace  AST-aware pattern search/rewrite
- *   - lsp_diagnostics On-demand LSP diagnostics
  *
  * Commands:
  *   - /aft-status    Status dialog (index states, LSP servers, storage dir)
@@ -86,7 +85,6 @@ import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
-import { registerLspTools } from "./tools/lsp.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
@@ -185,13 +183,13 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.32.0";
+const ANNOUNCEMENT_VERSION = "0.33.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "`aft_search` is now the primary code-search tool — auto-routes regex / literal / semantic / hybrid by query shape, with a `hint` override.",
-  'Semantic search stays queryable through edits — no more "rebuilding" fallback after every save.',
-  "Workflow hints promote `aft_search` as primary; `grep` is positioned as the specialized fallback.",
-  "Bare `\\n`, `\\t`, `\\r` queries correctly route to regex mode.",
-  'Empty params (`targets: []`, `url: ""`) no longer trigger misleading mutual-exclusion errors.',
+  "New `aft_inspect` — one call for codebase health: diagnostics, metrics, TODOs, dead code, unused exports, and duplicates.",
+  "Diagnostics now flow through `aft_inspect` (run it after a batch of edits) instead of arriving automatically on every edit.",
+  "`aft_navigate` is renamed to `aft_callgraph`; the Rust call graph now resolves cross-file callers.",
+  "Edits no longer echo the whole file back to the agent — much lower token cost per edit.",
+  "Batch of `aft_search` correctness fixes and undo-history/SSRF/Windows hardening.",
 ];
 
 /**
@@ -204,7 +202,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
 const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
 
 const ALL_ONLY_TOOLS = new Set([
-  "aft_navigate",
+  "aft_callgraph",
   "aft_delete",
   "aft_move",
   "aft_transform",
@@ -324,7 +322,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  lspDiagnostics: boolean;
   structure: boolean;
   refactor: boolean;
 } {
@@ -358,7 +355,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       move: false,
       astSearch: false,
       astReplace: false,
-      lspDiagnostics: false,
       structure: false,
       refactor: false,
     };
@@ -384,7 +380,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    lspDiagnostics: ok("lsp_diagnostics"),
     structure: false,
     refactor: false,
   };
@@ -392,7 +387,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   if (surface === "all") {
     return {
       ...base,
-      navigate: allOnly("aft_navigate"),
+      navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
       structure: allOnly("aft_transform"),
@@ -774,9 +769,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.delete || surface.move) {
     registerFsTools(pi, ctx, surface);
-  }
-  if (surface.lspDiagnostics) {
-    registerLspTools(pi, ctx);
   }
   if (surface.structure) {
     registerStructureTool(pi, ctx);
