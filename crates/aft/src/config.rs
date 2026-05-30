@@ -147,7 +147,7 @@ impl DistanceMetric {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
     pub backend: SemanticBackend,
     pub model: String,
@@ -186,7 +186,39 @@ pub struct SemanticBackendConfig {
     /// Example: "Represent this code snippet for retrieval: {text}"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_prompt_template: Option<String>,
+    /// Enable per-query search diagnostics collection (default: false).
+    #[serde(default)]
+    pub diagnostics_enabled: bool,
+    /// Score threshold below which results are flagged as low-confidence (default: 0.3).
+    #[serde(default = "default_low_confidence_threshold")]
+    pub low_confidence_threshold: f32,
+    /// Number of recent queries to retain for aggregate metrics (default: 100).
+    #[serde(default = "default_metrics_window_size")]
+    pub metrics_window_size: usize,
 }
+
+fn default_low_confidence_threshold() -> f32 {
+    0.3
+}
+
+fn default_metrics_window_size() -> usize {
+    100
+}
+
+impl SemanticBackendConfig {
+    pub fn diagnostics_enabled(&self) -> bool {
+        self.diagnostics_enabled
+    }
+
+    pub fn low_confidence_threshold(&self) -> f32 {
+        self.low_confidence_threshold
+    }
+
+    pub fn metrics_window_size(&self) -> usize {
+        self.metrics_window_size
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserServerDef {
     pub id: String,
@@ -341,6 +373,9 @@ impl Default for SemanticBackendConfig {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         }
     }
 }

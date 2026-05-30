@@ -5580,6 +5580,9 @@ mod tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5660,6 +5663,9 @@ mod tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5712,6 +5718,9 @@ mod tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6296,6 +6305,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6346,6 +6358,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6375,6 +6390,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6410,6 +6428,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6448,6 +6469,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6479,6 +6503,9 @@ mod fingerprint_invalidation_tests {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();

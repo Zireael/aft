@@ -8,6 +8,9 @@ use crate::context::{AppContext, SemanticIndexStatus};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::SearchIndex;
+use crate::semantic_diagnostics::{
+    score_statistics, top1_margin, PhaseTimer, SearchDiagnostics, SearchPipelineType, SearchWarning,
+};
 use crate::semantic_index::{
     is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
 };
@@ -42,6 +45,9 @@ struct SemanticSearchParams {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _pipeline_timer = PhaseTimer::start();
+    let diagnostics_enabled = ctx.config().semantic.diagnostics_enabled;
+
     let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
         Ok(params) => params,
         Err(error) => {
@@ -50,6 +56,24 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 "invalid_request",
                 format!("semantic_search: invalid params: {error}"),
             );
+        }
+    };
+
+    let query_hash = SearchDiagnostics::hash_query(&params.query);
+    let mut warnings: Vec<SearchWarning> = Vec::new();
+
+    // Snapshot index state for diagnostics.
+    let index_state = {
+        let status = ctx.semantic_index_status().borrow();
+        match &*status {
+            SemanticIndexStatus::Disabled => "disabled".to_string(),
+            SemanticIndexStatus::Building { .. } => "building".to_string(),
+            SemanticIndexStatus::Failed(_) => "failed".to_string(),
+            SemanticIndexStatus::Partial { completeness, .. } => {
+                warnings.push(SearchWarning::PartialIndex { completeness: *completeness });
+                "partial".to_string()
+            }
+            SemanticIndexStatus::Ready => "ready".to_string(),
         }
     };
 
@@ -113,10 +137,17 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         SemanticIndexStatus::Ready => {}
     }
 
+    let embedding_timer = PhaseTimer::start();
     let query_vector = match embed_query(&params.query, ctx) {
         Ok(query_vector) => query_vector,
-        Err(error) => return semantic_error_response(&req.id, &error),
+        Err(error) => {
+            if diagnostics_enabled {
+                warnings.push(SearchWarning::EmbeddingFailure { reason: error.clone() });
+            }
+            return semantic_error_response(&req.id, &error);
+        }
     };
+    let embedding_latency_ms = embedding_timer.stop();
 
     let project_root = ctx
         .config()
@@ -125,6 +156,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
+    let vector_search_timer = PhaseTimer::start();
     let semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
         let Some(index) = semantic_index.as_ref() else {
@@ -138,7 +170,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         index.search(&query_vector, params.top_k.clamp(50, MAX_TOP_K))
     };
+    let vector_search_latency_ms = vector_search_timer.stop();
 
+    let lexical_timer = PhaseTimer::start();
     let shape = query_shape::classify(&params.query);
     let lexical_files = if shape.weights.should_use_lexical {
         let tokens = query_shape::extract_tokens(&params.query, &shape);
@@ -155,19 +189,77 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         Vec::new()
     };
+    let lexical_latency_ms = lexical_timer.stop();
 
+    // Determine pipeline type.
+    let has_semantic = !semantic_results.is_empty();
+    let has_lexical = !lexical_files.is_empty();
+    let pipeline_type = match (has_semantic, has_lexical) {
+        (true, true) => SearchPipelineType::Hybrid,
+        (true, false) => SearchPipelineType::Semantic,
+        (false, true) => {
+            warnings.push(SearchWarning::EmptyResults);
+            SearchPipelineType::LexicalFallback
+        }
+        (false, false) => {
+            warnings.push(SearchWarning::EmptyResults);
+            SearchPipelineType::Semantic
+        }
+    };
+
+    let fusion_timer = PhaseTimer::start();
     let results = fuse_hybrid_results(
         semantic_results,
         lexical_files,
         &shape,
         params.top_k.min(MAX_TOP_K),
     );
+    let hybrid_fusion_latency_ms = fusion_timer.stop();
+
+    // If all results have low scores, flag low confidence.
+    let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
+    let low_conf_threshold = ctx.config().semantic.low_confidence_threshold;
+    if !scores.is_empty() && scores.iter().all(|s| *s < low_conf_threshold) {
+        warnings.push(SearchWarning::LowConfidence);
+    }
 
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
     // hit with its score so the caller can decide.
 
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+
+    // Record diagnostics if enabled.
+    if diagnostics_enabled {
+        let candidate_count = scores.len();
+        let returned_count = results.len();
+        let (score_min, score_median, score_p90, score_max) = score_statistics(&scores);
+        let margin = top1_margin(&scores);
+        let total_latency_ms = _pipeline_timer.stop();
+        let prompt_active = ctx.config().semantic.query_prompt_template.is_some();
+
+        let diag = SearchDiagnostics {
+            query_hash,
+            pipeline_type,
+            index_state,
+            total_latency_ms,
+            embedding_latency_ms: Some(embedding_latency_ms),
+            lexical_latency_ms: Some(lexical_latency_ms),
+            vector_search_latency_ms: Some(vector_search_latency_ms),
+            hybrid_fusion_latency_ms: Some(hybrid_fusion_latency_ms),
+            candidate_count,
+            returned_count,
+            score_min,
+            score_median,
+            score_p90,
+            score_max,
+            top1_margin: margin,
+            query_cache_hit: false, // Not tracked per-query yet.
+            prompt_active,
+            warnings: warnings.clone(),
+        };
+        ctx.semantic_search_metrics().borrow_mut().record(diag);
+    }
 
     Response::success(
         &req.id,

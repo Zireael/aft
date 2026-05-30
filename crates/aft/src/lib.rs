@@ -80,6 +80,7 @@ pub mod protocol;
 pub mod query_shape;
 pub mod search_index;
 pub mod semantic_index;
+pub mod semantic_diagnostics;
 pub mod symbol_cache_disk;
 pub mod symbols;
 // Compiled on all platforms so cross-platform unit tests in

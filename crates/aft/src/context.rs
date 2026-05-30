@@ -358,6 +358,8 @@ pub struct AppContext {
     /// Cancellation token for the semantic index build. Incremented on reconfigure
     /// to cooperatively cancel any in-flight build thread.
     semantic_cancel_token: SemanticCancellationToken,
+    /// Rolling per-query semantic search metrics collector.
+    semantic_search_metrics: RefCell<crate::semantic_diagnostics::SearchMetricsCollector>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -396,6 +398,7 @@ pub struct AppContext {
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
+        let metrics_window_size = config.semantic.metrics_window_size;
         let progress_sender = Arc::new(Mutex::new(None));
         let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
@@ -427,6 +430,11 @@ impl AppContext {
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
             semantic_embedding_model: RefCell::new(None),
             semantic_cancel_token: SemanticCancellationToken::new(),
+            semantic_search_metrics: RefCell::new(
+                crate::semantic_diagnostics::SearchMetricsCollector::new(
+                    metrics_window_size,
+                ),
+            ),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
@@ -869,6 +877,11 @@ impl AppContext {
     /// Access the cancellation token for the semantic index build.
     pub fn semantic_cancel_token(&self) -> &SemanticCancellationToken {
         &self.semantic_cancel_token
+    }
+
+    /// Access the rolling search metrics collector.
+    pub fn semantic_search_metrics(&self) -> &RefCell<crate::semantic_diagnostics::SearchMetricsCollector> {
+        &self.semantic_search_metrics
     }
 
     /// Access the file watcher handle (kept alive to continue watching).
