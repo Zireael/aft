@@ -102,6 +102,9 @@ pub enum StorageStrategy {
     /// Decode int8 to f32 and L2-normalize before storage (compatibility path for base64_int8).
     #[serde(rename = "decode_normalize_f32")]
     DecodeNormalizeF32,
+    /// Store as packed binary (bit) vectors for Hamming distance search.
+    #[serde(rename = "binary_packed")]
+    BinaryPacked,
 }
 
 impl StorageStrategy {

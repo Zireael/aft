@@ -166,6 +166,9 @@ impl TypedVector {
                     let sv = StoredVector::DenseF32(v);
                     Ok(sv.l2_normalize())
                 }
+                StorageStrategy::BinaryPacked => Err(
+                    "DenseF32 vectors cannot be stored as BinaryPacked".to_string(),
+                ),
             },
             Self::DenseInt8(v) => match strategy {
                 StorageStrategy::NativeF32 => {
@@ -176,14 +179,20 @@ impl TypedVector {
                     let f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
                     Ok(StoredVector::DenseF32(f32s).l2_normalize())
                 }
+                StorageStrategy::BinaryPacked => Err(
+                    "DenseInt8 vectors cannot be stored as BinaryPacked".to_string(),
+                ),
             },
             Self::BinaryPacked {
-                bytes: _,
+                bytes,
                 logical_dims,
-            } => Err(format!(
-                "BinaryPacked vectors are not yet supported (logical_dims={})",
-                logical_dims
-            )),
+            } => match strategy {
+                StorageStrategy::BinaryPacked => Ok(StoredVector::BinaryPacked { bytes, logical_dims }),
+                _ => Err(format!(
+                    "BinaryPacked vectors require StorageStrategy::BinaryPacked (got {:?})",
+                    strategy
+                )),
+            },
         }
     }
 
@@ -266,9 +275,31 @@ pub(crate) fn parse_embedding_value(
                 _ => unreachable!("decode_base64_int8 always returns DenseInt8"),
             }
         }
-        OutputEncoding::Base64Binary => Err(format!(
-            "{context}: base64_binary output encoding is not yet supported"
-        )),
+        OutputEncoding::Base64Binary => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("{context}: expected base64 string, got {:?}", value))?;
+            let expected_dims = expected_dims.unwrap_or(s.len() * 8);
+            let typed = TypedVector::decode_base64_binary(s, expected_dims)?;
+            match typed {
+                TypedVector::BinaryPacked { bytes, logical_dims } => {
+                    // Convert packed bytes to f32 vec of 0.0/1.0, masking padding bits
+                    let mut f32s = Vec::with_capacity(logical_dims);
+                    for i in 0..logical_dims {
+                        let byte_idx = i / 8;
+                        let bit_idx = (i % 8) as u8;
+                        if byte_idx < bytes.len() {
+                            let bit = (bytes[byte_idx] >> bit_idx) & 1;
+                            f32s.push(if bit != 0 { 1.0 } else { 0.0 });
+                        } else {
+                            f32s.push(0.0);
+                        }
+                    }
+                    Ok(f32s)
+                }
+                _ => unreachable!("decode_base64_binary always returns BinaryPacked"),
+            }
+        }
     }
 }
 
@@ -458,6 +489,27 @@ impl EmbeddingModelProfile {
     }
 
     /// Returns a profile for Perplexity providers returning base64-encoded
+    /// binary (packed-bit) embeddings. Vectors are stored as packed bits and
+    /// searched with Hamming distance.
+    pub fn perplexity_binary() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Base64Binary,
+            source_vector_kind: VectorKind::BinaryPacked,
+            stored_vector_kind: VectorKind::BinaryPacked,
+            metric: DistanceMetric::Hamming,
+            normalization: NormalizationPolicy::NotApplicable,
+            storage_strategy: StorageStrategy::BinaryPacked,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
+    /// Returns a profile for Perplexity providers returning base64-encoded
     /// int8 embeddings. The int8 values are decoded, cast to f32, and
     /// L2-normalized before storage/search through the existing f32 cosine path.
     pub fn perplexity_int8() -> Self {
@@ -494,6 +546,8 @@ impl EmbeddingModelProfile {
             SemanticBackend::Perplexity => {
                 if config.output_encoding == Some(OutputEncoding::Base64Int8) {
                     Some(Self::perplexity_int8())
+                } else if config.output_encoding == Some(OutputEncoding::Base64Binary) {
+                    Some(Self::perplexity_binary())
                 } else {
                     Some(Self::perplexity_generic())
                 }
@@ -553,6 +607,8 @@ impl EmbeddingModelProfile {
         match (output_encoding, storage_strategy) {
             (OutputEncoding::Float, StorageStrategy::NativeF32) => {}
             (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32) => {}
+            (OutputEncoding::Base64Int8, StorageStrategy::NativeF32) => {}
+            (OutputEncoding::Base64Binary, StorageStrategy::BinaryPacked) => {}
             (OutputEncoding::Base64Binary, _) => {
                 errors.push(format!(
                     "{}.output_encoding=base64_binary requires a native binary vector store, not available in MVP",
@@ -650,9 +706,7 @@ impl EmbeddingModelProfile {
             (OutputEncoding::Float, StorageStrategy::NativeF32) => Ok(()),
             (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32)
             | (OutputEncoding::Base64Int8, StorageStrategy::NativeF32) => Ok(()),
-            (OutputEncoding::Base64Binary, _) => {
-                Err("base64_binary output encoding is not yet supported".to_string())
-            }
+            (OutputEncoding::Base64Binary, StorageStrategy::BinaryPacked) => Ok(()),
             (enc, strat) => Err(format!(
                 "output encoding {:?} is not compatible with storage strategy {:?}",
                 enc, strat
@@ -1329,6 +1383,7 @@ impl std::fmt::Display for StorageStrategy {
         match self {
             Self::NativeF32 => write!(f, "native_f32"),
             Self::DecodeNormalizeF32 => write!(f, "decode_normalize_f32"),
+            Self::BinaryPacked => write!(f, "binary_packed"),
         }
     }
 }
@@ -6208,8 +6263,6 @@ mod fingerprint_invalidation_tests {
 
     #[test]
     fn openai_compatible_base64_int8_embeds_with_mock_server() {
-        use base64::Engine as _;
-
         // Simulate a provider returning base64-encoded int8 vectors.
         // Two vectors of 3 dimensions: [10, -20, 30] and [-40, 50, -60].
         let v1 = encode_int8_base64(&[10, -20, 30]);
@@ -6505,10 +6558,20 @@ mod fingerprint_invalidation_tests {
     }
 
     #[test]
-    fn parse_embedding_value_base64_binary_not_supported() {
-        let val = serde_json::json!("some_base64");
-        let err =
-            parse_embedding_value(&val, OutputEncoding::Base64Binary, "test", None).unwrap_err();
-        assert!(err.contains("not yet supported"), "got: {err}");
+    fn parse_embedding_value_base64_binary_succeeds() {
+        // Binary vector: byte 0xAA (10101010), 8 logical dimensions
+        // bits (LSB→MSB): 0,1,0,1,0,1,0,1
+        let val = serde_json::json!("qg==");
+        let result =
+            parse_embedding_value(&val, OutputEncoding::Base64Binary, "test", Some(8)).unwrap();
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0], 0.0);
+        assert_eq!(result[1], 1.0);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 1.0);
+        assert_eq!(result[4], 0.0);
+        assert_eq!(result[5], 1.0);
+        assert_eq!(result[6], 0.0);
+        assert_eq!(result[7], 1.0);
     }
 }
