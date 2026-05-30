@@ -681,10 +681,10 @@ async function deliverConfigureWarningBatch(
   opts: ConfigureWarningOptions,
   warnings: ConfigureWarning[],
 ): Promise<boolean> {
+  if (warnings.length === 0) return false;
   const delivery = opts.delivery ?? "toast";
   const message = formatConfigureWarningsBatch(warnings);
-  const title = warnings.length === 1 ? `AFT: ${warningTitle(warnings[0]!)}` : "AFT: Missing tools";
-
+  const title = warnings.length === 1 ? `AFT: ${warningTitle(warnings[0])}` : "AFT: Missing tools";
   if (delivery === "log") {
     warn(`[aft-plugin] configure warnings:\n${message}`);
     sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);

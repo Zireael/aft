@@ -312,7 +312,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   });
 
   test("background completions are no longer appended by the bash adapter", async () => {
-    const { h, bash, pool } = await pluginHarness({ experimental_bash_background: true });
+    const { h, bash } = await pluginHarness({ experimental_bash_background: true });
     await h.bridge.send("configure", {
       project_root: h.tempDir,
       harness: "opencode",

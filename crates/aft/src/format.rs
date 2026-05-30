@@ -461,6 +461,46 @@ fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec
     candidates
 }
 
+/// Build the candidate path list for the given command name using well-known
+/// Windows install locations. Extracted so tests can drive the lookup with a
+/// controlled USERPROFILE without mutating process-global env vars.
+///
+/// Search order:
+/// 1. `C:\Go\bin\<command>.exe` — Windows Go installer (default path)
+/// 2. `C:\Program Files\Go\bin\<command>.exe` — Windows Go installer (Program Files)
+/// 3. `%USERPROFILE%\.cargo\bin\<command>.exe` — `cargo install`
+/// 4. `%USERPROFILE%\go\bin\<command>.exe` — `go install` with default GOPATH
+///
+/// Each candidate appends `.exe` because Windows executables require the
+/// extension for `std::fs::metadata` to resolve the correct file.
+#[cfg(windows)]
+fn well_known_windows_search_paths(
+    command: &str,
+    userprofile: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let exe_name = format!("{}.exe", command);
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
+    // Go SDK installations
+    candidates.push(PathBuf::from(r"C:\Go\bin").join(&exe_name));
+    candidates.push(PathBuf::from(r"C:\Program Files\Go\bin").join(&exe_name));
+    if let Some(up) = userprofile {
+        let up_path = PathBuf::from(up);
+        // Cargo-installed tools (rustfmt, cargo-outdated, etc.)
+        candidates.push(up_path.join(r".cargo\bin").join(&exe_name));
+        // Go-installed tools (gopls, staticcheck, goimports, etc.)
+        candidates.push(up_path.join(r"go\bin").join(&exe_name));
+    }
+    candidates
+}
+
+#[cfg(not(windows))]
+fn well_known_windows_search_paths(
+    _command: &str,
+    _userprofile: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    Vec::new() // dead code on POSIX, included for compile-time completeness
+}
+
 /// Walk a pre-built candidate list, returning the first file that exists and
 /// is executable. Extracted from `try_well_known_path_lookup` so tests can
 /// inject candidates anchored at a tempdir.
@@ -1129,13 +1169,13 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "rust-analyzer" => "Install: `rustup component add rust-analyzer`".to_string(),
         "cargo" => "Install Rust from https://rustup.rs/.".to_string(),
         "go" => if cfg!(windows) {
-            "Install Go from https://go.dev/dl/. Common install paths: \
+            "Install Go from https://go.dev/dl/. Common install paths:\
                  C:\\Go\\bin, C:\\Program Files\\Go\\bin. \
                  GUI-launched editors often don't inherit login-shell PATH."
         } else {
-            "Install Go from https://go.dev/dl/, or — if it's already installed — \
-                 ensure its bin directory is on PATH (Homebrew typically uses \
-                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS). \
+            "Install Go from https://go.dev/dl/, or — if it's already installed —\
+                 ensure its bin directory is on PATH (Homebrew typically uses\
+                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).\
                  GUI-launched editors often don't inherit login-shell PATH."
         }
         .to_string(),
