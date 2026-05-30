@@ -219,6 +219,59 @@ impl TypedVector {
     }
 }
 
+/// Deserialize a single embedding value from a JSON `embedding` field.
+///
+/// For `OutputEncoding::Float`, the field is expected to be an array of f32.
+/// For `OutputEncoding::Base64Int8`, the field is a base64-encoded string of
+/// signed int8 bytes, which is decoded, validated against `expected_dims`,
+/// cast to f32, and L2-normalized.
+///
+/// Returns the embedding as `Vec<f32>` ready for storage/search.
+pub(crate) fn parse_embedding_value(
+    value: &serde_json::Value,
+    output_encoding: OutputEncoding,
+    context: &str,
+    expected_dims: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    match output_encoding {
+        OutputEncoding::Float => serde_json::from_value(value.clone())
+            .map_err(|e| format!("{context}: expected float array, got error: {e}")),
+        OutputEncoding::Base64Int8 => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("{context}: expected base64 string, got {:?}", value))?;
+            let typed = TypedVector::decode_base64_int8(s)?;
+            match typed {
+                TypedVector::DenseInt8(v) => {
+                    // Validate decoded byte count matches expected dimensions.
+                    if let Some(dims) = expected_dims {
+                        if v.len() != dims {
+                            return Err(format!(
+                                "{context}: int8 dimension mismatch: decoded {} values, expected {dims}",
+                                v.len()
+                            ));
+                        }
+                    }
+                    // Cast i8 to f32 and L2-normalize for cosine/dot-product search.
+                    let mut f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
+                    let norm_sq: f32 = f32s.iter().map(|x| x * x).sum();
+                    if norm_sq > 0.0 {
+                        let norm = norm_sq.sqrt();
+                        for x in &mut f32s {
+                            *x /= norm;
+                        }
+                    }
+                    Ok(f32s)
+                }
+                _ => unreachable!("decode_base64_int8 always returns DenseInt8"),
+            }
+        }
+        OutputEncoding::Base64Binary => Err(format!(
+            "{context}: base64_binary output encoding is not yet supported"
+        )),
+    }
+}
+
 /// A vector as stored in the index after conversion.
 ///
 /// This is the final form that is written to the snapshot / disk cache.
@@ -404,6 +457,27 @@ impl EmbeddingModelProfile {
         }
     }
 
+    /// Returns a profile for Perplexity providers returning base64-encoded
+    /// int8 embeddings. The int8 values are decoded, cast to f32, and
+    /// L2-normalized before storage/search through the existing f32 cosine path.
+    pub fn perplexity_int8() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Base64Int8,
+            source_vector_kind: VectorKind::DenseInt8,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::NormalizeOnInsertQuery,
+            storage_strategy: StorageStrategy::DecodeNormalizeF32,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
     /// Look up a profile for the given config.
     /// Returns `None` if no specific profile is known (caller should use defaults).
     pub fn from_config(config: &SemanticBackendConfig) -> Option<Self> {
@@ -417,7 +491,13 @@ impl EmbeddingModelProfile {
             }
             SemanticBackend::OpenAiCompatible => Some(Self::openai_compatible_generic()),
             SemanticBackend::Ollama => Some(Self::ollama_generic()),
-            SemanticBackend::Perplexity => Some(Self::perplexity_generic()),
+            SemanticBackend::Perplexity => {
+                if config.output_encoding == Some(OutputEncoding::Base64Int8) {
+                    Some(Self::perplexity_int8())
+                } else {
+                    Some(Self::perplexity_generic())
+                }
+            }
         }
     }
 
@@ -1528,6 +1608,11 @@ impl SemanticEmbeddingModel {
                 if let Some(dims) = self.config_dimensions.or(self.dimension) {
                     body["dimensions"] = serde_json::json!(dims);
                 }
+                // Request the configured output encoding from providers that
+                // support it (e.g. Perplexity base64_int8 via openai_compatible).
+                if self.output_encoding != OutputEncoding::Float {
+                    body["encoding_format"] = serde_json::json!(self.output_encoding.to_string());
+                }
 
                 let raw = send_embedding_request(
                     || {
@@ -1551,14 +1636,16 @@ impl SemanticEmbeddingModel {
                     "openai compatible",
                 )?;
 
+                // Parse response — handle both float arrays and base64-encoded
+                // int8 strings depending on the configured output encoding.
                 #[derive(Deserialize)]
                 struct OpenAiResponse {
-                    data: Vec<OpenAiEmbeddingResult>,
+                    data: Vec<OpenAiEmbeddingEntry>,
                 }
 
                 #[derive(Deserialize)]
-                struct OpenAiEmbeddingResult {
-                    embedding: Vec<f32>,
+                struct OpenAiEmbeddingEntry {
+                    embedding: serde_json::Value,
                     index: Option<u32>,
                 }
 
@@ -1580,7 +1667,12 @@ impl SemanticEmbeddingModel {
                             "openai compatible response contains invalid vector index".to_string()
                         );
                     }
-                    vectors[index] = item.embedding;
+                    vectors[index] = parse_embedding_value(
+                        &item.embedding,
+                        self.output_encoding,
+                        "openai compatible embedding",
+                        self.config_dimensions.or(self.dimension),
+                    )?;
                 }
 
                 for vector in &vectors {
@@ -1610,6 +1702,10 @@ impl SemanticEmbeddingModel {
                 if let Some(dims) = self.config_dimensions.or(self.dimension) {
                     body["dimensions"] = serde_json::json!(dims);
                 }
+                // Request the configured output encoding from Perplexity.
+                if self.output_encoding != OutputEncoding::Float {
+                    body["encoding_format"] = serde_json::json!(self.output_encoding.to_string());
+                }
 
                 let raw = send_embedding_request(
                     || {
@@ -1623,15 +1719,17 @@ impl SemanticEmbeddingModel {
                     "perplexity",
                 )?;
 
+                // Parse response — handle both float arrays and base64-encoded
+                // int8 strings depending on the configured output encoding.
                 #[derive(Deserialize)]
-                struct PerplexityEmbedding {
-                    embedding: Vec<f32>,
+                struct PerplexityEmbeddingEntry {
+                    embedding: serde_json::Value,
                     index: Option<u32>,
                 }
 
                 #[derive(Deserialize)]
                 struct PerplexityEmbedResponse {
-                    data: Vec<PerplexityEmbedding>,
+                    data: Vec<PerplexityEmbeddingEntry>,
                 }
 
                 let parsed: PerplexityEmbedResponse = serde_json::from_str(&raw)
@@ -1650,7 +1748,12 @@ impl SemanticEmbeddingModel {
                     if index >= vectors.len() {
                         return Err("perplexity response contains invalid vector index".to_string());
                     }
-                    vectors[index] = item.embedding;
+                    vectors[index] = parse_embedding_value(
+                        &item.embedding,
+                        self.output_encoding,
+                        "perplexity embedding",
+                        self.config_dimensions.or(self.dimension),
+                    )?;
                 }
 
                 for vector in &vectors {
@@ -1744,7 +1847,15 @@ impl SemanticEmbeddingModel {
                 _ => unreachable!(),
             };
             let dims = self.config_dimensions.or(self.dimension);
-            Self::embed_document_chunks_native(&client, &model, &base_url, &api_key, dims, docs)
+            Self::embed_document_chunks_native(
+                &client,
+                &model,
+                &base_url,
+                &api_key,
+                dims,
+                self.output_encoding,
+                docs,
+            )
         } else {
             let all_texts: Vec<String> = docs
                 .documents
@@ -1776,6 +1887,7 @@ impl SemanticEmbeddingModel {
         base_url: &str,
         api_key: &Option<String>,
         dims: Option<usize>,
+        output_encoding: OutputEncoding,
         docs: DocumentChunks,
     ) -> Result<DocumentEmbeddings, String> {
         #[derive(Serialize)]
@@ -1795,6 +1907,10 @@ impl SemanticEmbeddingModel {
         if let Some(d) = dims {
             body["dimensions"] = serde_json::json!(d);
         }
+        // Request the configured output encoding from Perplexity.
+        if output_encoding != OutputEncoding::Float {
+            body["encoding_format"] = serde_json::json!(output_encoding.to_string());
+        }
 
         let endpoint = build_openai_embeddings_endpoint(base_url);
 
@@ -1809,6 +1925,8 @@ impl SemanticEmbeddingModel {
             "perplexity",
         )?;
 
+        // Parse response — handle both float arrays and base64-encoded
+        // int8 strings depending on the configured output encoding.
         #[derive(Deserialize)]
         struct DocumentEmbeddingResponse {
             data: Vec<PerDocumentEmbeddings>,
@@ -1816,7 +1934,7 @@ impl SemanticEmbeddingModel {
 
         #[derive(Deserialize)]
         struct PerDocumentEmbeddings {
-            embeddings: Vec<Vec<f32>>,
+            embeddings: Vec<serde_json::Value>,
             index: u32,
         }
 
@@ -1840,9 +1958,18 @@ impl SemanticEmbeddingModel {
                         .to_string(),
                 );
             }
+            let mut vectors = Vec::with_capacity(item.embeddings.len());
+            for (chunk_idx, val) in item.embeddings.into_iter().enumerate() {
+                vectors.push(parse_embedding_value(
+                    &val,
+                    output_encoding,
+                    &format!("perplexity document-chunk embedding[{}]", chunk_idx),
+                    dims,
+                )?);
+            }
             embeddings[index] = ChunkEmbeddings {
                 file_path: docs.documents[index].file_path.clone(),
-                vectors: item.embeddings,
+                vectors,
             };
         }
 
@@ -4750,7 +4877,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
+    pub(crate) fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
     where
         F: Fn(String, String, String) -> String + Send + 'static,
     {
@@ -4773,7 +4900,10 @@ mod tests {
                         header_end = Some(pos + 4);
                         let headers = String::from_utf8_lossy(&buf[..pos + 4]);
                         for line in headers.lines() {
-                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                            let lower = line.trim().to_lowercase();
+                            if let Some(value) = lower
+                                .strip_prefix("content-length:")
+                            {
                                 content_length = value.trim().parse::<usize>().unwrap_or(0);
                             }
                         }
@@ -5903,6 +6033,7 @@ mod tests {
 
 #[cfg(test)]
 mod fingerprint_invalidation_tests {
+    use super::tests::start_mock_http_server;
     use super::*;
 
     /// Build a fingerprint with all fields set to predictable defaults.
@@ -6064,5 +6195,320 @@ mod fingerprint_invalidation_tests {
             "clear_query_cache"
         );
         assert_eq!(FingerprintChange::None.to_string(), "none");
+    }
+
+    // ── base64_int8 embedding tests ────────────────────────────────────
+
+    /// Helper: encode a vec of i8 as a base64 string (STANDARD encoding).
+    fn encode_int8_base64(values: &[i8]) -> String {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn openai_compatible_base64_int8_embeds_with_mock_server() {
+        use base64::Engine as _;
+
+        // Simulate a provider returning base64-encoded int8 vectors.
+        // Two vectors of 3 dimensions: [10, -20, 30] and [-40, 50, -60].
+        let v1 = encode_int8_base64(&[10, -20, 30]);
+        let v2 = encode_int8_base64(&[-40, 50, -60]);
+        let response_body = format!(
+            "{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}},{{\"embedding\":\"{}\",\"index\":1}}]}}",
+            v1, v2
+        );
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, body| {
+            // Verify that encoding_format is sent in the request body.
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["encoding_format"], "base64_int8",
+                "request should include encoding_format: base64_int8"
+            );
+            response_body.clone()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-int8".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        // Vectors are L2-normalized after int8→f32 conversion.
+        let norm1_sq: f32 = vectors[0].iter().map(|x| x * x).sum();
+        assert!((norm1_sq - 1.0).abs() < 1e-5, "vector 1 norm² = {norm1_sq}");
+        let norm2_sq: f32 = vectors[1].iter().map(|x| x * x).sum();
+        assert!((norm2_sq - 1.0).abs() < 1e-5, "vector 2 norm² = {norm2_sq}");
+        // Verify relative ordering is preserved (positive/negative signs).
+        assert!(vectors[0][0] > 0.0, "v1[0] should be positive");
+        assert!(vectors[0][1] < 0.0, "v1[1] should be negative");
+        assert!(vectors[0][2] > 0.0, "v1[2] should be positive");
+        assert!(vectors[1][0] < 0.0, "v2[0] should be negative");
+        assert!(vectors[1][1] > 0.0, "v2[1] should be positive");
+        assert!(vectors[1][2] < 0.0, "v2[2] should be negative");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn openai_compatible_float_path_unchanged() {
+        // Ensure the existing float array path still works after refactoring.
+        let (base_url, handle) = start_mock_http_server(|_request, _path, body| {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            // encoding_format should NOT be present for Float encoding.
+            assert!(
+                parsed.get("encoding_format").is_none(),
+                "float path should not send encoding_format"
+            );
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3],\"index\":0}]}".to_string()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-float".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None, // defaults to Float
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model.embed(vec!["test".to_string()]).unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_invalid_base64_returns_error() {
+        let (base_url, handle) = start_mock_http_server(|_request, _path, _body| {
+            // Return invalid base64 data.
+            "{\"data\":[{\"embedding\":\"!!!NOT_BASE64!!!\",\"index\":0}]}".to_string()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("base64 decode error") || err.contains("provider-response"),
+            "expected base64 decode error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_wrong_dimension_returns_error() {
+        // Return a valid base64 string, but the byte count doesn't match
+        // what the model expects (we configured 5 dimensions but encode 3 bytes).
+        let v = encode_int8_base64(&[1, 2, 3]); // 3 bytes, but dimensions=5
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            format!("{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}}]}}", v)
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: Some(5), // expect 5 dimensions
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        // The dimension mismatch is caught either at parse time (if the model
+        // already knows its dimension from a prior probe) or at validation time.
+        // Either way, the error should contain a meaningful message.
+        assert!(
+            err.contains("dimension") || err.contains("length"),
+            "expected dimension/length error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_inconsistent_response_count_returns_error() {
+        // Request 2 texts but provider returns only 1 embedding.
+        let v = encode_int8_base64(&[10, 20, 30]);
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            // Return only 1 embedding for 2 inputs.
+            format!("{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}}]}}", v)
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap_err();
+        assert!(
+            err.contains("1 embeddings for 2 inputs"),
+            "expected count mismatch error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_profile_from_config_selects_correctly() {
+        use crate::config::SemanticBackend;
+
+        let config_int8 = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            model: "sonar".to_string(),
+            base_url: Some("http://127.0.0.1:9999".to_string()),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+        };
+
+        let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+
+        let config_float = SemanticBackendConfig {
+            output_encoding: None, // defaults to Float
+            ..config_int8
+        };
+
+        let profile = SemanticEmbeddingModel::from_config(&config_float).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+    }
+
+    #[test]
+    fn parse_embedding_value_float_succeeds() {
+        let val = serde_json::json!([0.1, 0.2, 0.3]);
+        let result = parse_embedding_value(&val, OutputEncoding::Float, "test", None).unwrap();
+        assert!((result[0] - 0.1).abs() < 1e-6);
+        assert!((result[1] - 0.2).abs() < 1e-6);
+        assert!((result[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_succeeds_and_normalizes() {
+        let encoded = encode_int8_base64(&[10, -20, 30]);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // L2-norm of [10, -20, 30] = sqrt(1400) ≈ 37.4166
+        let norm_sq: f32 = 10.0 * 10.0 + (-20.0) * (-20.0) + 30.0 * 30.0;
+        let norm = norm_sq.sqrt();
+        assert!((result[0] - 10.0 / norm).abs() < 1e-5, "got {}", result[0]);
+        assert!(
+            (result[1] - (-20.0) / norm).abs() < 1e-5,
+            "got {}",
+            result[1]
+        );
+        assert!((result[2] - 30.0 / norm).abs() < 1e-5, "got {}", result[2]);
+        // Verify L2 norm ≈ 1.0
+        let norm_check: f32 = result.iter().map(|x| x * x).sum();
+        assert!((norm_check - 1.0).abs() < 1e-5, "norm² = {norm_check}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_dimension_mismatch() {
+        let encoded = encode_int8_base64(&[10, -20, 30]); // 3 values
+        let val = serde_json::json!(encoded);
+        let err =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", Some(5)).unwrap_err();
+        assert!(err.contains("dimension mismatch"), "got: {err}");
+        assert!(err.contains("decoded 3 values, expected 5"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_dimension_match() {
+        let encoded = encode_int8_base64(&[10, -20, 30]); // 3 values
+        let val = serde_json::json!(encoded);
+        let result =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", Some(3)).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_invalid_base64() {
+        let val = serde_json::json!("not-valid-base64!!!");
+        let err =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap_err();
+        assert!(err.contains("base64 decode error"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_float_wrong_type() {
+        // Float encoding expects an array, not a string.
+        let val = serde_json::json!("not-an-array");
+        let err = parse_embedding_value(&val, OutputEncoding::Float, "test", None).unwrap_err();
+        assert!(err.contains("expected float array"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_binary_not_supported() {
+        let val = serde_json::json!("some_base64");
+        let err =
+            parse_embedding_value(&val, OutputEncoding::Base64Binary, "test", None).unwrap_err();
+        assert!(err.contains("not yet supported"), "got: {err}");
     }
 }
