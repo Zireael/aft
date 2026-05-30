@@ -305,9 +305,7 @@ export function fileResultBySuffix(
   return match;
 }
 
-async function resolveAftBinaryPath(
-  candidates: string[],
-): Promise<string | undefined> {
+async function resolveAftBinaryPath(candidates: string[]): Promise<string | undefined> {
   for (const candidate of candidates) {
     if (await isExecutable(candidate)) {
       return candidate;
@@ -323,9 +321,7 @@ function debugBinaryCandidates(): string[] {
 }
 
 function fallbackBinaryCandidates(): string[] {
-  return process.platform === "win32"
-    ? [FALLBACK_BINARY_EXE, FALLBACK_BINARY]
-    : [FALLBACK_BINARY];
+  return process.platform === "win32" ? [FALLBACK_BINARY_EXE, FALLBACK_BINARY] : [FALLBACK_BINARY];
 }
 
 async function prepareBinaryOnce(): Promise<PreparedBinary> {
@@ -387,7 +383,9 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
 
 async function isExecutable(filePath: string): Promise<boolean> {
   try {
-    await access(filePath, constants.X_OK);
+    // Windows has no Unix execute bit; existence is enough for .exe discovery.
+    const mode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
+    await access(filePath, mode);
     return true;
   } catch {
     return false;

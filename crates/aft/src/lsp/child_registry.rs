@@ -221,14 +221,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("grandchild.pid");
-        let script = format!(
-            "sleep 60 & echo $! > '{}'; wait",
-            pid_file.display()
-        );
+        // Pass the path via env so the shell never interpolates TMPDIR characters
+        // (e.g. embedded single quotes) into the script literal.
+        const PID_FILE_ENV: &str = "AFT_LSP_KILLALL_TEST_PID_FILE";
 
         let mut child = unsafe {
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(&script);
+            cmd.arg("-c")
+                .arg("sleep 60 & echo $! > \"$AFT_LSP_KILLALL_TEST_PID_FILE\"; wait")
+                .env(PID_FILE_ENV, &pid_file);
             // setsid() so wrapper becomes its own process-group leader,
             // matching what LspClient::spawn does.
             cmd.pre_exec(|| {
