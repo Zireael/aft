@@ -14,7 +14,9 @@ import { bridgeLogger } from "../../logger.js";
 setActiveLogger(bridgeLogger);
 
 const TARGET_DEBUG_BINARY = resolve(import.meta.dir, "../../../../../target/debug/aft");
+const TARGET_DEBUG_BINARY_EXE = `${TARGET_DEBUG_BINARY}.exe`;
 const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin/aft");
+const FALLBACK_BINARY_EXE = `${FALLBACK_BINARY}.exe`;
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -303,34 +305,63 @@ export function fileResultBySuffix(
   return match;
 }
 
+async function resolveAftBinaryPath(
+  candidates: string[],
+): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    if (await isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function debugBinaryCandidates(): string[] {
+  return process.platform === "win32"
+    ? [TARGET_DEBUG_BINARY_EXE, TARGET_DEBUG_BINARY]
+    : [TARGET_DEBUG_BINARY];
+}
+
+function fallbackBinaryCandidates(): string[] {
+  return process.platform === "win32"
+    ? [FALLBACK_BINARY_EXE, FALLBACK_BINARY]
+    : [FALLBACK_BINARY];
+}
+
 async function prepareBinaryOnce(): Promise<PreparedBinary> {
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const existing = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (existing) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: existing,
       source: "target",
       buildAttempted: false,
     };
   }
 
   const build = await runCargoBuild();
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const built = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (built) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: built,
       source: "target",
       buildAttempted: true,
     };
   }
 
-  if (await isExecutable(FALLBACK_BINARY)) {
+  const fallback = await resolveAftBinaryPath(fallbackBinaryCandidates());
+  if (fallback) {
     return {
-      binaryPath: FALLBACK_BINARY,
+      binaryPath: fallback,
       source: "fallback",
       buildAttempted: true,
     };
   }
 
+  const searched = [...debugBinaryCandidates(), ...fallbackBinaryCandidates()]
+    .map((path) => relative(PROJECT_ROOT, path))
+    .join(" or ");
   const skipReason = build.ok
-    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    ? `aft binary not found at ${searched}`
     : `cargo build failed and no fallback aft binary was found\n${build.output}`;
 
   // In CI the aft binary is always built before the Bun suites run, so a missing

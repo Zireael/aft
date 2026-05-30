@@ -176,6 +176,10 @@ fn start_mock_embedding_server_with_response(
     (format!("http://{addr}"), handle)
 }
 
+fn path_ends_with(file: &str, suffix: &str) -> bool {
+    file.replace('\\', "/").ends_with(suffix)
+}
+
 fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(
         response["success"], true,
@@ -195,7 +199,7 @@ fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
         results.iter().any(|result| result["source"] == "lexical"
             && result["file"]
                 .as_str()
-                .is_some_and(|file| file.ends_with("src/lib.rs"))),
+                .is_some_and(|file| path_ends_with(file, "src/lib.rs"))),
         "expected lexical fallback result, got {results:?}"
     );
     let warnings = response["warnings"].as_array().expect("warnings array");
@@ -228,7 +232,7 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
         results.iter().any(|result| result["kind"] == "GrepLine"
             && result["file"]
                 .as_str()
-                .is_some_and(|file| file.ends_with("src/lib.rs"))
+                .is_some_and(|file| path_ends_with(file, "src/lib.rs"))
             && result["line_text"]
                 .as_str()
                 .is_some_and(|line| line.contains("needle_symbol"))),
