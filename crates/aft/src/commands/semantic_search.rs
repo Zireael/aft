@@ -70,7 +70,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             SemanticIndexStatus::Building { .. } => "building".to_string(),
             SemanticIndexStatus::Failed(_) => "failed".to_string(),
             SemanticIndexStatus::Partial { completeness, .. } => {
-                warnings.push(SearchWarning::PartialIndex { completeness: *completeness });
+                warnings.push(SearchWarning::PartialIndex {
+                    completeness: *completeness,
+                });
                 "partial".to_string()
             }
             SemanticIndexStatus::Ready => "ready".to_string(),
@@ -142,7 +144,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(query_vector) => query_vector,
         Err(error) => {
             if diagnostics_enabled {
-                warnings.push(SearchWarning::EmbeddingFailure { reason: error.clone() });
+                warnings.push(SearchWarning::EmbeddingFailure {
+                    reason: error.clone(),
+                });
             }
             return semantic_error_response(&req.id, &error);
         }
@@ -231,6 +235,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Record diagnostics if enabled.
     if diagnostics_enabled {
+        // Lazily init JSONL logger.
+        ctx.init_diagnostics_logger();
+
         let candidate_count = scores.len();
         let returned_count = results.len();
         let (score_min, score_median, score_p90, score_max) = score_statistics(&scores);
@@ -258,7 +265,14 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             prompt_active,
             warnings: warnings.clone(),
         };
-        ctx.semantic_search_metrics().borrow_mut().record(diag);
+        ctx.semantic_search_metrics()
+            .borrow_mut()
+            .record(diag.clone());
+
+        // Write to JSONL if logger is active.
+        if let Some(logger) = ctx.semantic_diagnostics_logger().borrow_mut().as_mut() {
+            logger.record(&diag, Some(&params.query), None);
+        }
     }
 
     Response::success(

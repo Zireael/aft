@@ -166,9 +166,9 @@ impl TypedVector {
                     let sv = StoredVector::DenseF32(v);
                     Ok(sv.l2_normalize())
                 }
-                StorageStrategy::BinaryPacked => Err(
-                    "DenseF32 vectors cannot be stored as BinaryPacked".to_string(),
-                ),
+                StorageStrategy::BinaryPacked => {
+                    Err("DenseF32 vectors cannot be stored as BinaryPacked".to_string())
+                }
             },
             Self::DenseInt8(v) => match strategy {
                 StorageStrategy::NativeF32 => {
@@ -179,15 +179,18 @@ impl TypedVector {
                     let f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
                     Ok(StoredVector::DenseF32(f32s).l2_normalize())
                 }
-                StorageStrategy::BinaryPacked => Err(
-                    "DenseInt8 vectors cannot be stored as BinaryPacked".to_string(),
-                ),
+                StorageStrategy::BinaryPacked => {
+                    Err("DenseInt8 vectors cannot be stored as BinaryPacked".to_string())
+                }
             },
             Self::BinaryPacked {
                 bytes,
                 logical_dims,
             } => match strategy {
-                StorageStrategy::BinaryPacked => Ok(StoredVector::BinaryPacked { bytes, logical_dims }),
+                StorageStrategy::BinaryPacked => Ok(StoredVector::BinaryPacked {
+                    bytes,
+                    logical_dims,
+                }),
                 _ => Err(format!(
                     "BinaryPacked vectors require StorageStrategy::BinaryPacked (got {:?})",
                     strategy
@@ -282,7 +285,10 @@ pub(crate) fn parse_embedding_value(
             let expected_dims = expected_dims.unwrap_or(s.len() * 8);
             let typed = TypedVector::decode_base64_binary(s, expected_dims)?;
             match typed {
-                TypedVector::BinaryPacked { bytes, logical_dims } => {
+                TypedVector::BinaryPacked {
+                    bytes,
+                    logical_dims,
+                } => {
                     // Convert packed bytes to f32 vec of 0.0/1.0, masking padding bits
                     let mut f32s = Vec::with_capacity(logical_dims);
                     for i in 0..logical_dims {
@@ -4956,9 +4962,7 @@ mod tests {
                         let headers = String::from_utf8_lossy(&buf[..pos + 4]);
                         for line in headers.lines() {
                             let lower = line.trim().to_lowercase();
-                            if let Some(value) = lower
-                                .strip_prefix("content-length:")
-                            {
+                            if let Some(value) = lower.strip_prefix("content-length:") {
                                 content_length = value.trim().parse::<usize>().unwrap_or(0);
                             }
                         }
@@ -5583,6 +5587,11 @@ mod tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5666,6 +5675,11 @@ mod tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5721,6 +5735,11 @@ mod tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6308,6 +6327,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6361,6 +6385,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6393,6 +6422,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6431,6 +6465,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6472,6 +6511,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6506,6 +6550,11 @@ mod fingerprint_invalidation_tests {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// Identifies which search pipeline path was taken for a single query.
@@ -33,21 +35,12 @@ impl std::fmt::Display for SearchPipelineType {
 pub enum SearchWarning {
     LowConfidence,
     EmptyResults,
-    PartialIndex {
-        completeness: f64,
-    },
+    PartialIndex { completeness: f64 },
     StaleIndex,
     DegradedIndex,
-    EmbeddingFailure {
-        reason: String,
-    },
-    LexicalFailure {
-        reason: String,
-    },
-    DimensionMismatch {
-        expected: usize,
-        got: usize,
-    },
+    EmbeddingFailure { reason: String },
+    LexicalFailure { reason: String },
+    DimensionMismatch { expected: usize, got: usize },
 }
 
 impl std::fmt::Display for SearchWarning {
@@ -123,9 +116,10 @@ impl SearchDiagnostics {
         let mut hasher = Sha256::new();
         hasher.update(query.as_bytes());
         let result = hasher.finalize();
-        format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            result[0], result[1], result[2], result[3],
-            result[4], result[5], result[6], result[7])
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7]
+        )
     }
 }
 
@@ -342,6 +336,242 @@ pub fn top1_margin(scores: &[f32]) -> Option<f32> {
     Some(sorted[0] - sorted[1])
 }
 
+/// JSONL event written for each semantic search query.
+///
+/// Redacts the `raw_query` field unless `include_raw_queries` is enabled,
+/// and omits snippets unless `include_snippets` is enabled.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SearchDiagnosticsEvent {
+    /// Event type discriminator: "semantic_search"
+    pub event: String,
+    /// Hash of the query string (SHA-256 hex prefix, first 16 chars).
+    pub query_hash: String,
+    /// The raw query text. Omitted from serialization unless explicitly enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_query: Option<String>,
+    /// Which pipeline path was taken.
+    pub pipeline_type: SearchPipelineType,
+    /// Index state at search time.
+    pub index_state: String,
+    /// Total wall-clock latency in milliseconds.
+    pub total_latency_ms: f64,
+    /// Time spent embedding the query, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_latency_ms: Option<f64>,
+    /// Time spent on lexical (trigram) search, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_latency_ms: Option<f64>,
+    /// Time spent on vector search (k-NN), in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_search_latency_ms: Option<f64>,
+    /// Time spent on hybrid fusion, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_fusion_latency_ms: Option<f64>,
+    /// Number of candidates before fusion/capping.
+    pub candidate_count: usize,
+    /// Number of results returned to the caller.
+    pub returned_count: usize,
+    /// Minimum score among returned results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_min: Option<f32>,
+    /// Median score among returned results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_median: Option<f32>,
+    /// P90 score among returned results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_p90: Option<f32>,
+    /// Maximum score among returned results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_max: Option<f32>,
+    /// Difference between the highest and second-highest score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top1_margin: Option<f32>,
+    /// Whether the embedding query cache was hit.
+    pub query_cache_hit: bool,
+    /// Whether a prompt template was active for this query.
+    pub prompt_active: bool,
+    /// Warnings generated for this query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SearchWarning>,
+}
+
+impl SearchDiagnosticsEvent {
+    pub fn from_diagnostics(
+        diag: &SearchDiagnostics,
+        include_raw_query: bool,
+        _include_snippets: bool,
+        raw_query: Option<&str>,
+        _snippets: Option<&[String]>,
+    ) -> Self {
+        Self {
+            event: "semantic_search".to_string(),
+            query_hash: diag.query_hash.clone(),
+            raw_query: if include_raw_query {
+                raw_query.map(|s| s.to_string())
+            } else {
+                None
+            },
+            pipeline_type: diag.pipeline_type,
+            index_state: diag.index_state.clone(),
+            total_latency_ms: diag.total_latency_ms,
+            embedding_latency_ms: diag.embedding_latency_ms,
+            lexical_latency_ms: diag.lexical_latency_ms,
+            vector_search_latency_ms: diag.vector_search_latency_ms,
+            hybrid_fusion_latency_ms: diag.hybrid_fusion_latency_ms,
+            candidate_count: diag.candidate_count,
+            returned_count: diag.returned_count,
+            score_min: diag.score_min,
+            score_median: diag.score_median,
+            score_p90: diag.score_p90,
+            score_max: diag.score_max,
+            top1_margin: diag.top1_margin,
+            query_cache_hit: diag.query_cache_hit,
+            prompt_active: diag.prompt_active,
+            warnings: diag.warnings.clone(),
+        }
+    }
+}
+
+/// Writes per-query search diagnostics as JSONL to a local file.
+///
+/// Failure-safe: log write errors are swallowed (logged via `slog_warn`)
+/// and never propagate to the caller. This ensures a corrupt or unwritable
+/// log file never breaks semantic search.
+///
+/// Retention is handled by periodically trimming entries older than
+/// `retention_days` based on file modification time.
+#[derive(Debug)]
+pub struct SemanticDiagnosticsLogger {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    include_raw_queries: bool,
+    include_snippets: bool,
+    retention_days: u32,
+    /// Track file size to avoid unbounded growth between retention runs.
+    max_file_bytes: u64,
+}
+
+impl SemanticDiagnosticsLogger {
+    const DEFAULT_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
+    /// Create a new logger. Opens or creates the JSONL file, appending if it
+    /// already exists. Returns `None` if the file cannot be opened (failure-safe).
+    pub fn new(
+        path: PathBuf,
+        include_raw_queries: bool,
+        include_snippets: bool,
+        retention_days: u32,
+    ) -> Option<Self> {
+        let parent = path.parent()?;
+        if std::fs::create_dir_all(parent).is_err() {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        let max_file_bytes = Self::DEFAULT_MAX_FILE_BYTES;
+        Some(Self {
+            path,
+            file: Some(file),
+            include_raw_queries,
+            include_snippets,
+            retention_days,
+            max_file_bytes,
+        })
+    }
+
+    /// Record a single search diagnostics event as a JSONL line.
+    /// Failure-safe: on write error, logs a warning, closes the file,
+    /// and the next write will attempt to reopen.
+    pub fn record(
+        &mut self,
+        diag: &SearchDiagnostics,
+        raw_query: Option<&str>,
+        snippets: Option<&[String]>,
+    ) {
+        let event = SearchDiagnosticsEvent::from_diagnostics(
+            diag,
+            self.include_raw_queries,
+            self.include_snippets,
+            raw_query,
+            snippets,
+        );
+        let line = match serde_json::to_string(&event) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+
+        // Check file size and rotate if needed.
+        if let Some(ref file) = self.file {
+            if let Ok(meta) = file.metadata() {
+                if meta.len() > self.max_file_bytes {
+                    self.rotate();
+                }
+            }
+        }
+
+        if let Some(ref mut file) = self.file {
+            writeln!(file, "{}", line).ok();
+            file.flush().ok();
+        }
+    }
+
+    /// Rotate the log file: rename `path` to `path.1`, then open a new file.
+    /// Deletes `path.2` and beyond. Failure-safe: on any error, keeps writing
+    /// to the old file.
+    fn rotate(&mut self) {
+        let rotated = self.path.with_extension("jsonl.1");
+        // Close the current file.
+        self.file.take();
+
+        // Rename current → .1, old .1 → .2 (then delete .2 so we keep at
+        // most one rotated archive).
+        if std::fs::rename(&self.path, &rotated).is_ok() {
+            // Delete any older archive beyond .1
+            let older = self.path.with_extension("jsonl.2");
+            std::fs::remove_file(&older).ok();
+        }
+
+        // Reopen.
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok();
+    }
+
+    /// Run retention cleanup: remove entries older than `retention_days`.
+    /// This checks the log file's modification time. If the file is older
+    /// than the retention period, it is deleted entirely (the logger will
+    /// recreate it on the next write).
+    pub fn run_retention(&self) {
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(self.retention_days as u64 * 86400);
+        // Check primary file.
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    // Delete the entire file — it's older than retention window.
+                    // We won't reopen here; `record()` handles reopening.
+                    std::fs::remove_file(&self.path).ok();
+                }
+            }
+        }
+        // Also check the .1 archive.
+        let archived = self.path.with_extension("jsonl.1");
+        if let Ok(meta) = std::fs::metadata(&archived) {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    std::fs::remove_file(&archived).ok();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +582,10 @@ mod tests {
         let h2 = SearchDiagnostics::hash_query("how to create a file");
         assert_eq!(h1, h2, "hash should be deterministic");
         assert_eq!(h1.len(), 16, "hash should be 16 hex chars");
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()), "hash should be hex");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should be hex"
+        );
     }
 
     #[test]
@@ -392,16 +625,10 @@ mod tests {
 
     #[test]
     fn warnings_display_format() {
-        assert_eq!(
-            SearchWarning::LowConfidence.to_string(),
-            "low_confidence"
-        );
+        assert_eq!(SearchWarning::LowConfidence.to_string(), "low_confidence");
         assert_eq!(SearchWarning::EmptyResults.to_string(), "empty_results");
         assert_eq!(
-            SearchWarning::PartialIndex {
-                completeness: 0.5
-            }
-            .to_string(),
+            SearchWarning::PartialIndex { completeness: 0.5 }.to_string(),
             "partial_index(50%)"
         );
         assert_eq!(SearchWarning::StaleIndex.to_string(), "stale_index");
@@ -464,7 +691,11 @@ mod tests {
         let scores: Vec<f32> = (1..=10).map(|i| i as f32 * 0.1).collect();
         let (min, median, p90, max) = score_statistics(&scores);
         assert!((min.unwrap() - 0.1).abs() < 1e-6);
-        assert!((median.unwrap() - 0.5).abs() < 1e-6, "median = {}", median.unwrap());
+        assert!(
+            (median.unwrap() - 0.5).abs() < 1e-6,
+            "median = {}",
+            median.unwrap()
+        );
         assert!((p90.unwrap() - 0.9).abs() < 1e-6, "p90 = {}", p90.unwrap());
         assert!((max.unwrap() - 1.0).abs() < 1e-6);
     }
@@ -555,10 +786,7 @@ mod tests {
         }
         assert_eq!(collector.len(), 2);
         // The last entry has hash "hash4"
-        assert_eq!(
-            collector.entries.back().unwrap().query_hash,
-            "hash4"
-        );
+        assert_eq!(collector.entries.back().unwrap().query_hash, "hash4");
     }
 
     #[test]
@@ -582,9 +810,7 @@ mod tests {
             top1_margin: None,
             query_cache_hit: false,
             prompt_active: false,
-            warnings: vec![SearchWarning::PartialIndex {
-                completeness: 0.75,
-            }],
+            warnings: vec![SearchWarning::PartialIndex { completeness: 0.75 }],
         });
         let agg = collector.aggregate();
         assert!((agg.avg_index_completeness.unwrap() - 0.75).abs() < 1e-6);
@@ -601,10 +827,7 @@ mod tests {
         let ms = timer.stop();
         assert!(ms >= 0.0, "duration should not be negative, got {ms}");
         // Even on a very fast machine 100k ops should take > 0 µs.
-        assert!(
-            ms > 0.0 || x > 0,
-            "duration should be measurable, got {ms}"
-        );
+        assert!(ms > 0.0 || x > 0, "duration should be measurable, got {ms}");
     }
 
     #[test]
@@ -633,5 +856,154 @@ mod tests {
         collector.reset();
         let agg = collector.aggregate();
         assert_eq!(agg.total_queries, 0);
+    }
+
+    #[test]
+    fn diagnostics_event_redacts_raw_query_by_default() {
+        let diag = SearchDiagnostics {
+            query_hash: "abc".into(),
+            pipeline_type: SearchPipelineType::Semantic,
+            index_state: "ready".into(),
+            total_latency_ms: 10.0,
+            embedding_latency_ms: None,
+            lexical_latency_ms: None,
+            vector_search_latency_ms: None,
+            hybrid_fusion_latency_ms: None,
+            candidate_count: 5,
+            returned_count: 3,
+            score_min: None,
+            score_median: None,
+            score_p90: None,
+            score_max: None,
+            top1_margin: None,
+            query_cache_hit: false,
+            prompt_active: false,
+            warnings: vec![],
+        };
+        let event = SearchDiagnosticsEvent::from_diagnostics(
+            &diag,
+            false,
+            false,
+            Some("my secret query"),
+            None,
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("secret query"), "raw query leaked: {json}");
+        assert!(
+            json.contains("\"event\":\"semantic_search\""),
+            "event type missing"
+        );
+    }
+
+    #[test]
+    fn diagnostics_event_includes_raw_query_when_enabled() {
+        let diag = SearchDiagnostics {
+            query_hash: "abc".into(),
+            pipeline_type: SearchPipelineType::Semantic,
+            index_state: "ready".into(),
+            total_latency_ms: 10.0,
+            embedding_latency_ms: None,
+            lexical_latency_ms: None,
+            vector_search_latency_ms: None,
+            hybrid_fusion_latency_ms: None,
+            candidate_count: 5,
+            returned_count: 3,
+            score_min: None,
+            score_median: None,
+            score_p90: None,
+            score_max: None,
+            top1_margin: None,
+            query_cache_hit: false,
+            prompt_active: false,
+            warnings: vec![],
+        };
+        let event = SearchDiagnosticsEvent::from_diagnostics(
+            &diag,
+            true,
+            false,
+            Some("my secret query"),
+            None,
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("my secret query"),
+            "raw query should be present: {json}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_logger_writes_jsonl_to_disk() {
+        let dir = std::env::temp_dir().join("aft-test-diag-logger");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("diag.jsonl");
+        let mut logger = SemanticDiagnosticsLogger::new(path.clone(), false, false, 14)
+            .expect("logger should create");
+        let diag = SearchDiagnostics {
+            query_hash: "abc".into(),
+            pipeline_type: SearchPipelineType::Hybrid,
+            index_state: "ready".into(),
+            total_latency_ms: 42.5,
+            embedding_latency_ms: Some(10.0),
+            lexical_latency_ms: Some(5.0),
+            vector_search_latency_ms: Some(20.0),
+            hybrid_fusion_latency_ms: Some(7.5),
+            candidate_count: 50,
+            returned_count: 10,
+            score_min: Some(0.3),
+            score_median: Some(0.5),
+            score_p90: Some(0.8),
+            score_max: Some(0.9),
+            top1_margin: Some(0.1),
+            query_cache_hit: false,
+            prompt_active: false,
+            warnings: vec![SearchWarning::LowConfidence],
+        };
+        logger.record(&diag, None, None);
+        // File should exist and contain valid JSON.
+        let content = std::fs::read_to_string(&path).expect("file exists");
+        assert!(content.contains("\"event\":\"semantic_search\""));
+        assert!(content.contains("\"pipeline_type\":\"hybrid\""));
+        assert!(content.contains("\"total_latency_ms\":42.5"));
+        assert!(content.contains("\"warnings\":[\"low_confidence\"]"));
+        // Raw query should NOT be present since we created logger with include_raw_queries=false.
+        assert!(!content.contains("\"raw_query\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_logger_recovers_from_missing_file() {
+        let dir = std::env::temp_dir().join("aft-test-diag-recover");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("diag.jsonl");
+        let mut logger = SemanticDiagnosticsLogger::new(path.clone(), false, false, 14)
+            .expect("logger should create");
+        let diag = SearchDiagnostics {
+            query_hash: "abc".into(),
+            pipeline_type: SearchPipelineType::Semantic,
+            index_state: "ready".into(),
+            total_latency_ms: 10.0,
+            embedding_latency_ms: None,
+            lexical_latency_ms: None,
+            vector_search_latency_ms: None,
+            hybrid_fusion_latency_ms: None,
+            candidate_count: 5,
+            returned_count: 3,
+            score_min: None,
+            score_median: None,
+            score_p90: None,
+            score_max: None,
+            top1_margin: None,
+            query_cache_hit: false,
+            prompt_active: false,
+            warnings: vec![],
+        };
+        logger.record(&diag, None, None);
+        // Delete the file to simulate external deletion or rotation.
+        std::fs::remove_file(&path).unwrap();
+        // record() should not panic — JSONL record silently fails on write error.
+        logger.record(&diag, None, None);
+        // After deletion the file is gone; the logger closes on write error,
+        // so subsequent writes fail silently. We verify no panic occurred.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

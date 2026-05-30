@@ -195,10 +195,31 @@ pub struct SemanticBackendConfig {
     /// Number of recent queries to retain for aggregate metrics (default: 100).
     #[serde(default = "default_metrics_window_size")]
     pub metrics_window_size: usize,
+    /// Write per-query diagnostics as JSONL to a local file (default: false).
+    #[serde(default)]
+    pub jsonl_logging: bool,
+    /// Override path for the JSONL diagnostics log.
+    /// Defaults to `<AFT_CACHE_DIR>/semantic_diagnostics.jsonl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonl_path: Option<PathBuf>,
+    /// Include the raw query text in JSONL diagnostics (default: false).
+    /// When false, only the query hash is recorded.
+    #[serde(default)]
+    pub include_raw_queries: bool,
+    /// Include code snippets in JSONL diagnostics (default: false).
+    #[serde(default)]
+    pub include_snippets: bool,
+    /// Number of days to retain JSONL diagnostics before cleanup (default: 14).
+    #[serde(default = "default_jsonl_retention_days")]
+    pub retention_days: u32,
 }
 
 fn default_low_confidence_threshold() -> f32 {
     0.3
+}
+
+fn default_jsonl_retention_days() -> u32 {
+    14
 }
 
 fn default_metrics_window_size() -> usize {
@@ -206,8 +227,9 @@ fn default_metrics_window_size() -> usize {
 }
 
 impl SemanticBackendConfig {
+    /// Returns true if either in-memory metrics or JSONL logging is enabled.
     pub fn diagnostics_enabled(&self) -> bool {
-        self.diagnostics_enabled
+        self.diagnostics_enabled || self.jsonl_logging
     }
 
     pub fn low_confidence_threshold(&self) -> f32 {
@@ -216,6 +238,26 @@ impl SemanticBackendConfig {
 
     pub fn metrics_window_size(&self) -> usize {
         self.metrics_window_size
+    }
+
+    pub fn jsonl_logging(&self) -> bool {
+        self.jsonl_logging
+    }
+
+    pub fn jsonl_path(&self) -> Option<&std::path::Path> {
+        self.jsonl_path.as_deref()
+    }
+
+    pub fn include_raw_queries(&self) -> bool {
+        self.include_raw_queries
+    }
+
+    pub fn include_snippets(&self) -> bool {
+        self.include_snippets
+    }
+
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days
     }
 }
 
@@ -376,6 +418,11 @@ impl Default for SemanticBackendConfig {
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
         }
     }
 }
