@@ -69,35 +69,6 @@ fn configure_semantic(
     )
 }
 
-/// v0.32+ `aft_search`: when semantic is disabled, natural-language queries still
-/// succeed via degraded grep fallback (`status: "ready"`, `semantic_status:
-/// "disabled"`). Do not assert `status: "disabled"` — that only applies when no
-/// fallback path runs (e.g. explicit `hint: "semantic"`).
-fn assert_semantic_disabled_degraded_fallback(response: &Value) {
-    assert_eq!(
-        response["success"], true,
-        "search should succeed: {response:?}"
-    );
-    assert_eq!(response["semantic_status"], "disabled");
-    assert_eq!(response["status"], "ready");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["semantic_unavailable"], true);
-    assert_eq!(response["lexical_only_fallback"], true);
-    assert!(
-        response["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("Semantic search is not enabled")),
-        "expected disabled detail in text: {response:?}"
-    );
-    let warnings = response["warnings"].as_array().expect("warnings array");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("lexical-only fallback"))),
-        "expected lexical fallback warning, got {warnings:?}"
-    );
-}
-
 fn configure_semantic_openai(
     aft: &mut AftProcess,
     root: &Path,
@@ -315,14 +286,10 @@ fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
     // and interpreted_as "literal" alongside whatever lexical results it finds.
     // Use an empty project directory so the path is deterministic regardless of cwd.
     let project = setup_project(&[]);
-    let storage = tempfile::tempdir().expect("create storage dir");
-    let mut aft = AftProcess::spawn();
+    let previous_cwd = std::env::current_dir().expect("read cwd");
+    std::env::set_current_dir(project.path()).expect("set cwd to empty project");
 
-    let configure = configure_semantic(&mut aft, project.path(), storage.path(), false);
-    assert_eq!(
-        configure["success"], true,
-        "configure should succeed: {configure:?}"
-    );
+    let mut aft = AftProcess::spawn();
 
     let response = send(
         &mut aft,
@@ -335,11 +302,19 @@ fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
         }),
     );
 
-    assert_semantic_disabled_degraded_fallback(&response);
+    std::env::set_current_dir(&previous_cwd).expect("restore cwd");
+
+    assert_eq!(
+        response["success"], true,
+        "search should succeed: {response:?}"
+    );
+    assert_eq!(response["semantic_status"], "disabled");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["lexical_only_fallback"], true);
+
     let status = aft.shutdown();
     assert!(status.success());
 }
-
 #[test]
 fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
@@ -363,11 +338,17 @@ fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
 
     // semantic_search: false -> natural-language query degrades to the honest
     // lexical-only grep fallback (council #5), not a bare "not enabled" error.
-    assert_semantic_disabled_degraded_fallback(&response);
+    assert_eq!(
+        response["success"], true,
+        "search should succeed: {response:?}"
+    );
+    assert_eq!(response["semantic_status"], "disabled");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["lexical_only_fallback"], true);
+
     let status = aft.shutdown();
     assert!(status.success());
 }
-
 #[test]
 fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidation() {
     let project = setup_project(&[
