@@ -6,7 +6,7 @@
 
 **Key Characteristics:**
 - Use `packages/opencode-plugin/src/index.ts` to register OpenCode tools and map them onto Rust commands.
-- Use `packages/opencode-plugin/src/bridge.ts` and `packages/opencode-plugin/src/pool.ts` to isolate one `aft` process per session.
+- Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` to isolate one `aft` process per session. Both harness adapters (OpenCode, Pi) import these shared primitives from `@cortexkit/aft-bridge`.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular.
 - Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
@@ -16,21 +16,21 @@
 - Purpose: Register tools, load config, and attach post-execution metadata.
 - Location: `packages/opencode-plugin/src/index.ts`
 - Contains: Plugin bootstrap, tool-surface selection, hoisting logic, disabled-tool filtering
-- Depends on: `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/src/tools/*.ts`, `packages/opencode-plugin/src/pool.ts`
+- Depends on: `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/src/tools/*.ts`, `packages/aft-bridge/src/pool.ts`
 - Used by: OpenCode plugin loading through `@cortexkit/aft-opencode`
 
 **Plugin transport layer:**
 - Purpose: Resolve or download the binary, start worker processes, and forward requests.
-- Location: `packages/opencode-plugin/src/bridge.ts`, `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/resolver.ts`, `packages/opencode-plugin/src/downloader.ts`
-- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery, binary download
-- Depends on: Node child-process APIs, GitHub releases, `packages/opencode-plugin/src/logger.ts`
-- Used by: `packages/opencode-plugin/src/tools/*.ts` and `packages/opencode-plugin/src/index.ts`
+- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`
+- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery and download, ONNX runtime helpers, URL fetch
+- Depends on: Node child-process APIs, GitHub releases, per-host logger adapters (via `setActiveLogger`)
+- Used by: `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` (both import from `@cortexkit/aft-bridge`)
 
 **Tool definition layer:**
 - Purpose: Convert OpenCode tool arguments into protocol requests and permission checks.
 - Location: `packages/opencode-plugin/src/tools/`
 - Contains: Hoisted tools, reading tools, import tools, transform tools, navigation tools, refactoring tools, safety tools, conflict tools, permissions helpers
-- Depends on: `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/metadata-store.ts`, `packages/opencode-plugin/src/lsp.ts`
+- Depends on: `packages/aft-bridge/src/pool.ts`, `packages/opencode-plugin/src/metadata-store.ts`, `packages/opencode-plugin/src/lsp.ts`
 - Used by: `packages/opencode-plugin/src/index.ts`
 
 **Protocol and command layer:**
@@ -38,11 +38,11 @@
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
 - Contains: Request dispatch, response encoding, command handlers for read/edit/refactor/LSP/conflicts
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`
-- Used by: `packages/opencode-plugin/src/bridge.ts`
+- Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
 - Purpose: Parse code, compute call graphs, apply edits, format files, and manage imports.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports.rs`, `crates/aft/src/extract.rs`
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports.rs`, `crates/aft/src/extract.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/semantic_index.rs`
 - Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, refactor helpers
 - Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes
 - Used by: `crates/aft/src/commands/*.rs`
@@ -59,7 +59,7 @@
 **Tool invocation flow:**
 
 1. Register tool definitions and config-driven surface selection — `packages/opencode-plugin/src/index.ts`
-2. Get a session bridge and send a command over NDJSON — `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/bridge.ts`
+2. Get a session bridge and send a command over NDJSON — `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
 3. Dispatch the request to a Rust handler and return structured JSON — `crates/aft/src/main.rs`, `crates/aft/src/commands/mod.rs`
 
 **Edit pipeline:**
@@ -76,20 +76,20 @@
 
 **Binary resolution flow:**
 
-1. Check cache, npm platform package, PATH, and cargo install locations — `packages/opencode-plugin/src/resolver.ts`
-2. Download and checksum-verify a release asset when local resolution fails — `packages/opencode-plugin/src/downloader.ts`
-3. Start bridges against the resolved binary and hot-swap after version mismatch — `packages/opencode-plugin/src/bridge.ts`, `packages/opencode-plugin/src/pool.ts`
+1. Check cache, npm platform package, PATH, and cargo install locations — `packages/aft-bridge/src/resolver.ts`
+2. Download and checksum-verify a release asset when local resolution fails — `packages/aft-bridge/src/downloader.ts`
+3. Start bridges against the resolved binary and hot-swap after version mismatch — `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`
 
 ## Key Abstractions
 
 **BinaryBridge:**
 - Purpose: Keep one live `aft` subprocess available for request/response traffic.
-- Location: `packages/opencode-plugin/src/bridge.ts`
+- Location: `packages/aft-bridge/src/bridge.ts`
 - Pattern: Persistent child-process adapter with timeout-triggered restart
 
 **BridgePool:**
 - Purpose: Scope bridges per OpenCode session and preserve isolated undo history.
-- Location: `packages/opencode-plugin/src/pool.ts`
+- Location: `packages/aft-bridge/src/pool.ts`
 - Pattern: Session-keyed object pool with LRU eviction
 
 **Tool groups:**
@@ -101,6 +101,12 @@
 - Purpose: Centralize runtime state for commands inside the Rust worker.
 - Location: `crates/aft/src/context.rs`
 - Pattern: Interior-mutable service container for a single-threaded request loop
+
+**VectorStore (trait):**
+- Purpose: Decouple vector storage and similarity search from the semantic index lifecycle.
+- Location: `crates/aft/src/vector_store.rs`
+- Pattern: Trait with two built-in implementations — `FlatF32VectorStore` (f32 cosine similarity, same as original in-memory store) and `FlatBinaryHammingVectorStore` (packed binary Hamming search for quantized vectors).
+- Used by: `crates/aft/src/semantic_index.rs`
 
 **CallGraph:**
 - Purpose: Cache per-file call data and answer callers, call-tree, impact, and trace queries.
@@ -116,7 +122,7 @@
 
 **Rust protocol entry point:**
 - Location: `crates/aft/src/main.rs`
-- Triggers: `packages/opencode-plugin/src/bridge.ts` spawns the `aft` binary
+- Triggers: `packages/aft-bridge/src/bridge.ts` spawns the `aft` binary
 - Responsibilities: Read NDJSON requests from stdin, dispatch handlers, drain watcher and LSP events, and write JSON responses
 
 **Release automation entry point:**
@@ -126,7 +132,7 @@
 
 ## Error Handling
 
-**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/opencode-plugin/src/bridge.ts`.
+**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/aft-bridge/src/bridge.ts`.
 
 ## Honest Reporting Convention
 
@@ -159,14 +165,15 @@
 
 **Goal:** reduce hoisted-bash output to fewer tokens while keeping the information the agent actually needs (errors, summaries, ref updates) and discarding the noise (progress bars, repeated headers, deep nested directory listings).
 
-**Three-tier dispatch in `crates/aft/src/compress/mod.rs`:**
+**Four-tier dispatch in `crates/aft/src/compress/mod.rs`:**
 
-1. **Rust [`Compressor`] modules** — stateful, hand-written parsers for high-traffic tools where heuristics like JSON parsing or section detection are required. Always wins when matched. Each module lives in its own file under `crates/aft/src/compress/` (e.g. `git.rs`, `cargo.rs`, `eslint.rs`) and implements the `Compressor` trait (`fn matches(&str) -> bool` + `fn compress(&str, &str) -> String`).
-2. **Declarative TOML filters** — strip + truncate + cap + shortcircuit rules for the long tail of CLI tools, loaded from three sources at startup with project > user > builtin priority by filename:
-    - **Builtin**: shipped via `include_str!()` from `crates/aft/src/compress/builtin_filters/*.toml`, registered in `crates/aft/src/compress/builtin_filters.rs::ALL`
+1. **Specific Rust [`Compressor`] modules** — hand-written parsers for specific tools identified by tool token. Wins before broad package-manager modules. Each module lives in its own file under `crates/aft/src/compress/` and implements the `Compressor` trait (`fn matches(&str) -> bool` + `fn compress(&str, &str) -> String`). Current modules: `git.rs`, `cargo.rs`, `eslint.rs`, `biome.rs`, `tsc.rs`, `pytest.rs`, `vitest.rs`, `playwright.rs`, `mypy.rs`, `prettier.rs`, `ruff.rs`, `go.rs`, `next.rs`.
+2. **Package-manager [`Compressor`] modules** — broad head-token matchers (`npm.rs`, `pnpm.rs`, `bun.rs`) that compress unclaimed package-manager output.
+3. **Declarative TOML filters** — strip + truncate + cap + shortcircuit rules for the long tail of CLI tools, loaded from three sources at startup with project > user > builtin priority by filename:
+    - **Builtin**: 22 filters shipped via `include_str!()` from `crates/aft/src/compress/builtin_filters/*.toml`, registered in `crates/aft/src/compress/builtin_filters.rs::ALL`
     - **User**: `<storage_dir>/filters/*.toml` (XDG-aware via the active `storage_dir`)
     - **Project**: `<project_root>/.aft/filters/*.toml` — gated by [`crate::compress::trust`]; never loaded for an untrusted project
-3. **Generic fallback** — ANSI strip + consecutive-line dedup + middle-truncate. Always applies when no Rust module or TOML filter matches.
+4. **Generic fallback** — ANSI strip + consecutive-line dedup + middle-truncate. Always applies when no Rust module or TOML filter matches.
 
 **Pipeline for TOML filters** (in `crates/aft/src/compress/toml_filter.rs::apply_filter`):
 
@@ -188,6 +195,6 @@
 
 **Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.
 
-**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/opencode-plugin/src/downloader.ts`, cache session bridges in `packages/opencode-plugin/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, and cache call-graph state in `crates/aft/src/callgraph.rs`.
+**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, and cache call-graph state in `crates/aft/src/callgraph.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/opencode-plugin/src/downloader.ts`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`.

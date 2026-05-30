@@ -25,6 +25,7 @@ version = "0.29.1"
 dependencies = [
  "aft-tokenizer",
  "ast-grep-core",
+ "base64 0.22.1",
  "blake3",
  "content_inspector",
  "crc32fast",

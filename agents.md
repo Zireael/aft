@@ -1,2 +1,2 @@
 This environment does not have compiling environment set up to run cargo or clippy.
-For compiling, linting and testing use script `"D:/Coding/_tools/aft-src/scripts/docker-rust.ps1"`
+For compiling, linting and testing use script bash `cd "D:/Coding/_tools/aft-src" && bash scripts/zir-aft-check.sh quick --keep-going`, which spawns tests in Docker container.
