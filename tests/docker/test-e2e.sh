@@ -192,7 +192,7 @@ stop_aimock() {
 run_opencode_session() {
     local prompt="$1"
     local result_file="$2"
-    local timeout_secs="${3:-30}"
+    local timeout_secs="${3:-60}"
 
     set +e
     # OPENAI_API_KEY required for OpenCode's openai adapter to make requests.
@@ -278,9 +278,23 @@ check "no crash" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 
 # through the bridge and return a usable result. This is the positive signal
 # that replaces "session completed on timeout" false greens.
 TURNS_SERVED=$(wc -l < "$TURN_LOG" 2>/dev/null | tr -d ' ')
-echo "  Turns served by mock: ${TURNS_SERVED:-0} ($(tr '\n' ' ' < "$TURN_LOG" 2>/dev/null))"
-check "agent loop progressed (>=3 turns served)" "[ \"${TURNS_SERVED:-0}\" -ge 3 ]"
-check "first tool turn served (outline)" "grep -q 'turn-1-outline' '$TURN_LOG' 2>/dev/null"
+TURN_LABELS=$(tr '\n' ' ' < "$TURN_LOG" 2>/dev/null)
+echo "  Turns served by mock: ${TURNS_SERVED:-0} (${TURN_LABELS})"
+check "agent loop completed all 8 scripted turns" "[ \"${TURNS_SERVED:-0}\" -eq 8 ]"
+for turn_label in \
+    turn-1-outline \
+    turn-2-read \
+    turn-3-grep \
+    turn-4-glob \
+    turn-5-aft_search \
+    turn-6-edit \
+    turn-7-undo \
+    turn-8-final
+do
+    check "scripted tool turn served (${turn_label})" "grep -qx '$turn_label' '$TURN_LOG' 2>/dev/null"
+done
+check "unexpected mock fallback not used" "! grep -q 'unexpected-fallback' '$TURN_LOG' 2>/dev/null && ! grep -q 'UNEXPECTED_TURN_FALLBACK' '$RESULT_FILE' '$AIMOCK_LOG' 2>/dev/null"
+check "edit was undone (main.py restored)" "grep -q 'print(greet(\"world\"))' src/main.py && ! grep -q 'print(greet(\"docker\"))' src/main.py"
 
 # Plugin startup
 check "plugin loaded" "grep -q 'Resolved binary\|Copied npm binary' '$PLUGIN_LOG' 2>/dev/null"

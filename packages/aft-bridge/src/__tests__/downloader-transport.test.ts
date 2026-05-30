@@ -17,8 +17,14 @@ import { join } from "node:path";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
-const skipShellFixture =
-  (process.platform === "linux" && process.env.CI === "true") || process.platform === "win32";
+const shellFixtureSkipReason =
+  process.platform === "win32" ? "POSIX shell fixture is unavailable on Windows" : "";
+
+function shellFixtureAvailable(): boolean {
+  if (!shellFixtureSkipReason) return true;
+  if (process.env.CI === "true") throw new Error(shellFixtureSkipReason);
+  return false;
+}
 
 describe("downloadBinary hardened transport", () => {
   let tmpDir: string;
@@ -51,7 +57,7 @@ describe("downloadBinary hardened transport", () => {
   }
 
   test("dedupes concurrent same-version downloads and writes one final binary", async () => {
-    if (skipShellFixture) return;
+    if (!shellFixtureAvailable()) return;
     const { downloadBinary, getBinaryName } = await import(
       `../downloader.js?transport-dedupe-${Date.now()}`
     );
@@ -85,7 +91,7 @@ describe("downloadBinary hardened transport", () => {
   });
 
   test("ensureBinary redownloads mismatched versioned cache entries", async () => {
-    if (skipShellFixture) return;
+    if (!shellFixtureAvailable()) return;
 
     const { ensureBinary, getBinaryName, readBinaryVersion } = await import(
       `../downloader.js?ensure-cache-validate-${Date.now()}`

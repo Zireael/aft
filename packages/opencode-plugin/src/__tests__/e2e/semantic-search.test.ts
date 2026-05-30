@@ -17,6 +17,7 @@ import {
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
+const isCI = process.env.CI === "true";
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
 function createMockClient(): any {
@@ -131,8 +132,6 @@ maybeDescribe("e2e semantic search tool", () => {
     expect(typeof output).toBe("string");
     expect(output.length).toBeGreaterThan(0);
 
-    // In CI without ONNX Runtime, various non-ready responses are valid.
-    // Only assert structure when the index is actually ready.
     const isBuilding =
       output.includes("building") || output.includes("not ready") || output.includes("not_ready");
     const isUnavailable =
@@ -141,14 +140,23 @@ maybeDescribe("e2e semantic search tool", () => {
       output.includes("not found") ||
       output.includes("not enabled");
     const isDisabled = output.includes("disabled") || output.includes("not enabled");
-    if (isBuilding || isUnavailable || isDisabled) {
-      // Any non-ready state is acceptable in test environments
-      expect(output.length).toBeGreaterThan(0);
-    } else {
+
+    if (isCI) {
+      expect(isBuilding || isUnavailable || isDisabled).toBe(false);
       expect(output).toContain("Found ");
       expect(output).toContain("[index: ready]");
       expect(output).toContain("src/");
+      return;
     }
+
+    if (isBuilding || isUnavailable || isDisabled) {
+      expect(output.length).toBeGreaterThan(0);
+      return;
+    }
+
+    expect(output).toContain("Found ");
+    expect(output).toContain("[index: ready]");
+    expect(output).toContain("src/");
   });
 });
 

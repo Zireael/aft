@@ -40,8 +40,16 @@ import { registerSemanticTool } from "../../tools/semantic.js";
 import { registerStructureTool } from "../../tools/structure.js";
 import type { PluginContext } from "../../types.js";
 
-const TARGET_DEBUG_BINARY = resolve(import.meta.dir, "../../../../../target/debug/aft");
-const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin/aft");
+// Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
+// platform-correct name so CI's fail-loud "binary must be present" guard does
+// not trip on a name mismatch (Windows previously silent-skipped into a false
+// green before the guard landed).
+const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
+const TARGET_DEBUG_BINARY = resolve(
+  import.meta.dir,
+  `../../../../../target/debug/${AFT_BINARY_NAME}`,
+);
+const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;

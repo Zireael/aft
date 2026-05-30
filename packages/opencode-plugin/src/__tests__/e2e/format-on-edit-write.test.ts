@@ -2,7 +2,7 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { aftPrefixedTools, hoistedTools } from "../../tools/hoisted.js";
@@ -27,6 +27,7 @@ import {
 import { type E2EHarness, type PreparedBinary, prepareBinary } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
+const isCI = process.env.CI === "true";
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
 const BIOME_TS_EXPECTED = `export function foo(a: number, b: number) {
@@ -92,17 +93,22 @@ function createSdkContext(directory: string): ToolContext {
   };
 }
 
-async function commandAvailable(command: string): Promise<boolean> {
+async function commandPath(command: string): Promise<string | null> {
   const paths = (process.env.PATH ?? "").split(":").filter(Boolean);
   for (const dir of paths) {
+    const candidate = join(dir, command);
     try {
-      await access(join(dir, command));
-      return true;
+      await access(candidate);
+      return candidate;
     } catch {
       // keep searching
     }
   }
-  return false;
+  return null;
+}
+
+async function commandAvailable(command: string): Promise<boolean> {
+  return (await commandPath(command)) !== null;
 }
 
 async function ruffCanFormat(): Promise<boolean> {
@@ -121,7 +127,8 @@ async function ruffCanFormat(): Promise<boolean> {
   return major > 0 || minor > 1 || (minor === 1 && patch >= 2);
 }
 
-const gofmtAvailable = await commandAvailable("gofmt");
+const gofmtPath = await commandPath("gofmt");
+const gofmtAvailable = gofmtPath !== null;
 const ruffFormatAvailable = await ruffCanFormat();
 
 function formatterPreset(tool: string): FormatPreset {
@@ -251,21 +258,22 @@ maybeDescribe("e2e format_on_edit write tools", () => {
     expectWriteOutcome(output, data, true);
   }, 30_000);
 
-  test.skipIf(!gofmtAvailable)(
-    "gofmt formats deformatted Go (skipped: gofmt not available)",
+  (isCI ? test : test.skipIf(!gofmtAvailable))(
+    "gofmt formats deformatted Go (skipped outside CI: gofmt not available)",
     async () => {
+      expect(gofmtPath).not.toBeNull();
       const h = await formatHarness(GOFMT_PRESET);
+      if (gofmtPath) {
+        const binDir = h.path("node_modules", ".bin");
+        await mkdir(binDir, { recursive: true });
+        await symlink(gofmtPath, h.path("node_modules", ".bin", "gofmt")).catch(() => {});
+      }
       const filePath = h.path("main.go");
 
       const { output, data } = await executeHoistedWrite(h, filePath, FIXTURES.go_deformatted);
 
-      if (data.format_skipped_reason === "formatter_not_installed") {
-        expect(await readFile(filePath, "utf8")).toBe(FIXTURES.go_deformatted);
-        expectWriteOutcome(output, data, false, "formatter_not_installed");
-      } else {
-        expect(await readFile(filePath, "utf8")).toBe(GOFMT_EXPECTED);
-        expectWriteOutcome(output, data, true);
-      }
+      expect(await readFile(filePath, "utf8")).toBe(GOFMT_EXPECTED);
+      expectWriteOutcome(output, data, true);
     },
   );
 

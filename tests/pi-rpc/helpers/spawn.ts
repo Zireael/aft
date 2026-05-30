@@ -29,7 +29,7 @@ function resolvePiPackageJson(): string {
     return require_.resolve("@earendil-works/pi-coding-agent/package.json");
   } catch {
     const bunModules = join(REPO_ROOT, "node_modules/.bun");
-    const prefix = "@mariozechner+pi-coding-agent@";
+    const prefix = "@earendil-works+pi-coding-agent@";
     const candidates = readdirSync(bunModules, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
       .map((entry) => {

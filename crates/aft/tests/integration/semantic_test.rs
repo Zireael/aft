@@ -308,7 +308,12 @@ fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {
 }
 
 #[test]
-fn semantic_search_returns_not_ready_without_an_index() {
+fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
+    // When semantic search is disabled, a natural-language query degrades to a
+    // lexical grep fallback (council #5 design) so the agent is not stranded with
+    // zero results. The fallback is honest: it reports semantic_status "disabled"
+    // and interpreted_as "literal" alongside whatever lexical results it finds.
+    // Use an empty project directory so the path is deterministic regardless of cwd.
     let project = setup_project(&[]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let mut aft = AftProcess::spawn();
@@ -322,20 +327,21 @@ fn semantic_search_returns_not_ready_without_an_index() {
     let response = send(
         &mut aft,
         json!({
-            "id": "semantic-not-ready",
+            "id": "semantic-disabled-fallback",
             "command": "semantic_search",
+            // Natural-language phrasing routes to the degraded lexical fallback
+            // when semantic is disabled.
             "query": "how does request handling work",
         }),
     );
 
     assert_semantic_disabled_degraded_fallback(&response);
-
     let status = aft.shutdown();
     assert!(status.success());
 }
 
 #[test]
-fn semantic_search_returns_disabled_when_feature_is_off() {
+fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let mut aft = AftProcess::spawn();
@@ -355,8 +361,9 @@ fn semantic_search_returns_disabled_when_feature_is_off() {
         }),
     );
 
+    // semantic_search: false -> natural-language query degrades to the honest
+    // lexical-only grep fallback (council #5), not a bare "not enabled" error.
     assert_semantic_disabled_degraded_fallback(&response);
-
     let status = aft.shutdown();
     assert!(status.success());
 }

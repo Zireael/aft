@@ -35,13 +35,16 @@ type GlobCase = {
 };
 
 const initialBinary = await prepareBinary();
+const isCI = process.env.CI === "true";
 const ripgrepAvailable = hasCommand("rg", ["--version"]);
 
 if (!ripgrepAvailable) {
   console.warn("Skipping e2e search parity tests: ripgrep (rg) is not installed.");
 }
 
-const maybeDescribe = describe.skipIf(!initialBinary.binaryPath || !ripgrepAvailable);
+const maybeDescribe = isCI
+  ? describe.skipIf(!initialBinary.binaryPath)
+  : describe.skipIf(!initialBinary.binaryPath || !ripgrepAvailable);
 
 const grepCases: GrepCase[] = [
   {

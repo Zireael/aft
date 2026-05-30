@@ -131,8 +131,8 @@ async function main() {
           name: "edit",
           arguments: JSON.stringify({
             filePath: "src/main.py",
-            oldString: 'name = "World"',
-            newString: 'name = "Docker"',
+            oldString: 'print(greet("world"))',
+            newString: 'print(greet("docker"))',
           }),
         },
       ],
@@ -164,10 +164,11 @@ async function main() {
     { streamingProfile: { ttft: 500, tps: 50 } }
   );
 
-  // Fallback for any unexpected turns
-  mock.onMessage(".*", {
-    content: "Task complete.",
-  });
+  // Fallback for any unexpected turns. Keep the marker distinct so the
+  // harness can fail loudly instead of treating an un-scripted turn as success.
+  mock.onMessage(".*", served("unexpected-fallback", {
+    content: "UNEXPECTED_TURN_FALLBACK",
+  }));
 
   await mock.start();
   console.log(`[aimock] listening on ${mock.url}`);

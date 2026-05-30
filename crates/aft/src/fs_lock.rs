@@ -1022,11 +1022,17 @@ mod tests {
         // Restore valid owner metadata with a clearly-stale heartbeat sentinel.
         // Ownership fields must match `owner` exactly so heartbeat_once passes
         // its ownership check and writes a fresh timestamp.
+        //
+        // Use the atomic temp-write+rename path rather than remove-then-recreate:
+        // a remove followed by a separate create leaves a window where the file
+        // does not exist, and a heartbeat poll landing in that window reads
+        // NotFound -> LockGone (terminal) and kills the thread, failing this test
+        // spuriously under runner load (observed on macOS CI). The atomic replace
+        // overwrites the corrupt file in place with no no-file window on Unix.
         let sentinel = now_ms().saturating_sub(1_000_000);
         let mut restored = owner.clone();
         restored.heartbeat_at_ms = sentinel;
-        let _ = remove_lock_file(&path);
-        write_synthetic_lock(&path, &restored);
+        atomic_write_lock_metadata(&path, &restored).expect("atomically restore lock metadata");
 
         // If the heartbeat thread is still alive (the fix), it will overwrite
         // heartbeat_at_ms with a current value. Poll for that recovery.

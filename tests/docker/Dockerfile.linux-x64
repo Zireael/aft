@@ -59,7 +59,7 @@ RUN mkdir -p /root/.config/opencode
 # OpenCode global config — AFT plugin + aimock provider
 RUN echo '{ \
   "$schema": "https://opencode.ai/config.json", \
-  "plugin": ["@cortexkit/aft-opencode@latest"], \
+  "plugin": ["@cortexkit/aft-opencode"], \
   "provider": { \
     "mock": { \
       "api": "openai", \
@@ -83,13 +83,20 @@ RUN echo '{ \
 # TUI config
 RUN echo '{ \
   "$schema": "https://opencode.ai/tui.json", \
-  "plugin": ["@cortexkit/aft-opencode@latest"] \
+  "plugin": ["@cortexkit/aft-opencode"] \
 }' > /root/.config/opencode/tui.json
 
-# Pre-install the AFT plugin + platform binary
+# Pre-install the locally packed AFT plugin + bridge so package metadata and
+# dependency resolution come from the code under test, not npm @latest. The
+# Linux platform package is still installed from npm for its package wrapper;
+# the executable payload is overwritten by the locally built fixture below.
+COPY tests/docker/fixtures/npm-packs/*.tgz /tmp/aft-local-packs/
 RUN mkdir -p /root/.cache/opencode/packages && \
     cd /root/.cache/opencode/packages && \
-    npm install @cortexkit/aft-opencode@latest @cortexkit/aft-linux-x64@latest
+    npm install /tmp/aft-local-packs/cortexkit-aft-bridge-*.tgz \
+        /tmp/aft-local-packs/cortexkit-aft-opencode-*.tgz \
+        @cortexkit/aft-linux-x64@latest && \
+    rm -rf /tmp/aft-local-packs
 
 # Inject locally-built AFT binary (overrides npm binary for testing local changes)
 # Build this binary first: docker build -t aft-build-linux -f tests/docker/Dockerfile.build-linux .
@@ -101,13 +108,8 @@ RUN AFT_VER=$(node -p "require('/root/.cache/opencode/packages/node_modules/@cor
     chmod +x /root/.cache/aft/bin/v${AFT_VER}/aft && \
     rm /tmp/aft-local-binary
 
-# Inject locally-built plugin dist (overrides npm plugin for testing local changes)
-# This ensures TypeScript-side fixes (like onnx-runtime.ts) are tested too
-COPY packages/opencode-plugin/dist/ /tmp/aft-plugin-dist/
-RUN PLUGIN_DIR=$(find /root/.cache/opencode/packages -path '*/node_modules/@cortexkit/aft-opencode/dist' -type d 2>/dev/null | head -1) && \
-    test -n "$PLUGIN_DIR" && \
-    cp -r /tmp/aft-plugin-dist/* "$PLUGIN_DIR/" && \
-    rm -rf /tmp/aft-plugin-dist
+# The locally packed @cortexkit/aft-opencode tarball already contains the built
+# dist/ for this checkout, so there is no npm-latest dist overlay here.
 
 # Set NODE_PATH so aimock global install is accessible via require()
 ENV NODE_PATH="/usr/lib/node_modules"

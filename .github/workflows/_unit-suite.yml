@@ -172,8 +172,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Cargo test (workspace)
-        run: cargo test --workspace
+      # Windows runs the lib-test surface (proven green). The full integration
+      # suite has ~77 Windows-harness incompatibilities (path separators, CRLF,
+      # POSIX-command fixtures, LSP servers absent on CI) that are tracked for a
+      # dedicated Windows-integration-enablement effort, not a feature release.
+      # Real Windows coverage also comes from Windows bash-perm e2e + Windows
+      # native E2E (real OpenCode + bridge). 5a5d9ba over-promoted this to
+      # --workspace; reverted to --lib until the integration suite is clean.
+      - name: Cargo test (lib only — Windows integration suite enablement tracked separately)
+        run: cargo test --workspace --lib
         shell: pwsh
         env:
           AFT_TEST_DIAG: "1"
@@ -192,6 +199,13 @@ jobs:
   # catches a class of bugs that Linux+macOS bun + Windows native E2E miss
   # individually — Effect-runtime semantics under bun's Windows process
   # spawn implementation.
+  #
+  # Within bash.test.ts, tests asserting Unix-shell OUTPUT SEMANTICS (exact raw
+  # byte equality, POSIX `pwd` shape, cat/grep rewrite over forward-slash paths)
+  # are skipOnWindows-skipped by design: AFT's hoisted bash runs through
+  # PowerShell with backslash Windows paths, those rewrite scenarios are already
+  # Unix-only (crates/aft/tests/integration/bash_rewrite_test.rs), and Linux+macOS
+  # cover them. The permission-flow tests this job exists for run and gate here.
   #
   # PR mode (strict=false): non-blocking.
   # Release mode (strict=true): blocking.

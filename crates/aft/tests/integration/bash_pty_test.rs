@@ -741,6 +741,36 @@ fn pty_kill_terminates_pwsh_infinite_loop() {
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
 }
 
+#[cfg(windows)]
+#[test]
+fn pty_kill_terminates_pwsh_infinite_loop_within_bounded_time() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "pwsh -NoProfile -Command while($true){Start-Sleep -Milliseconds 100}",
+        Duration::from_secs(30),
+    );
+
+    let started = Instant::now();
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Windows PTY kill did not reach terminal status within bounded time"
+    );
+}
+
+// POSIX-only harness: spawns `cat`, which is not a Windows PowerShell command.
+// Skip on Windows — the kill-marker invariant is covered on Unix; the real
+// Windows kill path is gated by pty_kill_terminates_pwsh_infinite_loop.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`cat`); Unix covers the invariant"
+)]
 #[test]
 fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
     let project = tempfile::tempdir().unwrap();
@@ -760,6 +790,11 @@ fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
     assert_eq!(marker.trim(), "killed");
 }
 
+// POSIX-only harness: spawns `cat`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`cat`); Unix covers the invariant"
+)]
 #[test]
 fn pty_kill_with_clones_outstanding_still_terminates() {
     let project = tempfile::tempdir().unwrap();
@@ -799,6 +834,12 @@ fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
     assert_eq!(snapshot.exit_code, Some(124));
 }
 
+// POSIX-only harness: spawns `printf`, not a Windows command. Skip on Windows;
+// the snapshot/preview invariant is covered on Unix.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
     let project = tempfile::tempdir().unwrap();
@@ -820,6 +861,11 @@ fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
     assert_eq!(snapshot.stderr_path, None);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_completion_preview_is_empty() {
     let project = tempfile::tempdir().unwrap();
@@ -839,6 +885,11 @@ fn pty_completion_preview_is_empty() {
     assert!(!completion.output_truncated);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_completion_token_counts_returns_skipped_sentinel() {
     let project = tempfile::tempdir().unwrap();
@@ -859,6 +910,11 @@ fn pty_completion_token_counts_returns_skipped_sentinel() {
     assert!(completion.tokens_skipped);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_parallel_smoke_10_tasks() {
     let project = tempfile::tempdir().unwrap();

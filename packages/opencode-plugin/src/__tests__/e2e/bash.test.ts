@@ -19,6 +19,26 @@ import {
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
+// On Windows, AFT's hoisted bash runs through PowerShell, which emits CRLF
+// (`\r\n`) line endings. The bash adapter returns raw shell output by contract
+// (see packages/opencode-plugin/src/tools/bash.ts), so output text legitimately
+// differs only by line ending across platforms. Normalize CRLF->LF in
+// assertions where the LINE ENDING is incidental to what the test is verifying
+// (e.g. "the command's stdout came back"), so these stay meaningful on Windows
+// without weakening the raw-output contract elsewhere.
+const IS_WINDOWS = process.platform === "win32";
+const eol = (text: string): string => text.replace(/\r\n/g, "\n");
+
+// Tests that assert Unix-shell output SEMANTICS — exact raw byte equality,
+// POSIX `pwd` path shape, or `cat`/`grep` rewrite output over forward-slash
+// paths — are not this job's contract on Windows. AFT's hoisted bash uses
+// backslash Windows paths and PowerShell, and the rewrite scenarios are already
+// documented as Unix-only (see crates/aft/tests/integration/bash_rewrite_test.rs).
+// Linux + macOS cover these shell semantics; Windows native E2E covers real
+// Windows product integration. This Windows Bun job's contract is the bash
+// PERMISSION FLOW, which is platform-relevant and kept blocking below.
+const skipOnWindows = IS_WINDOWS ? test.skip : test;
+
 interface BashResult {
   /** Agent-visible bash output (what the LLM sees verbatim). */
   output: string;
@@ -140,8 +160,9 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const result = await callPluginBash(bash, h, { command: "echo hello" });
 
     // Agent-visible output is the raw bash text — NOT a JSON literal that the
-    // model would have to JSON.parse before reading.
-    expect(result.output).toBe("hello\n");
+    // model would have to JSON.parse before reading. (CRLF-tolerant: PowerShell
+    // emits "hello\r\n" on Windows; the no-JSON-envelope contract is what matters.)
+    expect(eol(result.output)).toBe("hello\n");
     // Exit code, truncation, etc. land in metadata for the UI.
     expect(result.metadata.exit).toBe(0);
   });
@@ -157,7 +178,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.metadata.exit).toBe(1);
   });
 
-  test("workdir is respected", async () => {
+  skipOnWindows("workdir is respected", async () => {
     const { h, bash } = await pluginHarness();
     const subdir = h.path("subdir");
     await mkdir(subdir);
@@ -178,7 +199,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(response.exit_code).toBe(124);
   });
 
-  test("rewrites cat to read with footer hint when enabled", async () => {
+  skipOnWindows("rewrites cat to read with footer hint when enabled", async () => {
     const h = await harness({ experimental_bash_rewrite: true });
     const filePath = h.path("notes.txt");
     await writeFile(filePath, "alpha\nbeta\n", "utf8");
@@ -193,7 +214,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(String(response.output)).toContain("Prefer `read` tool over bash.");
   });
 
-  test("rewrites grep -r to grep tool with footer hint when enabled", async () => {
+  skipOnWindows("rewrites grep -r to grep tool with footer hint when enabled", async () => {
     const h = await harness({ experimental_bash_rewrite: true });
     await mkdir(h.path("src"));
     await writeFile(h.path("src", "lib.ts"), "needle\nhaystack\n", "utf8");
@@ -208,7 +229,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(String(response.output)).toContain("Prefer `grep` tool over bash.");
   });
 
-  test("rewriter disabled runs cat as raw bash without footer", async () => {
+  skipOnWindows("rewriter disabled runs cat as raw bash without footer", async () => {
     const h = await harness({ experimental_bash_rewrite: false });
     const filePath = h.path("raw.txt");
     await writeFile(filePath, "raw cat output\n", "utf8");
@@ -295,7 +316,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const completed = await waitForStatus(h, taskId, "completed");
     expect(completed.exit_code).toBe(0);
-    expect(completed.output_preview).toBe("done\n");
+    // CRLF-tolerant: PowerShell emits "done\r\n" on Windows.
+    expect(eol(String(completed.output_preview))).toBe("done\n");
   });
 
   test("bash_kill terminates a running task", async () => {
@@ -330,7 +352,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, { command: "echo foreground" });
 
-    expect(result.output).toContain("foreground\n");
+    expect(eol(result.output)).toContain("foreground\n");
     expect(result.output).not.toContain("Background tasks completed:");
     expect(result.output).not.toContain(taskId);
     expect(result.output).not.toContain("bg-done");
@@ -393,7 +415,9 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const result = await callPluginBash(bash, h, { command: "echo allowed" }, { ask });
 
     expect(askInvoked).toBe(true);
-    expect(result.output).toBe("allowed\n");
+    // CRLF-tolerant: PowerShell emits "allowed\r\n" on Windows. The permission
+    // flow (ask invoked, command ran) is the contract — not the line ending.
+    expect(eol(result.output)).toBe("allowed\n");
     expect(result.metadata.exit).toBe(0);
   });
 
