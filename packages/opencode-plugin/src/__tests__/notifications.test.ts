@@ -478,6 +478,92 @@ describe("deliverConfigureWarnings", () => {
     expect(dbSetCalls(send)).toHaveLength(1);
   });
 
+  test("chat_delivery_omits_agent_from_prompt_body", async () => {
+    const storageDir = createStorageDir();
+    const { bridge } = createStateBridge();
+    const promptBodies: Array<Record<string, unknown>> = [];
+    const client = {
+      session: {
+        prompt(input: { body?: Record<string, unknown> }) {
+          if (input.body) promptBodies.push(input.body);
+        },
+      },
+    };
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "chat",
+      },
+      [baseWarning()],
+    );
+
+    expect(promptBodies).toHaveLength(1);
+    expect(promptBodies[0]?.agent).toBeUndefined();
+    expect(promptBodies[0]?.model).toBeUndefined();
+  });
+
+  test("chat_partial_delivery_records_only_successful_warnings", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    let calls = 0;
+    const client = {
+      session: {
+        prompt() {
+          calls += 1;
+          if (calls === 1) {
+            throw new Error("prompt failed");
+          }
+        },
+      },
+    };
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "chat",
+      },
+      [
+        baseWarning({ tool: "biome", hint: "first" }),
+        baseWarning({ tool: "prettier", hint: "second" }),
+      ],
+    );
+
+    expect(calls).toBe(2);
+    expect(dbSetCalls(send)).toHaveLength(1);
+  });
+
+  test("toast_delivery_when_tui_unavailable_still_records_warning", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    const client = {};
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "toast",
+      },
+      [baseWarning()],
+    );
+
+    expect(dbSetCalls(send)).toHaveLength(1);
+  });
+
   test("bridge_error_suppresses_delivery_and_is_non_fatal", async () => {
     // A throwing bridge means the dedup state is UNKNOWN. Previously the
     // gate treated an unreadable state as "never warned" and delivered

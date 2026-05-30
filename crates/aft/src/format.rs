@@ -2747,8 +2747,12 @@ mod tests {
         let result = detect_type_checker(&path, LangId::Go, &config);
         if resolve_tool("go", config.project_root.as_deref()).is_some() {
             let (cmd, _args) = result.unwrap();
-            // Could be staticcheck or go vet depending on what's installed
-            assert!(cmd == "go" || cmd == "staticcheck");
+            // Resolved paths may be absolute after PATH / well-known lookup.
+            let name = checker_executable_name(&cmd);
+            assert!(
+                name == "go" || name == "staticcheck",
+                "expected go or staticcheck, got {cmd}"
+            );
         } else {
             assert!(result.is_none());
         }
