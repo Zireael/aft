@@ -5592,6 +5592,7 @@ mod tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5680,6 +5681,7 @@ mod tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5740,6 +5742,7 @@ mod tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6332,6 +6335,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6390,6 +6394,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6427,6 +6432,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6470,6 +6476,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6516,6 +6523,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6555,6 +6563,7 @@ mod fingerprint_invalidation_tests {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();

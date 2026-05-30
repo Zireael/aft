@@ -9,7 +9,8 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::SearchIndex;
 use crate::semantic_diagnostics::{
-    score_statistics, top1_margin, PhaseTimer, SearchDiagnostics, SearchPipelineType, SearchWarning,
+    format_diagnostics_prefix, score_statistics, top1_margin, PhaseTimer, SearchDiagnostics,
+    SearchPipelineType, SearchWarning,
 };
 use crate::semantic_index::{
     is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
@@ -233,18 +234,43 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
 
-    // Record diagnostics if enabled.
+    // Compute query statistics (always needed for output mode and diagnostics).
+    let candidate_count = scores.len();
+    let returned_count = results.len();
+    let score_stats = score_statistics(&scores);
+    let margin = top1_margin(&scores);
+    let total_latency_ms = _pipeline_timer.stop();
+    let prompt_active = ctx.config().semantic.query_prompt_template.is_some();
+
+    // Format diagnostics prefix for tool output.
+    let output_mode = ctx.config().semantic.output_mode;
+    let diagnostics_prefix = format_diagnostics_prefix(
+        output_mode,
+        &warnings,
+        pipeline_type,
+        total_latency_ms,
+        Some(score_stats),
+        candidate_count,
+        returned_count,
+        Some(embedding_latency_ms),
+        Some(vector_search_latency_ms),
+        Some(lexical_latency_ms),
+        Some(hybrid_fusion_latency_ms),
+    );
+
+    // Build tool output text.
+    let base_text = format_semantic_text(&results, &project_root);
+    let text = match &diagnostics_prefix {
+        Some(prefix) => format!("{}\n\n{}", prefix, base_text),
+        None => base_text,
+    };
+
+    // Record diagnostics if enabled (metrics + JSONL, independent of output_mode).
     if diagnostics_enabled {
         // Lazily init JSONL logger.
         ctx.init_diagnostics_logger();
 
-        let candidate_count = scores.len();
-        let returned_count = results.len();
-        let (score_min, score_median, score_p90, score_max) = score_statistics(&scores);
-        let margin = top1_margin(&scores);
-        let total_latency_ms = _pipeline_timer.stop();
-        let prompt_active = ctx.config().semantic.query_prompt_template.is_some();
-
+        let (score_min, score_median, score_p90, score_max) = score_stats;
         let diag = SearchDiagnostics {
             query_hash,
             pipeline_type,
@@ -279,7 +305,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         serde_json::json!({
             "status": "ready",
-            "text": format_semantic_text(&results, &project_root),
+            "text": text,
             "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
         }),
     )

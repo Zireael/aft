@@ -212,6 +212,22 @@ pub struct SemanticBackendConfig {
     /// Number of days to retain JSONL diagnostics before cleanup (default: 14).
     #[serde(default = "default_jsonl_retention_days")]
     pub retention_days: u32,
+    /// How much diagnostic detail to include in `aft_search` tool output (default: minimal).
+    #[serde(default)]
+    pub output_mode: DiagnosticsOutputMode,
+}
+
+/// How much diagnostic detail to include in the tool output text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsOutputMode {
+    /// No diagnostics in tool output.
+    Off,
+    /// Only warnings that change result interpretation (default).
+    #[default]
+    Minimal,
+    /// Include full diagnostics (scores, latency, warnings) in tool output.
+    Verbose,
 }
 
 fn default_low_confidence_threshold() -> f32 {
@@ -258,6 +274,10 @@ impl SemanticBackendConfig {
 
     pub fn retention_days(&self) -> u32 {
         self.retention_days
+    }
+
+    pub fn output_mode(&self) -> DiagnosticsOutputMode {
+        self.output_mode
     }
 }
 
@@ -423,6 +443,7 @@ impl Default for SemanticBackendConfig {
             include_raw_queries: false,
             include_snippets: false,
             retention_days: 14,
+            output_mode: DiagnosticsOutputMode::default(),
         }
     }
 }

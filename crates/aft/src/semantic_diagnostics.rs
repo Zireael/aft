@@ -572,6 +572,139 @@ impl SemanticDiagnosticsLogger {
     }
 }
 
+/// Format a diagnostics prefix for the `aft_search` text output,
+/// respecting the output mode. Returns `None` for `Off` mode.
+///
+/// `Minimal` — only warnings that change result interpretation:
+///
+///   ⚠ semantic index is still building (72%) — results may be incomplete
+///
+/// `Verbose` — warnings plus score statistics and timing summary:
+///
+///   ⚠ semantic index is still building (72%) — results may be incomplete
+///   scores: min 0.12, p50 0.48, p90 0.81, max 0.92
+///   latency: 245ms total (embed 42ms, vector 18ms, lexical 120ms, fusion 3ms)
+///   50 candidates → 10 returned
+pub fn format_diagnostics_prefix(
+    mode: crate::config::DiagnosticsOutputMode,
+    warnings: &[SearchWarning],
+    pipeline_type: SearchPipelineType,
+    total_latency_ms: f64,
+    score_stats: Option<(Option<f32>, Option<f32>, Option<f32>, Option<f32>)>,
+    candidate_count: usize,
+    returned_count: usize,
+    embedding_latency_ms: Option<f64>,
+    vector_search_latency_ms: Option<f64>,
+    lexical_latency_ms: Option<f64>,
+    hybrid_fusion_latency_ms: Option<f64>,
+) -> Option<String> {
+    match mode {
+        crate::config::DiagnosticsOutputMode::Off => None,
+        crate::config::DiagnosticsOutputMode::Minimal => {
+            let mut lines = Vec::new();
+            for w in warnings {
+                if let Some(line) = format_warning_minimal(w) {
+                    lines.push(line);
+                }
+            }
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        crate::config::DiagnosticsOutputMode::Verbose => {
+            let mut lines = Vec::new();
+            for w in warnings {
+                lines.push(format_warning_verbose(w));
+            }
+            if let Some((min, median, p90, max)) = score_stats {
+                let parts: Vec<String> = [
+                    min.map(|v| format!("min {:.3}", v)),
+                    median.map(|v| format!("p50 {:.3}", v)),
+                    p90.map(|v| format!("p90 {:.3}", v)),
+                    max.map(|v| format!("max {:.3}", v)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !parts.is_empty() {
+                    lines.push(format!("scores: {}", parts.join(", ")));
+                }
+            }
+            let mut latency_parts = vec![format!("{:.0}ms total", total_latency_ms)];
+            if let Some(v) = embedding_latency_ms {
+                latency_parts.push(format!("embed {:.0}ms", v));
+            }
+            if let Some(v) = vector_search_latency_ms {
+                latency_parts.push(format!("vector {:.0}ms", v));
+            }
+            if let Some(v) = lexical_latency_ms {
+                latency_parts.push(format!("lexical {:.0}ms", v));
+            }
+            if let Some(v) = hybrid_fusion_latency_ms {
+                latency_parts.push(format!("fusion {:.0}ms", v));
+            }
+            lines.push(format!("latency: {}", latency_parts.join(", ")));
+            lines.push(format!(
+                "{} candidates → {} returned ({})",
+                candidate_count, returned_count, pipeline_type
+            ));
+            Some(lines.join("\n"))
+        }
+    }
+}
+
+fn format_warning_minimal(w: &SearchWarning) -> Option<String> {
+    match w {
+        SearchWarning::PartialIndex { completeness } => {
+            let pct = (*completeness * 100.0) as usize;
+            Some(format!(
+                "⚠ semantic index is still building ({}%) — results may be incomplete",
+                pct
+            ))
+        }
+        SearchWarning::StaleIndex => {
+            Some("⚠ semantic index is stale — results may not reflect current files".to_string())
+        }
+        SearchWarning::DegradedIndex => {
+            Some("⚠ semantic index is degraded — results may be less relevant".to_string())
+        }
+        SearchWarning::LowConfidence => None,
+        SearchWarning::EmptyResults => Some("⚠ no matching results found".to_string()),
+        SearchWarning::EmbeddingFailure { .. } => None,
+        SearchWarning::LexicalFailure { .. } => None,
+        SearchWarning::DimensionMismatch { .. } => None,
+    }
+}
+
+fn format_warning_verbose(w: &SearchWarning) -> String {
+    match w {
+        SearchWarning::LowConfidence => {
+            "⚠ low confidence — all results below threshold".to_string()
+        }
+        SearchWarning::EmptyResults => "⚠ no matching results found".to_string(),
+        SearchWarning::PartialIndex { completeness } => {
+            let pct = (*completeness * 100.0) as usize;
+            format!(
+                "⚠ semantic index is still building ({}%) — results may be incomplete",
+                pct
+            )
+        }
+        SearchWarning::StaleIndex => {
+            "⚠ semantic index is stale — results may not reflect current files".to_string()
+        }
+        SearchWarning::DegradedIndex => {
+            "⚠ semantic index is degraded — results may be less relevant".to_string()
+        }
+        SearchWarning::EmbeddingFailure { reason } => format!("⚠ embedding failed: {}", reason),
+        SearchWarning::LexicalFailure { reason } => format!("⚠ lexical search failed: {}", reason),
+        SearchWarning::DimensionMismatch { expected, got } => {
+            format!("⚠ dimension mismatch: expected {}, got {}", expected, got)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,5 +1138,95 @@ mod tests {
         // After deletion the file is gone; the logger closes on write error,
         // so subsequent writes fail silently. We verify no panic occurred.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_prefix_off_returns_none() {
+        let result = format_diagnostics_prefix(
+            crate::config::DiagnosticsOutputMode::Off,
+            &[],
+            SearchPipelineType::Semantic,
+            100.0,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn diagnostics_prefix_minimal_includes_partial_index_warning() {
+        let warnings = vec![SearchWarning::PartialIndex { completeness: 0.72 }];
+        let result = format_diagnostics_prefix(
+            crate::config::DiagnosticsOutputMode::Minimal,
+            &warnings,
+            SearchPipelineType::Semantic,
+            100.0,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        );
+        let text = result.expect("minimal with warnings should return Some");
+        assert!(text.contains("72%"), "should include completeness: {text}");
+        assert!(text.contains("⚠"), "should include warning marker: {text}");
+        assert!(!text.contains("scores:"), "no scores in minimal: {text}");
+        assert!(!text.contains("latency:"), "no latency in minimal: {text}");
+    }
+
+    #[test]
+    fn diagnostics_prefix_minimal_returns_none_without_warnings() {
+        let result = format_diagnostics_prefix(
+            crate::config::DiagnosticsOutputMode::Minimal,
+            &[],
+            SearchPipelineType::Semantic,
+            100.0,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_none(), "no warnings = no output in minimal");
+    }
+
+    #[test]
+    fn diagnostics_prefix_verbose_includes_scores_and_latency() {
+        let result = format_diagnostics_prefix(
+            crate::config::DiagnosticsOutputMode::Verbose,
+            &[SearchWarning::LowConfidence],
+            SearchPipelineType::Hybrid,
+            245.0,
+            Some((Some(0.1), Some(0.48), Some(0.81), Some(0.92))),
+            50,
+            10,
+            Some(42.0),
+            Some(18.0),
+            Some(120.0),
+            Some(3.0),
+        );
+        let text = result.expect("verbose should return Some");
+        assert!(text.contains("⚠"), "should include warnings: {text}");
+        assert!(
+            text.contains("low confidence"),
+            "low confidence warning: {text}"
+        );
+        assert!(text.contains("min 0.100"), "min score: {text}");
+        assert!(text.contains("p50 0.480"), "median: {text}");
+        assert!(text.contains("p90 0.810"), "p90: {text}");
+        assert!(text.contains("max 0.920"), "max: {text}");
+        assert!(text.contains("latency:"), "latency summary: {text}");
+        assert!(text.contains("245ms total"), "total latency: {text}");
+        assert!(text.contains("embed 42ms"), "embed latency: {text}");
+        assert!(text.contains("50 candidates"), "candidates: {text}");
     }
 }
