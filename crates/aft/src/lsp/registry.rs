@@ -36,22 +36,35 @@ pub fn resolve_lsp_binary(
         }
     }
 
+    // 3. PATH fallback
+    which::which(binary).ok()
+}
+
+/// Check `dir/<binary>` and (on Windows) `dir/<binary>.cmd|.exe|.bat`.
+fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+
     if cfg!(windows) {
-        for dir in crate::tool_path::well_known_windows_bin_dirs(
-            std::env::var_os("USERPROFILE").as_deref(),
-        ) {
-            if let Some(found) = probe_dir(&dir, binary) {
-                return Some(found);
+        // npm creates both an extensionless POSIX shell shim and a `.cmd`
+        // wrapper under node_modules/.bin. The extensionless shim exists on
+        // Windows too but is not a Win32 executable, so prefer Windows-native
+        // wrappers before falling back to the direct path.
+        for ext in ["cmd", "exe", "bat"] {
+            let candidate = dir.join(format!("{binary}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
 
-    // PATH fallback
-    crate::tool_path::resolve_on_path(binary)
-}
+    let direct = dir.join(binary);
+    if direct.is_file() {
+        return Some(direct);
+    }
 
-fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
-    crate::tool_path::probe_tool_in_dir(dir, binary)
+    None
 }
 
 /// Unique identifier for a language server kind.
