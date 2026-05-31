@@ -312,6 +312,7 @@ pub(crate) fn parse_embedding_value(
 /// A vector as stored in the index after conversion.
 ///
 /// This is the final form that is written to the snapshot / disk cache.
+#[derive(Debug)]
 pub(crate) enum StoredVector {
     /// Stored as dense f32 (for cosine / dot-product search).
     DenseF32(Vec<f32>),
@@ -6712,5 +6713,782 @@ mod fingerprint_invalidation_tests {
         assert_eq!(result[5], 1.0);
         assert_eq!(result[6], 0.0);
         assert_eq!(result[7], 1.0);
+    }
+
+    // ── Config deserialization tests ────────────────────────────────────
+
+    #[test]
+    fn config_deserialize_minimal_json() {
+        let json = r#"{"backend":"fastembed","model":"all-MiniLM-L6-v2","timeout_ms":25000,"max_batch_size":64}"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.backend, SemanticBackend::Fastembed);
+        assert_eq!(config.model, "all-MiniLM-L6-v2");
+        assert_eq!(config.timeout_ms, 25000);
+        assert_eq!(config.max_batch_size, 64);
+        // Optional fields default to None
+        assert!(config.base_url.is_none());
+        assert!(config.api_key_env.is_none());
+        assert!(config.dimensions.is_none());
+        assert!(config.output_encoding.is_none());
+    }
+
+    #[test]
+    fn config_deserialize_all_fields() {
+        let json = r#"{
+            "backend": "openai_compatible",
+            "model": "text-embedding-3-small",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "timeout_ms": 30000,
+            "max_batch_size": 128,
+            "dimensions": 1536,
+            "output_encoding": "base64_int8",
+            "input_mode": "flat_texts",
+            "storage_strategy": "decode_normalize_f32",
+            "distance_metric": "cosine",
+            "query_prompt_template": "Instruct: {query}",
+            "document_prompt_template": "Represent: {text}",
+            "diagnostics_enabled": true,
+            "low_confidence_threshold": 0.5,
+            "metrics_window_size": 200,
+            "jsonl_logging": true,
+            "include_raw_queries": true,
+            "include_snippets": true,
+            "retention_days": 30,
+            "rerank_enabled": true,
+            "rerank_model": "codellama",
+            "rerank_timeout_ms": 10000,
+            "rerank_max_candidates": 10
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.backend, SemanticBackend::OpenAiCompatible);
+        assert_eq!(config.model, "text-embedding-3-small");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(config.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(config.timeout_ms, 30000);
+        assert_eq!(config.max_batch_size, 128);
+        assert_eq!(config.dimensions, Some(1536));
+        assert_eq!(config.output_encoding, Some(OutputEncoding::Base64Int8));
+        assert_eq!(config.input_mode, Some(InputMode::FlatTexts));
+        assert_eq!(
+            config.storage_strategy,
+            Some(StorageStrategy::DecodeNormalizeF32)
+        );
+        assert_eq!(config.distance_metric, Some(DistanceMetric::Cosine));
+        assert!(config.diagnostics_enabled);
+        assert!((config.low_confidence_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.metrics_window_size, 200);
+        assert!(config.jsonl_logging);
+        assert!(config.include_raw_queries);
+        assert!(config.include_snippets);
+        assert_eq!(config.retention_days, 30);
+        assert!(config.rerank_enabled);
+        assert_eq!(config.rerank_model.as_deref(), Some("codellama"));
+        assert_eq!(config.rerank_timeout_ms, 10000);
+        assert_eq!(config.rerank_max_candidates, 10);
+    }
+
+    #[test]
+    fn config_deserialize_safe_defaults() {
+        // Empty object should deserialize with all defaults
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        // Verify all optional fields are None
+        assert!(config.base_url.is_none());
+        assert!(config.api_key_env.is_none());
+        assert!(config.dimensions.is_none());
+        assert!(config.output_encoding.is_none());
+        assert!(config.input_mode.is_none());
+        assert!(config.storage_strategy.is_none());
+        assert!(config.distance_metric.is_none());
+        assert!(config.query_prompt_template.is_none());
+        assert!(config.document_prompt_template.is_none());
+        assert!(!config.diagnostics_enabled);
+        assert!(!config.jsonl_logging);
+        assert!(!config.include_raw_queries);
+        assert!(!config.include_snippets);
+    }
+
+    // ── Profile validation tests ────────────────────────────────────────
+
+    #[test]
+    fn profile_fastembed_minilm_is_compatible() {
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+        assert_eq!(profile.storage_strategy, StorageStrategy::NativeF32);
+        assert!(!profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_openai_compatible_generic_is_compatible() {
+        let profile = EmbeddingModelProfile::openai_compatible_generic();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Auto);
+        assert!(profile.mrl_supported);
+        assert!(!profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_perplexity_int8_is_compatible() {
+        let profile = EmbeddingModelProfile::perplexity_int8();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseInt8);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+        assert_eq!(
+            profile.normalization,
+            NormalizationPolicy::NormalizeOnInsertQuery
+        );
+        assert_eq!(
+            profile.storage_strategy,
+            StorageStrategy::DecodeNormalizeF32
+        );
+        assert!(profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_perplexity_binary_is_compatible() {
+        let profile = EmbeddingModelProfile::perplexity_binary();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Binary);
+        assert_eq!(profile.source_vector_kind, VectorKind::BinaryPacked);
+        assert_eq!(profile.stored_vector_kind, VectorKind::BinaryPacked);
+        assert_eq!(profile.metric, DistanceMetric::Hamming);
+        assert_eq!(profile.normalization, NormalizationPolicy::NotApplicable);
+        assert_eq!(profile.storage_strategy, StorageStrategy::BinaryPacked);
+        assert!(profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_from_config_selects_correctly() {
+        // Fastembed with matching model
+        let config_fastembed = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            output_encoding: None,
+            storage_strategy: None,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_fastembed).unwrap();
+        assert_eq!(profile.backend, SemanticBackend::Fastembed);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+
+        // OpenAI-compatible
+        let config_oai = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_oai).unwrap();
+        assert_eq!(profile.backend, SemanticBackend::OpenAiCompatible);
+
+        // Perplexity with base64_int8
+        let config_int8 = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_int8).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseInt8);
+
+        // Perplexity with base64_binary
+        let config_binary = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            output_encoding: Some(OutputEncoding::Base64Binary),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_binary).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Binary);
+        assert_eq!(profile.source_vector_kind, VectorKind::BinaryPacked);
+    }
+
+    // ── TypedVector conversion tests ────────────────────────────────────
+
+    #[test]
+    fn typed_vector_dense_f32_kind_and_dims() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(v.kind(), VectorKind::DenseF32);
+        assert_eq!(v.dims(), 4);
+    }
+
+    #[test]
+    fn typed_vector_dense_int8_kind_and_dims() {
+        let v = TypedVector::DenseInt8(vec![10, -20, 30]);
+        assert_eq!(v.kind(), VectorKind::DenseInt8);
+        assert_eq!(v.dims(), 3);
+    }
+
+    #[test]
+    fn typed_vector_binary_packed_kind_and_dims() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF, 0x00],
+            logical_dims: 12,
+        };
+        assert_eq!(v.kind(), VectorKind::BinaryPacked);
+        assert_eq!(v.dims(), 12);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_native() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let stored = v.into_stored(StorageStrategy::NativeF32).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+        assert_eq!(stored.dims(), 3);
+        let f32s = stored.to_f32_slice().unwrap();
+        assert!((f32s[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_normalize() {
+        let v = TypedVector::DenseF32(vec![3.0, 4.0]);
+        let stored = v.into_stored(StorageStrategy::DecodeNormalizeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        // L2 norm of [3,4] = 5; normalized = [0.6, 0.8]
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_rejects_binary_packed() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2]);
+        let err = v.into_stored(StorageStrategy::BinaryPacked).unwrap_err();
+        assert!(err.contains("DenseF32"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_native() {
+        let v = TypedVector::DenseInt8(vec![10, -20, 30]);
+        let stored = v.into_stored(StorageStrategy::NativeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        assert!((f32s[0] - 10.0).abs() < 1e-6);
+        assert!((f32s[1] - (-20.0)).abs() < 1e-6);
+        assert!((f32s[2] - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_normalize() {
+        let v = TypedVector::DenseInt8(vec![3, 4]);
+        let stored = v.into_stored(StorageStrategy::DecodeNormalizeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        // L2 norm of [3,4] = 5; normalized = [0.6, 0.8]
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_rejects_binary_packed() {
+        let v = TypedVector::DenseInt8(vec![10, -20]);
+        let err = v.into_stored(StorageStrategy::BinaryPacked).unwrap_err();
+        assert!(err.contains("DenseInt8"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_native() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let stored = v.into_stored(StorageStrategy::BinaryPacked).unwrap();
+        assert_eq!(stored.kind(), VectorKind::BinaryPacked);
+        assert_eq!(stored.dims(), 8);
+        let (bytes, dims) = stored.to_packed().unwrap();
+        assert_eq!(bytes, &[0xFF]);
+        assert_eq!(dims, 8);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_rejects_f32() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = v.into_stored(StorageStrategy::NativeF32).unwrap_err();
+        assert!(err.contains("BinaryPacked"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_rejects_normalize() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = v
+            .into_stored(StorageStrategy::DecodeNormalizeF32)
+            .unwrap_err();
+        assert!(err.contains("BinaryPacked"), "got: {err}");
+    }
+
+    // ── StoredVector roundtrip tests ────────────────────────────────────
+
+    #[test]
+    fn stored_vector_dense_f32_to_f32_slice_roundtrip() {
+        let sv = StoredVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let slice = sv.to_f32_slice().unwrap();
+        assert_eq!(slice, &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn stored_vector_dense_f32_to_packed_rejects() {
+        let sv = StoredVector::DenseF32(vec![0.1, 0.2]);
+        let err = sv.to_packed().unwrap_err();
+        assert!(err.contains("dense"), "got: {err}");
+    }
+
+    #[test]
+    fn stored_vector_binary_to_packed_roundtrip() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xAB, 0xCD],
+            logical_dims: 12,
+        };
+        let (bytes, dims) = sv.to_packed().unwrap();
+        assert_eq!(bytes, &[0xAB, 0xCD]);
+        assert_eq!(dims, 12);
+    }
+
+    #[test]
+    fn stored_vector_binary_to_f32_rejects() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = sv.to_f32_slice().unwrap_err();
+        assert!(err.contains("binary"), "got: {err}");
+    }
+
+    #[test]
+    fn stored_vector_l2_normalize_dense() {
+        let sv = StoredVector::DenseF32(vec![3.0, 4.0]);
+        let normed = sv.l2_normalize();
+        let f32s = normed.to_f32_slice().unwrap();
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stored_vector_l2_normalize_binary_noop() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let normed = sv.l2_normalize();
+        assert_eq!(normed.kind(), VectorKind::BinaryPacked);
+        let (bytes, dims) = normed.to_packed().unwrap();
+        assert_eq!(bytes, &[0xFF]);
+        assert_eq!(dims, 8);
+    }
+
+    // ── convert_vector tests ────────────────────────────────────────────
+
+    #[test]
+    fn convert_vector_f32_to_f32_succeeds() {
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let typed = TypedVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+    }
+
+    #[test]
+    fn convert_vector_int8_to_f32_succeeds() {
+        let profile = EmbeddingModelProfile::perplexity_int8();
+        let typed = TypedVector::DenseInt8(vec![10, -20, 30]);
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+        // Verify L2 normalization was applied (NormalizeOnInsertQuery)
+        let f32s = stored.to_f32_slice().unwrap();
+        let norm_sq: f32 = f32s.iter().map(|x| x * x).sum();
+        assert!((norm_sq - 1.0).abs() < 1e-5, "norm² = {norm_sq}");
+    }
+
+    #[test]
+    fn convert_vector_binary_to_binary_succeeds() {
+        let profile = EmbeddingModelProfile::perplexity_binary();
+        let typed = TypedVector::BinaryPacked {
+            bytes: vec![0xFF, 0x00],
+            logical_dims: 12,
+        };
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::BinaryPacked);
+    }
+
+    #[test]
+    fn convert_vector_rejects_kind_mismatch() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // expects DenseF32
+        let typed = TypedVector::DenseInt8(vec![10, -20]);
+        let err = profile.convert_vector(typed).unwrap_err();
+        assert!(err.contains("vector kind mismatch"), "got: {err}");
+    }
+
+    // ── validate_compatible rejection tests ─────────────────────────────
+
+    #[test]
+    fn validate_compatible_rejects_f32_source_to_binary_stored() {
+        let profile = EmbeddingModelProfile {
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::BinaryPacked,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("unsupported source"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_binary_stored_with_cosine_metric() {
+        let profile = EmbeddingModelProfile {
+            stored_vector_kind: VectorKind::BinaryPacked,
+            metric: DistanceMetric::Cosine,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("metric"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_f32_encoding_with_binary_strategy() {
+        let profile = EmbeddingModelProfile {
+            output_encoding: OutputEncoding::Float,
+            storage_strategy: StorageStrategy::BinaryPacked,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("not compatible"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_int8_encoding_with_f32_strategy() {
+        let profile = EmbeddingModelProfile {
+            output_encoding: OutputEncoding::Base64Int8,
+            storage_strategy: StorageStrategy::NativeF32,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        // NativeF32 is allowed for Base64Int8
+        assert!(profile.validate_compatible().is_ok());
+    }
+
+    // ── Distance metric auto-resolution tests ───────────────────────────
+
+    #[test]
+    fn resolve_distance_metric_fastembed_defaults_to_cosine() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            distance_metric: Some(DistanceMetric::Auto),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn resolve_distance_metric_explicit_overrides_auto() {
+        let config = SemanticBackendConfig {
+            distance_metric: Some(DistanceMetric::DotProduct),
+            ..SemanticBackendConfig::default()
+        };
+        let resolved = resolve_distance_metric(&config, None);
+        assert_eq!(resolved, DistanceMetric::DotProduct);
+    }
+
+    #[test]
+    fn resolve_distance_metric_int8_profile_cosine() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            distance_metric: Some(DistanceMetric::Auto),
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config).unwrap();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn resolve_distance_metric_binary_profile_hamming() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            distance_metric: Some(DistanceMetric::Auto),
+            output_encoding: Some(OutputEncoding::Base64Binary),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config).unwrap();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Hamming);
+    }
+
+    // ── Dimension validation tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_dimensions_prefers_config_over_profile() {
+        let config = SemanticBackendConfig {
+            dimensions: Some(1536),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // default 384
+        let resolved = resolve_dimensions(&config, Some(&profile));
+        assert_eq!(resolved, Some(1536));
+    }
+
+    #[test]
+    fn resolve_dimensions_falls_back_to_profile_default() {
+        let config = SemanticBackendConfig {
+            dimensions: None,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let resolved = resolve_dimensions(&config, Some(&profile));
+        assert_eq!(resolved, Some(384));
+    }
+
+    #[test]
+    fn validate_config_rejects_unsupported_dimensions() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // range: 384-384
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            dimensions: Some(768),
+            ..SemanticBackendConfig::default()
+        };
+        let err = profile.validate_config(&config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("dimensions")), "got: {err:?}");
+    }
+
+    #[test]
+    fn validate_config_rejects_contextualized_for_flat_provider() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // contextualized_supported: false
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            input_mode: Some(InputMode::DocumentChunks),
+            ..SemanticBackendConfig::default()
+        };
+        let err = profile.validate_config(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.contains("input_mode") || e.contains("document_chunks")),
+            "got: {err:?}"
+        );
+    }
+
+    // ── base64_int8 signed int8 decode tests ────────────────────────────
+
+    #[test]
+    fn base64_int8_negative_values_decode_correctly() {
+        // -1 as i8 = 0xFF in unsigned, -128 as i8 = 0x80
+        let values: Vec<i8> = vec![-1, -128, 127, 0, 1];
+        let encoded = encode_int8_base64(&values);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // After L2-normalization, verify signs are preserved
+        assert!(result[0] < 0.0, "v[0] = {} should be negative", result[0]);
+        assert!(result[1] < 0.0, "v[1] = {} should be negative", result[1]);
+        assert!(result[2] > 0.0, "v[2] = {} should be positive", result[2]);
+        assert!(
+            (result[3]).abs() < 1e-6,
+            "v[3] = {} should be ~0",
+            result[3]
+        );
+        assert!(result[4] > 0.0, "v[4] = {} should be positive", result[4]);
+    }
+
+    #[test]
+    fn base64_int8_all_zeros_is_zero_norm() {
+        let values: Vec<i8> = vec![0, 0, 0];
+        let encoded = encode_int8_base64(&values);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // All-zero vector: norm is 0, no division happens
+        assert_eq!(result, vec![0.0, 0.0, 0.0]);
+    }
+
+    // ── Template hashing tests ──────────────────────────────────────────
+
+    #[test]
+    fn prompt_template_hash_none_is_empty() {
+        assert_eq!(prompt_template_hash(None), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_deterministic() {
+        let h1 = prompt_template_hash(Some("Instruct: {query}"));
+        let h2 = prompt_template_hash(Some("Instruct: {query}"));
+        assert_eq!(h1, h2);
+        assert!(!h1.is_empty());
+    }
+
+    #[test]
+    fn prompt_template_hash_differs_for_different_templates() {
+        let h1 = prompt_template_hash(Some("template A"));
+        let h2 = prompt_template_hash(Some("template B"));
+        assert_ne!(h1, h2);
+    }
+
+    // ── SemanticBackend enum tests ──────────────────────────────────────
+
+    #[test]
+    fn semantic_backend_as_str_roundtrip() {
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            let s = backend.as_str();
+            let parsed = SemanticBackend::from_name(s).unwrap();
+            assert_eq!(&parsed, backend);
+        }
+    }
+
+    #[test]
+    fn semantic_backend_from_name_unknown() {
+        assert!(SemanticBackend::from_name("unknown_backend").is_none());
+    }
+
+    #[test]
+    fn semantic_backend_serde_roundtrip() {
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            let json = serde_json::to_string(backend).unwrap();
+            let parsed: SemanticBackend = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *backend);
+        }
+    }
+
+    // ── OutputEncoding enum tests ───────────────────────────────────────
+
+    #[test]
+    fn output_encoding_default_for_backend() {
+        // All built-in backends default to Float
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            assert_eq!(
+                OutputEncoding::default_for_backend(*backend),
+                OutputEncoding::Float
+            );
+        }
+    }
+
+    // ── InputMode enum tests ────────────────────────────────────────────
+
+    #[test]
+    fn input_mode_default_for_backend() {
+        let flat_backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+        ];
+        for backend in &flat_backends {
+            assert_eq!(
+                InputMode::default_for_backend(*backend),
+                InputMode::FlatTexts
+            );
+        }
+        assert_eq!(
+            InputMode::default_for_backend(SemanticBackend::Perplexity),
+            InputMode::DocumentChunks
+        );
+    }
+
+    // ── resolve_output_encoding / resolve_storage_strategy tests ────────
+
+    #[test]
+    fn resolve_output_encoding_uses_config_when_set() {
+        let config = SemanticBackendConfig {
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(resolve_output_encoding(&config), OutputEncoding::Base64Int8);
+    }
+
+    #[test]
+    fn resolve_output_encoding_falls_back_to_default() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            output_encoding: None,
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(resolve_output_encoding(&config), OutputEncoding::Float);
+    }
+
+    #[test]
+    fn resolve_storage_strategy_uses_config_when_set() {
+        let config = SemanticBackendConfig {
+            storage_strategy: Some(StorageStrategy::BinaryPacked),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(
+            resolve_storage_strategy(&config),
+            StorageStrategy::BinaryPacked
+        );
+    }
+
+    #[test]
+    fn resolve_storage_strategy_falls_back_to_default() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            storage_strategy: None,
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(
+            resolve_storage_strategy(&config),
+            StorageStrategy::NativeF32
+        );
+    }
+
+    // ── apply_query_template / apply_document_template tests ─────────────
+
+    #[test]
+    fn apply_query_template_replaces_placeholder() {
+        let result = apply_query_template("hello", Some("Search: {query}"));
+        assert_eq!(result, "Search: hello");
+    }
+
+    #[test]
+    fn apply_query_template_no_placeholder_returns_raw() {
+        let result = apply_query_template("hello", Some("No placeholder here"));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_query_template_none_returns_raw() {
+        let result = apply_query_template("hello", None);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_replaces_placeholder() {
+        let result = apply_document_template("chunk text", Some("Doc: {text}"));
+        assert_eq!(result, "Doc: chunk text");
+    }
+
+    #[test]
+    fn apply_document_template_none_returns_raw() {
+        let result = apply_document_template("chunk text", None);
+        assert_eq!(result, "chunk text");
     }
 }
