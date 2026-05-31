@@ -166,4 +166,72 @@ mod tests {
         let project = tempdir().unwrap();
         assert!(!is_project_trusted(Some(storage.path()), project.path()));
     }
+
+    // ── Security-focused trust boundary tests ─────────────────────────
+
+    #[test]
+    fn trust_file_is_atomic_write() {
+        // Verify the trust file doesn't leave tmp files behind after save.
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        trust_project(storage.path(), project.path()).unwrap();
+        // No .tmp files should remain
+        let entries: Vec<_> = fs::read_dir(storage.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "tmp"))
+            .collect();
+        assert!(entries.is_empty(), "tmp files left behind: {:?}", entries);
+    }
+
+    #[test]
+    fn multiple_projects_trusted_independently() {
+        let storage = tempdir().unwrap();
+        let p1 = tempdir().unwrap();
+        let p2 = tempdir().unwrap();
+        let p3 = tempdir().unwrap();
+        trust_project(storage.path(), p1.path()).unwrap();
+        trust_project(storage.path(), p2.path()).unwrap();
+        trust_project(storage.path(), p3.path()).unwrap();
+        assert!(is_project_trusted(Some(storage.path()), p1.path()));
+        assert!(is_project_trusted(Some(storage.path()), p2.path()));
+        assert!(is_project_trusted(Some(storage.path()), p3.path()));
+        assert_eq!(list_trusted(storage.path()).len(), 3);
+        // Untrust one — others remain
+        untrust_project(storage.path(), p2.path()).unwrap();
+        assert!(is_project_trusted(Some(storage.path()), p1.path()));
+        assert!(!is_project_trusted(Some(storage.path()), p2.path()));
+        assert!(is_project_trusted(Some(storage.path()), p3.path()));
+        assert_eq!(list_trusted(storage.path()).len(), 2);
+    }
+
+    #[test]
+    fn untrust_is_idempotent() {
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        // Untrust a project that was never trusted — no error
+        untrust_project(storage.path(), project.path()).unwrap();
+        untrust_project(storage.path(), project.path()).unwrap();
+        assert!(!is_project_trusted(Some(storage.path()), project.path()));
+    }
+
+    #[test]
+    fn trust_state_survives_reload() {
+        // Simulate bridge restart: trust, then read from a fresh load.
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        trust_project(storage.path(), project.path()).unwrap();
+        // Simulate fresh process by directly loading from file
+        let state_bytes = fs::read(trust_path(storage.path())).unwrap();
+        let state: TrustState = serde_json::from_slice(&state_bytes).unwrap();
+        assert_eq!(state.trusted_projects.len(), 1);
+    }
+
+    #[test]
+    fn nonexistent_project_path_is_untrusted() {
+        let storage = tempdir().unwrap();
+        let fake = storage.path().join("nonexistent_project_dir");
+        // Should fail-closed, not panic
+        assert!(!is_project_trusted(Some(storage.path()), &fake));
+    }
 }
