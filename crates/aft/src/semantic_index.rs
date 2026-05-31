@@ -6293,6 +6293,67 @@ mod fingerprint_invalidation_tests {
     }
 
     #[test]
+    fn file_policy_hash_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.file_policy_hash = "policy_v2_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn docs_chunker_version_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.docs_chunker_version = 2;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn multi_field_change_still_rebuild() {
+        // Multiple rebuild-field changes should still produce Rebuild.
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        b.dimension = 768;
+        b.file_policy_hash = "new_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn rebuild_plus_query_prompt_change_still_rebuild() {
+        // When both rebuild and query-prompt fields change, Rebuild wins
+        // because it's checked first.
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        b.query_prompt_hash = "new_query_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn only_query_prompt_changes_gives_clear_cache() {
+        // When only query_prompt_hash changes (all rebuild fields match),
+        // ClearQueryCache is returned.
+        let a = fp();
+        let mut b = fp();
+        b.query_prompt_hash = "only_this_changes".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::ClearQueryCache);
+    }
+
+    #[test]
+    fn non_fingerprint_field_changes_produce_none() {
+        // Fields NOT in the fingerprint (e.g. diagnostics, rerank config)
+        // should not cause any diff. We simulate this by checking that
+        // changing only distance_metric (which IS in fp but excluded from
+        // rebuild) produces None — and by extension, fields not in fp at all
+        // also produce None.
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "euclidean".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
     fn display_implementation() {
         assert_eq!(FingerprintChange::Rebuild.to_string(), "rebuild");
         assert_eq!(
