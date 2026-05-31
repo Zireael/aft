@@ -6134,6 +6134,329 @@ mod tests {
             "system path should be quoted in the auto-fix sentence: {msg}"
         );
     }
+
+    // ── is_generated_file tests ─────────────────────────────────────────
+
+    #[test]
+    fn is_generated_file_detects_protobuf_go() {
+        assert!(is_generated_file(Path::new("foo.pb.go")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_protobuf_python() {
+        assert!(is_generated_file(Path::new("foo_pb2.py")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_minified() {
+        assert!(is_generated_file(Path::new("vendor/jquery.min.js")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_snapshot() {
+        assert!(is_generated_file(Path::new("__snapshots__/test.snap")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_dist_directory() {
+        assert!(is_generated_file(Path::new("dist/index.js")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_build_directory() {
+        assert!(is_generated_file(Path::new("build/main.rs")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_generated_directory() {
+        assert!(is_generated_file(Path::new("generated/models.rs")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_generated_prefix() {
+        assert!(is_generated_file(Path::new(".generated.ts")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_dart_generated() {
+        assert!(is_generated_file(Path::new("foo.g.dart")));
+    }
+
+    #[test]
+    fn is_generated_file_allows_normal_files() {
+        assert!(!is_generated_file(Path::new("src/main.rs")));
+        assert!(!is_generated_file(Path::new("lib/utils.ts")));
+        assert!(!is_generated_file(Path::new("README.md")));
+    }
+
+    // ── is_doc_extension tests ──────────────────────────────────────────
+
+    #[test]
+    fn is_doc_extension_markdown() {
+        assert!(is_doc_extension(Path::new("README.md")));
+        assert!(is_doc_extension(Path::new("docs/guide.rst")));
+        assert!(is_doc_extension(Path::new("notes.txt")));
+        assert!(is_doc_extension(Path::new("guide.adoc")));
+    }
+
+    #[test]
+    fn is_doc_extension_rejects_code() {
+        assert!(!is_doc_extension(Path::new("main.rs")));
+        assert!(!is_doc_extension(Path::new("app.ts")));
+    }
+
+    // ── is_config_extension tests ───────────────────────────────────────
+
+    #[test]
+    fn is_config_extension_toml_yaml_json() {
+        assert!(is_config_extension(Path::new("Cargo.toml")));
+        assert!(is_config_extension(Path::new("config.yaml")));
+        assert!(is_config_extension(Path::new("package.json")));
+        assert!(is_config_extension(Path::new("tsconfig.jsonc")));
+    }
+
+    #[test]
+    fn is_config_extension_rejects_lockfiles() {
+        assert!(!is_config_extension(Path::new("package-lock.json")));
+        assert!(!is_config_extension(Path::new("yarn.lock")));
+        assert!(!is_config_extension(Path::new("bun.lockb")));
+    }
+
+    #[test]
+    fn is_config_extension_detects_dotfiles() {
+        assert!(is_config_extension(Path::new(".env")));
+        assert!(is_config_extension(Path::new(".eslintrc")));
+        assert!(is_config_extension(Path::new(".prettierrc")));
+        assert!(is_config_extension(Path::new(".gitignore")));
+    }
+
+    // ── classify_semantic_file tests ────────────────────────────────────
+
+    #[test]
+    fn classify_semantic_file_code() {
+        assert_eq!(
+            classify_semantic_file(Path::new("src/main.rs")),
+            SemanticFileType::Code
+        );
+        assert_eq!(
+            classify_semantic_file(Path::new("app.ts")),
+            SemanticFileType::Code
+        );
+    }
+
+    #[test]
+    fn classify_semantic_file_doc() {
+        assert_eq!(
+            classify_semantic_file(Path::new("README.md")),
+            SemanticFileType::Doc
+        );
+        assert_eq!(
+            classify_semantic_file(Path::new("guide.rst")),
+            SemanticFileType::Doc
+        );
+    }
+
+    #[test]
+    fn classify_semantic_file_config() {
+        assert_eq!(
+            classify_semantic_file(Path::new("Cargo.toml")),
+            SemanticFileType::Config
+        );
+    }
+
+    // ── collect_docs_chunks tests ───────────────────────────────────────
+
+    #[test]
+    fn collect_docs_chunks_markdown_splits_by_heading() {
+        let md =
+            "# Title\n\nIntro text.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n";
+        let chunks = collect_docs_chunks(md, Path::new("docs.md"));
+        // Should have at least 2 chunks (Section A, Section B); intro is merged into first
+        assert!(
+            chunks.len() >= 2,
+            "expected >=2 chunks, got {}",
+            chunks.len()
+        );
+        // Each chunk should have the heading name
+        let names: Vec<_> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("Section A")),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("Section B")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_docs_chunks_markdown_empty_returns_empty() {
+        let chunks = collect_docs_chunks("", Path::new("empty.md"));
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn collect_docs_chunks_non_markdown_single_chunk() {
+        let text = "This is a plain text document.\nWith multiple lines.\n";
+        let chunks = collect_docs_chunks(text, Path::new("notes.txt"));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].embed_text.contains("plain text"));
+    }
+
+    #[test]
+    fn collect_docs_chunks_non_markdown_empty_returns_empty() {
+        let chunks = collect_docs_chunks("", Path::new("empty.txt"));
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn collect_docs_chunks_markdown_with_h1_only() {
+        let md = "# Just a title\n\nSome content here.\n";
+        let chunks = collect_docs_chunks(md, Path::new("single.md"));
+        assert!(!chunks.is_empty());
+    }
+
+    // ── SemanticFilePolicy tests ────────────────────────────────────────
+
+    #[test]
+    fn semantic_file_policy_default_values() {
+        let policy = SemanticFilePolicy::default();
+        assert!(policy.include_code);
+        assert!(policy.include_docs);
+        assert!(!policy.include_configs);
+        assert!(policy.respect_gitignore);
+        assert!(policy.binary_detection);
+        assert!(policy.generated_file_detection);
+        assert_eq!(policy.max_file_size_bytes, 1_048_576);
+        assert!(policy.include_globs.is_empty());
+        assert!(policy.exclude_globs.is_empty());
+    }
+
+    #[test]
+    fn semantic_file_policy_builtins_not_empty() {
+        let policy = SemanticFilePolicy::default();
+        assert!(!policy.builtin_doc_globs.is_empty());
+        assert!(!policy.builtin_exclude_globs.is_empty());
+        // Should include common exclusions
+        assert!(policy
+            .builtin_exclude_globs
+            .iter()
+            .any(|g| g.contains("node_modules")));
+        assert!(policy
+            .builtin_exclude_globs
+            .iter()
+            .any(|g| g.contains("target")));
+    }
+
+    // ── FileRecord and FileManifest tests ───────────────────────────────
+
+    #[test]
+    fn file_record_fields_populated() {
+        let record = FileRecord {
+            content_hash: blake3::hash(b"test content"),
+            size_bytes: 1024,
+            mtime: SystemTime::now(),
+            language: Some("rust".to_string()),
+            document_kind: "code".to_string(),
+            inclusion_policy_hash: "hash123".to_string(),
+            indexed_at: SystemTime::now(),
+        };
+        assert_eq!(record.size_bytes, 1024);
+        assert_eq!(record.language.as_deref(), Some("rust"));
+        assert_eq!(record.document_kind, "code");
+        assert_eq!(record.inclusion_policy_hash, "hash123");
+    }
+
+    #[test]
+    fn build_manifest_from_store_populates_records() {
+        // Create a snapshot with some file metadata
+        let mut store = crate::vector_store::FlatF32VectorStore::new(384);
+        let path_a = PathBuf::from("src/main.rs");
+        let path_b = PathBuf::from("lib/utils.ts");
+        store.file_metadata_mut().insert(
+            path_a.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 500,
+                content_hash: blake3::hash(b"main"),
+            },
+        );
+        store.file_metadata_mut().insert(
+            path_b.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 300,
+                content_hash: blake3::hash(b"utils"),
+            },
+        );
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store,
+            dimension: 384,
+            project_root: PathBuf::from("."),
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+
+        snapshot.build_manifest_from_store();
+
+        assert_eq!(snapshot.file_manifest.len(), 2);
+        let record_a = snapshot.file_manifest.get(&path_a).unwrap();
+        assert_eq!(record_a.size_bytes, 500);
+        assert_eq!(record_a.document_kind, "code");
+
+        let record_b = snapshot.file_manifest.get(&path_b).unwrap();
+        assert_eq!(record_b.size_bytes, 300);
+    }
+
+    #[test]
+    fn build_manifest_from_store_clears_old_entries() {
+        let mut store = crate::vector_store::FlatF32VectorStore::new(384);
+        store.file_metadata_mut().insert(
+            PathBuf::from("src/only.rs"),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 100,
+                content_hash: blake3::hash(b"only"),
+            },
+        );
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store,
+            dimension: 384,
+            project_root: PathBuf::from("."),
+            file_manifest: {
+                let mut m = HashMap::new();
+                m.insert(
+                    PathBuf::from("old/deleted.rs"),
+                    FileRecord {
+                        content_hash: blake3::hash(b"old"),
+                        size_bytes: 999,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        language: None,
+                        document_kind: "code".to_string(),
+                        inclusion_policy_hash: String::new(),
+                        indexed_at: SystemTime::UNIX_EPOCH,
+                    },
+                );
+                m
+            },
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+
+        snapshot.build_manifest_from_store();
+
+        // Old entry should be gone, only new entry remains
+        assert_eq!(snapshot.file_manifest.len(), 1);
+        assert!(snapshot
+            .file_manifest
+            .contains_key(&PathBuf::from("src/only.rs")));
+        assert!(!snapshot
+            .file_manifest
+            .contains_key(&PathBuf::from("old/deleted.rs")));
+    }
 }
 
 #[cfg(test)]
