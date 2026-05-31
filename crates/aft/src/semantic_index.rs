@@ -6673,6 +6673,118 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(index.len(), 1);
     }
+
+    // ── Concurrency tests ──────────────────────────────────────────────
+
+    #[test]
+    fn concurrent_snapshot_clones_are_independent() {
+        // Verify that cloning a snapshot and reading from both doesn't interfere.
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snap1 = index.snapshot.clone();
+        let snap2 = index.snapshot.clone();
+
+        // Both snapshots should search independently
+        let results1 = snap1.search(&[1.0, 0.0, 0.0], 10);
+        let results2 = snap2.search(&[0.0, 1.0, 0.0], 10);
+        assert_eq!(results1.len(), 1);
+        assert_eq!(results2.len(), 1);
+        // Different queries yield different scores
+        assert!(results1[0].score > results2[0].score);
+    }
+
+    #[test]
+    fn concurrent_read_threads_see_same_data() {
+        use std::thread;
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snap = Arc::clone(&index.snapshot);
+        let snap2 = Arc::clone(&index.snapshot);
+
+        let handle1 = thread::spawn(move || snap.search(&[1.0, 0.0, 0.0], 10));
+        let handle2 = thread::spawn(move || snap2.entries_slice().len());
+
+        let results = handle1.join().unwrap();
+        let count = handle2.join().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mutex_contention_does_not_deadlock() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let data = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let data = Arc::clone(&data);
+            handles.push(thread::spawn(move || {
+                let mut guard = data.lock().unwrap();
+                guard.push(i);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = data.lock().unwrap();
+        assert_eq!(guard.len(), 10);
+    }
+
+    #[test]
+    fn arc_clone_count_is_correct() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        assert_eq!(Arc::strong_count(&index.snapshot), 1);
+        let _snap1 = Arc::clone(&index.snapshot);
+        assert_eq!(Arc::strong_count(&index.snapshot), 2);
+        let _snap2 = Arc::clone(&index.snapshot);
+        assert_eq!(Arc::strong_count(&index.snapshot), 3);
+        drop(_snap1);
+        assert_eq!(Arc::strong_count(&index.snapshot), 2);
+    }
 }
 
 #[cfg(test)]
