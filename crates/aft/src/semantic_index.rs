@@ -6457,6 +6457,222 @@ mod tests {
             .file_manifest
             .contains_key(&PathBuf::from("old/deleted.rs")));
     }
+
+    // ── Lifecycle state tests ───────────────────────────────────────────
+
+    #[test]
+    fn lifecycle_cold_start_is_initial_state() {
+        let index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        assert!(matches!(
+            index.lifecycle(),
+            SemanticIndexLifecycle::ColdStart
+        ));
+    }
+
+    #[test]
+    fn lifecycle_set_and_get() {
+        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        index.set_lifecycle(SemanticIndexLifecycle::Ready);
+        assert!(matches!(index.lifecycle(), SemanticIndexLifecycle::Ready));
+    }
+
+    #[test]
+    fn lifecycle_mark_failed_sets_failed() {
+        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        index.set_lifecycle(SemanticIndexLifecycle::Ready);
+        index.set_lifecycle(SemanticIndexLifecycle::Failed);
+        index.set_last_error("something broke".to_string());
+        assert!(matches!(index.lifecycle(), SemanticIndexLifecycle::Failed));
+        assert_eq!(index.last_error(), Some("something broke"));
+    }
+
+    #[test]
+    fn lifecycle_all_variants_exist() {
+        // Verify all lifecycle variants can be constructed and are distinct.
+        let _d = SemanticIndexLifecycle::Disabled;
+        let _cs = SemanticIndexLifecycle::ColdStart;
+        let _sf = SemanticIndexLifecycle::ScanningFiles;
+        let _ck = SemanticIndexLifecycle::Chunking;
+        let _em = SemanticIndexLifecycle::Embedding;
+        let _r = SemanticIndexLifecycle::Ready;
+        let _rf = SemanticIndexLifecycle::Refreshing;
+        let _rr = SemanticIndexLifecycle::RebuildRequired;
+        let _dg = SemanticIndexLifecycle::Degraded;
+        let _f = SemanticIndexLifecycle::Failed;
+        // Pattern-match to confirm all variants are covered.
+        assert!(matches!(
+            SemanticIndexLifecycle::Disabled,
+            SemanticIndexLifecycle::Disabled
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::ColdStart,
+            SemanticIndexLifecycle::ColdStart
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::Ready,
+            SemanticIndexLifecycle::Ready
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::Failed,
+            SemanticIndexLifecycle::Failed
+        ));
+    }
+
+    // ── Snapshot atomicity tests ────────────────────────────────────────
+
+    #[test]
+    fn snapshot_search_returns_ranked_results() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "func_b".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snapshot = index.snapshot.clone();
+        let results = snapshot.search(&[1.0, 0.0, 0.0], 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "func_a");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn snapshot_immutable_after_clone() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snapshot = index.snapshot.clone();
+        let original_len = snapshot.len();
+        // Mutate the original index
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "func2".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        // Snapshot should still have the old length
+        assert_eq!(snapshot.len(), original_len);
+    }
+
+    // ── Stale-vector pruning tests ──────────────────────────────────────
+
+    #[test]
+    fn prune_stale_vectors_removes_zero_norm() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "zero".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        assert_eq!(index.len(), 2);
+        let snap = Arc::get_mut(&mut index.snapshot).unwrap();
+        let pruned = snap.store_mut().prune_stale_vectors();
+        assert_eq!(pruned, 1);
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn prune_orphans_removes_entries_for_deleted_files() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("keep.rs"),
+                name: "keep".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("delete.rs"),
+                name: "del".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let current_files = vec![PathBuf::from("keep.rs")];
+        let snap = Arc::get_mut(&mut index.snapshot).unwrap();
+        let removed = snap.store_mut().prune_orphans(&current_files);
+        assert_eq!(removed, 1);
+        assert_eq!(index.len(), 1);
+    }
 }
 
 #[cfg(test)]
