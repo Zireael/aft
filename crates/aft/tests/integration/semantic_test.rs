@@ -430,7 +430,7 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
             result["source"] == "semantic"
                 && result["file"]
                     .as_str()
-                    .is_some_and(|file| file.ends_with("src/a.rs"))
+                    .is_some_and(|file| file.replace('\\', "/").ends_with("src/a.rs"))
         }),
         "expected semantic result from unchanged file, got {results:?}"
     );
