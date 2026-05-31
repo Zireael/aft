@@ -53,6 +53,8 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
+  /** Maximum number of project files to semantically index (default 20000). */
+  max_files: z.number().int().positive().optional(),
 });
 
 const LspExtensionSchema = z
@@ -161,6 +163,11 @@ const BashFeaturesSchema = z.object({
   subagent_background: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
+  /**
+   * How long foreground bash blocks before auto-promoting the task to
+   * background. Default 8000ms; values below the 5000ms floor are clamped up.
+   */
+  foreground_wait_window_ms: z.number().int().positive().optional(),
 });
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
@@ -445,7 +452,17 @@ export interface ResolvedBashConfig {
   subagent_background: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * Foreground poll window before auto-promotion to background, in ms.
+   * Always resolved: defaults to 8000, floored at 5000.
+   */
+  foreground_wait_window_ms: number;
 }
+
+/** Default foreground wait-window before auto-promotion (ms). */
+export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 8_000;
+/** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
+export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
 
 /**
  * Single source of truth for bash config across the plugin. Resolution
@@ -488,6 +505,15 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const topSubagentBg =
     typeof top === "object" && top !== null ? top.subagent_background === true : false;
 
+  // Foreground wait-window: only the object form can set it; clamp to the
+  // 5000ms floor and default to 8000ms when unset.
+  const rawForegroundWait =
+    typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
+  const foregroundWaitWindowMs = Math.max(
+    FOREGROUND_WAIT_WINDOW_MIN_MS,
+    rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
+  );
+
   const base: ResolvedBashConfig = {
     enabled: false,
     rewrite: false,
@@ -496,6 +522,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     subagent_background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
+    foreground_wait_window_ms: foregroundWaitWindowMs,
   };
 
   // Top-level wins over legacy when both are present.
@@ -944,6 +971,8 @@ function mergeSemanticConfig(
       projectSemantic.timeout_ms = overrideSemantic.timeout_ms;
     if (overrideSemantic.max_batch_size !== undefined)
       projectSemantic.max_batch_size = overrideSemantic.max_batch_size;
+    if (overrideSemantic.max_files !== undefined)
+      projectSemantic.max_files = overrideSemantic.max_files;
   }
 
   const semantic = {

@@ -679,8 +679,40 @@ fn watcher_path_is_infra_skip(path: &std::path::Path) -> bool {
     })
 }
 
-fn watcher_path_is_gitignore(path: &std::path::Path) -> bool {
-    path.file_name().map(|n| n == ".gitignore").unwrap_or(false)
+fn watcher_path_is_ignore_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .map(|n| n == ".gitignore" || n == ".aftignore")
+        .unwrap_or(false)
+}
+
+fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
+    let configured_root = ctx.config().project_root.clone();
+    ctx.canonical_cache_root_opt()
+        .or_else(|| configured_root.map(canonicalize_watcher_path))
+}
+
+fn watcher_path_is_git_info_exclude(
+    project_root: &std::path::Path,
+    path: &std::path::Path,
+) -> bool {
+    path == project_root.join(".git").join("info").join("exclude")
+}
+
+fn watcher_path_can_change_corpus_ignore(
+    project_root: Option<&std::path::Path>,
+    path: &std::path::Path,
+) -> bool {
+    let Some(project_root) = project_root else {
+        return false;
+    };
+    if !path.starts_with(project_root) {
+        return false;
+    }
+    if watcher_path_is_git_info_exclude(project_root, path) {
+        return true;
+    }
+
+    watcher_path_is_ignore_file(path) && !watcher_path_is_infra_skip(path)
 }
 
 fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
@@ -698,22 +730,37 @@ fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
     }
 }
 
-fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> HashSet<std::path::PathBuf>
+struct FilteredWatcherPaths {
+    changed: HashSet<std::path::PathBuf>,
+    ignore_file_changed: bool,
+}
+
+fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> FilteredWatcherPaths
 where
     I: IntoIterator<Item = std::path::PathBuf>,
 {
-    let raw_paths: Vec<std::path::PathBuf> = raw_paths.into_iter().collect();
+    let raw_paths: Vec<std::path::PathBuf> = raw_paths
+        .into_iter()
+        .map(canonicalize_watcher_path)
+        .collect();
+    let project_root = watcher_project_root(ctx);
 
-    // If any .gitignore file changed, rebuild the matcher before filtering
-    // this same batch so sibling events are checked against fresh rules.
-    if raw_paths.iter().any(|path| watcher_path_is_gitignore(path)) {
-        log::debug!("watcher: .gitignore changed, rebuilding matcher before filter");
+    // If any corpus-affecting ignore file changed, rebuild the matcher before
+    // filtering this same batch so sibling events are checked against fresh
+    // rules. The caller also needs this fact even if the ignore file itself is
+    // filtered out: changing ignore rules changes the corpus shape, not just a
+    // single path. Infra ignore files (for example, node_modules/.gitignore) do
+    // not affect AFT's project corpus and should not trigger a corpus refresh.
+    let ignore_file_changed = raw_paths
+        .iter()
+        .any(|path| watcher_path_can_change_corpus_ignore(project_root.as_deref(), path));
+    if ignore_file_changed {
+        log::debug!("watcher: project ignore file changed, rebuilding matcher before filter");
         ctx.rebuild_gitignore();
     }
 
-    raw_paths
+    let changed = raw_paths
         .into_iter()
-        .map(canonicalize_watcher_path)
         .filter(|path| {
             if watcher_path_is_infra_skip(path) {
                 return false;
@@ -732,7 +779,85 @@ where
             }
             true
         })
-        .collect()
+        .collect();
+
+    FilteredWatcherPaths {
+        changed,
+        ignore_file_changed,
+    }
+}
+
+fn refresh_corpus_after_ignore_change(ctx: &AppContext) {
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    let config = ctx.config().clone();
+    let mut status_changed = false;
+
+    if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
+        graph.invalidate_file(&root.join(".gitignore"));
+        graph.invalidate_file(&root.join(".aftignore"));
+    }
+
+    if config.search_index {
+        let index = aft::search_index::SearchIndex::build_with_limit(
+            &root,
+            config.search_index_max_file_size,
+        );
+        if !ctx.is_worktree_bridge() {
+            let cache_dir =
+                aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+            index.write_to_disk(&cache_dir, index.stored_git_head());
+        }
+        *ctx.search_index_rx().borrow_mut() = None;
+        *ctx.search_index().borrow_mut() = Some(index);
+        ctx.reset_symbol_cache();
+        status_changed = true;
+        aft::slog_info!("refreshed search index after ignore-rule change");
+    }
+
+    if config.semantic_search {
+        match aft::search_index::walk_project_files_bounded_default(
+            &root,
+            config.semantic.max_files,
+        ) {
+            Ok(current_files) => {
+                if let Some(sender) = ctx.semantic_refresh_sender() {
+                    let file_count = current_files.len();
+                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                        stage: "refreshing_corpus".to_string(),
+                        files: Some(file_count),
+                        entries_done: None,
+                        entries_total: None,
+                    };
+                    match sender.send(SemanticRefreshRequest::Corpus { current_files }) {
+                        Ok(()) => {
+                            status_changed = true;
+                        }
+                        Err(error) => {
+                            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                                format!("semantic corpus refresh worker unavailable: {error}"),
+                            );
+                            status_changed = true;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                ctx.clear_semantic_refresh_worker();
+                *ctx.semantic_index().borrow_mut() = None;
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(format!(
+                    "too many files (>{}) for semantic indexing (max {})",
+                    config.semantic.max_files, config.semantic.max_files
+                ));
+                status_changed = true;
+            }
+        }
+    }
+
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
 }
 
 /// Borrows the watcher receiver and callgraph in separate phases to avoid
@@ -742,7 +867,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     // Phase 1: collect changed paths from the receiver without applying the
     // gitignore matcher yet; .gitignore writes in this same batch must rebuild
     // the matcher before any sibling path is filtered.
-    let changed: HashSet<std::path::PathBuf> = {
+    let filtered = {
         let rx_ref = ctx.watcher_rx().borrow();
         let rx = match rx_ref.as_ref() {
             Some(rx) => rx,
@@ -785,6 +910,11 @@ fn drain_watcher_events(ctx: &AppContext) {
         filter_watcher_raw_paths(ctx, raw_paths)
     }; // receiver borrow dropped here
 
+    if filtered.ignore_file_changed {
+        refresh_corpus_after_ignore_change(ctx);
+    }
+
+    let changed = filtered.changed;
     if changed.is_empty() {
         return;
     }
@@ -851,7 +981,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     if !semantic_refresh_paths.is_empty() {
         let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
             sender
-                .send(SemanticRefreshRequest {
+                .send(SemanticRefreshRequest::Files {
                     paths: semantic_refresh_paths.clone(),
                 })
                 .is_ok()
@@ -1000,6 +1130,26 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     status_changed = true;
                 }
             }
+            SemanticRefreshEvent::CorpusCompleted {
+                index,
+                changed,
+                added,
+                deleted,
+                total_processed,
+            } => {
+                if changed > 0 || added > 0 || deleted > 0 {
+                    aft::slog_info!(
+                        "semantic corpus refresh completed: {} changed, {} new, {} deleted, {} total processed",
+                        changed,
+                        added,
+                        deleted,
+                        total_processed
+                    );
+                }
+                *ctx.semantic_index().borrow_mut() = Some(index);
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                status_changed = true;
+            }
             SemanticRefreshEvent::Failed { paths, error } => {
                 aft::slog_warn!("semantic refresh failed: {}", error);
                 let mut status = ctx.semantic_index_status().borrow_mut();
@@ -1009,6 +1159,12 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     }
                     status_changed = true;
                 }
+            }
+            SemanticRefreshEvent::CorpusFailed { error } => {
+                aft::slog_warn!("semantic corpus refresh failed: {}", error);
+                *ctx.semantic_index().borrow_mut() = None;
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
+                status_changed = true;
             }
         }
     }
@@ -1296,8 +1452,48 @@ mod watcher_filter_tests {
         let gitignore = std::fs::canonicalize(gitignore).unwrap();
         let ignored = std::fs::canonicalize(ignored).unwrap();
         let kept = std::fs::canonicalize(kept).unwrap();
-        assert!(changed.contains(&gitignore));
-        assert!(!changed.contains(&ignored));
-        assert!(changed.contains(&kept));
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.contains(&gitignore));
+        assert!(!changed.changed.contains(&ignored));
+        assert!(changed.changed.contains(&kept));
+    }
+
+    #[test]
+    fn infra_ignore_file_does_not_request_corpus_refresh_but_project_aftignore_does() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let infra_gitignore = root.join("node_modules").join("pkg").join(".gitignore");
+        std::fs::create_dir_all(infra_gitignore.parent().unwrap()).unwrap();
+        std::fs::write(&infra_gitignore, "dist/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![infra_gitignore]);
+
+        assert!(!changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+
+        let aftignore = root.join(".aftignore");
+        std::fs::write(&aftignore, "ignored/\n").unwrap();
+        let changed = filter_watcher_raw_paths(&ctx, vec![aftignore.clone()]);
+
+        let aftignore = std::fs::canonicalize(aftignore).unwrap();
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.contains(&aftignore));
+    }
+
+    #[test]
+    fn project_git_info_exclude_requests_corpus_refresh_without_indexing_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git_info = root.join(".git").join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        let exclude = git_info.join("exclude");
+        std::fs::write(&exclude, "ignored/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![exclude]);
+
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
     }
 }

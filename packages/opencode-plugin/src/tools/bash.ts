@@ -22,7 +22,8 @@ const METADATA_PREVIEW_LIMIT = 30 * 1024;
 // promoting the task to background and returning. INTENTIONALLY decoupled
 // from the task's own kill cap (`args.timeout`). Council decision:
 // .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-const FOREGROUND_WAIT_WINDOW_MS = 5_000;
+// The value is resolved per-call from bash config (default 8000ms, floored at
+// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
 const FOREGROUND_POLL_INTERVAL_MS = 100;
 // Bridge transport timeout for `bash` calls. The Rust handler returns a
 // `running` status immediately and the plugin polls separately, so transport
@@ -96,7 +97,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           "Shell command to execute through AFT's unified bash schema. Supports normal shell syntax, pipes, redirection, and command rewriting to dedicated AFT tools when available.",
         ),
       timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-        "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~5s; otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
+        "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
       ),
       workdir: z
         .string()
@@ -144,7 +145,8 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty
-      // parentID). AFT bash auto-promotes anything >~5s to background, but a
+      // parentID). AFT bash auto-promotes long foreground tasks to background
+      // (default ~8s, configurable via bash.foreground_wait_window_ms), but a
       // subagent terminates after its single response and cannot survive
       // backgrounding: any task_id we returned would be unreachable because
       // the subagent has no chance to call bash_status. So for subagents we
@@ -240,7 +242,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
 
         // Wait-window is decoupled from `args.timeout`. For primary sessions
         // we always cap the foreground polling window at
-        // FOREGROUND_WAIT_WINDOW_MS so agents get a fast "promoted" response
+        // foregroundWaitMs so agents get a fast "promoted" response
         // for unexpectedly long commands. If the agent passed a shorter
         // explicit `timeout`, honor that — there's no point polling longer
         // than the task can possibly survive.
@@ -256,11 +258,12 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         // Schema validation guarantees `args.timeout` is a positive
         // integer or undefined, so these expressions are well-defined.
         const argTimeout = args.timeout as number | undefined;
+        const foregroundWaitMs = bashCfg.foreground_wait_window_ms;
         const waitTimeoutMs = subagentForcedForeground
           ? (argTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
           : argTimeout !== undefined
-            ? Math.min(argTimeout, FOREGROUND_WAIT_WINDOW_MS)
-            : FOREGROUND_WAIT_WINDOW_MS;
+            ? Math.min(argTimeout, foregroundWaitMs)
+            : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
           const status = await callBridge(ctx, context, "bash_status", { task_id: taskId });
@@ -289,7 +292,11 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(context.sessionID, taskId);
-            let message = formatPromotionMessage(taskId, args.timeout as number | undefined);
+            let message = formatPromotionMessage(
+              taskId,
+              args.timeout as number | undefined,
+              foregroundWaitMs,
+            );
             if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
             const metadataPayload = { description, output: message, status: "running", taskId };
             metadata?.(metadataPayload);
@@ -513,17 +520,22 @@ function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
-function formatPromotionMessage(taskId: string, timeout: number | undefined): string {
-  // We waited up to FOREGROUND_WAIT_WINDOW_MS, or shorter if the agent's
-  // explicit timeout capped us first. Report the actual elapsed wait so the
-  // message is accurate. We do NOT echo the original command back — the
-  // agent already has it in its own tool-call args, and bash_status returns
-  // it on demand.
-  const waited =
-    timeout !== undefined
-      ? Math.min(timeout, FOREGROUND_WAIT_WINDOW_MS)
-      : FOREGROUND_WAIT_WINDOW_MS;
-  return `Foreground bash didn't finish within ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
+function formatPromotionMessage(
+  taskId: string,
+  timeout: number | undefined,
+  waitWindowMs: number,
+): string {
+  // We waited up to waitWindowMs, or shorter if the agent's explicit timeout
+  // capped us first. Report the actual elapsed wait so the message is
+  // accurate. We do NOT echo the original command back — the agent already
+  // has it in its own tool-call args, and bash_status returns it on demand.
+  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
+  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
+}
+
+/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
+function formatSeconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(1))}s`;
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {

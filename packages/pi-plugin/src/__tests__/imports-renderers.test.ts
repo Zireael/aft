@@ -52,6 +52,30 @@ describe("import renderer", () => {
     expect(organize).toContain("duplicates removed 3");
   });
 
+  test("renderImportResult distinguishes a real remove from a no-op", () => {
+    const removed = renderToString(
+      renderImportResult(
+        makeResult("", { file: "src/a.ts", module: "react", removed: true }),
+        { op: "remove", filePath: "src/a.ts", module: "react" },
+        mockTheme,
+        makeContext({ op: "remove", filePath: "src/a.ts", module: "react" }),
+      ),
+    );
+    const noop = renderToString(
+      renderImportResult(
+        makeResult("", { file: "src/a.ts", module: "react", removed: false }),
+        { op: "remove", filePath: "src/a.ts", module: "react" },
+        mockTheme,
+        makeContext({ op: "remove", filePath: "src/a.ts", module: "react" }),
+      ),
+    );
+
+    expect(removed).toContain("removed react");
+    // A no-op must not claim it removed anything.
+    expect(noop).toContain("not present react");
+    expect(noop).not.toContain("removed react");
+  });
+
   test("renderImportResult handles error and empty payloads", () => {
     const error = renderToString(
       renderImportResult(

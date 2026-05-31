@@ -155,6 +155,182 @@ fn add_import_ts_relative_group() {
 }
 
 #[test]
+fn add_import_ts_allows_parent_relative_module() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("parent_relative.ts");
+    fs::write(&file, "export const x = 1;\n").unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-parent-relative",
+        &file.display().to_string(),
+        "../config",
+        Some(&["Config"]),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "relative add should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import { Config } from '../config';"),
+        "single-parent ES relative imports must remain allowed:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_c_allows_parent_relative_include() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("relative_include.c");
+    fs::write(&file, "int main(void) { return 0; }\n").unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-c-parent-relative",
+        &file.display().to_string(),
+        "\"../foo.h\"",
+        None,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "parent-relative C include should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("#include \"../foo.h\""),
+        "C include should preserve the parent-relative local path:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_solidity_allows_parent_relative_import() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("RelativeImport.sol");
+    fs::write(
+        &file,
+        "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+    )
+    .unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-sol-parent-relative",
+        &file.display().to_string(),
+        "../lib/X.sol",
+        None,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "parent-relative Solidity import should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import \"../lib/X.sol\";"),
+        "Solidity import should preserve the parent-relative path:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_c_rejects_absolute_modules() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("unsafe_include.c");
+    let original = "int main(void) { return 0; }\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    for (id, module) in [
+        ("imp-c-posix-absolute", "/etc/passwd"),
+        ("imp-c-drive-absolute", "C:\\evil"),
+        ("imp-c-unc-absolute", "\\\\srv\\x"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "absolute module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            original,
+            "rejected module {module:?} must not mutate the file"
+        );
+    }
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_java_and_php_reject_filesystem_modules() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+
+    let java_file = dir.path().join("Unsafe.java");
+    let java_original = "package demo;\n\nclass Unsafe {}\n";
+    fs::write(&java_file, java_original).unwrap();
+    let java_file_str = java_file.display().to_string();
+
+    for (id, module) in [
+        ("imp-java-parent", "../evil"),
+        ("imp-java-slash", "/evil"),
+        ("imp-java-drive", "C:\\evil"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &java_file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "Java filesystem module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(fs::read_to_string(&java_file).unwrap(), java_original);
+    }
+
+    let php_file = dir.path().join("unsafe.php");
+    let php_original = "<?php\n\nnamespace Demo;\n\nclass C {}\n";
+    fs::write(&php_file, php_original).unwrap();
+    let php_file_str = php_file.display().to_string();
+
+    for (id, module) in [
+        ("imp-php-parent", "..\\Evil"),
+        ("imp-php-slash", "/tmp/Evil"),
+        ("imp-php-drive", "C:\\evil"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &php_file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "PHP filesystem module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(fs::read_to_string(&php_file).unwrap(), php_original);
+    }
+
+    fs::remove_file(&java_file).ok();
+    fs::remove_file(&php_file).ok();
+    aft.shutdown();
+}
+
+#[test]
 fn add_import_ts_dedup() {
     let mut aft = AftProcess::spawn();
     let (_dir, file) = temp_copy("imports_ts.ts");
@@ -345,7 +521,10 @@ fn add_import_unsupported_language_returns_error() {
         resp["success"], false,
         "should fail for unsupported language"
     );
-    assert_eq!(resp["code"], "invalid_request");
+    assert_eq!(
+        resp["code"], "unsupported_language",
+        "unsupported file type uses the actionable standardized code, not invalid_request"
+    );
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -829,6 +1008,31 @@ fn remove_import_missing_module_reports_not_removed() {
     assert_eq!(resp["success"], true, "request should complete: {resp:?}");
     assert_eq!(resp["removed"], false, "nothing should be removed");
     assert_eq!(resp["reason"], "module_not_found");
+    assert_eq!(resp["no_op"], true, "no-match removes must report no_op");
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn remove_import_missing_name_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let (_dir, file) = temp_copy("imports_ts.ts");
+    let file_str = file.display().to_string();
+
+    let resp = send_remove_import(
+        &mut aft,
+        "rm-missing-name",
+        &file_str,
+        "react",
+        Some("useMemo"),
+    );
+
+    assert_eq!(resp["success"], true, "request should complete: {resp:?}");
+    assert_eq!(resp["removed"], false, "nothing should be removed");
+    assert_eq!(resp["reason"], "name_not_found");
+    assert_eq!(resp["name"], "useMemo");
+    assert_eq!(resp["no_op"], true, "name misses must report no_op");
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -876,6 +1080,71 @@ fn remove_import_preserves_default_when_named_removed() {
 // ===========================================================================
 // organize_imports tests
 // ===========================================================================
+
+#[test]
+fn organize_imports_without_imports_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("no_imports.ts");
+    let original = "export const x = 1;\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-no-imports", &file.display().to_string());
+
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
+    assert_eq!(resp["removed_duplicates"], 0);
+    assert_eq!(resp["no_op"], true, "no-import organize must report no_op");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_rejects_multi_namespace_php_without_mutating() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("multi_namespace.php");
+    let original = r#"<?php
+
+namespace Foo {
+use Zed\Last;
+
+class X {}
+}
+
+namespace Bar {
+use App\Alpha;
+
+class Y {}
+}
+"#;
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-multi-php", &file.display().to_string());
+
+    assert_eq!(
+        resp["success"], false,
+        "multi-namespace PHP organize should be refused: {resp:?}"
+    );
+    assert_eq!(resp["code"], "multi_region_imports");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("span multiple code regions"),
+        "error should explain the multi-region refusal: {resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "refused organize must leave the PHP file byte-for-byte unchanged"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
 
 #[test]
 fn organize_imports_ts_regroups_and_sorts() {

@@ -19,7 +19,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
   return {
     aft_import: {
       description:
-        "Language-aware import management. Supports TS, JS, TSX, Python, Rust, and Go.\n\n" +
+        "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.\n\n" +
         "Ops:\n" +
         "- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n" +
         "- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n" +
@@ -36,8 +36,40 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         names: z
           .array(z.string())
           .optional()
-          .describe("Named imports to add (e.g. ['useState', 'useEffect'])"),
-        defaultImport: z.string().optional().describe("Default import name (e.g. 'React')"),
+          .describe(
+            "Named imports to add. Each entry uses the language's native named-import text, " +
+              "including per-name aliasing where the language uses `as` (e.g. ['useState', 'debounce as db'], " +
+              "Solidity ['ERC20', 'IERC20 as IToken']).",
+          ),
+        defaultImport: z
+          .string()
+          .optional()
+          .describe("Default import name, ES only (e.g. 'React')"),
+        namespace: z
+          .string()
+          .optional()
+          .describe(
+            "Namespace binding: `import * as ns from 'mod'` (ES), `import * as N from \"./X.sol\"` (Solidity).",
+          ),
+        alias: z
+          .string()
+          .optional()
+          .describe(
+            'Whole-module alias. Solidity: `import "./X.sol" as X` (module=path, alias=X).',
+          ),
+        modifiers: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Statement-level modifier tokens, language-validated: Java/C# 'static'; C# 'global'/'unsafe'; " +
+              "Java/Kotlin/Scala 'wildcard'; Swift '@testable'. Unsupported tokens for the file's language return a clear error.",
+          ),
+        importKind: z
+          .string()
+          .optional()
+          .describe(
+            "Symbol-kind-specific import: PHP 'function'/'const'; Swift 'struct'/'class'/'enum'/'protocol'/'func'; Scala 'given'.",
+          ),
         typeOnly: z.boolean().optional().describe("Type-only import (TS only, default: false)"),
         removeName: z
           .string()
@@ -81,6 +113,10 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         if (args.module !== undefined) params.module = args.module;
         if (args.names !== undefined) params.names = args.names;
         if (args.defaultImport !== undefined) params.default_import = args.defaultImport;
+        if (args.namespace !== undefined) params.namespace = args.namespace;
+        if (args.alias !== undefined) params.alias = args.alias;
+        if (args.modifiers !== undefined) params.modifiers = args.modifiers;
+        if (args.importKind !== undefined) params.import_kind = args.importKind;
         if (args.typeOnly !== undefined) params.type_only = args.typeOnly;
         if (args.removeName !== undefined) params.name = args.removeName;
         if (args.validate !== undefined) params.validate = args.validate;

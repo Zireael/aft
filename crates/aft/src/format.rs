@@ -408,6 +408,51 @@ fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<S
     ordered
 }
 
+/// Try spawning the tool via the inherited PATH. Returns the bare command
+/// name on success (downstream `Command::new` re-resolves through PATH),
+/// or None if the spawn fails or the tool exits with non-zero status.
+fn try_path_lookup(command: &str) -> Option<PathBuf> {
+    let probe_args = path_lookup_probe_args(command);
+    let mut child = Command::new(command)
+        .args(probe_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Some(PathBuf::from(command))
+                } else {
+                    None
+                };
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn path_lookup_probe_args(command: &str) -> &'static [&'static str] {
+    match command {
+        // Go uses `go version` rather than a POSIX-style `--version` flag.
+        "go" => &["version"],
+        // `gofmt` has no version flag. It exits successfully with empty stdin,
+        // which is sufficient for PATH availability probing.
+        "gofmt" => &[],
+        _ => &["--version"],
+    }
+}
+
 /// Look up `command` in the well-known install locations that GUI-launched
 /// editors commonly miss from PATH. Returns the absolute path so the caller
 /// invokes the tool via `Command::new(absolute_path)` regardless of PATH.
@@ -415,9 +460,12 @@ fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<S
 /// Search order is built by `well_known_search_paths`:
 /// 1. `/opt/homebrew/bin` (Apple Silicon Homebrew)
 /// 2. `/usr/local/bin` (Intel Mac Homebrew + most manual Linux installs)
-/// 3. `$HOME/.cargo/bin` (cargo install — rustfmt, etc.)
-/// 4. `$HOME/go/bin` (`go install` default GOPATH layout)
-/// 5. `$HOME/.local/bin` (pip --user, pipx, npm prefix, many shell scripts)
+/// 3. `/usr/local/go/bin` (official go.dev installer)
+/// 4. `/usr/bin` (distro-packaged tools)
+/// 5. `/snap/bin` (snap-packaged tools)
+/// 6. `$HOME/.cargo/bin` (cargo install — rustfmt, etc.)
+/// 7. `$HOME/go/bin` (`go install` default GOPATH layout)
+/// 8. `$HOME/.local/bin` (pip --user, pipx, npm prefix, many shell scripts)
 ///
 /// Each candidate is verified to (a) exist as a regular file and (b) be
 /// executable; we don't spawn `--version` here because spawning an
@@ -449,9 +497,16 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
 /// Extracted so tests can drive the lookup with a controlled HOME without
 /// mutating process-global env vars.
 fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(8);
     candidates.push(PathBuf::from("/opt/homebrew/bin").join(command));
     candidates.push(PathBuf::from("/usr/local/bin").join(command));
+    // System/distro install locations a GUI-launched editor's truncated PATH
+    // often misses. /usr/local/go/bin is where the official go.dev installer
+    // puts the Go toolchain (gofmt, go); /snap/bin and /usr/bin cover
+    // distro-packaged installs (Go from apt/snap, etc.).
+    candidates.push(PathBuf::from("/usr/local/go/bin").join(command));
+    candidates.push(PathBuf::from("/usr/bin").join(command));
+    candidates.push(PathBuf::from("/snap/bin").join(command));
     if let Some(home) = home {
         let home_path = PathBuf::from(home);
         candidates.push(home_path.join(".cargo/bin").join(command));
@@ -2300,6 +2355,13 @@ mod tests {
     }
 
     #[test]
+    fn path_lookup_probe_args_match_go_tool_conventions() {
+        assert_eq!(path_lookup_probe_args("go"), &["version"]);
+        assert!(path_lookup_probe_args("gofmt").is_empty());
+        assert_eq!(path_lookup_probe_args("rustfmt"), &["--version"]);
+    }
+
+    #[test]
     fn auto_format_unsupported_language() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
@@ -2897,19 +2959,25 @@ mod tests {
         // tool wins over a HOME-rooted shim.
         assert_eq!(strs[0], "/opt/homebrew/bin/toolx");
         assert_eq!(strs[1], "/usr/local/bin/toolx");
-        assert_eq!(strs[2], "/Users/test-home/.cargo/bin/toolx");
-        assert_eq!(strs[3], "/Users/test-home/go/bin/toolx");
-        assert_eq!(strs[4], "/Users/test-home/.local/bin/toolx");
-        assert_eq!(strs.len(), 5);
+        assert_eq!(strs[2], "/usr/local/go/bin/toolx");
+        assert_eq!(strs[3], "/usr/bin/toolx");
+        assert_eq!(strs[4], "/snap/bin/toolx");
+        assert_eq!(strs[5], "/Users/test-home/.cargo/bin/toolx");
+        assert_eq!(strs[6], "/Users/test-home/go/bin/toolx");
+        assert_eq!(strs[7], "/Users/test-home/.local/bin/toolx");
+        assert_eq!(strs.len(), 8);
     }
 
     #[cfg(unix)]
     #[test]
     fn well_known_search_paths_skips_home_when_unset() {
         let paths = well_known_search_paths("toolx", None);
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 5);
         assert!(paths[0].ends_with("opt/homebrew/bin/toolx"));
         assert!(paths[1].ends_with("usr/local/bin/toolx"));
+        assert!(paths[2].ends_with("usr/local/go/bin/toolx"));
+        assert!(paths[3].ends_with("usr/bin/toolx"));
+        assert!(paths[4].ends_with("snap/bin/toolx"));
     }
 
     #[cfg(unix)]
@@ -3217,10 +3285,11 @@ C:\repo\other.go:1:1: other file
 
         fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
         fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
-        let go_config = Config {
+        let mut go_config = Config {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
         };
+        go_config.checker.insert("go".to_string(), "go".to_string());
         let (go_cmd, _) =
             detect_type_checker(&dir.path().join("main.go"), LangId::Go, &go_config).unwrap();
         assert_eq!(go_cmd, bin_dir.join("go").to_string_lossy());

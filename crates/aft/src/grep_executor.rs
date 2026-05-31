@@ -113,6 +113,12 @@ pub fn compute_filter_root(
 
 pub fn scope_has_files(project_root: &Path, scope: &GrepScope) -> bool {
     scope.roots.iter().any(|root| {
+        // An explicitly-named existing file is always in scope (it's searched
+        // directly even if gitignored / .aftignored), so don't report it as
+        // "no files matched scope".
+        if root.search_root.is_file() {
+            return true;
+        }
         walk_project_files_from(
             &root.filter_root,
             &root.search_root,
@@ -224,6 +230,19 @@ fn execute_root(
     max_results: usize,
     project_root: &Path,
 ) -> GrepResult {
+    // Explicit single-file scope: search the named file directly, bypassing the
+    // trigram index and the gitignore/.aftignore-aware walk. Matches ripgrep,
+    // where naming a file explicitly searches it even when it is gitignored,
+    // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
+    if root.search_root.is_file() {
+        let index_status = if root.use_index {
+            current_index_status(ctx)
+        } else {
+            IndexStatus::Fallback
+        };
+        return grep_explicit_file(&root.search_root, pattern, max_results, index_status);
+    }
+
     let search_index = ctx.search_index().borrow();
     match search_index.as_ref() {
         Some(index) if index.ready && root.use_index => index.search_grep(
@@ -237,6 +256,7 @@ fn execute_root(
             if !root.use_index {
                 if let Some(result) = ripgrep_grep(
                     &root.search_root,
+                    project_root,
                     pattern,
                     &params.include,
                     &params.exclude,
@@ -261,6 +281,49 @@ fn execute_root(
                 index_status,
             )
         }
+    }
+}
+
+/// Grep a single explicitly-named file directly, bypassing the trigram index
+/// and the gitignore/.aftignore-aware walk. Used when the caller's `path`
+/// resolves to one existing file — ripgrep semantics: an explicitly-named file
+/// is searched even when it is gitignored, `.aftignore`d, or not yet indexed.
+/// Binary detection and UTF-8 guards still apply (via `read_searchable_text`
+/// inside `fallback_search_file`).
+fn grep_explicit_file(
+    file: &Path,
+    pattern: &CompiledPattern,
+    max_results: usize,
+    index_status: IndexStatus,
+) -> GrepResult {
+    let total_matches = AtomicUsize::new(0);
+    let files_searched = AtomicUsize::new(0);
+    let files_with_matches = AtomicUsize::new(0);
+    let truncated = AtomicBool::new(false);
+    let engine_capped = AtomicBool::new(false);
+    let stop_after = max_results.saturating_mul(2);
+
+    let matches = fallback_search_file(
+        &file.to_path_buf(),
+        pattern,
+        max_results,
+        stop_after,
+        &total_matches,
+        &files_searched,
+        &files_with_matches,
+        &truncated,
+        &engine_capped,
+    );
+
+    GrepResult {
+        total_matches: total_matches.load(Ordering::Relaxed),
+        matches,
+        files_searched: files_searched.load(Ordering::Relaxed),
+        files_with_matches: files_with_matches.load(Ordering::Relaxed),
+        index_status,
+        truncated: truncated.load(Ordering::Relaxed),
+        fully_degraded: false,
+        engine_capped: engine_capped.load(Ordering::Relaxed),
     }
 }
 
@@ -522,6 +585,7 @@ fn should_stop_fallback_search(
 
 fn ripgrep_grep(
     search_root: &Path,
+    project_root: &Path,
     pattern: &CompiledPattern,
     include: &[String],
     exclude: &[String],
@@ -530,6 +594,9 @@ fn ripgrep_grep(
     let rg = which_rg()?;
     let mut cmd = Command::new(rg);
     cmd.args(["-nH", "--hidden", "--no-messages", "--json"]);
+    if let Some(ignore_file) = aftignore_file_for_ripgrep(search_root, project_root) {
+        cmd.arg("--ignore-file").arg(ignore_file);
+    }
     if pattern.case_insensitive() {
         cmd.arg("-i");
     }
@@ -613,6 +680,16 @@ fn ripgrep_grep(
         fully_degraded: true,
         engine_capped,
     })
+}
+
+fn aftignore_file_for_ripgrep(search_root: &Path, project_root: &Path) -> Option<PathBuf> {
+    let search_ignore = search_root.join(".aftignore");
+    if search_ignore.is_file() {
+        return Some(search_ignore);
+    }
+
+    let project_ignore = project_root.join(".aftignore");
+    project_ignore.is_file().then_some(project_ignore)
 }
 
 pub(crate) fn ripgrep_glob(

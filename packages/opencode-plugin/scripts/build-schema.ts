@@ -211,7 +211,7 @@ function buildSchema(): Record<string, unknown> {
                 type: "boolean",
                 default: true,
                 description:
-                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag.",
+                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
               },
               long_running_reminder_enabled: {
                 type: "boolean",
@@ -225,6 +225,13 @@ function buildSchema(): Record<string, unknown> {
                 default: 600000,
                 description:
                   "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+              },
+              foreground_wait_window_ms: {
+                type: "integer",
+                minimum: 5000,
+                default: 8000,
+                description:
+                  "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
               },
             },
             additionalProperties: false,
@@ -379,6 +386,13 @@ function buildSchema(): Record<string, unknown> {
             type: "integer",
             minimum: 1,
             description: "Maximum batch size used by the semantic embedding pipeline.",
+          },
+          max_files: {
+            type: "integer",
+            minimum: 1,
+            default: 20000,
+            description:
+              "Maximum number of project files to semantically index (default 20000). Guards local fastembed memory on large roots; raise it for remote backends that embed server-side.",
           },
         },
         additionalProperties: false,

@@ -85,7 +85,7 @@ function externalDirectoryPromptTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
 }
 
-async function assertExternalDirectoryPermission(
+export async function assertExternalDirectoryPermission(
   extCtx: {
     cwd: string;
     hasUI?: boolean;
@@ -718,7 +718,7 @@ function shortenPath(path: string): string {
 }
 
 /** Resolve a path argument to an absolute path if it exists, expanding `~`. */
-async function resolvePathArg(cwd: string, path: string): Promise<string> {
+export async function resolvePathArg(cwd: string, path: string): Promise<string> {
   const expanded = expandTilde(path);
   const abs = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
   try {

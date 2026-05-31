@@ -236,8 +236,9 @@ pub enum SemanticIndexEvent {
 }
 
 #[derive(Debug, Clone)]
-pub struct SemanticRefreshRequest {
-    pub paths: Vec<PathBuf>,
+pub enum SemanticRefreshRequest {
+    Files { paths: Vec<PathBuf> },
+    Corpus { current_files: Vec<PathBuf> },
 }
 
 #[derive(Debug)]
@@ -250,8 +251,18 @@ pub enum SemanticRefreshEvent {
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: Vec<PathBuf>,
     },
+    CorpusCompleted {
+        index: SemanticIndex,
+        changed: usize,
+        added: usize,
+        deleted: usize,
+        total_processed: usize,
+    },
     Failed {
         paths: Vec<PathBuf>,
+        error: String,
+    },
+    CorpusFailed {
         error: String,
     },
 }
@@ -618,6 +629,20 @@ impl AppContext {
                 );
             }
         }
+        // Root .aftignore — AFT-specific ignores layered on top of .gitignore.
+        // Lets users exclude paths git can't (e.g. submodules) from AFT's
+        // walks/indexes. Honored by the watcher matcher too, so edits under an
+        // aftignored path don't trigger reindexing.
+        let root_aftignore = Path::new(&root).join(".aftignore");
+        if root_aftignore.exists() {
+            if let Some(err) = builder.add(&root_aftignore) {
+                crate::slog_warn!(
+                    "aftignore parse error in {}: {}",
+                    root_aftignore.display(),
+                    err
+                );
+            }
+        }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
         // does not auto-discover it (verified against ignore-0.4.25 source).
         let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
@@ -630,17 +655,16 @@ impl AppContext {
                 );
             }
         }
-        // Walk the project to pick up nested .gitignore files. Cap the walk
-        // at the same SOURCE_WALK_LIMIT used by other configure-time walks
-        // (currently 20000 files); gitignore lookup-cost stays bounded for
-        // huge monorepos. Skip the obvious infra dirs so we don't accidentally
-        // load a vendored repo's .gitignore that doesn't apply to ours.
+        // Walk the project to pick up nested .gitignore/.aftignore files at
+        // arbitrary depth. The main project walkers honor deeply nested ignore
+        // files, so the watcher matcher must do the same or live invalidation
+        // can disagree with startup indexing. Skip obvious infra dirs so we
+        // don't accidentally load a vendored repo's ignore file as ours.
         let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(true)
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.
             .hidden(false)
-            .max_depth(Some(8))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(
@@ -650,10 +674,13 @@ impl AppContext {
             })
             .build();
         for entry in walker.flatten() {
-            if entry.file_name() == ".gitignore" && entry.path() != root_ignore {
+            let file_name = entry.file_name();
+            let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
+            let is_nested_aftignore = file_name == ".aftignore" && entry.path() != root_aftignore;
+            if is_nested_gitignore || is_nested_aftignore {
                 if let Some(err) = builder.add(entry.path()) {
                     crate::slog_warn!(
-                        "nested gitignore parse error in {}: {}",
+                        "nested ignore parse error in {}: {}",
                         entry.path().display(),
                         err
                     );

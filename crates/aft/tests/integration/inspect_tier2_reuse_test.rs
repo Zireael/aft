@@ -102,16 +102,16 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     let inspect_dir = root.join(".aft-cache").join("inspect");
 
     let first_manager = InspectManager::new();
-    let (first, t1) = run_reuse(&first_manager, snapshot(&root, &inspect_dir));
+    let (first, _t1) = run_reuse(&first_manager, snapshot(&root, &inspect_dir));
     assert_eq!(first.scanned_files.len(), 32);
     assert!(first.aggregate["groups_count"].as_u64().unwrap_or(0) > 0);
 
     let second_manager = InspectManager::new();
-    let (second, t2) = run_reuse(&second_manager, snapshot(&root, &inspect_dir));
-    assert!(
-        t2 < t1 / 2 || t1.saturating_sub(t2) > Duration::from_millis(5),
-        "cached Tier 2 run should be substantially faster: first={t1:?} second={t2:?}"
-    );
+    let (second, _t2) = run_reuse(&second_manager, snapshot(&root, &inspect_dir));
+    // Cache reuse is proven behaviorally: a fully-fresh second run rescans
+    // zero files and returns the identical aggregate. (A wall-clock "faster"
+    // assertion was removed — it flaked under parallel test load while adding
+    // no signal beyond the scanned_files/aggregate checks below.)
     assert!(second.scanned_files.is_empty());
     assert_eq!(second.aggregate, first.aggregate);
 

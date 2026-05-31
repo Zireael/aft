@@ -293,7 +293,7 @@ impl SearchIndex {
         Self::build_with_limit(root, DEFAULT_MAX_FILE_SIZE)
     }
 
-    pub(crate) fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
+    pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
         let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut index = SearchIndex {
             project_root: project_root.clone(),
@@ -1012,7 +1012,7 @@ impl SearchIndex {
         })
     }
 
-    pub(crate) fn stored_git_head(&self) -> Option<&str> {
+    pub fn stored_git_head(&self) -> Option<&str> {
         self.git_head.as_deref()
     }
 
@@ -1464,17 +1464,46 @@ pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<Path
     walk_project_files_from(root, root, filters)
 }
 
+pub(crate) fn walk_project_files_bounded(
+    root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+) -> Result<Vec<PathBuf>, usize> {
+    walk_project_files_from_inner(root, root, filters, Some(max_files))
+}
+
+pub fn walk_project_files_bounded_default(
+    root: &Path,
+    max_files: usize,
+) -> Result<Vec<PathBuf>, usize> {
+    walk_project_files_from_inner(root, root, &PathFilters::default(), Some(max_files))
+}
+
 pub(crate) fn walk_project_files_from(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
 ) -> Vec<PathBuf> {
+    walk_project_files_from_inner(filter_root, search_root, filters, None)
+        .expect("unbounded project walk cannot exceed a file limit")
+}
+
+fn walk_project_files_from_inner(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: Option<usize>,
+) -> Result<Vec<PathBuf>, usize> {
     let mut builder = WalkBuilder::new(search_root);
     builder
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        // `.aftignore` — AFT-specific ignores layered on top of .gitignore.
+        // Honored hierarchically like .gitignore (works in non-git projects too),
+        // so users can exclude paths git can't (e.g. submodules) from indexing.
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -1505,11 +1534,14 @@ pub(crate) fn walk_project_files_from(
         let path = entry.into_path();
         if filters.matches(filter_root, &path) {
             files.push(path);
+            if max_files.is_some_and(|limit| files.len() > limit) {
+                return Err(files.len());
+            }
         }
     }
 
     sort_paths_by_mtime_desc(&mut files);
-    files
+    Ok(files)
 }
 
 pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {

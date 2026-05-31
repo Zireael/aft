@@ -877,6 +877,7 @@ fn collect_degraded_grep_files(project_root: &Path) -> (Vec<PathBuf>, bool) {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             if entry
@@ -1795,6 +1796,7 @@ mod tests {
                     api_key_env: None,
                     timeout_ms: 5_000,
                     max_batch_size: 64,
+                    max_files: 20_000,
                 },
                 ..Config::default()
             },

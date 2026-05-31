@@ -10,6 +10,7 @@
 //! `use std::path::{Path, PathBuf};`). This implements D045's deferred merging.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::context::AppContext;
@@ -56,7 +57,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {
             return Response::error(
                 &req.id,
-                "invalid_request",
+                "unsupported_language",
                 format!(
                     "organize_imports: unsupported file extension: {}",
                     path.extension()
@@ -70,7 +71,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     if !imports::is_supported(lang) {
         return Response::error(
             &req.id,
-            "invalid_request",
+            "unsupported_language",
             format!(
                 "organize_imports: import management not yet supported for {:?}",
                 lang
@@ -86,6 +87,12 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&_tree) {
+            return Response::error(&req.id, err.code(), err.message("organize_imports"));
+        }
+    }
+
     if block.imports.is_empty() {
         log::debug!("organize_imports: {} (no imports)", file);
         return Response::success(
@@ -94,7 +101,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
                 "file": file,
                 "groups": [],
                 "removed_duplicates": 0,
+                "no_op": true,
             }),
+        );
+    }
+
+    if imports_span_multiple_code_regions(&source, lang, &block.imports) {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "organize_imports: imports in {file} span multiple code regions; refusing to organize because replacing the combined import range would corrupt intervening code"
+            ),
+            serde_json::json!({ "file": file }),
         );
     }
 
@@ -162,6 +181,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — imports were NOT reorganized. Report that honestly with an
+    // error instead of claiming `organized: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "organize_imports: reorganizing imports in {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
+    }
+
     log::debug!("organize_imports: {}", file);
 
     // --- Build response ---
@@ -207,6 +239,113 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, result)
 }
 
+fn imports_span_multiple_code_regions(
+    source: &str,
+    lang: LangId,
+    imports: &[ImportStatement],
+) -> bool {
+    imports.windows(2).any(|pair| {
+        let previous = &pair[0];
+        let next = &pair[1];
+        if previous.byte_range.end > next.byte_range.start {
+            return true;
+        }
+
+        !import_gap_is_trivia(source, lang, previous.byte_range.end..next.byte_range.start)
+    })
+}
+
+fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool {
+    let Some(gap) = source.get(range) else {
+        return false;
+    };
+
+    let mut offset = 0;
+    while offset < gap.len() {
+        let rest = &gap[offset..];
+        let ch = rest
+            .chars()
+            .next()
+            .expect("offset is within the trivia gap");
+
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--[[") {
+            let Some(end) = rest.find("]]") else {
+                return false;
+            };
+            offset += end + 2;
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--") {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        if supports_slash_line_comments(lang) && rest.starts_with("//") {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        if supports_block_comments(lang) && rest.starts_with("/*") {
+            let Some(end) = rest.find("*/") else {
+                return false;
+            };
+            offset += end + 2;
+            continue;
+        }
+
+        if supports_hash_line_comments(lang) && rest.starts_with('#') {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn line_comment_len(s: &str) -> usize {
+    s.find('\n').unwrap_or(s.len())
+}
+
+fn supports_slash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Go
+            | LangId::Rust
+            | LangId::Solidity
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Swift
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+    )
+}
+
+fn supports_block_comments(lang: LangId) -> bool {
+    supports_slash_line_comments(lang)
+}
+
+fn supports_hash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Python | LangId::Ruby | LangId::Perl | LangId::Php
+    )
+}
+
 /// Organize imports: group by convention, sort within groups, deduplicate.
 /// Returns (grouped imports in order, count of removed duplicates).
 fn organize(
@@ -225,6 +364,8 @@ fn organize(
     for (group, imps) in &groups {
         let (organized, removed) = if matches!(lang, LangId::Rust) {
             organize_rust_group(imps)
+        } else if should_preserve_raw_on_organize(lang) {
+            organize_raw_preserving_group(imps)
         } else {
             organize_generic_group(imps, lang)
         };
@@ -237,6 +378,25 @@ fn organize(
     (result, total_removed)
 }
 
+fn should_preserve_raw_on_organize(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Scala
+            | LangId::Java
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Kotlin
+            | LangId::Solidity
+            | LangId::Swift
+            | LangId::Ruby
+            | LangId::Lua
+            | LangId::Perl
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+    )
+}
+
 /// An organized import ready for code generation.
 #[derive(Debug, Clone)]
 struct OrganizedImport {
@@ -245,6 +405,11 @@ struct OrganizedImport {
     default_import: Option<String>,
     namespace_import: Option<String>,
     kind: ImportKind,
+    /// When set, the import is rendered verbatim from this string instead of
+    /// being regenerated from the structured fields. Used by dialect-sensitive
+    /// languages (e.g. Scala) where re-rendering would normalize across
+    /// incompatible syntax variants and corrupt the source.
+    raw_override: Option<String>,
 }
 
 /// Organize a group of non-Rust imports: sort by module path, deduplicate.
@@ -306,6 +471,49 @@ fn organize_generic_group(
             default_import: imp.default_import.clone(),
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
+            raw_override: None,
+        });
+    }
+
+    (organized, removed)
+}
+
+fn organize_raw_preserving_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usize) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut organized: Vec<OrganizedImport> = Vec::new();
+    let mut removed = 0;
+
+    let mut side_effects: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind == ImportKind::SideEffect)
+        .collect();
+    let mut sorted: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind != ImportKind::SideEffect)
+        .collect();
+    sorted.sort_by(|a, b| a.raw_text.trim().cmp(b.raw_text.trim()));
+    side_effects.extend(sorted);
+
+    for imp in side_effects {
+        let raw = imp.raw_text.trim().to_string();
+        if raw.is_empty() {
+            continue;
+        }
+        if seen.contains(&raw) {
+            removed += 1;
+            continue;
+        }
+        seen.insert(raw.clone());
+
+        organized.push(OrganizedImport {
+            module_path: imp.module_path.clone(),
+            names: imp.names.clone(),
+            default_import: imp.default_import.clone(),
+            namespace_import: imp.namespace_import.clone(),
+            kind: imp.kind,
+            raw_override: Some(raw),
         });
     }
 
@@ -444,6 +652,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     },
                     namespace_import: None,
                     kind: up.kind,
+                    raw_override: None,
                 });
             }
         }
@@ -478,6 +687,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             },
             namespace_import: None,
             kind,
+            raw_override: None,
         });
     }
 
@@ -560,6 +770,9 @@ fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) ->
 
 /// Generate a single import line from an OrganizedImport.
 fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
+    if let Some(ref raw) = imp.raw_override {
+        return raw.clone();
+    }
     match lang {
         LangId::Rust => {
             let prefix = if imp.default_import.as_deref() == Some("pub") {

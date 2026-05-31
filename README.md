@@ -42,7 +42,7 @@ AFT gives it the real thing. It sits between an agent's reasoning and your codeb
 
 - **Sensory cortex: perceive.** Outline a file, zoom into one symbol, search by meaning, follow a call graph. The agent sees *structure* instead of scrolling text.
 - **Motor cortex: act.** Edit a function by name, refactor across the workspace, organize imports. Every change is parsed, validated, formatted, and backed up by the binary.
-- **Brainstem: stay alive.** Background bash tasks, PTY sessions, compressed output, and an undo stack keep the agent's environment running without it having to think about it.
+- **Brainstem: stay alive.** Background bash tasks, PTY sessions, and compressed output keep the agent's environment running without it having to think about it. On-demand health checks and an undo stack keep the codebase healthy and recoverable when something does go wrong.
 
 Sensory and motor make the **IDE**; the brainstem is the **OS**. Your agent gets both.
 
@@ -163,21 +163,23 @@ _Coming soon._
 | Python | ✓ | ✓ | ✓ | ✓ | ✓ | partial |
 | Rust | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Go | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| C / C++ / C# | ✓ | ✓ | ✓ | ✓ | | |
-| Java / Kotlin | ✓ | ✓ | ✓ | | | |
-| Scala | ✓ | ✓ | | | | |
-| Swift | ✓ | ✓ | ✓ | | | |
-| Ruby | ✓ | ✓ | ✓ | | | |
-| PHP | ✓ | ✓ | ✓ | | | |
-| Lua / Perl | ✓ | ✓ | ✓ | | | |
+| C / C++ / C# | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Java / Kotlin | ✓ | ✓ | ✓ | | ✓ | |
+| Scala | ✓ | ✓ | | | ✓ | |
+| Swift | ✓ | ✓ | ✓ | | ✓ | |
+| Ruby | ✓ | ✓ | ✓ | | ✓ | |
+| PHP | ✓ | ✓ | ✓ | | ✓ | |
+| Lua / Perl | ✓ | ✓ | ✓ | | ✓ | |
 | Zig | ✓ | ✓ | ✓ | ✓ | | |
 | Bash | ✓ | ✓ | | ✓ | | |
 | HTML / Markdown | ✓ | ✓ | | | | |
 | JSON | ✓ | ✓ | ✓ | | | |
-| Solidity | ✓ | ✓ | ✓ | ✓ | | |
-| Vue | ✓ | ✓ | ✓ | ✓ | | |
+| Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Vue | ✓ | ✓ | ✓ | ✓ | ✓ | |
 
 Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`, and trigram-indexed `grep`/`glob` covers every text file regardless of language. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Semantic** is `aft_search` embedding coverage. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
+
+Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
 ---
 

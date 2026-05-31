@@ -44,6 +44,7 @@ export interface SemanticConfig {
   api_key_env?: string;
   timeout_ms?: number;
   max_batch_size?: number;
+  max_files?: number;
 }
 
 export interface LspServerConfig {
@@ -133,6 +134,11 @@ export interface BashConfig {
   background?: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * How long foreground bash blocks before auto-promoting to background.
+   * Default 8000ms; values below the 5000ms floor are clamped up.
+   */
+  foreground_wait_window_ms?: number;
 }
 
 export interface AftConfig {
@@ -191,7 +197,17 @@ export interface ResolvedBashConfig {
   background: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * Foreground poll window before auto-promotion to background, in ms.
+   * Always resolved: defaults to 8000, floored at 5000.
+   */
+  foreground_wait_window_ms: number;
 }
+
+/** Default foreground wait-window before auto-promotion (ms). */
+export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 8_000;
+/** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
+export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
 
 /**
  * Single source of truth for bash config across the Pi plugin. Resolution
@@ -224,6 +240,15 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
     legacy?.long_running_reminder_interval_ms;
 
+  // Foreground wait-window: only the object form can set it; clamp to the
+  // 5000ms floor and default to 8000ms when unset.
+  const rawForegroundWait =
+    typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
+  const foregroundWaitWindowMs = Math.max(
+    FOREGROUND_WAIT_WINDOW_MIN_MS,
+    rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
+  );
+
   const base: ResolvedBashConfig = {
     enabled: false,
     rewrite: false,
@@ -231,6 +256,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
+    foreground_wait_window_ms: foregroundWaitWindowMs,
   };
 
   if (top === false) return base;
@@ -309,6 +335,7 @@ const SemanticConfigSchema = z.object({
   api_key_env: z.string().trim().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   max_batch_size: z.number().int().positive().optional(),
+  max_files: z.number().int().positive().optional(),
 });
 
 const LspExtensionSchema = z
@@ -394,6 +421,7 @@ const BashFeaturesSchema = z.object({
   background: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
+  foreground_wait_window_ms: z.number().int().positive().optional(),
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
@@ -848,6 +876,7 @@ function mergeSemanticConfig(
   if (override?.model !== undefined) projectSafe.model = override.model;
   if (override?.timeout_ms !== undefined) projectSafe.timeout_ms = override.timeout_ms;
   if (override?.max_batch_size !== undefined) projectSafe.max_batch_size = override.max_batch_size;
+  if (override?.max_files !== undefined) projectSafe.max_files = override.max_files;
 
   const semantic: SemanticConfig = { ...base, ...projectSafe };
   if (Object.values(semantic).every((v) => v === undefined)) return undefined;

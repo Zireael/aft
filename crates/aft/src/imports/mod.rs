@@ -1,16 +1,29 @@
 //! Import analysis engine: parsing, grouping, deduplication, and insertion.
 //!
-//! Provides per-language import handling dispatched by `LangId`. Each language
-//! implementation extracts imports from tree-sitter ASTs, classifies them into
-//! groups, and generates import text.
+//! Per-language behavior is provided by [`ImportSyntax`] implementations,
+//! resolved through the [`syntax_for`] registry. Each engine extracts imports
+//! from tree-sitter ASTs, classifies them into groups, and generates import
+//! text. A single import's structured shape is carried by [`ImportForm`].
 //!
-//! Currently supports: TypeScript, TSX, JavaScript.
+//! Currently supports: TypeScript, TSX, JavaScript, Python, Rust, Go.
 
 use std::ops::Range;
 
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
+
+mod c;
+pub(crate) use c::{classify_group_c_import_kind, normalize_include_module};
+mod csharp;
+mod java;
+mod kotlin;
+mod lua;
+mod perl;
+mod php;
+mod ruby;
+mod scala;
+mod swift;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -59,6 +72,124 @@ impl ImportGroup {
     }
 }
 
+/// Structured, language-honest representation of a single import's shape.
+///
+/// This is the migration target that replaces the TS-shaped flat fields
+/// (`names`/`default_import`/`namespace_import`) and their per-language
+/// overloads (Rust packs `"pub"` into `default_import`; Go packs the alias
+/// there). It is introduced additively alongside the flat fields (Stream M of
+/// the imports-refactor plan): parsers populate BOTH, readers migrate onto
+/// `form` one at a time behind the golden-parity gate, and the flat fields are
+/// removed once no reader depends on them. New-language variants (Static,
+/// Include, RuntimeRequire, …) are added when their engines land — only the
+/// variants the existing engines produce exist today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportForm {
+    /// ES modules: TypeScript, TSX, JavaScript.
+    /// `named` holds verbatim specifiers (`"useState"`, `"stdin as input"`,
+    /// `"type Foo"`, `"type Foo as Bar"`) — see [`specifier_imported_name`].
+    Es {
+        default_import: Option<String>,
+        namespace_import: Option<String>,
+        named: Vec<String>,
+        /// Statement-level `import type { ... }`.
+        type_only: bool,
+        /// Side-effect-only `import "mod"` (no bindings).
+        side_effect: bool,
+    },
+    /// Python `import module` (`from_import = false`) or
+    /// `from module import a, b` (`from_import = true`).
+    Python {
+        from_import: bool,
+        named: Vec<String>,
+    },
+    /// Rust `use path;` / `pub use path;`. `visibility` replaces the
+    /// `default_import == "pub"` overload (`Some("pub")`, `Some("pub(crate)")`,
+    /// …). The brace/use-tree text remains carried by `module_path` per the
+    /// lossless-round-trip decision; `named` holds extracted use-list names.
+    RustUse {
+        visibility: Option<String>,
+        named: Vec<String>,
+    },
+    /// Go import. `alias` replaces the `default_import` overload, including the
+    /// blank (`_`) and dot (`.`) import bindings.
+    Go { alias: Option<String> },
+    /// Solidity import, in one of four forms:
+    /// - side-effect: `import "x";` (all empty)
+    /// - named: `import { A, B as C } from "x";` (`named`)
+    /// - namespace: `import * as A from "x";` (`namespace`)
+    /// - whole-file alias: `import "x" as A;` (`alias`)
+    ///
+    /// `named` holds verbatim specifiers (`"A"`, `"B as C"`) like the ES form,
+    /// so [`specifier_imported_name`] / [`specifier_local_name`] apply.
+    Solidity {
+        named: Vec<String>,
+        namespace: Option<String>,
+        alias: Option<String>,
+    },
+    /// Generic structured form shared by the Phase-1 engines (Java, C#, PHP,
+    /// Kotlin, Scala, Swift, …). Carries the full schema field set so a new
+    /// engine does not need its own enum variant; `module_path` (on the parent
+    /// `ImportStatement`) holds the path/FQN. `named` uses the verbatim
+    /// specifier convention.
+    Structured {
+        named: Vec<String>,
+        namespace: Option<String>,
+        alias: Option<String>,
+        modifiers: Vec<String>,
+        import_kind: Option<String>,
+    },
+}
+
+/// Structured request to generate a single import line. Superset of the fields
+/// the public `aft_import` schema exposes; each engine reads only the subset it
+/// supports. New languages add fields here rather than growing positional
+/// parameters on every generator signature.
+#[derive(Debug, Clone)]
+pub struct ImportRequest<'a> {
+    pub module_path: &'a str,
+    pub names: &'a [String],
+    pub default_import: Option<&'a str>,
+    /// ES `* as ns` / Solidity `* as A`.
+    pub namespace: Option<&'a str>,
+    /// Whole-module local alias (Solidity `import "x" as A`).
+    pub alias: Option<&'a str>,
+    pub type_only: bool,
+    /// Statement-level modifier tokens (Java/C# `static`, C# `global`/`unsafe`,
+    /// `wildcard`, Swift `@testable`, …). Empty for the legacy engines.
+    pub modifiers: &'a [String],
+    /// Symbol-kind-specific import (PHP `function`/`const`, Swift `struct`/…,
+    /// Scala `given`). Absent for the legacy engines.
+    pub import_kind: Option<&'a str>,
+}
+
+/// Empty default for the `modifiers` slice so legacy callers need not allocate.
+const NO_MODIFIERS: &[String] = &[];
+
+impl<'a> ImportRequest<'a> {
+    /// Construct a request carrying only the legacy positional fields; the
+    /// structured fields (alias/modifiers/import_kind) default to absent. Used
+    /// by the back-compat free-function wrappers.
+    pub fn legacy(
+        module_path: &'a str,
+        names: &'a [String],
+        default_import: Option<&'a str>,
+        namespace: Option<&'a str>,
+        type_only: bool,
+    ) -> Self {
+        ImportRequest {
+            module_path,
+            names,
+            default_import,
+            namespace,
+            alias: None,
+            type_only,
+            modifiers: NO_MODIFIERS,
+            import_kind: None,
+        }
+    }
+}
+
 /// A single parsed import statement.
 #[derive(Debug, Clone)]
 pub struct ImportStatement {
@@ -78,6 +209,10 @@ pub struct ImportStatement {
     pub byte_range: Range<usize>,
     /// Raw text of the import statement.
     pub raw_text: String,
+    /// Structured, de-overloaded representation (Stream M migration target).
+    /// Populated by every parser alongside the flat fields above; readers
+    /// migrate onto this incrementally behind the golden-parity gate.
+    pub form: ImportForm,
 }
 
 /// A block of parsed imports from a file.
@@ -99,7 +234,7 @@ impl ImportBlock {
     }
 }
 
-fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usize>> {
+pub(crate) fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usize>> {
     imports.first().zip(imports.last()).map(|(first, last)| {
         let start = first.byte_range.start;
         let end = last.byte_range.end;
@@ -164,33 +299,280 @@ pub fn specifier_matches(spec: &str, target: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Per-language engine: the ImportSyntax trait + registry
+// ---------------------------------------------------------------------------
+
+/// Per-language import engine. One impl per supported language; [`syntax_for`]
+/// maps a [`LangId`] to its `&'static dyn ImportSyntax`. This is the single
+/// plug-in point that replaces the scattered `match lang` dispatch in
+/// `parse_imports` / `generate_import_line_with_namespace` / `classify_group` /
+/// `is_supported`. Adding a language is a new impl + one registry arm.
+///
+/// The existing engines are thin wrappers over the free functions they already
+/// used, so routing through the trait is behavior-preserving (golden-gated).
+pub trait ImportSyntax: Sync {
+    /// Parse all imports from a file's already-parsed tree.
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock;
+
+    /// Generate a single import line from a structured [`ImportRequest`].
+    /// Engines read only the fields they support and ignore the rest.
+    fn generate_line(&self, req: &ImportRequest) -> String;
+
+    /// Classify a module path into stdlib / external / internal.
+    fn classify_group(&self, module_path: &str) -> ImportGroup;
+}
+
+/// ES modules engine: TypeScript, TSX, JavaScript.
+struct EsSyntax;
+impl ImportSyntax for EsSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_ts_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_ts_import_line(
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
+        )
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_ts(module_path)
+    }
+}
+
+struct PythonSyntax;
+impl ImportSyntax for PythonSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_py_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_py_import_line(req.module_path, req.names, req.default_import)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_py(module_path)
+    }
+}
+
+struct RustSyntax;
+impl ImportSyntax for RustSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_rs_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_rs_import_line(req.module_path, req.names, req.type_only)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_rs(module_path)
+    }
+}
+
+struct GoSyntax;
+impl ImportSyntax for GoSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_go_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_go_import_line(req.module_path, req.default_import, false)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_go(module_path)
+    }
+}
+
+/// Solidity import engine. Supports named / namespace / whole-file-alias /
+/// side-effect forms (Phase 1: first new language onto the registry).
+struct SoliditySyntax;
+impl ImportSyntax for SoliditySyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_solidity_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_solidity_import_line(req)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_solidity(module_path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VueScriptRangeError {
+    MissingScript,
+    MultipleScripts,
+}
+
+impl VueScriptRangeError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            VueScriptRangeError::MissingScript => "missing_vue_script",
+            VueScriptRangeError::MultipleScripts => "ambiguous_vue_script",
+        }
+    }
+
+    pub(crate) fn message(self, command: &str) -> String {
+        match self {
+            VueScriptRangeError::MissingScript => format!(
+                "{command}: Vue import management requires exactly one <script> block; found none"
+            ),
+            VueScriptRangeError::MultipleScripts => format!(
+                "{command}: Vue import management requires exactly one <script> block; found multiple"
+            ),
+        }
+    }
+}
+
+/// Locate the byte range of the single `<script>` block's inner content in a
+/// Vue Single-File Component. tree-sitter-vue exposes the script body as a
+/// single `raw_text` node; this returns `(start, end)` of that node, or — for an
+/// empty `<script></script>` with no `raw_text` child — a zero-width range right
+/// after the start tag. Multiple scripts are ambiguous for byte-level edits and
+/// no-script SFCs have no safe insertion region, so callers should surface the
+/// returned error instead of silently editing byte 0 or the first script.
+pub(crate) fn vue_single_script_content_range(
+    tree: &Tree,
+) -> Result<(usize, usize), VueScriptRangeError> {
+    let root = tree.root_node();
+    let mut ranges = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "script_element" {
+            ranges.push(vue_script_element_content_range(&child));
+        }
+    }
+
+    match ranges.len() {
+        0 => Err(VueScriptRangeError::MissingScript),
+        1 => Ok(ranges[0]),
+        _ => Err(VueScriptRangeError::MultipleScripts),
+    }
+}
+
+/// Back-compat convenience wrapper for callers that only need the safe single
+/// script range and intentionally treat missing/ambiguous scripts as absent.
+pub(crate) fn vue_script_content_range(tree: &Tree) -> Option<(usize, usize)> {
+    vue_single_script_content_range(tree).ok()
+}
+
+fn vue_script_element_content_range(child: &Node) -> (usize, usize) {
+    let mut inner = child.walk();
+    for sub in child.named_children(&mut inner) {
+        if sub.kind() == "raw_text" {
+            return (sub.start_byte(), sub.end_byte());
+        }
+    }
+
+    // Empty `<script></script>`: insert right after the start tag.
+    let mut inner2 = child.walk();
+    for sub in child.named_children(&mut inner2) {
+        if sub.kind() == "start_tag" {
+            return (sub.end_byte(), sub.end_byte());
+        }
+    }
+
+    (child.end_byte(), child.end_byte())
+}
+
+/// Parse imports from a Vue SFC `<script>` block. The script body is re-parsed
+/// with the TypeScript grammar (which covers both `lang="ts"` and plain JS
+/// import syntax), then every byte offset is remapped from script-relative to
+/// whole-file positions so insertion, removal, and organize operate correctly.
+fn parse_vue_imports(source: &str, tree: &Tree) -> ImportBlock {
+    let Ok((start, end)) = vue_single_script_content_range(tree) else {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    };
+    let inner = &source[start..end];
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar_for(LangId::TypeScript))
+        .is_err()
+    {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    }
+    let Some(inner_tree) = parser.parse(inner, None) else {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    };
+    let mut block = parse_ts_imports(inner, &inner_tree);
+    for imp in &mut block.imports {
+        imp.byte_range = (imp.byte_range.start + start)..(imp.byte_range.end + start);
+    }
+    block.byte_range = block.byte_range.map(|r| (r.start + start)..(r.end + start));
+    block
+}
+
+/// Vue Single-File Component import engine. The `<script>` body is exposed by
+/// tree-sitter-vue as a single `raw_text` node, so we re-parse it with the
+/// TypeScript grammar and remap the resulting byte offsets back to whole-file
+/// positions. Generation and grouping reuse the ES (TS/JS) engine, since Vue
+/// script imports are TypeScript/JavaScript.
+struct VueSyntax;
+impl ImportSyntax for VueSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_vue_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_ts_import_line(
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
+        )
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_ts(module_path)
+    }
+}
+
+static ES_SYNTAX: EsSyntax = EsSyntax;
+static PYTHON_SYNTAX: PythonSyntax = PythonSyntax;
+static RUST_SYNTAX: RustSyntax = RustSyntax;
+static GO_SYNTAX: GoSyntax = GoSyntax;
+static SOLIDITY_SYNTAX: SoliditySyntax = SoliditySyntax;
+static VUE_SYNTAX: VueSyntax = VueSyntax;
+
+/// Map a language to its import engine, or `None` when imports are unsupported.
+pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => Some(&ES_SYNTAX),
+        LangId::Python => Some(&PYTHON_SYNTAX),
+        LangId::Rust => Some(&RUST_SYNTAX),
+        LangId::Go => Some(&GO_SYNTAX),
+        LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::Vue => Some(&VUE_SYNTAX),
+        LangId::C => Some(&c::C_SYNTAX),
+        LangId::Cpp => Some(&c::C_SYNTAX),
+        LangId::Java => Some(&java::JAVA_SYNTAX),
+        LangId::Kotlin => Some(&kotlin::KOTLIN_SYNTAX),
+        LangId::Lua => Some(&lua::LUA_SYNTAX),
+        LangId::CSharp => Some(&csharp::CSHARP_SYNTAX),
+        LangId::Php => Some(&php::PHP_SYNTAX),
+        LangId::Perl => Some(&perl::PERL_SYNTAX),
+        LangId::Ruby => Some(&ruby::RUBY_SYNTAX),
+        LangId::Scala => Some(&scala::SCALA_SYNTAX),
+        LangId::Swift => Some(&swift::SWIFT_SYNTAX),
+        LangId::Zig | LangId::Bash | LangId::Json | LangId::Html | LangId::Markdown => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core API
 // ---------------------------------------------------------------------------
 
 /// Parse imports from source using the provided tree-sitter tree.
 pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => parse_ts_imports(source, tree),
-        LangId::Python => parse_py_imports(source, tree),
-        LangId::Rust => parse_rs_imports(source, tree),
-        LangId::Go => parse_go_imports(source, tree),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
-        | LangId::Solidity
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Scala
-        | LangId::Java
-        | LangId::Ruby
-        | LangId::Kotlin
-        | LangId::Swift
-        | LangId::Php
-        | LangId::Lua
-        | LangId::Perl => ImportBlock::empty(),
-        LangId::Html | LangId::Markdown => ImportBlock::empty(),
+    match syntax_for(lang) {
+        Some(engine) => engine.parse(source, tree),
+        None => ImportBlock::empty(),
     }
 }
 
@@ -290,6 +672,347 @@ pub fn is_duplicate_with_namespace(
     }
 
     false
+}
+
+/// Check whether a fully structured add-import request is already present.
+///
+/// Legacy ES/Python/Rust/Go callers intentionally keep the historical
+/// subset/dominance semantics (`import { a, b }` satisfies adding `{ a }`). The
+/// newer engines carry language-specific shape in `ImportForm::Structured` (or
+/// Solidity's dedicated form), where module path alone is not enough: include
+/// delimiters, statement kinds, modifiers, aliases, and runtime import flavors
+/// all affect the generated source. Those languages deduplicate on a canonical
+/// full-form key so `#include <x>` does not block `#include "x"`, `load` does
+/// not block `require`, and side-effect Solidity imports do not block aliases.
+pub(crate) fn is_duplicate_import_request(
+    lang: LangId,
+    block: &ImportBlock,
+    req: &ImportRequest<'_>,
+) -> bool {
+    if !uses_form_aware_dedup(lang) {
+        return is_duplicate_with_namespace(
+            block,
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
+        );
+    }
+
+    let target = request_dedup_key(lang, req);
+    block
+        .imports
+        .iter()
+        .map(|imp| statement_dedup_key(lang, imp))
+        .any(|key| key == target)
+}
+
+fn uses_form_aware_dedup(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Solidity
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Java
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::Swift
+            | LangId::Ruby
+            | LangId::Lua
+            | LangId::Perl
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDedupKey {
+    module_path: String,
+    kind: ImportKind,
+    form: ImportForm,
+}
+
+fn statement_dedup_key(lang: LangId, imp: &ImportStatement) -> ImportDedupKey {
+    canonical_dedup_key(
+        lang,
+        ImportDedupKey {
+            module_path: imp.module_path.clone(),
+            kind: imp.kind,
+            form: imp.form.clone(),
+        },
+    )
+}
+
+fn request_dedup_key(lang: LangId, req: &ImportRequest<'_>) -> ImportDedupKey {
+    let key = match lang {
+        LangId::Solidity => {
+            let kind = if req.names.is_empty() && req.namespace.is_none() && req.alias.is_none() {
+                ImportKind::SideEffect
+            } else {
+                ImportKind::Value
+            };
+            ImportDedupKey {
+                module_path: req.module_path.to_string(),
+                kind,
+                form: ImportForm::Solidity {
+                    named: req.names.to_vec(),
+                    namespace: req.namespace.map(str::to_string),
+                    alias: req.alias.map(str::to_string),
+                },
+            }
+        }
+        LangId::C | LangId::Cpp => structured_dedup_key(
+            req.module_path,
+            ImportKind::SideEffect,
+            &[],
+            None,
+            None,
+            &[],
+            Some(req.import_kind.or(req.default_import).unwrap_or("system")),
+        ),
+        LangId::Java => {
+            let (module_path, modifiers) = wildcard_suffix_request(
+                req.module_path,
+                req.modifiers,
+                req.default_import == Some("*"),
+            );
+            structured_dedup_key(
+                &module_path,
+                ImportKind::Value,
+                &[],
+                None,
+                None,
+                &modifiers,
+                None,
+            )
+        }
+        LangId::CSharp => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            req.alias,
+            req.modifiers,
+            None,
+        ),
+        LangId::Php => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            req.alias,
+            req.modifiers,
+            req.import_kind,
+        ),
+        LangId::Kotlin => {
+            let wildcard = req.default_import == Some("*") || req.module_path.ends_with(".*");
+            let (module_path, modifiers) =
+                wildcard_suffix_request(req.module_path, req.modifiers, wildcard);
+            let alias = req
+                .alias
+                .or(req.default_import.filter(|value| *value != "*"));
+            structured_dedup_key(
+                &module_path,
+                ImportKind::Value,
+                &[],
+                None,
+                alias,
+                &modifiers,
+                None,
+            )
+        }
+        LangId::Scala => scala_request_dedup_key(req),
+        LangId::Swift => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            None,
+            req.modifiers,
+            req.import_kind,
+        ),
+        LangId::Ruby => {
+            let mut modifiers = req.modifiers.to_vec();
+            if !modifiers
+                .iter()
+                .any(|modifier| modifier == "quote:single" || modifier == "quote:double")
+            {
+                modifiers.push("quote:single".to_string());
+            }
+            structured_dedup_key(
+                req.module_path,
+                ImportKind::SideEffect,
+                &[],
+                None,
+                None,
+                &modifiers,
+                Some(req.import_kind.unwrap_or("require")),
+            )
+        }
+        LangId::Lua => {
+            let alias = req.default_import.or(req.alias);
+            let kind = if alias.is_some() {
+                ImportKind::Value
+            } else {
+                ImportKind::SideEffect
+            };
+            structured_dedup_key(req.module_path, kind, &[], None, alias, req.modifiers, None)
+        }
+        LangId::Perl => structured_dedup_key(
+            req.module_path,
+            ImportKind::SideEffect,
+            &[],
+            None,
+            None,
+            req.modifiers,
+            Some(req.import_kind.unwrap_or("use")),
+        ),
+        _ => structured_dedup_key(
+            req.module_path,
+            if req.type_only {
+                ImportKind::Type
+            } else {
+                ImportKind::Value
+            },
+            req.names,
+            req.namespace,
+            req.alias,
+            req.modifiers,
+            req.import_kind,
+        ),
+    };
+
+    canonical_dedup_key(lang, key)
+}
+
+fn structured_dedup_key(
+    module_path: &str,
+    kind: ImportKind,
+    named: &[String],
+    namespace: Option<&str>,
+    alias: Option<&str>,
+    modifiers: &[String],
+    import_kind: Option<&str>,
+) -> ImportDedupKey {
+    ImportDedupKey {
+        module_path: module_path.to_string(),
+        kind,
+        form: ImportForm::Structured {
+            named: named.to_vec(),
+            namespace: namespace.map(str::to_string),
+            alias: alias.map(str::to_string),
+            modifiers: modifiers.to_vec(),
+            import_kind: import_kind.map(str::to_string),
+        },
+    }
+}
+
+fn wildcard_suffix_request(
+    module_path: &str,
+    modifiers: &[String],
+    wildcard: bool,
+) -> (String, Vec<String>) {
+    let stripped = module_path.strip_suffix(".*").unwrap_or(module_path);
+    let mut modifiers = modifiers.to_vec();
+    if (wildcard || stripped.len() != module_path.len())
+        && !modifiers.iter().any(|modifier| modifier == "wildcard")
+    {
+        modifiers.push("wildcard".to_string());
+    }
+    (stripped.to_string(), modifiers)
+}
+
+fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
+    let mut module_path = req.module_path.to_string();
+    let mut names: Vec<String> = req
+        .names
+        .iter()
+        .map(|name| normalize_scala_selector_for_dedup(name))
+        .collect();
+    let mut modifiers = req.modifiers.to_vec();
+    let mut import_kind = req.import_kind.map(str::to_string);
+
+    if req.default_import == Some("given") || module_path.ends_with(".given") {
+        import_kind.get_or_insert_with(|| "given".to_string());
+        if let Some(stripped) = module_path.strip_suffix(".given") {
+            module_path = stripped.to_string();
+        }
+    }
+
+    if matches!(req.default_import, Some("*") | Some("_"))
+        || matches!(req.namespace, Some("*") | Some("_"))
+        || module_path.ends_with(".*")
+        || module_path.ends_with("._")
+    {
+        if !modifiers.iter().any(|modifier| modifier == "wildcard") {
+            modifiers.push("wildcard".to_string());
+        }
+        module_path = module_path
+            .strip_suffix(".*")
+            .or_else(|| module_path.strip_suffix("._"))
+            .unwrap_or(&module_path)
+            .to_string();
+    }
+
+    if names.is_empty() {
+        if let Some(alias) = req.alias.filter(|alias| !alias.is_empty()) {
+            if let Some((prefix, leaf)) = module_path.rsplit_once('.') {
+                names.push(format!("{leaf} as {alias}"));
+                module_path = prefix.to_string();
+            }
+        }
+    }
+
+    structured_dedup_key(
+        &module_path,
+        ImportKind::Value,
+        &names,
+        None,
+        None,
+        &modifiers,
+        import_kind.as_deref(),
+    )
+}
+
+fn normalize_scala_selector_for_dedup(name: &str) -> String {
+    let trimmed = name.trim();
+    if let Some((from, to)) = trimmed.split_once("=>") {
+        format!("{} as {}", from.trim(), to.trim())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn canonical_dedup_key(lang: LangId, mut key: ImportDedupKey) -> ImportDedupKey {
+    match &mut key.form {
+        ImportForm::Structured { named, .. } | ImportForm::Solidity { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::Es { named, .. } | ImportForm::Python { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::RustUse { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::Go { .. } => {}
+    }
+
+    if matches!(lang, LangId::Java | LangId::Kotlin) {
+        if let Some(stripped) = key.module_path.strip_suffix(".*") {
+            key.module_path = stripped.to_string();
+        }
+    } else if matches!(lang, LangId::Scala) {
+        key.module_path = key
+            .module_path
+            .strip_suffix(".given")
+            .or_else(|| key.module_path.strip_suffix(".*"))
+            .or_else(|| key.module_path.strip_suffix("._"))
+            .unwrap_or(&key.module_path)
+            .to_string();
+    }
+
+    key
 }
 
 fn sort_named_specifiers(names: &mut [String]) {
@@ -395,7 +1118,18 @@ pub fn find_insertion_point(
     (insert_at, false, false)
 }
 
-/// Generate an import line for the given language.
+/// Generate a single import line from a structured [`ImportRequest`]. The full
+/// entry point — engines read the fields they support; unsupported languages
+/// yield an empty string.
+pub fn generate_import(lang: LangId, req: &ImportRequest) -> String {
+    match syntax_for(lang) {
+        Some(engine) => engine.generate_line(req),
+        None => String::new(),
+    }
+}
+
+/// Generate an import line for the given language. Back-compat wrapper over
+/// [`generate_import`] for callers that pass only the legacy positional fields.
 pub fn generate_import_line(
     lang: LangId,
     module_path: &str,
@@ -403,11 +1137,14 @@ pub fn generate_import_line(
     default_import: Option<&str>,
     type_only: bool,
 ) -> String {
-    generate_import_line_with_namespace(lang, module_path, names, default_import, None, type_only)
+    generate_import(
+        lang,
+        &ImportRequest::legacy(module_path, names, default_import, None, type_only),
+    )
 }
 
-/// Generate an import line for the given language, including namespace imports
-/// for TS/JS/TSX (`import * as ns from 'mod'`).
+/// Generate an import line including namespace imports
+/// (`import * as ns from 'mod'`). Back-compat wrapper over [`generate_import`].
 pub fn generate_import_line_with_namespace(
     lang: LangId,
     module_path: &str,
@@ -416,48 +1153,21 @@ pub fn generate_import_line_with_namespace(
     namespace_import: Option<&str>,
     type_only: bool,
 ) -> String {
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => generate_ts_import_line(
+    generate_import(
+        lang,
+        &ImportRequest::legacy(
             module_path,
             names,
             default_import,
             namespace_import,
             type_only,
         ),
-        LangId::Python => generate_py_import_line(module_path, names, default_import),
-        LangId::Rust => generate_rs_import_line(module_path, names, type_only),
-        LangId::Go => generate_go_import_line(module_path, default_import, false),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
-        | LangId::Solidity
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Scala
-        | LangId::Java
-        | LangId::Ruby
-        | LangId::Kotlin
-        | LangId::Swift
-        | LangId::Php
-        | LangId::Lua
-        | LangId::Perl => String::new(),
-        LangId::Html | LangId::Markdown => String::new(),
-    }
+    )
 }
 
 /// Check if the given language is supported by the import engine.
 pub fn is_supported(lang: LangId) -> bool {
-    matches!(
-        lang,
-        LangId::TypeScript
-            | LangId::Tsx
-            | LangId::JavaScript
-            | LangId::Python
-            | LangId::Rust
-            | LangId::Go
-    )
+    syntax_for(lang).is_some()
 }
 
 /// Classify a module path into a group for TS/JS/TSX.
@@ -471,28 +1181,11 @@ pub fn classify_group_ts(module_path: &str) -> ImportGroup {
 
 /// Classify a module path into a group for the given language.
 pub fn classify_group(lang: LangId, module_path: &str) -> ImportGroup {
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => classify_group_ts(module_path),
-        LangId::Python => classify_group_py(module_path),
-        LangId::Rust => classify_group_rs(module_path),
-        LangId::Go => classify_group_go(module_path),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
-        | LangId::Solidity
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Scala
-        | LangId::Java
-        | LangId::Ruby
-        | LangId::Kotlin
-        | LangId::Swift
-        | LangId::Php
-        | LangId::Lua
-        | LangId::Perl => ImportGroup::External,
-        LangId::Html | LangId::Markdown => ImportGroup::External,
+    match syntax_for(lang) {
+        Some(engine) => engine.classify_group(module_path),
+        // Unsupported languages have no grouping policy; External is the
+        // historical neutral default.
+        None => ImportGroup::External,
     }
 }
 
@@ -617,6 +1310,14 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
 
     let group = classify_group_ts(&module_path);
 
+    let form = ImportForm::Es {
+        default_import: default_import.clone(),
+        namespace_import: namespace_import.clone(),
+        named: names.clone(),
+        type_only: is_type_only,
+        side_effect: matches!(kind, ImportKind::SideEffect),
+    };
+
     Some(ImportStatement {
         module_path,
         names,
@@ -626,6 +1327,7 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
         group,
         byte_range,
         raw_text,
+        form,
     })
 }
 
@@ -1143,6 +1845,10 @@ fn parse_py_import_statement(source: &str, node: &Node) -> Option<ImportStatemen
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Python {
+            from_import: false,
+            named: Vec::new(),
+        },
     })
 }
 
@@ -1194,13 +1900,17 @@ fn parse_py_import_from_statement(source: &str, node: &Node) -> Option<ImportSta
 
     Some(ImportStatement {
         module_path,
-        names,
+        names: names.clone(),
         default_import: None,
         namespace_import: None,
         kind: ImportKind::Value,
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Python {
+            from_import: true,
+            named: names,
+        },
     })
 }
 
@@ -1331,7 +2041,7 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
 
     Some(ImportStatement {
         module_path: use_path,
-        names,
+        names: names.clone(),
         default_import: if has_pub {
             Some("pub".to_string())
         } else {
@@ -1342,6 +2052,13 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
         group,
         byte_range,
         raw_text,
+        form: ImportForm::RustUse {
+            // Only bare `pub` is recognized by the current parser; richer
+            // visibilities (`pub(crate)`, …) collapse to the same flag today and
+            // will be parsed precisely when the Rust engine moves onto `form`.
+            visibility: has_pub.then(|| "pub".to_string()),
+            named: names,
+        },
     })
 }
 
@@ -1504,12 +2221,13 @@ fn parse_go_import_spec(source: &str, node: &Node) -> Option<ImportStatement> {
     Some(ImportStatement {
         module_path: import_path,
         names: Vec::new(),
-        default_import: alias,
+        default_import: alias.clone(),
         namespace_import: None,
         kind: ImportKind::Value,
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Go { alias },
     })
 }
 
@@ -1573,6 +2291,185 @@ pub fn go_has_grouped_import(_source: &str, tree: &Tree) -> Option<Range<usize>>
     None
 }
 
+// ---------------------------------------------------------------------------
+// Solidity implementation
+// ---------------------------------------------------------------------------
+
+/// Classify a Solidity import path: relative (`./`, `../`) is internal,
+/// everything else (remappings, `@scope/...`, bare) is external. No stdlib.
+pub fn classify_group_solidity(module_path: &str) -> ImportGroup {
+    if module_path.starts_with('.') {
+        ImportGroup::Internal
+    } else {
+        ImportGroup::External
+    }
+}
+
+fn parse_solidity_imports(source: &str, tree: &Tree) -> ImportBlock {
+    let root = tree.root_node();
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_directive" {
+                if let Some(imp) = parse_solidity_import_directive(source, &node) {
+                    imports.push(imp);
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    let byte_range = import_byte_range(&imports);
+    ImportBlock {
+        imports,
+        byte_range,
+    }
+}
+
+/// Parse one `import_directive`. The Solidity grammar emits a flat token
+/// sequence (verified by grammar fixture test), so the four forms are
+/// distinguished by the presence of `{` (named), `*` (namespace), a trailing
+/// `as` (whole-file alias), or none (side-effect).
+fn parse_solidity_import_directive(source: &str, node: &Node) -> Option<ImportStatement> {
+    let raw_text = source[node.byte_range()].to_string();
+    let byte_range = node.byte_range();
+
+    let mut children: Vec<(String, String)> = Vec::new();
+    let mut c = node.walk();
+    if c.goto_first_child() {
+        loop {
+            let ch = c.node();
+            children.push((ch.kind().to_string(), source[ch.byte_range()].to_string()));
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    // Every form carries exactly one string literal: the imported file path.
+    let module_path = children
+        .iter()
+        .find(|(k, _)| k == "string")
+        .map(|(_, t)| t.trim_matches('"').to_string())?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let has_brace = children.iter().any(|(k, _)| k == "{");
+    let has_star = children.iter().any(|(k, _)| k == "*");
+
+    let mut named: Vec<String> = Vec::new();
+    let mut namespace: Option<String> = None;
+    let mut alias: Option<String> = None;
+
+    if has_brace {
+        named = parse_solidity_named_specifiers(&children);
+    } else if has_star {
+        namespace = solidity_identifier_after_as(&children);
+    } else {
+        // No `{`, no `*`: a trailing `as IDENT` is a whole-file alias;
+        // otherwise a bare side-effect import.
+        alias = solidity_identifier_after_as(&children);
+    }
+
+    let kind = if named.is_empty() && namespace.is_none() && alias.is_none() {
+        ImportKind::SideEffect
+    } else {
+        ImportKind::Value
+    };
+    let group = classify_group_solidity(&module_path);
+
+    Some(ImportStatement {
+        module_path,
+        names: named.clone(),
+        default_import: None,
+        // Namespace maps to the flat slot so existing readers (dedup) see it;
+        // the whole-file alias has no flat slot and lives only in `form`.
+        namespace_import: namespace.clone(),
+        kind,
+        group,
+        byte_range,
+        raw_text,
+        form: ImportForm::Solidity {
+            named,
+            namespace,
+            alias,
+        },
+    })
+}
+
+/// Return the `identifier` token immediately following the first `as`.
+fn solidity_identifier_after_as(children: &[(String, String)]) -> Option<String> {
+    let as_pos = children.iter().position(|(k, _)| k == "as")?;
+    children[as_pos + 1..]
+        .iter()
+        .find(|(k, _)| k == "identifier")
+        .map(|(_, t)| t.clone())
+}
+
+/// Collect named specifiers between `{` and `}` into verbatim strings,
+/// combining `A as B` into `"A as B"` to match the ES specifier convention.
+fn parse_solidity_named_specifiers(children: &[(String, String)]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_braces = false;
+    let mut current: Option<String> = None;
+    let mut expect_alias = false;
+    for (k, t) in children {
+        match k.as_str() {
+            "{" => in_braces = true,
+            "}" => {
+                if let Some(n) = current.take() {
+                    names.push(n);
+                }
+                in_braces = false;
+            }
+            _ if !in_braces => {}
+            "identifier" => {
+                if expect_alias {
+                    if let Some(n) = current.take() {
+                        names.push(format!("{n} as {t}"));
+                    }
+                    expect_alias = false;
+                } else {
+                    if let Some(n) = current.take() {
+                        names.push(n);
+                    }
+                    current = Some(t.clone());
+                }
+            }
+            "as" => expect_alias = true,
+            "," => {
+                if let Some(n) = current.take() {
+                    names.push(n);
+                }
+                expect_alias = false;
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Generate a Solidity import line in the appropriate form.
+fn generate_solidity_import_line(req: &ImportRequest) -> String {
+    if !req.names.is_empty() {
+        format!(
+            "import {{ {} }} from \"{}\";",
+            req.names.join(", "),
+            req.module_path
+        )
+    } else if let Some(ns) = req.namespace {
+        format!("import * as {} from \"{}\";", ns, req.module_path)
+    } else if let Some(al) = req.alias {
+        format!("import \"{}\" as {};", req.module_path, al)
+    } else {
+        format!("import \"{}\";", req.module_path)
+    }
+}
+
 /// Skip past a newline character at the given position.
 fn skip_newline(source: &str, pos: usize) -> usize {
     if pos < source.len() {
@@ -1598,6 +2495,138 @@ fn skip_newline(source: &str, pos: usize) -> usize {
 mod tests {
     use super::*;
 
+    // --- ImportForm field-mapping contract (Stream M) ---
+    //
+    // These assert the additive `form` field faithfully mirrors the flat
+    // fields each parser populates. They are the executable field-mapping
+    // contract from the migration plan: when a reader is moved off a flat
+    // field onto `form`, these guarantee no information was lost in the
+    // de-overloading (Rust `pub`, Go alias) or restructuring.
+
+    #[test]
+    fn form_es_mirrors_flat_fields() {
+        let (_, block) = parse_ts(
+            "import Default, { a, b as c } from \"ext\";\nimport type { T } from \"./t\";\nimport \"./side\";\nimport * as ns from \"nspkg\";\n",
+        );
+        // import Default, { a, b as c } from "ext"
+        match &block.imports[0].form {
+            ImportForm::Es {
+                default_import,
+                namespace_import,
+                named,
+                type_only,
+                side_effect,
+            } => {
+                assert_eq!(default_import.as_deref(), Some("Default"));
+                assert_eq!(namespace_import, &None);
+                assert_eq!(named, &block.imports[0].names);
+                assert!(!type_only);
+                assert!(!side_effect);
+            }
+            other => panic!("expected Es, got {other:?}"),
+        }
+        // import type { T } from "./t"
+        match &block.imports[1].form {
+            ImportForm::Es {
+                type_only, named, ..
+            } => {
+                assert!(type_only);
+                assert_eq!(named, &block.imports[1].names);
+            }
+            other => panic!("expected Es type-only, got {other:?}"),
+        }
+        // import "./side"
+        match &block.imports[2].form {
+            ImportForm::Es { side_effect, .. } => assert!(side_effect),
+            other => panic!("expected Es side-effect, got {other:?}"),
+        }
+        // import * as ns from "nspkg"
+        match &block.imports[3].form {
+            ImportForm::Es {
+                namespace_import, ..
+            } => assert_eq!(namespace_import.as_deref(), Some("ns")),
+            other => panic!("expected Es namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_python_mirrors_flat_fields() {
+        let (_, block) = parse_py("import os\nfrom sys import argv, path\n");
+        match &block.imports[0].form {
+            ImportForm::Python { from_import, named } => {
+                assert!(!from_import, "`import os` is not a from-import");
+                assert!(named.is_empty());
+            }
+            other => panic!("expected Python import, got {other:?}"),
+        }
+        match &block.imports[1].form {
+            ImportForm::Python { from_import, named } => {
+                assert!(from_import, "`from sys import ...` is a from-import");
+                assert_eq!(named, &block.imports[1].names);
+            }
+            other => panic!("expected Python from-import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_rust_de_overloads_pub_from_default_import() {
+        let (_, block) = parse_rust("pub use crate::a::Exported;\nuse std::fmt::Debug;\n");
+        // pub use -> visibility=Some("pub"); flat field still carries the "pub" hack.
+        match &block.imports[0].form {
+            ImportForm::RustUse { visibility, named } => {
+                assert_eq!(visibility.as_deref(), Some("pub"));
+                assert_eq!(named, &block.imports[0].names);
+            }
+            other => panic!("expected RustUse, got {other:?}"),
+        }
+        assert_eq!(
+            block.imports[0].default_import.as_deref(),
+            Some("pub"),
+            "flat field unchanged during additive migration"
+        );
+        // plain use -> visibility=None
+        match &block.imports[1].form {
+            ImportForm::RustUse { visibility, .. } => assert_eq!(visibility, &None),
+            other => panic!("expected RustUse, got {other:?}"),
+        }
+        assert_eq!(block.imports[1].default_import, None);
+    }
+
+    #[test]
+    fn form_go_de_overloads_alias_from_default_import() {
+        // The current Go parser only captures blank (`_`) / dot bindings as the
+        // alias (regular package aliases like `al "path"` are a pre-existing
+        // parser gap — not extracted into `default_import` today). The contract
+        // locked here is that `form.alias` mirrors `default_import` exactly,
+        // whatever the parser captures, so the de-overload is information-faithful.
+        let (_, block) =
+            parse_go("package main\n\nimport (\n\t_ \"github.com/x/y\"\n\t\"fmt\"\n)\n");
+        let blank = block
+            .imports
+            .iter()
+            .find(|i| i.module_path == "github.com/x/y")
+            .expect("blank import parsed");
+        match &blank.form {
+            ImportForm::Go { alias } => assert_eq!(alias.as_deref(), Some("_")),
+            other => panic!("expected Go blank-aliased, got {other:?}"),
+        }
+        assert_eq!(
+            blank.default_import.as_deref(),
+            Some("_"),
+            "form.alias mirrors the flat default_import field exactly"
+        );
+        let plain = block
+            .imports
+            .iter()
+            .find(|i| i.module_path == "fmt")
+            .expect("plain import parsed");
+        match &plain.form {
+            ImportForm::Go { alias } => assert_eq!(alias, &None),
+            other => panic!("expected Go plain, got {other:?}"),
+        }
+        assert_eq!(plain.default_import, None);
+    }
+
     fn parse_ts(source: &str) -> (Tree, ImportBlock) {
         let grammar = grammar_for(LangId::TypeScript);
         let mut parser = Parser::new();
@@ -1614,6 +2643,67 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let block = parse_imports(source, &tree, LangId::JavaScript);
         (tree, block)
+    }
+
+    fn parse_vue(source: &str) -> (Tree, ImportBlock) {
+        let grammar = grammar_for(LangId::Vue);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let block = parse_imports(source, &tree, LangId::Vue);
+        (tree, block)
+    }
+
+    /// Locks the tree-sitter-vue node kinds the Vue engine depends on: the
+    /// `<script>` body is exposed as a single `raw_text` node inside a
+    /// `script_element`. If a grammar bump changes this, the engine breaks
+    /// silently, so assert it here.
+    #[test]
+    fn vue_grammar_node_kinds_are_stable() {
+        let src = "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\n</script>\n";
+        let grammar = grammar_for(LangId::Vue);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let script = root
+            .named_children(&mut cursor)
+            .find(|n| n.kind() == "script_element")
+            .expect("expected a script_element node");
+        let mut inner = script.walk();
+        assert!(
+            script
+                .named_children(&mut inner)
+                .any(|n| n.kind() == "raw_text"),
+            "expected script body exposed as raw_text"
+        );
+    }
+
+    #[test]
+    fn vue_parses_script_imports_with_whole_file_offsets() {
+        let src = "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\nimport Foo from './Foo.vue'\nconst x = ref(0)\n</script>\n";
+        let (_tree, block) = parse_vue(src);
+        assert_eq!(block.imports.len(), 2, "should find both script imports");
+        // Byte ranges must be whole-file (inside the <script> block), not
+        // script-relative — verify the raw slice round-trips.
+        for imp in &block.imports {
+            assert_eq!(&src[imp.byte_range.clone()], imp.raw_text);
+            assert!(
+                imp.byte_range.start > src.find("<script").unwrap(),
+                "import offset must fall inside the script block"
+            );
+        }
+        assert_eq!(block.imports[0].module_path, "vue");
+        assert_eq!(block.imports[1].module_path, "./Foo.vue");
+    }
+
+    #[test]
+    fn vue_without_script_block_has_no_imports() {
+        let src = "<template>\n  <div />\n</template>\n\n<style>.x{}</style>\n";
+        let (_tree, block) = parse_vue(src);
+        assert!(block.imports.is_empty());
+        assert!(block.byte_range.is_none());
     }
 
     // --- Basic parsing ---
@@ -2170,5 +3260,200 @@ import { c } from 'charlie';
     fn generate_go_with_alias() {
         let line = generate_go_import_line("github.com/pkg/errors", Some("errs"), false);
         assert_eq!(line, "import errs \"github.com/pkg/errors\"");
+    }
+
+    // --- Solidity (Phase 1: first new language on the ImportSyntax registry) ---
+
+    fn parse_solidity(source: &str) -> (Tree, ImportBlock) {
+        let grammar = grammar_for(LangId::Solidity);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let block = parse_imports(source, &tree, LangId::Solidity);
+        (tree, block)
+    }
+
+    /// Grammar fixture (council #6): lock the tree-sitter-solidity node kinds the
+    /// parser depends on. If the grammar updates and renames these, this test
+    /// fails loudly before the parser silently mis-parses.
+    #[test]
+    fn solidity_grammar_node_kinds_are_stable() {
+        let grammar = grammar_for(LangId::Solidity);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let src = "import { Foo, Bar as Baz } from \"./A.sol\";\nimport * as N from \"./B.sol\";\nimport \"./C.sol\" as C;\nimport \"./D.sol\";\n";
+        let tree = parser.parse(src, None).unwrap();
+        let mut kinds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        fn walk(node: tree_sitter::Node, kinds: &mut std::collections::BTreeSet<String>) {
+            kinds.insert(node.kind().to_string());
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    walk(c.node(), kinds);
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        walk(tree.root_node(), &mut kinds);
+        for required in [
+            "import_directive",
+            "string",
+            "identifier",
+            "as",
+            "from",
+            "*",
+            "{",
+            "}",
+        ] {
+            assert!(
+                kinds.contains(required),
+                "solidity grammar missing node kind {required:?}; present: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_solidity_all_four_forms() {
+        let (_, block) = parse_solidity(
+            "import \"./A.sol\";\nimport \"./B.sol\" as B;\nimport * as C from \"./C.sol\";\nimport { Foo, Bar as Baz } from \"./D.sol\";\n",
+        );
+        assert_eq!(block.imports.len(), 4);
+
+        // side-effect
+        assert_eq!(block.imports[0].module_path, "./A.sol");
+        assert_eq!(block.imports[0].kind, ImportKind::SideEffect);
+        assert_eq!(
+            block.imports[0].form,
+            ImportForm::Solidity {
+                named: vec![],
+                namespace: None,
+                alias: None
+            }
+        );
+
+        // whole-file alias
+        assert_eq!(
+            block.imports[1].form,
+            ImportForm::Solidity {
+                named: vec![],
+                namespace: None,
+                alias: Some("B".to_string())
+            }
+        );
+
+        // namespace
+        match &block.imports[2].form {
+            ImportForm::Solidity { namespace, .. } => assert_eq!(namespace.as_deref(), Some("C")),
+            other => panic!("expected Solidity namespace, got {other:?}"),
+        }
+        assert_eq!(block.imports[2].namespace_import.as_deref(), Some("C"));
+
+        // named with alias (verbatim specifier convention)
+        match &block.imports[3].form {
+            ImportForm::Solidity { named, .. } => {
+                assert_eq!(named, &vec!["Foo".to_string(), "Bar as Baz".to_string()]);
+            }
+            other => panic!("expected Solidity named, got {other:?}"),
+        }
+        assert_eq!(
+            block.imports[3].names,
+            vec!["Foo".to_string(), "Bar as Baz".to_string()]
+        );
+    }
+
+    #[test]
+    fn generate_solidity_all_forms() {
+        // side-effect
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./A.sol", &[], None, None, false)
+            ),
+            "import \"./A.sol\";"
+        );
+        // named
+        let names = vec!["Foo".to_string(), "Bar as Baz".to_string()];
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./D.sol", &names, None, None, false)
+            ),
+            "import { Foo, Bar as Baz } from \"./D.sol\";"
+        );
+        // namespace
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./C.sol", &[], None, Some("C"), false)
+            ),
+            "import * as C from \"./C.sol\";"
+        );
+        // whole-file alias
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest {
+                    module_path: "./B.sol",
+                    names: &[],
+                    default_import: None,
+                    namespace: None,
+                    alias: Some("B"),
+                    type_only: false,
+                    modifiers: &[],
+                    import_kind: None,
+                }
+            ),
+            "import \"./B.sol\" as B;"
+        );
+    }
+
+    #[test]
+    fn solidity_round_trips_through_parse_generate() {
+        // Every generated form must parse back to the same structured shape.
+        for src in [
+            "import \"./A.sol\";",
+            "import \"./B.sol\" as B;",
+            "import * as C from \"./C.sol\";",
+            "import { Foo, Bar as Baz } from \"./D.sol\";",
+        ] {
+            let (_, block) = parse_solidity(src);
+            assert_eq!(block.imports.len(), 1, "parse {src:?}");
+            let imp = &block.imports[0];
+            let (namespace, alias) = match &imp.form {
+                ImportForm::Solidity {
+                    namespace, alias, ..
+                } => (namespace.as_deref(), alias.as_deref()),
+                other => panic!("expected Solidity, got {other:?}"),
+            };
+            let regenerated = generate_import(
+                LangId::Solidity,
+                &ImportRequest {
+                    module_path: &imp.module_path,
+                    names: &imp.names,
+                    default_import: None,
+                    namespace,
+                    alias,
+                    type_only: false,
+                    modifiers: &[],
+                    import_kind: None,
+                },
+            );
+            assert_eq!(regenerated, src, "round-trip mismatch for {src:?}");
+        }
+    }
+
+    #[test]
+    fn classify_group_solidity_relative_vs_external() {
+        assert_eq!(classify_group_solidity("./A.sol"), ImportGroup::Internal);
+        assert_eq!(
+            classify_group_solidity("../lib/B.sol"),
+            ImportGroup::Internal
+        );
+        assert_eq!(
+            classify_group_solidity("@openzeppelin/contracts/token/ERC20/ERC20.sol"),
+            ImportGroup::External
+        );
     }
 }

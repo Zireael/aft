@@ -17,6 +17,7 @@ import {
   unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
+import { resolveBashConfig } from "../config.js";
 import {
   disposePtyTerminal,
   getOrCreatePtyTerminal,
@@ -37,7 +38,8 @@ import {
 // promoting the task to background and returning. INTENTIONALLY decoupled
 // from the task's own kill cap (`params.timeout`). Council decision:
 // .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-const FOREGROUND_WAIT_WINDOW_MS = 5_000;
+// The value is resolved per-call from bash config (default 8000ms, floored at
+// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
 const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
@@ -260,6 +262,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     parameters: BashParams,
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
+      const foregroundWaitMs = resolveBashConfig(ctx.config).foreground_wait_window_ms;
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust
@@ -346,15 +349,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         }
 
         // Wait-window decoupled from params.timeout. Always cap polling at
-        // FOREGROUND_WAIT_WINDOW_MS so agents get a fast promotion message
+        // foregroundWaitMs so agents get a fast promotion message
         // for unexpectedly long commands. Honor a shorter explicit timeout
         // when present — polling beyond the task's kill cap is pointless.
         // Schema validation guarantees params.timeout is a positive integer
         // or undefined, so this Math.min is always well-defined.
         const waitTimeoutMs =
-          timeout !== undefined
-            ? Math.min(timeout, FOREGROUND_WAIT_WINDOW_MS)
-            : FOREGROUND_WAIT_WINDOW_MS;
+          timeout !== undefined ? Math.min(timeout, foregroundWaitMs) : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
           const status = await callBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
@@ -376,7 +377,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(formatPromotionMessage(taskId, params.timeout), {
+            return bashResult(formatPromotionMessage(taskId, params.timeout, foregroundWaitMs), {
               task_id: taskId,
             });
           }
@@ -425,15 +426,21 @@ function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
-function formatPromotionMessage(taskId: string, timeout: number | undefined): string {
+function formatPromotionMessage(
+  taskId: string,
+  timeout: number | undefined,
+  waitWindowMs: number,
+): string {
   // Reports actual elapsed wait, not the user's full kill cap. The agent
   // already has the original command in its tool-call args; bash_status
   // returns it on demand if a downstream tool ever needs it.
-  const waited =
-    timeout !== undefined
-      ? Math.min(timeout, FOREGROUND_WAIT_WINDOW_MS)
-      : FOREGROUND_WAIT_WINDOW_MS;
-  return `Foreground bash didn't finish within ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
+  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
+  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
+}
+
+/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
+function formatSeconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(1))}s`;
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {

@@ -172,6 +172,30 @@ pub struct FileCallData {
     pub lang: LangId,
 }
 
+impl FileCallData {
+    /// Look up metadata for an exported symbol name.
+    ///
+    /// `exported_symbols` stores bare names (e.g. `total_disk_bytes`), but
+    /// `symbol_metadata` is keyed by scoped identity (e.g.
+    /// `BackupStore::total_disk_bytes` for impl methods, via
+    /// [`symbol_identity`]). A bare-name `.get()` therefore misses scoped
+    /// symbols and forces callers into degraded `unknown`/line-1 fallbacks.
+    /// This resolves an exact key first, then falls back to the first entry
+    /// whose unqualified name matches — recovering correct kind and line for
+    /// methods. (Bare-name exports are already ambiguous across scopes, so
+    /// first-match is the best available signal; this only affects displayed
+    /// metadata, never liveness, which keys on the symbol name.)
+    pub fn symbol_metadata_for(&self, name: &str) -> Option<&SymbolMeta> {
+        if let Some(meta) = self.symbol_metadata.get(name) {
+            return Some(meta);
+        }
+        self.symbol_metadata
+            .iter()
+            .find(|(key, _)| symbol_unqualified_name(key) == name)
+            .map(|(_, meta)| meta)
+    }
+}
+
 /// Result of resolving a cross-file call edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeResolution {
@@ -3973,12 +3997,10 @@ fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Optio
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
-    if let Some(cached) = WORKSPACE_PACKAGE_CACHE
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned())
-    {
-        return cached;
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return cached.clone();
+        }
     }
 
     let resolved = workspace_member_dirs(&workspace_root)
@@ -4259,6 +4281,25 @@ fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Optio
     }
 }
 
+pub(crate) fn resolve_reexported_symbol_target<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+) -> Option<(PathBuf, String)>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    resolve_reexported_symbol(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+    )
+    .map(|target| (target.file, target.symbol))
+}
+
 fn resolve_reexported_symbol<F, D>(
     file: &Path,
     symbol_name: &str,
@@ -4382,7 +4423,9 @@ where
     F: FnMut(&Path, &str) -> bool,
     D: FnMut(&Path) -> Option<String>,
 {
-    let source_node = node.child_by_field_name("source")?;
+    let source_node = node
+        .child_by_field_name("source")
+        .or_else(|| find_child_by_kind(node, "string"))?;
     let module_path = string_literal_content(source, source_node)?;
     let target_file = resolve_module_path(from_dir, &module_path)?;
     let raw_export = node_text(node, source);
@@ -4540,6 +4583,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .git_ignore(true)     // respect .gitignore
         .git_global(true)     // respect global gitignore
         .git_exclude(true)    // respect .git/info/exclude
+        .add_custom_ignore_filename(".aftignore") // AFT-specific ignores (e.g. submodules)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
@@ -4570,6 +4614,50 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn symbol_metadata_for_recovers_scoped_method_by_bare_name() {
+        // exported_symbols carries the bare name; symbol_metadata is keyed by
+        // scoped identity (impl method). A plain .get(bare) misses and would
+        // force the degraded unknown/line-1 fallback. symbol_metadata_for must
+        // recover the scoped entry via unqualified-name match.
+        let mut symbol_metadata = HashMap::new();
+        symbol_metadata.insert(
+            "BackupStore::total_disk_bytes".to_string(),
+            SymbolMeta {
+                kind: SymbolKind::Method,
+                exported: true,
+                signature: None,
+                line: 703,
+                range: Range {
+                    start_line: 702,
+                    start_col: 0,
+                    end_line: 705,
+                    end_col: 0,
+                },
+            },
+        );
+        let file_data = FileCallData {
+            calls_by_symbol: HashMap::new(),
+            exported_symbols: vec!["total_disk_bytes".to_string()],
+            symbol_metadata,
+            default_export_symbol: None,
+            import_block: ImportBlock::empty(),
+            lang: LangId::Rust,
+        };
+
+        let meta = file_data
+            .symbol_metadata_for("total_disk_bytes")
+            .expect("scoped method recovered by bare name");
+        assert_eq!(meta.kind, SymbolKind::Method);
+        assert_eq!(
+            meta.line, 703,
+            "real declaration line, not the line-1 fallback"
+        );
+
+        // A genuinely-absent symbol still returns None (no false recovery).
+        assert!(file_data.symbol_metadata_for("does_not_exist").is_none());
+    }
 
     /// Create a temp directory with TypeScript files for testing.
     fn setup_ts_project() -> TempDir {
@@ -5015,6 +5103,38 @@ export function funcB() {
         assert!(
             !file_names.contains(&"dep.ts".to_string()),
             "Should exclude node_modules, got: {:?}",
+            file_names
+        );
+    }
+
+    #[test]
+    fn callgraph_walker_excludes_aftignored() {
+        let dir = TempDir::new().unwrap();
+
+        // .aftignore is honored without a git repo (custom ignore file).
+        fs::write(dir.path().join(".aftignore"), "vendored/\n").unwrap();
+        fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::create_dir(dir.path().join("vendored")).unwrap();
+        fs::write(
+            dir.path().join("vendored").join("sub.ts"),
+            "export function sub() {}",
+        )
+        .unwrap();
+
+        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let file_names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            file_names.contains(&"main.ts".to_string()),
+            "Should include main.ts, got: {:?}",
+            file_names
+        );
+        assert!(
+            !file_names.contains(&"sub.ts".to_string()),
+            "Should exclude .aftignored sub.ts, got: {:?}",
             file_names
         );
     }

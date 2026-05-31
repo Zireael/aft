@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -7,15 +8,27 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
+use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
+use crate::calls::extract_type_references;
+use crate::imports::{parse_imports, specifier_imported_name};
 use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess,
 };
+use crate::parser::{detect_language, grammar_for, LangId};
+
+use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
 type ExportNode = (String, String);
+
+#[derive(Debug, Default)]
+struct ImportedExportLiveness {
+    root_exports: Vec<ImportedExportContribution>,
+    namespace_exports: Vec<ImportedExportContribution>,
+}
 
 pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
@@ -35,7 +48,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         .map(|file| relative_path(&job.project_root, file))
         .collect::<BTreeSet<_>>();
     let public_api_files = collect_public_api_files(&job.project_root);
-    let (exported_symbols_by_file, files_by_exported_symbol) =
+    let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes(job, snapshot);
 
     let contributions = job
@@ -48,6 +61,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
                 file,
                 &exported_symbols_by_file,
                 &files_by_exported_symbol,
+                &default_export_symbols_by_file,
                 &liveness_root_files,
                 &public_api_files,
             )
@@ -70,12 +84,19 @@ fn exported_symbol_indexes(
 ) -> (
     BTreeMap<String, BTreeSet<String>>,
     BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, String>,
 ) {
     let mut exported_symbols_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut files_by_exported_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut default_export_symbols_by_file: BTreeMap<String, String> = BTreeMap::new();
 
     for export in &snapshot.exported_symbols {
         let file = relative_path(&job.project_root, &export.file);
+        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
+            default_export_symbols_by_file.insert(file, export.symbol.clone());
+            continue;
+        }
+
         exported_symbols_by_file
             .entry(file.clone())
             .or_default()
@@ -86,7 +107,11 @@ fn exported_symbol_indexes(
             .insert(file);
     }
 
-    (exported_symbols_by_file, files_by_exported_symbol)
+    (
+        exported_symbols_by_file,
+        files_by_exported_symbol,
+        default_export_symbols_by_file,
+    )
 }
 
 fn gather_file_contribution(
@@ -95,6 +120,7 @@ fn gather_file_contribution(
     file: &Path,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
     liveness_root_files: &BTreeSet<String>,
     public_api_files: &BTreeSet<String>,
 ) -> FileContribution {
@@ -105,6 +131,7 @@ fn gather_file_contribution(
         .exported_symbols
         .iter()
         .filter(|export| same_file(&job.project_root, &export.file, file))
+        .filter(|export| export.kind != DEFAULT_EXPORT_MARKER_KIND)
         .map(|export| ExportContribution {
             symbol: export.symbol.clone(),
             kind: export.kind.clone(),
@@ -150,6 +177,13 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let imported_export_liveness = imported_export_liveness_roots(
+        &job.project_root,
+        file,
+        exported_symbols_by_file,
+        default_export_symbols_by_file,
+    );
+    let type_ref_names = collect_type_ref_names(file);
 
     let liveness_roots = liveness_roots_for_file(
         &file_name,
@@ -193,6 +227,26 @@ fn gather_file_contribution(
     if !dispatched_method_names.is_empty() {
         payload["dispatched_method_names"] = json!(dispatched_method_names);
     }
+    if !imported_export_liveness.root_exports.is_empty() {
+        payload["imported_exports"] = json!(imported_export_liveness
+            .root_exports
+            .iter()
+            .map(|root| json!({
+                "file": root.file,
+                "symbol": root.symbol,
+            }))
+            .collect::<Vec<_>>());
+    }
+    if !imported_export_liveness.namespace_exports.is_empty() {
+        payload["namespace_imported_exports"] = json!(imported_export_liveness
+            .namespace_exports
+            .iter()
+            .map(|root| json!({
+                "file": root.file,
+                "symbol": root.symbol,
+            }))
+            .collect::<Vec<_>>());
+    }
 
     FileContribution::new(
         InspectCategory::DeadCode,
@@ -200,6 +254,7 @@ fn gather_file_contribution(
         collect_freshness(file),
         payload,
     )
+    .with_type_ref_names(type_ref_names)
 }
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
@@ -240,15 +295,15 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         .collect::<Vec<_>>();
 
     let edges_by_source = edges_by_source(&parsed);
-    let inbound_edges = inbound_edges_by_target(&edges_by_source);
     let reachable = reachable_exports(&parsed, &edges_by_source);
+    let referenced_type_names = collect_referenced_type_names(&parsed);
     let dispatched_method_names = collect_dispatched_method_names(&parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
     let mut dead_items = Vec::new();
-    let mut uncertain_count = 0usize;
-    let mut uncertain_items = Vec::new();
+    let uncertain_count = 0usize;
+    let uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in &parsed {
         let is_public_api_file = public_api_files.contains(&contribution.file);
         for export in &contribution.exports {
@@ -260,20 +315,9 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
                 continue;
             }
 
-            let has_inbound_edge = inbound_edges
-                .get(&node)
-                .is_some_and(|sources| !sources.is_empty());
-            if (export.is_type_like || is_type_like_kind(&export.kind)) && !has_inbound_edge {
-                uncertain_count += 1;
-                if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
-                    uncertain_items.push(json!({
-                        "file": contribution.file,
-                        "symbol": export.symbol,
-                        "kind": export.kind,
-                        "line": export.line,
-                        "reason": "type-position usage not tracked until Phase 2",
-                    }));
-                }
+            if (export.is_type_like || is_type_like_kind(&export.kind))
+                && referenced_type_names.contains(symbol_liveness_name(&export.symbol))
+            {
                 continue;
             }
 
@@ -330,21 +374,6 @@ fn edges_by_source(
     edges
 }
 
-fn inbound_edges_by_target(
-    edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
-) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
-    let mut inbound: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
-    for (source, targets) in edges_by_source {
-        for target in targets {
-            inbound
-                .entry(target.clone())
-                .or_default()
-                .insert(source.clone());
-        }
-    }
-    inbound
-}
-
 fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
     contributions
         .iter()
@@ -352,10 +381,29 @@ fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BT
         .collect()
 }
 
+fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
+    // A type-like export is live if it is referenced in type position ANYWHERE
+    // in the project — not only from call-reachable files. Filtering by
+    // call-reachability (the original Phase 2 design) under-approximates
+    // liveness: the cross-file call graph is incomplete (constructor/method
+    // edges, workspace-package boundaries), so genuinely-used types referenced
+    // from files the call graph fails to mark reachable were flagged dead.
+    // This mirrors `collect_dispatched_method_names`, which is also unfiltered,
+    // and keeps dead_code biased toward under-reporting (it is a hint, not
+    // authority): a type with zero type-references anywhere is still precise
+    // dead.
+    contributions
+        .iter()
+        .flat_map(|contribution| contribution.type_ref_names.iter().cloned())
+        .collect()
+}
+
 fn reachable_exports(
     contributions: &[DeadCodeContribution],
     edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
 ) -> BTreeSet<ExportNode> {
+    let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
+    let mut expanded_namespace_imports = BTreeSet::new();
     let mut reachable = BTreeSet::new();
     let mut queue = VecDeque::new();
 
@@ -368,11 +416,26 @@ fn reachable_exports(
                 queue.push_back((contribution.file.clone(), export.symbol.clone()));
             }
         }
+        for imported_export in &contribution.imported_exports {
+            queue.push_back((imported_export.file.clone(), imported_export.symbol.clone()));
+        }
     }
 
     while let Some(node) = queue.pop_front() {
         if !reachable.insert(node.clone()) {
             continue;
+        }
+        if expanded_namespace_imports.insert(node.0.clone()) {
+            // Namespace imports are conservative file-level edges: once the
+            // importer file is reached, every export of the imported module is
+            // considered live because member access is not tracked here.
+            if let Some(targets) = namespace_imports_by_file.get(&node.0) {
+                for target in targets {
+                    if !reachable.contains(target) {
+                        queue.push_back(target.clone());
+                    }
+                }
+            }
         }
         if let Some(targets) = edges_by_source.get(&node) {
             for target in targets {
@@ -384,6 +447,29 @@ fn reachable_exports(
     }
 
     reachable
+}
+
+fn namespace_imported_exports_by_file(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<String, BTreeSet<ExportNode>> {
+    let mut by_file: BTreeMap<String, BTreeSet<ExportNode>> = BTreeMap::new();
+
+    for contribution in contributions {
+        if contribution.namespace_imported_exports.is_empty() {
+            continue;
+        }
+        by_file
+            .entry(contribution.file.clone())
+            .or_default()
+            .extend(
+                contribution
+                    .namespace_imported_exports
+                    .iter()
+                    .map(|root| (root.file.clone(), root.symbol.clone())),
+            );
+    }
+
+    by_file
 }
 
 fn project_internal_call(
@@ -418,6 +504,250 @@ fn project_internal_call(
         symbol,
         line: call.line,
     })
+}
+
+fn imported_export_liveness_roots(
+    project_root: &Path,
+    file: &Path,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> ImportedExportLiveness {
+    let Some(lang) = detect_language(file)
+        .filter(|lang| matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript))
+    else {
+        return ImportedExportLiveness::default();
+    };
+    let Ok(source) = fs::read_to_string(file) else {
+        return ImportedExportLiveness::default();
+    };
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return ImportedExportLiveness::default();
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return ImportedExportLiveness::default();
+    };
+
+    let import_block = parse_imports(&source, &tree, lang);
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut root_exports: BTreeSet<ExportNode> = BTreeSet::new();
+    let mut namespace_exports: BTreeSet<ExportNode> = BTreeSet::new();
+
+    for import in &import_block.imports {
+        if import.namespace_import.is_some() {
+            if let Some(module_entry) = resolve_module_path(from_dir, &import.module_path) {
+                namespace_exports.extend(resolve_namespace_import_liveness_roots(
+                    project_root,
+                    &module_entry,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                ));
+            }
+        }
+
+        let Some(module_entry) = resolve_workspace_package_import(from_dir, &import.module_path)
+        else {
+            continue;
+        };
+
+        for imported_name in import
+            .names
+            .iter()
+            .map(|name| specifier_imported_name(name))
+        {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                imported_name,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ) {
+                root_exports.insert(root);
+            }
+        }
+
+        if import.default_import.is_some() {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                "default",
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ) {
+                root_exports.insert(root);
+            }
+        }
+    }
+
+    ImportedExportLiveness {
+        root_exports: root_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+        namespace_exports: namespace_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+    }
+}
+
+fn resolve_workspace_package_import(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let package_name = package_name_from_import(module_path)?;
+    let module_entry = resolve_module_path(from_dir, module_path)?;
+    let resolved_package_name = package_name_for_file(&module_entry)?;
+    (resolved_package_name == package_name).then_some(module_entry)
+}
+
+fn package_name_from_import(module_path: &str) -> Option<String> {
+    if module_path.starts_with('.') || module_path.starts_with('/') || module_path.starts_with('#')
+    {
+        return None;
+    }
+
+    let mut parts = module_path.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        (!second.is_empty()).then(|| format!("{first}/{second}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn package_name_for_file(file: &Path) -> Option<String> {
+    let mut current = file.parent();
+    while let Some(dir) = current {
+        let manifest = dir.join("package.json");
+        if manifest.is_file() {
+            if let Ok(source) = fs::read_to_string(&manifest) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&source) {
+                    if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn resolve_namespace_import_liveness_roots(
+    project_root: &Path,
+    module_entry: &Path,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<ExportNode> {
+    let Some((_, symbols)) =
+        exported_symbols_for_resolved_file(project_root, module_entry, exported_symbols_by_file)
+    else {
+        return Vec::new();
+    };
+    let mut roots = BTreeSet::new();
+
+    for symbol in symbols {
+        if let Some(root) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            symbol,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            roots.insert(root);
+        }
+    }
+
+    if default_export_symbol_for_resolved_file(
+        project_root,
+        module_entry,
+        default_export_symbols_by_file,
+    )
+    .is_some()
+    {
+        if let Some(root) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            "default",
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            roots.insert(root);
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn resolve_imported_export_liveness_root(
+    project_root: &Path,
+    module_entry: &Path,
+    imported_symbol: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Option<ExportNode> {
+    let mut file_exports_symbol = |path: &Path, symbol_name: &str| {
+        exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
+            .is_some_and(|(_, symbols)| symbols.contains(symbol_name))
+    };
+    let mut file_default_export_symbol = |path: &Path| {
+        default_export_symbol_for_resolved_file(project_root, path, default_export_symbols_by_file)
+            .or_else(|| {
+                exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
+                    .and_then(|(_, symbols)| {
+                        symbols.contains("default").then(|| "default".to_string())
+                    })
+            })
+    };
+
+    let (target_file, symbol) = resolve_reexported_symbol_target(
+        module_entry,
+        imported_symbol,
+        &mut file_exports_symbol,
+        &mut file_default_export_symbol,
+    )?;
+
+    let (file, symbols) =
+        exported_symbols_for_resolved_file(project_root, &target_file, exported_symbols_by_file)?;
+    symbols.contains(&symbol).then_some((file, symbol))
+}
+
+fn exported_symbols_for_resolved_file<'a>(
+    project_root: &Path,
+    file: &Path,
+    exported_symbols_by_file: &'a BTreeMap<String, BTreeSet<String>>,
+) -> Option<(String, &'a BTreeSet<String>)> {
+    let relative = relative_path(project_root, file);
+    if let Some(symbols) = exported_symbols_by_file.get(&relative) {
+        return Some((relative, symbols));
+    }
+
+    let canonical_root = fs::canonicalize(project_root).ok()?;
+    let canonical_file = fs::canonicalize(file).ok()?;
+    let relative = relative_path(&canonical_root, &canonical_file);
+    exported_symbols_by_file
+        .get(&relative)
+        .map(|symbols| (relative, symbols))
+}
+
+fn default_export_symbol_for_resolved_file(
+    project_root: &Path,
+    file: &Path,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Option<String> {
+    let relative = relative_path(project_root, file);
+    if let Some(symbol) = default_export_symbols_by_file.get(&relative) {
+        return Some(symbol.clone());
+    }
+
+    let canonical_root = fs::canonicalize(project_root).ok()?;
+    let canonical_file = fs::canonicalize(file).ok()?;
+    let relative = relative_path(&canonical_root, &canonical_file);
+    default_export_symbols_by_file.get(&relative).cloned()
 }
 
 fn resolve_unqualified_target(
@@ -615,6 +945,37 @@ fn language_for_file(file: &str) -> &'static str {
     }
 }
 
+fn collect_type_ref_names(file: &Path) -> BTreeSet<String> {
+    let Some(lang) = detect_language(file).filter(|lang| supports_type_refs(*lang)) else {
+        return BTreeSet::new();
+    };
+    let Ok(source) = fs::read_to_string(file) else {
+        return BTreeSet::new();
+    };
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return BTreeSet::new();
+    };
+
+    extract_type_references(&source, tree.root_node(), lang)
+}
+
+fn supports_type_refs(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Python
+            | LangId::Rust
+            | LangId::Go
+    )
+}
+
 fn collect_freshness(file: &Path) -> FileFreshness {
     cache_freshness::collect(file).unwrap_or_else(|_| FileFreshness {
         mtime: UNIX_EPOCH,
@@ -674,7 +1035,19 @@ struct DeadCodeContribution {
     #[serde(default)]
     liveness_roots: Vec<String>,
     #[serde(default)]
+    imported_exports: Vec<ImportedExportContribution>,
+    #[serde(default)]
+    namespace_imported_exports: Vec<ImportedExportContribution>,
+    #[serde(default)]
     dispatched_method_names: Vec<String>,
+    #[serde(default)]
+    type_ref_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImportedExportContribution {
+    file: String,
+    symbol: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -764,12 +1137,21 @@ mod tests {
         exported_symbols: Vec<CallgraphExport>,
         outbound_calls: Vec<CallgraphOutboundCall>,
     ) -> CallgraphSnapshot {
+        snapshot_with_entry_points(files, exported_symbols, outbound_calls, BTreeSet::new())
+    }
+
+    fn snapshot_with_entry_points(
+        files: Vec<PathBuf>,
+        exported_symbols: Vec<CallgraphExport>,
+        outbound_calls: Vec<CallgraphOutboundCall>,
+        entry_points: BTreeSet<PathBuf>,
+    ) -> CallgraphSnapshot {
         CallgraphSnapshot {
             generated_at: None,
             files,
             exported_symbols,
             outbound_calls,
-            entry_points: BTreeSet::new(),
+            entry_points,
         }
     }
 
@@ -856,7 +1238,63 @@ mod tests {
     }
 
     #[test]
-    fn type_like_export_without_inbound_edge_is_uncertain() {
+    fn rust_struct_referenced_only_in_types_is_live() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("src/types.rs", "pub struct Widget { id: u64 }\n"),
+            (
+                "src/main.rs",
+                "use crate::types::Widget;\nstruct Holder { value: Widget }\npub fn main(input: Widget) -> Widget { input }\n",
+            ),
+        ]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(
+                paths,
+                vec![
+                    export(&root, "src/types.rs", "Widget", "struct"),
+                    export(&root, "src/main.rs", "main", "function"),
+                ],
+                Vec::new(),
+                BTreeSet::from([root.join("src/main.rs")]),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ts_interface_referenced_only_in_type_annotation_is_live() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("src/types.ts", "export interface Widget { id: string }\n"),
+            (
+                "src/main.ts",
+                "import type { Widget } from './types';\nexport function run(input: Widget): void {}\n",
+            ),
+        ]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(
+                paths,
+                vec![
+                    export(&root, "src/types.ts", "Widget", "interface"),
+                    export(&root, "src/main.ts", "run", "function"),
+                ],
+                Vec::new(),
+                BTreeSet::from([root.join("src/main.ts")]),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn type_like_export_without_call_or_type_ref_is_precise_dead() {
         let (_temp_dir, root, paths) =
             fixture_project(&[("src/types.ts", "export interface Widget { id: string }\n")]);
         let aggregate = scan(job(
@@ -869,18 +1307,14 @@ mod tests {
             ),
         ));
 
-        assert_eq!(aggregate["count"], 0);
-        assert!(aggregate["items"].as_array().unwrap().is_empty());
-        assert_eq!(aggregate["uncertain_count"], 1);
-        assert_eq!(aggregate["uncertain_items"][0]["symbol"], "Widget");
-        assert_eq!(
-            aggregate["uncertain_items"][0]["reason"],
-            "type-position usage not tracked until Phase 2"
-        );
+        assert_eq!(aggregate["count"], 1);
+        assert_eq!(aggregate["items"][0]["symbol"], "Widget");
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["uncertain_items"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn non_type_unreachable_export_is_still_dead() {
+    fn genuinely_unreachable_function_is_still_dead() {
         let (_temp_dir, root, paths) =
             fixture_project(&[("src/build.ts", "export function build() {}\n")]);
         let aggregate = scan(job(
