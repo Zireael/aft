@@ -1268,4 +1268,197 @@ mod tests {
         assert!(text.contains("embed 42ms"), "embed latency: {text}");
         assert!(text.contains("50 candidates"), "candidates: {text}");
     }
+
+    // ── Additional diagnostics tests ────────────────────────────────────
+
+    #[test]
+    fn search_pipeline_type_hybrid_rerank_display() {
+        assert_eq!(
+            SearchPipelineType::HybridRerank.to_string(),
+            "hybrid_rerank"
+        );
+    }
+
+    #[test]
+    fn search_metrics_collector_window_size_one() {
+        let mut collector = SearchMetricsCollector::new(1);
+        collector.record(make_diag(10.0, 0));
+        assert_eq!(collector.aggregate().total_queries, 1);
+        collector.record(make_diag(20.0, 0));
+        // Window size 1: first entry evicted
+        assert_eq!(collector.aggregate().total_queries, 1);
+        assert!((collector.aggregate().p50_latency_ms - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_metrics_collector_cache_hit_rate() {
+        let mut collector = SearchMetricsCollector::new(10);
+        let mut d1 = make_diag(10.0, 1);
+        d1.query_cache_hit = true;
+        collector.record(d1);
+        let mut d2 = make_diag(20.0, 1);
+        d2.query_cache_hit = false;
+        collector.record(d2);
+        let agg = collector.aggregate();
+        assert!((agg.query_cache_hit_rate - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_metrics_collector_zero_result_rate() {
+        let mut collector = SearchMetricsCollector::new(10);
+        collector.record(make_diag(10.0, 0)); // zero results
+        collector.record(make_diag(20.0, 5)); // has results
+        collector.record(make_diag(30.0, 0)); // zero results
+        let agg = collector.aggregate();
+        assert!((agg.zero_result_rate - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_metrics_collector_low_confidence_rate() {
+        let mut collector = SearchMetricsCollector::new(10);
+        let mut d1 = make_diag(10.0, 1);
+        d1.warnings.push(SearchWarning::LowConfidence);
+        collector.record(d1);
+        collector.record(make_diag(20.0, 1)); // no warning
+        let agg = collector.aggregate();
+        assert!((agg.low_confidence_rate - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_metrics_collector_latency_percentiles() {
+        let mut collector = SearchMetricsCollector::new(100);
+        for i in 0..100 {
+            collector.record(make_diag(i as f64, 1));
+        }
+        let agg = collector.aggregate();
+        // p50 should be around 50ms, p95 around 95ms
+        assert!(agg.p50_latency_ms >= 49.0 && agg.p50_latency_ms <= 51.0);
+        assert!(agg.p95_latency_ms >= 94.0 && agg.p95_latency_ms <= 96.0);
+    }
+
+    #[test]
+    fn diagnostics_output_mode_defaults() {
+        assert_eq!(
+            crate::config::DiagnosticsOutputMode::default(),
+            crate::config::DiagnosticsOutputMode::Minimal
+        );
+    }
+
+    #[test]
+    fn format_warning_minimal_all_variants() {
+        // Minimal mode: only shows high-visibility warnings
+        assert_eq!(format_warning_minimal(&SearchWarning::LowConfidence), None);
+        assert_eq!(
+            format_warning_minimal(&SearchWarning::EmptyResults),
+            Some("⚠ no matching results found".to_string())
+        );
+        assert!(
+            format_warning_minimal(&SearchWarning::PartialIndex { completeness: 0.8 }).is_some()
+        );
+        assert!(format_warning_minimal(&SearchWarning::StaleIndex).is_some());
+        assert!(format_warning_minimal(&SearchWarning::DegradedIndex).is_some());
+        // These are suppressed in minimal mode
+        assert_eq!(
+            format_warning_minimal(&SearchWarning::EmbeddingFailure {
+                reason: "err".into()
+            }),
+            None
+        );
+        assert_eq!(
+            format_warning_minimal(&SearchWarning::DimensionMismatch {
+                expected: 384,
+                got: 768
+            }),
+            None
+        );
+        assert_eq!(
+            format_warning_minimal(&SearchWarning::LexicalFailure {
+                reason: "err".into()
+            }),
+            None
+        );
+        assert_eq!(
+            format_warning_minimal(&SearchWarning::RerankerFailure {
+                reason: "err".into()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn format_warning_verbose_all_variants() {
+        let v = format_warning_verbose(&SearchWarning::LowConfidence);
+        assert!(v.contains("low confidence"));
+        let v = format_warning_verbose(&SearchWarning::EmptyResults);
+        assert!(v.contains("no matching results"));
+        let v = format_warning_verbose(&SearchWarning::PartialIndex { completeness: 0.5 });
+        assert!(v.contains("50%"));
+        let v = format_warning_verbose(&SearchWarning::StaleIndex);
+        assert!(v.contains("stale"));
+        let v = format_warning_verbose(&SearchWarning::DegradedIndex);
+        assert!(v.contains("degraded"));
+        let v = format_warning_verbose(&SearchWarning::EmbeddingFailure {
+            reason: "timeout".into(),
+        });
+        assert!(v.contains("timeout"));
+        let v = format_warning_verbose(&SearchWarning::DimensionMismatch {
+            expected: 768,
+            got: 384,
+        });
+        assert!(v.contains("768") && v.contains("384"));
+        let v = format_warning_verbose(&SearchWarning::LexicalFailure {
+            reason: "skip".into(),
+        });
+        assert!(v.contains("skip"));
+    }
+
+    #[test]
+    fn search_warning_serde_roundtrip() {
+        let warnings = vec![
+            SearchWarning::LowConfidence,
+            SearchWarning::EmptyResults,
+            SearchWarning::PartialIndex { completeness: 0.75 },
+            SearchWarning::StaleIndex,
+            SearchWarning::DegradedIndex,
+            SearchWarning::EmbeddingFailure {
+                reason: "err".into(),
+            },
+            SearchWarning::DimensionMismatch {
+                expected: 384,
+                got: 768,
+            },
+            SearchWarning::LexicalFailure {
+                reason: "skip".into(),
+            },
+        ];
+        for w in &warnings {
+            let json = serde_json::to_string(w).unwrap();
+            let parsed: SearchWarning = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, w);
+        }
+    }
+
+    fn make_diag(latency_ms: f64, returned: usize) -> SearchDiagnostics {
+        SearchDiagnostics {
+            query_hash: "test".to_string(),
+            pipeline_type: SearchPipelineType::Semantic,
+            index_state: "ready".to_string(),
+            total_latency_ms: latency_ms,
+            embedding_latency_ms: None,
+            lexical_latency_ms: None,
+            vector_search_latency_ms: None,
+            hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
+            candidate_count: 10,
+            returned_count: returned,
+            score_min: None,
+            score_median: None,
+            score_p90: None,
+            score_max: None,
+            top1_margin: None,
+            query_cache_hit: false,
+            prompt_active: false,
+            warnings: vec![],
+        }
+    }
 }
