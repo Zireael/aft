@@ -7862,6 +7862,7 @@ mod fingerprint_invalidation_tests {
     #[test]
     fn validate_compatible_rejects_binary_stored_with_cosine_metric() {
         let profile = EmbeddingModelProfile {
+            source_vector_kind: VectorKind::BinaryPacked,
             stored_vector_kind: VectorKind::BinaryPacked,
             metric: DistanceMetric::Cosine,
             ..EmbeddingModelProfile::fastembed_minilm()
