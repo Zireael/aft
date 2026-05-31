@@ -22,6 +22,10 @@ import {
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import {
+  enqueueConfigureWarningsForSession,
+  flushConfigureWarningsOnIdle,
+} from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, debug, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
@@ -34,10 +38,6 @@ import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import { consumeToolMetadata } from "./metadata-store.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
-import {
-  enqueueConfigureWarningsForSession,
-  flushConfigureWarningsOnIdle,
-} from "./configure-warnings.js";
 import {
   cleanupWarnings,
   type NotificationOptions,

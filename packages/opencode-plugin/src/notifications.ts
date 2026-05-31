@@ -696,13 +696,7 @@ async function deliverConfigureWarningBatch(
 
   const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
   if (effectiveServerUrl) {
-    const httpToast = await showToastViaHttp(
-      effectiveServerUrl,
-      title,
-      message,
-      "warning",
-      10_000,
-    );
+    const httpToast = await showToastViaHttp(effectiveServerUrl, title, message, "warning", 10_000);
     if (httpToast) return true;
   }
 

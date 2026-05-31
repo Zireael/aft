@@ -408,51 +408,6 @@ fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<S
     ordered
 }
 
-/// Try spawning the tool via the inherited PATH. Returns the bare command
-/// name on success (downstream `Command::new` re-resolves through PATH),
-/// or None if the spawn fails or the tool exits with non-zero status.
-fn try_path_lookup(command: &str) -> Option<PathBuf> {
-    let probe_args = path_lookup_probe_args(command);
-    let mut child = Command::new(command)
-        .args(probe_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    let timeout = Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Some(PathBuf::from(command))
-                } else {
-                    None
-                };
-            }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
-        }
-    }
-}
-
-fn path_lookup_probe_args(command: &str) -> &'static [&'static str] {
-    match command {
-        // Go uses `go version` rather than a POSIX-style `--version` flag.
-        "go" => &["version"],
-        // `gofmt` has no version flag. It exits successfully with empty stdin,
-        // which is sufficient for PATH availability probing.
-        "gofmt" => &[],
-        _ => &["--version"],
-    }
-}
-
 /// Look up `command` in the well-known install locations that GUI-launched
 /// editors commonly miss from PATH. Returns the absolute path so the caller
 /// invokes the tool via `Command::new(absolute_path)` regardless of PATH.
@@ -2352,13 +2307,6 @@ mod tests {
             }
             other => panic!("expected Failed, got: {:?}", other),
         }
-    }
-
-    #[test]
-    fn path_lookup_probe_args_match_go_tool_conventions() {
-        assert_eq!(path_lookup_probe_args("go"), &["version"]);
-        assert!(path_lookup_probe_args("gofmt").is_empty());
-        assert_eq!(path_lookup_probe_args("rustfmt"), &["--version"]);
     }
 
     #[test]

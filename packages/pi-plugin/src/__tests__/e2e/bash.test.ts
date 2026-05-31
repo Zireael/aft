@@ -448,7 +448,6 @@ async function waitForStatus(h: Harness, taskId: string, expected: string) {
   }
   throw new Error(`timed out waiting for ${expected}`);
 }
-
 async function waitForToolStatus(
   h: Harness,
   bashStatus: MockToolDef,
@@ -471,4 +470,3 @@ async function waitForToolStatus(
   }
   throw new Error(`timed out waiting for ${expected}`);
 }
-
