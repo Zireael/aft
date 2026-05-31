@@ -215,6 +215,27 @@ pub struct SemanticBackendConfig {
     /// How much diagnostic detail to include in `aft_search` tool output (default: minimal).
     #[serde(default)]
     pub output_mode: DiagnosticsOutputMode,
+    /// Enable optional reranking via an OpenAI-compatible chat endpoint (default: false).
+    /// When enabled, `aft_search` overfetches candidates and reranks them.
+    /// Falls back to original order on failure.
+    #[serde(default)]
+    pub rerank_enabled: bool,
+    /// Override model for reranking. Defaults to `codellama/codellama:7b-instruct` if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_model: Option<String>,
+    /// Base URL for reranker (OpenAI-compatible /v1/chat/completions endpoint).
+    /// Falls back to `base_url` if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_base_url: Option<String>,
+    /// Env var name for reranker API key. Falls back to `api_key_env` if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_api_key_env: Option<String>,
+    /// Timeout in ms for reranker requests (default: 15000).
+    #[serde(default = "default_rerank_timeout_ms")]
+    pub rerank_timeout_ms: u64,
+    /// Max number of candidates to send to the reranker per query (default: 20).
+    #[serde(default = "default_rerank_max_candidates")]
+    pub rerank_max_candidates: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -240,6 +261,14 @@ fn default_jsonl_retention_days() -> u32 {
 
 fn default_metrics_window_size() -> usize {
     100
+}
+
+fn default_rerank_timeout_ms() -> u64 {
+    15000
+}
+
+fn default_rerank_max_candidates() -> usize {
+    20
 }
 
 impl SemanticBackendConfig {
@@ -444,6 +473,12 @@ impl Default for SemanticBackendConfig {
             include_snippets: false,
             retention_days: 14,
             output_mode: DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         }
     }
 }

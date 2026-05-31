@@ -35,12 +35,25 @@ impl std::fmt::Display for SearchPipelineType {
 pub enum SearchWarning {
     LowConfidence,
     EmptyResults,
-    PartialIndex { completeness: f64 },
+    PartialIndex {
+        completeness: f64,
+    },
     StaleIndex,
     DegradedIndex,
-    EmbeddingFailure { reason: String },
-    LexicalFailure { reason: String },
-    DimensionMismatch { expected: usize, got: usize },
+    EmbeddingFailure {
+        reason: String,
+    },
+    LexicalFailure {
+        reason: String,
+    },
+    DimensionMismatch {
+        expected: usize,
+        got: usize,
+    },
+    /// Reranker failed — results are in original (non-reranked) order.
+    RerankerFailure {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SearchWarning {
@@ -58,6 +71,7 @@ impl std::fmt::Display for SearchWarning {
             Self::DimensionMismatch { expected, got } => {
                 write!(f, "dimension_mismatch(expected={expected}, got={got})")
             }
+            Self::RerankerFailure { reason } => write!(f, "reranker_failure({reason})"),
         }
     }
 }
@@ -85,6 +99,8 @@ pub struct SearchDiagnostics {
     pub vector_search_latency_ms: Option<f64>,
     /// Time spent on hybrid fusion, in milliseconds.
     pub hybrid_fusion_latency_ms: Option<f64>,
+    /// Time spent on reranking, in milliseconds.
+    pub rerank_latency_ms: Option<f64>,
     /// Number of candidates before fusion/capping.
     pub candidate_count: usize,
     /// Number of results returned to the caller.
@@ -368,6 +384,9 @@ pub struct SearchDiagnosticsEvent {
     /// Time spent on hybrid fusion, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid_fusion_latency_ms: Option<f64>,
+    /// Time spent on reranking, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_latency_ms: Option<f64>,
     /// Number of candidates before fusion/capping.
     pub candidate_count: usize,
     /// Number of results returned to the caller.
@@ -419,6 +438,7 @@ impl SearchDiagnosticsEvent {
             lexical_latency_ms: diag.lexical_latency_ms,
             vector_search_latency_ms: diag.vector_search_latency_ms,
             hybrid_fusion_latency_ms: diag.hybrid_fusion_latency_ms,
+            rerank_latency_ms: diag.rerank_latency_ms,
             candidate_count: diag.candidate_count,
             returned_count: diag.returned_count,
             score_min: diag.score_min,
@@ -597,6 +617,7 @@ pub fn format_diagnostics_prefix(
     vector_search_latency_ms: Option<f64>,
     lexical_latency_ms: Option<f64>,
     hybrid_fusion_latency_ms: Option<f64>,
+    rerank_latency_ms: Option<f64>,
 ) -> Option<String> {
     match mode {
         crate::config::DiagnosticsOutputMode::Off => None,
@@ -645,6 +666,9 @@ pub fn format_diagnostics_prefix(
             if let Some(v) = hybrid_fusion_latency_ms {
                 latency_parts.push(format!("fusion {:.0}ms", v));
             }
+            if let Some(v) = rerank_latency_ms {
+                latency_parts.push(format!("rerank {:.0}ms", v));
+            }
             lines.push(format!("latency: {}", latency_parts.join(", ")));
             lines.push(format!(
                 "{} candidates → {} returned ({})",
@@ -675,6 +699,7 @@ fn format_warning_minimal(w: &SearchWarning) -> Option<String> {
         SearchWarning::EmbeddingFailure { .. } => None,
         SearchWarning::LexicalFailure { .. } => None,
         SearchWarning::DimensionMismatch { .. } => None,
+        SearchWarning::RerankerFailure { .. } => None,
     }
 }
 
@@ -702,6 +727,7 @@ fn format_warning_verbose(w: &SearchWarning) -> String {
         SearchWarning::DimensionMismatch { expected, got } => {
             format!("⚠ dimension mismatch: expected {}, got {}", expected, got)
         }
+        SearchWarning::RerankerFailure { reason } => format!("⚠ reranker failed: {}", reason),
     }
 }
 
@@ -739,6 +765,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 10,
             returned_count: 5,
             score_min: None,
@@ -870,6 +897,7 @@ mod tests {
                 lexical_latency_ms: None,
                 vector_search_latency_ms: None,
                 hybrid_fusion_latency_ms: None,
+                rerank_latency_ms: None,
                 candidate_count: 10,
                 returned_count: 5,
                 score_min: None,
@@ -905,6 +933,7 @@ mod tests {
                 lexical_latency_ms: None,
                 vector_search_latency_ms: None,
                 hybrid_fusion_latency_ms: None,
+                rerank_latency_ms: None,
                 candidate_count: 10,
                 returned_count: 5,
                 score_min: None,
@@ -934,6 +963,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 10,
             returned_count: 5,
             score_min: None,
@@ -975,6 +1005,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 10,
             returned_count: 5,
             score_min: None,
@@ -1002,6 +1033,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 5,
             returned_count: 3,
             score_min: None,
@@ -1039,6 +1071,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 5,
             returned_count: 3,
             score_min: None,
@@ -1080,6 +1113,7 @@ mod tests {
             lexical_latency_ms: Some(5.0),
             vector_search_latency_ms: Some(20.0),
             hybrid_fusion_latency_ms: Some(7.5),
+            rerank_latency_ms: None,
             candidate_count: 50,
             returned_count: 10,
             score_min: Some(0.3),
@@ -1119,6 +1153,7 @@ mod tests {
             lexical_latency_ms: None,
             vector_search_latency_ms: None,
             hybrid_fusion_latency_ms: None,
+            rerank_latency_ms: None,
             candidate_count: 5,
             returned_count: 3,
             score_min: None,
@@ -1154,6 +1189,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_none());
     }
@@ -1169,6 +1205,7 @@ mod tests {
             None,
             0,
             0,
+            None,
             None,
             None,
             None,
@@ -1195,6 +1232,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_none(), "no warnings = no output in minimal");
     }
@@ -1213,6 +1251,7 @@ mod tests {
             Some(18.0),
             Some(120.0),
             Some(3.0),
+            None,
         );
         let text = result.expect("verbose should return Some");
         assert!(text.contains("⚠"), "should include warnings: {text}");

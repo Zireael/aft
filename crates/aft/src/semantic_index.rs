@@ -5593,6 +5593,12 @@ mod tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5682,6 +5688,12 @@ mod tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5743,6 +5755,12 @@ mod tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6336,6 +6354,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6395,6 +6419,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6433,6 +6463,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6477,6 +6513,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6524,6 +6566,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6564,6 +6612,12 @@ mod fingerprint_invalidation_tests {
             include_snippets: false,
             retention_days: 14,
             output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();

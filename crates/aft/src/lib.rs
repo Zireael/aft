@@ -79,8 +79,9 @@ pub mod parser;
 pub mod protocol;
 pub mod query_shape;
 pub mod search_index;
-pub mod semantic_index;
 pub mod semantic_diagnostics;
+pub mod semantic_index;
+pub mod semantic_rerank;
 pub mod symbol_cache_disk;
 pub mod symbols;
 // Compiled on all platforms so cross-platform unit tests in

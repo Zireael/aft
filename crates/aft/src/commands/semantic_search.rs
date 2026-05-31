@@ -15,6 +15,7 @@ use crate::semantic_diagnostics::{
 use crate::semantic_index::{
     is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
 };
+use crate::semantic_rerank::{rerank_candidates, RerankOutcome};
 use crate::slog_info;
 use crate::symbols::SymbolKind;
 
@@ -221,8 +222,34 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     let hybrid_fusion_latency_ms = fusion_timer.stop();
 
+    // Reranking pipeline (optional, config-dependent).
+    let rerank_timer = PhaseTimer::start();
+    let rerank_latency_ms;
+    let (reranked, _rerank_failed) =
+        match rerank_candidates(&ctx.config().semantic, &params.query, &results) {
+            RerankOutcome::ReRanked(indices) => {
+                rerank_latency_ms = rerank_timer.stop();
+                let reranked: Vec<HybridResult> = indices
+                    .iter()
+                    .filter_map(|&i| results.get(i).cloned())
+                    .collect();
+                (reranked, false)
+            }
+            RerankOutcome::Skipped => {
+                rerank_latency_ms = rerank_timer.stop();
+                (results.clone(), false)
+            }
+            RerankOutcome::Failed(e) => {
+                rerank_latency_ms = rerank_timer.stop();
+                if diagnostics_enabled {
+                    warnings.push(SearchWarning::RerankerFailure { reason: e });
+                }
+                (results.clone(), true)
+            }
+        };
+
     // If all results have low scores, flag low confidence.
-    let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
+    let scores: Vec<f32> = reranked.iter().map(|r| r.score).collect();
     let low_conf_threshold = ctx.config().semantic.low_confidence_threshold;
     if !scores.is_empty() && scores.iter().all(|s| *s < low_conf_threshold) {
         warnings.push(SearchWarning::LowConfidence);
@@ -236,7 +263,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Compute query statistics (always needed for output mode and diagnostics).
     let candidate_count = scores.len();
-    let returned_count = results.len();
+    let returned_count = reranked.len();
     let score_stats = score_statistics(&scores);
     let margin = top1_margin(&scores);
     let total_latency_ms = _pipeline_timer.stop();
@@ -256,10 +283,11 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(vector_search_latency_ms),
         Some(lexical_latency_ms),
         Some(hybrid_fusion_latency_ms),
+        Some(rerank_latency_ms),
     );
 
     // Build tool output text.
-    let base_text = format_semantic_text(&results, &project_root);
+    let base_text = format_semantic_text(&reranked, &project_root);
     let text = match &diagnostics_prefix {
         Some(prefix) => format!("{}\n\n{}", prefix, base_text),
         None => base_text,
@@ -280,6 +308,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             lexical_latency_ms: Some(lexical_latency_ms),
             vector_search_latency_ms: Some(vector_search_latency_ms),
             hybrid_fusion_latency_ms: Some(hybrid_fusion_latency_ms),
+            rerank_latency_ms: Some(rerank_latency_ms),
             candidate_count,
             returned_count,
             score_min,
@@ -306,7 +335,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         serde_json::json!({
             "status": "ready",
             "text": text,
-            "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+            "results": reranked.iter().map(result_to_json).collect::<Vec<_>>(),
         }),
     )
 }
