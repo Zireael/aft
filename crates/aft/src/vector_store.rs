@@ -537,3 +537,366 @@ impl VectorStore for FlatBinaryHammingVectorStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_entry(file: &str, name: &str, vector: Vec<f32>) -> EmbeddingEntry {
+        let chunk = SemanticChunk {
+            file: PathBuf::from(file),
+            name: name.to_string(),
+            kind: crate::symbols::SymbolKind::Function,
+            start_line: 0,
+            end_line: 10,
+            exported: false,
+            embed_text: String::new(),
+            snippet: String::new(),
+        };
+        let chunk_hash = crate::semantic_index::compute_chunk_hash(&chunk);
+        EmbeddingEntry {
+            chunk,
+            vector,
+            chunk_hash,
+        }
+    }
+
+    // ── FlatF32VectorStore tests ────────────────────────────────────────
+
+    #[test]
+    fn f32_store_search_returns_top_k_sorted() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![
+                make_entry("a.rs", "func_a", vec![1.0, 0.0, 0.0]),
+                make_entry("a.rs", "func_b", vec![0.0, 1.0, 0.0]),
+            ],
+        );
+        store.upsert_file(
+            Path::new("b.rs"),
+            vec![make_entry("b.rs", "func_c", vec![0.0, 0.0, 1.0])],
+        );
+
+        // Query closest to [1,0,0]
+        let results = store.search(&[1.0, 0.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "func_a");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn f32_store_search_empty_returns_empty() {
+        let store = FlatF32VectorStore::new(3);
+        let results = store.search(&[1.0, 0.0, 0.0], 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn f32_store_search_dimension_mismatch_returns_empty() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f", vec![1.0, 0.0, 0.0])],
+        );
+        let results = store.search(&[1.0, 0.0], 5); // 2 dims vs 3
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn f32_store_len_and_is_empty() {
+        let mut store = FlatF32VectorStore::new(3);
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f", vec![1.0, 0.0, 0.0])],
+        );
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn f32_store_entries_slice_read_only() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f", vec![1.0, 0.0, 0.0])],
+        );
+        let slice = store.entries_slice();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].chunk.name, "f");
+    }
+
+    #[test]
+    fn f32_store_delete_path_removes_entries() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f1", vec![1.0, 0.0, 0.0])],
+        );
+        store.upsert_file(
+            Path::new("b.rs"),
+            vec![make_entry("b.rs", "f2", vec![0.0, 1.0, 0.0])],
+        );
+        store.delete_path(Path::new("a.rs"));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries_slice()[0].chunk.name, "f2");
+    }
+
+    #[test]
+    fn f32_store_prune_orphans_removes_stale() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f1", vec![1.0, 0.0, 0.0])],
+        );
+        store.upsert_file(
+            Path::new("b.rs"),
+            vec![make_entry("b.rs", "f2", vec![0.0, 1.0, 0.0])],
+        );
+        let removed = store.prune_orphans(&[PathBuf::from("b.rs")]);
+        assert_eq!(removed, 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn f32_store_prune_stale_vectors_removes_zero_norm() {
+        let mut store = FlatF32VectorStore::new(3);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![
+                make_entry("a.rs", "f1", vec![1.0, 0.0, 0.0]),
+                make_entry("a.rs", "f2", vec![0.0, 0.0, 0.0]), // zero norm
+            ],
+        );
+        let pruned = store.prune_stale_vectors();
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn f32_store_stats() {
+        let mut store = FlatF32VectorStore::new(384);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f", vec![1.0, 0.0, 0.0])],
+        );
+        let stats = store.stats();
+        assert_eq!(stats.dimension, 384);
+        assert_eq!(stats.total_entries, 1);
+        assert_eq!(stats.vector_kind, "dense_f32");
+        assert_eq!(stats.metric, "cosine");
+    }
+
+    #[test]
+    fn f32_store_exported_entry_boosted() {
+        let mut store = FlatF32VectorStore::new(3);
+        let mut entry = make_entry("a.rs", "exported_fn", vec![1.0, 0.0, 0.0]);
+        entry.chunk.exported = true;
+        let mut entry2 = make_entry("a.rs", "private_fn", vec![0.99, 0.01, 0.0]);
+        entry2.chunk.exported = false;
+
+        store.upsert_file(Path::new("a.rs"), vec![entry, entry2]);
+
+        let results = store.search(&[1.0, 0.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        // Exported entry should rank higher due to 1.1x boost
+        assert_eq!(results[0].name, "exported_fn");
+    }
+
+    // ── FlatBinaryHammingVectorStore tests ──────────────────────────────
+
+    #[test]
+    fn hamming_store_search_identical_vector() {
+        let mut store = FlatBinaryHammingVectorStore::new(8);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry(
+                "a.rs",
+                "f",
+                vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            )],
+        );
+        let results = store.search(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 1);
+        assert_eq!(results.len(), 1);
+        assert!(
+            (results[0].score - 1.0).abs() < 1e-6,
+            "identical should score 1.0, got {}",
+            results[0].score
+        );
+    }
+
+    #[test]
+    fn hamming_store_search_ranking() {
+        let mut store = FlatBinaryHammingVectorStore::new(8);
+        // Vector A: 10101010 (4 bits set)
+        // Vector B: 11110000 (4 bits set)
+        // Query:    10101010 (identical to A)
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![
+                make_entry(
+                    "a.rs",
+                    "vec_a",
+                    vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                ),
+                make_entry(
+                    "b.rs",
+                    "vec_b",
+                    vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        );
+        let results = store.search(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "vec_a"); // identical
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn hamming_store_empty_returns_empty() {
+        let store = FlatBinaryHammingVectorStore::new(8);
+        let results = store.search(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn hamming_store_prune_stale_vectors() {
+        let mut store = FlatBinaryHammingVectorStore::new(8);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![
+                make_entry("a.rs", "f1", vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]),
+                make_entry("a.rs", "f2", vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ],
+        );
+        let pruned = store.prune_stale_vectors();
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn hamming_store_delete_path() {
+        let mut store = FlatBinaryHammingVectorStore::new(8);
+        store.upsert_file(
+            Path::new("a.rs"),
+            vec![make_entry("a.rs", "f1", vec![1.0; 8])],
+        );
+        store.upsert_file(
+            Path::new("b.rs"),
+            vec![make_entry("b.rs", "f2", vec![0.0; 8])],
+        );
+        store.delete_path(Path::new("a.rs"));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn hamming_store_stats() {
+        let store = FlatBinaryHammingVectorStore::new(128);
+        let stats = store.stats();
+        assert_eq!(stats.dimension, 128);
+        assert_eq!(stats.vector_kind, "binary_packed");
+        assert_eq!(stats.metric, "hamming");
+    }
+
+    #[test]
+    fn hamming_distance_identical_is_zero() {
+        let a = vec![0xAAAAAAAAAAAAAAAAu64, 0xAAAAAAAAAAAAAAAAu64];
+        let b = vec![0xAAAAAAAAAAAAAAAAu64, 0xAAAAAAAAAAAAAAAAu64];
+        assert_eq!(hamming_distance(&a, &b), 0);
+    }
+
+    #[test]
+    fn hamming_distance_all_different() {
+        let a = vec![0xAAAAAAAAAAAAAAAAu64]; // 10101010...
+        let b = vec![0x5555555555555555u64]; // 01010101...
+        assert_eq!(hamming_distance(&a, &b), 64);
+    }
+
+    #[test]
+    fn popcount64_correct() {
+        assert_eq!(popcount64(0), 0);
+        assert_eq!(popcount64(1), 1);
+        assert_eq!(popcount64(0xFF), 8);
+        assert_eq!(popcount64(u64::MAX), 64);
+    }
+
+    // ── Binary packed-vector decode tests ───────────────────────────────
+
+    #[test]
+    fn binary_decode_exact_byte_aligned() {
+        // 8 dimensions = 1 byte, byte 0xAA = 10101010
+        let val = serde_json::json!("qg=="); // base64 of 0xAA
+        let result = crate::semantic_index::parse_embedding_value(
+            &val,
+            crate::config::OutputEncoding::Base64Binary,
+            "test",
+            Some(8),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0], 0.0);
+        assert_eq!(result[1], 1.0);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 1.0);
+        assert_eq!(result[4], 0.0);
+        assert_eq!(result[5], 1.0);
+        assert_eq!(result[6], 0.0);
+        assert_eq!(result[7], 1.0);
+    }
+
+    #[test]
+    fn binary_decode_non_byte_aligned() {
+        // 5 dimensions = 1 byte (padded to 8 bits), byte 0x15 = 00010101
+        // bits 0..4: 1,0,1,0,1
+        let val = serde_json::json!("FQ=="); // base64 of 0x15
+        let result = crate::semantic_index::parse_embedding_value(
+            &val,
+            crate::config::OutputEncoding::Base64Binary,
+            "test",
+            Some(5),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], 1.0);
+        assert_eq!(result[1], 0.0);
+        assert_eq!(result[2], 1.0);
+        assert_eq!(result[3], 0.0);
+        assert_eq!(result[4], 1.0);
+    }
+
+    #[test]
+    fn binary_decode_padding_bits_masked() {
+        // 3 dimensions = 1 byte, byte 0x07 = 00000111
+        // bits 0..2: 1,1,1 (the remaining 5 bits are padding and should be 0.0)
+        let val = serde_json::json!("Bw=="); // base64 of 0x07
+        let result = crate::semantic_index::parse_embedding_value(
+            &val,
+            crate::config::OutputEncoding::Base64Binary,
+            "test",
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], 1.0);
+        assert_eq!(result[1], 1.0);
+        assert_eq!(result[2], 1.0);
+    }
+
+    #[test]
+    fn binary_decode_too_short_returns_error() {
+        // 1 byte but we ask for 16 dimensions (needs 2 bytes)
+        let val = serde_json::json!("AA=="); // base64 of 0x00
+        let err = crate::semantic_index::parse_embedding_value(
+            &val,
+            crate::config::OutputEncoding::Base64Binary,
+            "test",
+            Some(16),
+        )
+        .unwrap_err();
+        assert!(err.contains("too short"), "got: {err}");
+    }
+}
