@@ -368,6 +368,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
+        "semantic_eval" => aft::commands::semantic_eval::handle_semantic_eval(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {
