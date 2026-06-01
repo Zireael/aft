@@ -340,13 +340,11 @@ async function resolveAftBinaryPath(candidates: string[]): Promise<string | unde
 }
 
 function debugBinaryCandidates(): string[] {
-  return process.platform === "win32"
-    ? [TARGET_DEBUG_BINARY_EXE, TARGET_DEBUG_BINARY]
-    : [TARGET_DEBUG_BINARY];
+  return [TARGET_DEBUG_BINARY];
 }
 
 function fallbackBinaryCandidates(): string[] {
-  return process.platform === "win32" ? [FALLBACK_BINARY_EXE, FALLBACK_BINARY] : [FALLBACK_BINARY];
+  return [FALLBACK_BINARY];
 }
 
 async function prepareBinaryOnce(): Promise<PreparedBinary> {

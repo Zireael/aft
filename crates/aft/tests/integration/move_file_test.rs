@@ -261,7 +261,7 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
         .expect("make source parent undeletable");
 
     let mut aft = AftProcess::spawn();
-    configure(&mut aft, Path::new("/"));
+    configure(&mut aft, src_tmp.path());
 
     let resp = aft.send_with_timeout(
         &json!({
