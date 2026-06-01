@@ -146,11 +146,8 @@ mod tests {
 
     fn write_eval(content: &str) -> std::path::PathBuf {
         let counter = EVAL_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aft-eval-test-{}-{}",
-            std::process::id(),
-            counter
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aft-eval-test-{}-{}", std::process::id(), counter));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("eval.jsonl");
         std::fs::write(&path, content).unwrap();
