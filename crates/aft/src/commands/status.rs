@@ -71,7 +71,7 @@ impl AppContext {
         };
 
         // Semantic index status
-        let semantic_index_info = {
+        let mut semantic_index_info = {
             let index = self.semantic_index().borrow();
             match index.as_ref() {
                 Some(idx) => {
@@ -131,6 +131,59 @@ impl AppContext {
                 },
             }
         };
+
+        // Extend semantic_index_info with metrics, rerank, and warnings
+        // so TUI/status surfaces can show pipeline health without a separate call.
+        let metrics_agg = self.semantic_search_metrics().borrow().aggregate();
+        if let Some(obj) = semantic_index_info.as_object_mut() {
+            // Search quality metrics
+            obj.insert(
+                "total_queries".into(),
+                serde_json::json!(metrics_agg.total_queries),
+            );
+            obj.insert(
+                "p50_latency_ms".into(),
+                serde_json::json!(metrics_agg.p50_latency_ms),
+            );
+            obj.insert(
+                "p95_latency_ms".into(),
+                serde_json::json!(metrics_agg.p95_latency_ms),
+            );
+            obj.insert(
+                "zero_result_rate".into(),
+                serde_json::json!(metrics_agg.zero_result_rate),
+            );
+            obj.insert(
+                "low_confidence_rate".into(),
+                serde_json::json!(metrics_agg.low_confidence_rate),
+            );
+            obj.insert(
+                "embedding_failure_rate".into(),
+                serde_json::json!(metrics_agg.embedding_failure_rate),
+            );
+            obj.insert(
+                "lexical_failure_rate".into(),
+                serde_json::json!(metrics_agg.lexical_failure_rate),
+            );
+            // Rerank status
+            obj.insert(
+                "rerank_enabled".into(),
+                serde_json::json!(config.semantic.rerank_enabled),
+            );
+            obj.insert(
+                "rerank_model".into(),
+                serde_json::json!(config.semantic.rerank_model),
+            );
+            // Diagnostics
+            obj.insert(
+                "diagnostics_enabled".into(),
+                serde_json::json!(config.semantic.diagnostics_enabled),
+            );
+            obj.insert(
+                "prompt_active".into(),
+                serde_json::json!(config.semantic.query_prompt_template.is_some()),
+            );
+        }
 
         // Disk cache sizes — scoped to the **current project** only.
         //
