@@ -157,6 +157,51 @@ fn grep_multi_path_with_overlap_deduplicates_files() {
 }
 
 #[test]
+fn grep_multi_path_keeps_sibling_dirs_with_shared_prefix() {
+    let project = setup_project(&[
+        (
+            "packages/app/main.ts",
+            "const value = 'shared-prefix-needle';\n",
+        ),
+        (
+            "packages/app-old/main.ts",
+            "const value = 'shared-prefix-needle';\n",
+        ),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-sibling-prefix",
+            "command": "grep",
+            "pattern": "shared-prefix-needle",
+            "path": "packages/app packages/app-old",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 2,
+        "sibling directory with shared lexical prefix must not be dropped: {response:?}"
+    );
+    let files = match_files(&response);
+    assert!(files.contains(&canonical_path_string(
+        &project.path().join("packages/app/main.ts")
+    )));
+    assert!(files.contains(&canonical_path_string(
+        &project.path().join("packages/app-old/main.ts")
+    )));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn grep_multi_path_keeps_explicit_file_under_aftignored_parent() {
     let project = setup_project(&[
         (

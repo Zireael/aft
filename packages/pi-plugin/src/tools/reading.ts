@@ -4,12 +4,17 @@
  */
 
 import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
 import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -78,6 +83,22 @@ function isUrl(s: string): boolean {
   return s.startsWith("http://") || s.startsWith("https://");
 }
 
+async function assertReadPathPermissions(
+  extCtx: ExtensionContext,
+  ctx: PluginContext,
+  paths: string | string[],
+): Promise<void> {
+  const targets = Array.isArray(paths) ? paths : [paths];
+  const checked = new Set<string>();
+  for (const target of targets) {
+    if (!target || checked.has(target)) continue;
+    checked.add(target);
+    await assertExternalDirectoryPermission(extCtx, target, "read", {
+      restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+    });
+  }
+}
+
 /** Best-effort label for renderers when zoom is called with `filePath` OR `url`. */
 function zoomTargetLabel(args: { filePath?: string; url?: string }): string {
   return args.filePath ?? args.url ?? "(no target)";
@@ -118,24 +139,31 @@ export function buildZoomSections(
   theme: Theme,
 ): string[] {
   const batch = asRecord(payload);
-  if (Array.isArray(batch?.symbols)) {
-    const header = batch.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
-    const items = batch.symbols as unknown[];
+  const batchItems = Array.isArray(batch?.symbols)
+    ? (batch.symbols as unknown[])
+    : Array.isArray(batch?.entries)
+      ? (batch.entries as unknown[])
+      : null;
+  if (batchItems) {
+    const header =
+      batch?.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
     return [
       ...header,
-      ...items.map((item) => {
+      ...batchItems.map((item) => {
         const record = asRecord(item);
         if (!record) return theme.fg("muted", "No zoom result available.");
         const name = asString(record.name) ?? "(unknown symbol)";
+        const itemTargetLabel = asString(record.targetLabel) ?? zoomTargetLabel(args);
         if (record.success === false) {
+          const location = record.targetLabel ? ` in ${shortenPath(itemTargetLabel)}` : "";
           return theme.fg(
             "error",
-            `Symbol "${name}" not found: ${asString(record.error) ?? "zoom failed"}`,
+            `Symbol "${name}" not found${location}: ${asString(record.error) ?? "zoom failed"}`,
           );
         }
         const content = asString(record.content);
         return [
-          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(zoomTargetLabel(args)))}`,
+          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(itemTargetLabel))}`,
           content,
         ]
           .filter(Boolean)
@@ -299,7 +327,16 @@ export function registerReadingTools(
             if (target.length === 0) {
               throw new Error("'target' must be a non-empty string or array of strings");
             }
-            const response = await callBridge(bridge, "outline", { target, files: true }, extCtx);
+            const resolvedTargets = await Promise.all(
+              target.map((entry) => resolvePathArg(extCtx.cwd, entry)),
+            );
+            await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
+            const response = await callBridge(
+              bridge,
+              "outline",
+              { target: resolvedTargets, files: true },
+              extCtx,
+            );
             if (response.success === false) {
               throw new Error((response.message as string) || "outline failed");
             }
@@ -310,18 +347,19 @@ export function registerReadingTools(
             throw new Error("'target' must be a non-empty string or array of strings");
           }
 
+          const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
           let isDirectory = false;
           try {
-            const resolved = resolve(extCtx.cwd, target);
-            const st = await stat(resolved);
+            const st = await stat(resolvedTarget);
             isDirectory = st.isDirectory();
           } catch {
             // Let Rust report missing paths with its structured error shape.
           }
 
+          await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
           const request = isDirectory
-            ? { directory: resolve(extCtx.cwd, target), files: true }
-            : { file: target, files: true };
+            ? { directory: resolvedTarget, files: true }
+            : { file: resolvedTarget, files: true };
           const response = await callBridge(bridge, "outline", request, extCtx);
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
@@ -340,12 +378,11 @@ export function registerReadingTools(
 
         // Multi-file mode
         if (isArray) {
-          const response = await callBridge(
-            bridge,
-            "outline",
-            { files: target as string[] },
-            extCtx,
+          const resolvedTargets = await Promise.all(
+            (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
           );
+          await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
+          const response = await callBridge(bridge, "outline", { files: resolvedTargets }, extCtx);
           return textResult(formatOutlineText(response));
         }
 
@@ -354,23 +391,28 @@ export function registerReadingTools(
         }
 
         // Stat to disambiguate file vs directory
+        const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
         let isDirectory = false;
         try {
-          const resolved = resolve(extCtx.cwd, target);
-          const st = await stat(resolved);
+          const st = await stat(resolvedTarget);
           isDirectory = st.isDirectory();
         } catch {
           // path doesn't exist locally — fall through to single-file mode and let
           // Rust report the real error
         }
 
+        await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
         if (isDirectory) {
-          const dirPath = resolve(extCtx.cwd, target);
-          const response = await callBridge(bridge, "outline", { directory: dirPath }, extCtx);
+          const response = await callBridge(
+            bridge,
+            "outline",
+            { directory: resolvedTarget },
+            extCtx,
+          );
           return textResult(JSON.stringify(response, null, 2), response);
         }
 
-        const response = await callBridge(bridge, "outline", { file: target }, extCtx);
+        const response = await callBridge(bridge, "outline", { file: resolvedTarget }, extCtx);
         return textResult(formatOutlineText(response));
       },
       renderCall(args, theme, context) {
@@ -450,9 +492,16 @@ export function registerReadingTools(
               throw new Error(`targets[${i}].symbol must be a non-empty string`);
             }
           }
+          const resolvedTargets = await Promise.all(
+            targets.map((t) => resolvePathArg(extCtx.cwd, t.filePath)),
+          );
+          await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
           const responses = await Promise.all(
-            targets.map((t) => {
-              const req: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
+            targets.map((t, index) => {
+              const req: Record<string, unknown> = {
+                file: resolvedTargets[index],
+                symbol: t.symbol,
+              };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
               if (wantCallgraph) req.callgraph = true;
               return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
@@ -478,7 +527,10 @@ export function registerReadingTools(
         }
 
         // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        const file = hasUrl ? (params.url as string) : (params.filePath as string);
+        const file = hasUrl
+          ? (params.url as string)
+          : await resolvePathArg(extCtx.cwd, params.filePath as string);
+        if (!hasUrl) await assertReadPathPermissions(extCtx, ctx, file);
 
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? params.url : params.filePath) ?? file;

@@ -25,9 +25,9 @@ use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir,
-    walk_project_files_bounded, CacheLock, SearchIndex,
+    walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
-use crate::semantic_index::{SemanticIndex, SemanticIndexLock};
+use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::{slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +35,8 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 const MAX_SEARCH_INDEX_FILES: usize = 20_000;
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
+const MAX_SEMANTIC_TIMEOUT_MS: u64 = 120_000;
+const MAX_SEMANTIC_BATCH_SIZE: usize = 1_024;
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -419,14 +421,15 @@ fn parse_semantic_config(
         let timeout_ms = raw.as_u64().ok_or_else(|| {
             "configure: semantic.timeout_ms must be an unsigned integer".to_string()
         })?;
-        semantic.timeout_ms = timeout_ms;
+        semantic.timeout_ms = timeout_ms.min(MAX_SEMANTIC_TIMEOUT_MS);
     }
     if let Some(raw) = obj.get("max_batch_size") {
         let max_batch_size = raw.as_u64().ok_or_else(|| {
             "configure: semantic.max_batch_size must be an unsigned integer".to_string()
         })?;
         semantic.max_batch_size = usize::try_from(max_batch_size)
-            .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?;
+            .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?
+            .min(MAX_SEMANTIC_BATCH_SIZE);
     }
     if let Some(raw) = obj.get("max_files") {
         let max_files = raw.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
@@ -1279,6 +1282,28 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
+fn walk_semantic_project_files_bounded(
+    root: &Path,
+    max_files: usize,
+) -> Result<Vec<PathBuf>, usize> {
+    let filters = build_path_filters(&[], &[]).unwrap_or_default();
+    walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
+}
+
+#[cfg(debug_assertions)]
+fn delay_search_rebuild_publish_for_debug() {
+    let Some(delay_ms) = std::env::var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay_ms));
+}
+
+#[cfg(not(debug_assertions))]
+fn delay_search_rebuild_publish_for_debug() {}
+
 #[cfg(debug_assertions)]
 fn mark_search_rebuild_spawn_for_debug() {
     let Some(path) = std::env::var_os("AFT_TEST_SEARCH_REBUILD_THREAD_MARKER") else {
@@ -1745,6 +1770,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
     ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;
+    ctx.clear_pending_index_updates();
 
     // Snapshot accumulated degraded reasons on the context so status /
     // sidebar / future tool calls all see the same state. Reasons emitted
@@ -1829,6 +1855,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 current_head,
                                 baseline,
                             );
+                            delay_search_rebuild_publish_for_debug();
                             if !is_worktree_bridge_for_search {
                                 index.write_to_disk(&cache_dir, index.stored_git_head());
                             }
@@ -1941,10 +1968,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 // This is the hot path for restart on a project with a
                                 // handful of edits — avoids re-embedding 4000+ unchanged
                                 // files just to pick up 10 changes.
-                                let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                                let current_files = match walk_project_files_bounded(
+                                let current_files = match walk_semantic_project_files_bounded(
                                     &root_clone,
-                                    &filters,
                                     max_semantic_files,
                                 ) {
                                     Ok(files) => files,
@@ -2029,10 +2054,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
-                        let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                        let files = match walk_project_files_bounded(
+                        let files = match walk_semantic_project_files_bounded(
                             &root_clone,
-                            &filters,
                             max_semantic_files,
                         ) {
                             Ok(files) => {
@@ -2353,6 +2376,43 @@ mod tests {
             std::fs::canonicalize(temp.path()).unwrap()
         );
         assert_eq!(ctx.cache_role(), "main");
+    }
+
+    #[test]
+    fn parse_semantic_config_clamps_expensive_limits() {
+        let parsed = super::parse_semantic_config(
+            &json!({
+                "timeout_ms": 999_999_999_u64,
+                "max_batch_size": 999_999_999_u64,
+            }),
+            &SemanticBackendConfig::default(),
+        )
+        .expect("parse semantic config");
+
+        assert_eq!(parsed.timeout_ms, super::MAX_SEMANTIC_TIMEOUT_MS);
+        assert_eq!(parsed.max_batch_size, super::MAX_SEMANTIC_BATCH_SIZE);
+    }
+
+    #[test]
+    fn semantic_file_cap_counts_only_semantic_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn one() {}\n").unwrap();
+        for index in 0..5 {
+            std::fs::write(
+                temp.path().join(format!("asset-{index}.bin")),
+                format!("asset {index}"),
+            )
+            .unwrap();
+        }
+
+        let files = super::walk_semantic_project_files_bounded(temp.path(), 1)
+            .expect("one semantic file should be within cap");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("src/lib.rs"));
+
+        std::fs::write(temp.path().join("src/second.rs"), "pub fn two() {}\n").unwrap();
+        assert!(super::walk_semantic_project_files_bounded(temp.path(), 1).is_err());
     }
 
     #[test]

@@ -1,0 +1,8 @@
+namespace App {
+using System;
+// keep using section note
+using System.Collections;
+using System.Text;
+
+class C {}
+}

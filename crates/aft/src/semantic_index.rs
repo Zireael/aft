@@ -1096,6 +1096,7 @@ pub struct SemanticIndex {
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
     project_root: PathBuf,
+    deferred_files: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1155,6 +1156,7 @@ impl SemanticIndex {
             dimension,
             fingerprint: None,
             project_root,
+            deferred_files: HashSet::new(),
         }
     }
 
@@ -1258,6 +1260,7 @@ impl SemanticIndex {
                 dimension: DEFAULT_DIMENSION,
                 fingerprint: None,
                 project_root: project_root.to_path_buf(),
+                deferred_files: HashSet::new(),
             });
         }
 
@@ -1323,6 +1326,7 @@ impl SemanticIndex {
             dimension,
             fingerprint: None,
             project_root: project_root.to_path_buf(),
+            deferred_files: HashSet::new(),
         })
     }
 
@@ -1399,6 +1403,8 @@ impl SemanticIndex {
 
         // 1. Bucket files into deleted / changed / added.
         let current_set: HashSet<&Path> = current_files.iter().map(PathBuf::as_path).collect();
+        self.deferred_files
+            .retain(|path| current_set.contains(path.as_path()));
         let total_processed = current_set.len() + self.file_mtimes.len()
             - self
                 .file_mtimes
@@ -1504,6 +1510,9 @@ impl SemanticIndex {
         if chunks.is_empty() {
             progress(0, 0);
             let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+            for file in &successful_files {
+                self.deferred_files.remove(file);
+            }
             if !successful_files.is_empty() {
                 self.entries
                     .retain(|entry| !successful_files.contains(&entry.chunk.file));
@@ -1578,6 +1587,9 @@ impl SemanticIndex {
         }
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+        for file in &successful_files {
+            self.deferred_files.remove(file);
+        }
         if !successful_files.is_empty() {
             self.entries
                 .retain(|entry| !successful_files.contains(&entry.chunk.file));
@@ -1628,7 +1640,9 @@ impl SemanticIndex {
     {
         self.backfill_missing_file_sizes();
 
+        self.deferred_files.retain(|path| path.exists());
         let mut requested_paths = paths.to_vec();
+        requested_paths.extend(self.deferred_files.iter().cloned());
         requested_paths.sort();
         requested_paths.dedup();
         let total_processed = requested_paths.len();
@@ -1666,6 +1680,11 @@ impl SemanticIndex {
             .count();
 
         if existing_paths.is_empty() {
+            for path in &requested_paths {
+                if !path.exists() {
+                    self.deferred_files.remove(path);
+                }
+            }
             progress(0, 0);
             return Ok(InvalidatedFilesRefresh {
                 completed_paths: requested_paths,
@@ -1713,6 +1732,9 @@ impl SemanticIndex {
             chunks.retain(|chunk| !deferred_new_files.contains(&chunk.file));
 
             if !deferred_new_files.is_empty() {
+                for path in &deferred_new_files {
+                    self.deferred_files.insert(path.clone());
+                }
                 slog_warn!(
                     "semantic refresh deferred {} new file(s): indexed-file cap {} is reached",
                     deferred_new_files.len(),
@@ -1722,6 +1744,9 @@ impl SemanticIndex {
         }
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+        for file in &successful_files {
+            self.deferred_files.remove(file);
+        }
         let changed = successful_files
             .iter()
             .filter(|path| previously_indexed.contains(path.as_path()))
@@ -2459,6 +2484,7 @@ impl SemanticIndex {
             dimension,
             fingerprint,
             project_root: current_canonical_root.to_path_buf(),
+            deferred_files: HashSet::new(),
         })
     }
 }

@@ -12,6 +12,9 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerAstTools } from "../tools/ast.js";
 import { registerFsTools } from "../tools/fs.js";
 import { registerImportTools } from "../tools/imports.js";
+import { registerInspectTool } from "../tools/inspect.js";
+import { registerNavigateTool } from "../tools/navigate.js";
+import { registerReadingTools } from "../tools/reading.js";
 import { registerRefactorTool } from "../tools/refactor.js";
 import { registerSafetyTool } from "../tools/safety.js";
 import { registerStructureTool } from "../tools/structure.js";
@@ -108,6 +111,34 @@ describe("AFT external-directory permissions", () => {
         action: "modify",
       },
       {
+        label: "aft_outline",
+        toolName: "aft_outline",
+        params: { target: "/outside/outline.ts" },
+        command: "outline",
+        action: "read",
+      },
+      {
+        label: "aft_zoom",
+        toolName: "aft_zoom",
+        params: { filePath: "/outside/zoom.ts" },
+        command: "zoom",
+        action: "read",
+      },
+      {
+        label: "aft_callgraph",
+        toolName: "aft_callgraph",
+        params: { op: "callers", filePath: "/outside/nav.ts", symbol: "run" },
+        command: "callers",
+        action: "read",
+      },
+      {
+        label: "aft_inspect",
+        toolName: "aft_inspect",
+        params: { scope: "/outside/scope" },
+        command: "inspect",
+        action: "read",
+      },
+      {
         label: "aft_delete",
         toolName: "aft_delete",
         params: { files: ["/outside/delete.ts"] },
@@ -126,7 +157,13 @@ describe("AFT external-directory permissions", () => {
     for (const entry of cases) {
       const { api, tools } = makeMockApi();
       const prompts: Prompt[] = [];
-      const { bridge, calls } = makeMockBridge((command) => {
+      const { bridge, calls } = makeMockBridge((command, params) => {
+        if (command === "undo_preview") {
+          return { success: true, paths: [params.file].filter(Boolean) };
+        }
+        if (command === "checkpoint_paths") {
+          return { success: true, paths: [] };
+        }
         if (command === "delete_file") {
           return { success: true, deleted: [{ file: "/outside/delete.ts" }] };
         }
@@ -143,6 +180,14 @@ describe("AFT external-directory permissions", () => {
       if (entry.label === "ast_grep_replace") {
         registerAstTools(api, restrictedContext(bridge), { astSearch: false, astReplace: true });
       }
+      if (entry.label === "aft_outline") {
+        registerReadingTools(api, restrictedContext(bridge), { outline: true, zoom: false });
+      }
+      if (entry.label === "aft_zoom") {
+        registerReadingTools(api, restrictedContext(bridge), { outline: false, zoom: true });
+      }
+      if (entry.label === "aft_callgraph") registerNavigateTool(api, restrictedContext(bridge));
+      if (entry.label === "aft_inspect") registerInspectTool(api, restrictedContext(bridge));
       if (entry.label === "aft_delete") {
         registerFsTools(api, restrictedContext(bridge), { delete: true, move: false });
       }
@@ -155,7 +200,8 @@ describe("AFT external-directory permissions", () => {
       expect(prompts).toHaveLength(1);
       expect(prompts[0].title).toBe("Allow external directory access?");
       expect(prompts[0].message).toContain(`AFT wants to ${entry.action} outside the project:`);
-      expect(calls[0].command).toBe(entry.command);
+      const commandCall = calls.find((call) => call.command === entry.command);
+      expect(commandCall?.command).toBe(entry.command);
     }
   });
 
@@ -191,6 +237,102 @@ describe("AFT external-directory permissions", () => {
 
     expect(prompts).toHaveLength(0);
     expect(calls).toHaveLength(1);
+  });
+
+  test("aft_safety undo and restore preflight external preview paths", async () => {
+    {
+      const { api, tools } = makeMockApi();
+      const prompts: Prompt[] = [];
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "undo_preview"
+          ? { success: true, paths: ["/outside/undo.ts", "/outside/undo.ts"] }
+          : { success: true, operation: true },
+      );
+      registerSafetyTool(api, restrictedContext(bridge));
+
+      await executeTool(tools.get("aft_safety")!, { op: "undo" }, confirmingExtContext(prompts));
+
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0].message).toContain("/outside/undo.ts");
+      expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    }
+
+    {
+      const { api, tools } = makeMockApi();
+      const prompts: Prompt[] = [];
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "checkpoint_paths"
+          ? { success: true, paths: ["/outside/restore.ts"] }
+          : { success: true, name: "snap" },
+      );
+      registerSafetyTool(api, restrictedContext(bridge));
+
+      await executeTool(
+        tools.get("aft_safety")!,
+        { op: "restore", name: "snap" },
+        confirmingExtContext(prompts),
+      );
+
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0].message).toContain("/outside/restore.ts");
+      expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+    }
+  });
+
+  test("aft_safety internal preview paths do not prompt", async () => {
+    {
+      const { api, tools } = makeMockApi();
+      const prompts: Prompt[] = [];
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "undo_preview"
+          ? { success: true, paths: ["/repo/internal-undo.ts"] }
+          : { success: true, operation: true },
+      );
+      registerSafetyTool(api, restrictedContext(bridge));
+
+      await executeTool(tools.get("aft_safety")!, { op: "undo" }, confirmingExtContext(prompts));
+
+      expect(prompts).toHaveLength(0);
+      expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    }
+
+    {
+      const { api, tools } = makeMockApi();
+      const prompts: Prompt[] = [];
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "checkpoint_paths"
+          ? { success: true, paths: ["/repo/internal-restore.ts"] }
+          : { success: true, name: "snap" },
+      );
+      registerSafetyTool(api, restrictedContext(bridge));
+
+      await executeTool(
+        tools.get("aft_safety")!,
+        { op: "restore", name: "snap" },
+        confirmingExtContext(prompts),
+      );
+
+      expect(prompts).toHaveLength(0);
+      expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+    }
+  });
+
+  test("aft_safety checkpoint checks a single external filePath", async () => {
+    const { api, tools } = makeMockApi();
+    const prompts: Prompt[] = [];
+    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    registerSafetyTool(api, restrictedContext(bridge));
+
+    await executeTool(
+      tools.get("aft_safety")!,
+      { op: "checkpoint", name: "single", filePath: "/outside/checkpoint.ts" },
+      confirmingExtContext(prompts),
+    );
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].message).toContain("/outside/checkpoint.ts");
+    expect(calls[0].command).toBe("checkpoint");
+    expect(calls[0].params).toMatchObject({ files: ["/outside/checkpoint.ts"] });
   });
 
   test("multi-path tools dedupe permission prompts", async () => {
@@ -380,6 +522,12 @@ describe("AFT external-directory permissions", () => {
       const { api, tools } = makeMockApi();
       const prompts: Prompt[] = [];
       const { bridge, calls } = makeMockBridge((command, params) => {
+        if (command === "undo_preview") {
+          return { success: true, paths: [params.file].filter(Boolean) };
+        }
+        if (command === "checkpoint_paths") {
+          return { success: true, paths: [] };
+        }
         if (command === "delete_file") {
           return {
             success: true,
@@ -418,8 +566,9 @@ describe("AFT external-directory permissions", () => {
           (path) => `AFT wants to ${entry.action} outside the project: ${path}`,
         ),
       );
-      expect(calls[0].command).toBe(entry.command);
-      expect(calls[0].params).toMatchObject(entry.expectedParams);
+      const commandCall = calls.find((call) => call.command === entry.command);
+      expect(commandCall?.command).toBe(entry.command);
+      expect(commandCall?.params).toMatchObject(entry.expectedParams);
     }
   });
 });

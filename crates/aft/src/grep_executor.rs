@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
@@ -13,7 +12,7 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, read_searchable_text, resolve_search_scope,
+    build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
     sort_grep_matches_by_mtime_desc, walk_project_files_from, GrepMatch, GrepResult, IndexStatus,
 };
 
@@ -119,22 +118,10 @@ pub fn scope_has_files(project_root: &Path, scope: &GrepScope) -> bool {
         if root.search_root.is_file() {
             return true;
         }
-        walk_project_files_from(
-            &root.filter_root,
-            &root.search_root,
-            &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
-        )
-        .into_iter()
-        .next()
-        .is_some()
-            || walk_project_files_from(
-                project_root,
-                &root.search_root,
-                &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
-            )
-            .into_iter()
-            .next()
-            .is_some()
+        let catch_all =
+            build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
+        has_any_project_file_from(&root.filter_root, &root.search_root, &catch_all)
+            || has_any_project_file_from(project_root, &root.search_root, &catch_all)
     })
 }
 
@@ -253,18 +240,6 @@ fn execute_root(
             max_results,
         ),
         _ => {
-            if !root.use_index {
-                if let Some(result) = ripgrep_grep(
-                    &root.search_root,
-                    project_root,
-                    pattern,
-                    &params.include,
-                    &params.exclude,
-                    max_results,
-                ) {
-                    return result;
-                }
-            }
             let index_status = if root.use_index {
                 current_index_status(ctx)
             } else {
@@ -583,149 +558,15 @@ fn should_stop_fallback_search(
     truncated.load(Ordering::Relaxed) && total_matches.load(Ordering::Relaxed) >= stop_after
 }
 
-fn ripgrep_grep(
-    search_root: &Path,
-    project_root: &Path,
-    pattern: &CompiledPattern,
-    include: &[String],
-    exclude: &[String],
-    max_results: usize,
-) -> Option<GrepResult> {
-    let rg = which_rg()?;
-    let mut cmd = Command::new(rg);
-    cmd.args(["-nH", "--hidden", "--no-messages", "--json"]);
-    if let Some(ignore_file) = aftignore_file_for_ripgrep(search_root, project_root) {
-        cmd.arg("--ignore-file").arg(ignore_file);
-    }
-    if pattern.case_insensitive() {
-        cmd.arg("-i");
-    }
-    if pattern.is_literal() {
-        cmd.arg("-F");
-    }
-    for inc in include {
-        cmd.args(["--glob", inc]);
-    }
-    for exc in exclude {
-        let negated = if exc.starts_with('!') {
-            exc.clone()
-        } else {
-            format!("!{exc}")
-        };
-        cmd.args(["--glob", &negated]);
-    }
-    cmd.arg(format!("--regexp={}", pattern.ripgrep_pattern()))
-        .arg(search_root);
-
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let mut matches = Vec::new();
-    let mut total_matches = 0usize;
-    let mut files_with_matches_set: HashSet<PathBuf> = HashSet::new();
-    let mut truncated = false;
-    let mut engine_capped = false;
-    let stop_after = max_results.saturating_mul(2);
-
-    for line in stdout.lines() {
-        let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-        if parsed.get("type").and_then(|value| value.as_str()) != Some("match") {
-            continue;
-        }
-
-        let data = parsed.get("data")?;
-        let file_str = data
-            .get("path")
-            .and_then(|value| value.get("text"))
-            .and_then(|value| value.as_str())?;
-        let line_num = data
-            .get("line_number")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())?;
-        let line_text = data
-            .get("lines")
-            .and_then(|value| value.get("text"))
-            .and_then(|value| value.as_str())?
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-        let file_path = PathBuf::from(file_str);
-
-        total_matches += 1;
-        files_with_matches_set.insert(file_path.clone());
-
-        if matches.len() < max_results {
-            matches.push(GrepMatch {
-                file: file_path,
-                line: line_num,
-                column: 0,
-                line_text,
-                match_text: String::new(),
-            });
-        } else {
-            truncated = true;
-        }
-        if truncated && total_matches >= stop_after {
-            engine_capped = true;
-            break;
-        }
-    }
-
-    Some(GrepResult {
-        total_matches,
-        matches,
-        files_searched: 0,
-        files_with_matches: files_with_matches_set.len(),
-        index_status: IndexStatus::Fallback,
-        truncated,
-        fully_degraded: true,
-        engine_capped,
-    })
-}
-
-fn aftignore_file_for_ripgrep(search_root: &Path, project_root: &Path) -> Option<PathBuf> {
-    let search_ignore = search_root.join(".aftignore");
-    if search_ignore.is_file() {
-        return Some(search_ignore);
-    }
-
-    let project_ignore = project_root.join(".aftignore");
-    project_ignore.is_file().then_some(project_ignore)
-}
-
 pub(crate) fn ripgrep_glob(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
 ) -> Option<Vec<PathBuf>> {
-    let rg = which_rg()?;
-    let mut cmd = Command::new(rg);
-    cmd.args(["--files", "--hidden", "--glob=!.git/*"])
-        .arg(format!("--glob={pattern}"))
-        .arg(search_root);
-
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let files: Vec<PathBuf> = stdout
-        .lines()
-        .take(max_results)
-        .map(PathBuf::from)
-        .collect();
-
+    let filters = build_path_filters(&[pattern.to_string()], &[]).ok()?;
+    let mut files = walk_project_files_from(search_root, search_root, &filters);
+    files.truncate(max_results);
     Some(files)
-}
-
-fn which_rg() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(if cfg!(windows) { "rg.exe" } else { "rg" });
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
 }
 
 fn current_index_status(ctx: &AppContext) -> IndexStatus {

@@ -23,7 +23,7 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
-const INDEX_VERSION: u32 = 3;
+const INDEX_VERSION: u32 = 4;
 const PREVIEW_BYTES: usize = 8 * 1024;
 const EOF_SENTINEL: u8 = 0;
 const MAX_ENTRIES: usize = 10_000_000;
@@ -63,6 +63,7 @@ pub struct SearchIndex {
     project_root: PathBuf,
     git_head: Option<String>,
     max_file_size: u64,
+    ignore_rules_fingerprint: String,
     pub file_trigrams: HashMap<u32, Vec<u32>>,
     unindexed_files: HashSet<u32>,
 }
@@ -284,6 +285,7 @@ impl SearchIndex {
             project_root: PathBuf::new(),
             git_head: None,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            ignore_rules_fingerprint: String::new(),
             file_trigrams: HashMap::new(),
             unindexed_files: HashSet::new(),
         }
@@ -298,6 +300,7 @@ impl SearchIndex {
         let mut index = SearchIndex {
             project_root: project_root.clone(),
             max_file_size,
+            ignore_rules_fingerprint: ignore_rules_fingerprint(&project_root),
             ..SearchIndex::new()
         };
 
@@ -697,19 +700,28 @@ impl SearchIndex {
 
             let head = git_head.unwrap_or_default();
             let root = self.project_root.to_string_lossy();
+            let ignore_fingerprint = if self.ignore_rules_fingerprint.is_empty() {
+                ignore_rules_fingerprint(&self.project_root)
+            } else {
+                self.ignore_rules_fingerprint.clone()
+            };
             let head_len = u32::try_from(head.len())
                 .map_err(|_| std::io::Error::other("git head too large to cache"))?;
             let root_len = u32::try_from(root.len())
                 .map_err(|_| std::io::Error::other("project root too large to cache"))?;
+            let ignore_fingerprint_len = u32::try_from(ignore_fingerprint.len())
+                .map_err(|_| std::io::Error::other("ignore fingerprint too large to cache"))?;
             let file_count = u32::try_from(active_ids.len())
                 .map_err(|_| std::io::Error::other("too many files to cache"))?;
 
             write_u32(&mut postings_writer, head_len)?;
             write_u32(&mut postings_writer, root_len)?;
+            write_u32(&mut postings_writer, ignore_fingerprint_len)?;
             write_u64(&mut postings_writer, self.max_file_size)?;
             write_u32(&mut postings_writer, file_count)?;
             postings_writer.write_all(head.as_bytes())?;
             postings_writer.write_all(root.as_bytes())?;
+            postings_writer.write_all(ignore_fingerprint.as_bytes())?;
 
             for old_id in &active_ids {
                 let Some(file) = self.files.get(*old_id as usize) else {
@@ -871,6 +883,7 @@ impl SearchIndex {
 
         let head_len = read_u32(&mut postings_reader).ok()? as usize;
         let root_len = read_u32(&mut postings_reader).ok()? as usize;
+        let ignore_fingerprint_len = read_u32(&mut postings_reader).ok()? as usize;
         let max_file_size = read_u64(&mut postings_reader).ok()?;
         let file_count = read_u32(&mut postings_reader).ok()? as usize;
         if file_count > MAX_ENTRIES {
@@ -901,6 +914,19 @@ impl SearchIndex {
         postings_reader.read_exact(&mut root_bytes).ok()?;
         let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
         let project_root = current_canonical_root.to_path_buf();
+
+        if ignore_fingerprint_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
+            return None;
+        }
+        let mut ignore_fingerprint_bytes = vec![0u8; ignore_fingerprint_len];
+        postings_reader
+            .read_exact(&mut ignore_fingerprint_bytes)
+            .ok()?;
+        let stored_ignore_rules_fingerprint = String::from_utf8(ignore_fingerprint_bytes).ok()?;
+        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&project_root);
+        if stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+            return None;
+        }
 
         let mut files = Vec::with_capacity(file_count);
         let mut path_to_id = HashMap::new();
@@ -1007,6 +1033,7 @@ impl SearchIndex {
             project_root,
             git_head,
             max_file_size,
+            ignore_rules_fingerprint: current_ignore_rules_fingerprint,
             file_trigrams,
             unindexed_files,
         })
@@ -1041,6 +1068,11 @@ impl SearchIndex {
         if let Some(mut baseline) = baseline {
             baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             baseline.max_file_size = max_file_size;
+            let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
+            if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+                return SearchIndex::build_with_limit(root, max_file_size);
+            }
+            baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
 
             if baseline.git_head == current_head || current_head.is_none() {
                 // HEAD matches, but files may have changed on disk since the index was
@@ -1464,19 +1496,40 @@ pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<Path
     walk_project_files_from(root, root, filters)
 }
 
-pub(crate) fn walk_project_files_bounded(
-    root: &Path,
-    filters: &PathFilters,
-    max_files: usize,
-) -> Result<Vec<PathBuf>, usize> {
-    walk_project_files_from_inner(root, root, filters, Some(max_files))
-}
-
 pub fn walk_project_files_bounded_default(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {
     walk_project_files_from_inner(root, root, &PathFilters::default(), Some(max_files))
+}
+
+pub(crate) fn walk_project_files_bounded_matching<F>(
+    root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+    matches_file: F,
+) -> Result<Vec<PathBuf>, usize>
+where
+    F: Fn(&Path) -> bool,
+{
+    walk_project_files_from_inner_matching(root, root, filters, Some(max_files), matches_file)
+}
+
+pub fn walk_project_files_bounded_default_matching<F>(
+    root: &Path,
+    max_files: usize,
+    matches_file: F,
+) -> Result<Vec<PathBuf>, usize>
+where
+    F: Fn(&Path) -> bool,
+{
+    walk_project_files_from_inner_matching(
+        root,
+        root,
+        &PathFilters::default(),
+        Some(max_files),
+        matches_file,
+    )
 }
 
 pub(crate) fn walk_project_files_from(
@@ -1488,12 +1541,33 @@ pub(crate) fn walk_project_files_from(
         .expect("unbounded project walk cannot exceed a file limit")
 }
 
+pub(crate) fn has_any_project_file_from(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+) -> bool {
+    walk_project_files_from_inner(filter_root, search_root, filters, Some(0)).is_err()
+}
+
 fn walk_project_files_from_inner(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
     max_files: Option<usize>,
 ) -> Result<Vec<PathBuf>, usize> {
+    walk_project_files_from_inner_matching(filter_root, search_root, filters, max_files, |_| true)
+}
+
+fn walk_project_files_from_inner_matching<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: Option<usize>,
+    matches_file: F,
+) -> Result<Vec<PathBuf>, usize>
+where
+    F: Fn(&Path) -> bool,
+{
     let mut builder = WalkBuilder::new(search_root);
     builder
         .hidden(false)
@@ -1532,7 +1606,7 @@ fn walk_project_files_from_inner(
             continue;
         }
         let path = entry.into_path();
-        if filters.matches(filter_root, &path) {
+        if filters.matches(filter_root, &path) && matches_file(&path) {
             files.push(path);
             if max_files.is_some_and(|limit| files.len() > limit) {
                 return Err(files.len());
@@ -1728,6 +1802,106 @@ pub fn project_cache_key(project_root: &Path) -> String {
     digest[..16].to_string()
 }
 
+/// Fingerprint corpus-shaping ignore rules that are not represented by git HEAD.
+///
+/// The search cache stores this value next to the file mtimes. If `.gitignore`,
+/// `.aftignore`, or `.git/info/exclude` changes while AFT is not running, a
+/// matching HEAD + matching file mtimes is not enough to safely reuse the old
+/// cache: files that are now ignored may still be indexed. Hashing the ignore
+/// files themselves makes cold-start cache reuse agree with the current walker.
+pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let root = canonicalize_or_normalize(project_root);
+    let mut files = Vec::new();
+    collect_ignore_rule_files(&root, &mut files);
+    if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+        if global_ignore.is_file() {
+            files.push(global_ignore);
+        }
+    }
+    let info_exclude = git_info_exclude_path(&root);
+    if info_exclude.is_file() {
+        files.push(info_exclude);
+    }
+    files.sort();
+    files.dedup();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aft-ignore-rules-v1\0");
+    for path in files {
+        if let Some(relative) = cache_relative_path(&root, &path) {
+            hasher.update(relative.to_string_lossy().as_bytes());
+        } else {
+            hasher.update(path.to_string_lossy().as_bytes());
+        }
+        hasher.update(b"\0");
+        match fs::read(&path) {
+            Ok(bytes) => hasher.update(&bytes),
+            Err(error) => hasher.update(format!("read-error:{error}").as_bytes()),
+        }
+        hasher.update(b"\0");
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+fn git_info_exclude_path(root: &Path) -> PathBuf {
+    run_git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| root.join(".git"))
+    .join("info")
+    .join("exclude")
+}
+
+fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            if file_name == ".gitignore" || file_name == ".aftignore" {
+                if path.is_file() {
+                    files.push(path);
+                }
+                continue;
+            }
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            if ignore_rule_fingerprint_skips_dir(&file_name) {
+                continue;
+            }
+            stack.push(path);
+        }
+    }
+}
+
+fn ignore_rule_fingerprint_skips_dir(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str().unwrap_or(""),
+        ".git"
+            | "node_modules"
+            | "target"
+            | "venv"
+            | ".venv"
+            | "__pycache__"
+            | ".tox"
+            | "dist"
+            | "build"
+    )
+}
+
 impl PathFilters {
     fn matches(&self, root: &Path, path: &Path) -> bool {
         let relative = to_glob_path(&relative_to_root(root, path));
@@ -1803,11 +1977,19 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(index: &mut SearchIndex) {
+    let filters = PathFilters::default();
+    let current_files = walk_project_files(&index.project_root, &filters);
+    let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
     let mut stale_paths = Vec::new();
+    let mut removed_paths = Vec::new();
 
     for entry in &mut index.files {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
+        }
+        if !current_file_set.contains(&entry.path) {
+            removed_paths.push(entry.path.clone());
+            continue;
         }
         let cached = FileFreshness {
             mtime: entry.modified,
@@ -1829,14 +2011,23 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
         }
     }
 
-    // Re-index stale files
+    for path in &removed_paths {
+        index.remove_file(path);
+    }
+
+    // Re-index stale files that are still in the current walk set. If an ignore
+    // rule changed while AFT was down but the fingerprint missed it, this keeps
+    // warm-cache verification from resurrecting now-ignored cached entries.
     for path in &stale_paths {
-        index.update_file(path);
+        if current_file_set.contains(path) {
+            index.update_file(path);
+        } else {
+            index.remove_file(path);
+        }
     }
 
     // Detect new files not in the index
-    let filters = PathFilters::default();
-    for path in walk_project_files(&index.project_root, &filters) {
+    for path in current_files {
         if !index.path_to_id.contains_key(&path) {
             index.update_file(&path);
         }

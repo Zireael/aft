@@ -1802,9 +1802,13 @@ fn directory_mode_with_walk_truncation_reports_complete_false() {
     assert_eq!(json["success"], true);
     assert_eq!(json["complete"], false);
     assert_eq!(json["walk_truncated"], true);
+    // The directory walk stops at DIRECTORY_FILE_CAP (200) instead of
+    // enumerating the whole tree; walk_truncated is the honest gap signal that
+    // more files exist beyond the cap. unchecked_files lists the within-cap
+    // files that no server covered (here: all 200, since no LSP is registered).
     assert_eq!(
         json["unchecked_files"].as_array().expect("unchecked").len(),
-        50
+        200
     );
 }
 

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc, walk_project_files_from,
+    build_path_filters, has_any_project_file_from, resolve_search_scope, sort_paths_by_mtime_desc,
+    walk_project_files_from,
 };
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
@@ -110,14 +111,8 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
-    walk_project_files_from(
-        project_root,
-        search_root,
-        &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
-    )
-    .into_iter()
-    .next()
-    .is_some()
+    let catch_all = build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
+    has_any_project_file_from(project_root, search_root, &catch_all)
 }
 
 fn glob_root(

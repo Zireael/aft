@@ -1,5 +1,5 @@
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -464,11 +464,14 @@ pub struct AppContext {
     callgraph: RefCell<Option<CallGraph>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
+    pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
     semantic_index: RefCell<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
+    pending_semantic_index_paths: RefCell<BTreeSet<PathBuf>>,
+    pending_semantic_corpus_refresh: RefCell<bool>,
     semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
     semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
     semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
@@ -540,11 +543,14 @@ impl AppContext {
             callgraph: RefCell::new(None),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
+            pending_search_index_paths: RefCell::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
             semantic_index: RefCell::new(None),
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
+            pending_semantic_index_paths: RefCell::new(BTreeSet::new()),
+            pending_semantic_corpus_refresh: RefCell::new(false),
             semantic_refresh_tx: RefCell::new(None),
             semantic_refresh_event_rx: RefCell::new(None),
             semantic_refresh_worker: RefCell::new(None),
@@ -582,8 +588,9 @@ impl AppContext {
     ///
     /// The builder honors:
     /// - `<project_root>/.gitignore`
-    /// - `<project_root>/.git/info/exclude` (loaded explicitly because
-    ///   `GitignoreBuilder::new` does not auto-discover it)
+    /// - Git's global excludes file (the same source used by `ignore::WalkBuilder`)
+    /// - the repository's real `info/exclude` file, resolved through Git's
+    ///   common dir for linked worktrees
     /// - nested `.gitignore` files (each `.gitignore` discovered during
     ///   the recursive walk)
     ///
@@ -618,6 +625,21 @@ impl AppContext {
         // for watcher events on macOS) keeps them in the same prefix space.
         let root = std::fs::canonicalize(&root_raw).unwrap_or(root_raw);
         let mut builder = GitignoreBuilder::new(&root);
+        // Git's global excludes file — keep the live watcher matcher aligned
+        // with the project walkers (`WalkBuilder::git_global(true)`). The
+        // ignore crate exposes the same path discovery it uses internally, so
+        // this handles the default XDG location and configured excludesFile.
+        if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+            if global_ignore.is_file() {
+                if let Some(err) = builder.add(&global_ignore) {
+                    crate::slog_warn!(
+                        "global gitignore parse error in {}: {}",
+                        global_ignore.display(),
+                        err
+                    );
+                }
+            }
+        }
         // Add root .gitignore (the most common case)
         let root_ignore = Path::new(&root).join(".gitignore");
         if root_ignore.exists() {
@@ -645,7 +667,15 @@ impl AppContext {
         }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
         // does not auto-discover it (verified against ignore-0.4.25 source).
-        let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
+        // In linked worktrees this lives under the repository common dir, not
+        // under `<worktree>/.git/info/exclude` (where `.git` is only a file).
+        let info_exclude = self
+            .git_common_dir
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Path::new(&root).join(".git"))
+            .join("info")
+            .join("exclude");
         if info_exclude.exists() {
             if let Some(err) = builder.add(&info_exclude) {
                 crate::slog_warn!(
@@ -956,6 +986,10 @@ impl AppContext {
         *self.is_worktree_bridge.borrow()
     }
 
+    pub fn git_common_dir(&self) -> Option<PathBuf> {
+        self.git_common_dir.borrow().clone()
+    }
+
     /// Replace the current degraded-mode reasons. Empty vec = full-featured
     /// mode (no degradation). Called by `handle_configure` after deciding
     /// which subsystems to disable for this project root.
@@ -998,6 +1032,46 @@ impl AppContext {
     /// Access the search-index build receiver.
     pub fn search_index_rx(&self) -> &RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>> {
         &self.search_index_rx
+    }
+
+    pub fn add_pending_search_index_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_search_index_paths.borrow_mut().extend(paths);
+    }
+
+    pub fn take_pending_search_index_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_search_index_paths.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    pub fn add_pending_semantic_index_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_semantic_index_paths.borrow_mut().extend(paths);
+    }
+
+    pub fn take_pending_semantic_index_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_semantic_index_paths.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    pub fn mark_pending_semantic_corpus_refresh(&self) {
+        *self.pending_semantic_corpus_refresh.borrow_mut() = true;
+    }
+
+    pub fn take_pending_semantic_corpus_refresh(&self) -> bool {
+        std::mem::take(&mut *self.pending_semantic_corpus_refresh.borrow_mut())
+    }
+
+    pub fn clear_pending_index_updates(&self) {
+        self.pending_search_index_paths.borrow_mut().clear();
+        self.pending_semantic_index_paths.borrow_mut().clear();
+        *self.pending_semantic_corpus_refresh.borrow_mut() = false;
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {

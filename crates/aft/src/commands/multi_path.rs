@@ -75,7 +75,11 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::new();
     'outer: for (index, (path, key, is_dir)) in keyed.iter().enumerate() {
         for (other_index, (_, other_key, other_is_dir)) in keyed.iter().enumerate() {
-            if index != other_index && *is_dir && *other_is_dir && key.starts_with(other_key) {
+            if index != other_index
+                && *is_dir
+                && *other_is_dir
+                && path_is_nested_under(key, other_key)
+            {
                 continue 'outer;
             }
         }
@@ -86,6 +90,17 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 pub(crate) fn canonical_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_nested_under(path: &Path, ancestor: &Path) -> bool {
+    let mut path_components = path.components();
+    for ancestor_component in ancestor.components() {
+        match path_components.next() {
+            Some(path_component) if path_component == ancestor_component => {}
+            _ => return false,
+        }
+    }
+    path_components.next().is_some()
 }
 
 fn search_root(project_root: &Path, validated: &Path) -> PathBuf {
@@ -115,5 +130,20 @@ mod tests {
         let body = serde_json::to_value(err).expect("serialize response");
         assert!(body.to_string().contains("path_not_found"));
         assert!(body.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn dedupe_nested_paths_keeps_sibling_dirs_with_shared_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app = temp.path().join("packages/app");
+        let app_old = temp.path().join("packages/app-old");
+        std::fs::create_dir_all(&app).expect("create app");
+        std::fs::create_dir_all(&app_old).expect("create app-old");
+
+        let deduped = dedupe_nested_paths(vec![app.clone(), app_old.clone()]);
+
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped.contains(&app));
+        assert!(deduped.contains(&app_old));
     }
 }

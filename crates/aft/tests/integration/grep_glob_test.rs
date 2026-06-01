@@ -633,6 +633,82 @@ fn grep_external_ripgrep_fallback_respects_search_root_aftignore() {
 }
 
 #[test]
+fn grep_external_fallback_respects_nested_aftignore() {
+    let project = setup_project(&[]);
+    let external = setup_project(&[
+        ("keep.rs", "nested-external-needle here\n"),
+        ("sub/skip.rs", "nested-external-needle ignored\n"),
+        ("sub/.aftignore", "skip.rs\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-external-nested-aftignore",
+            "command": "grep",
+            "pattern": "nested-external-needle",
+            "path": external.path(),
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["index_status"], "Fallback");
+    assert_eq!(
+        response["total_matches"], 1,
+        "external grep must honor nested .aftignore files: {response:?}"
+    );
+    assert_eq!(
+        response["matches"][0]["file"],
+        canonical_path_string(&external.path().join("keep.rs"))
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn glob_external_fallback_respects_nested_aftignore() {
+    let project = setup_project(&[]);
+    let external = setup_project(&[
+        ("keep.rs", "fn keep() {}\n"),
+        ("sub/skip.rs", "fn skip() {}\n"),
+        ("sub/.aftignore", "skip.rs\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "glob-external-nested-aftignore",
+            "command": "glob",
+            "pattern": "**/*.rs",
+            "path": external.path(),
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "glob should succeed: {response:?}"
+    );
+    assert_eq!(response["total"], 1, "glob response: {response:?}");
+    assert_eq!(
+        response["files"].as_array().expect("files"),
+        &vec![Value::String(canonical_path_string(
+            &external.path().join("keep.rs")
+        ))]
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn grep_explicit_file_reports_runtime_fallback_index_status_when_index_disabled() {
     let project = setup_project(&[("src/main.rs", "fn main() { println!(\"needle\"); }\n")]);
     let mut aft = AftProcess::spawn();

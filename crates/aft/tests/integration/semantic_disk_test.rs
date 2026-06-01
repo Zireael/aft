@@ -201,6 +201,78 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
 }
 
 #[test]
+fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let old_file = project.path().join("src/old.rs");
+    let new_file = project.path().join("src/new.rs");
+    fs::create_dir_all(old_file.parent().expect("source parent")).expect("create src dir");
+    fs::write(&old_file, "pub fn old_anchor() -> usize { 1 }\n").expect("write old file");
+    fs::write(&new_file, "pub fn new_anchor() -> usize { 2 }\n").expect("write new file");
+
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(
+            texts
+                .into_iter()
+                .map(|text| {
+                    if text.contains("new_anchor") {
+                        vec![0.0, 1.0, 0.0, 0.0]
+                    } else {
+                        vec![1.0, 0.0, 0.0, 0.0]
+                    }
+                })
+                .collect(),
+        )
+    };
+    let mut index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&old_file),
+        &mut embed,
+        16,
+    )
+    .expect("build initial semantic index");
+    assert_eq!(index.indexed_file_count(), 1);
+
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&new_file),
+            &mut embed,
+            16,
+            1,
+            &mut progress,
+        )
+        .expect("defer new file at cap");
+    let deferred_results = index.search(&[0.0, 1.0, 0.0, 0.0], 5);
+    assert!(
+        deferred_results
+            .iter()
+            .all(|result| result.name != "new_anchor"),
+        "new file should be deferred while the cap is full: {deferred_results:?}"
+    );
+
+    fs::remove_file(&old_file).expect("delete old file");
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&old_file),
+            &mut embed,
+            16,
+            1,
+            &mut progress,
+        )
+        .expect("retry deferred file after deletion");
+
+    let results = index.search(&[0.0, 1.0, 0.0, 0.0], 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].file, new_file);
+    assert!(
+        results[0].snippet.contains("new_anchor"),
+        "deferred file should be indexed after capacity frees: {results:?}"
+    );
+}
+
+#[test]
 fn stale_file_detected_after_deletion() {
     let project = tempfile::tempdir().expect("create project dir");
     let storage = tempfile::tempdir().expect("create storage dir");

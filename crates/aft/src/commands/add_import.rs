@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
@@ -84,7 +85,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let modifiers: Vec<String> = req
+    let mut modifiers: Vec<String> = req
         .params
         .get("modifiers")
         .and_then(|v| v.as_array())
@@ -179,6 +180,42 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    if matches!(lang, LangId::CSharp | LangId::Php)
+        && organize_imports::imports_span_multiple_code_regions(&source, lang, &block.imports)
+    {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "add_import: imports in {file} span multiple code regions; refusing to add because the target region is ambiguous"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
+    if lang == LangId::Php
+        && block.imports.iter().any(|imp| {
+            imports::php_grouped_use_shares_prefix(imp, module)
+                || imports::php_grouped_use_matches_module(imp, module)
+        })
+    {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_grouped_import",
+            format!(
+                "add_import: PHP grouped use declarations matching '{module}' are not safe to edit member-wise; expand the grouped use first"
+            ),
+            serde_json::json!({ "file": file, "module": module }),
+        );
+    }
+
+    if lang == LangId::Scala
+        && imports::scala_block_uses_scala2_dialect(&block)
+        && !modifiers.iter().any(|modifier| modifier == "scala2")
+    {
+        modifiers.push("scala2".to_string());
+    }
+
     let import_request = imports::ImportRequest {
         module_path: module,
         names: &names,
@@ -249,6 +286,24 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
 
+    let namespace_merge_target = if names.is_empty()
+        && default_import.is_some()
+        && namespace.is_some()
+        && matches!(
+            lang,
+            LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
+        ) {
+        block.imports.iter().find(|imp| {
+            imp.module_path == module
+                && imp.kind == target_kind
+                && imp.names.is_empty()
+                && imp.default_import.as_deref() == default_import.as_deref()
+                && imp.namespace_import.is_none()
+        })
+    } else {
+        None
+    };
+
     let (insert_offset, replace_end, insert_text, merged_into_existing) = if let Some(existing) =
         merge_target
     {
@@ -271,6 +326,21 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             &existing.module_path,
             &merged_names,
             None,
+            type_only,
+        );
+        (
+            existing.byte_range.start,
+            existing.byte_range.end,
+            merged_line,
+            true,
+        )
+    } else if let Some(existing) = namespace_merge_target {
+        let merged_line = imports::generate_import_line_with_namespace(
+            lang,
+            &existing.module_path,
+            &existing.names,
+            existing.default_import.as_deref(),
+            namespace.as_deref(),
             type_only,
         );
         (
@@ -337,7 +407,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // For Go, check if we're inserting into a grouped import block
         let import_line = if matches!(lang, LangId::Go) {
-            let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
+            let in_group = imports::go_offset_is_in_grouped_import(&source, &tree, insert_offset);
             imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
         } else {
             imports::generate_import(lang, &import_request)
@@ -528,7 +598,7 @@ fn validate_module_path_for_add(lang: LangId, module: &str) -> Result<(), &'stat
         if module.starts_with('/') || module.contains('/') {
             return Err("filesystem paths are not allowed for this language");
         }
-        if module.starts_with('\\') || has_windows_drive_prefix(module) {
+        if (lang != LangId::Php && module.starts_with('\\')) || has_windows_drive_prefix(module) {
             return Err("absolute paths are not allowed for this language");
         }
         if lang != LangId::Php && module.contains('\\') {
