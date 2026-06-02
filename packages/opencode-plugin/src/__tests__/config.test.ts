@@ -712,11 +712,11 @@ describe("loadAftConfig", () => {
       fixture.projectConfigPath,
       JSON.stringify({
         semantic: {
-          output_encoding: "binary",
-          storage_strategy: "binary_pack",
-          input_mode: "contextualized",
+          output_encoding: "base64_binary",
+          storage_strategy: "binary_packed",
+          input_mode: "document_chunks",
           dimensions: 256,
-          distance_metric: "dot",
+          distance_metric: "dot_product",
           query_prompt_template: "inject {{query}}",
           document_prompt_template: "inject {{document}}",
         },

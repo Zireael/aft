@@ -34,19 +34,19 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
-const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
+const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama", "perplexity"]);
 
 /** Output encoding mode for embeddings. */
-const SemanticOutputEncodingEnum = z.enum(["float", "binary", "ubinary", "int8", "uint8"]);
+const SemanticOutputEncodingEnum = z.enum(["float", "base64_int8", "base64_binary"]);
 
 /** Storage strategy for embedding vectors. */
-const SemanticStorageStrategyEnum = z.enum(["flat", "binary_pack"]);
+const SemanticStorageStrategyEnum = z.enum(["native_f32", "decode_normalize_f32", "binary_packed"]);
 
 /** Input mode for document chunking before embedding. */
-const SemanticInputModeEnum = z.enum(["flat_texts", "chunk_extracts", "contextualized"]);
+const SemanticInputModeEnum = z.enum(["flat_texts", "document_chunks"]);
 
 /** Distance metric for similarity search. */
-const SemanticDistanceMetricEnum = z.enum(["cosine", "dot", "hamming"]);
+const SemanticDistanceMetricEnum = z.enum(["auto", "cosine", "dot_product", "euclidean", "hamming"]);
 
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
@@ -61,15 +61,15 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
-  /** Output encoding for embedding vectors: "float" (default), "binary", "ubinary", "int8", or "uint8". */
+  /** Output encoding for embedding vectors: "float" (default), "base64_int8", or "base64_binary". */
   output_encoding: SemanticOutputEncodingEnum.optional(),
-  /** Storage strategy: "flat" (default) or "binary_pack". */
+  /** Storage strategy: "native_f32" (default), "decode_normalize_f32", or "binary_packed". */
   storage_strategy: SemanticStorageStrategyEnum.optional(),
-  /** Input mode for document processing: "flat_texts" (default), "chunk_extracts", or "contextualized". */
+  /** Input mode for document processing: "flat_texts" (default) or "document_chunks". */
   input_mode: SemanticInputModeEnum.optional(),
   /** Embedding dimension count (for providers that support variable dimensions). */
   dimensions: z.number().int().positive().optional(),
-  /** Distance metric: "cosine" (default), "dot", or "hamming". */
+  /** Distance metric: "auto" (default), "cosine", "dot_product", "euclidean", or "hamming". */
   distance_metric: SemanticDistanceMetricEnum.optional(),
   /** Optional query prompt template (applied before embedding queries). */
   query_prompt_template: z.string().optional(),

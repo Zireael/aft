@@ -143,6 +143,9 @@ pub fn rerank_candidates(
         Err(_) => text.clone(),
     };
 
+    // Strip markdown code fences that some LLMs wrap around JSON responses.
+    let content = strip_markdown_fences(&content);
+
     // Parse the content as a JSON array of indices.
     let indices = serde_json::from_str::<Vec<usize>>(&content)
         .or_else(|_| {
@@ -168,6 +171,21 @@ pub fn rerank_candidates(
         Ok(indices) => RerankOutcome::ReRanked(indices),
         Err(e) => RerankOutcome::Failed(e),
     }
+}
+
+/// Strip markdown code fences (```json ... ``` or ``` ... ```) from LLM responses.
+/// Many chat models wrap JSON in code fences regardless of `response_format: json_object`.
+fn strip_markdown_fences(s: &str) -> String {
+    let trimmed = s.trim();
+    let stripped = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    stripped
+        .strip_suffix("```")
+        .unwrap_or(stripped)
+        .trim()
+        .to_string()
 }
 
 /// Resolve the reranker API key from config, falling back to the embedding key.
@@ -270,13 +288,8 @@ mod tests {
     fn rerank_parses_markdown_fenced_json() {
         // Some LLMs wrap JSON in markdown code fences.
         let content = "```json\n[1, 0, 2]\n```";
-        // Strip markdown fences before parsing.
-        let stripped = content
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-        let indices: Vec<usize> = serde_json::from_str(stripped).unwrap();
+        let stripped = strip_markdown_fences(content);
+        let indices: Vec<usize> = serde_json::from_str(&stripped).unwrap();
         assert_eq!(indices, vec![1, 0, 2]);
     }
 

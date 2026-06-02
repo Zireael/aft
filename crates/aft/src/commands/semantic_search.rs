@@ -234,7 +234,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 let mut reranked: Vec<HybridResult> = indices
                     .iter()
                     .filter_map(|&i| {
-                        if i < results.len() {
+                        if i < results.len() && !used[i] {
                             used[i] = true;
                             Some(results[i].clone())
                         } else {
