@@ -8367,4 +8367,529 @@ mod fingerprint_invalidation_tests {
         let result = apply_document_template("chunk text", None);
         assert_eq!(result, "chunk text");
     }
+
+    // ── Contextualized embedding tests (aft-t6p.23.1) ──────────────────────────
+
+    /// Helper: write a source file with given content into temp dir and return its path.
+    fn write_temp_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Build a mock contextualized embed fn that returns vectors of given dimension.
+    fn mock_contextual_embed_fn(
+        dim: usize,
+    ) -> impl FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String> {
+        move |dc: DocumentChunks| {
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .into_iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path,
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; dim]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    /// Build a mock contextualized embed fn that also captures the documents it receives.
+    fn capturing_contextual_embed_fn(
+        captured: std::rc::Rc<std::cell::RefCell<Vec<DocumentChunks>>>,
+        dim: usize,
+    ) -> impl FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String> {
+        move |dc: DocumentChunks| {
+            captured.borrow_mut().push(dc.clone());
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; dim]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    #[test]
+    fn contextualized_chunks_grouped_by_source_document() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file_a = write_temp_file(
+            &project_root,
+            "a.rs",
+            "pub fn foo() -> bool { true }\npub fn bar() -> bool { false }\npub fn baz() -> i32 { 42 }\n",
+        );
+        let file_b = write_temp_file(
+            &project_root,
+            "b.rs",
+            "pub fn alpha() -> bool { true }\npub fn beta() -> bool { false }\n",
+        );
+
+        let files = vec![file_a.clone(), file_b.clone()];
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress_calls: Vec<(usize, usize)> = Vec::new();
+        let mut progress = |done: usize, total: usize| progress_calls.push((done, total));
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &files,
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+        let index = result.unwrap();
+        assert!(!index.is_empty(), "index should have entries");
+
+        // Verify documents grouped by file: each file's chunks appear together
+        let caps = captured.borrow();
+        let mut found_a = false;
+        let mut found_b = false;
+        for dc in caps.iter() {
+            for doc in &dc.documents {
+                if doc.file_path == file_a {
+                    found_a = true;
+                    assert!(doc.chunks.len() >= 2);
+                }
+                if doc.file_path == file_b {
+                    found_b = true;
+                    assert!(!doc.chunks.is_empty());
+                }
+            }
+        }
+        assert!(found_a, "file_a chunks not found");
+        assert!(found_b, "file_b chunks not found");
+        assert!(!progress_calls.is_empty(), "progress should be called");
+    }
+
+    #[test]
+    fn contextualized_chunk_order_preserved_within_document() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "ordered.rs",
+            "pub fn first() {}\npub fn second() {}\npub fn third() {}\npub fn fourth() {}\n",
+        );
+        let file_for_check = file.clone();
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+
+        // Verify chunk order is preserved
+        let caps = captured.borrow();
+        for dc in caps.iter() {
+            for doc in &dc.documents {
+                if doc.file_path == file_for_check {
+                    let full_text = doc.chunks.join(" ");
+                    let first_pos = full_text.find("first");
+                    let second_pos = full_text.find("second");
+                    let third_pos = full_text.find("third");
+                    let fourth_pos = full_text.find("fourth");
+                    if let (Some(a), Some(b), Some(c), Some(d)) =
+                        (first_pos, second_pos, third_pos, fourth_pos)
+                    {
+                        assert!(a < b, "first before second");
+                        assert!(b < c, "second before third");
+                        assert!(c < d, "third before fourth");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contextualized_response_wrong_chunk_count_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "chunkcount.rs",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        );
+
+        // Return wrong number of vectors for the chunks
+        let mut embed_fn = |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: vec![vec![1.0; 3]],
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+
+        assert!(result.is_err(), "should fail on wrong chunk count");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("vectors for") || err.contains("embedding response returned"),
+            "error should mention vector count mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_response_unknown_file_path_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(&project_root, "unknownpath.rs", "pub fn a() {}\n");
+
+        // Return embeddings for a file not in the index
+        let bad_path = project_root.join("nonexistent.rs");
+        let mut embed_fn = move |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            Ok(DocumentEmbeddings {
+                embeddings: vec![ChunkEmbeddings {
+                    file_path: bad_path.clone(),
+                    vectors: vec![vec![1.0; 3]],
+                }],
+            })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+
+        assert!(result.is_err(), "should fail on unknown file path");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown file path"),
+            "error should mention unknown file path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_response_dimension_mismatch_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "dimmismatch.rs",
+            "pub fn a() {}\npub fn b() {}\n",
+        );
+
+        let mut dims = vec![3, 5, 5].into_iter();
+        let mut embed_fn = move |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let d = dims.next().unwrap_or(3);
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; d]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+
+        assert!(result.is_err(), "should fail on dimension change");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("dimension changed") || err.contains("embedding dimension"),
+            "error should mention dimension mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_stale_vector_pruning_after_refresh() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "stale.rs",
+            "pub fn original() -> bool { true }\npub fn also_original() -> bool { false }\n",
+        );
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let mut index = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        )
+        .expect("initial build");
+
+        let initial_len = index.len();
+        assert!(initial_len > 0, "index should have entries");
+
+        // Modify the file
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(
+            &file,
+            "pub fn modified() -> i32 { 42 }\npub fn new_func() -> bool { false }\n",
+        )
+        .unwrap();
+
+        let mut flat_embed = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|_| vec![1.0; 3]).collect())
+        };
+        let refreshed = index.refresh_stale_files(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut flat_embed,
+            8,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+
+        assert!(
+            refreshed.is_ok(),
+            "refresh should succeed: {:?}",
+            refreshed.err()
+        );
+        let summary = refreshed.unwrap();
+        assert!(
+            summary.changed > 0 || summary.added > 0 || summary.deleted > 0,
+            "refresh should detect changes: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn contextualized_perplexity_backend_sets_document_chunks_input_mode() {
+        // Verify that Perplexity uses InputMode::DocumentChunks
+        let _config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            model: "sonar".to_string(),
+            ..Default::default()
+        };
+        let profile = EmbeddingModelProfile::perplexity_generic();
+        assert_eq!(
+            profile.input_mode,
+            InputMode::DocumentChunks,
+            "Perplexity profile should use DocumentChunks input mode"
+        );
+
+        // Verify Fastembed uses FlatTexts (for contrast)
+        let fastembed_profile = EmbeddingModelProfile::fastembed_minilm();
+        assert_eq!(
+            fastembed_profile.input_mode,
+            InputMode::FlatTexts,
+            "Fastembed profile should use FlatTexts"
+        );
+    }
+
+    #[test]
+    fn contextualized_oversized_document_is_split() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // Create a file with many small functions to produce >100 chunks
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!("pub fn func_{i}() -> i32 {{ {} }}\n", i));
+        }
+        let file = write_temp_file(&project_root, "oversized.rs", &content);
+        let file_for_check = file.clone();
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(result.is_ok(), "build should succeed: {:?}", result.err());
+        let index = result.unwrap();
+        assert!(
+            !index.is_empty(),
+            "oversized doc should still produce entries"
+        );
+
+        // Verify the doc was split: should see multiple sub-docs for the same file
+        let caps = captured.borrow();
+        let parts_for_file: usize = caps
+            .iter()
+            .flat_map(|dc| dc.documents.iter())
+            .filter(|doc| doc.file_path == file_for_check)
+            .count();
+        assert!(
+            parts_for_file >= 2,
+            "oversized doc should be split into >= 2 parts, got {parts_for_file}"
+        );
+    }
+
+    #[test]
+    fn contextualized_empty_files_produces_empty_index() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let mut embed_fn = |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            Ok(DocumentEmbeddings {
+                embeddings: Vec::new(),
+            })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(result.is_ok(), "empty build should succeed");
+        let index = result.unwrap();
+        assert_eq!(index.len(), 0, "empty files → empty index");
+    }
+
+    #[test]
+    fn contextualized_retry_on_transient_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(&project_root, "retry.rs", "pub fn retry_me() {}\n");
+        let file_for_response = file.clone();
+
+        let attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let att_clone = attempts.clone();
+        let mut embed_fn = move |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let mut a = att_clone.borrow_mut();
+            *a += 1;
+            if *a <= 2 {
+                Err("rate limit exceeded (429)".to_string())
+            } else {
+                Ok(DocumentEmbeddings {
+                    embeddings: vec![ChunkEmbeddings {
+                        file_path: file_for_response.clone(),
+                        vectors: vec![vec![1.0; 3]],
+                    }],
+                })
+            }
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "should succeed after retries: {:?}",
+            result.err()
+        );
+        assert!(
+            *attempts.borrow() >= 3,
+            "should have retried, got {} attempts",
+            *attempts.borrow()
+        );
+    }
+
+    #[test]
+    fn contextualized_non_transient_error_is_not_retried() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(&project_root, "noretry.rs", "pub fn no_retry() {}\n");
+
+        let attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let att_clone = attempts.clone();
+        let mut embed_fn = move |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            *att_clone.borrow_mut() += 1;
+            Err("invalid model configuration: unsupported encoding".to_string())
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "build should not abort on non-transient errors"
+        );
+        assert_eq!(
+            *attempts.borrow(),
+            1,
+            "non-transient error should not retry"
+        );
+    }
+
+    #[test]
+    fn contextualized_progress_reports_total_chunks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "progress.rs",
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        );
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress_calls: Vec<(usize, usize)> = Vec::new();
+        let mut progress = |done: usize, total: usize| progress_calls.push((done, total));
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(result.is_ok());
+
+        assert!(!progress_calls.is_empty(), "progress should be called");
+        assert_eq!(progress_calls[0].0, 0, "first call should report 0 done");
+        assert!(progress_calls[0].1 > 0, "total should be > 0");
+        let last = progress_calls.last().unwrap();
+        assert_eq!(last.0, last.1, "final progress: done == total");
+    }
 }
