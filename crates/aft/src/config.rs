@@ -236,6 +236,9 @@ pub struct SemanticBackendConfig {
     /// Max number of candidates to send to the reranker per query (default: 20).
     #[serde(default = "default_rerank_max_candidates")]
     pub rerank_max_candidates: usize,
+    /// Max characters per candidate snippet sent to reranker (default: 2500).
+    #[serde(default = "default_rerank_max_candidate_chars")]
+    pub rerank_max_candidate_chars: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -269,6 +272,10 @@ fn default_rerank_timeout_ms() -> u64 {
 
 fn default_rerank_max_candidates() -> usize {
     20
+}
+
+fn default_rerank_max_candidate_chars() -> usize {
+    2500
 }
 
 impl SemanticBackendConfig {
@@ -479,6 +486,7 @@ impl Default for SemanticBackendConfig {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         }
     }
 }

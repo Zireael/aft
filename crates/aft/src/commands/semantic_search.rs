@@ -229,10 +229,25 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         match rerank_candidates(&ctx.config().semantic, &params.query, &results) {
             RerankOutcome::ReRanked(indices) => {
                 rerank_latency_ms = rerank_timer.stop();
-                let reranked: Vec<HybridResult> = indices
+                // Apply reranked order, then append any missing indices in original order.
+                let mut used = vec![false; results.len()];
+                let mut reranked: Vec<HybridResult> = indices
                     .iter()
-                    .filter_map(|&i| results.get(i).cloned())
+                    .filter_map(|&i| {
+                        if i < results.len() {
+                            used[i] = true;
+                            Some(results[i].clone())
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
+                // Append missing IDs in original order.
+                for (i, result) in results.iter().enumerate() {
+                    if !used[i] {
+                        reranked.push(result.clone());
+                    }
+                }
                 (reranked, false)
             }
             RerankOutcome::Skipped => {

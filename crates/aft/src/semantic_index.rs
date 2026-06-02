@@ -5600,6 +5600,7 @@ mod tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5695,6 +5696,7 @@ mod tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5762,6 +5764,7 @@ mod tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7073,6 +7076,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7138,6 +7142,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7182,6 +7187,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7232,6 +7238,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7285,6 +7292,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7331,6 +7339,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_key_env: None,
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
