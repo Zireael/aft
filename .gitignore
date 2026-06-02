@@ -87,3 +87,11 @@ benchmarks/aft-search/.bench/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Local agent tooling directories (not for distribution)
+.beads/
+.qartez/
+.claude/
+omo/
+.kiro/
+.lean-ctx/
