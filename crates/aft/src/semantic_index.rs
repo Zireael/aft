@@ -30,6 +30,18 @@ use url::Url;
 
 const DEFAULT_DIMENSION: usize = 384;
 const MAX_ENTRIES: usize = 1_000_000;
+/// Maximum chunks per document group sent to a contextualized embedding provider.
+/// Documents with more chunks are split into sub-groups.
+const DEFAULT_MAX_CHUNKS_PER_DOCUMENT: usize = 100;
+/// Maximum documents per single contextualized embedding request.
+/// Documents beyond this limit are batched into separate requests.
+const DEFAULT_MAX_DOCUMENTS_PER_REQUEST: usize = 50;
+/// Maximum retries for a failed document group in contextualized embedding.
+const CONTEXTUALIZED_MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff in contextualized retry (ms).
+const CONTEXTUALIZED_RETRY_BASE_DELAY_MS: u64 = 1000;
+/// Max delay cap for exponential backoff in contextualized retry (ms).
+const CONTEXTUALIZED_RETRY_MAX_DELAY_MS: u64 = 8000;
 // Covers high-dimensional backends such as OpenAI text-embedding-3-large (3072)
 // and common local models (4096) while keeping a bounded supported shape.
 pub(crate) const MAX_DIMENSION: usize = 4096;
@@ -3042,6 +3054,86 @@ impl SemanticIndex {
         })
     }
 
+    /// Split a document's chunks into sub-groups that respect the provider's
+    /// max-chunks-per-document limit. Each sub-group preserves chunk order
+    /// and carries a synthetic title indicating which slice it is.
+    fn split_oversized_document(
+        doc: &PerDocumentChunks,
+        max_chunks: usize,
+    ) -> Vec<PerDocumentChunks> {
+        if doc.chunks.len() <= max_chunks {
+            return vec![doc.clone()];
+        }
+        let mut groups = Vec::new();
+        for (i, chunk_batch) in doc.chunks.chunks(max_chunks).enumerate() {
+            groups.push(PerDocumentChunks {
+                file_path: doc.file_path.clone(),
+                title: if i == 0 {
+                    doc.title.clone()
+                } else {
+                    format!("{} (part {})", doc.title, i + 1)
+                },
+                chunks: chunk_batch.to_vec(),
+            });
+        }
+        groups
+    }
+
+    /// Retry a single document group's embedding call with exponential backoff.
+    /// Returns Ok embeddings on success, or Err with the last error after all
+    /// retries are exhausted. Only transient errors (rate limits, timeouts,
+    /// server errors) are retried.
+    fn embed_document_group_with_retry<F>(
+        embed_fn: &mut F,
+        doc: PerDocumentChunks,
+        retry_count: &mut usize,
+    ) -> Result<DocumentEmbeddings, String>
+    where
+        F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
+    {
+        let mut last_err = String::new();
+        for attempt in 0..=CONTEXTUALIZED_MAX_RETRIES {
+            match embed_fn(DocumentChunks {
+                documents: vec![doc.clone()],
+            }) {
+                Ok(result) => {
+                    if attempt > 0 {
+                        *retry_count += 1;
+                    }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    last_err = e.clone();
+                    let is_transient = e.to_lowercase().contains("rate")
+                        || e.to_lowercase().contains("limit")
+                        || e.to_lowercase().contains("timeout")
+                        || e.to_lowercase().contains("429")
+                        || e.to_lowercase().contains("503")
+                        || e.to_lowercase().contains("502")
+                        || e.to_lowercase().contains("500")
+                        || e.to_lowercase().contains("connection")
+                        || e.to_lowercase().contains("reset")
+                        || e.to_lowercase().contains("network");
+
+                    if !is_transient || attempt == CONTEXTUALIZED_MAX_RETRIES {
+                        return Err(last_err);
+                    }
+                    let delay = (CONTEXTUALIZED_RETRY_BASE_DELAY_MS * 2u64.pow(attempt))
+                        .min(CONTEXTUALIZED_RETRY_MAX_DELAY_MS);
+                    slog_warn!(
+                        "contextualized doc group failed (attempt {}/{}): {}. Retrying in {}ms...",
+                        attempt + 1,
+                        CONTEXTUALIZED_MAX_RETRIES + 1,
+                        e,
+                        delay
+                    );
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Build the semantic index using a contextualized document-chunk embedding
     /// function. Groups chunks by source document so the embedding provider can
     /// use surrounding chunks as context.
@@ -3088,27 +3180,60 @@ impl SemanticIndex {
             docs_map.entry(chunk.file.clone()).or_default().push(chunk);
         }
 
+        // Build per-document chunk groups, splitting oversized documents
         let mut documents: Vec<PerDocumentChunks> = Vec::with_capacity(docs_map.len());
+        let mut diagnostics = ContextualizedBuildDiagnostics {
+            max_chunks_in_document: docs_map.values().map(|c| c.len()).max().unwrap_or(0),
+            ..Default::default()
+        };
+
         for (path, chunks) in &docs_map {
             let title = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let chunk_texts: Vec<String> = chunks.iter().map(|c| c.embed_text.clone()).collect();
-            documents.push(PerDocumentChunks {
+            let doc = PerDocumentChunks {
                 file_path: path.clone(),
                 title,
                 chunks: chunk_texts,
-            });
+            };
+
+            // Split oversized documents into sub-groups
+            let sub_groups = Self::split_oversized_document(&doc, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+            documents.extend(sub_groups);
         }
 
-        let doc_embeddings = embed_fn(DocumentChunks { documents })?;
+        // Embed documents with retry logic, tracking diagnostics
+        let mut all_embeddings: Vec<ChunkEmbeddings> = Vec::new();
+        let mut retried_count = 0usize;
+        let mut failed_count = 0usize;
+
+        for doc in &documents {
+            match Self::embed_document_group_with_retry(embed_fn, doc.clone(), &mut retried_count) {
+                Ok(result) => {
+                    all_embeddings.extend(result.embeddings);
+                }
+                Err(e) => {
+                    slog_warn!(
+                        "contextualized doc group failed after retries, skipping: {} ({})",
+                        doc.file_path.display(),
+                        e
+                    );
+                    failed_count += 1;
+                }
+            }
+        }
+
+        diagnostics.documents_processed = all_embeddings.len();
+        diagnostics.retried_groups = retried_count;
+        diagnostics.failed_groups = failed_count;
 
         let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(total_chunks);
         let mut expected_dimension: Option<usize> = None;
         let mut done = 0;
 
-        for emb in doc_embeddings.embeddings.into_iter() {
+        for emb in all_embeddings.into_iter() {
             let file_chunks = docs_map.get(&emb.file_path).ok_or_else(|| {
                 format!(
                     "embedding response returned unknown file path: {}",
@@ -3140,12 +3265,22 @@ impl SemanticIndex {
                 entries.push(EmbeddingEntry {
                     chunk: chunk.clone(),
                     vector,
-                    chunk_hash: compute_chunk_hash(&chunk),
+                    chunk_hash: compute_chunk_hash(chunk),
                 });
                 done += 1;
                 progress(done, total_chunks);
             }
         }
+
+        diagnostics.chunks_embedded = entries.len();
+        slog_info!(
+            "contextualized build complete: {} docs, {} chunks, {} retried, {} failed, {} rejected oversized",
+            diagnostics.documents_processed,
+            diagnostics.chunks_embedded,
+            diagnostics.retried_groups,
+            diagnostics.failed_groups,
+            diagnostics.rejected_oversized
+        );
 
         let dimension = expected_dimension.unwrap_or(DEFAULT_DIMENSION);
 
@@ -4721,6 +4856,25 @@ pub struct FilePolicyStats {
     pub skipped_unknown_type: usize,
     pub docs_files_indexed: usize,
     pub config_files_indexed: usize,
+}
+
+/// Diagnostics collected during contextualized document-chunk embedding.
+/// Tracks oversized document handling, retry behavior, and per-request metrics.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ContextualizedBuildDiagnostics {
+    /// Total documents processed (including sub-groups from oversized docs).
+    pub documents_processed: usize,
+    /// Total chunks embedded across all documents.
+    pub chunks_embedded: usize,
+    /// Documents rejected because they exceeded max_chunks_per_document
+    /// and could not be split further.
+    pub rejected_oversized: usize,
+    /// Document groups that failed embedding and were retried.
+    pub retried_groups: usize,
+    /// Document groups that failed after all retries and were skipped.
+    pub failed_groups: usize,
+    /// Maximum chunks in any single document (before splitting).
+    pub max_chunks_in_document: usize,
 }
 
 /// Classify a file's type for the semantic indexer.
