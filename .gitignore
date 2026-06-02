@@ -95,7 +95,6 @@ benchmarks/aft-search/.bench/
 omo/
 .kiro/
 .lean-ctx/
-.alfonso/
 agents.md
 beads-data-*.jsonl
 magic-context-*.md
