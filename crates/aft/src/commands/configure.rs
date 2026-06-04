@@ -374,6 +374,42 @@ fn parse_semantic_config(
         semantic.rerank_max_candidate_chars = usize::try_from(v)
             .map_err(|_| "configure: semantic.rerank_max_candidate_chars is too large".to_string())?;
     }
+    if let Some(raw) = obj.get("jsonl_logging") {
+        semantic.jsonl_logging = raw.as_bool().ok_or_else(|| {
+            "configure: semantic.jsonl_logging must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("jsonl_path") {
+        semantic.jsonl_path = if raw.is_null() {
+            None
+        } else {
+            Some(raw.as_str().ok_or_else(|| {
+                "configure: semantic.jsonl_path must be a string or null".to_string()
+            })?.into())
+        };
+    }
+    if let Some(raw) = obj.get("include_raw_queries") {
+        semantic.include_raw_queries = raw.as_bool().ok_or_else(|| {
+            "configure: semantic.include_raw_queries must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("include_snippets") {
+        semantic.include_snippets = raw.as_bool().ok_or_else(|| {
+            "configure: semantic.include_snippets must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("retention_days") {
+        semantic.retention_days = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.retention_days must be an unsigned integer".to_string()
+        })? as u32;
+    }
+    if let Some(raw) = obj.get("metrics_window_size") {
+        let v = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.metrics_window_size must be an unsigned integer".to_string()
+        })?;
+        semantic.metrics_window_size = usize::try_from(v)
+            .map_err(|_| "configure: semantic.metrics_window_size is too large".to_string())?;
+    }
 
     Ok(semantic)
 }
