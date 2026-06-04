@@ -230,6 +230,150 @@ fn parse_semantic_config(
         semantic.max_batch_size = usize::try_from(max_batch_size)
             .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?;
     }
+    if let Some(raw) = obj.get("dimensions") {
+        semantic.dimensions = if raw.is_null() {
+            None
+        } else {
+            Some(raw.as_u64().ok_or_else(|| {
+                "configure: semantic.dimensions must be an unsigned integer or null".to_string()
+            })? as usize)
+        };
+    }
+    if let Some(raw) = obj.get("output_encoding") {
+        semantic.output_encoding = if raw.is_null() {
+            None
+        } else {
+            let name = raw.as_str().ok_or_else(|| {
+                "configure: semantic.output_encoding must be a string or null".to_string()
+            })?;
+            Some(
+                serde_json::from_value::<crate::config::OutputEncoding>(raw.clone())
+                    .map_err(|e| format!("configure: invalid semantic.output_encoding '{name}': {e}"))?,
+            )
+        };
+    }
+    if let Some(raw) = obj.get("input_mode") {
+        semantic.input_mode = if raw.is_null() {
+            None
+        } else {
+            let name = raw.as_str().ok_or_else(|| {
+                "configure: semantic.input_mode must be a string or null".to_string()
+            })?;
+            Some(
+                serde_json::from_value::<crate::config::InputMode>(raw.clone())
+                    .map_err(|e| format!("configure: invalid semantic.input_mode '{name}': {e}"))?,
+            )
+        };
+    }
+    if let Some(raw) = obj.get("storage_strategy") {
+        semantic.storage_strategy = if raw.is_null() {
+            None
+        } else {
+            let name = raw.as_str().ok_or_else(|| {
+                "configure: semantic.storage_strategy must be a string or null".to_string()
+            })?;
+            Some(
+                serde_json::from_value::<crate::config::StorageStrategy>(raw.clone())
+                    .map_err(|e| format!("configure: invalid semantic.storage_strategy '{name}': {e}"))?,
+            )
+        };
+    }
+    if let Some(raw) = obj.get("distance_metric") {
+        semantic.distance_metric = if raw.is_null() {
+            None
+        } else {
+            let name = raw.as_str().ok_or_else(|| {
+                "configure: semantic.distance_metric must be a string or null".to_string()
+            })?;
+            Some(
+                serde_json::from_value::<crate::config::DistanceMetric>(raw.clone())
+                    .map_err(|e| format!("configure: invalid semantic.distance_metric '{name}': {e}"))?,
+            )
+        };
+    }
+    if let Some(raw) = obj.get("query_prompt_template") {
+        semantic.query_prompt_template = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.query_prompt_template must be a string".to_string())?
+            .trim()
+            .to_string()
+            .into();
+    }
+    if let Some(raw) = obj.get("document_prompt_template") {
+        semantic.document_prompt_template = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.document_prompt_template must be a string".to_string())?
+            .trim()
+            .to_string()
+            .into();
+    }
+    if let Some(raw) = obj.get("diagnostics_enabled") {
+        semantic.diagnostics_enabled = raw.as_bool().ok_or_else(|| {
+            "configure: semantic.diagnostics_enabled must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("low_confidence_threshold") {
+        semantic.low_confidence_threshold = raw.as_f64().ok_or_else(|| {
+            "configure: semantic.low_confidence_threshold must be a number".to_string()
+        })? as f32;
+    }
+    if let Some(raw) = obj.get("output_mode") {
+        let name = raw.as_str().ok_or_else(|| {
+            "configure: semantic.output_mode must be a string".to_string()
+        })?;
+        semantic.output_mode = serde_json::from_value::<crate::config::DiagnosticsOutputMode>(
+            raw.clone(),
+        )
+        .map_err(|e| format!("configure: invalid semantic.output_mode '{name}': {e}"))?;
+    }
+    if let Some(raw) = obj.get("rerank_enabled") {
+        semantic.rerank_enabled = raw.as_bool().ok_or_else(|| {
+            "configure: semantic.rerank_enabled must be a boolean".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("rerank_model") {
+        semantic.rerank_model = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.rerank_model must be a string".to_string())?
+            .trim()
+            .to_string()
+            .into();
+    }
+    if let Some(raw) = obj.get("rerank_base_url") {
+        semantic.rerank_base_url = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.rerank_base_url must be a string".to_string())?
+            .trim()
+            .to_string()
+            .into();
+    }
+    if let Some(raw) = obj.get("rerank_api_key_env") {
+        semantic.rerank_api_key_env = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.rerank_api_key_env must be a string".to_string())?
+            .trim()
+            .to_string()
+            .into();
+    }
+    if let Some(raw) = obj.get("rerank_timeout_ms") {
+        semantic.rerank_timeout_ms = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.rerank_timeout_ms must be an unsigned integer".to_string()
+        })?;
+    }
+    if let Some(raw) = obj.get("rerank_max_candidates") {
+        let v = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.rerank_max_candidates must be an unsigned integer".to_string()
+        })?;
+        semantic.rerank_max_candidates = usize::try_from(v)
+            .map_err(|_| "configure: semantic.rerank_max_candidates is too large".to_string())?;
+    }
+    if let Some(raw) = obj.get("rerank_max_candidate_chars") {
+        let v = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.rerank_max_candidate_chars must be an unsigned integer".to_string()
+        })?;
+        semantic.rerank_max_candidate_chars = usize::try_from(v)
+            .map_err(|_| "configure: semantic.rerank_max_candidate_chars is too large".to_string())?;
+    }
 
     Ok(semantic)
 }
