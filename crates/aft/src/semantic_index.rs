@@ -3201,6 +3201,9 @@ impl SemanticIndex {
 
             // Split oversized documents into sub-groups
             let sub_groups = Self::split_oversized_document(&doc, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+            if sub_groups.len() > 1 {
+                diagnostics.rejected_oversized += 1;
+            }
             documents.extend(sub_groups);
         }
 
@@ -4356,10 +4359,7 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
 
     // Build: "file:relative/path kind:function name:validateAuth signature:fn validateAuth(token: &str) -> bool"
     let name = &symbol.name;
-    let mut text = format!(
-        "name:{name} file:{} kind:{} name:{name}",
-        relative, kind_label
-    );
+    let mut text = format!("file:{} kind:{} name:{name}", relative, kind_label);
 
     if let Some(sig) = &symbol.signature {
         text.push_str(&format!(" signature:{}", sig));
@@ -4679,10 +4679,16 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
+    if denom == 0.0 || !denom.is_normal() {
         0.0
     } else {
-        dot / denom
+        let result = dot / denom;
+        // Guard against NaN from floating-point edge cases (e.g. subnormal norms).
+        if result.is_nan() {
+            0.0
+        } else {
+            result.clamp(-1.0, 1.0)
+        }
     }
 }
 
@@ -5035,7 +5041,6 @@ fn split_large_chunk(chunk: &SemanticChunk) -> Vec<SemanticChunk> {
     let mut current_body = String::new();
     let mut chunk_start = chunk.start_line;
     let mut current_lines: u32 = 0;
-    let mut total_lines: u32 = 0;
 
     for para in chunk.embed_text.split("\n\n") {
         if !current_body.is_empty() && current_body.len() + para.len() > MAX_CHUNK_CHARS {
@@ -5060,7 +5065,6 @@ fn split_large_chunk(chunk: &SemanticChunk) -> Vec<SemanticChunk> {
         }
         current_body.push_str(para);
         current_lines += para.lines().count() as u32;
-        total_lines += para.lines().count() as u32;
     }
 
     if !current_body.trim().is_empty() {
@@ -5074,7 +5078,7 @@ fn split_large_chunk(chunk: &SemanticChunk) -> Vec<SemanticChunk> {
             },
             kind: chunk.kind.clone(),
             start_line: chunk_start,
-            end_line: chunk.start_line + total_lines,
+            end_line: chunk_start + current_lines,
             exported: false,
             embed_text: body.clone(),
             snippet: truncate_snippet(&body),

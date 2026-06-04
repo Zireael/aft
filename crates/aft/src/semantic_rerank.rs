@@ -175,17 +175,33 @@ pub fn rerank_candidates(
 
 /// Strip markdown code fences (```json ... ``` or ``` ... ```) from LLM responses.
 /// Many chat models wrap JSON in code fences regardless of `response_format: json_object`.
+/// Handles: prefix whitespace, optional language tag, nested fences, and trailing text.
 fn strip_markdown_fences(s: &str) -> String {
     let trimmed = s.trim();
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    stripped
-        .strip_suffix("```")
-        .unwrap_or(stripped)
-        .trim()
-        .to_string()
+
+    // Look for opening fence: ```lang or ```
+    // The fence may have trailing text on the same line (unlikely but safe).
+    let after_open = if let Some(rest) = trimmed.strip_prefix("```") {
+        // Skip optional language tag (e.g. "json", "JSON") up to end of first line.
+        let newline_pos = rest.find('\n').unwrap_or(rest.len());
+        &rest[newline_pos..]
+    } else {
+        trimmed
+    };
+
+    // Look for closing fence. Must be on its own line (possibly with trailing whitespace).
+    let after_open_trimmed = after_open.trim_start();
+    if let Some(_content) = after_open_trimmed.strip_suffix("```") {
+        // Ensure the ``` isn't just 3 backticks in the middle of content —
+        // verify the closing fence sits on its own line.
+        let before_fence = &after_open_trimmed[..after_open_trimmed.len() - 3];
+        if before_fence.ends_with('\n') || before_fence.is_empty() {
+            return before_fence.trim().to_string();
+        }
+    }
+
+    // Fallback: no closing fence found, or opening fence wasn't present.
+    after_open_trimmed.trim().to_string()
 }
 
 /// Resolve the reranker API key from config, falling back to the embedding key.

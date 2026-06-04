@@ -64,6 +64,15 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let query_hash = SearchDiagnostics::hash_query(&params.query);
     let mut warnings: Vec<SearchWarning> = Vec::new();
 
+    // Reject empty or whitespace-only queries early.
+    if params.query.trim().is_empty() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "semantic_search: query must not be empty",
+        );
+    }
+
     // Snapshot index state for diagnostics.
     let index_state = {
         let status = ctx.semantic_index_status().borrow();
@@ -230,11 +239,21 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             RerankOutcome::ReRanked(indices) => {
                 rerank_latency_ms = rerank_timer.stop();
                 // Apply reranked order, then append any missing indices in original order.
-                let mut used = vec![false; results.len()];
+                let n = results.len();
+                let mut used = vec![false; n];
+                let oob_count = indices.iter().filter(|&&i| i >= n).count();
+                if oob_count > 0 && diagnostics_enabled {
+                    warnings.push(SearchWarning::RerankerFailure {
+                        reason: format!(
+                            "reranker returned {} out-of-bounds indices (max {})",
+                            oob_count, n
+                        ),
+                    });
+                }
                 let mut reranked: Vec<HybridResult> = indices
                     .iter()
                     .filter_map(|&i| {
-                        if i < results.len() && !used[i] {
+                        if i < n && !used[i] {
                             used[i] = true;
                             Some(results[i].clone())
                         } else {
@@ -274,7 +293,8 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     // model had reasonable matches the agent could have judged. Surface every
     // hit with its score so the caller can decide.
 
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+    // NOTE: Do NOT overwrite the index status here. A search command must not
+    // change the lifecycle state — that is the build/refresh pipeline's job.
 
     // Compute query statistics (always needed for output mode and diagnostics).
     let candidate_count = scores.len();

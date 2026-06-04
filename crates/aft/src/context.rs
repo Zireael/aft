@@ -137,20 +137,20 @@ impl SemanticCancellationToken {
     /// Capture the current generation. The build thread calls this once at start
     /// and then uses `is_cancelled(generation)` to check cooperatively.
     pub fn capture_generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Check if the captured generation is still current. Returns `true` if
     /// a reconfigure has superseded this build.
     pub fn is_cancelled(&self, captured_generation: u64) -> bool {
-        self.generation.load(std::sync::atomic::Ordering::Relaxed) != captured_generation
+        self.generation.load(std::sync::atomic::Ordering::Acquire) != captured_generation
     }
 
     /// Increment the generation counter, cancelling any in-flight build.
     /// Returns the new generation value.
     pub fn cancel_and_advance(&self) -> u64 {
         self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1
     }
 }
