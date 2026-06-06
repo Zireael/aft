@@ -48,6 +48,12 @@ pub struct ConfigSummary {
     pub diagnostics_enabled: bool,
     pub rerank_enabled: bool,
     pub rerank_model: Option<String>,
+    /// Whether the `semantic-model2vec` Cargo feature is compiled in.
+    pub model2vec_feature_enabled: bool,
+    /// Local model path for model2vec backend (if configured).
+    pub model2vec_model_path: Option<String>,
+    /// Max token length for model2vec truncation (if configured).
+    pub model2vec_max_length: Option<usize>,
 }
 
 /// Index health state.
@@ -174,6 +180,9 @@ mod tests {
                 diagnostics_enabled: false,
                 rerank_enabled: false,
                 rerank_model: None,
+                model2vec_feature_enabled: cfg!(feature = "semantic-model2vec"),
+                model2vec_model_path: None,
+                model2vec_max_length: None,
             },
             index: IndexSummary {
                 status: "ready".into(),
@@ -224,6 +233,9 @@ mod tests {
             diagnostics_enabled: true,
             rerank_enabled: false,
             rerank_model: None,
+            model2vec_feature_enabled: cfg!(feature = "semantic-model2vec"),
+            model2vec_model_path: None,
+            model2vec_max_length: None,
         };
         let json = serde_json::to_string(&cs).unwrap();
         assert!(!json.contains("api_key"));

@@ -61,6 +61,13 @@ pub fn handle_semantic_doctor(req: &RawRequest, ctx: &crate::context::AppContext
         diagnostics_enabled: config.diagnostics_enabled,
         rerank_enabled: config.rerank_enabled,
         rerank_model: config.rerank_model.clone(),
+        model2vec_feature_enabled: cfg!(feature = "semantic-model2vec"),
+        model2vec_model_path: config.model_path.as_ref().map(|p| p.display().to_string()),
+        model2vec_max_length: if config.model2vec_max_length > 0 {
+            Some(config.model2vec_max_length)
+        } else {
+            None
+        },
     };
 
     // --- Index summary ---

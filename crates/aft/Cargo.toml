@@ -21,6 +21,10 @@ path = "src/main.rs"
 name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
 
+[features]
+default = []
+semantic-model2vec = ["dep:model2vec-rs"]
+
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
@@ -77,6 +81,7 @@ content_inspector = "0.2.4"
 memchr = "2"
 rayon = "1"
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic"] }
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["fancy-regex", "local-only"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 base64 = "0.22"
 

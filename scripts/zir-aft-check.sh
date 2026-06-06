@@ -66,6 +66,7 @@ FUZZ_TARGET=""
 FUZZ_ARGS=()
 REBUILD_IMAGES=0
 INCLUDE_IMAGES_ON_CLEAN=0
+CARGO_FEATURES=""
 
 RUST_BASE_IMAGE="${AFT_RUST_BASE_IMAGE:-rust:1-bookworm}"
 RUST_CHECK_IMAGE="${AFT_RUST_CHECK_IMAGE:-aft-check-rust:bookworm}"
@@ -144,6 +145,8 @@ Options:
   --prune-after TTL    Stale cache TTL. Examples: 1h, 45m, 3600s. Default: 1h.
   --no-prune           Do not prune stale caches before running checks.
   --fuzz-target NAME   Required for task fuzz unless AFT_FUZZ_TARGET is set.
+  --features FEATURES  Cargo features to enable (e.g. semantic-model2vec).
+                        Applied to check, clippy, nextest, doctest, coverage.
   --rebuild-images     Rebuild local Rust helper images before running.
   --include-images     With clean-caches, also remove helper images.
   -h, --help           Show this help.
@@ -166,6 +169,8 @@ Examples:
   ./scripts/aft-check.sh coverage --fail-under 75
   ./scripts/aft-check.sh deps
   ./scripts/aft-check.sh deep
+  ./scripts/aft-check.sh check --features semantic-model2vec
+  ./scripts/aft-check.sh quick --features semantic-model2vec
   ./scripts/aft-check.sh fuzz --fuzz-target parser_payload -- -runs=100000
   ./scripts/aft-check.sh prune-caches --prune-after 1h
 EOF
@@ -451,6 +456,12 @@ install_cargo_tool_cmd() {
   printf 'if ! command -v %q >/dev/null 2>&1; then cargo install %q --locked; fi' "$binary" "$crate"
 }
 
+cargo_features_flag() {
+  if [[ -n "$CARGO_FEATURES" ]]; then
+    printf '%s' "--features $CARGO_FEATURES"
+  fi
+}
+
 bun_install_cmd() {
   cat <<'EOF'
 if [ -f bun.lock ] || [ -f bun.lockb ]; then
@@ -463,19 +474,19 @@ EOF
 
 task_fmt() { run_rust "fmt" "cargo fmt --all -- --check"; }
 task_autofmt() { run_rust "autofmt" "cargo fmt --all"; }
-task_check() { run_rust "check" "cargo check --workspace --all-targets --locked"; }
-task_clippy() { run_rust "clippy" "cargo clippy --workspace --all-targets --locked -- -D warnings"; }
+task_check() { run_rust "check" "cargo check --workspace --all-targets --locked $(cargo_features_flag)"; }
+task_clippy() { run_rust "clippy" "cargo clippy --workspace --all-targets --locked $(cargo_features_flag) -- -D warnings"; }
 task_nextest() {
   local install_nextest
   install_nextest="$(install_cargo_tool_cmd cargo-nextest cargo-nextest)"
-  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked"
+  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked $(cargo_features_flag)"
 }
-task_doctest() { run_rust "doctest" "cargo test --doc --workspace --locked"; }
+task_doctest() { run_rust "doctest" "cargo test --doc --workspace --locked $(cargo_features_flag)"; }
 task_coverage() {
   local install_nextest install_cov
   install_nextest="$(install_cargo_tool_cmd cargo-nextest cargo-nextest)"
   install_cov="$(install_cargo_tool_cmd cargo-llvm-cov cargo-llvm-cov)"
-  run_rust "coverage" "$install_nextest; $install_cov; mkdir -p target/coverage; cargo llvm-cov nextest --workspace --locked --lcov --output-path target/coverage/lcov.info --fail-under-lines $FAIL_UNDER"
+  run_rust "coverage" "$install_nextest; $install_cov; mkdir -p target/coverage; cargo llvm-cov nextest --workspace --locked $(cargo_features_flag) --lcov --output-path target/coverage/lcov.info --fail-under-lines $FAIL_UNDER"
 }
 task_audit() {
   local install_audit
@@ -625,6 +636,9 @@ parse_args() {
       --fuzz-target)
         shift; [[ $# -gt 0 ]] || fatal "--fuzz-target requires a value"; FUZZ_TARGET="$1" ;;
       --fuzz-target=*) FUZZ_TARGET="${1#*=}" ;;
+      --features)
+        shift; [[ $# -gt 0 ]] || fatal "--features requires a value"; CARGO_FEATURES="$1" ;;
+      --features=*) CARGO_FEATURES="${1#*=}" ;;
       --rebuild-images) REBUILD_IMAGES=1 ;;
       --include-images) INCLUDE_IMAGES_ON_CLEAN=1 ;;
       --)

@@ -784,6 +784,46 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring semantic.backend, base_url, api_key_env");
   });
 
+  test("strips model2vec trust-boundary fields from project config", () => {
+    const fixture = createConfigFixture();
+    // User config with model2vec backend
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        semantic: {
+          backend: "model2vec",
+          model_path: "/home/user/.cache/minishlab/potion-code-16M",
+          model2vec_max_length: 512,
+        },
+      }),
+    );
+    // Project config tries to redirect model path to attacker-controlled directory
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        semantic: {
+          backend: "fastembed",
+          model_path: "/tmp/evil-model",
+          model2vec_max_length: 999,
+        },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    // User's model2vec settings must survive
+    expect(config.semantic.backend).toBe("model2vec");
+    expect(config.semantic.model_path).toBe("/home/user/.cache/minishlab/potion-code-16M");
+    expect(config.semantic.model2vec_max_length).toBe(512);
+    // Project's model2vec fields must be stripped
+    expect(result.stderr).toContain("model_path");
+    expect(result.stderr).toContain("model2vec_max_length");
+  });
+
   test("partial safe-field override preserves user model", () => {    const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,

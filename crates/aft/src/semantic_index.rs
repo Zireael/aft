@@ -14,6 +14,8 @@ use crate::vector_store::VectorStore;
 use crate::{slog_info, slog_warn};
 
 use fastembed::{EmbeddingModel as FastembedEmbeddingModel, InitOptions, TextEmbedding};
+#[cfg(feature = "semantic-model2vec")]
+use model2vec_rs::model::StaticModel as Model2VecStaticModel;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -571,6 +573,7 @@ impl EmbeddingModelProfile {
                     Some(Self::perplexity_generic())
                 }
             }
+            SemanticBackend::Model2Vec => None, // No known profile; use config defaults.
         }
     }
 
@@ -1098,6 +1101,12 @@ enum SemanticEmbeddingEngine {
         base_url: String,
         api_key: Option<String>,
     },
+    /// Local model2vec static embeddings (requires `semantic-model2vec` feature).
+    #[cfg(feature = "semantic-model2vec")]
+    Model2Vec {
+        model: Model2VecStaticModel,
+        max_length: usize,
+    },
 }
 
 #[allow(dead_code)]
@@ -1500,6 +1509,42 @@ impl SemanticEmbeddingModel {
                     api_key,
                 }
             }
+            SemanticBackend::Model2Vec => {
+                #[cfg(feature = "semantic-model2vec")]
+                {
+                    let model_path = config.model_path.as_ref().ok_or_else(|| {
+                        "model_path is required for model2vec backend".to_string()
+                    })?;
+                    if !model_path.exists() {
+                        return Err(format!(
+                            "model_path does not exist: {}",
+                            model_path.display()
+                        ));
+                    }
+                    let static_model = Model2VecStaticModel::from_pretrained(
+                        model_path.to_str().ok_or_else(|| {
+                            "model_path is not valid UTF-8".to_string()
+                        })?,
+                        None,  // hf_token
+                        None,  // normalize_embeddings (use model default)
+                        None,  // subfolder
+                    )
+                    .map_err(|error| format!("failed to load model2vec model: {error}"))?;
+                    SemanticEmbeddingEngine::Model2Vec {
+                        model: static_model,
+                        max_length: config.model2vec_max_length,
+                    }
+                }
+                #[cfg(not(feature = "semantic-model2vec"))]
+                {
+                    return Err(
+                        "backend = \"model2vec\" requires the semantic-model2vec Cargo feature \
+                         to be enabled at compile time. Rebuild with \
+                         --features semantic-model2vec to use the model2vec backend."
+                            .to_string(),
+                    );
+                }
+            }
         };
 
         Ok(Self {
@@ -1596,6 +1641,15 @@ impl SemanticEmbeddingModel {
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
             SemanticEmbeddingEngine::Perplexity { .. } => {
+                let vectors =
+                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                vectors
+                    .first()
+                    .map(|v| v.len())
+                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+            }
+            #[cfg(feature = "semantic-model2vec")]
+            SemanticEmbeddingEngine::Model2Vec { .. } => {
                 let vectors =
                     self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
                 vectors
@@ -1896,6 +1950,20 @@ impl SemanticEmbeddingModel {
 
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
+            }
+            #[cfg(feature = "semantic-model2vec")]
+            SemanticEmbeddingEngine::Model2Vec { model, max_length } => {
+                let embeddings = model.encode_with_args(&texts, Some(*max_length), 1024);
+                if embeddings.is_empty() {
+                    return Err("model2vec returned no embeddings".to_string());
+                }
+                for vector in &embeddings {
+                    if vector.is_empty() {
+                        return Err("model2vec returned empty embedding".to_string());
+                    }
+                }
+                self.dimension = embeddings.first().map(Vec::len);
+                Ok(embeddings)
             }
         }
     }
@@ -5759,6 +5827,8 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5855,6 +5925,8 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5923,6 +5995,8 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7235,6 +7309,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7301,6 +7377,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7346,6 +7424,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7397,6 +7477,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7451,6 +7533,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7498,6 +7582,8 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();

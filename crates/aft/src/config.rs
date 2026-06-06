@@ -20,6 +20,10 @@ pub enum SemanticBackend {
     /// arrays and returns one embedding per chunk using surrounding context.
     #[serde(rename = "perplexity")]
     Perplexity,
+    /// Local model2vec static embeddings (e.g. Potion Code 16M).
+    /// Requires the `semantic-model2vec` Cargo feature to be enabled.
+    #[serde(rename = "model2vec")]
+    Model2Vec,
 }
 
 impl SemanticBackend {
@@ -29,6 +33,7 @@ impl SemanticBackend {
             Self::OpenAiCompatible => "openai_compatible",
             Self::Ollama => "ollama",
             Self::Perplexity => "perplexity",
+            Self::Model2Vec => "model2vec",
         }
     }
 
@@ -38,6 +43,7 @@ impl SemanticBackend {
             "openai_compatible" => Some(Self::OpenAiCompatible),
             "ollama" => Some(Self::Ollama),
             "perplexity" => Some(Self::Perplexity),
+            "model2vec" => Some(Self::Model2Vec),
             _ => None,
         }
     }
@@ -65,6 +71,7 @@ impl OutputEncoding {
             SemanticBackend::OpenAiCompatible => Self::Float,
             SemanticBackend::Ollama => Self::Float,
             SemanticBackend::Perplexity => Self::Float,
+            SemanticBackend::Model2Vec => Self::Float,
         }
     }
 }
@@ -88,6 +95,7 @@ impl InputMode {
             SemanticBackend::OpenAiCompatible => Self::FlatTexts,
             SemanticBackend::Ollama => Self::FlatTexts,
             SemanticBackend::Perplexity => Self::DocumentChunks,
+            SemanticBackend::Model2Vec => Self::FlatTexts,
         }
     }
 }
@@ -114,6 +122,7 @@ impl StorageStrategy {
             SemanticBackend::OpenAiCompatible => Self::NativeF32,
             SemanticBackend::Ollama => Self::NativeF32,
             SemanticBackend::Perplexity => Self::NativeF32,
+            SemanticBackend::Model2Vec => Self::NativeF32,
         }
     }
 }
@@ -143,6 +152,7 @@ impl DistanceMetric {
             SemanticBackend::OpenAiCompatible => Self::Auto,
             SemanticBackend::Ollama => Self::Auto,
             SemanticBackend::Perplexity => Self::Cosine,
+            SemanticBackend::Model2Vec => Self::Cosine,
         }
     }
 }
@@ -239,6 +249,17 @@ pub struct SemanticBackendConfig {
     /// Max characters per candidate snippet sent to reranker (default: 2500).
     #[serde(default = "default_rerank_max_candidate_chars")]
     pub rerank_max_candidate_chars: usize,
+    /// Local filesystem path to a model2vec model directory (e.g. `minishlab/potion-code-16M`).
+    /// Required when `backend = "model2vec"`. Must contain `config.json`, `tokenizer.json`,
+    /// and `model.safetensors`. No remote downloads are performed.
+    /// **USER-ONLY trust boundary** — project-level config cannot set this field;
+    /// the OpenCode plugin strips it from project config before merging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
+    /// Max token length for model2vec truncation (default: 512).
+    /// **USER-ONLY trust boundary** — project-level config cannot set this field.
+    #[serde(default = "default_model2vec_max_length")]
+    pub model2vec_max_length: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -276,6 +297,10 @@ fn default_rerank_max_candidates() -> usize {
 
 fn default_rerank_max_candidate_chars() -> usize {
     2500
+}
+
+fn default_model2vec_max_length() -> usize {
+    512
 }
 
 impl SemanticBackendConfig {
@@ -487,6 +512,8 @@ impl Default for SemanticBackendConfig {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            model_path: None,
+            model2vec_max_length: 512,
         }
     }
 }

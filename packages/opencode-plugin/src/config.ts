@@ -34,7 +34,13 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
-const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama", "perplexity"]);
+const SemanticBackendEnum = z.enum([
+  "fastembed",
+  "openai_compatible",
+  "ollama",
+  "perplexity",
+  "model2vec",
+]);
 
 /** Output encoding mode for embeddings. */
 const SemanticOutputEncodingEnum = z.enum(["float", "base64_int8", "base64_binary"]);
@@ -75,6 +81,10 @@ const SemanticConfigSchema = z.object({
   query_prompt_template: z.string().optional(),
   /** Optional document prompt template (applied before embedding documents). */
   document_prompt_template: z.string().optional(),
+  /** Local filesystem path to a model2vec model directory (USER-ONLY, trust boundary). */
+  model_path: z.string().optional(),
+  /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */
+  model2vec_max_length: z.number().int().positive().optional(),
 });
 const LspExtensionSchema = z
   .string()
@@ -1072,6 +1082,8 @@ function getStrippedSemanticKeys(semantic: AftConfig["semantic"]): string {
   if (semantic.distance_metric !== undefined) stripped.push("distance_metric");
   if (semantic.query_prompt_template !== undefined) stripped.push("query_prompt_template");
   if (semantic.document_prompt_template !== undefined) stripped.push("document_prompt_template");
+  if (semantic.model_path !== undefined) stripped.push("model_path");
+  if (semantic.model2vec_max_length !== undefined) stripped.push("model2vec_max_length");
   return stripped.join(", ");
 }
 

@@ -264,6 +264,7 @@ impl AppContext {
                 "restrict_to_project_root": config.restrict_to_project_root,
                 "search_index": config.search_index,
                 "semantic_search": config.semantic_search,
+                "semantic_model2vec": cfg!(feature = "semantic-model2vec"),
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,

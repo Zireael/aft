@@ -718,4 +718,249 @@ mod tests {
         assert_eq!(json["semantic_score"], 0.75);
         assert!(json["lexical_score"].is_null());
     }
+
+    // ── fuse_hybrid_results tests ──────────────────────────────────────
+
+    fn make_semantic_result(file: &str, name: &str, score: f32) -> crate::semantic_index::SemanticResult {
+        crate::semantic_index::SemanticResult {
+            file: PathBuf::from(file),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            start_line: 0,
+            end_line: 10,
+            exported: false,
+            snippet: String::new(),
+            score,
+            source: "semantic",
+        }
+    }
+
+    fn make_nl_shape() -> crate::query_shape::QueryShape {
+        crate::query_shape::classify("how to handle authentication in the middleware layer")
+    }
+
+    fn make_id_shape() -> crate::query_shape::QueryShape {
+        crate::query_shape::classify("handleAuthRequest")
+    }
+
+    fn make_path_shape() -> crate::query_shape::QueryShape {
+        crate::query_shape::classify("src/auth/session.ts")
+    }
+
+    #[test]
+    fn fuse_empty_semantic_and_empty_lexical_returns_empty() {
+        let shape = make_nl_shape();
+        let results = fuse_hybrid_results(vec![], vec![], &shape, 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn fuse_semantic_only_returns_semantic_results() {
+        let shape = make_nl_shape();
+        let semantic = vec![make_semantic_result("a.rs", "func_a", 0.9)];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "semantic");
+        assert_eq!(results[0].name, "func_a");
+    }
+
+    #[test]
+    fn fuse_lexical_only_returns_lexical_results() {
+        let shape = make_id_shape();
+        let lexical = vec![(PathBuf::from("b.rs"), 0.8)];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "lexical");
+    }
+
+    #[test]
+    fn fuse_hybrid_marks_files_in_both_as_hybrid() {
+        let shape = make_nl_shape();
+        let semantic = vec![make_semantic_result("a.rs", "func_a", 0.9)];
+        let lexical = vec![(PathBuf::from("a.rs"), 0.5)];
+        let results = fuse_hybrid_results(semantic, lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "hybrid");
+        assert!(results[0].lexical_score.is_some());
+    }
+
+    #[test]
+    fn fuse_hybrid_boost_applied() {
+        let shape = make_nl_shape();
+        let semantic = vec![make_semantic_result("a.rs", "func_a", 0.8)];
+        let lexical = vec![(PathBuf::from("a.rs"), 0.5)];
+        let results = fuse_hybrid_results(semantic, lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        // Score should be semantic * HYBRID_LEXICAL_BOOST = 0.8 * 1.1 = 0.88
+        assert!((results[0].score - 0.88).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fuse_lexical_only_score_capped() {
+        let shape = make_id_shape();
+        // A very high lexical score should be capped at LEXICAL_ONLY_SCORE_CEILING (0.25).
+        let lexical = vec![(PathBuf::from("a.rs"), 10.0)];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score <= 0.25 + 1e-6);
+    }
+
+    #[test]
+    fn fuse_natural_language_lexical_only_weight_zero() {
+        let shape = make_nl_shape();
+        let lexical = vec![(PathBuf::from("a.rs"), 0.9)];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        // NL queries weight lexical at 0.0, so score = 0.9 * 0.0 = 0.0.
+        assert!(results[0].score.abs() < 1e-6);
+    }
+
+    #[test]
+    fn fuse_top_k_truncates_results() {
+        let shape = make_nl_shape();
+        let semantic = vec![
+            make_semantic_result("a.rs", "f1", 0.9),
+            make_semantic_result("b.rs", "f2", 0.8),
+            make_semantic_result("c.rs", "f3", 0.7),
+        ];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "f1");
+        assert_eq!(results[1].name, "f2");
+    }
+
+    #[test]
+    fn fuse_zero_top_k_returns_empty() {
+        let shape = make_nl_shape();
+        let semantic = vec![make_semantic_result("a.rs", "f1", 0.9)];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn fuse_cap_per_file_limits_results() {
+        let shape = make_nl_shape();
+        // 3 results from the same file — cap_per_file(2) should keep only 2.
+        let semantic = vec![
+            make_semantic_result("a.rs", "f1", 0.9),
+            make_semantic_result("a.rs", "f2", 0.8),
+            make_semantic_result("a.rs", "f3", 0.7),
+        ];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn fuse_results_sorted_by_score_desc() {
+        let shape = make_nl_shape();
+        let semantic = vec![
+            make_semantic_result("a.rs", "f_low", 0.3),
+            make_semantic_result("b.rs", "f_high", 0.9),
+            make_semantic_result("c.rs", "f_mid", 0.6),
+        ];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].name, "f_high");
+        assert_eq!(results[1].name, "f_mid");
+        assert_eq!(results[2].name, "f_low");
+    }
+
+    #[test]
+    fn fuse_lexical_only_path_shape_weight() {
+        let shape = make_path_shape();
+        let lexical = vec![(PathBuf::from("a.rs"), 0.9)];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert_eq!(results.len(), 1);
+        // Path shape weights lexical at 0.5, capped at 0.25.
+        assert!(results[0].score <= 0.25 + 1e-6);
+    }
+
+    #[test]
+    fn result_to_json_semantic_result() {
+        let result = HybridResult {
+            file: PathBuf::from("/project/src/lib.ts"),
+            name: "processData".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 14,
+            end_line: 42,
+            exported: true,
+            snippet: "function processData() {}".to_string(),
+            score: 0.85,
+            source: "hybrid",
+            semantic_score: Some(0.8),
+            lexical_score: Some(0.5),
+        };
+        let json = result_to_json(&result);
+        assert_eq!(json["name"], "processData");
+        assert_eq!(json["source"], "hybrid");
+        assert_eq!(json["start_line"], 15); // 1-indexed
+        assert_eq!(json["end_line"], 43); // 1-indexed
+        assert_eq!(json["semantic_score"], 0.8);
+        assert_eq!(json["lexical_score"], 0.5);
+        assert_eq!(json["snippet"], "function processData() {}");
+    }
+
+    #[test]
+    fn result_to_json_lexical_result() {
+        let result = HybridResult {
+            file: PathBuf::from("/project/src/config.ts"),
+            name: String::new(),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet: String::new(),
+            score: 0.25,
+            source: "lexical",
+            semantic_score: None,
+            lexical_score: Some(1.5),
+        };
+        let json = result_to_json(&result);
+        assert_eq!(json["location"], "[lexical match]");
+        assert!(json["semantic_score"].is_null());
+        assert_eq!(json["lexical_score"], 1.5);
+    }
+
+    #[test]
+    fn format_semantic_text_empty_results() {
+        let text = format_semantic_text(&[], Path::new("/project"));
+        assert!(text.contains("0 semantic result(s)"));
+    }
+
+    #[test]
+    fn format_semantic_text_groups_by_file() {
+        let results = vec![
+            HybridResult {
+                file: PathBuf::from("/project/src/a.ts"),
+                name: "fn1".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 10,
+                exported: false,
+                snippet: String::new(),
+                score: 0.9,
+                source: "semantic",
+                semantic_score: Some(0.9),
+                lexical_score: None,
+            },
+            HybridResult {
+                file: PathBuf::from("/project/src/a.ts"),
+                name: "fn2".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 15,
+                end_line: 25,
+                exported: false,
+                snippet: String::new(),
+                score: 0.7,
+                source: "semantic",
+                semantic_score: Some(0.7),
+                lexical_score: None,
+            },
+        ];
+        let text = format_semantic_text(&results, Path::new("/project"));
+        // Both should appear under the same file heading.
+        assert!(text.contains("fn1"));
+        assert!(text.contains("fn2"));
+        assert!(text.contains("2 semantic result(s)"));
+    }
 }
