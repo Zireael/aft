@@ -52,7 +52,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -W 2>/dev/null || pwd -P)"
 
 TASK="validate"
 FAIL_UNDER=80
