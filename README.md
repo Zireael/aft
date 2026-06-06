@@ -983,12 +983,13 @@ Parameters: `query` (required — natural language description), `topK` (optiona
 
 #### Embedding backends
 
-`aft_search` supports three embedding backends. Set them under the `semantic` block in your
+`aft_search` supports four embedding backends. Set them under the `semantic` block in your
 **user-level** AFT config (`~/.config/opencode/aft.jsonc` or `~/.pi/agent/aft.jsonc`).
 
-> **Trust boundary:** `backend`, `base_url`, and `api_key_env` are user-only. Project-level
-> `aft.jsonc` files cannot inject these — a hostile repository cannot point your embeddings
-> at an attacker-controlled endpoint or steal your API keys. Project config can still tune
+> **Trust boundary:** `backend`, `base_url`, `api_key_env`, `model_path`, and
+> `model2vec_max_length` are user-only. Project-level `aft.jsonc` files cannot inject these
+> — a hostile repository cannot point your embeddings at an attacker-controlled endpoint,
+> steal your API keys, or load arbitrary local model files. Project config can still tune
 > `model`, `timeout_ms`, and `max_batch_size`.
 
 **1. `fastembed` (default)** — local ONNX Runtime, no network, no API key. Uses
@@ -1034,6 +1035,54 @@ time. The key itself is never stored in config or logs.
 }
 ```
 
+**4. `model2vec`** *(optional, off by default)* — local static embeddings via
+[model2vec-rs](https://github.com/MinishLab/model2vec-rs). Uses pre-trained models like
+[Potion Code 16M](https://huggingface.co/minishlab/potion-code-16M) (256 dims, ~65MB)
+that embed code without any runtime neural network — pure CPU, no ONNX, no GPU, no API key.
+
+> **This backend is opt-in.** It is disabled by default and requires a Cargo feature flag to
+> compile. AFT's default backend (fastembed) is unchanged. Potion Code 16M is **not bundled**
+> — you must download and point AFT at the local model directory.
+
+**Setup:**
+
+1. **Compile with the feature:**
+   ```bash
+   cargo build --features semantic-model2vec
+   ```
+
+2. **Download Potion Code 16M** (or any model2vec-compatible model):
+   ```bash
+   # From Hugging Face — no special tools needed, just the raw files:
+   mkdir -p ~/models/potion-code-16M
+   cd ~/models/potion-code-16M
+   curl -LO https://huggingface.co/minishlab/potion-code-16M/resolve/main/config.json
+   curl -LO https://huggingface.co/minishlab/potion-code-16M/resolve/main/tokenizer.json
+   curl -LO https://huggingface.co/minishlab/potion-code-16M/resolve/main/model.safetensors
+   ```
+
+3. **Configure** — add to your **user-level** AFT config:
+   ```jsonc
+   {
+     "semantic_search": true,
+     "semantic": {
+       "backend": "model2vec",
+       "model_path": "/absolute/path/to/potion-code-16M"
+     }
+   }
+   ```
+
+   > `model_path` and `model2vec_max_length` are **user-only** fields. Project-level config
+   > cannot set them — a hostile repository cannot redirect your embeddings at arbitrary paths.
+
+**Limitations:**
+- Requires `semantic-model2vec` Cargo feature. If AFT was compiled without it, requesting
+  `backend = "model2vec"` returns a clear error: *"compiled without semantic-model2vec feature"*.
+- Model files must exist locally. No automatic Hugging Face downloads.
+- Potion Code 16M produces 256-dim embeddings — different semantic space than fastembed
+  (384-dim) or OpenAI (1536/3072-dim). Switching to model2vec rebuilds the index.
+- Local-only by default. No remote model endpoints.
+
 **Choosing a backend:**
 
 | backend | when |
@@ -1041,6 +1090,7 @@ time. The key itself is never stored in config or logs.
 | `fastembed` | Default. Offline, free, zero setup beyond ONNX Runtime. Lower recall than larger models but good enough for most code search. |
 | `openai_compatible` | You want higher recall (1536/3072-dim models), already pay for an embeddings API, or your repo is large enough that local CPU embedding is too slow. |
 | `ollama` | You want a local self-hosted model larger than `all-MiniLM-L6-v2` without paying per-token. |
+| `model2vec` | You want ultra-fast static embeddings (no runtime neural network) with zero API cost. Good for symbol/exact lookup. Requires compiling with `--features semantic-model2vec` and downloading the model manually. |
 
 **Switching backends rebuilds the index.** AFT stores a fingerprint
 (`backend`, `model`, `base_url`, `dimension`, plus an internal `chunking_version` for the
@@ -1313,23 +1363,28 @@ The schema is identical across harnesses. Only file location differs.
   "semantic_search": false,
 
   // Optional embedding-backend configuration for aft_search. Omit this block to use
-  // the local fastembed default. Three backends are supported: "fastembed" (default,
+  // the local fastembed default. Four backends are supported: "fastembed" (default,
   // local ONNX), "openai_compatible" (any /v1/embeddings endpoint — OpenAI, Together,
-  // Voyage, vLLM, LM Studio, etc.), and "ollama" (self-hosted at /api/embeddings).
+  // Voyage, vLLM, LM Studio, etc.), "ollama" (self-hosted at /api/embeddings), and
+  // "model2vec" (optional, requires --features semantic-model2vec; local static
+  // embeddings via model2vec-rs — see "Embedding backends" section above for setup).
   //
-  // USER-only fields: "backend", "base_url", "api_key_env" (project config cannot
-  // inject these — strict-allowlist trust boundary). Project config can still tune
-  // "model", "timeout_ms", "max_batch_size".
+  // USER-only fields: "backend", "base_url", "api_key_env", "model_path",
+  // "model2vec_max_length" (project config cannot inject these — strict-allowlist
+  // trust boundary). Project config can still tune "model", "timeout_ms",
+  // "max_batch_size".
   //
   // Switching "backend", "model", or "base_url" deletes the persisted index and
   // rebuilds from scratch on next session start (necessary because dimensions and
   // semantic spaces differ across models). Rotating an API key without changing
   // "api_key_env" does NOT trigger a rebuild.
   "semantic": {
-    "backend": "fastembed",            // "fastembed" | "openai_compatible" | "ollama"
+    "backend": "fastembed",            // "fastembed" | "openai_compatible" | "ollama" | "model2vec"
     "model": "all-MiniLM-L6-v2",       // model id understood by the backend
     // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
+    // "model_path": "/path/to/potion-code-16M",   // required for model2vec (user-only)
+    // "model2vec_max_length": 512,                // optional, default 512 (user-only)
     "timeout_ms": 25000,                // per-request timeout, kept under bridge limit
     "max_batch_size": 64                // embeddings batched in groups of this size
   },
