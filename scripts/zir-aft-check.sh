@@ -673,6 +673,15 @@ main() {
   fi
   init_cache_volumes
 
+  # Ensure CRLF line endings don't cause test failures inside Linux Docker containers.
+  # Golden/fixture files with \r\n produce byte-comparison failures when the Rust
+  # process (running inside Linux Docker) outputs LF. Setting this once here is safe
+  # because the repo is bind-mounted into Docker.
+  if [[ "$(git -C "$REPO_ROOT" config core.autocrlf 2>/dev/null)" != "false" ]]; then
+    log "Setting core.autocrlf=false for Docker test compatibility"
+    git -C "$REPO_ROOT" config core.autocrlf false
+  fi
+
   case "$TASK" in
     validate) task_validate ;;
     quick) task_quick ;;
