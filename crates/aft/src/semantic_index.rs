@@ -7026,6 +7026,7 @@ mod tests {
 mod fingerprint_invalidation_tests {
     use super::tests::start_mock_http_server;
     use super::*;
+    use crate::config::DiagnosticsOutputMode;
 
     /// Build a fingerprint with all fields set to predictable defaults.
     fn fp() -> SemanticIndexFingerprint {
@@ -8950,6 +8951,311 @@ mod fingerprint_invalidation_tests {
             1,
             "non-transient error should not retry"
         );
+    }
+
+    // ── model2vec tests ─────────────────────────────────────────────
+
+    /// Build a tiny model2vec-compatible fixture directory with `vocab_size` tokens and `dim` dimensions.
+    #[cfg(feature = "semantic-model2vec")]
+    fn build_model2vec_fixture(dir: &Path, vocab_size: usize, dim: usize) -> PathBuf {
+        // config.json
+        let config = serde_json::json!({
+            "normalize": true,
+            "hidden_size": dim,
+        });
+        fs::write(dir.join("config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+
+        // Build a minimal word-level tokenizer.json
+        let mut vocab: Vec<(String, u32)> = Vec::new();
+        for i in 0..vocab_size {
+            let word = if i == 0 {
+                "[UNK]".to_string()
+            } else {
+                format!("token_{i}")
+            };
+            vocab.push((word, i as u32));
+        }
+        let tokenizer_json = serde_json::json!({
+            "model": {
+                "type": "Word",
+                "unk_token": "[UNK]",
+                "vocab": vocab.iter().fold(serde_json::Map::new(), |mut m, (k, v)| {
+                    m.insert(k.clone(), serde_json::json!(v));
+                    m
+                }),
+            },
+            "padding": { "pad_token": "[PAD]" },
+            "added_tokens": [],
+        });
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+
+        // Build a tiny embeddings tensor: vocab_size x dim, all 0.1
+        let data: Vec<f32> = vec![0.1; vocab_size * dim];
+        let data_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let metadata = serde_json::json!({
+            "embeddings": {
+                "dtype": "F32",
+                "shape": [vocab_size, dim],
+                "data_offsets": [0, data_bytes.len()]
+            }
+        });
+        let meta_bytes = serde_json::to_string(&metadata).unwrap();
+        let meta_len = (meta_bytes.len() as u64).to_le_bytes();
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&meta_len);
+        file_bytes.extend_from_slice(meta_bytes.as_bytes());
+        file_bytes.extend_from_slice(&data_bytes);
+        fs::write(dir.join("model.safetensors"), &file_bytes).unwrap();
+
+        dir.to_path_buf()
+    }
+
+    /// Helper: build model2vec from_bytes with given tokenizer/config/data.
+    #[cfg(feature = "semantic-model2vec")]
+    fn model2vec_from_bytes_helper(
+        tokenizer_json: &str,
+        config_json: &str,
+        data: &[f32],
+        dim: usize,
+    ) -> model2vec_rs::model::StaticModel {
+        let data_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let vocab_size = data.len() / dim;
+        let metadata = serde_json::json!({
+            "embeddings": {
+                "dtype": "F32",
+                "shape": [vocab_size, dim],
+                "data_offsets": [0, data_bytes.len()]
+            }
+        });
+        let meta_bytes = serde_json::to_string(&metadata).unwrap();
+        let meta_len = (meta_bytes.len() as u64).to_le_bytes();
+        let mut model_bytes = Vec::new();
+        model_bytes.extend_from_slice(&meta_len);
+        model_bytes.extend_from_slice(meta_bytes.as_bytes());
+        model_bytes.extend_from_slice(&data_bytes);
+
+        model2vec_rs::model::StaticModel::from_bytes(
+            tokenizer_json.as_bytes(),
+            &model_bytes,
+            config_json.as_bytes(),
+            None,
+        )
+        .expect("load from_bytes")
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_deterministic_encoding() {
+        let tok = r#"{"model":{"type":"Word","unk_token":"[UNK]","vocab":{"[UNK]":0,"hello":1,"world":2}},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"#;
+        let cfg = r#"{"normalize":true,"hidden_size":4}"#;
+        let data: Vec<f32> = vec![0.25; 3 * 4];
+        let model = model2vec_from_bytes_helper(tok, cfg, &data, 4);
+
+        let emb1 = model.encode(&["hello world".to_string()]);
+        let emb2 = model.encode(&["hello world".to_string()]);
+        assert_eq!(emb1.len(), 1);
+        assert_eq!(emb1[0].len(), 4);
+        assert_eq!(emb1[0], emb2[0], "encoding must be deterministic");
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_empty_input() {
+        let tok = r#"{"model":{"type":"Word","unk_token":"[UNK]","vocab":{"[UNK]":0,"hello":1}},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"#;
+        let cfg = r#"{"normalize":true}"#;
+        let data: Vec<f32> = vec![0.5; 2 * 2];
+        let model = model2vec_from_bytes_helper(tok, cfg, &data, 2);
+
+        let emb = model.encode(&["".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 2);
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_unknown_tokens_only() {
+        let tok = r#"{"model":{"type":"Word","unk_token":"[UNK]","vocab":{"[UNK]":0,"known":1}},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"#;
+        let cfg = r#"{"normalize":false}"#;
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let model = model2vec_from_bytes_helper(tok, cfg, &data, 3);
+
+        let emb = model.encode(&["xyz_unknown_token".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 3);
+        // Unknown tokens only => zero vector
+        assert!(emb[0].iter().all(|&v| v.abs() < 1e-6));
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_pretrained_fixture_roundtrip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = build_model2vec_fixture(dir.path(), 10, 8);
+
+        let model = model2vec_rs::model::StaticModel::from_pretrained(
+            &fixture_path, None, None, None,
+        )
+        .expect("load from_pretrained fixture");
+
+        let emb = model.encode(&["token_1 token_2".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 8);
+        // L2-normalized (normalize=true in fixture config)
+        let norm: f32 = emb[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "L2 norm should be ~1.0, got {norm}");
+    }
+
+    /// Helper: build a default SemanticBackendConfig for model2vec tests.
+    #[cfg(feature = "semantic-model2vec")]
+    fn make_model2vec_config(model_path: Option<PathBuf>) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend: SemanticBackend::Model2Vec,
+            model: String::new(),
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: 5000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            model_path,
+            model2vec_max_length: 512,
+        }
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_missing_model_path_returns_error() {
+        let config = make_model2vec_config(None);
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        assert!(err.contains("model_path is required"), "error: {err}");
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_nonexistent_model_path_returns_error() {
+        let config = make_model2vec_config(Some(PathBuf::from("/nonexistent/path/to/model")));
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        assert!(err.contains("does not exist"), "error: {err}");
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_engine_embed_texts_roundtrip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = build_model2vec_fixture(dir.path(), 20, 16);
+
+        let mut config = make_model2vec_config(Some(fixture_path));
+        config.model2vec_max_length = 128;
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).expect("from_config");
+        let texts = vec![
+            "token_1 token_2 token_3".to_string(),
+            "token_5 token_6".to_string(),
+        ];
+        let vectors = model.embed_texts(texts).expect("embed_texts");
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0].len(), 16);
+        assert_eq!(vectors[1].len(), 16);
+        assert!(vectors[0].iter().any(|&v| v.abs() > 1e-6));
+        assert!(vectors[1].iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    /// Optional integration test for Potion Code 16M.
+    /// Run: AFT_POTION_CODE_16M_PATH=/path/to/potion-code-16M \
+    ///   cargo test -p agent-file-tools --features semantic-model2vec \
+    ///   -- --ignored potion_code_16m
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    #[ignore]
+    fn potion_code_16m_embed_and_search() {
+        let model_path = std::env::var("AFT_POTION_CODE_16M_PATH")
+            .expect("set AFT_POTION_CODE_16M_PATH to run this test");
+        let model_dir = PathBuf::from(model_path);
+        assert!(model_dir.exists(), "model dir not found: {}", model_dir.display());
+
+        let config = make_model2vec_config(Some(model_dir));
+        let mut model = SemanticEmbeddingModel::from_config(&config).expect("load Potion Code 16M");
+
+        let query = "how to handle authentication errors".to_string();
+        let doc = "fn handle_auth_error(e: AuthError) -> Response { todo!() }".to_string();
+        let vectors = model.embed_texts(vec![query, doc]).expect("embed texts");
+        assert_eq!(vectors.len(), 2);
+        let dim = vectors[0].len();
+        eprintln!("Potion Code 16M dimension: {dim}");
+        assert!(dim > 0);
+
+        let dot: f32 = vectors[0].iter().zip(vectors[1].iter()).map(|(a, b)| a * b).sum();
+        let na: f32 = vectors[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = vectors[1].iter().map(|v| v * v).sum::<f32>().sqrt();
+        let sim = if na > 0.0 && nb > 0.0 { dot / (na * nb) } else { 0.0 };
+        eprintln!("query-doc cosine similarity: {sim:.4}");
+        assert!(sim > 0.0, "Potion Code 16M should produce positive similarity");
+    }
+
+    #[cfg(not(feature = "semantic-model2vec"))]
+    #[test]
+    fn model2vec_feature_disabled_returns_error() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Model2Vec,
+            model: String::new(),
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: 5000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            model_path: Some(PathBuf::from("/any/path")),
+            model2vec_max_length: 512,
+        };
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        assert!(err.contains("semantic-model2vec"), "error: {err}");
     }
 
     #[test]
