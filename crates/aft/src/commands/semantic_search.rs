@@ -416,59 +416,58 @@ pub fn fuse_hybrid_results(
         return Vec::new();
     }
 
-    if lexical_files.is_empty() {
-        return semantic
+    let mut results: Vec<HybridResult> = if lexical_files.is_empty() {
+        semantic
             .into_iter()
             .map(|result| hybrid_from_semantic(result, "semantic", None))
-            .take(top_k)
-            .collect();
-    }
-
-    if semantic.is_empty() {
-        return lexical_files
+            .collect()
+    } else if semantic.is_empty() {
+        lexical_files
             .into_iter()
-            .take(top_k)
             .map(|(file, score)| lexical_only_result(file, score, shape))
+            .collect()
+    } else {
+        let lexical_top_files: HashMap<PathBuf, f32> =
+            lexical_files.iter().take(20).cloned().collect();
+        let mut hybrid: Vec<HybridResult> = semantic
+            .into_iter()
+            .map(|result| {
+                if let Some(&lexical_score) = lexical_top_files.get(&result.file) {
+                    hybrid_from_semantic(result, "hybrid", Some(lexical_score))
+                } else {
+                    hybrid_from_semantic(result, "semantic", None)
+                }
+            })
             .collect();
-    }
 
-    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().take(20).cloned().collect();
-    let mut results: Vec<HybridResult> = semantic
-        .into_iter()
-        .map(|result| {
-            if let Some(&lexical_score) = lexical_top_files.get(&result.file) {
-                hybrid_from_semantic(result, "hybrid", Some(lexical_score))
-            } else {
-                hybrid_from_semantic(result, "semantic", None)
+        let semantic_files: HashSet<PathBuf> =
+            hybrid.iter().map(|result| result.file.clone()).collect();
+        for (file, score) in lexical_files.iter().take(20) {
+            if !semantic_files.contains(file) {
+                hybrid.push(lexical_only_result(file.clone(), *score, shape));
             }
-        })
-        .collect();
-
-    let semantic_files: HashSet<PathBuf> =
-        results.iter().map(|result| result.file.clone()).collect();
-    for (file, score) in lexical_files.iter().take(20) {
-        if !semantic_files.contains(file) {
-            results.push(lexical_only_result(file.clone(), *score, shape));
         }
-    }
+        hybrid
+    };
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let mut results = cap_per_file(results, 2);
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    results.truncate(top_k);
+    sort_cap_and_truncate(&mut results, top_k);
     results
+}
+
+/// Sort by score descending, apply per-file cap, re-sort, then truncate.
+fn sort_cap_and_truncate(results: &mut Vec<HybridResult>, top_k: usize) {
+    let cmp = |a: &HybridResult, b: &HybridResult| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    };
+    results.sort_by(&cmp);
+    let capped = cap_per_file(std::mem::take(results), 2);
+    *results = capped;
+    results.sort_by(&cmp);
+    results.truncate(top_k);
 }
 
 fn hybrid_from_semantic(
@@ -876,6 +875,34 @@ mod tests {
     }
 
     #[test]
+    fn fuse_lexical_only_sorted_by_score_desc() {
+        let shape = make_nl_shape();
+        let lexical = vec![
+            (PathBuf::from("c.rs"), 0.3),
+            (PathBuf::from("a.rs"), 0.9),
+            (PathBuf::from("b.rs"), 0.6),
+        ];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert_eq!(results.len(), 3);
+        // Lexical-only results should be sorted by score descending.
+        assert!(results[0].score >= results[1].score);
+        assert!(results[1].score >= results[2].score);
+    }
+
+    #[test]
+    fn fuse_lexical_only_cap_per_file() {
+        let shape = make_nl_shape();
+        // 3 results from the same file — cap_per_file(2) should keep only 2.
+        let lexical = vec![
+            (PathBuf::from("a.rs"), 0.9),
+            (PathBuf::from("a.rs"), 0.8),
+            (PathBuf::from("a.rs"), 0.7),
+        ];
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        assert!(results.len() <= 2);
+    }
+
+    #[test]
     fn result_to_json_semantic_result() {
         let result = HybridResult {
             file: PathBuf::from("/project/src/lib.ts"),
@@ -895,8 +922,10 @@ mod tests {
         assert_eq!(json["source"], "hybrid");
         assert_eq!(json["start_line"], 15); // 1-indexed
         assert_eq!(json["end_line"], 43); // 1-indexed
-        assert_eq!(json["semantic_score"], 0.8);
-        assert_eq!(json["lexical_score"], 0.5);
+        // f32→JSON promotes to f64, exposing IEEE 754 precision artifacts
+        // (e.g. 0.8f32 → 0.800000011920929). Use approximate comparison.
+        assert!((json["semantic_score"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert!((json["lexical_score"].as_f64().unwrap() - 0.5).abs() < 1e-6);
         assert_eq!(json["snippet"], "function processData() {}");
     }
 
