@@ -108,6 +108,7 @@ fn write_rejects_paths_outside_the_configured_project_root() {
 
 #[test]
 fn write_fails_for_read_only_files() {
+    super::helpers::skip_if_root();
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("readonly.txt");

@@ -9,6 +9,7 @@ use super::helpers::AftProcess;
 
 #[test]
 fn edit_match_glob_rolls_back_prior_files_when_later_write_fails() {
+    super::helpers::skip_if_root();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let a = root.join("a.ts");

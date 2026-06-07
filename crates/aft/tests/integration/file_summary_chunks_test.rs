@@ -46,8 +46,9 @@ fn index_ts_with_one_export_emits_file_summary_and_symbol_chunks() {
     assert!(embed_texts.iter().any(|text| text.contains(
         "file:src/index.ts kind:file-summary name:index parent:src doc:/** Entry point"
     )));
-    assert!(embed_texts.iter().any(|text| text
-        .contains("name:initializePlugin file:src/index.ts kind:function name:initializePlugin")));
+    assert!(embed_texts
+        .iter()
+        .any(|text| text.contains("file:src/index.ts kind:function name:initializePlugin")));
 
     let results = index.search(&[1.0], 10);
     let summary = results

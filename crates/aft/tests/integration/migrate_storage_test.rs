@@ -178,6 +178,7 @@ fn migrate_lock_contention_returns_code_3() {
 #[cfg(unix)]
 #[test]
 fn migrate_partial_failure_leaves_staging_dirs() {
+    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -224,6 +225,7 @@ fn migrate_partial_failure_leaves_staging_dirs() {
 #[cfg(unix)]
 #[test]
 fn migrate_writes_markers_only_on_full_success() {
+    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();

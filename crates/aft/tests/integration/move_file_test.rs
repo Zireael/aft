@@ -177,6 +177,7 @@ fn undo_after_move_file_restores_source_and_removes_destination() {
 #[cfg(target_os = "linux")]
 #[test]
 fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
+    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 

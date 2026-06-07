@@ -6,6 +6,15 @@
 opencode-aft/
 ├── crates/                    # Rust workspace packages
 │   ├── aft/                   # Core AFT library, CLI binary, command handlers, and integration tests
+│   │   └── src/
+│   │       ├── bash_background/  # Background task lifecycle, PTY, watchdog, persistence
+│   │       ├── bash_permissions/ # Shell command permission analysis
+│   │       ├── bash_rewrite/     # Shell command rewriting for Windows compatibility
+│   │       ├── commands/         # One handler per protocol command
+│   │       ├── compress/         # Shell output compression (Rust modules + TOML filters)
+│   │       ├── db/               # SQLite persistent storage layer
+│   │       ├── lsp/              # LSP client, transport, diagnostics
+│   │       └── migrate_storage/  # Storage migration utilities
 │   └── aft-tokenizer/         # Claude lookup-encoding tokenizer for code estimation
 ├── packages/                  # JavaScript workspace packages
 │   ├── aft-bridge/            # Shared NDJSON bridge transport, binary resolution, ONNX runtime helpers
@@ -16,6 +25,8 @@ opencode-aft/
 ├── benchmarks/                # Bun-based benchmark runner and reporting code
 ├── scripts/                   # Release and version-management scripts
 ├── assets/                    # Repository assets such as the banner image
+├── tests/                     # Docker-based integration tests, macOS/Windows E2E
+├── docs/                      # Architecture and structure documentation
 ├── .github/workflows/         # Release automation workflows
 ├── Cargo.toml                 # Rust workspace manifest
 ├── package.json               # JavaScript workspace manifest
@@ -37,7 +48,27 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: Command-specific request parsing and response generation
-- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/conflicts.rs`
+- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/conflicts.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/commands/configure.rs`
+
+**`crates/aft/src/bash_background/`:**
+- Purpose: Manage background shell task lifecycle: spawn, buffer, watchdog, persist, and terminate.
+- Contains: Process manager, PTY terminal emulation, output buffering, SQLite persistence, watchdog timeout monitoring, task registry
+- Key files: `crates/aft/src/bash_background/mod.rs`, `crates/aft/src/bash_background/registry.rs`, `crates/aft/src/bash_background/process.rs`, `crates/aft/src/bash_background/pty_process.rs`, `crates/aft/src/bash_background/watchdog.rs`, `crates/aft/src/bash_background/persistence.rs`
+
+**`crates/aft/src/db/`:**
+- Purpose: Provide SQLite-backed persistent storage for backups, bash task records, and compression events.
+- Contains: Schema management, CRUD operations, migration helpers
+- Key files: `crates/aft/src/db/mod.rs`, `crates/aft/src/db/state.rs`, `crates/aft/src/db/backups.rs`, `crates/aft/src/db/bash_tasks.rs`, `crates/aft/src/db/compression_events.rs`
+
+**`crates/aft/src/migrate_storage/`:**
+- Purpose: Migrate persistent storage between versions (e.g., JSON → SQLite).
+- Contains: Migration logic and logging
+- Key files: `crates/aft/src/migrate_storage/log.rs`
+
+**`crates/aft/src/compress/`:**
+- Purpose: Compress shell command output to reduce token usage while preserving actionable information.
+- Contains: Rust compressor modules (git, cargo, eslint, biome, tsc, pytest, etc.), TOML filter engine, trust model, builtin filter definitions
+- Key files: `crates/aft/src/compress/mod.rs`, `crates/aft/src/compress/toml_filter.rs`, `crates/aft/src/compress/trust.rs`, `crates/aft/src/compress/builtin_filters/`
 
 **`crates/aft/src/lsp/`:**
 - Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
@@ -51,13 +82,13 @@ opencode-aft/
 
 **`packages/opencode-plugin/src/tools/`:**
 - Purpose: Group OpenCode tool definitions by capability area.
-- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, AST, LSP, and conflict tools
-- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`
+- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, AST, LSP, semantic, search, bash, conflict, and permission tools
+- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/_shared.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`, `packages/opencode-plugin/src/tools/permissions.ts`
 
 **`packages/pi-plugin/src/tools/`:**
 - Purpose: Group Pi tool definitions by capability area, mirroring the opencode-plugin tool structure.
-- Contains: Thin adapters for hoisted, reading, AST, bash, structure, navigation, import, refactor, safety, semantic, LSP, and conflict tools
-- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/bash.ts`
+- Contains: Thin adapters for hoisted, reading, AST, bash, structure, navigation, import, refactor, safety, semantic, LSP, conflict, diff-format, and fs tools
+- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/bash.ts`, `packages/pi-plugin/src/tools/semantic.ts`, `packages/pi-plugin/src/tools/_shared.ts`, `packages/pi-plugin/src/tools/render-helpers.ts`, `packages/pi-plugin/src/tools/diff-format.ts`, `packages/pi-plugin/src/tools/fs.ts`
 
 **`packages/opencode-plugin/src/__tests__/`:**
 - Purpose: Verify plugin behavior, resolver logic, tool registration, and end-to-end bridge flows.
@@ -107,7 +138,7 @@ opencode-aft/
 
 **Configuration:** `package.json`: Define Bun workspace scripts; `Cargo.toml`: Define the Rust workspace; `packages/opencode-plugin/src/config.ts`: Parse user and project AFT config.
 
-**Core Logic:** `crates/aft/src/parser.rs`: Extract symbols and languages; `crates/aft/src/callgraph.rs`: Build navigation indexes; `crates/aft/src/edit.rs`: Run shared edit and diff logic; `crates/aft/src/semantic_index.rs`: Embed and search code by meaning; `crates/aft/src/vector_store.rs`: Vector storage abstraction; `packages/aft-bridge/src/bridge.ts`: Manage subprocess transport.
+**Core Logic:** `crates/aft/src/parser.rs`: Extract symbols and languages; `crates/aft/src/callgraph.rs`: Build navigation indexes; `crates/aft/src/edit.rs`: Run shared edit and diff logic; `crates/aft/src/semantic_index.rs`: Embed and search code by meaning across multiple backends; `crates/aft/src/vector_store.rs`: Vector storage abstraction; `crates/aft/src/semantic_rerank.rs`: LLM-based result reranking; `crates/aft/src/semantic_diagnostics.rs`: Search quality telemetry; `crates/aft/src/semantic_doctor.rs`: Semantic health reports; `crates/aft/src/semantic_eval.rs`: Local retrieval evaluation; `crates/aft/src/db/`: SQLite persistent storage; `crates/aft/src/bash_background/`: Background task lifecycle; `packages/aft-bridge/src/bridge.ts`: Manage subprocess transport.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/`: Plugin unit and e2e tests; `crates/aft/tests/integration/`: Rust integration tests.
 
@@ -132,6 +163,14 @@ opencode-aft/
 **New Rust command handler:** `crates/aft/src/commands/[command_name].rs` — expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
 
 **New shared Rust engine code:** `crates/aft/src/[domain].rs` — keep reusable parser, formatter, import, analysis, or semantic code outside command handlers.
+
+**New semantic backend:** `crates/aft/src/semantic_index.rs` — add a new variant to `SemanticBackend` (config), `SemanticEmbeddingEngine` (engine), and implement `embed_texts` for the new backend. Add a new `VectorStore` implementation in `crates/aft/src/vector_store.rs` if the backend uses a different vector format. Update `crates/aft/src/config.rs` with default parameters.
+
+**New semantic reranking strategy:** `crates/aft/src/semantic_rerank.rs` — implement a new reranking approach and wire it into `crates/aft/src/commands/semantic_search.rs`.
+
+**New background bash task behavior:** `crates/aft/src/bash_background/[module].rs` — add the lifecycle module and register it in `crates/aft/src/bash_background/mod.rs`.
+
+**New persistent storage table:** `crates/aft/src/db/[table].rs` — define the schema, add CRUD operations, and register in `crates/aft/src/db/mod.rs`.
 
 **New LSP behavior:** `crates/aft/src/lsp/[module].rs` — keep transport and server-management code inside the LSP subsystem.
 

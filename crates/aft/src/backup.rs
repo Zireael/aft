@@ -2192,6 +2192,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_last_operation_is_atomic_when_a_write_fails() {
+        // Root bypasses filesystem permission checks, making this test vacuous.
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping: running as root");
+            return;
+        }
         let dir = std::env::temp_dir().join("aft_backup_tests_atomic_restore");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

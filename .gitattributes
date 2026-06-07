@@ -1,0 +1,4 @@
+# Compress filter fixtures must use LF to match Rust's .lines() behavior.
+# Rust's .lines() strips \r and rejoins with LF, so CRLF fixtures cause
+# byte-for-byte comparison failures in Docker (Linux) test runs.
+crates/aft/tests/integration/fixtures/compress_filters/**/*.txt text eol=lf

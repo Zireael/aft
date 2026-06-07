@@ -237,6 +237,7 @@ fn ast_replace_operation_undo_restores_all_touched_files() {
 #[cfg(unix)]
 #[test]
 fn ast_replace_unwritable_target_fails_without_partial_write() {
+    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
 
     let project = setup_project(&[

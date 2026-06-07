@@ -247,8 +247,9 @@ fn parse_semantic_config(
                 "configure: semantic.output_encoding must be a string or null".to_string()
             })?;
             Some(
-                serde_json::from_value::<crate::config::OutputEncoding>(raw.clone())
-                    .map_err(|e| format!("configure: invalid semantic.output_encoding '{name}': {e}"))?,
+                serde_json::from_value::<crate::config::OutputEncoding>(raw.clone()).map_err(
+                    |e| format!("configure: invalid semantic.output_encoding '{name}': {e}"),
+                )?,
             )
         };
     }
@@ -273,8 +274,9 @@ fn parse_semantic_config(
                 "configure: semantic.storage_strategy must be a string or null".to_string()
             })?;
             Some(
-                serde_json::from_value::<crate::config::StorageStrategy>(raw.clone())
-                    .map_err(|e| format!("configure: invalid semantic.storage_strategy '{name}': {e}"))?,
+                serde_json::from_value::<crate::config::StorageStrategy>(raw.clone()).map_err(
+                    |e| format!("configure: invalid semantic.storage_strategy '{name}': {e}"),
+                )?,
             )
         };
     }
@@ -286,15 +288,18 @@ fn parse_semantic_config(
                 "configure: semantic.distance_metric must be a string or null".to_string()
             })?;
             Some(
-                serde_json::from_value::<crate::config::DistanceMetric>(raw.clone())
-                    .map_err(|e| format!("configure: invalid semantic.distance_metric '{name}': {e}"))?,
+                serde_json::from_value::<crate::config::DistanceMetric>(raw.clone()).map_err(
+                    |e| format!("configure: invalid semantic.distance_metric '{name}': {e}"),
+                )?,
             )
         };
     }
     if let Some(raw) = obj.get("query_prompt_template") {
         semantic.query_prompt_template = raw
             .as_str()
-            .ok_or_else(|| "configure: semantic.query_prompt_template must be a string".to_string())?
+            .ok_or_else(|| {
+                "configure: semantic.query_prompt_template must be a string".to_string()
+            })?
             .trim()
             .to_string()
             .into();
@@ -302,7 +307,9 @@ fn parse_semantic_config(
     if let Some(raw) = obj.get("document_prompt_template") {
         semantic.document_prompt_template = raw
             .as_str()
-            .ok_or_else(|| "configure: semantic.document_prompt_template must be a string".to_string())?
+            .ok_or_else(|| {
+                "configure: semantic.document_prompt_template must be a string".to_string()
+            })?
             .trim()
             .to_string()
             .into();
@@ -318,18 +325,17 @@ fn parse_semantic_config(
         })? as f32;
     }
     if let Some(raw) = obj.get("output_mode") {
-        let name = raw.as_str().ok_or_else(|| {
-            "configure: semantic.output_mode must be a string".to_string()
-        })?;
-        semantic.output_mode = serde_json::from_value::<crate::config::DiagnosticsOutputMode>(
-            raw.clone(),
-        )
-        .map_err(|e| format!("configure: invalid semantic.output_mode '{name}': {e}"))?;
+        let name = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.output_mode must be a string".to_string())?;
+        semantic.output_mode =
+            serde_json::from_value::<crate::config::DiagnosticsOutputMode>(raw.clone())
+                .map_err(|e| format!("configure: invalid semantic.output_mode '{name}': {e}"))?;
     }
     if let Some(raw) = obj.get("rerank_enabled") {
-        semantic.rerank_enabled = raw.as_bool().ok_or_else(|| {
-            "configure: semantic.rerank_enabled must be a boolean".to_string()
-        })?;
+        semantic.rerank_enabled = raw
+            .as_bool()
+            .ok_or_else(|| "configure: semantic.rerank_enabled must be a boolean".to_string())?;
     }
     if let Some(raw) = obj.get("rerank_model") {
         semantic.rerank_model = raw
@@ -371,21 +377,26 @@ fn parse_semantic_config(
         let v = raw.as_u64().ok_or_else(|| {
             "configure: semantic.rerank_max_candidate_chars must be an unsigned integer".to_string()
         })?;
-        semantic.rerank_max_candidate_chars = usize::try_from(v)
-            .map_err(|_| "configure: semantic.rerank_max_candidate_chars is too large".to_string())?;
+        semantic.rerank_max_candidate_chars = usize::try_from(v).map_err(|_| {
+            "configure: semantic.rerank_max_candidate_chars is too large".to_string()
+        })?;
     }
     if let Some(raw) = obj.get("jsonl_logging") {
-        semantic.jsonl_logging = raw.as_bool().ok_or_else(|| {
-            "configure: semantic.jsonl_logging must be a boolean".to_string()
-        })?;
+        semantic.jsonl_logging = raw
+            .as_bool()
+            .ok_or_else(|| "configure: semantic.jsonl_logging must be a boolean".to_string())?;
     }
     if let Some(raw) = obj.get("jsonl_path") {
         semantic.jsonl_path = if raw.is_null() {
             None
         } else {
-            Some(raw.as_str().ok_or_else(|| {
-                "configure: semantic.jsonl_path must be a string or null".to_string()
-            })?.into())
+            Some(
+                raw.as_str()
+                    .ok_or_else(|| {
+                        "configure: semantic.jsonl_path must be a string or null".to_string()
+                    })?
+                    .into(),
+            )
         };
     }
     if let Some(raw) = obj.get("include_raw_queries") {
@@ -394,9 +405,9 @@ fn parse_semantic_config(
         })?;
     }
     if let Some(raw) = obj.get("include_snippets") {
-        semantic.include_snippets = raw.as_bool().ok_or_else(|| {
-            "configure: semantic.include_snippets must be a boolean".to_string()
-        })?;
+        semantic.include_snippets = raw
+            .as_bool()
+            .ok_or_else(|| "configure: semantic.include_snippets must be a boolean".to_string())?;
     }
     if let Some(raw) = obj.get("retention_days") {
         semantic.retention_days = raw.as_u64().ok_or_else(|| {

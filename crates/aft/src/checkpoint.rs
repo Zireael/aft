@@ -698,6 +698,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checkpoint_restore_rolls_back_on_partial_failure() {
+        // Root bypasses filesystem permission checks, making this test vacuous.
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping: running as root");
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();

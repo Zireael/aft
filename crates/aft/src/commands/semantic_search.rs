@@ -720,7 +720,11 @@ mod tests {
 
     // ── fuse_hybrid_results tests ──────────────────────────────────────
 
-    fn make_semantic_result(file: &str, name: &str, score: f32) -> crate::semantic_index::SemanticResult {
+    fn make_semantic_result(
+        file: &str,
+        name: &str,
+        score: f32,
+    ) -> crate::semantic_index::SemanticResult {
         crate::semantic_index::SemanticResult {
             file: PathBuf::from(file),
             name: name.to_string(),
@@ -922,8 +926,8 @@ mod tests {
         assert_eq!(json["source"], "hybrid");
         assert_eq!(json["start_line"], 15); // 1-indexed
         assert_eq!(json["end_line"], 43); // 1-indexed
-        // f32→JSON promotes to f64, exposing IEEE 754 precision artifacts
-        // (e.g. 0.8f32 → 0.800000011920929). Use approximate comparison.
+                                          // f32→JSON promotes to f64, exposing IEEE 754 precision artifacts
+                                          // (e.g. 0.8f32 → 0.800000011920929). Use approximate comparison.
         assert!((json["semantic_score"].as_f64().unwrap() - 0.8).abs() < 1e-6);
         assert!((json["lexical_score"].as_f64().unwrap() - 0.5).abs() < 1e-6);
         assert_eq!(json["snippet"], "function processData() {}");

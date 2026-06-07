@@ -36,16 +36,37 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests and route each command to a focused handler.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
-- Contains: Request dispatch, response encoding, command handlers for read/edit/refactor/LSP/conflicts
-- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`
+- Contains: Request dispatch, response encoding, command handlers for read/edit/refactor/LSP/conflicts/semantic search/bash
+- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
 - Purpose: Parse code, compute call graphs, apply edits, format files, and manage imports.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports.rs`, `crates/aft/src/extract.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/semantic_index.rs`
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports.rs`, `crates/aft/src/extract.rs`
 - Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, refactor helpers
 - Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes
 - Used by: `crates/aft/src/commands/*.rs`
+
+**Semantic search engine layer:**
+- Purpose: Embed, chunk, index, search, and rerank code by meaning across multiple backends.
+- Location: `crates/aft/src/semantic_index.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_doctor.rs`, `crates/aft/src/semantic_eval.rs`
+- Contains: Multi-backend embedding engine (Fastembed, OpenAI-compatible, Ollama, Perplexity, Model2Vec), chunking strategies, vector storage traits, LLM-based reranking, search quality telemetry, health reports, local retrieval evaluation
+- Depends on: `fastembed`, `model2vec-rs` (optional), `reqwest`, `tree-sitter`, `rayon`
+- Used by: `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/commands/configure.rs`
+
+**Bash task management layer:**
+- Purpose: Run, buffer, persist, and watchdog background shell tasks.
+- Location: `crates/aft/src/bash_background/` (mod.rs, buffer.rs, process.rs, pty_process.rs, pty_runtime.rs, registry.rs, watchdog.rs, persistence.rs)
+- Contains: Process lifecycle, PTY terminal emulation, output buffering, persistence to SQLite, watchdog timeout monitoring, task registry
+- Depends on: `rusqlite`, PTY libraries, `crates/aft/src/db/`
+- Used by: `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/commands/bash_kill.rs`, `crates/aft/src/commands/bash_promote.rs`, `crates/aft/src/commands/bash_drain_completions.rs`, `crates/aft/src/commands/bash_write.rs`
+
+**Persistent storage layer:**
+- Purpose: Store durable state (backups, bash task records, compression events) in SQLite.
+- Location: `crates/aft/src/db/` (mod.rs, state.rs, backups.rs, bash_tasks.rs, compression_events.rs)
+- Contains: SQLite schema management, backup/snapshot records, bash task archives, compression event log
+- Depends on: `rusqlite`
+- Used by: `crates/aft/src/bash_background/`, `crates/aft/src/backup.rs`, `crates/aft/src/compress/`
 
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, and LSP state.
@@ -74,6 +95,21 @@
 2. Build or query lazy file-level graph data — `crates/aft/src/callgraph.rs`
 3. Serve navigation commands such as callers, impact, and trace-data — `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`
 
+**Semantic search flow:**
+
+1. Configure backend and embedding model — `crates/aft/src/commands/configure.rs`, `crates/aft/src/config.rs`
+2. Chunk source files and embed content into a vector index — `crates/aft/src/semantic_index.rs`
+3. Store vectors via the trait abstraction — `crates/aft/src/vector_store.rs`
+4. Accept queries, embed, search, and optionally rerank — `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/semantic_rerank.rs`
+5. Report index health and search quality — `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/semantic_diagnostics.rs`
+6. Evaluate retrieval quality locally — `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/semantic_eval.rs`
+
+**Bash background task flow:**
+
+1. Accept a command, validate permissions, and spawn a background process — `crates/aft/src/commands/bash_write.rs`, `crates/aft/src/bash_background/process.rs`
+2. Buffer output, monitor timeout, and persist state to SQLite — `crates/aft/src/bash_background/buffer.rs`, `crates/aft/src/bash_background/watchdog.rs`, `crates/aft/src/bash_background/persistence.rs`
+3. Poll status, drain completions, promote, or kill from command handlers — `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/commands/bash_drain_completions.rs`, `crates/aft/src/commands/bash_promote.rs`, `crates/aft/src/commands/bash_kill.rs`
+
 **Binary resolution flow:**
 
 1. Check cache, npm platform package, PATH, and cargo install locations — `packages/aft-bridge/src/resolver.ts`
@@ -94,7 +130,7 @@
 
 **Tool groups:**
 - Purpose: Group related OpenCode tool definitions by capability surface.
-- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`
+- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/bash_write.ts`, `packages/opencode-plugin/src/tools/permissions.ts`, `packages/opencode-plugin/src/tools/_shared.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`
 - Pattern: Thin TypeScript adapters over shared bridge transport
 
 **AppContext:**
@@ -105,8 +141,25 @@
 **VectorStore (trait):**
 - Purpose: Decouple vector storage and similarity search from the semantic index lifecycle.
 - Location: `crates/aft/src/vector_store.rs`
-- Pattern: Trait with two built-in implementations — `FlatF32VectorStore` (f32 cosine similarity, same as original in-memory store) and `FlatBinaryHammingVectorStore` (packed binary Hamming search for quantized vectors).
+- Pattern: Trait with three built-in implementations — `FlatF32VectorStore` (f32 cosine similarity), `FlatBinaryHammingVectorStore` (packed binary Hamming search for quantized vectors), and `Model2VecVectorStore` (native f32 storage for model2vec backend).
 - Used by: `crates/aft/src/semantic_index.rs`
+
+**SemanticBackend (enum):**
+- Purpose: Model the five embedding backends and their per-backend resolution rules (encoding, input mode, storage strategy, distance metric).
+- Location: `crates/aft/src/config.rs`
+- Variants: `Fastembed` (local ONNX), `OpenAiCompatible` (HTTP API), `Ollama` (local HTTP), `Perplexity` (contextualized document-chunk), `Model2Vec` (local static weights, gated by `semantic-model2vec` Cargo feature).
+- Pattern: Enum-driven dispatch — each variant maps to default `OutputEncoding`, `InputMode`, `StorageStrategy`, and `DistanceMetric`.
+
+**SemanticEmbeddingEngine (enum):**
+- Purpose: Hold the live embedding model state for whichever backend is active.
+- Location: `crates/aft/src/semantic_index.rs`
+- Variants: `Fastembed`, `OpenAiCompatible`, `Ollama`, `Perplexity`, `Model2Vec` — each carries the client/model/configuration needed to produce embeddings.
+- Pattern: Gated by `#[cfg(feature = "semantic-model2vec")]` for the Model2Vec variant; other variants are always compiled.
+
+**Reranker:**
+- Purpose: Send candidate search results to an LLM chat endpoint for relevance re-ordering.
+- Location: `crates/aft/src/semantic_rerank.rs`
+- Pattern: OpenAI-compatible chat completions call with a prompt template; falls back to original order on any error. Configurable via `rerank_enabled`, `rerank_model`, `rerank_base_url`, and `rerank_max_candidates` in `SemanticBackendConfig`.
 
 **CallGraph:**
 - Purpose: Cache per-file call data and answer callers, call-tree, impact, and trace queries.
@@ -197,4 +250,4 @@
 
 **Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, and cache call-graph state in `crates/aft/src/callgraph.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, persistent SQLite state in `crates/aft/src/db/` (bash task records, backups, compression events), background task output in `crates/aft/src/bash_background/persistence.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`.
