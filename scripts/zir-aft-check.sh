@@ -60,6 +60,7 @@ SKIP_COVERAGE=0
 SKIP_TS=0
 WITH_DEEP=0
 KEEP_GOING=0
+VERBOSE=0
 NO_PRUNE=0
 PRUNE_AFTER="1h"
 FUZZ_TARGET=""
@@ -142,6 +143,8 @@ Options:
   --with-deep          Append deep checks to validate/rust.
   --keep-going         Continue after failures and summarize all failures.
   --fail-fast          Stop after first failure. Default behavior.
+  --verbose            Show full output including passing tests. Default:
+                       only non-passing tests are shown.
   --prune-after TTL    Stale cache TTL. Examples: 1h, 45m, 3600s. Default: 1h.
   --no-prune           Do not prune stale caches before running checks.
   --fuzz-target NAME   Required for task fuzz unless AFT_FUZZ_TARGET is set.
@@ -398,6 +401,43 @@ bun_docker_args() {
     "$BUN_IMAGE" bash -lc
 }
 
+# Filter passing test output to reduce noise. Keeps failures, errors,
+# summaries, and non-test output. Strips individual PASS lines from
+# nextest and other test runners.
+_filter_passing() {
+  local in_summary=0
+  local prev_blank=0
+  while IFS= read -r line; do
+    # Keep everything from the summary line onward.
+    if (( in_summary )); then
+      printf '%s\n' "$line"
+      continue
+    fi
+    # Detect the test result summary line: "... N passed; ... N failed; ..."
+    if [[ "$line" == *"passed;"* ]] || [[ "$line" == *"failed;"* ]]; then
+      in_summary=1
+      printf '%s\n' "$line"
+      continue
+    fi
+    # Skip individual passing test lines (nextest, cargo test, etc.)
+    if [[ "$line" =~ ^[[:space:]]*(PASS|[0-9]+ passed) ]]; then
+      prev_blank=0
+      continue
+    fi
+    # Deduplicate consecutive blank lines.
+    if [[ -z "$line" ]]; then
+      if (( prev_blank )); then
+        continue
+      fi
+      prev_blank=1
+      printf '\n'
+      continue
+    fi
+    prev_blank=0
+    printf '%s\n' "$line"
+  done
+}
+
 run_step() {
   local label="$1"
   shift
@@ -408,8 +448,13 @@ run_step() {
 
   local code=0
   set +e
-  "$@"
-  code=$?
+  if (( VERBOSE )); then
+    "$@"
+    code=$?
+  else
+    "$@" 2>&1 | _filter_passing
+    code=${PIPESTATUS[0]}
+  fi
   set -e
 
   if (( code == 0 )); then
@@ -629,6 +674,7 @@ parse_args() {
       --with-deep) WITH_DEEP=1 ;;
       --keep-going) KEEP_GOING=1 ;;
       --fail-fast) KEEP_GOING=0 ;;
+      --verbose) VERBOSE=1 ;;
       --prune-after)
         shift; [[ $# -gt 0 ]] || fatal "--prune-after requires a value"; PRUNE_AFTER="$1" ;;
       --prune-after=*) PRUNE_AFTER="${1#*=}" ;;

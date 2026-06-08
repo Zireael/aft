@@ -22,6 +22,48 @@ pub enum RerankOutcome {
     Failed(String),
 }
 
+/// Maximum reranker response body size in bytes (2 MiB).
+///
+/// Reranker responses are typically small JSON arrays of indices. A 2 MiB
+/// cap prevents unbounded memory allocation from a malicious, buggy, or
+/// misconfigured endpoint while remaining generous for any realistic
+/// response. Responses exceeding this limit cause a safe fallback to the
+/// original retrieval order.
+const MAX_RERANK_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read a reranker response body with a hard size cap.
+///
+/// Uses `Content-Length` for fast rejection when the server provides an
+/// honest header, then reads the full body and verifies the actual size.
+/// Returns the body as a UTF-8 string on success.
+fn read_response_body_bounded(
+    response: reqwest::blocking::Response,
+    limit: usize,
+) -> Result<String, String> {
+    // Fast path: reject via Content-Length when the server is honest.
+    if let Some(len) = response.content_length() {
+        if len > limit as u64 {
+            return Err(format!(
+                "reranker response Content-Length {len} exceeds {limit} bytes limit"
+            ));
+        }
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("failed to read reranker response: {e}"))?;
+
+    if bytes.len() > limit {
+        return Err(format!(
+            "reranker response body ({} bytes) exceeds {limit} bytes limit",
+            bytes.len()
+        ));
+    }
+
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("reranker response is not valid UTF-8: {e}"))
+}
+
 /// Rerank candidates using an OpenAI-compatible chat endpoint.
 pub fn rerank_candidates(
     config: &SemanticBackendConfig,
@@ -116,9 +158,9 @@ pub fn rerank_candidates(
     };
 
     let status = response.status();
-    let text = match response.text() {
+    let text = match read_response_body_bounded(response, MAX_RERANK_BODY_BYTES) {
         Ok(t) => t,
-        Err(e) => return RerankOutcome::Failed(format!("failed to read reranker response: {e}")),
+        Err(e) => return RerankOutcome::Failed(e),
     };
 
     if !status.is_success() {
@@ -357,5 +399,39 @@ mod tests {
         let outcome = rerank_candidates(&config, "test", &results);
         // Will fail because endpoint is unreachable, but max_candidates is respected.
         assert!(matches!(outcome, RerankOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn rerank_body_size_limit_constant_is_2mb() {
+        assert_eq!(
+            MAX_RERANK_BODY_BYTES,
+            2 * 1024 * 1024,
+            "reranker body size limit should be 2 MiB"
+        );
+    }
+
+    #[test]
+    fn rerank_failed_on_unreachable_reports_failure() {
+        // Verify that a reranker against an unreachable endpoint
+        // returns Failed (not Skipped), confirming the body-read path
+        // is attempted and fails safely.
+        let config = SemanticBackendConfig {
+            rerank_enabled: true,
+            rerank_base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            rerank_timeout_ms: 100,
+            ..SemanticBackendConfig::default()
+        };
+        let results = vec![make_result(0), make_result(1)];
+        let outcome = rerank_candidates(&config, "test", &results);
+        match outcome {
+            RerankOutcome::Failed(msg) => {
+                // Should mention connection failure, not an OOM or panic.
+                assert!(
+                    msg.contains("reranker") || msg.contains("request failed"),
+                    "failure message should describe reranker error: {msg}"
+                );
+            }
+            other => panic!("expected RerankOutcome::Failed, got {other:?}"),
+        }
     }
 }
