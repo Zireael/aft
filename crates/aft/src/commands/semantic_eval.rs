@@ -40,6 +40,8 @@ use serde::Deserialize;
 use crate::protocol::{RawRequest, Response};
 use crate::semantic_eval as eval;
 
+use crate::commands::semantic_search::handle_semantic_search;
+
 #[derive(Debug, Deserialize)]
 struct SemanticEvalParams {
     path: String,
@@ -56,7 +58,7 @@ fn default_include_per_case() -> bool {
     true
 }
 
-pub fn handle_semantic_eval(req: &RawRequest, _ctx: &crate::context::AppContext) -> Response {
+pub fn handle_semantic_eval(req: &RawRequest, ctx: &crate::context::AppContext) -> Response {
     let params: SemanticEvalParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -94,12 +96,40 @@ pub fn handle_semantic_eval(req: &RawRequest, _ctx: &crate::context::AppContext)
             );
         }
     };
-    // Note: This stub returns zero retrieved hits per case. Wiring to
-    // `handle_semantic_search` is deferred to a follow-up Bead; for now the
-    // harness is exercised through its pure-logic surface (parser, matcher,
-    // scorer). Misses surface as expected and are the agent's signal that
-    // the upstream wiring is not yet in place.
-    let results: Vec<Vec<eval::RetrievedHit>> = cases.iter().map(|_| Vec::new()).collect();
+    // Execute real semantic search for each case.
+    let results: Vec<Vec<eval::RetrievedHit>> = cases
+        .iter()
+        .map(|case| {
+            let search_req = RawRequest {
+                id: format!("eval-{}", case.query),
+                command: "semantic_search".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({
+                    "query": case.query,
+                    "top_k": params.top_k,
+                }),
+            };
+            let resp = handle_semantic_search(&search_req, ctx);
+            if !resp.success {
+                // Search failed (disabled, not ready, etc.) — return empty.
+                return Vec::new();
+            }
+            // Extract results array from response data.
+            let results_arr = match resp.data.get("results") {
+                Some(serde_json::Value::Array(arr)) => arr,
+                _ => return Vec::new(),
+            };
+            results_arr
+                .iter()
+                .filter_map(|r| {
+                    let path = r.get("file")?.as_str()?.to_string();
+                    let symbol = r.get("name").and_then(|v| v.as_str()).map(String::from);
+                    Some(eval::RetrievedHit { path, symbol })
+                })
+                .collect()
+        })
+        .collect();
     let summary = eval::score_suite(&cases, &results, params.top_k);
 
     let mut payload = serde_json::json!({

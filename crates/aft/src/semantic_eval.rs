@@ -228,7 +228,7 @@ pub fn symbol_matches(retrieved: &str, expected: &str) -> bool {
 pub fn score_case(case: &EvalCase, retrieved: &[RetrievedHit], default_k: usize) -> EvalCaseResult {
     let k = case.top_k.unwrap_or(default_k).max(1);
     let expectation_count = case.expected_paths.len() + case.expected_symbols.len();
-    let truncated = &retrieved[..retrieved.len().min(retrieved.len())];
+    let truncated = retrieved;
 
     let mut first_hit_rank: Option<usize> = None;
     let mut expectations_matched: HashSet<String> = HashSet::new();
