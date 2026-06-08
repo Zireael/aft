@@ -1677,7 +1677,7 @@ impl SemanticEmbeddingModel {
         &mut self,
         query: &str,
         query_prompt_template: Option<&str>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<(Vec<f32>, bool), String> {
         let prompt_hash = prompt_template_hash(query_prompt_template);
         let cache_key = if prompt_hash.is_empty() {
             query.to_string()
@@ -1687,7 +1687,7 @@ impl SemanticEmbeddingModel {
 
         if let Some(vector) = self.query_embedding_cache.get(&cache_key) {
             self.query_embedding_cache_hits += 1;
-            return Ok(vector.clone());
+            return Ok((vector.clone(), true));
         }
 
         self.query_embedding_cache_misses += 1;
@@ -1707,7 +1707,7 @@ impl SemanticEmbeddingModel {
             .insert(cache_key.clone(), vector.clone());
         self.query_embedding_cache_order.push_back(cache_key);
 
-        Ok(vector)
+        Ok((vector, false))
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {

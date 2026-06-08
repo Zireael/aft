@@ -151,8 +151,8 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let embedding_timer = PhaseTimer::start();
-    let query_vector = match embed_query(&params.query, ctx) {
-        Ok(query_vector) => query_vector,
+    let (query_vector, query_cache_hit) = match embed_query(&params.query, ctx) {
+        Ok(result) => result,
         Err(error) => {
             if diagnostics_enabled {
                 warnings.push(SearchWarning::EmbeddingFailure {
@@ -351,7 +351,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             score_p90,
             score_max,
             top1_margin: margin,
-            query_cache_hit: false, // Not tracked per-query yet.
+            query_cache_hit,
             prompt_active,
             warnings: warnings.clone(),
         };
@@ -379,7 +379,7 @@ fn default_top_k() -> usize {
     DEFAULT_TOP_K
 }
 
-fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
+fn embed_query(query: &str, ctx: &AppContext) -> Result<(Vec<f32>, bool), String> {
     let mut model_ref = ctx.semantic_embedding_model().borrow_mut();
     let semantic_config = ctx.config().semantic.clone();
 
@@ -390,7 +390,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
-    let query_vector = model
+    let (query_vector, query_cache_hit) = model
         .embed_query_cached(query, semantic_config.query_prompt_template.as_deref())
         .map_err(|error| format!("failed to embed query: {error}"))?;
     if let Some(index) = ctx.semantic_index().borrow().as_ref() {
@@ -403,7 +403,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
         }
     }
 
-    Ok(query_vector)
+    Ok((query_vector, query_cache_hit))
 }
 
 pub fn fuse_hybrid_results(
