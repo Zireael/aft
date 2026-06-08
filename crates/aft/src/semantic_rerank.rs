@@ -326,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    fn rerank_max_candidate_chars_default_is_2500() {
+        let config = SemanticBackendConfig::default();
+        assert_eq!(
+            config.rerank_max_candidate_chars, 2500,
+            "default max_candidate_chars should be 2500"
+        );
+    }
+
+    #[test]
+    fn rerank_max_candidate_chars_custom_value_is_accepted() {
+        let config = SemanticBackendConfig {
+            rerank_max_candidate_chars: 100,
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(config.rerank_max_candidate_chars, 100);
+    }
+
+    #[test]
     fn rerank_max_candidates_limits_input() {
         let config = SemanticBackendConfig {
             rerank_enabled: true,
