@@ -817,14 +817,20 @@ pub fn apply_document_template(text: &str, template: Option<&str>) -> String {
     }
 }
 
-/// Compute a stable hash for a prompt template. Returns empty string when None.
+/// Compute a stable hash for a prompt template.
+/// Returns empty string when the template is None or empty/whitespace-only,
+/// so that `None` and `Some("")` produce identical fingerprints and avoid
+/// unnecessary index rebuilds.
 pub fn prompt_template_hash(template: Option<&str>) -> String {
-    template.map_or(String::new(), |t| {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::{Hash, Hasher};
-        t.hash(&mut hasher);
-        hasher.finish().to_string()
-    })
+    template
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map_or(String::new(), |t| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            t.hash(&mut hasher);
+            hasher.finish().to_string()
+        })
 }
 
 /// Compute a stable hash of the file policy settings.
@@ -8492,6 +8498,68 @@ mod fingerprint_invalidation_tests {
     fn apply_document_template_none_returns_raw() {
         let result = apply_document_template("chunk text", None);
         assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_empty_string_returns_raw() {
+        // An empty template should behave like None (no wrapping).
+        let result = apply_query_template("hello", Some(""));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_empty_string_returns_raw() {
+        let result = apply_document_template("chunk text", Some(""));
+        assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_wrong_placeholder_returns_raw() {
+        // Template with {text} instead of {query} — no-op.
+        let result = apply_query_template("hello", Some("Doc: {text}"));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_wrong_placeholder_returns_raw() {
+        // Template with {query} instead of {text} — no-op.
+        let result = apply_document_template("chunk text", Some("Query: {query}"));
+        assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_literal_query_not_double_substituted() {
+        // A query containing literal {query} should be substituted once.
+        let result = apply_query_template("find {query} in code", Some("Search: {query}"));
+        assert_eq!(result, "Search: find {query} in code");
+    }
+
+    #[test]
+    fn prompt_template_hash_none_equals_empty_string() {
+        // None and empty string should produce the same hash (both normalize to empty).
+        assert_eq!(prompt_template_hash(None), "");
+        assert_eq!(prompt_template_hash(Some("")), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_whitespace_only_equals_none() {
+        // Whitespace-only templates should also normalize to empty.
+        assert_eq!(prompt_template_hash(Some("  ")), "");
+        assert_eq!(prompt_template_hash(Some("\t\n")), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_nonempty_produces_nonempty() {
+        // A real template should produce a non-empty hash.
+        let hash = prompt_template_hash(Some("Search: {query}"));
+        assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn prompt_template_hash_different_templates_different_hashes() {
+        let h1 = prompt_template_hash(Some("Search: {query}"));
+        let h2 = prompt_template_hash(Some("Find: {query}"));
+        assert_ne!(h1, h2);
     }
 
     // ── Contextualized embedding tests (aft-t6p.23.1) ──────────────────────────

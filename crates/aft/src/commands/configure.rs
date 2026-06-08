@@ -295,24 +295,48 @@ fn parse_semantic_config(
         };
     }
     if let Some(raw) = obj.get("query_prompt_template") {
-        semantic.query_prompt_template = raw
+        let trimmed = raw
             .as_str()
             .ok_or_else(|| {
                 "configure: semantic.query_prompt_template must be a string".to_string()
             })?
             .trim()
-            .to_string()
-            .into();
+            .to_string();
+        // Normalize empty/whitespace-only templates to None so fingerprint
+        // hashes match the no-template case and avoid unnecessary rebuilds.
+        semantic.query_prompt_template = if trimmed.is_empty() {
+            None
+        } else {
+            // Warn if the template does not contain the expected placeholder.
+            if !trimmed.contains("{query}") {
+                crate::slog_warn!(
+                    "semantic.query_prompt_template does not contain {{query}} placeholder; template will be ignored at query time: {}",
+                    &trimmed,
+                );
+            }
+            Some(trimmed)
+        };
     }
     if let Some(raw) = obj.get("document_prompt_template") {
-        semantic.document_prompt_template = raw
+        let trimmed = raw
             .as_str()
             .ok_or_else(|| {
                 "configure: semantic.document_prompt_template must be a string".to_string()
             })?
             .trim()
-            .to_string()
-            .into();
+            .to_string();
+        // Normalize empty/whitespace-only templates to None.
+        semantic.document_prompt_template = if trimmed.is_empty() {
+            None
+        } else {
+            if !trimmed.contains("{text}") {
+                crate::slog_warn!(
+                    "semantic.document_prompt_template does not contain {{text}} placeholder; template will be ignored at document time: {}",
+                    &trimmed,
+                );
+            }
+            Some(trimmed)
+        };
     }
     if let Some(raw) = obj.get("diagnostics_enabled") {
         semantic.diagnostics_enabled = raw.as_bool().ok_or_else(|| {

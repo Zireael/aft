@@ -101,6 +101,13 @@ FAILURES=()
 SUCCESSES=()
 STARTED_AT="$(date +%s)"
 
+# Test count aggregation — extracted from nextest/cargo-test Summary lines.
+TESTS_RUN=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
+TESTS_TIMED_OUT=0
+
 usage() {
   cat <<EOF
 Usage:
@@ -404,11 +411,54 @@ bun_docker_args() {
 # Filter passing test output to reduce noise. Keeps failures, errors,
 # summaries, and non-test output. Strips individual PASS lines from
 # nextest and other test runners.
+# Extract test counts from nextest Summary line and accumulate into globals.
+# Handles lines like: "Summary [ 198.630s] 1967/2049 tests run: 1966 passed (1 slow), 1 failed, 1 skipped"
+_extract_test_counts() {
+  local line="$1"
+  local total=0 passed=0 failed=0 skipped=0 timed_out=0
+
+  # Match the core pattern: "N/M tests run:" where N = ran, M = total
+  if [[ "$line" =~ ([0-9]+)/([0-9]+)[[:space:]]+tests[[:space:]]+run: ]]; then
+    total="${BASH_REMATCH[1]}"
+  else
+    return 0
+  fi
+  # Extract "N passed" — ignore parenthetical like "(1 slow)"
+  if [[ "$line" =~ ([0-9]+)[[:space:]]+passed ]]; then
+    passed="${BASH_REMATCH[1]}"
+  fi
+  # Extract "N failed"
+  if [[ "$line" =~ ([0-9]+)[[:space:]]+failed ]]; then
+    failed="${BASH_REMATCH[1]}"
+  fi
+  # Extract "N skipped"
+  if [[ "$line" =~ ([0-9]+)[[:space:]]+skipped ]]; then
+    skipped="${BASH_REMATCH[1]}"
+  fi
+  # Extract "N timed out" (cargo-mutants / future runners)
+  if [[ "$line" =~ ([0-9]+)[[:space:]]+timed[[:space:]]+out ]]; then
+    timed_out="${BASH_REMATCH[1]}"
+  fi
+  TESTS_RUN=$(( TESTS_RUN + total ))
+  TESTS_PASSED=$(( TESTS_PASSED + passed ))
+  TESTS_FAILED=$(( TESTS_FAILED + failed ))
+  TESTS_SKIPPED=$(( TESTS_SKIPPED + skipped ))
+  TESTS_TIMED_OUT=$(( TESTS_TIMED_OUT + timed_out ))
+}
+
 _filter_passing() {
   local in_summary=0
   local prev_blank=0
   while IFS= read -r line; do
-    # Keep everything from the summary line onward.
+    # Detect nextest "Summary" line — extract counts and show it.
+    # Must be checked before the in_summary guard since the Summary line
+    # also contains "passed" and "failed" which would match the guard.
+    if [[ "$line" == *"Summary"*"tests run:"* ]]; then
+      _extract_test_counts "$line"
+      printf '%s\n' "$line"
+      continue
+    fi
+    # Keep everything from the test-result summary line onward.
     if (( in_summary )); then
       printf '%s\n' "$line"
       continue
@@ -447,15 +497,23 @@ run_step() {
   log "+ $(quote_cmd "$@")"
 
   local code=0
-  set +e
   if (( VERBOSE )); then
+    set +e
     "$@"
     code=$?
+    set -e
   else
-    "$@" 2>&1 | _filter_passing
-    code=${PIPESTATUS[0]}
+    # Capture output to temp file so _filter_passing runs in the main shell
+    # (not a pipe subshell) and can update TESTS_* globals.
+    local tmpfile
+    tmpfile="$(mktemp)"
+    set +e
+    "$@" >"$tmpfile" 2>&1
+    code=$?
+    set -e
+    _filter_passing <"$tmpfile"
+    rm -f "$tmpfile"
   fi
-  set -e
 
   if (( code == 0 )); then
     log "OK: $label"
@@ -649,6 +707,16 @@ summarize_and_exit() {
   if ((${#FAILURES[@]})); then
     log "Failed:"
     printf '  - %s\n' "${FAILURES[@]}"
+  fi
+  # Show aggregated test counts when any tests were executed.
+  if (( TESTS_RUN > 0 )); then
+    log ""
+    log "Tests: ${TESTS_RUN} run, ${TESTS_PASSED} passed, ${TESTS_FAILED} failed, ${TESTS_SKIPPED} skipped"
+    if (( TESTS_TIMED_OUT > 0 )); then
+      log "       ${TESTS_TIMED_OUT} timed out"
+    fi
+  fi
+  if ((${#FAILURES[@]})); then
     exit 1
   fi
   log "All selected checks passed."
