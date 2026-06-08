@@ -90,6 +90,31 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    // Warn if the distance metric changed since the index was built.
+    // Metric changes affect scoring/ranking but do not trigger re-embedding.
+    let config_metric = ctx
+        .config()
+        .semantic
+        .distance_metric
+        .as_ref()
+        .map(|m| {
+            serde_json::to_value(m)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "cosine".to_string())
+        })
+        .unwrap_or_else(|| "cosine".to_string());
+    if let Some(idx) = ctx.semantic_index().borrow().as_ref() {
+        if let Some(fp) = idx.fingerprint() {
+            if !fp.distance_metric.is_empty() && fp.distance_metric != config_metric {
+                warnings.push(SearchWarning::DistanceMetricChanged {
+                    previous: fp.distance_metric.clone(),
+                    current: config_metric,
+                });
+            }
+        }
+    }
+
     match &*ctx.semantic_index_status().borrow() {
         SemanticIndexStatus::Disabled => {
             return Response::success(
@@ -222,12 +247,14 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let max_results_per_file = ctx.config().semantic.max_results_per_file;
     let fusion_timer = PhaseTimer::start();
     let results = fuse_hybrid_results(
         semantic_results,
         lexical_files,
         &shape,
         params.top_k.min(MAX_TOP_K),
+        max_results_per_file,
     );
     let hybrid_fusion_latency_ms = fusion_timer.stop();
 
@@ -411,6 +438,7 @@ pub fn fuse_hybrid_results(
     lexical_files: Vec<(PathBuf, f32)>,
     shape: &QueryShape,
     top_k: usize,
+    max_results_per_file: usize,
 ) -> Vec<HybridResult> {
     if top_k == 0 {
         return Vec::new();
@@ -450,12 +478,16 @@ pub fn fuse_hybrid_results(
         hybrid
     };
 
-    sort_cap_and_truncate(&mut results, top_k);
+    sort_cap_and_truncate(&mut results, top_k, max_results_per_file);
     results
 }
 
 /// Sort by score descending, apply per-file cap, re-sort, then truncate.
-fn sort_cap_and_truncate(results: &mut Vec<HybridResult>, top_k: usize) {
+fn sort_cap_and_truncate(
+    results: &mut Vec<HybridResult>,
+    top_k: usize,
+    max_results_per_file: usize,
+) {
     let cmp = |a: &HybridResult, b: &HybridResult| {
         b.score
             .partial_cmp(&a.score)
@@ -464,7 +496,7 @@ fn sort_cap_and_truncate(results: &mut Vec<HybridResult>, top_k: usize) {
             .then_with(|| a.name.cmp(&b.name))
     };
     results.sort_by(&cmp);
-    let capped = cap_per_file(std::mem::take(results), 2);
+    let capped = cap_per_file(std::mem::take(results), max_results_per_file);
     *results = capped;
     results.sort_by(&cmp);
     results.truncate(top_k);
@@ -753,7 +785,7 @@ mod tests {
     #[test]
     fn fuse_empty_semantic_and_empty_lexical_returns_empty() {
         let shape = make_nl_shape();
-        let results = fuse_hybrid_results(vec![], vec![], &shape, 10);
+        let results = fuse_hybrid_results(vec![], vec![], &shape, 10, 2);
         assert!(results.is_empty());
     }
 
@@ -761,7 +793,7 @@ mod tests {
     fn fuse_semantic_only_returns_semantic_results() {
         let shape = make_nl_shape();
         let semantic = vec![make_semantic_result("a.rs", "func_a", 0.9)];
-        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10, 2);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, "semantic");
         assert_eq!(results[0].name, "func_a");
@@ -771,7 +803,7 @@ mod tests {
     fn fuse_lexical_only_returns_lexical_results() {
         let shape = make_id_shape();
         let lexical = vec![(PathBuf::from("b.rs"), 0.8)];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, "lexical");
     }
@@ -781,7 +813,7 @@ mod tests {
         let shape = make_nl_shape();
         let semantic = vec![make_semantic_result("a.rs", "func_a", 0.9)];
         let lexical = vec![(PathBuf::from("a.rs"), 0.5)];
-        let results = fuse_hybrid_results(semantic, lexical, &shape, 10);
+        let results = fuse_hybrid_results(semantic, lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, "hybrid");
         assert!(results[0].lexical_score.is_some());
@@ -792,7 +824,7 @@ mod tests {
         let shape = make_nl_shape();
         let semantic = vec![make_semantic_result("a.rs", "func_a", 0.8)];
         let lexical = vec![(PathBuf::from("a.rs"), 0.5)];
-        let results = fuse_hybrid_results(semantic, lexical, &shape, 10);
+        let results = fuse_hybrid_results(semantic, lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         // Score should be semantic * HYBRID_LEXICAL_BOOST = 0.8 * 1.1 = 0.88
         assert!((results[0].score - 0.88).abs() < 1e-5);
@@ -803,7 +835,7 @@ mod tests {
         let shape = make_id_shape();
         // A very high lexical score should be capped at LEXICAL_ONLY_SCORE_CEILING (0.25).
         let lexical = vec![(PathBuf::from("a.rs"), 10.0)];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         assert!(results[0].score <= 0.25 + 1e-6);
     }
@@ -812,7 +844,7 @@ mod tests {
     fn fuse_natural_language_lexical_only_weight_zero() {
         let shape = make_nl_shape();
         let lexical = vec![(PathBuf::from("a.rs"), 0.9)];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         // NL queries weight lexical at 0.0, so score = 0.9 * 0.0 = 0.0.
         assert!(results[0].score.abs() < 1e-6);
@@ -826,7 +858,7 @@ mod tests {
             make_semantic_result("b.rs", "f2", 0.8),
             make_semantic_result("c.rs", "f3", 0.7),
         ];
-        let results = fuse_hybrid_results(semantic, vec![], &shape, 2);
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 2, 2);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].name, "f1");
         assert_eq!(results[1].name, "f2");
@@ -836,7 +868,7 @@ mod tests {
     fn fuse_zero_top_k_returns_empty() {
         let shape = make_nl_shape();
         let semantic = vec![make_semantic_result("a.rs", "f1", 0.9)];
-        let results = fuse_hybrid_results(semantic, vec![], &shape, 0);
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 0, 2);
         assert!(results.is_empty());
     }
 
@@ -849,7 +881,7 @@ mod tests {
             make_semantic_result("a.rs", "f2", 0.8),
             make_semantic_result("a.rs", "f3", 0.7),
         ];
-        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10, 2);
         assert!(results.len() <= 2);
     }
 
@@ -861,7 +893,7 @@ mod tests {
             make_semantic_result("b.rs", "f_high", 0.9),
             make_semantic_result("c.rs", "f_mid", 0.6),
         ];
-        let results = fuse_hybrid_results(semantic, vec![], &shape, 10);
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10, 2);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].name, "f_high");
         assert_eq!(results[1].name, "f_mid");
@@ -872,7 +904,7 @@ mod tests {
     fn fuse_lexical_only_path_shape_weight() {
         let shape = make_path_shape();
         let lexical = vec![(PathBuf::from("a.rs"), 0.9)];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert_eq!(results.len(), 1);
         // Path shape weights lexical at 0.5, capped at 0.25.
         assert!(results[0].score <= 0.25 + 1e-6);
@@ -886,7 +918,7 @@ mod tests {
             (PathBuf::from("a.rs"), 0.9),
             (PathBuf::from("b.rs"), 0.6),
         ];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert_eq!(results.len(), 3);
         // Lexical-only results should be sorted by score descending.
         assert!(results[0].score >= results[1].score);
@@ -902,8 +934,37 @@ mod tests {
             (PathBuf::from("a.rs"), 0.8),
             (PathBuf::from("a.rs"), 0.7),
         ];
-        let results = fuse_hybrid_results(vec![], lexical, &shape, 10);
+        let results = fuse_hybrid_results(vec![], lexical, &shape, 10, 2);
         assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn fuse_custom_max_results_per_file() {
+        let shape = make_nl_shape();
+        // 4 results from the same file — cap_per_file(3) should keep 3.
+        let semantic = vec![
+            make_semantic_result("a.rs", "f1", 0.9),
+            make_semantic_result("a.rs", "f2", 0.8),
+            make_semantic_result("a.rs", "f3", 0.7),
+            make_semantic_result("a.rs", "f4", 0.6),
+        ];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10, 3);
+        assert_eq!(results.len(), 3);
+        let expected_file = std::path::Path::new("a.rs");
+        assert!(results.iter().all(|r| r.file == expected_file));
+    }
+
+    #[test]
+    fn fuse_max_results_per_file_one_allows_many_files() {
+        let shape = make_nl_shape();
+        // One result per file — cap_per_file(1) should keep all since each file has only 1.
+        let semantic = vec![
+            make_semantic_result("a.rs", "f1", 0.9),
+            make_semantic_result("b.rs", "f2", 0.8),
+            make_semantic_result("c.rs", "f3", 0.7),
+        ];
+        let results = fuse_hybrid_results(semantic, vec![], &shape, 10, 1);
+        assert_eq!(results.len(), 3);
     }
 
     #[test]

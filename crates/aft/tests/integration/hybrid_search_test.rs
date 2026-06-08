@@ -44,6 +44,7 @@ fn identifier_file_in_both_lanes_gets_hybrid_boost() {
         vec![(PathBuf::from("/project/src/hooks.ts"), 2.0)],
         &shape,
         10,
+        2,
     );
 
     assert_eq!(results[0].source, "hybrid");
@@ -60,6 +61,7 @@ fn identifier_file_only_in_lexical_top_twenty_surfaces() {
         vec![(PathBuf::from("/project/src/hooks.ts"), 2.0)],
         &shape,
         10,
+        2,
     );
 
     let lexical = results
@@ -82,6 +84,7 @@ fn natural_language_query_with_no_lexical_lane_stays_semantic() {
         Vec::new(),
         &shape,
         10,
+        2,
     );
 
     assert!(results.iter().all(|result| result.source == "semantic"));
@@ -99,6 +102,7 @@ fn per_file_cap_keeps_top_two_results() {
         vec![(PathBuf::from("/project/src/elsewhere.ts"), 0.5)],
         &shape,
         10,
+        2,
     );
     let hooks_file = PathBuf::from("/project/src/hooks.ts");
 
@@ -126,8 +130,8 @@ fn same_inputs_produce_stable_results() {
         (PathBuf::from("/project/src/c.ts"), 0.9),
     ];
 
-    let first = fuse_hybrid_results(semantic_results.clone(), lexical.clone(), &shape, 10);
-    let second = fuse_hybrid_results(semantic_results, lexical, &shape, 10);
+    let first = fuse_hybrid_results(semantic_results.clone(), lexical.clone(), &shape, 10, 2);
+    let second = fuse_hybrid_results(semantic_results, lexical, &shape, 10, 2);
 
     assert_eq!(fingerprint(&first), fingerprint(&second));
 }

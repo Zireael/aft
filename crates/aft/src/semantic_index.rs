@@ -5870,6 +5870,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5968,6 +5969,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -6038,6 +6040,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7353,6 +7356,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7421,6 +7425,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7468,6 +7473,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7521,6 +7527,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7577,6 +7584,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7626,6 +7634,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
@@ -9451,6 +9460,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         }
     }
 
@@ -9574,6 +9584,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             model_path: Some(PathBuf::from("/any/path")),
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         };
         let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
         assert!(err.contains("semantic-model2vec"), "error: {err}");

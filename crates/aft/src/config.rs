@@ -260,6 +260,10 @@ pub struct SemanticBackendConfig {
     /// **USER-ONLY trust boundary** — project-level config cannot set this field.
     #[serde(default = "default_model2vec_max_length")]
     pub model2vec_max_length: usize,
+    /// Maximum number of results returned per file after hybrid fusion (default: 2).
+    /// Prevents a single dense module from dominating search results.
+    #[serde(default = "default_max_results_per_file")]
+    pub max_results_per_file: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -301,6 +305,10 @@ fn default_rerank_max_candidate_chars() -> usize {
 
 fn default_model2vec_max_length() -> usize {
     512
+}
+
+fn default_max_results_per_file() -> usize {
+    2
 }
 
 impl SemanticBackendConfig {
@@ -514,6 +522,7 @@ impl Default for SemanticBackendConfig {
             rerank_max_candidate_chars: 2500,
             model_path: None,
             model2vec_max_length: 512,
+            max_results_per_file: 2,
         }
     }
 }

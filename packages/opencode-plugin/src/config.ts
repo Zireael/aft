@@ -129,6 +129,8 @@ const SemanticConfigSchema = z.object({
   model_path: z.string().optional(),
   /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */
   model2vec_max_length: z.number().int().positive().optional(),
+  /** Maximum results per file after hybrid fusion (default: 2). Prevents a single dense module from dominating. */
+  max_results_per_file: z.number().int().positive().optional(),
 });
 const LspExtensionSchema = z
   .string()

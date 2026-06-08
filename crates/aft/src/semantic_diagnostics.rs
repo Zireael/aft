@@ -54,6 +54,12 @@ pub enum SearchWarning {
     RerankerFailure {
         reason: String,
     },
+    /// Distance metric changed since the index was built. Scores may be
+    /// stale — the index was not re-embedded for the new metric.
+    DistanceMetricChanged {
+        previous: String,
+        current: String,
+    },
 }
 
 impl std::fmt::Display for SearchWarning {
@@ -72,6 +78,9 @@ impl std::fmt::Display for SearchWarning {
                 write!(f, "dimension_mismatch(expected={expected}, got={got})")
             }
             Self::RerankerFailure { reason } => write!(f, "reranker_failure({reason})"),
+            Self::DistanceMetricChanged { previous, current } => {
+                write!(f, "distance_metric_changed({previous} -> {current})")
+            }
         }
     }
 }
@@ -700,6 +709,11 @@ fn format_warning_minimal(w: &SearchWarning) -> Option<String> {
         SearchWarning::LexicalFailure { .. } => None,
         SearchWarning::DimensionMismatch { .. } => None,
         SearchWarning::RerankerFailure { .. } => None,
+        SearchWarning::DistanceMetricChanged { previous, current } => {
+            Some(format!(
+                "⚠ distance metric changed from {previous} to {current} — scores may be stale (index was not re-embedded)"
+            ))
+        }
     }
 }
 
@@ -728,6 +742,11 @@ fn format_warning_verbose(w: &SearchWarning) -> String {
             format!("⚠ dimension mismatch: expected {}, got {}", expected, got)
         }
         SearchWarning::RerankerFailure { reason } => format!("⚠ reranker failed: {}", reason),
+        SearchWarning::DistanceMetricChanged { previous, current } => {
+            format!(
+                "⚠ distance metric changed from {previous} to {current} — scores may be stale (index was not re-embedded)"
+            )
+        }
     }
 }
 
