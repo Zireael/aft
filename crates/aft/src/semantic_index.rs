@@ -19,7 +19,7 @@ use model2vec_rs::model::StaticModel as Model2VecStaticModel;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -3248,25 +3248,33 @@ impl SemanticIndex {
             });
         }
 
-        // Group chunks by file path
-        let mut docs_map: HashMap<PathBuf, Vec<SemanticChunk>> = HashMap::new();
+        // Group chunks by file path using BTreeMap for deterministic ordering
+        let mut docs_map: BTreeMap<PathBuf, Vec<SemanticChunk>> = BTreeMap::new();
         for chunk in chunks {
             docs_map.entry(chunk.file.clone()).or_default().push(chunk);
         }
 
-        // Build per-document chunk groups, splitting oversized documents
+        // Build per-document chunk groups, splitting oversized documents.
+        // `group_source_chunks` tracks the original SemanticChunk objects for
+        // each sub-group so reconstruction doesn't rely on file_path lookups
+        // (which break when one file is split into multiple sub-groups).
+        // `group_file_paths` tracks the expected file_path for each sub-group
+        // so we can validate the embedder's response.
         let mut documents: Vec<PerDocumentChunks> = Vec::with_capacity(docs_map.len());
+        let mut group_source_chunks: Vec<Vec<SemanticChunk>> = Vec::with_capacity(docs_map.len());
+        let mut group_file_paths: Vec<PathBuf> = Vec::with_capacity(docs_map.len());
         let mut diagnostics = ContextualizedBuildDiagnostics {
             max_chunks_in_document: docs_map.values().map(|c| c.len()).max().unwrap_or(0),
             ..Default::default()
         };
 
-        for (path, chunks) in &docs_map {
+        for (path, file_chunks) in &docs_map {
             let title = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let chunk_texts: Vec<String> = chunks.iter().map(|c| c.embed_text.clone()).collect();
+            let chunk_texts: Vec<String> =
+                file_chunks.iter().map(|c| c.embed_text.clone()).collect();
             let doc = PerDocumentChunks {
                 file_path: path.clone(),
                 title,
@@ -3275,21 +3283,36 @@ impl SemanticIndex {
 
             // Split oversized documents into sub-groups
             let sub_groups = Self::split_oversized_document(&doc, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+
+            // Record source chunks and expected file_path for each sub-group
+            for (i, sub_group) in sub_groups.iter().enumerate() {
+                let start = i * DEFAULT_MAX_CHUNKS_PER_DOCUMENT;
+                let end = std::cmp::min(start + DEFAULT_MAX_CHUNKS_PER_DOCUMENT, file_chunks.len());
+                group_source_chunks.push(file_chunks[start..end].to_vec());
+                group_file_paths.push(sub_group.file_path.clone());
+            }
+
             if sub_groups.len() > 1 {
-                diagnostics.rejected_oversized += 1;
+                diagnostics.split_documents += 1;
             }
             documents.extend(sub_groups);
         }
 
+        diagnostics.documents_processed = docs_map.len();
+
         // Embed documents with retry logic, tracking diagnostics
         let mut all_embeddings: Vec<ChunkEmbeddings> = Vec::new();
+        let mut succeeded_source_chunks: Vec<Vec<SemanticChunk>> = Vec::new();
+        let mut succeeded_file_paths: Vec<PathBuf> = Vec::new();
         let mut retried_count = 0usize;
         let mut failed_count = 0usize;
 
-        for doc in &documents {
+        for (i, doc) in documents.iter().enumerate() {
             match Self::embed_document_group_with_retry(embed_fn, doc.clone(), &mut retried_count) {
                 Ok(result) => {
                     all_embeddings.extend(result.embeddings);
+                    succeeded_source_chunks.push(group_source_chunks[i].clone());
+                    succeeded_file_paths.push(group_file_paths[i].clone());
                 }
                 Err(e) => {
                     slog_warn!(
@@ -3302,7 +3325,6 @@ impl SemanticIndex {
             }
         }
 
-        diagnostics.documents_processed = all_embeddings.len();
         diagnostics.retried_groups = retried_count;
         diagnostics.failed_groups = failed_count;
 
@@ -3310,24 +3332,31 @@ impl SemanticIndex {
         let mut expected_dimension: Option<usize> = None;
         let mut done = 0;
 
-        for emb in all_embeddings.into_iter() {
-            let file_chunks = docs_map.get(&emb.file_path).ok_or_else(|| {
-                format!(
-                    "embedding response returned unknown file path: {}",
-                    emb.file_path.display()
-                )
-            })?;
+        for (emb, source_chunks, expected_path) in all_embeddings
+            .into_iter()
+            .zip(succeeded_source_chunks)
+            .zip(succeeded_file_paths)
+            .map(|((emb, chunks), path)| (emb, chunks, path))
+        {
+            // Validate that the embedder returned embeddings for the file we expected
+            if emb.file_path != expected_path {
+                return Err(format!(
+                    "embedding response returned unknown file path: {} (expected {})",
+                    emb.file_path.display(),
+                    expected_path.display()
+                ));
+            }
 
-            if emb.vectors.len() != file_chunks.len() {
+            if emb.vectors.len() != source_chunks.len() {
                 return Err(format!(
                     "embedding response returned {} vectors for {} chunks in file {}",
                     emb.vectors.len(),
-                    file_chunks.len(),
+                    source_chunks.len(),
                     emb.file_path.display()
                 ));
             }
 
-            for (chunk, vector) in file_chunks.iter().zip(emb.vectors) {
+            for (chunk, vector) in source_chunks.iter().zip(emb.vectors) {
                 if let Some(dim) = expected_dimension {
                     if vector.len() != dim {
                         return Err(format!(
@@ -3351,12 +3380,12 @@ impl SemanticIndex {
 
         diagnostics.chunks_embedded = entries.len();
         slog_info!(
-            "contextualized build complete: {} docs, {} chunks, {} retried, {} failed, {} rejected oversized",
+            "contextualized build complete: {} docs ({} split), {} chunks, {} retried, {} failed",
             diagnostics.documents_processed,
+            diagnostics.split_documents,
             diagnostics.chunks_embedded,
             diagnostics.retried_groups,
-            diagnostics.failed_groups,
-            diagnostics.rejected_oversized
+            diagnostics.failed_groups
         );
 
         let dimension = expected_dimension.unwrap_or(DEFAULT_DIMENSION);
@@ -4942,13 +4971,13 @@ pub struct FilePolicyStats {
 /// Tracks oversized document handling, retry behavior, and per-request metrics.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContextualizedBuildDiagnostics {
-    /// Total documents processed (including sub-groups from oversized docs).
+    /// Total source documents processed (before splitting into sub-groups).
     pub documents_processed: usize,
     /// Total chunks embedded across all documents.
     pub chunks_embedded: usize,
-    /// Documents rejected because they exceeded max_chunks_per_document
-    /// and could not be split further.
-    pub rejected_oversized: usize,
+    /// Documents that were split into multiple sub-groups because they
+    /// exceeded max_chunks_per_document.
+    pub split_documents: usize,
     /// Document groups that failed embedding and were retried.
     pub retried_groups: usize,
     /// Document groups that failed after all retries and were skipped.
