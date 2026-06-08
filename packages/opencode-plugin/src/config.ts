@@ -42,8 +42,20 @@ const SemanticBackendEnum = z.enum([
   "model2vec",
 ]);
 
-/** Output encoding mode for embeddings. */
-const SemanticOutputEncodingEnum = z.enum(["float", "base64_int8", "base64_binary"]);
+/** Output encoding mode for embeddings. Accepts legacy aliases for backward compatibility. */
+const SemanticOutputEncodingEnum = z.preprocess(
+  (val) => {
+    // Backward-compat: old enum values mapped to their replacements.
+    const legacyMap: Record<string, string> = {
+      binary: "base64_binary",
+      ubinary: "base64_binary",
+      int8: "base64_int8",
+      uint8: "base64_int8",
+    };
+    return typeof val === "string" && val in legacyMap ? legacyMap[val] : val;
+  },
+  z.enum(["float", "base64_int8", "base64_binary"]),
+);
 
 /** Storage strategy for embedding vectors. */
 const SemanticStorageStrategyEnum = z.enum(["native_f32", "decode_normalize_f32", "binary_packed"]);
@@ -81,6 +93,38 @@ const SemanticConfigSchema = z.object({
   query_prompt_template: z.string().optional(),
   /** Optional document prompt template (applied before embedding documents). */
   document_prompt_template: z.string().optional(),
+  /** Enable per-query search diagnostics collection (default: false). */
+  diagnostics_enabled: z.boolean().optional(),
+  /** Score threshold below which results are flagged as low-confidence (default: 0.3). */
+  low_confidence_threshold: z.number().optional(),
+  /** Number of recent queries to retain for aggregate metrics (default: 100). */
+  metrics_window_size: z.number().int().positive().optional(),
+  /** Write per-query diagnostics as JSONL to a local file (default: false). */
+  jsonl_logging: z.boolean().optional(),
+  /** Override path for the JSONL diagnostics log. */
+  jsonl_path: z.string().optional(),
+  /** Include the raw query text in JSONL diagnostics (default: false). */
+  include_raw_queries: z.boolean().optional(),
+  /** Include code snippets in JSONL diagnostics (default: false). */
+  include_snippets: z.boolean().optional(),
+  /** Number of days to retain JSONL diagnostics before cleanup (default: 14). */
+  retention_days: z.number().int().positive().optional(),
+  /** Diagnostic detail level in tool output: "off", "minimal" (default), or "verbose". */
+  output_mode: z.enum(["off", "minimal", "verbose"]).optional(),
+  /** Enable optional reranking via an OpenAI-compatible chat endpoint (default: false). */
+  rerank_enabled: z.boolean().optional(),
+  /** Override model for reranking. Falls back to a default instruct model if unset. */
+  rerank_model: z.string().trim().min(1).optional(),
+  /** Base URL for reranker (OpenAI-compatible /v1/chat/completions endpoint). */
+  rerank_base_url: z.string().trim().min(1).optional(),
+  /** Env var name for reranker API key. Falls back to api_key_env if unset. */
+  rerank_api_key_env: z.string().trim().min(1).optional(),
+  /** Reranker request timeout in milliseconds (default: 10000). */
+  rerank_timeout_ms: z.number().int().positive().optional(),
+  /** Maximum candidate count passed to the reranker (default: 50). */
+  rerank_max_candidates: z.number().int().positive().optional(),
+  /** Maximum characters per candidate text sent to the reranker (default: 2000). */
+  rerank_max_candidate_chars: z.number().int().positive().optional(),
   /** Local filesystem path to a model2vec model directory (USER-ONLY, trust boundary). */
   model_path: z.string().optional(),
   /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */

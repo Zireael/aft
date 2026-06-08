@@ -21,8 +21,8 @@
 
 **Plugin transport layer:**
 - Purpose: Resolve or download the binary, start worker processes, and forward requests.
-- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`
-- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery and download, ONNX runtime helpers, URL fetch
+- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/paths.ts`
+- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery and download, ONNX runtime helpers, URL fetch, harness-scoped storage paths, announcement versioning
 - Depends on: Node child-process APIs, GitHub releases, per-host logger adapters (via `setActiveLogger`)
 - Used by: `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` (both import from `@cortexkit/aft-bridge`)
 

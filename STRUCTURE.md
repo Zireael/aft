@@ -98,7 +98,7 @@ opencode-aft/
 **`packages/aft-bridge/`:**
 - Purpose: Share NDJSON bridge transport, binary resolution, ONNX runtime helpers, and URL fetch across all harness adapters.
 - Contains: `src/` TypeScript sources, tests, package manifest
-- Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/url-fetch.ts`
+- Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/url-fetch.ts`, `packages/aft-bridge/src/paths.ts`
 - Used by: `packages/opencode-plugin/` and `packages/pi-plugin/` (both import from `@cortexkit/aft-bridge`)
 
 **`packages/aft-cli/`:**

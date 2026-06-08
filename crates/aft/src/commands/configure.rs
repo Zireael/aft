@@ -346,12 +346,17 @@ fn parse_semantic_config(
             .into();
     }
     if let Some(raw) = obj.get("rerank_base_url") {
-        semantic.rerank_base_url = raw
+        let url = raw
             .as_str()
             .ok_or_else(|| "configure: semantic.rerank_base_url must be a string".to_string())?
             .trim()
-            .to_string()
-            .into();
+            .to_string();
+        semantic.rerank_base_url = if url.is_empty() {
+            None
+        } else {
+            crate::semantic_index::validate_base_url_no_ssrf(&url)?;
+            Some(url)
+        };
     }
     if let Some(raw) = obj.get("rerank_api_key_env") {
         semantic.rerank_api_key_env = raw
@@ -390,13 +395,28 @@ fn parse_semantic_config(
         semantic.jsonl_path = if raw.is_null() {
             None
         } else {
-            Some(
-                raw.as_str()
-                    .ok_or_else(|| {
-                        "configure: semantic.jsonl_path must be a string or null".to_string()
-                    })?
-                    .into(),
-            )
+            let s = raw
+                .as_str()
+                .ok_or_else(|| {
+                    "configure: semantic.jsonl_path must be a string or null".to_string()
+                })?
+                .trim();
+            if s.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(s);
+                let normalized = normalize_absolute_path(&path);
+                if normalized
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+                {
+                    return Err(
+                        "configure: semantic.jsonl_path must not escape via '..' traversal"
+                            .to_string(),
+                    );
+                }
+                Some(normalized)
+            }
         };
     }
     if let Some(raw) = obj.get("include_raw_queries") {
@@ -410,9 +430,11 @@ fn parse_semantic_config(
             .ok_or_else(|| "configure: semantic.include_snippets must be a boolean".to_string())?;
     }
     if let Some(raw) = obj.get("retention_days") {
-        semantic.retention_days = raw.as_u64().ok_or_else(|| {
+        let v = raw.as_u64().ok_or_else(|| {
             "configure: semantic.retention_days must be an unsigned integer".to_string()
-        })? as u32;
+        })?;
+        semantic.retention_days = u32::try_from(v)
+            .map_err(|_| "configure: semantic.retention_days is too large".to_string())?;
     }
     if let Some(raw) = obj.get("metrics_window_size") {
         let v = raw.as_u64().ok_or_else(|| {

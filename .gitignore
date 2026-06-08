@@ -92,7 +92,7 @@ benchmarks/aft-search/.bench/
 .beads/
 .qartez/
 .claude/
-omo/
+.omo/
 .kiro/
 .lean-ctx/
 agents.md
