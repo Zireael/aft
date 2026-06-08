@@ -93,9 +93,13 @@ benchmarks/aft-search/.bench/
 .qartez/
 .claude/
 .omo/
+.omo_/
 .kiro/
 .lean-ctx/
+.atl/
 agents.md
 beads-data-*.jsonl
 magic-context-*.md
 biome.json_
+aft-semantic-search-upgrade.json
+semantic-search-upgrade*.jsonl
