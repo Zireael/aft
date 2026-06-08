@@ -9010,6 +9010,181 @@ mod fingerprint_invalidation_tests {
         );
     }
 
+    /// Regression: oversized file with 101+ functions triggers actual split into
+    /// sub-groups. Verify every returned vector maps to the correct original chunk
+    /// and no dimension mismatch occurs. This is the core regression test for
+    /// aft-t6p.23.2 (split sub-groups previously reused file_path → false mismatch).
+    #[test]
+    fn contextualized_oversized_file_actual_split_maps_vectors_correctly() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // 101 functions × 3 lines each = 101 chunks → exceeds DEFAULT_MAX_CHUNKS_PER_DOCUMENT (100)
+        // This forces split_oversized_document to create 2 sub-groups.
+        let mut content = String::new();
+        for i in 0..101 {
+            content.push_str(&format!("pub fn func_{i:03}() -> i32 {{\n    {i}\n}}\n"));
+        }
+        let file = write_temp_file(&project_root, "big.rs", &content);
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "oversized split build should succeed: {:?}",
+            result.err()
+        );
+        let index = result.unwrap();
+
+        // Should have 101 entries (all functions embedded)
+        assert_eq!(index.len(), 101, "all 101 chunks should be embedded");
+
+        // Should have 2 sub-groups sent to embedder
+        let caps = captured.borrow();
+        let sub_groups: Vec<_> = caps
+            .iter()
+            .flat_map(|dc| dc.documents.iter())
+            .filter(|doc| doc.file_path == file)
+            .collect();
+        assert_eq!(sub_groups.len(), 2, "should split into 2 sub-groups");
+
+        // First sub-group has 100 chunks, second has 1
+        assert_eq!(
+            sub_groups[0].chunks.len(),
+            100,
+            "first sub-group: 100 chunks"
+        );
+        assert_eq!(sub_groups[1].chunks.len(), 1, "second sub-group: 1 chunk");
+
+        // Verify chunk content mapping: first sub-group's chunks are func_000..func_099
+        assert!(
+            sub_groups[0].chunks[0].contains("func_000"),
+            "first chunk should be func_000"
+        );
+        assert!(
+            sub_groups[0].chunks[99].contains("func_099"),
+            "last chunk of first sub-group should be func_099"
+        );
+        assert!(
+            sub_groups[1].chunks[0].contains("func_100"),
+            "second sub-group's chunk should be func_100"
+        );
+    }
+
+    /// Regression: split groups from the same source file must not trigger a
+    /// false full-file vector-count mismatch. Before aft-t6p.23.2, the
+    /// reconstruction loop looked up all chunks for a file_path and compared
+    /// against sub-group vector count → always failed for split files.
+    #[test]
+    fn contextualized_split_groups_same_file_no_false_mismatch() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // 101 functions → triggers split into 2 sub-groups (100 + 1)
+        let mut content = String::new();
+        for i in 0..101 {
+            content.push_str(&format!("pub fn split_{i:03}() -> i32 {{\n    {i}\n}}\n"));
+        }
+        let file = write_temp_file(&project_root, "splitfile.rs", &content);
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress = |_: usize, _: usize| {};
+
+        // Before the fix, this would fail with:
+        // "embedding response returned 100 vectors for 101 chunks in file splitfile.rs"
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "split groups should not cause false mismatch: {:?}",
+            result.err()
+        );
+    }
+
+    /// Retry exhaustion: all attempts return transient errors → group is skipped,
+    /// build continues with remaining groups, no crash.
+    #[test]
+    fn contextualized_retry_exhaustion_skips_group() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file_ok = write_temp_file(
+            &project_root,
+            "ok.rs",
+            "pub fn ok_func() -> i32 {\n    1\n}\n",
+        );
+        let file_fail = write_temp_file(
+            &project_root,
+            "fail.rs",
+            "pub fn fail_func() -> i32 {\n    2\n}\n",
+        );
+
+        let fail_attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let fail_clone = fail_attempts.clone();
+        let mut embed_fn = move |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            for doc in &dc.documents {
+                if doc.file_path.file_name().unwrap() == "fail.rs" {
+                    *fail_clone.borrow_mut() += 1;
+                    return Err("rate limit exceeded (429)".to_string());
+                }
+            }
+            // OK file succeeds
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; 3]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file_ok, file_fail],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+        );
+
+        // Build should succeed (partial — fail.rs skipped, ok.rs embedded)
+        assert!(
+            result.is_ok(),
+            "build should succeed with partial results: {:?}",
+            result.err()
+        );
+        let index = result.unwrap();
+
+        // Should have entries for ok.rs only (fail.rs skipped after retry exhaustion)
+        assert!(
+            !index.is_empty(),
+            "should have entries for the successful file"
+        );
+
+        // fail.rs should have been retried MAX_RETRIES + 1 times (initial + retries)
+        let attempts = *fail_attempts.borrow();
+        assert!(
+            attempts >= 4,
+            "should have attempted at least 4 times (1 initial + 3 retries), got {attempts}"
+        );
+    }
+
     // ── model2vec tests ─────────────────────────────────────────────
 
     /// Build a tiny model2vec-compatible fixture directory with `vocab_size` tokens and `dim` dimensions.
