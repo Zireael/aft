@@ -48,7 +48,7 @@ struct SemanticSearchParams {
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let _pipeline_timer = PhaseTimer::start();
-    let diagnostics_enabled = ctx.config().semantic.diagnostics_enabled;
+    let diagnostics_enabled = ctx.config().semantic.diagnostics_enabled();
 
     let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
         Ok(params) => params,
