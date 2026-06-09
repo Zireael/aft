@@ -1,0 +1,222 @@
+{
+  "timestamp": "2026-06-09T06:38:26.329Z",
+  "fixture_source": "semble-pilot",
+  "iterations": 2,
+  "index_timings": [
+    {
+      "repo": "axum",
+      "language": "rust",
+      "benchmark_root": "axum/src",
+      "cold_start_ms": 45.18280000000004,
+      "file_count": 79
+    },
+    {
+      "repo": "express",
+      "language": "javascript",
+      "benchmark_root": "lib",
+      "cold_start_ms": 31.1792999999999,
+      "file_count": 6
+    },
+    {
+      "repo": "pydantic",
+      "language": "python",
+      "benchmark_root": "pydantic",
+      "cold_start_ms": 32.12620000000004,
+      "file_count": 107
+    },
+    {
+      "repo": "serde",
+      "language": "rust",
+      "cold_start_ms": 46.295799999999986,
+      "file_count": 378
+    },
+    {
+      "repo": "gin",
+      "language": "go",
+      "cold_start_ms": 31.740699999999833,
+      "file_count": 161
+    }
+  ],
+  "query_timings": [
+    {
+      "query": "how are model fields declared and constrained",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 45.4991,
+      "result_count": 0
+    },
+    {
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 44.36469999999986,
+      "result_count": 0
+    },
+    {
+      "query": "response sending and content negotiation",
+      "repo_name": "express",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 45.27070000000003,
+      "result_count": 0
+    },
+    {
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 31.573300000000017,
+      "result_count": 0
+    },
+    {
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "repo_name": "axum",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 30.97290000000021,
+      "result_count": 0
+    },
+    {
+      "query": "Router",
+      "repo_name": "axum",
+      "category": "symbol",
+      "mode": "semantic",
+      "latency_ms": 31.523699999999963,
+      "result_count": 0
+    },
+    {
+      "query": "how middleware is applied globally and to route groups",
+      "repo_name": "gin",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 31.825400000000172,
+      "result_count": 0
+    },
+    {
+      "query": "model configuration and settings",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 32.68270000000007,
+      "result_count": 0
+    },
+    {
+      "query": "RouterGroup",
+      "repo_name": "gin",
+      "category": "symbol",
+      "mode": "semantic",
+      "latency_ms": 33.192999999999984,
+      "result_count": 0
+    },
+    {
+      "query": "Context",
+      "repo_name": "gin",
+      "category": "symbol",
+      "mode": "semantic",
+      "latency_ms": 42.456899999999905,
+      "result_count": 0
+    },
+    {
+      "query": "catching runtime panics in request handlers and returning 500",
+      "repo_name": "gin",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 45.86200000000008,
+      "result_count": 0
+    },
+    {
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 32.4375,
+      "result_count": 0
+    },
+    {
+      "query": "request API helpers and header access",
+      "repo_name": "express",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 44.8143,
+      "result_count": 0
+    },
+    {
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "repo_name": "axum",
+      "category": "semantic",
+      "mode": "semantic",
+      "latency_ms": 32.62440000000015,
+      "result_count": 0
+    },
+    {
+      "query": "Field",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "mode": "semantic",
+      "latency_ms": 32.98570000000018,
+      "result_count": 0
+    },
+    {
+      "query": "how is BaseModel defined and instantiated",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 31.991500000000087,
+      "result_count": 0
+    },
+    {
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 31.92489999999998,
+      "result_count": 0
+    },
+    {
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 32.53839999999991,
+      "result_count": 0
+    },
+    {
+      "query": "FromRequest",
+      "repo_name": "axum",
+      "category": "symbol",
+      "mode": "semantic",
+      "latency_ms": 33.53620000000001,
+      "result_count": 0
+    },
+    {
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "repo_name": "axum",
+      "category": "architecture",
+      "mode": "semantic",
+      "latency_ms": 32.22300000000041,
+      "result_count": 0
+    }
+  ],
+  "aggregate": {
+    "index": {
+      "mean_cold_start_ms": 37.30495999999996,
+      "total_cold_start_ms": 186.5247999999998,
+      "by_language": {
+        "rust": 91.47860000000003,
+        "javascript": 31.1792999999999,
+        "python": 32.12620000000004,
+        "go": 31.740699999999833
+      }
+    },
+    "query": {
+      "semantic": {
+        "mean_latency_ms": 36.01501500000005,
+        "p50_latency_ms": 32.68270000000007,
+        "p95_latency_ms": 45.86200000000008,
+        "query_count": 20
+      }
+    }
+  }
+}

@@ -1,0 +1,1345 @@
+{
+  "timestamp": "2026-06-09T06:43:26.344Z",
+  "fixture_source": "semble-pilot",
+  "k": 10,
+  "results": [
+    {
+      "mode": "lexical",
+      "query": "how axum Handler trait dispatches requests to async handler functions",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 108.80839999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Router path_router implementation for storing and matching routes",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 104.59520000000003,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 100.9959,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 102.0113,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 101.86490000000003,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 93.83349999999996,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how axum maps Tower middleware layers onto the router",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 79.18470000000002,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Router",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 81.84699999999998,
+      "results": [
+        {
+          "file": ".\\json.rs",
+          "line": 37
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 51
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 52
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 69
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 91
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 92
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 237
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 248
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 264
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 279
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "IntoResponse",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 94.00870000000009,
+      "results": [
+        {
+          "file": ".\\extension.rs",
+          "line": 1
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 5
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 57
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 117
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 129
+        },
+        {
+          "file": ".\\form.rs",
+          "line": 3
+        },
+        {
+          "file": ".\\form.rs",
+          "line": 107
+        },
+        {
+          "file": ".\\form.rs",
+          "line": 122
+        },
+        {
+          "file": ".\\lib.rs",
+          "line": 101
+        },
+        {
+          "file": ".\\lib.rs",
+          "line": 327
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "FromRequest",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 83.44179999999994,
+      "results": [
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 4
+        },
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 164
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 2
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 3
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 99
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 116
+        },
+        {
+          "file": ".\\json.rs",
+          "line": 161
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 2
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 4
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 83
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "application initialization and default configuration",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 88.9455999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "request API helpers and header access",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 84.04669999999987,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "response sending and content negotiation",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 73.16969999999992,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "response",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 71.35410000000002,
+      "results": [
+        {
+          "file": ".\\express.js",
+          "line": 21
+        },
+        {
+          "file": ".\\express.js",
+          "line": 49
+        },
+        {
+          "file": ".\\express.js",
+          "line": 50
+        },
+        {
+          "file": ".\\express.js",
+          "line": 64
+        },
+        {
+          "file": ".\\application.js",
+          "line": 119
+        },
+        {
+          "file": ".\\application.js",
+          "line": 170
+        },
+        {
+          "file": ".\\application.js",
+          "line": 234
+        },
+        {
+          "file": ".\\response.js",
+          "line": 52
+        },
+        {
+          "file": ".\\response.js",
+          "line": 113
+        },
+        {
+          "file": ".\\response.js",
+          "line": 221
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.125,
+      "ndcg_at_k": 0.9055596987675978
+    },
+    {
+      "mode": "lexical",
+      "query": "how sub-applications are mounted with use() and path prefix stripping",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 88.15820000000008,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how express creates the app function and attaches prototype methods",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 73.4855,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "application",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 72.26600000000008,
+      "results": [
+        {
+          "file": ".\\express.js",
+          "line": 18
+        },
+        {
+          "file": ".\\express.js",
+          "line": 30
+        },
+        {
+          "file": ".\\express.js",
+          "line": 62
+        },
+        {
+          "file": ".\\utils.js",
+          "line": 64
+        },
+        {
+          "file": ".\\request.js",
+          "line": 91
+        },
+        {
+          "file": ".\\request.js",
+          "line": 102
+        },
+        {
+          "file": ".\\request.js",
+          "line": 109
+        },
+        {
+          "file": ".\\request.js",
+          "line": 110
+        },
+        {
+          "file": ".\\request.js",
+          "line": 112
+        },
+        {
+          "file": ".\\request.js",
+          "line": 117
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "res.send body encoding and ETag generation",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 72.44749999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how app.render resolves views and calls the template engine",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 82.68380000000002,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "view",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 70.1594,
+      "results": [
+        {
+          "file": ".\\view.js",
+          "line": 16
+        },
+        {
+          "file": ".\\view.js",
+          "line": 45
+        },
+        {
+          "file": ".\\view.js",
+          "line": 84
+        },
+        {
+          "file": ".\\view.js",
+          "line": 98
+        },
+        {
+          "file": ".\\application.js",
+          "line": 18
+        },
+        {
+          "file": ".\\application.js",
+          "line": 134
+        },
+        {
+          "file": ".\\application.js",
+          "line": 135
+        },
+        {
+          "file": ".\\application.js",
+          "line": 139
+        },
+        {
+          "file": ".\\application.js",
+          "line": 506
+        },
+        {
+          "file": ".\\application.js",
+          "line": 527
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 2.5616063116448506
+    },
+    {
+      "mode": "lexical",
+      "query": "how routes are grouped and registered",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 99.72029999999995,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "radix tree path matching",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 79.4661000000001,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 79.99420000000009,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 80.13660000000027,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 96.6560999999997,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Engine",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 80.44329999999991,
+      "results": [
+        {
+          "file": ".\\benchmarks_test.go",
+          "line": 148
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 526
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 530
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 618
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 683
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 720
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 729
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 791
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 1264
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 1452
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Context",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 90.78620000000001,
+      "results": [
+        {
+          "file": ".\\auth_test.go",
+          "line": 88
+        },
+        {
+          "file": ".\\auth_test.go",
+          "line": 106
+        },
+        {
+          "file": ".\\auth_test.go",
+          "line": 126
+        },
+        {
+          "file": ".\\auth_test.go",
+          "line": 145
+        },
+        {
+          "file": ".\\auth_test.go",
+          "line": 163
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 82
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 171
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 181
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 182
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 224
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "RouterGroup",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 99.8438000000001,
+      "results": [
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 310
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 531
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 701
+        },
+        {
+          "file": ".\\gin.go",
+          "line": 93
+        },
+        {
+          "file": ".\\gin.go",
+          "line": 205
+        },
+        {
+          "file": ".\\gin.go",
+          "line": 341
+        },
+        {
+          "file": ".\\ginS\\gins.go",
+          "line": 51
+        },
+        {
+          "file": ".\\routergroup.go",
+          "line": 18
+        },
+        {
+          "file": ".\\routergroup.go",
+          "line": 29
+        },
+        {
+          "file": ".\\routergroup.go",
+          "line": 53
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.125,
+      "ndcg_at_k": 0.9055596987675978
+    },
+    {
+      "mode": "lexical",
+      "query": "how middleware is applied globally and to route groups",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 79.04359999999997,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "catching runtime panics in request handlers and returning 500",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 82.13160000000016,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how is BaseModel defined and instantiated",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 82.22679999999991,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how are model fields declared and constrained",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 79.09749999999985,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "JSON schema generation from models",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 83.02869999999984,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "custom field and model validators",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 99.84820000000036,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "model configuration and settings",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 102.8766999999998,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "BaseModel",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 101.20109999999977,
+      "results": [
+        {
+          "file": ".\\dataclasses.py",
+          "line": 353
+        },
+        {
+          "file": ".\\config.py",
+          "line": 71
+        },
+        {
+          "file": ".\\config.py",
+          "line": 73
+        },
+        {
+          "file": ".\\config.py",
+          "line": 89
+        },
+        {
+          "file": ".\\config.py",
+          "line": 92
+        },
+        {
+          "file": ".\\config.py",
+          "line": 111
+        },
+        {
+          "file": ".\\config.py",
+          "line": 114
+        },
+        {
+          "file": ".\\config.py",
+          "line": 126
+        },
+        {
+          "file": ".\\config.py",
+          "line": 129
+        },
+        {
+          "file": ".\\config.py",
+          "line": 160
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "field_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 77.72290000000021,
+      "results": [
+        {
+          "file": ".\\deprecated\\decorator.py",
+          "line": 11
+        },
+        {
+          "file": ".\\deprecated\\decorator.py",
+          "line": 244
+        },
+        {
+          "file": ".\\deprecated\\decorator.py",
+          "line": 252
+        },
+        {
+          "file": ".\\deprecated\\decorator.py",
+          "line": 262
+        },
+        {
+          "file": ".\\deprecated\\decorator.py",
+          "line": 272
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 378
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 389
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 400
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 409
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 429
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.16666666666666666,
+      "ndcg_at_k": 1.5951002192089534
+    },
+    {
+      "mode": "lexical",
+      "query": "model_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 87.49699999999984,
+      "results": [
+        {
+          "file": ".\\functional_validators.py",
+          "line": 522
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 534
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 551
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 567
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 582
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 598
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 612
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 627
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 632
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 642
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 4.543559338088346
+    },
+    {
+      "mode": "lexical",
+      "query": "ConfigDict",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 78.63110000000006,
+      "results": [
+        {
+          "file": ".\\config.py",
+          "line": 20
+        },
+        {
+          "file": ".\\config.py",
+          "line": 36
+        },
+        {
+          "file": ".\\config.py",
+          "line": 71
+        },
+        {
+          "file": ".\\config.py",
+          "line": 74
+        },
+        {
+          "file": ".\\config.py",
+          "line": 89
+        },
+        {
+          "file": ".\\config.py",
+          "line": 95
+        },
+        {
+          "file": ".\\config.py",
+          "line": 111
+        },
+        {
+          "file": ".\\config.py",
+          "line": 117
+        },
+        {
+          "file": ".\\config.py",
+          "line": 126
+        },
+        {
+          "file": ".\\config.py",
+          "line": 134
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 4.543559338088346
+    },
+    {
+      "mode": "lexical",
+      "query": "Field",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 78.0889000000002,
+      "results": [
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 13
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 15
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 16
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 17
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 18
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 33
+        },
+        {
+          "file": ".\\dataclasses.py",
+          "line": 19
+        },
+        {
+          "file": ".\\dataclasses.py",
+          "line": 31
+        },
+        {
+          "file": ".\\dataclasses.py",
+          "line": 48
+        },
+        {
+          "file": ".\\dataclasses.py",
+          "line": 67
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 102.24269999999979,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 103.97740000000022,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 102.80480000000034,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 101.25579999999991,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 100.11230000000023,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 104.54019999999991,
+      "results": [
+        {
+          "file": ".\\README.md",
+          "line": 20
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36
+        },
+        {
+          "file": ".\\README.md",
+          "line": 38
+        },
+        {
+          "file": ".\\README.md",
+          "line": 51
+        },
+        {
+          "file": ".\\README.md",
+          "line": 53
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 11
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 19
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 21
+        },
+        {
+          "file": ".\\serde_derive\\Cargo.toml",
+          "line": 6
+        },
+        {
+          "file": ".\\serde\\Cargo.toml",
+          "line": 41
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 105.36920000000009,
+      "results": [
+        {
+          "file": ".\\README.md",
+          "line": 20
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36
+        },
+        {
+          "file": ".\\README.md",
+          "line": 38
+        },
+        {
+          "file": ".\\README.md",
+          "line": 51
+        },
+        {
+          "file": ".\\README.md",
+          "line": 53
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 11
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 19
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 21
+        },
+        {
+          "file": ".\\serde\\Cargo.toml",
+          "line": 41
+        },
+        {
+          "file": ".\\serde_derive\\Cargo.toml",
+          "line": 6
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 103.96279999999933,
+      "results": [
+        {
+          "file": ".\\serde_core\\src\\crate_root.rs",
+          "line": 146
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 14
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 36
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 60
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1023
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1182
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1200
+        },
+        {
+          "file": ".\\serde\\src\\lib.rs",
+          "line": 253
+        },
+        {
+          "file": ".\\serde_core\\src\\ser\\fmt.rs",
+          "line": 2
+        },
+        {
+          "file": ".\\serde_core\\src\\ser\\fmt.rs",
+          "line": 38
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 108.97710000000006,
+      "results": [
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 1
+        },
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 8
+        },
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 11
+        },
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 13
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 13
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2436
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2438
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2454
+        },
+        {
+          "file": ".\\serde_core\\src\\de\\ignored_any.rs",
+          "line": 4
+        },
+        {
+          "file": ".\\serde_core\\src\\de\\ignored_any.rs",
+          "line": 15
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 98.9349000000002,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    }
+  ],
+  "aggregate": {
+    "lexical": {
+      "recall": 0.12,
+      "mrr": 0.06833333333333334,
+      "ndcg": 0.3010988920913138,
+      "latency_ms": 89.958516,
+      "count": 50
+    }
+  },
+  "category_winners": [
+    {
+      "category": "architecture",
+      "best_mode": "lexical",
+      "best_recall": 0,
+      "modes": {
+        "lexical": {
+          "recall": 0,
+          "mrr": 0,
+          "ndcg": 0,
+          "latency_ms": 93.24923000000001
+        }
+      }
+    },
+    {
+      "category": "semantic",
+      "best_mode": "lexical",
+      "best_recall": 0,
+      "modes": {
+        "lexical": {
+          "recall": 0,
+          "mrr": 0,
+          "ndcg": 0,
+          "latency_ms": 86.90005000000002
+        }
+      }
+    },
+    {
+      "category": "symbol",
+      "best_mode": "lexical",
+      "best_recall": 0.3333333333333333,
+      "modes": {
+        "lexical": {
+          "recall": 0.3333333333333333,
+          "mrr": 0.18981481481481483,
+          "ndcg": 0.8363858113647606,
+          "latency_ms": 88.34114444444442
+        }
+      }
+    }
+  ]
+}

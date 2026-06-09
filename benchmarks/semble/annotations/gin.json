@@ -1,0 +1,62 @@
+[
+  {
+    "query": "how routes are grouped and registered",
+    "relevant": ["routergroup.go"],
+    "secondary": ["gin.go"],
+    "category": "architecture"
+  },
+  {
+    "query": "radix tree path matching",
+    "relevant": ["tree.go"],
+    "secondary": [],
+    "category": "semantic"
+  },
+  {
+    "query": "request context lifecycle and helpers",
+    "relevant": ["context.go"],
+    "secondary": [],
+    "category": "semantic"
+  },
+  {
+    "query": "JSON request binding and validation",
+    "relevant": ["binding/json.go"],
+    "secondary": ["binding/default_validator.go"],
+    "category": "architecture"
+  },
+  {
+    "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+    "relevant": ["gin.go"],
+    "secondary": ["routergroup.go", "context.go"],
+    "category": "architecture"
+  },
+  {
+    "query": "Engine",
+    "relevant": ["gin.go"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "Context",
+    "relevant": ["context.go"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "RouterGroup",
+    "relevant": ["routergroup.go"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "how middleware is applied globally and to route groups",
+    "relevant": ["routergroup.go"],
+    "secondary": ["gin.go"],
+    "category": "architecture"
+  },
+  {
+    "query": "catching runtime panics in request handlers and returning 500",
+    "relevant": ["recovery.go"],
+    "secondary": [],
+    "category": "semantic"
+  }
+]

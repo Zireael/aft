@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/cortexkit/aft/blob/main/benchmarks/semble/schema.json",
+  "title": "AFT Semble-compatible benchmark fixture",
+  "description": "Schema for benchmark fixtures adapted from Semble annotations. Preserves Semble fields while adding AFT provenance metadata.",
+  "type": "object",
+  "required": ["schema_version", "repos", "annotations"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Fixture schema version. Bump for breaking changes."
+    },
+    "source": {
+      "type": "object",
+      "description": "Provenance metadata for the fixture set.",
+      "properties": {
+        "name": { "type": "string", "description": "Human-readable fixture set name (e.g. 'semble-pilot')" },
+        "upstream": { "type": "string", "description": "URL of the upstream data source" },
+        "imported_at": { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp of import" },
+        "importer_version": { "type": "string", "description": "Version of the AFT importer that created this fixture" }
+      },
+      "required": ["name", "upstream"]
+    },
+    "repos": {
+      "type": "array",
+      "description": "Repository manifests defining the benchmark corpus.",
+      "items": { "$ref": "#/$defs/Repo" }
+    },
+    "annotations": {
+      "type": "array",
+      "description": "Query annotations with relevance judgments.",
+      "items": { "$ref": "#/$defs/Annotation" }
+    }
+  },
+  "$defs": {
+    "Repo": {
+      "type": "object",
+      "required": ["name", "language", "url", "revision"],
+      "properties": {
+        "name": { "type": "string", "description": "Short repo identifier (e.g. 'axum')" },
+        "language": { "type": "string", "description": "Primary programming language" },
+        "url": { "type": "string", "format": "uri", "description": "Git clone URL" },
+        "revision": { "type": "string", "description": "Pinned commit SHA" },
+        "benchmark_root": {
+          "type": ["string", "null"],
+          "description": "Relative path to the code root within the repo. null = repo root."
+        }
+      }
+    },
+    "Annotation": {
+      "type": "object",
+      "required": ["query", "relevant", "category", "repo_name"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1, "description": "Natural language or symbol query" },
+        "relevant": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Primary relevance targets. Strings are full-file paths; objects specify line ranges.",
+          "items": { "$ref": "#/$defs/Target" }
+        },
+        "secondary": {
+          "type": "array",
+          "default": [],
+          "description": "Secondary relevance targets (lower weight in evaluation).",
+          "items": { "$ref": "#/$defs/Target" }
+        },
+        "category": {
+          "type": "string",
+          "enum": ["symbol", "semantic", "architecture"],
+          "description": "Query category: symbol = exact name lookup, semantic = implementation search, architecture = design/structure"
+        },
+        "repo_name": {
+          "type": "string",
+          "description": "Must match a repo.name in the repos array"
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional tags for filtering (e.g. 'rust', 'web-framework')"
+        }
+      }
+    },
+    "Target": {
+      "description": "A relevance target: either a full-file path (string) or a line-range within a file (object).",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Full file path relative to benchmark_root"
+        },
+        {
+          "type": "object",
+          "required": ["path", "start_line", "end_line"],
+          "properties": {
+            "path": { "type": "string", "description": "File path relative to benchmark_root" },
+            "start_line": { "type": "integer", "minimum": 1, "description": "1-indexed inclusive start line" },
+            "end_line": { "type": "integer", "minimum": 1, "description": "1-indexed inclusive end line" }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,2265 @@
+{
+  "timestamp": "2026-06-09T06:42:01.073Z",
+  "fixture_source": "semble-pilot",
+  "budgets": [
+    100,
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    50000
+  ],
+  "results": [
+    {
+      "query": "how axum Handler trait dispatches requests to async handler functions",
+      "repo_name": "axum",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 93.98700000000001
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 86.24289999999999
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 84.62270000000001
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 86.24270000000001
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 89.33019999999999
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 82.0512
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 77.63069999999993
+        }
+      ]
+    },
+    {
+      "query": "Router path_router implementation for storing and matching routes",
+      "repo_name": "axum",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 76.05740000000003
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 79.82999999999993
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 79.75639999999999
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 80.03539999999998
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 89.20460000000003
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 77.35619999999994
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 78.04420000000005
+        }
+      ]
+    },
+    {
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "repo_name": "axum",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 76.4674
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 76.37180000000012
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 78.16179999999986
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 78.43329999999992
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 91.08579999999984
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 77.97959999999989
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 75.42890000000011
+        }
+      ]
+    },
+    {
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "repo_name": "axum",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 89.53600000000006
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 77.34010000000012
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 79.27850000000012
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 76.1893
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 79.41210000000001
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 77.36549999999988
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 79.55780000000004
+        }
+      ]
+    },
+    {
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "repo_name": "axum",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 76.0043999999998
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 79.07850000000008
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 76.99179999999978
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 76.70969999999988
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 77.10880000000043
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 86.24609999999984
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 85.68949999999995
+        }
+      ]
+    },
+    {
+      "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
+      "repo_name": "axum",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 77.60270000000037
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 76.0974000000001
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 78.5016999999998
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 89.04470000000038
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 76.36859999999979
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 78.93889999999965
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 78.75839999999971
+        }
+      ]
+    },
+    {
+      "query": "how axum maps Tower middleware layers onto the router",
+      "repo_name": "axum",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 79.0027
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 80.91919999999982
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 78.31629999999996
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 75.60189999999966
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 77.19999999999982
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 79.03539999999975
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 80.85519999999997
+        }
+      ]
+    },
+    {
+      "query": "Router",
+      "repo_name": "axum",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 77.86389999999983
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 78.23470000000043
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 80.55020000000059
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 78.17139999999927
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.16759999999977
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 86.7512999999999
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 81.40970000000016
+        }
+      ]
+    },
+    {
+      "query": "IntoResponse",
+      "repo_name": "axum",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 88.39289999999983
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 88.8118999999997
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 77.96559999999954
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 76.70579999999973
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 89.86349999999948
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 79.69949999999972
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 75.91710000000057
+        }
+      ]
+    },
+    {
+      "query": "FromRequest",
+      "repo_name": "axum",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 82.01069999999982
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 76.48790000000008
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 87.76289999999972
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 85.27900000000045
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 91.54939999999988
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 77.98890000000029
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 77.23250000000007
+        }
+      ]
+    },
+    {
+      "query": "application initialization and default configuration",
+      "repo_name": "express",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 82.29240000000027
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 96.3732
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 73.57790000000023
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 73.58500000000004
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 72.32570000000032
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 84.29590000000007
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 71.43029999999999
+        }
+      ]
+    },
+    {
+      "query": "request API helpers and header access",
+      "repo_name": "express",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 71.71649999999954
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 71.46560000000045
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 81.14750000000004
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 69.13959999999952
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 72.3132000000005
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 70.28060000000005
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 70.40429999999924
+        }
+      ]
+    },
+    {
+      "query": "response sending and content negotiation",
+      "repo_name": "express",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 69.35980000000018
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 72.09969999999976
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 71.74449999999979
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 72.85220000000027
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 70.95949999999993
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 80.11020000000008
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 72.23729999999978
+        }
+      ]
+    },
+    {
+      "query": "response",
+      "repo_name": "express",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 68.65279999999984
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 70.58719999999994
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 84.82459999999992
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 71.90380000000005
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 83.00969999999961
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 70.30619999999999
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 68.46609999999964
+        }
+      ]
+    },
+    {
+      "query": "how sub-applications are mounted with use() and path prefix stripping",
+      "repo_name": "express",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 71.97720000000027
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 71.14450000000033
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 83.30360000000019
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 78.06700000000001
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 74.61620000000039
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 73.6935999999996
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 71.67519999999968
+        }
+      ]
+    },
+    {
+      "query": "how express creates the app function and attaches prototype methods",
+      "repo_name": "express",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 72.20930000000044
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 70.29140000000007
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 71.73029999999926
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 68.83840000000055
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 69.1296999999995
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 73.72679999999855
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 69.70949999999903
+        }
+      ]
+    },
+    {
+      "query": "application",
+      "repo_name": "express",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 1,
+          "latency_ms": 68.78600000000006
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 73.63500000000022
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 71.31660000000011
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 69.67770000000019
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 73.67109999999957
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 72.85519999999997
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 72.43409999999858
+        }
+      ]
+    },
+    {
+      "query": "res.send body encoding and ETag generation",
+      "repo_name": "express",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 80.11470000000008
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 71.41109999999935
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 70.44419999999991
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 71.22700000000077
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 71.8645000000015
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 71.4411
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 73.40110000000095
+        }
+      ]
+    },
+    {
+      "query": "how app.render resolves views and calls the template engine",
+      "repo_name": "express",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 72.03330000000096
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 72.3197999999993
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 71.09909999999945
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 69.33460000000014
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 74.96240000000034
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 71.46949999999924
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 70.33339999999953
+        }
+      ]
+    },
+    {
+      "query": "view",
+      "repo_name": "express",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 70.11719999999877
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 73.6919999999991
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 71.83679999999913
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 71.93319999999949
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 70.56590000000142
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 70.79310000000078
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 71.63760000000002
+        }
+      ]
+    },
+    {
+      "query": "how routes are grouped and registered",
+      "repo_name": "gin",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 84.2465000000011
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 80.64739999999983
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 80.97379999999976
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 81.46630000000005
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 80.84020000000055
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 89.14149999999972
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 80.29850000000079
+        }
+      ]
+    },
+    {
+      "query": "radix tree path matching",
+      "repo_name": "gin",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 77.3020000000015
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 81.69390000000021
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 80.06059999999889
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 77.70539999999892
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.58249999999862
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 79.61759999999958
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 79.4971999999998
+        }
+      ]
+    },
+    {
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 80.64649999999892
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 78.08499999999913
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 80.1869999999999
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 80.82650000000103
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.6214
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 79.5596000000005
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 79.78579999999965
+        }
+      ]
+    },
+    {
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 92.57229999999981
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 80.59729999999945
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 78.82760000000053
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 83.36029999999846
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 79.42840000000069
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 84.66759999999886
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 78.83719999999994
+        }
+      ]
+    },
+    {
+      "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+      "repo_name": "gin",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 82.81450000000041
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 78.90030000000115
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 80.83869999999843
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 86.23329999999987
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.15779999999904
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 77.10260000000017
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 78.57569999999942
+        }
+      ]
+    },
+    {
+      "query": "Engine",
+      "repo_name": "gin",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 80.19690000000082
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 89.29390000000058
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 94.23139999999876
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 78.90530000000035
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 80.52289999999994
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 79.23750000000109
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 80.71700000000055
+        }
+      ]
+    },
+    {
+      "query": "Context",
+      "repo_name": "gin",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 89.95429999999942
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 95.03429999999935
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 78.72649999999885
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 80.79410000000098
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 84.07470000000103
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 81.20660000000134
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 79.85859999999957
+        }
+      ]
+    },
+    {
+      "query": "RouterGroup",
+      "repo_name": "gin",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 78.46749999999884
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 83.10800000000017
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 81.25820000000022
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 79.55479999999989
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 78.50799999999981
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 77.83020000000033
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 81.00039999999899
+        }
+      ]
+    },
+    {
+      "query": "how middleware is applied globally and to route groups",
+      "repo_name": "gin",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 79.28139999999985
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 81.39209999999912
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 85.04839999999967
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 94.75470000000132
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.72339999999895
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 77.82469999999921
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 78.42929999999978
+        }
+      ]
+    },
+    {
+      "query": "catching runtime panics in request handlers and returning 500",
+      "repo_name": "gin",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 82.57589999999982
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 93.35789999999906
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 101.14470000000074
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 94.30099999999948
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 77.59009999999944
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 80.1909999999989
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 81.19350000000122
+        }
+      ]
+    },
+    {
+      "query": "how is BaseModel defined and instantiated",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 81.196899999999
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 89.92320000000109
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 75.70790000000125
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 77.90829999999914
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 82.22980000000098
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 83.90780000000086
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 85.39199999999983
+        }
+      ]
+    },
+    {
+      "query": "how are model fields declared and constrained",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 80.60269999999946
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 77.91860000000088
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 79.6102000000028
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 82.20270000000164
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 85.64289999999892
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 80.4298000000017
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 79.27699999999822
+        }
+      ]
+    },
+    {
+      "query": "JSON schema generation from models",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 77.35380000000077
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 78.33410000000003
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 91.16580000000249
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 92.68019999999888
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 78.60399999999936
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 81.4369000000006
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 79.8781999999992
+        }
+      ]
+    },
+    {
+      "query": "custom field and model validators",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 90.64990000000034
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 79.92380000000048
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 76.90250000000015
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 80.61839999999938
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 80.88669999999911
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 79.96899999999732
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 87.42540000000008
+        }
+      ]
+    },
+    {
+      "query": "model configuration and settings",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 94.75920000000042
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 82.76919999999882
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 77.65400000000227
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 79.72460000000137
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 77.58130000000165
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 93.20500000000175
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 92.58569999999963
+        }
+      ]
+    },
+    {
+      "query": "BaseModel",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 78.81460000000152
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 79.9935000000005
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 78.74189999999726
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 77.30140000000029
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 93.93029999999999
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 106.26629999999932
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 96.01499999999942
+        }
+      ]
+    },
+    {
+      "query": "field_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 80.91820000000007
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 81.51399999999921
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 77.76850000000195
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 80.50800000000163
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 89.59419999999955
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 94.14879999999903
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 79.95560000000114
+        }
+      ]
+    },
+    {
+      "query": "model_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 1,
+          "latency_ms": 78.36390000000029
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 82.71160000000236
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 80.23430000000008
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 88.6942999999992
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 78.48410000000149
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 81.33230000000185
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 79.60659999999916
+        }
+      ]
+    },
+    {
+      "query": "ConfigDict",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 1,
+          "latency_ms": 81.2551999999996
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 86.40409999999974
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 94.71090000000186
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 100.54490000000078
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 83.25970000000234
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 79.35719999999856
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 80.69440000000031
+        }
+      ]
+    },
+    {
+      "query": "Field",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 78.12669999999707
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 91.21839999999793
+        },
+        {
+          "budget": 1000,
+          "recall": 1,
+          "latency_ms": 97.53030000000217
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 82.76139999999941
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 82.0086999999985
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 78.93660000000091
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 77.96019999999771
+        }
+      ]
+    },
+    {
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 112.23709999999846
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 102.56880000000092
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 113.58989999999903
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 102.5666999999994
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 104.57749999999942
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 102.15980000000127
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 108.43049999999857
+        }
+      ]
+    },
+    {
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 107.97040000000197
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 104.55630000000019
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 102.31820000000153
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 104.78830000000016
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 104.16290000000299
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 105.46200000000317
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 101.0051999999996
+        }
+      ]
+    },
+    {
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 104.54559999999765
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 119.59180000000197
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 108.39180000000124
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 100.71800000000076
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 103.03110000000015
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 104.34769999999844
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 104.58139999999912
+        }
+      ]
+    },
+    {
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 107.53150000000096
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 106.7990000000027
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 102.97769999999946
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 108.04639999999927
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 110.9314000000013
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 105.64040000000023
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 101.98409999999785
+        }
+      ]
+    },
+    {
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 106.43929999999818
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 103.51949999999852
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 104.45599999999831
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 98.56039999999848
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 109.05500000000029
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 103.67889999999898
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 104.24799999999959
+        }
+      ]
+    },
+    {
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 102.377199999999
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 106.63440000000264
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 104.68019999999888
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 105.1166000000012
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 104.91609999999855
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 117.89600000000064
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 107.30079999999725
+        }
+      ]
+    },
+    {
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 104.09790000000066
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 104.22639999999956
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 106.48939999999857
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 111.3788999999997
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 106.08819999999832
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 101.69629999999961
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 104.03050000000076
+        }
+      ]
+    },
+    {
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 105.8231999999989
+        },
+        {
+          "budget": 500,
+          "recall": 1,
+          "latency_ms": 102.53080000000045
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 102.59479999999894
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 102.53410000000076
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 107.65369999999893
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 111.6297999999988
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 105.92380000000048
+        }
+      ]
+    },
+    {
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 104.26580000000104
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 104.50520000000324
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 100.34220000000278
+        },
+        {
+          "budget": 2000,
+          "recall": 1,
+          "latency_ms": 103.15980000000127
+        },
+        {
+          "budget": 5000,
+          "recall": 1,
+          "latency_ms": 101.05069999999978
+        },
+        {
+          "budget": 10000,
+          "recall": 1,
+          "latency_ms": 106.29379999999946
+        },
+        {
+          "budget": 50000,
+          "recall": 1,
+          "latency_ms": 105.80529999999999
+        }
+      ]
+    },
+    {
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "budget_curve": [
+        {
+          "budget": 100,
+          "recall": 0,
+          "latency_ms": 105.4487999999983
+        },
+        {
+          "budget": 500,
+          "recall": 0,
+          "latency_ms": 119.53850000000239
+        },
+        {
+          "budget": 1000,
+          "recall": 0,
+          "latency_ms": 117.42719999999827
+        },
+        {
+          "budget": 2000,
+          "recall": 0,
+          "latency_ms": 104.02170000000115
+        },
+        {
+          "budget": 5000,
+          "recall": 0,
+          "latency_ms": 107.69150000000081
+        },
+        {
+          "budget": 10000,
+          "recall": 0,
+          "latency_ms": 107.36399999999776
+        },
+        {
+          "budget": 50000,
+          "recall": 0,
+          "latency_ms": 103.55270000000019
+        }
+      ]
+    }
+  ],
+  "aggregate_curve": [
+    {
+      "budget": 100,
+      "recall": 0.06,
+      "latency_ms": 85.10039999999988
+    },
+    {
+      "budget": 500,
+      "recall": 0.16,
+      "latency_ms": 85.79450400000022
+    },
+    {
+      "budget": 1000,
+      "recall": 0.22,
+      "latency_ms": 85.75047200000004
+    },
+    {
+      "budget": 2000,
+      "recall": 0.28,
+      "latency_ms": 84.81417000000009
+    },
+    {
+      "budget": 5000,
+      "recall": 0.3,
+      "latency_ms": 85.18275400000006
+    },
+    {
+      "budget": 10000,
+      "recall": 0.34,
+      "latency_ms": 85.47844199999994
+    },
+    {
+      "budget": 50000,
+      "recall": 0.36,
+      "latency_ms": 83.72196999999969
+    }
+  ],
+  "by_category": {
+    "architecture": [
+      {
+        "budget": 100,
+        "recall": 0,
+        "latency_ms": 88.37303499999987
+      },
+      {
+        "budget": 500,
+        "recall": 0,
+        "latency_ms": 88.6936150000004
+      },
+      {
+        "budget": 1000,
+        "recall": 0,
+        "latency_ms": 87.40781499999994
+      },
+      {
+        "budget": 2000,
+        "recall": 0,
+        "latency_ms": 87.24412500000003
+      },
+      {
+        "budget": 5000,
+        "recall": 0,
+        "latency_ms": 87.46996500000023
+      },
+      {
+        "budget": 10000,
+        "recall": 0,
+        "latency_ms": 87.50641999999986
+      },
+      {
+        "budget": 50000,
+        "recall": 0,
+        "latency_ms": 85.26337499999954
+      }
+    ],
+    "semantic": [
+      {
+        "budget": 100,
+        "recall": 0,
+        "latency_ms": 80.75620000000013
+      },
+      {
+        "budget": 500,
+        "recall": 0,
+        "latency_ms": 78.93579999999976
+      },
+      {
+        "budget": 1000,
+        "recall": 0,
+        "latency_ms": 80.65016666666702
+      },
+      {
+        "budget": 2000,
+        "recall": 0,
+        "latency_ms": 79.2417916666666
+      },
+      {
+        "budget": 5000,
+        "recall": 0,
+        "latency_ms": 77.73499166666666
+      },
+      {
+        "budget": 10000,
+        "recall": 0,
+        "latency_ms": 79.13067499999987
+      },
+      {
+        "budget": 50000,
+        "recall": 0,
+        "latency_ms": 79.57214166666664
+      }
+    ],
+    "symbol": [
+      {
+        "budget": 100,
+        "recall": 0.16666666666666666,
+        "latency_ms": 84.36027222222197
+      },
+      {
+        "budget": 500,
+        "recall": 0.4444444444444444,
+        "latency_ms": 87.14573888888918
+      },
+      {
+        "budget": 1000,
+        "recall": 0.6111111111111112,
+        "latency_ms": 87.3091833333333
+      },
+      {
+        "budget": 2000,
+        "recall": 0.7777777777777778,
+        "latency_ms": 85.82913888888915
+      },
+      {
+        "budget": 5000,
+        "recall": 0.8333333333333334,
+        "latency_ms": 87.60658333333322
+      },
+      {
+        "budget": 10000,
+        "recall": 0.9444444444444444,
+        "latency_ms": 87.45697777777787
+      },
+      {
+        "budget": 50000,
+        "recall": 1,
+        "latency_ms": 84.77584999999969
+      }
+    ]
+  }
+}

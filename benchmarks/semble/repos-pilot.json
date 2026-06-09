@@ -1,0 +1,35 @@
+[
+  {
+    "name": "axum",
+    "language": "rust",
+    "url": "https://github.com/tokio-rs/axum.git",
+    "revision": "309d1bd9530eec2217134cb262760af1df42ee3b",
+    "benchmark_root": "axum/src"
+  },
+  {
+    "name": "express",
+    "language": "javascript",
+    "url": "https://github.com/expressjs/express.git",
+    "revision": "8e022edc9185f540a3fcecaf5e56b850d919cdac",
+    "benchmark_root": "lib"
+  },
+  {
+    "name": "pydantic",
+    "language": "python",
+    "url": "https://github.com/pydantic/pydantic.git",
+    "revision": "82c15f0ba8a9f8d8d6ba595df73ad20e2ee2eccf",
+    "benchmark_root": "pydantic"
+  },
+  {
+    "name": "serde",
+    "language": "rust",
+    "url": "https://github.com/serde-rs/serde.git",
+    "revision": "fa7da4a93567ed347ad0735c28e439fca688ef26"
+  },
+  {
+    "name": "gin",
+    "language": "go",
+    "url": "https://github.com/gin-gonic/gin.git",
+    "revision": "d3ffc9985281dcf4d3bef604cce4e662b1a327a6"
+  }
+]

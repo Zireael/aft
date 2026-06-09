@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-06-09T06:44:36.445Z",
+  "threshold": 0.05,
+  "passed": true,
+  "results": [
+    {
+      "mode": "lexical",
+      "baseline_recall": 0.1,
+      "current_recall": 0.1,
+      "recall_delta": 0,
+      "baseline_mrr": 0.049357142857142856,
+      "current_mrr": 0.049357142857142856,
+      "mrr_delta": 0,
+      "regression": false
+    }
+  ]
+}

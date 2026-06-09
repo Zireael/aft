@@ -1,0 +1,950 @@
+{
+  "timestamp": "2026-06-09T06:36:46.393Z",
+  "fixture_source": "semble-pilot",
+  "k": 5,
+  "total_queries": 50,
+  "results": [
+    {
+      "query": "how axum Handler trait dispatches requests to async handler functions",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 101.8885,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Router path_router implementation for storing and matching routes",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 90.07500000000002,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 91.85819999999998,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 93.40560000000005,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 87.75789999999995,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 78.42089999999996,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how axum maps Tower middleware layers onto the router",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 79.99080000000004,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Router",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 82.18629999999996,
+      "results": [
+        {
+          "file": ".\\boxed.rs",
+          "line": 9,
+          "match": "Router,"
+        },
+        {
+          "file": ".\\boxed.rs",
+          "line": 106,
+          "match": "pub(crate) struct MakeErasedRouter<S> {"
+        },
+        {
+          "file": ".\\boxed.rs",
+          "line": 107,
+          "match": "pub(crate) router: Router<S>,"
+        },
+        {
+          "file": ".\\boxed.rs",
+          "line": 108,
+          "match": "pub(crate) into_route: fn(Router<S>, S) -> Route,"
+        },
+        {
+          "file": ".\\boxed.rs",
+          "line": 111,
+          "match": "impl<S> ErasedIntoRoute<S, Infallible> for MakeErasedRouter<S>"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "IntoResponse",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 82.745,
+      "results": [
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 6,
+          "match": "response::{IntoResponse, Response},"
+        },
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 118,
+          "match": "S::Response: IntoResponse + Send,"
+        },
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 123,
+          "match": "Res: IntoResponse,"
+        },
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 158,
+          "match": "S::Response: IntoResponse + Send,"
+        },
+        {
+          "file": ".\\error_handling\\mod.rs",
+          "line": 163,
+          "match": "Res: IntoResponse,"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "FromRequest",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 87.30709999999999,
+      "results": [
+        {
+          "file": ".\\form.rs",
+          "line": 2,
+          "match": "use crate::extract::{rejection::*, FromRequest, RawForm};"
+        },
+        {
+          "file": ".\\form.rs",
+          "line": 73,
+          "match": "impl<T, S> FromRequest<S> for Form<T>"
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 2,
+          "match": "use axum_core::extract::OptionalFromRequestParts;"
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 4,
+          "match": "extract::FromRequestParts,"
+        },
+        {
+          "file": ".\\extension.rs",
+          "line": 83,
+          "match": "impl<T, S> FromRequestParts<S> for Extension<T>"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "application initialization and default configuration",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 71.85820000000001,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "request API helpers and header access",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 85.57550000000003,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "response sending and content negotiation",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 71.65910000000008,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "response",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 70.7202000000002,
+      "results": [
+        {
+          "file": ".\\response.js",
+          "line": 52,
+          "match": "* Set the HTTP status code for the response."
+        },
+        {
+          "file": ".\\response.js",
+          "line": 113,
+          "match": "* Send a response."
+        },
+        {
+          "file": ".\\response.js",
+          "line": 221,
+          "match": "* Send JSON response."
+        },
+        {
+          "file": ".\\response.js",
+          "line": 249,
+          "match": "* Send JSON response with JSONP callback support."
+        },
+        {
+          "file": ".\\response.js",
+          "line": 309,
+          "match": "* Sets the response status to `statusCode` and the body of the"
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "query": "how sub-applications are mounted with use() and path prefix stripping",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 70.3424,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how express creates the app function and attaches prototype methods",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 70.5492999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "application",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 72.13269999999989,
+      "results": [
+        {
+          "file": ".\\application.js",
+          "line": 17,
+          "match": "var debug = require('debug')('express:application');"
+        },
+        {
+          "file": ".\\application.js",
+          "line": 86,
+          "match": "* Initialize application configuration."
+        },
+        {
+          "file": ".\\application.js",
+          "line": 144,
+          "match": "* Dispatch a req, res pair into the application. Starts pipeline processing."
+        },
+        {
+          "file": ".\\application.js",
+          "line": 390,
+          "match": "* For example if the application was"
+        },
+        {
+          "file": ".\\application.js",
+          "line": 581,
+          "match": "* application (which is a `Function`) as its"
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "query": "res.send body encoding and ETag generation",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 72.58849999999984,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how app.render resolves views and calls the template engine",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 69.82399999999984,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "view",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 71.40840000000003,
+      "results": [
+        {
+          "file": ".\\view.js",
+          "line": 16,
+          "match": "var debug = require('debug')('express:view');"
+        },
+        {
+          "file": ".\\view.js",
+          "line": 45,
+          "match": "*   - `root` root path for view lookup"
+        },
+        {
+          "file": ".\\view.js",
+          "line": 84,
+          "match": "throw new Error('Module \"' + mod + '\" does not provide a view engine.')"
+        },
+        {
+          "file": ".\\view.js",
+          "line": 98,
+          "match": "* Lookup view by the given `name`"
+        },
+        {
+          "file": ".\\response.js",
+          "line": 882,
+          "match": "* Render `view` with the given `options` and optional callback `fn`."
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "query": "how routes are grouped and registered",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 79.26880000000006,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "radix tree path matching",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 75.60220000000004,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 95.17730000000006,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 92.81470000000013,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 80.27940000000012,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Engine",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 82.09090000000015,
+      "results": [
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 526,
+          "match": "- [NEW] Use specific `net.Listener` with `Engine.RunListener()` [#2023](https://github.com/gin-gonic/gin/pull/2023)"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 530,
+          "match": "- [FIX] `Engine.RunUnix()` now returns the error if it can't change the file mode [#2093](https://github.com/gin-gonic/gin/pull/2093)"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 618,
+          "match": "- [NEW] Improved support with App Engine"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 683,
+          "match": "- [FIX] Google App Engine integration. debugPrint does not use os.Stdout"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 720,
+          "match": "- [FIX] Context.Engine renamed to Context.engine"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Context",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 97.54019999999991,
+      "results": [
+        {
+          "file": ".\\context_test.go",
+          "line": 39,
+          "match": "var _ context.Context = (*Context)(nil)"
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 44,
+          "match": "// func (c *Context) File(filepath string) {"
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 45,
+          "match": "// func (c *Context) Negotiate(code int, config Negotiate) {"
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 46,
+          "match": "// BAD case: func (c *Context) Render(code int, render render.Render, obj ...any) {"
+        },
+        {
+          "file": ".\\context_test.go",
+          "line": 47,
+          "match": "// test that information is not leaked when reusing Contexts (using the Pool)"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "RouterGroup",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 92.54820000000018,
+      "results": [
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 310,
+          "match": "- RouterGroup.Handle regular match optimization of http method [#2685](https://github.com/gin-gonic/gin/pull/2685)"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 531,
+          "match": "- [FIX] `RouterGroup.StaticFS()` leaked files. Now it closes them. [#2118](https://github.com/gin-gonic/gin/pull/2118)"
+        },
+        {
+          "file": ".\\CHANGELOG.md",
+          "line": 701,
+          "match": "- [NEW] RouterGroup.BasePath is exposed"
+        },
+        {
+          "file": ".\\gin.go",
+          "line": 93,
+          "match": "RouterGroup"
+        },
+        {
+          "file": ".\\gin.go",
+          "line": 205,
+          "match": "RouterGroup: RouterGroup{"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how middleware is applied globally and to route groups",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 91.3110999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "catching runtime panics in request handlers and returning 500",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 82.63900000000012,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how is BaseModel defined and instantiated",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 83.11090000000013,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how are model fields declared and constrained",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 80.87580000000025,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "JSON schema generation from models",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 76.6911,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "custom field and model validators",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 87.82819999999992,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "model configuration and settings",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 88.97670000000016,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "BaseModel",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 76.33600000000024,
+      "results": [
+        {
+          "file": ".\\config.py",
+          "line": 71,
+          "match": "from pydantic import BaseModel, ConfigDict"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 73,
+          "match": "class User(BaseModel):"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 89,
+          "match": "from pydantic import BaseModel, ConfigDict, ValidationError"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 92,
+          "match": "class Model(BaseModel):"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 111,
+          "match": "from pydantic import BaseModel, ConfigDict"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "field_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 90.01980000000003,
+      "results": [
+        {
+          "file": ".\\functional_validators.py",
+          "line": 378,
+          "match": "def field_validator("
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 389,
+          "match": "def field_validator("
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 400,
+          "match": "def field_validator("
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 409,
+          "match": "def field_validator(  # noqa: D417"
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 429,
+          "match": "field_validator,"
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "query": "model_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 107.29639999999972,
+      "results": [
+        {
+          "file": ".\\deprecated\\class_validators.py",
+          "line": 200,
+          "match": "' You should migrate to Pydantic V2 style `@model_validator` validators,'"
+        },
+        {
+          "file": ".\\deprecated\\class_validators.py",
+          "line": 226,
+          "match": "' You should migrate to Pydantic V2 style `@model_validator` validators,'"
+        },
+        {
+          "file": ".\\deprecated\\class_validators.py",
+          "line": 242,
+          "match": "' Note that `@root_validator` is deprecated and should be replaced with `@model_validator`.',"
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 522,
+          "match": "\"\"\"`@model_validator` decorated function handler argument type. This is used when `mode='wrap'`.\"\"\""
+        },
+        {
+          "file": ".\\functional_validators.py",
+          "line": 534,
+          "match": "\"\"\"A `@model_validator` decorated function signature."
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25
+    },
+    {
+      "query": "ConfigDict",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 100.79739999999993,
+      "results": [
+        {
+          "file": ".\\config.py",
+          "line": 20,
+          "match": "__all__ = ('ConfigDict', 'with_config')"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 36,
+          "match": "class ConfigDict(TypedDict, total=False):"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 71,
+          "match": "from pydantic import BaseModel, ConfigDict"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 74,
+          "match": "model_config = ConfigDict(extra='ignore')  # (1)!"
+        },
+        {
+          "file": ".\\config.py",
+          "line": 89,
+          "match": "from pydantic import BaseModel, ConfigDict, ValidationError"
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "query": "Field",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 81.35429999999997,
+      "results": [
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 13,
+          "match": "CoreSchemaOrField = Union["
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 15,
+          "match": "core_schema.ModelField,"
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 16,
+          "match": "core_schema.DataclassField,"
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 17,
+          "match": "core_schema.TypedDictField,"
+        },
+        {
+          "file": ".\\annotated_handlers.py",
+          "line": 18,
+          "match": "core_schema.ComputedField,"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 103.85840000000007,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 98.60310000000027,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 103.27629999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 101.26489999999967,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 100.73949999999968,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 98.62750000000005,
+      "results": [
+        {
+          "file": ".\\crates-io.md",
+          "line": 11,
+          "match": "- [Setting up `#[derive(Serialize, Deserialize)]`](https://serde.rs/derive.html)"
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 19,
+          "match": "use serde::{Deserialize, Serialize};"
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 21,
+          "match": "#[derive(Serialize, Deserialize, Debug)]"
+        },
+        {
+          "file": ".\\README.md",
+          "line": 20,
+          "match": "- [Setting up `#[derive(Serialize, Deserialize)]`](https://serde.rs/derive.html)"
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36,
+          "match": "# The core APIs, including the Serialize and Deserialize traits. Always"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 101.74369999999999,
+      "results": [
+        {
+          "file": ".\\crates-io.md",
+          "line": 11,
+          "match": "- [Setting up `#[derive(Serialize, Deserialize)]`](https://serde.rs/derive.html)"
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 19,
+          "match": "use serde::{Deserialize, Serialize};"
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 21,
+          "match": "#[derive(Serialize, Deserialize, Debug)]"
+        },
+        {
+          "file": ".\\README.md",
+          "line": 20,
+          "match": "- [Setting up `#[derive(Serialize, Deserialize)]`](https://serde.rs/derive.html)"
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36,
+          "match": "# The core APIs, including the Serialize and Deserialize traits. Always"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 103.59839999999986,
+      "results": [
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 14,
+          "match": "use serde::ser::{Serialize, Serializer};"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 36,
+          "match": "S: Serializer;"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 60,
+          "match": "S: Serializer,"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1023,
+          "match": "S: Serializer,"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1182,
+          "match": "S: Serializer,"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 103.33739999999943,
+      "results": [
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 13,
+          "match": "use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, Unexpected, Visitor};"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2436,
+          "match": "struct AnyVisitor;"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2438,
+          "match": "impl<'de> Visitor<'de> for AnyVisitor {"
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2454,
+          "match": "deserializer.deserialize_any(AnyVisitor)"
+        },
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 1,
+          "match": "use serde::de::{Deserializer, Error, SeqAccess, Visitor};"
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 104.92200000000048,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0
+    }
+  ],
+  "aggregate": {
+    "mean_recall_at_k": 0.12,
+    "mean_mrr": 0.105,
+    "mean_latency_ms": 87.296464,
+    "p50_latency_ms": 87.75789999999995,
+    "p95_latency_ms": 103.85840000000007,
+    "by_category": {
+      "architecture": {
+        "recall": 0,
+        "mrr": 0,
+        "latency": 88.14121500000002
+      },
+      "semantic": {
+        "recall": 0,
+        "mrr": 0,
+        "latency": 83.35075000000003
+      },
+      "symbol": {
+        "recall": 0.3333333333333333,
+        "mrr": 0.2916666666666667,
+        "latency": 88.98832777777776
+      }
+    }
+  }
+}

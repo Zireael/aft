@@ -1,0 +1,62 @@
+[
+  {
+    "query": "Serialize and Serializer trait definitions",
+    "relevant": ["serde_core/src/ser/mod.rs"],
+    "secondary": [],
+    "category": "architecture"
+  },
+  {
+    "query": "Deserialize and Deserializer trait definitions",
+    "relevant": ["serde_core/src/de/mod.rs"],
+    "secondary": [],
+    "category": "architecture"
+  },
+  {
+    "query": "Visitor pattern for deserializer implementations",
+    "relevant": ["serde_core/src/de/mod.rs"],
+    "secondary": [],
+    "category": "architecture"
+  },
+  {
+    "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+    "relevant": ["serde_derive/src/ser.rs"],
+    "secondary": [],
+    "category": "architecture"
+  },
+  {
+    "query": "how derive macros generate Deserialize code for structs and enums",
+    "relevant": ["serde_derive/src/de.rs"],
+    "secondary": ["serde_derive/src/internals/ast.rs"],
+    "category": "architecture"
+  },
+  {
+    "query": "Serialize",
+    "relevant": ["serde_core/src/ser/mod.rs"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "Deserialize",
+    "relevant": ["serde_core/src/de/mod.rs"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "Serializer",
+    "relevant": ["serde_core/src/ser/mod.rs"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "Visitor",
+    "relevant": ["serde_core/src/de/mod.rs"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "how serde handles sequences and maps during serialization",
+    "relevant": ["serde_core/src/ser/mod.rs"],
+    "secondary": [],
+    "category": "architecture"
+  }
+]

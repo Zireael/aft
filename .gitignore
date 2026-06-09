@@ -103,3 +103,4 @@ magic-context-*.md
 biome.json_
 aft-semantic-search-upgrade.json
 semantic-search-upgrade*.jsonl
+.bench-cache/

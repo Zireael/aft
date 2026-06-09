@@ -1,0 +1,62 @@
+[
+  {
+    "query": "application initialization and default configuration",
+    "relevant": ["lib/application.js"],
+    "secondary": ["lib/express.js"],
+    "category": "architecture"
+  },
+  {
+    "query": "request API helpers and header access",
+    "relevant": ["lib/request.js"],
+    "secondary": [],
+    "category": "semantic"
+  },
+  {
+    "query": "response sending and content negotiation",
+    "relevant": ["lib/response.js"],
+    "secondary": [],
+    "category": "semantic"
+  },
+  {
+    "query": "response",
+    "relevant": ["lib/response.js"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "how sub-applications are mounted with use() and path prefix stripping",
+    "relevant": ["lib/application.js"],
+    "secondary": [],
+    "category": "architecture"
+  },
+  {
+    "query": "how express creates the app function and attaches prototype methods",
+    "relevant": ["lib/express.js"],
+    "secondary": ["lib/application.js"],
+    "category": "architecture"
+  },
+  {
+    "query": "application",
+    "relevant": ["lib/application.js"],
+    "secondary": [],
+    "category": "symbol"
+  },
+  {
+    "query": "res.send body encoding and ETag generation",
+    "relevant": [{"path": "lib/response.js", "start_line": 125, "end_line": 230}],
+    "secondary": [],
+    "category": "semantic"
+  },
+  {
+    "query": "how app.render resolves views and calls the template engine",
+    "relevant": [{"path": "lib/application.js", "start_line": 522, "end_line": 596}],
+    "secondary": ["lib/view.js"],
+    "category": "architecture"
+  },
+  {
+    "query": "view",
+    "relevant": ["lib/view.js"],
+    "secondary": [],
+    "category": "symbol"
+  }
+]

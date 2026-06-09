@@ -1,0 +1,693 @@
+{
+  "schema_version": 1,
+  "source": {
+    "name": "semble-pilot",
+    "upstream": "https://github.com/MinishLab/semble/tree/main/benchmarks",
+    "imported_at": "2026-06-09T06:24:26.314Z",
+    "importer_version": "0.1.0"
+  },
+  "repos": [
+    {
+      "name": "axum",
+      "language": "rust",
+      "url": "https://github.com/tokio-rs/axum.git",
+      "revision": "309d1bd9530eec2217134cb262760af1df42ee3b",
+      "benchmark_root": "axum/src"
+    },
+    {
+      "name": "express",
+      "language": "javascript",
+      "url": "https://github.com/expressjs/express.git",
+      "revision": "8e022edc9185f540a3fcecaf5e56b850d919cdac",
+      "benchmark_root": "lib"
+    },
+    {
+      "name": "pydantic",
+      "language": "python",
+      "url": "https://github.com/pydantic/pydantic.git",
+      "revision": "82c15f0ba8a9f8d8d6ba595df73ad20e2ee2eccf",
+      "benchmark_root": "pydantic"
+    },
+    {
+      "name": "serde",
+      "language": "rust",
+      "url": "https://github.com/serde-rs/serde.git",
+      "revision": "fa7da4a93567ed347ad0735c28e439fca688ef26"
+    },
+    {
+      "name": "gin",
+      "language": "go",
+      "url": "https://github.com/gin-gonic/gin.git",
+      "revision": "d3ffc9985281dcf4d3bef604cce4e662b1a327a6"
+    }
+  ],
+  "annotations": [
+    {
+      "query": "how axum Handler trait dispatches requests to async handler functions",
+      "relevant": [
+        {
+          "path": "axum/src/handler/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "Router path_router implementation for storing and matching routes",
+      "relevant": [
+        {
+          "path": "axum/src/routing/path_router.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "relevant": [
+        {
+          "path": "axum/src/extract/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "relevant": [
+        {
+          "path": "axum/src/json.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
+      "relevant": [
+        {
+          "path": "axum/src/routing/method_routing.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "how axum maps Tower middleware layers onto the router",
+      "relevant": [
+        {
+          "path": "axum/src/middleware/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "Router",
+      "relevant": [
+        {
+          "path": "axum/src/routing/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "IntoResponse",
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "FromRequest",
+      "relevant": [
+        {
+          "path": "axum/src/extract/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "axum",
+      "tags": []
+    },
+    {
+      "query": "application initialization and default configuration",
+      "relevant": [
+        {
+          "path": "lib/application.js"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "lib/express.js"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "request API helpers and header access",
+      "relevant": [
+        {
+          "path": "lib/request.js"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "response sending and content negotiation",
+      "relevant": [
+        {
+          "path": "lib/response.js"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "response",
+      "relevant": [
+        {
+          "path": "lib/response.js"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "how sub-applications are mounted with use() and path prefix stripping",
+      "relevant": [
+        {
+          "path": "lib/application.js"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "how express creates the app function and attaches prototype methods",
+      "relevant": [
+        {
+          "path": "lib/express.js"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "lib/application.js"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "application",
+      "relevant": [
+        {
+          "path": "lib/application.js"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "res.send body encoding and ETag generation",
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "start_line": 125,
+          "end_line": 230
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "how app.render resolves views and calls the template engine",
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "start_line": 522,
+          "end_line": 596
+        }
+      ],
+      "secondary": [
+        {
+          "path": "lib/view.js"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "view",
+      "relevant": [
+        {
+          "path": "lib/view.js"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "express",
+      "tags": []
+    },
+    {
+      "query": "how routes are grouped and registered",
+      "relevant": [
+        {
+          "path": "routergroup.go"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "gin.go"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "radix tree path matching",
+      "relevant": [
+        {
+          "path": "tree.go"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "request context lifecycle and helpers",
+      "relevant": [
+        {
+          "path": "context.go"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "JSON request binding and validation",
+      "relevant": [
+        {
+          "path": "binding/json.go"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "binding/default_validator.go"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+      "relevant": [
+        {
+          "path": "gin.go"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "routergroup.go"
+        },
+        {
+          "path": "context.go"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "Engine",
+      "relevant": [
+        {
+          "path": "gin.go"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "Context",
+      "relevant": [
+        {
+          "path": "context.go"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "RouterGroup",
+      "relevant": [
+        {
+          "path": "routergroup.go"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "how middleware is applied globally and to route groups",
+      "relevant": [
+        {
+          "path": "routergroup.go"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "gin.go"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "catching runtime panics in request handlers and returning 500",
+      "relevant": [
+        {
+          "path": "recovery.go"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "gin",
+      "tags": []
+    },
+    {
+      "query": "how is BaseModel defined and instantiated",
+      "relevant": [
+        {
+          "path": "pydantic/main.py"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "how are model fields declared and constrained",
+      "relevant": [
+        {
+          "path": "pydantic/fields.py"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "pydantic/types.py"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "JSON schema generation from models",
+      "relevant": [
+        {
+          "path": "pydantic/json_schema.py"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "custom field and model validators",
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "pydantic/class_validators.py"
+        }
+      ],
+      "category": "semantic",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "model configuration and settings",
+      "relevant": [
+        {
+          "path": "pydantic/config.py"
+        }
+      ],
+      "secondary": [],
+      "category": "semantic",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "BaseModel",
+      "relevant": [
+        {
+          "path": "pydantic/main.py"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "field_validator",
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "model_validator",
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "ConfigDict",
+      "relevant": [
+        {
+          "path": "pydantic/config.py"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "Field",
+      "relevant": [
+        {
+          "path": "pydantic/fields.py"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "pydantic",
+      "tags": []
+    },
+    {
+      "query": "Serialize and Serializer trait definitions",
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Deserialize and Deserializer trait definitions",
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Visitor pattern for deserializer implementations",
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "relevant": [
+        {
+          "path": "serde_derive/src/ser.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "relevant": [
+        {
+          "path": "serde_derive/src/de.rs"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "serde_derive/src/internals/ast.rs"
+        }
+      ],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Serialize",
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Deserialize",
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Serializer",
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "Visitor",
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "symbol",
+      "repo_name": "serde",
+      "tags": []
+    },
+    {
+      "query": "how serde handles sequences and maps during serialization",
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs"
+        }
+      ],
+      "secondary": [],
+      "category": "architecture",
+      "repo_name": "serde",
+      "tags": []
+    }
+  ]
+}
