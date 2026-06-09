@@ -332,10 +332,17 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let prompt_active = ctx.config().semantic.query_prompt_template.is_some();
 
     // Format diagnostics prefix for tool output.
+    // Deduplicate warnings for display — first occurrence visible,
+    // repeated occurrences within 60s suppressed. Full warnings still
+    // go to diagnostics recording below.
     let output_mode = ctx.config().semantic.output_mode;
+    let deduped_warnings = ctx
+        .semantic_warning_dedup()
+        .borrow_mut()
+        .filter_for_output(&warnings);
     let diagnostics_prefix = format_diagnostics_prefix(
         output_mode,
-        &warnings,
+        &deduped_warnings,
         pipeline_type,
         total_latency_ms,
         Some(score_stats),

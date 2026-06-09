@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Identifies which search pipeline path was taken for a single query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,6 +750,112 @@ fn format_warning_verbose(w: &SearchWarning) -> String {
     }
 }
 
+/// Bounded in-memory deduplication state for search warning output.
+///
+/// Tracks warning keys within a configurable time window. The first occurrence
+/// of a warning passes through; subsequent occurrences within the window are
+/// suppressed from tool-output text. After the window expires, the warning
+/// can appear again.
+///
+/// This struct does NOT affect diagnostics recording — `SearchDiagnostics`
+/// and JSONL logging always see the full, unsuppressed warnings list.
+#[derive(Debug)]
+pub struct WarningDedup {
+    /// Dedup window: warnings seen within this duration are suppressed.
+    window: Duration,
+    /// Warning key → (first_seen, occurrence_count).
+    seen: HashMap<String, (Instant, usize)>,
+}
+
+impl WarningDedup {
+    /// Create a new dedup state with the given time window.
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Filter warnings for tool-output display, suppressing duplicates.
+    ///
+    /// Returns a new `Vec` containing only warnings that should be shown:
+    /// - First occurrence of any warning key always passes through.
+    /// - Subsequent occurrences within the dedup window are suppressed.
+    /// - Occurrences after the window expires pass through again.
+    pub fn filter_for_output(&mut self, warnings: &[SearchWarning]) -> Vec<SearchWarning> {
+        let now = Instant::now();
+        let mut result = Vec::with_capacity(warnings.len());
+
+        for w in warnings {
+            let key = warning_dedup_key(w);
+            match self.seen.get(&key) {
+                Some((first_seen, count)) => {
+                    if now.duration_since(*first_seen) > self.window {
+                        // Window expired — treat as new occurrence.
+                        self.seen.insert(key, (now, 1));
+                        result.push(w.clone());
+                    } else if *count == 0 {
+                        // First occurrence within window — show it.
+                        self.seen.insert(key, (now, 1));
+                        result.push(w.clone());
+                    }
+                    // else: already shown within window — suppress.
+                }
+                None => {
+                    // Never seen — show it.
+                    self.seen.insert(key, (now, 1));
+                    result.push(w.clone());
+                }
+            }
+        }
+
+        // Evict entries outside the window to bound memory.
+        self.seen
+            .retain(|_, (first_seen, _)| now.duration_since(*first_seen) <= self.window);
+
+        result
+    }
+
+    /// Number of distinct warning keys currently tracked.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Returns true when no warning keys are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+/// Compute a dedup key for a `SearchWarning`. Uses the warning kind and
+/// stable data fields, but omits rapidly-changing values (e.g., partial
+/// index completeness percentage) so that closely-timed variations of the
+/// same warning are treated as duplicates.
+fn warning_dedup_key(w: &SearchWarning) -> String {
+    match w {
+        SearchWarning::LowConfidence => "low_confidence".to_string(),
+        SearchWarning::EmptyResults => "empty_results".to_string(),
+        SearchWarning::PartialIndex { .. } => "partial_index".to_string(),
+        SearchWarning::StaleIndex => "stale_index".to_string(),
+        SearchWarning::DegradedIndex => "degraded_index".to_string(),
+        SearchWarning::EmbeddingFailure { reason } => {
+            format!("embedding_failure:{reason}")
+        }
+        SearchWarning::LexicalFailure { reason } => {
+            format!("lexical_failure:{reason}")
+        }
+        SearchWarning::DimensionMismatch { expected, got } => {
+            format!("dimension_mismatch:{expected}:{got}")
+        }
+        SearchWarning::RerankerFailure { reason } => {
+            format!("reranker_failure:{reason}")
+        }
+        SearchWarning::DistanceMetricChanged { previous, current } => {
+            format!("distance_metric_changed:{previous}:{current}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1479,5 +1585,104 @@ mod tests {
             prompt_active: false,
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn warning_dedup_first_occurrence_visible() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(60));
+        let warnings = vec![SearchWarning::LowConfidence];
+        let filtered = dedup.filter_for_output(&warnings);
+        assert_eq!(filtered.len(), 1, "first occurrence should pass through");
+    }
+
+    #[test]
+    fn warning_dedup_second_occurrence_suppressed() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(60));
+        let warnings = vec![SearchWarning::LowConfidence];
+        // First call — visible.
+        let _ = dedup.filter_for_output(&warnings);
+        // Second call — suppressed.
+        let filtered = dedup.filter_for_output(&warnings);
+        assert!(
+            filtered.is_empty(),
+            "second occurrence within window should be suppressed"
+        );
+    }
+
+    #[test]
+    fn warning_dedup_different_warnings_both_visible() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(60));
+        let warnings = vec![SearchWarning::LowConfidence, SearchWarning::EmptyResults];
+        let filtered = dedup.filter_for_output(&warnings);
+        assert_eq!(
+            filtered.len(),
+            2,
+            "distinct warnings should both pass through"
+        );
+    }
+
+    #[test]
+    fn warning_dedup_partial_index_deduplicates_across_completeness() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(60));
+        let w1 = vec![SearchWarning::PartialIndex { completeness: 0.5 }];
+        let w2 = vec![SearchWarning::PartialIndex { completeness: 0.6 }];
+        // First call — visible.
+        let f1 = dedup.filter_for_output(&w1);
+        assert_eq!(f1.len(), 1);
+        // Second call with different completeness — should be suppressed
+        // because the dedup key is just "partial_index".
+        let f2 = dedup.filter_for_output(&w2);
+        assert!(
+            f2.is_empty(),
+            "partial_index with different completeness should be deduped"
+        );
+    }
+
+    #[test]
+    fn warning_dedup_bounded_state() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(0));
+        // With a 0-second window, entries are evicted immediately.
+        for _ in 0..100 {
+            let _ = dedup.filter_for_output(&[SearchWarning::LowConfidence]);
+        }
+        // State should be bounded — after eviction, the map is empty.
+        assert!(
+            dedup.len() <= 1,
+            "state should be bounded, got {} entries",
+            dedup.len()
+        );
+    }
+
+    #[test]
+    fn warning_dedup_mix_of_suppressed_and_visible() {
+        let mut dedup = WarningDedup::new(Duration::from_secs(60));
+        // First batch: LowConfidence + EmptyResults.
+        let batch1 = vec![SearchWarning::LowConfidence, SearchWarning::EmptyResults];
+        let f1 = dedup.filter_for_output(&batch1);
+        assert_eq!(f1.len(), 2);
+
+        // Second batch: LowConfidence (suppressed) + StaleIndex (new).
+        let batch2 = vec![SearchWarning::LowConfidence, SearchWarning::StaleIndex];
+        let f2 = dedup.filter_for_output(&batch2);
+        assert_eq!(f2.len(), 1, "only StaleIndex should be visible");
+        assert!(matches!(f2[0], SearchWarning::StaleIndex));
+    }
+
+    #[test]
+    fn warning_dedup_key_stability() {
+        // Verify dedup keys are deterministic.
+        let k1 = warning_dedup_key(&SearchWarning::EmbeddingFailure {
+            reason: "timeout".into(),
+        });
+        let k2 = warning_dedup_key(&SearchWarning::EmbeddingFailure {
+            reason: "timeout".into(),
+        });
+        assert_eq!(k1, k2);
+        assert_eq!(k1, "embedding_failure:timeout");
+
+        let k3 = warning_dedup_key(&SearchWarning::EmbeddingFailure {
+            reason: "network".into(),
+        });
+        assert_ne!(k1, k3, "different reasons should produce different keys");
     }
 }

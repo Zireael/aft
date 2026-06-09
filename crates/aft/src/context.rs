@@ -386,6 +386,9 @@ pub struct AppContext {
     /// Optional JSONL diagnostics logger for persistent search diagnostics.
     semantic_diagnostics_logger:
         RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>>,
+    /// Warning dedup state for semantic search tool output.
+    /// Deduplicates repeated warnings within a 60-second window.
+    semantic_warning_dedup: RefCell<crate::semantic_diagnostics::WarningDedup>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -460,6 +463,9 @@ impl AppContext {
                 crate::semantic_diagnostics::SearchMetricsCollector::new(metrics_window_size),
             ),
             semantic_diagnostics_logger: RefCell::new(None),
+            semantic_warning_dedup: RefCell::new(crate::semantic_diagnostics::WarningDedup::new(
+                Duration::from_secs(60),
+            )),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
@@ -916,6 +922,11 @@ impl AppContext {
         &self,
     ) -> &RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>> {
         &self.semantic_diagnostics_logger
+    }
+
+    /// Access the warning dedup state for semantic search tool output.
+    pub fn semantic_warning_dedup(&self) -> &RefCell<crate::semantic_diagnostics::WarningDedup> {
+        &self.semantic_warning_dedup
     }
 
     /// Lazily initialize the JSONL diagnostics logger if jsonl_logging is enabled.
