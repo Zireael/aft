@@ -34,12 +34,14 @@ const MAX_RERANK_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Read a reranker response body with a hard size cap.
 ///
 /// Uses `Content-Length` for fast rejection when the server provides an
-/// honest header, then reads the full body and verifies the actual size.
+/// honest header, then streams the body with incremental size checks.
 /// Returns the body as a UTF-8 string on success.
 fn read_response_body_bounded(
     response: reqwest::blocking::Response,
     limit: usize,
 ) -> Result<String, String> {
+    use std::io::Read;
+
     // Fast path: reject via Content-Length when the server is honest.
     if let Some(len) = response.content_length() {
         if len > limit as u64 {
@@ -49,19 +51,22 @@ fn read_response_body_bounded(
         }
     }
 
-    let bytes = response
-        .bytes()
+    // Stream the body with incremental size checks to avoid buffering
+    // the entire response when Content-Length is absent or incorrect.
+    let mut body = Vec::with_capacity(limit.min(64 * 1024));
+    let mut reader = response.take((limit as u64) + 1);
+    reader
+        .read_to_end(&mut body)
         .map_err(|e| format!("failed to read reranker response: {e}"))?;
 
-    if bytes.len() > limit {
+    if body.len() > limit {
         return Err(format!(
             "reranker response body ({} bytes) exceeds {limit} bytes limit",
-            bytes.len()
+            body.len()
         ));
     }
 
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| format!("reranker response is not valid UTF-8: {e}"))
+    String::from_utf8(body).map_err(|e| format!("reranker response is not valid UTF-8: {e}"))
 }
 
 /// Rerank candidates using an OpenAI-compatible chat endpoint.

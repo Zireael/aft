@@ -308,10 +308,16 @@ fn parse_semantic_config(
             None
         } else {
             // Warn if the template does not contain the expected placeholder.
+            // Truncate the template in the log to avoid exposing sensitive content.
             if !trimmed.contains("{query}") {
+                let preview = if trimmed.len() > 80 {
+                    format!("{}…", &trimmed[..80])
+                } else {
+                    trimmed.clone()
+                };
                 crate::slog_warn!(
                     "semantic.query_prompt_template does not contain {{query}} placeholder; template will be ignored at query time: {}",
-                    &trimmed,
+                    &preview,
                 );
             }
             Some(trimmed)
@@ -330,9 +336,14 @@ fn parse_semantic_config(
             None
         } else {
             if !trimmed.contains("{text}") {
+                let preview = if trimmed.len() > 80 {
+                    format!("{}…", &trimmed[..80])
+                } else {
+                    trimmed.clone()
+                };
                 crate::slog_warn!(
                     "semantic.document_prompt_template does not contain {{text}} placeholder; template will be ignored at document time: {}",
-                    &trimmed,
+                    &preview,
                 );
             }
             Some(trimmed)

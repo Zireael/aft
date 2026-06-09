@@ -100,6 +100,8 @@ pub fn handle_semantic_eval(req: &RawRequest, ctx: &crate::context::AppContext) 
     let results: Vec<Vec<eval::RetrievedHit>> = cases
         .iter()
         .map(|case| {
+            // Use per-case top_k if provided, otherwise fall back to global.
+            let case_top_k = case.top_k.unwrap_or(params.top_k);
             let search_req = RawRequest {
                 id: format!("eval-{}", case.query),
                 command: "semantic_search".to_string(),
@@ -107,7 +109,7 @@ pub fn handle_semantic_eval(req: &RawRequest, ctx: &crate::context::AppContext) 
                 session_id: None,
                 params: serde_json::json!({
                     "query": case.query,
-                    "top_k": params.top_k,
+                    "top_k": case_top_k,
                 }),
             };
             let resp = handle_semantic_search(&search_req, ctx);

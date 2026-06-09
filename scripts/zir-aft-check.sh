@@ -101,6 +101,16 @@ FAILURES=()
 SUCCESSES=()
 STARTED_AT="$(date +%s)"
 
+# Cleanup trap for temp files created by run_step.
+_CLEANUP_TEMPS=()
+_cleanup_temps() {
+  local f
+  for f in "${_CLEANUP_TEMPS[@]}"; do
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+trap _cleanup_temps EXIT
+
 # Test count aggregation — extracted from nextest/cargo-test Summary lines.
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -449,6 +459,7 @@ _extract_test_counts() {
 _filter_passing() {
   local in_summary=0
   local prev_blank=0
+  local line=""
   while IFS= read -r line; do
     # Detect nextest "Summary" line — extract counts and show it.
     # Must be checked before the in_summary guard since the Summary line
@@ -486,6 +497,12 @@ _filter_passing() {
     prev_blank=0
     printf '%s\n' "$line"
   done
+  # Process the final line if input lacked a trailing newline.
+  if [[ -n "$line" ]]; then
+    if [[ "$line" == *"Summary"*"tests run:"* ]]; then
+      _extract_test_counts "$line"
+    fi
+  fi
 }
 
 run_step() {
@@ -498,15 +515,29 @@ run_step() {
 
   local code=0
   if (( VERBOSE )); then
+    # In verbose mode, show full output but still extract test counts.
+    local tmpfile
+    tmpfile="$(mktemp)"
+    _CLEANUP_TEMPS+=("$tmpfile")
     set +e
-    "$@"
+    "$@" >"$tmpfile" 2>&1
     code=$?
     set -e
+    # Extract test counts from the output.
+    while IFS= read -r vline; do
+      if [[ "$vline" == *"Summary"*"tests run:"* ]]; then
+        _extract_test_counts "$vline"
+      fi
+    done <"$tmpfile"
+    # Show full output.
+    cat "$tmpfile"
+    rm -f "$tmpfile"
   else
     # Capture output to temp file so _filter_passing runs in the main shell
     # (not a pipe subshell) and can update TESTS_* globals.
     local tmpfile
     tmpfile="$(mktemp)"
+    _CLEANUP_TEMPS+=("$tmpfile")
     set +e
     "$@" >"$tmpfile" 2>&1
     code=$?

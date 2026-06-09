@@ -789,13 +789,9 @@ impl WarningDedup {
         for w in warnings {
             let key = warning_dedup_key(w);
             match self.seen.get(&key) {
-                Some((first_seen, count)) => {
+                Some((first_seen, _count)) => {
                     if now.duration_since(*first_seen) > self.window {
                         // Window expired — treat as new occurrence.
-                        self.seen.insert(key, (now, 1));
-                        result.push(w.clone());
-                    } else if *count == 0 {
-                        // First occurrence within window — show it.
                         self.seen.insert(key, (now, 1));
                         result.push(w.clone());
                     }
