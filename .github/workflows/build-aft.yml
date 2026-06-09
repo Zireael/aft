@@ -2,11 +2,15 @@ name: Build AFT Binary
 
 # Manually-triggered workflow that builds the AFT binary with ALL feature flags.
 # Lives on the default branch so GitHub can index it. Builds any branch/tag
-# via the "branch" input.
+# via the "branch" input. Select which platforms to build via the "targets" input
+# to avoid wasting runner minutes.
 #
 # Usage:
-#   gh workflow run build-aft.yml -f branch=semantic-search-enhancement
+#   gh workflow run build-aft.yml -f targets=windows -f branch=semantic-search-enhancement
 #   gh run download <run-id> -n aft-windows-x64 -D ./aft-build
+#
+# Targets: "windows", "linux", "darwin", "all" (default), or combinations like
+# "windows,linux". Only selected targets are built, saving runner minutes.
 
 on:
   workflow_dispatch:
@@ -19,6 +23,10 @@ on:
         description: "Cargo features to enable (comma-separated)"
         required: false
         default: "semantic-model2vec,semantic-fts5"
+      targets:
+        description: "Build targets (comma-separated): windows, linux, darwin, or all"
+        required: false
+        default: "all"
 
 concurrency:
   group: build-aft-${{ inputs.branch }}
@@ -33,6 +41,7 @@ env:
 jobs:
   build-windows-x64:
     name: Build Windows x64 (MSVC)
+    if: contains(inputs.targets, 'windows') || inputs.targets == 'all'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -80,6 +89,7 @@ jobs:
 
   build-linux-x64:
     name: Build Linux x64
+    if: contains(inputs.targets, 'linux') || inputs.targets == 'all'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -123,6 +133,7 @@ jobs:
 
   build-darwin-arm64:
     name: Build macOS ARM64
+    if: contains(inputs.targets, 'darwin') || inputs.targets == 'all'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
