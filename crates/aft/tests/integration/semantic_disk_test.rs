@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aft::cache_freshness::{self, FreshnessVerdict};
-use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+use aft::semantic_index::{SemanticFilePolicy, SemanticIndex, SemanticIndexFingerprint};
 
 // Warn-level log capture is shared across all integration test modules via a
 // single process-global, thread-local-capturing logger. See test_helpers.
@@ -241,6 +241,7 @@ fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
             16,
             1,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("defer new file at cap");
     let deferred_results = index.search(&[0.0, 1.0, 0.0, 0.0], 5);
@@ -260,6 +261,7 @@ fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
             16,
             1,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("retry deferred file after deletion");
 
@@ -377,6 +379,7 @@ fn semantic_stale_check_detects_same_mtime_same_size_content_change() {
             &mut refresh_embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("strict refresh should re-embed stale file");
 

@@ -481,6 +481,7 @@ fn invalidated_refresh_mixed_reuse_and_miss_retains_all_after_apply() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -534,6 +535,7 @@ fn invalidated_refresh_delta_retains_reused_chunks_after_apply() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -584,6 +586,7 @@ fn invalidated_refresh_reuses_duplicate_embed_text_for_new_identical_symbol() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -633,6 +636,7 @@ fn invalidated_refresh_file_summary_reuse_and_miss_are_text_based() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("body refresh succeeds");
     assert_eq!(body_stub.total_embedded_texts(), 1);
@@ -652,6 +656,7 @@ fn invalidated_refresh_file_summary_reuse_and_miss_are_text_based() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("doc refresh succeeds");
     assert_eq!(doc_stub.total_embedded_texts(), 1);
@@ -678,6 +683,7 @@ fn invalidated_refresh_deleted_file_drops_entries_after_apply() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -711,6 +717,7 @@ fn invalidated_refresh_collect_failure_does_not_resurrect_stale_entries() {
             16,
             100,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -755,6 +762,7 @@ fn invalidated_refresh_cap_deferral_stays_file_count_based() {
             16,
             1,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 

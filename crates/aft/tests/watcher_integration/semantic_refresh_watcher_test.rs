@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aft::context::SemanticIndexStatus;
 use aft::search_index::SearchIndex;
-use aft::semantic_index::SemanticIndex;
+use aft::semantic_index::{SemanticFilePolicy, SemanticIndex};
 use serde_json::{json, Value};
 
 use crate::helpers::AftProcess;
@@ -608,6 +608,7 @@ fn semantic_refresh_defers_new_files_when_max_files_cap_is_reached() {
             64,
             1,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh should succeed while deferring the new file");
 

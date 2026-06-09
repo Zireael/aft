@@ -180,6 +180,7 @@ fn spawn_semantic_refresh_worker(
     mut model: crate::semantic_index::EmbeddingModel,
     max_batch_size: usize,
     max_files: usize,
+    file_policy: SemanticFilePolicy,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
     session_id: Option<String>,
@@ -255,6 +256,7 @@ fn spawn_semantic_refresh_worker(
                         &mut embed,
                         max_batch_size,
                         &mut progress,
+                        &file_policy,
                     ) {
                         Ok(summary) => {
                             if !summary.is_noop() {
@@ -316,6 +318,7 @@ fn spawn_semantic_refresh_worker(
                     max_batch_size,
                     max_files,
                     &mut progress,
+                    &file_policy,
                 ) {
                     Ok(update) => {
                         if !update.summary.is_noop() {
@@ -2219,6 +2222,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_search = ctx.config().semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
     let semantic_config = ctx.config().semantic.clone();
+    let semantic_files = ctx.config().semantic_files.clone();
 
     let search_build_in_progress = ctx.search_index_rx().borrow().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
@@ -2397,6 +2401,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
         let semantic_config = semantic_config.clone();
+        let semantic_files = semantic_files.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let session_id_for_bg2 = log_ctx::current_session();
@@ -2494,6 +2499,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     &mut embed,
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
+                                    &semantic_files,
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2618,6 +2624,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             &mut embed,
                             semantic_config.max_batch_size.max(1),
                             &mut progress,
+                            &semantic_files,
                         )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
@@ -2703,6 +2710,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             model,
                             semantic_config.max_batch_size.max(1),
                             semantic_config.max_files,
+                            semantic_files.clone(),
                             refresh_rx,
                             refresh_event_tx,
                             log_ctx::current_session(),

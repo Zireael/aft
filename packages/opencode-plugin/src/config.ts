@@ -1132,6 +1132,8 @@ function getStrippedSemanticKeys(semantic: AftConfig["semantic"]): string {
   if (semantic.document_prompt_template !== undefined) stripped.push("document_prompt_template");
   if (semantic.model_path !== undefined) stripped.push("model_path");
   if (semantic.model2vec_max_length !== undefined) stripped.push("model2vec_max_length");
+  if (semantic.rerank_base_url !== undefined) stripped.push("rerank_base_url");
+  if (semantic.rerank_api_key_env !== undefined) stripped.push("rerank_api_key_env");
   return stripped.join(", ");
 }
 

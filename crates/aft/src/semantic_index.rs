@@ -2655,12 +2655,13 @@ impl SemanticIndexSnapshot {
 /// Read-only data lives in [`SemanticIndexSnapshot`], accessible through
 /// [`Deref`]. Mutation follows a clone–swap pattern: clone the inner
 /// snapshot, apply changes, atomically swap.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SemanticIndex {
     snapshot: Arc<SemanticIndexSnapshot>,
     lifecycle: SemanticIndexLifecycle,
     last_error: Option<String>,
     fingerprint: Option<SemanticIndexFingerprint>,
+    deferred_files: HashSet<PathBuf>,
 }
 
 impl std::ops::Deref for SemanticIndex {
@@ -2711,6 +2712,25 @@ impl RefreshSummary {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct InvalidatedFilesRefresh {
+    /// Full replacement entries for `completed_paths`, not just newly embedded
+    /// chunks. `apply_refresh_update` removes completed paths before extending
+    /// this set, so reused chunks must travel in this delta too.
+    pub added_entries: Vec<EmbeddingEntry>,
+    pub updated_metadata: Vec<(PathBuf, FileFreshness)>,
+    pub completed_paths: Vec<PathBuf>,
+    pub summary: RefreshSummary,
+}
+
+#[derive(Debug, Clone)]
+struct ReusableEmbedding {
+    embed_text: String,
+    vector: Vec<f32>,
+}
+
+type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbedding>>>;
+
 /// Search result from a semantic query
 #[derive(Debug, Clone)]
 pub struct SemanticResult {
@@ -2740,6 +2760,7 @@ impl SemanticIndex {
             lifecycle: SemanticIndexLifecycle::ColdStart,
             last_error: None,
             fingerprint: None,
+            deferred_files: HashSet::new(),
         }
     }
 
@@ -3094,6 +3115,7 @@ impl SemanticIndex {
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint: None,
+            deferred_files: HashSet::new(),
         })
     }
 
@@ -3189,6 +3211,7 @@ impl SemanticIndex {
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint: None,
+            deferred_files: HashSet::new(),
         })
     }
 
@@ -3309,6 +3332,7 @@ impl SemanticIndex {
                 lifecycle: SemanticIndexLifecycle::Ready,
                 last_error: None,
                 fingerprint: None,
+                deferred_files: HashSet::new(),
             });
         }
 
@@ -3472,6 +3496,7 @@ impl SemanticIndex {
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint: None,
+            deferred_files: HashSet::new(),
         })
     }
 
@@ -3716,6 +3741,424 @@ impl SemanticIndex {
             deleted: deleted.len(),
             total_processed,
         })
+    }
+
+    /// Number of distinct indexed files (file-metadata keys).
+    pub fn indexed_file_count(&self) -> usize {
+        self.snapshot.store().file_metadata().len()
+    }
+
+    fn build_chunk_reuse_map(&self, files: &[PathBuf]) -> ChunkReuseMap {
+        let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+        let mut reuse_map: ChunkReuseMap = HashMap::new();
+
+        for entry in self.snapshot.store().entries_slice() {
+            if !requested.contains(entry.chunk.file.as_path()) {
+                continue;
+            }
+
+            let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
+            reuse_map
+                .entry(entry.chunk.file.clone())
+                .or_default()
+                .entry(hash)
+                .or_default()
+                .push(ReusableEmbedding {
+                    embed_text: entry.chunk.embed_text.clone(),
+                    vector: entry.vector.clone(),
+                });
+        }
+
+        reuse_map
+    }
+
+    fn reusable_vector_for_chunk(
+        reuse_map: &ChunkReuseMap,
+        chunk: &SemanticChunk,
+    ) -> Option<Vec<f32>> {
+        let hash = blake3::hash(chunk.embed_text.as_bytes());
+        reuse_map
+            .get(&chunk.file)?
+            .get(&hash)?
+            .iter()
+            .find(|candidate| candidate.embed_text == chunk.embed_text)
+            .map(|candidate| candidate.vector.clone())
+    }
+
+    fn entries_for_chunks_with_reuse<F, P>(
+        chunks: Vec<SemanticChunk>,
+        reuse_map: &ChunkReuseMap,
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        initial_observed_dimension: Option<usize>,
+        refresh_label: &str,
+        progress: &mut P,
+    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>), String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+
+        let mut entries_by_chunk: Vec<Option<EmbeddingEntry>> = vec![None; total_chunks];
+        let mut misses: Vec<(usize, SemanticChunk)> = Vec::new();
+
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry {
+                    chunk_hash: compute_chunk_hash(&chunk),
+                    chunk,
+                    vector,
+                });
+            } else {
+                misses.push((chunk_index, chunk));
+            }
+        }
+
+        let mut completed = total_chunks.saturating_sub(misses.len());
+        if completed > 0 {
+            progress(completed, total_chunks);
+        }
+
+        let batch_size = max_batch_size.max(1);
+        let mut observed_dimension = initial_observed_dimension;
+
+        for batch_start in (0..misses.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(misses.len());
+            let batch_texts: Vec<String> = misses[batch_start..batch_end]
+                .iter()
+                .map(|(_, chunk)| chunk.embed_text.clone())
+                .collect();
+
+            let vectors = embed_fn(batch_texts)?;
+            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
+
+            if let Some(dim) = vectors.first().map(|vector| vector.len()) {
+                match observed_dimension {
+                    None => observed_dimension = Some(dim),
+                    Some(expected) if dim != expected => {
+                        return Err(format!(
+                            "embedding dimension changed during {refresh_label}: \
+                             cached index uses {expected}, new vectors use {dim}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (i, vector) in vectors.into_iter().enumerate() {
+                let (chunk_index, chunk) = misses[batch_start + i].clone();
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry {
+                    chunk_hash: compute_chunk_hash(&chunk),
+                    chunk,
+                    vector,
+                });
+            }
+
+            completed += batch_end - batch_start;
+            progress(completed, total_chunks);
+        }
+
+        let entries = entries_by_chunk
+            .into_iter()
+            .map(|entry| entry.expect("semantic refresh accounted for every chunk"))
+            .collect();
+
+        Ok((entries, observed_dimension))
+    }
+
+    /// Refresh only the requested invalidated files in this in-memory index,
+    /// re-extract and embed whatever still exists on disk, and return the delta
+    /// needed for another in-memory index to apply the same update.
+    pub fn refresh_invalidated_files<F, P>(
+        &mut self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        max_files: usize,
+        progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+    ) -> Result<InvalidatedFilesRefresh, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        self.backfill_missing_file_sizes();
+
+        self.deferred_files.retain(|path| path.exists());
+        let mut requested_paths = paths.to_vec();
+        requested_paths.extend(self.deferred_files.iter().cloned());
+        requested_paths.sort();
+        requested_paths.dedup();
+        let total_processed = requested_paths.len();
+
+        if requested_paths.is_empty() {
+            progress(0, 0);
+            return Ok(InvalidatedFilesRefresh {
+                summary: RefreshSummary {
+                    total_processed,
+                    ..RefreshSummary::default()
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let file_metadata = self.snapshot.store().file_metadata();
+        let previously_indexed: HashSet<PathBuf> = requested_paths
+            .iter()
+            .filter(|path| file_metadata.contains_key(*path))
+            .cloned()
+            .collect();
+        let reuse_map = self.build_chunk_reuse_map(&requested_paths);
+
+        self.remove_indexed_files(&requested_paths);
+
+        let existing_paths = requested_paths
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        let deleted = requested_paths
+            .iter()
+            .filter(|path| !path.exists() && previously_indexed.contains(path.as_path()))
+            .count();
+
+        if existing_paths.is_empty() {
+            for path in &requested_paths {
+                if !path.exists() {
+                    self.deferred_files.remove(path);
+                }
+            }
+            progress(0, 0);
+            return Ok(InvalidatedFilesRefresh {
+                completed_paths: requested_paths,
+                summary: RefreshSummary {
+                    deleted,
+                    total_processed,
+                    ..RefreshSummary::default()
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let (mut chunks, mut fresh_metadata) =
+            Self::collect_chunks(project_root, &existing_paths, file_policy);
+
+        let retained_file_count = self.indexed_file_count();
+        let changed_successful_count = existing_paths
+            .iter()
+            .filter(|path| {
+                previously_indexed.contains(path.as_path()) && fresh_metadata.contains_key(*path)
+            })
+            .count();
+        let available_new_files =
+            max_files.saturating_sub(retained_file_count.saturating_add(changed_successful_count));
+        let new_successful_files = existing_paths
+            .iter()
+            .filter(|path| {
+                !previously_indexed.contains(path.as_path()) && fresh_metadata.contains_key(*path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if new_successful_files.len() > available_new_files {
+            let allowed_new_files = new_successful_files
+                .iter()
+                .take(available_new_files)
+                .cloned()
+                .collect::<HashSet<_>>();
+            let deferred_new_files = new_successful_files
+                .into_iter()
+                .filter(|path| !allowed_new_files.contains(path))
+                .collect::<HashSet<_>>();
+
+            fresh_metadata.retain(|file, _| {
+                previously_indexed.contains(file.as_path()) || allowed_new_files.contains(file)
+            });
+            chunks.retain(|chunk| !deferred_new_files.contains(&chunk.file));
+
+            if !deferred_new_files.is_empty() {
+                for path in &deferred_new_files {
+                    self.deferred_files.insert(path.clone());
+                }
+                slog_warn!(
+                    "semantic refresh deferred {} new file(s): indexed-file cap {} is reached",
+                    deferred_new_files.len(),
+                    max_files
+                );
+            }
+        }
+
+        let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+        for file in &successful_files {
+            self.deferred_files.remove(file);
+        }
+        let changed = successful_files
+            .iter()
+            .filter(|path| previously_indexed.contains(path.as_path()))
+            .count();
+        let added = successful_files.len().saturating_sub(changed);
+        let mut updated_metadata = Vec::with_capacity(fresh_metadata.len());
+
+        if chunks.is_empty() {
+            progress(0, 0);
+            let mut snapshot = (*self.snapshot).clone();
+            for (file, metadata) in fresh_metadata {
+                let freshness = FileFreshness {
+                    mtime: metadata.mtime,
+                    size: metadata.size,
+                    content_hash: metadata.content_hash,
+                };
+                snapshot
+                    .store_mut()
+                    .file_metadata_mut()
+                    .insert(file.clone(), metadata);
+                updated_metadata.push((file, freshness));
+            }
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
+
+            return Ok(InvalidatedFilesRefresh {
+                updated_metadata,
+                completed_paths: requested_paths,
+                summary: RefreshSummary {
+                    changed,
+                    added,
+                    deleted,
+                    total_processed,
+                },
+                ..InvalidatedFilesRefresh::default()
+            });
+        }
+
+        let initial_observed_dimension = if self.is_empty() && previously_indexed.is_empty() {
+            None
+        } else {
+            Some(self.dimension())
+        };
+        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            initial_observed_dimension,
+            "invalidated-file refresh",
+            progress,
+        )?;
+
+        let added_entries = new_entries.clone();
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.store_mut().entries_mut().extend(new_entries);
+        for (file, metadata) in fresh_metadata {
+            let freshness = FileFreshness {
+                mtime: metadata.mtime,
+                size: metadata.size,
+                content_hash: metadata.content_hash,
+            };
+            snapshot
+                .store_mut()
+                .file_metadata_mut()
+                .insert(file.clone(), metadata);
+            updated_metadata.push((file, freshness));
+        }
+        if let Some(dim) = observed_dimension {
+            snapshot.dimension = dim;
+            snapshot.store_mut().set_dimension(dim);
+        }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
+
+        Ok(InvalidatedFilesRefresh {
+            added_entries,
+            updated_metadata,
+            completed_paths: requested_paths,
+            summary: RefreshSummary {
+                changed,
+                added,
+                deleted,
+                total_processed,
+            },
+        })
+    }
+
+    pub fn apply_refresh_update(
+        &mut self,
+        added_entries: Vec<EmbeddingEntry>,
+        updated_metadata: Vec<(PathBuf, FileFreshness)>,
+        completed_paths: &[PathBuf],
+    ) {
+        self.remove_indexed_files(completed_paths);
+
+        let observed_dimension = added_entries.first().map(|entry| entry.vector.len());
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.store_mut().entries_mut().extend(added_entries);
+        for (file, freshness) in updated_metadata {
+            snapshot.store_mut().file_metadata_mut().insert(
+                file,
+                IndexedFileMetadata {
+                    mtime: freshness.mtime,
+                    size: freshness.size,
+                    content_hash: freshness.content_hash,
+                },
+            );
+        }
+        if let Some(dim) = observed_dimension {
+            snapshot.dimension = dim;
+            snapshot.store_mut().set_dimension(dim);
+        }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
+    }
+
+    fn remove_indexed_files(&mut self, files: &[PathBuf]) {
+        let deleted_set: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot
+            .store_mut()
+            .entries_mut()
+            .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
+        for path in files {
+            snapshot.store_mut().file_metadata_mut().remove(path);
+        }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
+    }
+
+    fn backfill_missing_file_sizes(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .snapshot
+            .store()
+            .file_metadata()
+            .keys()
+            .cloned()
+            .collect();
+        let mut snapshot = (*self.snapshot).clone();
+        let mut changed = false;
+        for path in paths {
+            let needs_backfill = snapshot
+                .store()
+                .file_metadata()
+                .get(&path)
+                .is_some_and(|meta| meta.size == 0);
+            if !needs_backfill {
+                continue;
+            }
+            if let Ok(fs_meta) = fs::metadata(&path) {
+                let size = fs_meta.len();
+                if let Some(entry) = snapshot.store_mut().file_metadata_mut().get_mut(&path) {
+                    entry.size = size;
+                    changed = true;
+                    if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(&path, size) {
+                        entry.content_hash = hash;
+                    }
+                }
+            }
+        }
+        if changed {
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
+        }
     }
 
     /// Remove entries for a specific file (clone–swap pattern)
@@ -4452,6 +4895,7 @@ impl SemanticIndex {
             lifecycle: SemanticIndexLifecycle::Ready,
             last_error: None,
             fingerprint,
+            deferred_files: HashSet::new(),
         })
     }
 }
