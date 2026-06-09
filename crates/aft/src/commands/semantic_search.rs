@@ -1064,4 +1064,123 @@ mod tests {
         assert!(text.contains("fn2"));
         assert!(text.contains("2 semantic result(s)"));
     }
+
+    #[test]
+    fn warning_dedup_key_stability_across_warning_kinds() {
+        // Verify that the dedup key function produces stable, distinct keys
+        // for each warning kind.
+        let warnings = vec![
+            SearchWarning::LowConfidence,
+            SearchWarning::EmptyResults,
+            SearchWarning::PartialIndex { completeness: 0.5 },
+            SearchWarning::PartialIndex { completeness: 0.8 },
+            SearchWarning::StaleIndex,
+            SearchWarning::DegradedIndex,
+            SearchWarning::EmbeddingFailure {
+                reason: "timeout".into(),
+            },
+            SearchWarning::EmbeddingFailure {
+                reason: "network".into(),
+            },
+            SearchWarning::LexicalFailure {
+                reason: "skip".into(),
+            },
+            SearchWarning::DimensionMismatch {
+                expected: 768,
+                got: 384,
+            },
+            SearchWarning::RerankerFailure {
+                reason: "parse_error".into(),
+            },
+            SearchWarning::DistanceMetricChanged {
+                previous: "cosine".into(),
+                current: "dot_product".into(),
+            },
+        ];
+        // Each warning *kind* produces a unique dedup key. PartialIndex
+        // variants with different completeness values intentionally share
+        // the same key (completeness is excluded from dedup), so 12
+        // entries → 11 unique keys.
+        let mut keys: Vec<String> = warnings
+            .iter()
+            .map(crate::semantic_diagnostics::warning_dedup_key)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            11,
+            "12 warnings should produce 11 unique dedup keys (PartialIndex shares one)"
+        );
+    }
+
+    #[test]
+    fn sort_cap_and_truncate_respects_max_results_per_file() {
+        let results = vec![
+            HybridResult {
+                file: PathBuf::from("a.rs"),
+                name: "f1".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 2,
+                exported: true,
+                snippet: String::new(),
+                score: 0.9,
+                source: "semantic",
+                semantic_score: Some(0.9),
+                lexical_score: None,
+            },
+            HybridResult {
+                file: PathBuf::from("a.rs"),
+                name: "f2".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 2,
+                exported: true,
+                snippet: String::new(),
+                score: 0.8,
+                source: "semantic",
+                semantic_score: Some(0.8),
+                lexical_score: None,
+            },
+            HybridResult {
+                file: PathBuf::from("a.rs"),
+                name: "f3".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 2,
+                exported: true,
+                snippet: String::new(),
+                score: 0.7,
+                source: "semantic",
+                semantic_score: Some(0.7),
+                lexical_score: None,
+            },
+            HybridResult {
+                file: PathBuf::from("b.rs"),
+                name: "g1".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 2,
+                exported: true,
+                snippet: String::new(),
+                score: 0.6,
+                source: "semantic",
+                semantic_score: Some(0.6),
+                lexical_score: None,
+            },
+        ];
+        let mut results = results;
+        sort_cap_and_truncate(&mut results, 10, 2); // cap_per_file=2
+                                                    // a.rs should have at most 2 results, b.rs should have 1.
+        let expected_a = std::path::Path::new("a.rs");
+        let expected_b = std::path::Path::new("b.rs");
+        let a_count = results.iter().filter(|r| r.file == expected_a).count();
+        let b_count = results.iter().filter(|r| r.file == expected_b).count();
+        assert!(
+            a_count <= 2,
+            "a.rs should have at most 2 results, got {a_count}"
+        );
+        assert_eq!(b_count, 1, "b.rs should have 1 result");
+    }
 }

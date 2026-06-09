@@ -7833,6 +7833,94 @@ mod fingerprint_invalidation_tests {
         assert!(!config.include_snippets);
     }
 
+    #[test]
+    fn config_deserialize_rerank_fields() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "rerank_enabled": true,
+            "rerank_model": "gpt-4",
+            "rerank_base_url": "https://api.openai.com/v1",
+            "rerank_api_key_env": "OPENAI_API_KEY",
+            "rerank_timeout_ms": 5000,
+            "rerank_max_candidates": 20,
+            "rerank_max_candidate_chars": 1500
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert!(config.rerank_enabled);
+        assert_eq!(config.rerank_model.as_deref(), Some("gpt-4"));
+        assert_eq!(
+            config.rerank_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(config.rerank_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(config.rerank_timeout_ms, 5000);
+        assert_eq!(config.rerank_max_candidates, 20);
+        assert_eq!(config.rerank_max_candidate_chars, 1500);
+    }
+
+    #[test]
+    fn config_deserialize_diagnostics_fields() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "diagnostics_enabled": true,
+            "jsonl_logging": true,
+            "jsonl_path": "/tmp/diag.jsonl",
+            "include_raw_queries": true,
+            "include_snippets": true,
+            "retention_days": 30,
+            "output_mode": "verbose",
+            "low_confidence_threshold": 0.2,
+            "metrics_window_size": 200
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert!(config.diagnostics_enabled);
+        assert!(config.jsonl_logging);
+        assert_eq!(
+            config.jsonl_path.as_deref(),
+            Some(std::path::Path::new("/tmp/diag.jsonl"))
+        );
+        assert!(config.include_raw_queries);
+        assert!(config.include_snippets);
+        assert_eq!(config.retention_days, 30);
+        assert_eq!(
+            config.output_mode,
+            crate::config::DiagnosticsOutputMode::Verbose
+        );
+        assert!((config.low_confidence_threshold - 0.2).abs() < 1e-6);
+        assert_eq!(config.metrics_window_size, 200);
+    }
+
+    #[test]
+    fn config_deserialize_max_results_per_file() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "max_results_per_file": 5
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_results_per_file, 5);
+    }
+
+    #[test]
+    fn config_max_results_per_file_default_is_two() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_results_per_file, 2);
+    }
+
     // ── Profile validation tests ────────────────────────────────────────
 
     #[test]

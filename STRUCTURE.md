@@ -20,12 +20,25 @@ opencode-aft/
 │   ├── aft-bridge/            # Shared NDJSON bridge transport, binary resolution, ONNX runtime helpers
 │   ├── aft-cli/               # Unified CLI — setup/doctor across all harnesses (@cortexkit/aft)
 │   ├── opencode-plugin/       # OpenCode adapter that exposes and hoists AFT tools (@cortexkit/aft-opencode)
+│   │   └── src/
+│   │       ├── tools/         # One file per tool group
+│   │       ├── hooks/         # Auto-update checker lifecycle
+│   │       ├── shared/        # Shared utilities (RPC, PTY cache, status, session directory)
+│   │       └── tui/           # TUI type definitions
 │   ├── pi-plugin/             # Pi coding agent adapter for AFT (@cortexkit/aft-pi)
+│   │   └── src/
+│   │       ├── tools/         # One file per tool group
+│   │       ├── commands/      # Pi slash commands (e.g., /aft-status)
+│   │       ├── dialogs/       # Pi status dialog rendering
+│   │       └── shared/        # Shared utilities (file discovery, PTY cache, status)
 │   └── npm/                   # Platform-specific npm binary packages
 ├── benchmarks/                # Bun-based benchmark runner and reporting code
+│   ├── aft-search/            # Semantic search benchmarks (corpus + results)
+│   └── compression-tokens/    # Bash compression token savings benchmarks
 ├── scripts/                   # Release and version-management scripts
 ├── assets/                    # Repository assets such as the banner image
 ├── tests/                     # Docker-based integration tests, macOS/Windows E2E
+│   └── pi-rpc/                # Pi RPC integration tests
 ├── docs/                      # Architecture and structure documentation
 ├── .github/workflows/         # Release automation workflows
 ├── Cargo.toml                 # Rust workspace manifest
@@ -69,6 +82,51 @@ opencode-aft/
 - Purpose: Compress shell command output to reduce token usage while preserving actionable information.
 - Contains: Rust compressor modules (git, cargo, eslint, biome, tsc, pytest, etc.), TOML filter engine, trust model, builtin filter definitions
 - Key files: `crates/aft/src/compress/mod.rs`, `crates/aft/src/compress/toml_filter.rs`, `crates/aft/src/compress/trust.rs`, `crates/aft/src/compress/builtin_filters/`
+
+**`packages/opencode-plugin/src/hooks/`:**
+- Purpose: Manage plugin lifecycle hooks, primarily the auto-update checker.
+- Contains: Auto-update checker logic, version caching, hook activation
+- Key files: `packages/opencode-plugin/src/hooks/auto-update-checker/index.ts`, `packages/opencode-plugin/src/hooks/auto-update-checker/checker.ts`, `packages/opencode-plugin/src/hooks/auto-update-checker/cache.ts`
+
+**`packages/opencode-plugin/src/shared/`:**
+- Purpose: Hold shared utilities consumed across the OpenCode plugin.
+- Contains: RPC client/server, PTY cache, live server client, session directory helpers, TUI config, subagent detection, bash hints, status helpers
+- Key files: `packages/opencode-plugin/src/shared/rpc-client.ts`, `packages/opencode-plugin/src/shared/rpc-server.ts`, `packages/opencode-plugin/src/shared/status.ts`, `packages/opencode-plugin/src/shared/pty-cache.ts`
+
+**`packages/opencode-plugin/src/tui/`:**
+- Purpose: Define TypeScript interfaces for the OpenCode plugin TUI surface.
+- Contains: TUI type declarations
+- Key files: `packages/opencode-plugin/src/tui/types/opencode-plugin-tui.d.ts`
+
+**`packages/pi-plugin/src/commands/`:**
+- Purpose: Provide Pi slash commands (e.g., `/aft-status`) for runtime diagnostics inside the Pi harness.
+- Contains: Status command handler
+- Key files: `packages/pi-plugin/src/commands/aft-status.ts`
+
+**`packages/pi-plugin/src/dialogs/`:**
+- Purpose: Render Pi dialog UIs for status and configuration views.
+- Contains: Status dialog rendering
+- Key files: `packages/pi-plugin/src/dialogs/status-dialog.ts`
+
+**`packages/pi-plugin/src/shared/`:**
+- Purpose: Hold shared utilities consumed across the Pi plugin.
+- Contains: File discovery helpers, PTY cache, status helpers
+- Key files: `packages/pi-plugin/src/shared/discover-files.ts`, `packages/pi-plugin/src/shared/status.ts`
+
+**`benchmarks/aft-search/`:**
+- Purpose: Run and report semantic search benchmarks.
+- Contains: Benchmark corpus files and result data
+- Key files: `benchmarks/aft-search/corpus/`, `benchmarks/aft-search/results/`
+
+**`benchmarks/compression-tokens/`:**
+- Purpose: Measure token savings from bash output compression across different CLI tools.
+- Contains: Benchmark data, fixtures (build-test, deploy-container, filesystem, git, lint)
+- Key files: `benchmarks/compression-tokens/data/`, `benchmarks/compression-tokens/fixtures/`
+
+**`tests/pi-rpc/`:**
+- Purpose: Test Pi-specific RPC integration flows between the plugin and the aft binary.
+- Contains: RPC test helpers and fixture data
+- Key files: `tests/pi-rpc/helpers/`, `tests/pi-rpc/fixtures/`
 
 **`crates/aft/src/lsp/`:**
 - Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
@@ -138,7 +196,7 @@ opencode-aft/
 
 **Configuration:** `package.json`: Define Bun workspace scripts; `Cargo.toml`: Define the Rust workspace; `packages/opencode-plugin/src/config.ts`: Parse user and project AFT config.
 
-**Core Logic:** `crates/aft/src/parser.rs`: Extract symbols and languages; `crates/aft/src/callgraph.rs`: Build navigation indexes; `crates/aft/src/edit.rs`: Run shared edit and diff logic; `crates/aft/src/semantic_index.rs`: Embed and search code by meaning across multiple backends; `crates/aft/src/vector_store.rs`: Vector storage abstraction; `crates/aft/src/semantic_rerank.rs`: LLM-based result reranking; `crates/aft/src/semantic_diagnostics.rs`: Search quality telemetry; `crates/aft/src/semantic_doctor.rs`: Semantic health reports; `crates/aft/src/semantic_eval.rs`: Local retrieval evaluation; `crates/aft/src/db/`: SQLite persistent storage; `crates/aft/src/bash_background/`: Background task lifecycle; `packages/aft-bridge/src/bridge.ts`: Manage subprocess transport.
+**Core Logic:** `crates/aft/src/parser.rs`: Extract symbols and languages; `crates/aft/src/callgraph.rs`: Build navigation indexes; `crates/aft/src/edit.rs`: Run shared edit and diff logic; `crates/aft/src/semantic_index.rs`: Embed and search code by meaning across multiple backends; `crates/aft/src/vector_store.rs`: Vector storage abstraction; `crates/aft/src/semantic_rerank.rs`: LLM-based result reranking; `crates/aft/src/semantic_diagnostics.rs`: Search quality telemetry with WarningDedup; `crates/aft/src/semantic_doctor.rs`: Semantic health reports; `crates/aft/src/semantic_eval.rs`: Local retrieval evaluation via live search pipeline; `crates/aft/src/query_shape.rs`: Query classification for hybrid routing; `crates/aft/src/db/`: SQLite persistent storage; `crates/aft/src/bash_background/`: Background task lifecycle; `packages/aft-bridge/src/bridge.ts`: Manage subprocess transport.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/`: Plugin unit and e2e tests; `crates/aft/tests/integration/`: Rust integration tests.
 
@@ -158,6 +216,16 @@ opencode-aft/
 
 **New shared transport / binary-resolution code:** `packages/aft-bridge/src/[module].ts` — keep shared primitives (bridge, pool, downloader, resolver, ONNX, URL fetch) that both harness adapters consume.
 
+**New OpenCode plugin shared utility:** `packages/opencode-plugin/src/shared/[module].ts` — add shared RPC, PTY cache, status, or session-directory helpers consumed across the plugin.
+
+**New OpenCode plugin hook:** `packages/opencode-plugin/src/hooks/[hook-name]/` — add lifecycle hook logic and register it in the plugin bootstrap.
+
+**New Pi slash command:** `packages/pi-plugin/src/commands/[command].ts` — add a Pi slash command handler and wire it into `packages/pi-plugin/src/index.ts`.
+
+**New Pi dialog:** `packages/pi-plugin/src/dialogs/[dialog].ts` — add a Pi terminal dialog renderer and wire it into the Pi plugin.
+
+**New Pi plugin shared utility:** `packages/pi-plugin/src/shared/[module].ts` — add shared helpers consumed across the Pi plugin.
+
 **New unified CLI command:** `packages/aft-cli/src/commands/[command].ts` — add the handler and dispatch it from `packages/aft-cli/src/index.ts`.
 
 **New Rust command handler:** `crates/aft/src/commands/[command_name].rs` — expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
@@ -165,6 +233,8 @@ opencode-aft/
 **New shared Rust engine code:** `crates/aft/src/[domain].rs` — keep reusable parser, formatter, import, analysis, or semantic code outside command handlers.
 
 **New semantic backend:** `crates/aft/src/semantic_index.rs` — add a new variant to `SemanticBackend` (config), `SemanticEmbeddingEngine` (engine), and implement `embed_texts` for the new backend. Add a new `VectorStore` implementation in `crates/aft/src/vector_store.rs` if the backend uses a different vector format. Update `crates/aft/src/config.rs` with default parameters.
+
+**New query classification strategy:** `crates/aft/src/query_shape.rs` — add a new `QueryKind` variant and wire routing weights into the hybrid search pipeline.
 
 **New semantic reranking strategy:** `crates/aft/src/semantic_rerank.rs` — implement a new reranking approach and wire it into `crates/aft/src/commands/semantic_search.rs`.
 

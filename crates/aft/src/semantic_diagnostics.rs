@@ -831,7 +831,7 @@ impl WarningDedup {
 /// stable data fields, but omits rapidly-changing values (e.g., partial
 /// index completeness percentage) so that closely-timed variations of the
 /// same warning are treated as duplicates.
-fn warning_dedup_key(w: &SearchWarning) -> String {
+pub(crate) fn warning_dedup_key(w: &SearchWarning) -> String {
     match w {
         SearchWarning::LowConfidence => "low_confidence".to_string(),
         SearchWarning::EmptyResults => "empty_results".to_string(),

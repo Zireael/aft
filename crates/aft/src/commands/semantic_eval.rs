@@ -197,7 +197,7 @@ mod tests {
         assert!(resp.success, "got: {resp:?}");
         let v = &resp.data;
         assert_eq!(v["total"], 2);
-        assert_eq!(v["hits_in_top_k"], 0); // stub returns no hits
+        assert_eq!(v["hits_in_top_k"], 0); // no index configured → 0 hits
         assert_eq!(v["k"], 10);
         assert!(v["summary_line"].as_str().unwrap().contains("0/2"));
     }

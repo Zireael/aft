@@ -49,8 +49,8 @@
 
 **Semantic search engine layer:**
 - Purpose: Embed, chunk, index, search, and rerank code by meaning across multiple backends.
-- Location: `crates/aft/src/semantic_index.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_doctor.rs`, `crates/aft/src/semantic_eval.rs`
-- Contains: Multi-backend embedding engine (Fastembed, OpenAI-compatible, Ollama, Perplexity, Model2Vec), chunking strategies, vector storage traits, LLM-based reranking, search quality telemetry, health reports, local retrieval evaluation
+- Location: `crates/aft/src/semantic_index.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_doctor.rs`, `crates/aft/src/semantic_eval.rs`, `crates/aft/src/query_shape.rs`
+- Contains: Multi-backend embedding engine (Fastembed, OpenAI-compatible, Ollama, Perplexity, Model2Vec), chunking strategies, vector storage traits, LLM-based reranking with 2 MiB response body cap, query shape classification (identifier vs mixed vs error-code vs path vs natural-language), search quality telemetry with WarningDedup (60s deduplication window, full recording in diagnostics), health reports, local retrieval evaluation wired through `handle_semantic_search`
 - Depends on: `fastembed`, `model2vec-rs` (optional), `reqwest`, `tree-sitter`, `rayon`
 - Used by: `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/commands/configure.rs`
 
@@ -100,9 +100,10 @@
 1. Configure backend and embedding model — `crates/aft/src/commands/configure.rs`, `crates/aft/src/config.rs`
 2. Chunk source files and embed content into a vector index — `crates/aft/src/semantic_index.rs`
 3. Store vectors via the trait abstraction — `crates/aft/src/vector_store.rs`
-4. Accept queries, embed, search, and optionally rerank — `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/semantic_rerank.rs`
-5. Report index health and search quality — `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/semantic_diagnostics.rs`
-6. Evaluate retrieval quality locally — `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/semantic_eval.rs`
+4. Classify query shape (identifier, mixed, error-code, path, natural-language) to route semantic and lexical lanes — `crates/aft/src/query_shape.rs`
+5. Accept queries, embed, search, and optionally rerank — `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/semantic_rerank.rs`
+6. Report index health and search quality with WarningDedup (60s window, full recording in diagnostics) — `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/semantic_diagnostics.rs`
+7. Evaluate retrieval quality through the live search pipeline — `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/semantic_eval.rs`
 
 **Bash background task flow:**
 
@@ -141,7 +142,7 @@
 **VectorStore (trait):**
 - Purpose: Decouple vector storage and similarity search from the semantic index lifecycle.
 - Location: `crates/aft/src/vector_store.rs`
-- Pattern: Trait with three built-in implementations — `FlatF32VectorStore` (f32 cosine similarity), `FlatBinaryHammingVectorStore` (packed binary Hamming search for quantized vectors), and `Model2VecVectorStore` (native f32 storage for model2vec backend).
+- Pattern: Trait with two built-in implementations — `FlatF32VectorStore` (f32 cosine similarity and Euclidean distance, used by Fastembed, OpenAI-compatible, Ollama, Perplexity, and Model2Vec backends) and `FlatBinaryHammingVectorStore` (packed binary Hamming search for quantized vectors).
 - Used by: `crates/aft/src/semantic_index.rs`
 
 **SemanticBackend (enum):**
@@ -159,7 +160,7 @@
 **Reranker:**
 - Purpose: Send candidate search results to an LLM chat endpoint for relevance re-ordering.
 - Location: `crates/aft/src/semantic_rerank.rs`
-- Pattern: OpenAI-compatible chat completions call with a prompt template; falls back to original order on any error. Configurable via `rerank_enabled`, `rerank_model`, `rerank_base_url`, and `rerank_max_candidates` in `SemanticBackendConfig`.
+- Pattern: OpenAI-compatible chat completions call with a prompt template; falls back to original order on any error. Response body is capped at 2 MiB (`MAX_RERANK_BODY_BYTES`) to defend against malicious or misconfigured endpoints. Configurable via `rerank_enabled`, `rerank_model`, `rerank_base_url`, `rerank_max_candidates`, and `rerank_max_candidate_chars` (default 2500 chars) in `SemanticBackendConfig`.
 
 **CallGraph:**
 - Purpose: Cache per-file call data and answer callers, call-tree, impact, and trace queries.
