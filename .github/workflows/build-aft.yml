@@ -1,11 +1,11 @@
 name: Build AFT Binary
 
-# Manually-triggered workflow that builds the AFT binary with ALL feature flags
-# enabled. Use this to produce a Windows binary for local testing without
-# requiring MSVC Build Tools on the host machine.
+# Manually-triggered workflow that builds the AFT binary with ALL feature flags.
+# Lives on the default branch so GitHub can index it. Builds any branch/tag
+# via the "branch" input.
 #
 # Usage:
-#   gh workflow run build-aft.yml --ref <branch>
+#   gh workflow run build-aft.yml -f branch=semantic-search-enhancement
 #   gh run download <run-id> -n aft-windows-x64 -D ./aft-build
 
 on:
@@ -14,14 +14,14 @@ on:
       branch:
         description: "Git branch or tag to build from"
         required: false
-        default: "semantic-search-enhancement"
+        default: "main"
       features:
         description: "Cargo features to enable (comma-separated)"
         required: false
         default: "semantic-model2vec,semantic-fts5"
 
 concurrency:
-  group: build-aft-${{ github.ref }}
+  group: build-aft-${{ inputs.branch }}
   cancel-in-progress: true
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+          ref: ${{ inputs.branch }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,7 +47,7 @@ jobs:
         id: features
         shell: bash
         run: |
-          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          FEATURES="${{ inputs.features || 'semantic-model2vec,semantic-fts5' }}"
           echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
           echo "Building with features: $FEATURES"
 
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+          ref: ${{ inputs.branch }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -92,7 +92,7 @@ jobs:
         id: features
         shell: bash
         run: |
-          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          FEATURES="${{ inputs.features || 'semantic-model2vec,semantic-fts5' }}"
           echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
 
       - name: Build
@@ -127,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+          ref: ${{ inputs.branch }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,7 +137,7 @@ jobs:
         id: features
         shell: bash
         run: |
-          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          FEATURES="${{ inputs.features || 'semantic-model2vec,semantic-fts5' }}"
           echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
 
       - name: Build
