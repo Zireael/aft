@@ -1,0 +1,168 @@
+name: Build AFT Binary
+
+# Manually-triggered workflow that builds the AFT binary with ALL feature flags
+# enabled. Use this to produce a Windows binary for local testing without
+# requiring MSVC Build Tools on the host machine.
+#
+# Usage:
+#   gh workflow run build-aft.yml --ref <branch>
+#   gh run download <run-id> -n aft-windows-x64 -D ./aft-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Git branch or tag to build from"
+        required: false
+        default: "semantic-search-enhancement"
+      features:
+        description: "Cargo features to enable (comma-separated)"
+        required: false
+        default: "semantic-model2vec,semantic-fts5"
+
+concurrency:
+  group: build-aft-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Determine features
+        id: features
+        shell: bash
+        run: |
+          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
+          echo "Building with features: $FEATURES"
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --target x86_64-pc-windows-msvc \
+            -p agent-file-tools \
+            --features "${{ steps.features.outputs.flags }}"
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          BINARY="target/x86_64-pc-windows-msvc/release/aft.exe"
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: Binary not found at $BINARY"
+            exit 1
+          fi
+          "$BINARY" --version
+          echo "Binary size: $(du -h "$BINARY" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aft-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/aft.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux-x64:
+    name: Build Linux x64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine features
+        id: features
+        shell: bash
+        run: |
+          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            -p agent-file-tools \
+            --features "${{ steps.features.outputs.flags }}"
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          BINARY="target/release/aft"
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: Binary not found at $BINARY"
+            exit 1
+          fi
+          "$BINARY" --version
+          echo "Binary size: $(du -h "$BINARY" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aft-linux-x64
+          path: target/release/aft
+          if-no-files-found: error
+          retention-days: 7
+
+  build-darwin-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.branch || 'semantic-search-enhancement' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Determine features
+        id: features
+        shell: bash
+        run: |
+          FEATURES="${{ github.event.inputs.features || 'semantic-model2vec,semantic-fts5' }}"
+          echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --target aarch64-apple-darwin \
+            -p agent-file-tools \
+            --features "${{ steps.features.outputs.flags }}"
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          BINARY="target/aarch64-apple-darwin/release/aft"
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: Binary not found at $BINARY"
+            exit 1
+          fi
+          "$BINARY" --version
+          echo "Binary size: $(du -h "$BINARY" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aft-darwin-arm64
+          path: target/aarch64-apple-darwin/release/aft
+          if-no-files-found: error
+          retention-days: 7
