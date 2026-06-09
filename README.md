@@ -1106,20 +1106,220 @@ because `chunking_version` bumped to add file-summary chunks.
 Switching API keys (rotating `OPENAI_API_KEY` without changing `api_key_env`) does **not**
 trigger a rebuild — the key isn't part of the fingerprint.
 
+#### Reranking
+
+Reranking re-scores candidate results using a second model (typically a chat/instruct model)
+to improve precision. Disabled by default.
+
+```jsonc
+{
+  "semantic_search": true,
+  "semantic": {
+    "backend": "openai_compatible",
+    "model": "text-embedding-3-small",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "rerank_enabled": true,
+  "rerank_model": "codellama/codellama:7b-instruct",
+  "rerank_base_url": "http://127.0.0.1:10001/v1",
+  "rerank_api_key_env": "RERANK_API_KEY",  // optional, falls back to semantic api_key_env
+  "rerank_timeout_ms": 15000,
+  "rerank_max_candidates": 20,
+  "rerank_max_candidate_chars": 2500
+}
+```
+
+**Reranker fields:**
+
+| Field | Default | Description |
+|---|---|---|
+| `rerank_enabled` | `false` | Enable reranking stage |
+| `rerank_model` | model-specific | Model for reranking (OpenAI-compatible `/v1/chat/completions`) |
+| `rerank_base_url` | — | Base URL for reranker endpoint |
+| `rerank_api_key_env` | — | Env var name for API key (falls back to `api_key_env`) |
+| `rerank_timeout_ms` | `15000` | Per-request timeout |
+| `rerank_max_candidates` | `20` | Max candidates sent to reranker per query |
+| `rerank_max_candidate_chars` | `2500` | Max characters per candidate snippet |
+
+**Trust boundary:** `rerank_base_url` and `rerank_api_key_env` are **user-only** fields.
+Project-level config cannot set them — a hostile repository cannot redirect reranking at an
+attacker-controlled endpoint.
+
+**Behavior:**
+- When enabled, `aft_search` overfetches candidates (up to `rerank_max_candidates`) and
+  sends them to the reranker for relevance re-ordering.
+- Reranker response body is capped at 2 MiB to defend against misconfigured endpoints.
+- On any reranker failure (timeout, HTTP error, invalid JSON), AFT falls back to the
+  original embedding-based ranking — search never fails due to reranker issues.
+- Candidate snippets are truncated to `rerank_max_candidate_chars` before sending.
+
+#### Diagnostics and JSONL logging
+
+AFT collects per-query search diagnostics for debugging retrieval quality. Disabled by default.
+
+```jsonc
+{
+  "semantic_search": true,
+  "diagnostics_enabled": true,         // enable in-memory diagnostics
+  "jsonl_logging": true,               // write diagnostics to JSONL file
+  "jsonl_path": "/path/to/diagnostics.jsonl",  // optional, auto-generated if omitted
+  "jsonl_include_raw_query": false,    // include raw query text (privacy-sensitive)
+  "jsonl_include_snippets": false,     // include code snippets (privacy-sensitive)
+  "jsonl_retention_days": 14           // auto-cleanup after N days
+}
+```
+
+**Diagnostics fields:**
+
+| Field | Default | Description |
+|---|---|---|
+| `diagnostics_enabled` | `false` | Collect per-query metrics |
+| `jsonl_logging` | `false` | Write diagnostics to JSONL file |
+| `jsonl_path` | auto-generated | Override path for JSONL log |
+| `jsonl_include_raw_query` | `false` | Include raw query text (privacy-sensitive) |
+| `jsonl_include_snippets` | `false` | Include code snippets (privacy-sensitive) |
+| `jsonl_retention_days` | `14` | Days before auto-cleanup |
+
+**Per-query metrics include:**
+- Query hash (not raw query by default)
+- Pipeline type: `lexical`, `semantic`, `hybrid`, `semantic_rerank`, `hybrid_rerank`, `lexical_fallback`
+- Index state and completeness
+- Total latency, embedding latency, vector search latency, rerank latency
+- Candidate count and returned count
+- Score distribution (min, p50, p90, max)
+- Top-1 margin
+- Query cache hit/miss
+- Warning list
+
+**Privacy:** Raw queries and code snippets are never included by default. Enable
+`jsonl_include_raw_query` and `jsonl_include_snippets` only for local debugging —
+do not enable in production or shared environments.
+
+#### Semantic doctor
+
+Check semantic search health and configuration:
+
+```bash
+npx @cortexkit/aft doctor semantic
+```
+
+Reports:
+- Backend and model configuration
+- Index state (ready, building, disabled, degraded)
+- Chunk count and index completeness
+- Last query latency and matched count
+- Rerank status (enabled/disabled, last latency)
+- Recent warnings and suggestions
+
+#### Semantic eval
+
+Evaluate retrieval quality against a JSONL fixture file:
+
+```jsonl
+{"query": "authentication middleware", "expectations": [{"path": "src/auth/middleware.ts"}]}
+{"query": "retry logic", "expectations": [{"path": "src/utils/retry.ts", "symbol": "withRetry"}]}
+```
+
+Run evaluation:
+
+```bash
+npx @cortexkit/aft eval --file eval-fixtures.jsonl --top-k 10
+```
+
+**Metrics:**
+- Recall@k: fraction of expected paths found in top-k results
+- MRR (Mean Reciprocal Rank): average 1/rank of first correct result
+- Hit-anywhere: whether expected path appears anywhere in results
+
+**Limitations:**
+- Eval runs against the current semantic index state
+- Results depend on backend, model, and configuration
+- Ground truth annotations must be manually created or imported
+
+#### Contextualized embeddings
+
+Some providers (e.g., Perplexity-style) accept nested document/chunk arrays and return one
+embedding per chunk using surrounding chunks as context. This is called "contextualized"
+or "late chunking" embedding.
+
+**Current status:** Partial implementation. AFT supports the `DocumentChunkGroups` input
+mode for providers that declare it, but full contextualized embedding support is still
+being hardened.
+
+**Limitations:**
+- Contextualized mode requires provider-specific configuration
+- Document/chunk grouping must be preserved through chunking, batching, and indexing
+- Oversized documents may be split or rejected according to provider limits
+- Changing input mode triggers a full index rebuild
+
+**When to use:**
+- Document/RAG scenarios where surrounding context matters
+- Providers that explicitly support nested array inputs
+
+**When NOT to use:**
+- Small code symbols (functions, methods) — flat embeddings work fine
+- Providers that only support flat text arrays
+
+#### Prompt templates
+
+Optional query/document prompt templates improve retrieval for models that expect
+instruction-style inputs.
+
+```jsonc
+{
+  "semantic": {
+    "query_prompt_template": "Instruct: Given a code search query, retrieve relevant code\nQuery: {query}",
+    "document_prompt_template": "Represent this code for retrieval: {text}"
+  }
+}
+```
+
+**Behavior:**
+- `query_prompt_template` is applied only to user search queries (replaces `{query}`)
+- `document_prompt_template` is applied only to indexed code chunks (replaces `{text}`)
+- Empty or whitespace-only templates normalize to no-template behavior
+- Missing placeholders trigger validation warnings
+- Document template changes trigger index rebuild; query template changes clear query cache only
+
 **Constraints:**
-- `base_url` must be `http://` or `https://`.
-- **Loopback is allowed.** `127.0.0.1`, `localhost`, and `*.localhost` are accepted so
-  self-hosted backends like Ollama work at their default config (`http://127.0.0.1:11434`).
-  Loopback is by definition same-machine and not an SSRF target.
-- **Non-loopback private/reserved IPs are rejected** at configure time as an SSRF guard
-  against a malicious config redirecting embeddings to internal services. This includes
-  10/8, 172.16/12, 192.168/16, 169.254/16 (link-local), and 100.64/10 (CGNAT). mDNS
-  hostnames (`*.local`) are also rejected. Users running self-hosted services on a LAN IP
-  can either bind the service to loopback and use SSH/port-forward, or expose it on a
-  public-routable interface.
-- The plugin retries failed HTTP requests with exponential backoff before giving up.
-- Vector dimension is detected from the first response and validated on every subsequent
-  insert; mismatches abort the build instead of silently corrupting the index.
+- Only `{query}` and `{text}` placeholders are supported
+- Fastembed with templates emits a startup warning (templates may not be supported)
+- Template changes affect fingerprint and may trigger rebuilds
+
+#### Troubleshooting
+
+**Index shows `[index: building]`:**
+- Wait for background indexing to complete (visible in TUI sidebar)
+- Large repos may take several minutes
+- Check `npx @cortexkit/aft doctor semantic` for progress
+
+**Search returns no results:**
+- Verify `semantic_search: true` in config
+- Check ONNX Runtime is installed (`brew install onnxruntime` on macOS)
+- Run `npx @cortexkit/aft doctor` to check backend health
+- Try a simpler query (exact function name vs. natural language)
+
+**Reranker failures:**
+- AFT falls back to embedding-based ranking automatically
+- Check `rerank_base_url` is accessible
+- Verify API key with `curl -H "Authorization: Bearer $KEY" $BASE_URL/models`
+- Increase `rerank_timeout_ms` for slow models
+
+**Dimension mismatch errors:**
+- Switching models/backends rebuilds the index automatically
+- Ensure `dimensions` matches your model's output dimension
+- Check provider documentation for supported dimensions
+
+**SSRF protection blocks valid URL:**
+- Loopback (`127.0.0.1`, `localhost`) is always allowed
+- Non-loopback private IPs are rejected — bind to loopback or use SSH/port-forward
+- Public-routable URLs work without restriction
+
+**JSONL diagnostics not writing:**
+- Enable both `diagnostics_enabled` and `jsonl_logging`
+- Check `jsonl_path` is writable
+- Verify disk space for retention cleanup
 
 ---
 
