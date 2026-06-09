@@ -160,6 +160,27 @@ fn remove_refreshing_path(refreshing: &mut Vec<PathBuf>, path: &Path) {
     refreshing.retain(|existing| existing != path);
 }
 
+/// Resolve the default path for the JSONL diagnostics log.
+/// Order: `AFT_CACHE_DIR` env var → project's `.aft/cache/` → `~/.cache/aft/`.
+fn resolve_diagnostics_log_path(project_root: Option<&Path>) -> PathBuf {
+    if let Some(cache_dir) = std::env::var_os("AFT_CACHE_DIR") {
+        return PathBuf::from(cache_dir).join("semantic_diagnostics.jsonl");
+    }
+    if let Some(root) = project_root {
+        let cache = root.join(".aft").join("cache");
+        if cache.exists() || std::fs::create_dir_all(&cache).is_ok() {
+            return cache.join("semantic_diagnostics.jsonl");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    home.join(".cache")
+        .join("aft")
+        .join("semantic_diagnostics.jsonl")
+}
+
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
     Disabled,
@@ -526,6 +547,13 @@ pub struct AppContext {
     semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
     semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
+    /// Rolling per-query semantic search metrics collector.
+    semantic_search_metrics: RefCell<crate::semantic_diagnostics::SearchMetricsCollector>,
+    /// Optional JSONL diagnostics logger for persistent search diagnostics.
+    semantic_diagnostics_logger:
+        RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>>,
+    /// Warning dedup state for semantic search tool output.
+    semantic_warning_dedup: RefCell<crate::semantic_diagnostics::WarningDedup>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -612,6 +640,7 @@ fn callgraph_build_wait_window() -> Duration {
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
+        let metrics_window_size = config.semantic.metrics_window_size;
         let progress_sender = Arc::new(Mutex::new(None));
         let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         let (configure_warnings_tx, configure_warnings_rx) = mpsc::channel();
@@ -658,6 +687,13 @@ impl AppContext {
             semantic_refresh_event_rx: RefCell::new(None),
             semantic_refresh_worker: RefCell::new(None),
             semantic_embedding_model: RefCell::new(None),
+            semantic_search_metrics: RefCell::new(
+                crate::semantic_diagnostics::SearchMetricsCollector::new(metrics_window_size),
+            ),
+            semantic_diagnostics_logger: RefCell::new(None),
+            semantic_warning_dedup: RefCell::new(crate::semantic_diagnostics::WarningDedup::new(
+                Duration::from_secs(60),
+            )),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
@@ -1794,6 +1830,55 @@ impl AppContext {
         &self,
     ) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
+    }
+
+    /// Access the rolling search metrics collector.
+    pub fn semantic_search_metrics(
+        &self,
+    ) -> &RefCell<crate::semantic_diagnostics::SearchMetricsCollector> {
+        &self.semantic_search_metrics
+    }
+
+    /// Access the optional JSONL diagnostics logger.
+    pub fn semantic_diagnostics_logger(
+        &self,
+    ) -> &RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>> {
+        &self.semantic_diagnostics_logger
+    }
+
+    /// Access the warning dedup state for semantic search tool output.
+    pub fn semantic_warning_dedup(&self) -> &RefCell<crate::semantic_diagnostics::WarningDedup> {
+        &self.semantic_warning_dedup
+    }
+
+    /// Lazily initialize the JSONL diagnostics logger if jsonl_logging is enabled.
+    pub fn init_diagnostics_logger(&self) {
+        let mut logger = self.semantic_diagnostics_logger.borrow_mut();
+        if logger.is_some() {
+            return;
+        }
+        let cfg = self.config();
+        if !cfg.semantic.jsonl_logging {
+            return;
+        }
+        let path = cfg
+            .semantic
+            .jsonl_path
+            .clone()
+            .unwrap_or_else(|| resolve_diagnostics_log_path(cfg.project_root.as_deref()));
+        let include_raw_queries = cfg.semantic.include_raw_queries;
+        let include_snippets = cfg.semantic.include_snippets;
+        let retention_days = cfg.semantic.retention_days;
+        let new_logger = crate::semantic_diagnostics::SemanticDiagnosticsLogger::new(
+            path,
+            include_raw_queries,
+            include_snippets,
+            retention_days,
+        );
+        if let Some(lg) = new_logger {
+            lg.run_retention();
+            *logger = Some(lg);
+        }
     }
 
     /// Access the file watcher handle (kept alive to continue watching).

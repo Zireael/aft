@@ -2382,7 +2382,7 @@ pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
     mentions_onnx_runtime && mentions_dynamic_load_failure
 }
 
-fn format_embedding_init_error(error: impl Display) -> String {
+pub(crate) fn format_embedding_init_error(error: impl Display) -> String {
     let message = error.to_string();
 
     if is_onnx_runtime_unavailable(&message) {
@@ -6373,6 +6373,7 @@ mod tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6472,6 +6473,7 @@ mod tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -6543,6 +6545,7 @@ mod tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7859,6 +7862,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7928,6 +7932,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7976,6 +7981,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8030,6 +8036,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8087,6 +8094,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8137,6 +8145,7 @@ mod fingerprint_invalidation_tests {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
@@ -10175,6 +10184,7 @@ mod fingerprint_invalidation_tests {
             model_path: Some(PathBuf::from("/any/path")),
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         };
         let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
         assert!(err.contains("semantic-model2vec"), "error: {err}");

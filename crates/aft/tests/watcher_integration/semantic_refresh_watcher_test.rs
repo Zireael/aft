@@ -665,7 +665,7 @@ fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries(
     )
     .expect("build semantic index");
     assert!(
-        semantic_index.len() > 0,
+        !semantic_index.is_empty(),
         "semantic index should contain the canonical file entry"
     );
 

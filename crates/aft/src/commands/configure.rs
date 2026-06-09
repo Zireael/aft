@@ -1976,11 +1976,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
     }
     if let Some(v) = params.get("semantic_files") {
-        next_config.semantic_files = match parse_semantic_files_config(v, &next_config.semantic_files)
-        {
-            Ok(config) => config,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
+        next_config.semantic_files =
+            match parse_semantic_files_config(v, &next_config.semantic_files) {
+                Ok(config) => config,
+                Err(error) => return Response::error(&req.id, "invalid_request", error),
+            };
     }
     if let Some(v) = params.get("inspect") {
         next_config.inspect = match parse_inspect_config(v, &next_config.inspect) {
@@ -2426,7 +2426,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         });
                         let mut model =
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                        let fingerprint = model.fingerprint(&semantic_config)?;
+                        let fingerprint =
+                            model.fingerprint(&semantic_config, None, &semantic_files)?;
                         let fingerprint_key = fingerprint.as_string();
                         let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                             .then(|| ())

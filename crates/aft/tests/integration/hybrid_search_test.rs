@@ -47,7 +47,10 @@ fn identifier_file_in_both_lanes_gets_hybrid_boost() {
         2,
     );
 
-    assert_eq!(results[0].source, "hybrid");
+    // v0.32 contract: a file in both lanes keeps source "semantic" and is flagged
+    // hybrid_boosted (source is no longer overloaded with "hybrid").
+    assert_eq!(results[0].source, "semantic");
+    assert!(results[0].hybrid_boosted);
     assert_eq!(results[0].semantic_score, Some(0.4));
     assert_eq!(results[0].lexical_score, Some(2.0));
     assert!((results[0].score - 0.44).abs() < 0.0001);

@@ -279,6 +279,7 @@ mod tests {
             source: "hybrid",
             semantic_score: Some(1.0 / (id as f32 + 1.0)),
             lexical_score: None,
+            hybrid_boosted: false,
         }
     }
 

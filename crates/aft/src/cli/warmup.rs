@@ -485,7 +485,9 @@ fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
     }
     match ctx.semantic_index_status().borrow().clone() {
         SemanticIndexStatus::Disabled => SubsystemState::Disabled,
-        SemanticIndexStatus::Ready { .. } => SubsystemState::Ready,
+        SemanticIndexStatus::Ready { .. } | SemanticIndexStatus::Partial { .. } => {
+            SubsystemState::Ready
+        }
         SemanticIndexStatus::Failed(error) => SubsystemState::Failed(error),
         SemanticIndexStatus::Building {
             stage,

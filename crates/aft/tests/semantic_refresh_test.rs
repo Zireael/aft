@@ -353,6 +353,7 @@ fn refresh_reuses_line_shifted_file_chunks_without_embedding() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -387,6 +388,7 @@ fn refresh_reembeds_only_edited_symbol_in_changed_file() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 
@@ -436,6 +438,7 @@ fn refresh_stale_files_collect_failure_keeps_stale_entries() {
             &mut embed,
             16,
             &mut progress,
+            &SemanticFilePolicy::default(),
         )
         .expect("refresh succeeds");
 

@@ -60,6 +60,7 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
                 timeout_ms: 5_000,
                 max_batch_size: 64,
                 max_files: 20_000,
+                ..SemanticBackendConfig::default()
             },
             ..Config::default()
         },

@@ -266,6 +266,7 @@ pub struct SemanticBackendConfig {
     pub max_results_per_file: usize,
     /// Maximum number of project files to semantically index. Guards local
     /// embedding memory on huge project roots; remote backends can raise it.
+    #[serde(default = "default_max_semantic_files")]
     pub max_files: usize,
 }
 
@@ -312,6 +313,10 @@ fn default_model2vec_max_length() -> usize {
 
 fn default_max_results_per_file() -> usize {
     2
+}
+
+fn default_max_semantic_files() -> usize {
+    20_000
 }
 
 impl SemanticBackendConfig {
