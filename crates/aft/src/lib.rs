@@ -93,6 +93,9 @@ pub mod symbols;
 pub mod vector_store;
 pub mod windows_shell;
 
+#[cfg(feature = "semantic-fts5")]
+pub mod fts5_experimental;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,6 +24,7 @@ path = "tests/lsp/fake_server.rs"
 [features]
 default = []
 semantic-model2vec = ["dep:model2vec-rs"]
+semantic-fts5 = []
 
 [dependencies]
 log = "0.4"
