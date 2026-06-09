@@ -1,12 +1,14 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { astTools } from "../tools/ast.js";
 import { hoistedTools } from "../tools/hoisted.js";
+import { importTools } from "../tools/imports.js";
 import {
   _permissionsInternalsForTest,
   assertExternalDirectoryPermission,
@@ -32,6 +34,7 @@ afterEach(async () => {
     await rm(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
   }
+  _resetSessionDirectoryCacheForTest();
 });
 
 function createMockClient(): any {
@@ -41,8 +44,8 @@ function createMockClient(): any {
   };
 }
 
-function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
+function createPluginContext(pool: BridgePool, client: any = createMockClient()): PluginContext {
+  return { pool, client, config: {} as any, storageDir: "/tmp/aft-test" };
 }
 
 function createHarness(
@@ -105,6 +108,116 @@ function parsePermissionDenied(raw: string): Record<string, unknown> {
 }
 
 describe("permission audit regressions", () => {
+  test("aft_import rejects empty module sentinels before bridge dispatch", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const { calls, tools } = createHarness(importTools);
+
+    await expect(
+      tools.aft_import.execute(
+        { op: "add", filePath: "src/app.ts", module: "" },
+        createSdkContext(project, recordingAsk([])),
+      ),
+    ).rejects.toThrow("'module' is required for 'add' op");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("relative import paths use the session project root for both approval and bridge dispatch", async () => {
+    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-path-parity-")));
+    const project = path.join(tmpRoot, "project");
+    const launchCwd = path.join(tmpRoot, "launch-cwd");
+    await mkdir(path.join(project, "src"), { recursive: true });
+    await mkdir(launchCwd, { recursive: true });
+
+    const askCalls: AskCall[] = [];
+    const calls: SendCall[] = [];
+    const bridgeRoots: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        calls.push({ command, params });
+        return { success: true };
+      },
+    };
+    const pool = {
+      getBridge: (cwd: string) => {
+        bridgeRoots.push(cwd);
+        return bridge;
+      },
+    } as unknown as BridgePool;
+    const client = {
+      ...createMockClient(),
+      session: {
+        get: async () => ({ data: { directory: project } }),
+      },
+    };
+    const sdkCtx = {
+      ...createSdkContext(launchCwd, recordingAsk(askCalls)),
+      sessionID: "resume-session-path-parity",
+      worktree: launchCwd,
+    } as ToolContext;
+    const tools = importTools(createPluginContext(pool, client));
+
+    await tools.aft_import.execute({ op: "organize", filePath: "src/app.ts" }, sdkCtx);
+
+    const expectedFile = path.join(project, "src/app.ts");
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(expectedFile);
+    expect(calls[0]).toMatchObject({
+      command: "organize_imports",
+      params: { file: expectedFile },
+    });
+    expect(bridgeRoots[0]).toBe(project);
+  });
+
+  test("hoisted write paths use the session project root for approval and bridge dispatch", async () => {
+    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-hoisted-path-parity-")));
+    const project = path.join(tmpRoot, "project");
+    const launchCwd = path.join(tmpRoot, "launch-cwd");
+    await mkdir(path.join(project, "src"), { recursive: true });
+    await mkdir(launchCwd, { recursive: true });
+
+    const askCalls: AskCall[] = [];
+    const calls: SendCall[] = [];
+    const bridgeRoots: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        calls.push({ command, params });
+        return { success: true, created: true };
+      },
+    };
+    const pool = {
+      getBridge: (cwd: string) => {
+        bridgeRoots.push(cwd);
+        return bridge;
+      },
+    } as unknown as BridgePool;
+    const client = {
+      ...createMockClient(),
+      session: {
+        get: async () => ({ data: { directory: project } }),
+      },
+    };
+    const sdkCtx = {
+      ...createSdkContext(launchCwd, recordingAsk(askCalls)),
+      sessionID: "resume-hoisted-path-parity",
+      worktree: launchCwd,
+    } as ToolContext;
+    const tools = hoistedTools(createPluginContext(pool, client));
+
+    await tools.write.execute(
+      { filePath: "src/app.ts", content: "export const ok = true;\n" },
+      sdkCtx,
+    );
+
+    const expectedFile = path.join(project, "src/app.ts");
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(expectedFile);
+    expect(editAsk?.patterns).toEqual(["src/app.ts"]);
+    expect(calls[0]).toMatchObject({
+      command: "write",
+      params: { file: expectedFile },
+    });
+    expect(bridgeRoots[0]).toBe(project);
+  });
   windowsTest("containsPath rejects Windows cross-drive targets as external", async () => {
     const askCalls: AskCall[] = [];
     const ctx = createSdkContext("C:\\repo", recordingAsk(askCalls));
@@ -177,6 +290,56 @@ describe("permission audit regressions", () => {
     expect(calls[0]?.command).toBe("checkpoint");
   });
 
+  test("aft_safety checkpoint preflight warms session root before resolving relative files", async () => {
+    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-checkpoint-path-parity-")));
+    const project = path.join(tmpRoot, "project");
+    const launchCwd = path.join(project, "subdir");
+    await mkdir(launchCwd, { recursive: true });
+
+    const askCalls: AskCall[] = [];
+    const calls: SendCall[] = [];
+    const bridgeRoots: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        calls.push({ command, params });
+        return { success: true, name: "snap" };
+      },
+    };
+    const pool = {
+      getBridge: (cwd: string) => {
+        bridgeRoots.push(cwd);
+        return bridge;
+      },
+    } as unknown as BridgePool;
+    const client = {
+      ...createMockClient(),
+      session: {
+        get: async () => ({ data: { directory: project } }),
+      },
+    };
+    const sdkCtx = {
+      ...createSdkContext(launchCwd, recordingAsk(askCalls)),
+      sessionID: "resume-checkpoint-path-parity",
+      worktree: launchCwd,
+    } as ToolContext;
+    const tools = safetyTools(createPluginContext(pool, client));
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "checkpoint", name: "snap", files: ["../outside.ts"] },
+      sdkCtx,
+    )) as string;
+
+    const expectedApprovedPath = path.resolve(project, "../outside.ts");
+    const externalAsk = askCalls.find((call) => call.permission === "external_directory");
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(externalAsk?.metadata?.filepath).toBe(expectedApprovedPath);
+    expect(calls[0]).toMatchObject({
+      command: "checkpoint",
+      params: { files: ["../outside.ts"] },
+    });
+    expect(bridgeRoots[0]).toBe(project);
+  });
+
   test("aft_safety checkpoint external denial returns the permissionDeniedResponse envelope", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
@@ -200,7 +363,11 @@ describe("permission audit regressions", () => {
     const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, backup_id: "b1" }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "inside.ts")] }
+        : { success: true, backup_id: "b1" },
+    );
 
     const raw = (await tools.aft_safety.execute(
       { op: "undo", filePath: "inside.ts" },
@@ -209,32 +376,157 @@ describe("permission audit regressions", () => {
 
     expect(JSON.parse(raw).success).toBe(true);
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
-    expect(calls[0]?.command).toBe("undo");
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
   });
 
-  test("aft_safety undo without filePath calls bridge without file param", async () => {
+  test("aft_safety undo without filePath previews, asks edit, then calls bridge without file param", async () => {
     const { project } = await makeProjectAndExternalDirs();
+    const canonicalProject = await realpath(project);
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, operation: true }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? {
+            success: true,
+            paths: [
+              path.join(canonicalProject, "inside.ts"),
+              path.join(canonicalProject, "inside.ts"),
+            ],
+          }
+        : { success: true, operation: true },
+    );
 
     const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
 
     expect(JSON.parse(raw).success).toBe(true);
-    expect(askCalls).toHaveLength(0);
-    expect(calls[0]?.command).toBe("undo");
+    expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
+    expect(askCalls[0]?.patterns).toEqual(["inside.ts"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
     expect(calls[0]?.params).not.toHaveProperty("file");
+    expect(calls[1]?.params).not.toHaveProperty("file");
   });
 
-  test("aft_safety undo with filePath still passes file param", async () => {
+  test("aft_safety undo without filePath stops before undo when edit permission is denied", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(
+      project,
+      recordingAsk(askCalls, { permission: "edit", message: "edit denied by policy" }),
+    );
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "inside.ts")] }
+        : { success: true, operation: true },
+    );
+
+    const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
+
+    expect(parsePermissionDenied(raw).message).toBe("edit denied by policy");
+    expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview"]);
+  });
+
+  test("aft_safety undo with filePath previews and still passes file param", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const sdkCtx = createSdkContext(project, recordingAsk([]));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, backup_id: "b1" }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "inside.ts")] }
+        : { success: true, backup_id: "b1" },
+    );
 
     await tools.aft_safety.execute({ op: "undo", filePath: "inside.ts" }, sdkCtx);
 
-    expect(calls[0]?.command).toBe("undo");
+    expect(calls[0]?.command).toBe("undo_preview");
     expect(calls[0]?.params).toMatchObject({ file: "inside.ts" });
+    expect(calls[1]?.command).toBe("undo");
+    expect(calls[1]?.params).toMatchObject({ file: "inside.ts" });
+  });
+
+  test("aft_safety undo preflights external paths returned by preview", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "undo.ts");
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [externalFile, externalFile] }
+        : { success: true, operation: true },
+    );
+
+    const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+  });
+
+  test("aft_safety undo preview internal paths do not ask external_directory", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "undo.ts")] }
+        : { success: true, operation: true },
+    );
+
+    await tools.aft_safety.execute({ op: "undo" }, sdkCtx);
+
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+  });
+
+  test("aft_safety restore preflights external checkpoint paths", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "restore.ts");
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "checkpoint_paths"
+        ? { success: true, paths: [externalFile] }
+        : { success: true, name: "snap" },
+    );
+
+    const raw = (await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx)) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+  });
+
+  test("aft_safety restore internal checkpoint paths do not ask external_directory", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "checkpoint_paths"
+        ? { success: true, paths: [path.join(project, "restore.ts")] }
+        : { success: true, name: "snap" },
+    );
+
+    await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx);
+
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+  });
+
+  test("aft_safety checkpoint checks a single external filePath", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "single.ts");
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }));
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "checkpoint", name: "snap", filePath: externalFile },
+      sdkCtx,
+    )) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls[0]?.command).toBe("checkpoint");
+    expect(calls[0]?.params).toMatchObject({ files: [externalFile] });
   });
 
   test("ast_grep_search denies external paths before bridge execution", async () => {

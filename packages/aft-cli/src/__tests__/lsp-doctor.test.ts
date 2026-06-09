@@ -9,20 +9,21 @@ import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import { printLspDoctorHelp, renderLspInspection, runLspDoctor } from "../commands/lsp.js";
 import type { AftRequest, AftResponse } from "../lib/aft-bridge.js";
 
-function makeAdapter(): HarnessAdapter {
+function makeAdapter(opts: { kind?: "opencode" | "pi" } = {}): HarnessAdapter {
+  const kind = opts.kind ?? "opencode";
   const configPaths: HarnessConfigPaths = {
     configDir: "/tmp/aft-test",
-    harnessConfig: "/tmp/aft-test/opencode.jsonc",
+    harnessConfig: `/tmp/aft-test/${kind}.jsonc`,
     harnessConfigFormat: "jsonc",
     aftConfig: "/tmp/aft-test/aft.jsonc",
     aftConfigFormat: "jsonc",
   };
 
   return {
-    kind: "opencode",
-    displayName: "OpenCode",
-    pluginPackageName: "@cortexkit/aft-opencode",
-    pluginEntryWithVersion: "@cortexkit/aft-opencode@latest",
+    kind,
+    displayName: kind === "pi" ? "Pi" : "OpenCode",
+    pluginPackageName: `@cortexkit/aft-${kind}`,
+    pluginEntryWithVersion: `@cortexkit/aft-${kind}@latest`,
     isInstalled: () => true,
     getHostVersion: () => "test",
     detectConfigPaths: () => configPaths,
@@ -194,7 +195,36 @@ describe("doctor lsp", () => {
 
     expect(code).toBe(0);
     expect(requests[0][0].command).toBe("configure");
+    expect(requests[0][0].harness).toBe("opencode");
     expect(requests[0][1].command).toBe("lsp_inspect");
+  });
+
+  test("configure payload includes harness=pi when --harness pi is selected", async () => {
+    const requests: AftRequest[][] = [];
+    const code = await runLspDoctor({
+      argv: ["./main.py", "--harness", "pi"],
+      findBinary: () => "/tmp/aft-bin",
+      resolveAdapters: async () => [makeAdapter({ kind: "pi" })],
+      sendRequests: async (_binary, batch) => {
+        requests.push(batch);
+        return [
+          { id: "doctor-lsp-configure", success: true },
+          {
+            id: "doctor-lsp-inspect",
+            success: true,
+            file: "/repo/main.py",
+            extension: "py",
+            project_root: "/repo",
+            matching_servers: [],
+            diagnostics_count: 0,
+            diagnostics: [],
+          },
+        ];
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(requests[0][0].harness).toBe("pi");
   });
 
   test("infers cached lsp_paths_extra even when lsp.auto_install is false", async () => {

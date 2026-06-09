@@ -377,7 +377,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_info(&source, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     Response::success(&req.id, result)

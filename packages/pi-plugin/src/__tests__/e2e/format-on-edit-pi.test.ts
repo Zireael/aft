@@ -107,7 +107,15 @@ exit 1
   };
 }
 
-async function installPreset(h: Harness, preset: FormatPreset, shims: FakeFormatterShim[] = []) {
+async function installPreset(
+  h: Harness,
+  preset: FormatPreset,
+  shims: FakeFormatterShim[] = [],
+  config: Record<string, unknown> = {
+    format_on_edit: true,
+    validate_on_edit: "syntax",
+  },
+) {
   for (const file of preset.configFiles) {
     await mkdir(join(h.tempDir, file.path, ".."), { recursive: true });
     await writeFile(h.path(file.path), file.content, "utf8");
@@ -127,8 +135,7 @@ async function installPreset(h: Harness, preset: FormatPreset, shims: FakeFormat
   const configureParams: Record<string, unknown> = {
     project_root: h.tempDir,
     harness: "pi",
-    format_on_edit: true,
-    validate_on_edit: "syntax",
+    ...config,
   };
   if (preset.explicitFormatter) configureParams.formatter = preset.explicitFormatter;
   const configured = await h.bridge.send("configure", configureParams);
@@ -167,7 +174,7 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
       config,
     });
     harnesses.push(h);
-    await installPreset(h, preset, shims);
+    await installPreset(h, preset, shims, config);
     return h;
   }
 
@@ -185,7 +192,10 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
     // the wrapper used to drop these fields entirely.
     expect(detailsOf(result).formatted).toBe(true);
     expect(detailsOf(result).formatSkippedReason).toBeUndefined();
-    expect(h.text(result)).not.toContain("Auto-formatted.");
+    // Parity (v0.35.2): Pi's agent-facing text now shares formatEditSummary
+    // with OpenCode, so a formatted write surfaces " Auto-formatted." in both
+    // harnesses (previously only OpenCode's write said it; Pi was silent).
+    expect(h.text(result)).toContain("Auto-formatted.");
   });
 
   test("Pi hoisted edit triggers formatter", async () => {
@@ -244,24 +254,6 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
 
     expect(response.formatted).toBe(false);
     expect(response.format_skipped_reason).toBe("formatter_not_installed");
-  });
-
-  test("Pi multi-file edit transaction formats both files", async () => {
-    const h = await formatHarness(BIOME_TS_PRESET, [formattingBiomeShim()]);
-    await mkdir(h.path("src"), { recursive: true });
-    const response = await h.bridge.send("transaction", {
-      operations: [
-        { command: "write", file: h.path("src/a.ts"), content: TS_INPUT },
-        { command: "write", file: h.path("src/b.ts"), content: TS_INPUT },
-      ],
-    });
-
-    expect(response.success).toBe(true);
-    const files = response.results as Array<Record<string, unknown>>;
-    expect(files).toHaveLength(2);
-    expect(files.every((file) => file.formatted === true)).toBe(true);
-    expect(await readFile(h.path("src/a.ts"), "utf8")).toContain("export function foo");
-    expect(await readFile(h.path("src/b.ts"), "utf8")).toContain("export function foo");
   });
 
   test("Pi glob edit_match formats every matched file", async () => {

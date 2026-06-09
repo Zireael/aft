@@ -100,16 +100,54 @@ fn collect_optional_notification(
 
 fn executable_protocol_server_script() -> PathBuf {
     let temp_dir = tempdir().expect("tempdir for protocol server");
-    let script = temp_dir.keep().join("protocol_lsp_server.py");
+    let dir = temp_dir.keep();
+    let script = dir.join("protocol_lsp_server.py");
     fs::write(&script, PROTOCOL_SERVER).expect("write protocol server");
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).expect("chmod protocol server");
+        let wrapper = dir.join("protocol_lsp_server.cmd");
+        fs::write(
+            &wrapper,
+            "@echo off\r\nwhere python >nul 2>nul\r\nif %ERRORLEVEL% EQU 0 (python \"%~dp0protocol_lsp_server.py\" & exit /b %ERRORLEVEL%)\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
+        )
+        .expect("write protocol server cmd wrapper");
+        wrapper
     }
-    script
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("chmod protocol server");
+        }
+        script
+    }
+}
+
+fn protocol_server_prerequisites_available() -> bool {
+    if cfg!(windows) {
+        std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .is_ok()
+            || std::process::Command::new("py")
+                .args(["-3", "--version"])
+                .output()
+                .is_ok()
+    } else {
+        true
+    }
+}
+
+fn skip_if_protocol_server_prerequisites_missing() -> bool {
+    if protocol_server_prerequisites_available() {
+        false
+    } else {
+        eprintln!("skipping protocol LSP integration test: python/py launcher not available");
+        true
+    }
 }
 
 const PROTOCOL_SERVER: &str = r#"#!/usr/bin/env python3
@@ -165,6 +203,10 @@ while True:
                 "interFileDependencies": True,
                 "workspaceDiagnostics": True,
                 "identifier": "protocol-test",
+            }
+        if mode == "static-watch":
+            capabilities["workspace"] = {
+                "didChangeWatchedFiles": {"watchers": [{"globPattern": "**/*"}]}
             }
         response(message["id"], {"capabilities": capabilities})
     elif method == "initialized":
@@ -346,7 +388,65 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
 }
 
 #[test]
+fn static_watched_file_capability_allows_notification_without_dynamic_registration() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let source = root.join("main.staticwatch");
+    let changed = root.join("config.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("marker.txt"), "marker\n").unwrap();
+    fs::write(&source, "content\n").unwrap();
+    fs::write(&changed, "{}\n").unwrap();
+
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "protocol-static-watch".to_string(),
+            extensions: vec!["staticwatch".to_string()],
+            binary: "protocol-static-watch".to_string(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    let server_kind = ServerKind::Custom(Arc::from("protocol-static-watch"));
+    let mut manager = LspManager::new();
+    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "static-watch");
+
+    let keys = manager.ensure_server_for_file(&source, &config);
+    assert_eq!(keys.len(), 1);
+    assert!(
+        manager
+            .client_for_file(&source, &config)
+            .expect("client")
+            .supports_watched_files(),
+        "initialize-time watched-file support should be captured"
+    );
+
+    manager
+        .notify_files_watched_changed(&[(changed, FileChangeType::CHANGED)], &config)
+        .expect("send watched-file change");
+
+    let watched = collect_optional_notification(
+        &mut manager,
+        "custom/watchedFilesChanged",
+        Duration::from_secs(2),
+    )
+    .expect("static watched-file support should receive notification");
+    assert_eq!(watched["changes"][0]["type"], 2);
+}
+
+#[test]
 fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregister() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
     let source = root.join("main.watchtest");
@@ -438,6 +538,9 @@ fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregi
 
 #[test]
 fn workspace_pull_timeout_sends_cancel_request() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
     let source = root.join("main.wspull");

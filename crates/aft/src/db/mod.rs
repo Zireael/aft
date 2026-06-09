@@ -8,7 +8,7 @@ pub mod bash_tasks;
 pub mod compression_events;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -93,6 +93,29 @@ CREATE TABLE IF NOT EXISTS host_state (
   key        TEXT NOT NULL PRIMARY KEY,
   value      TEXT NOT NULL,
   updated_at INTEGER NOT NULL
+);
+"#;
+
+const MIGRATION_V2: &str = r#"
+DELETE FROM compression_events
+WHERE id NOT IN (
+  SELECT MIN(id)
+  FROM compression_events
+  GROUP BY
+    harness,
+    COALESCE(session_id, char(0)),
+    project_key,
+    tool,
+    COALESCE(task_id, char(0))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compression_event_identity
+ON compression_events (
+  harness,
+  COALESCE(session_id, char(0)),
+  project_key,
+  tool,
+  COALESCE(task_id, char(0))
 );
 "#;
 
@@ -215,6 +238,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
 
     let result = match version {
         1 => tx.execute_batch(MIGRATION_V1),
+        2 => tx.execute_batch(MIGRATION_V2),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -255,6 +279,7 @@ mod tests {
         "idx_compression_session",
         "idx_compression_session_created",
         "idx_compression_project_key",
+        "idx_compression_event_identity",
         "idx_backups_session_path",
         "idx_backups_session_op",
         "idx_backups_session_order",

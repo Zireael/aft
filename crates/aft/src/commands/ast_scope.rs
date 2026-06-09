@@ -223,7 +223,12 @@ fn walk_root(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                 return !matches!(

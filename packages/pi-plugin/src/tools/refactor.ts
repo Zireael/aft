@@ -7,7 +7,15 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  textResult,
+} from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -24,14 +32,16 @@ import {
 
 const RefactorParams = Type.Object({
   op: StringEnum(["move", "extract", "inline"] as const, { description: "Refactoring operation" }),
-  filePath: Type.String({ description: "Source file" }),
+  filePath: Type.String({
+    description: "Source file (absolute or relative to project root)",
+  }),
   symbol: Type.Optional(Type.String({ description: "Symbol name (for move, inline)" })),
   destination: Type.Optional(Type.String({ description: "Target file (for move)" })),
   scope: Type.Optional(Type.String({ description: "Disambiguation scope for move op" })),
   name: Type.Optional(Type.String({ description: "New function name (for extract)" })),
-  startLine: Type.Optional(Type.Number({ description: "1-based start line (for extract)" })),
-  endLine: Type.Optional(Type.Number({ description: "1-based end line, inclusive (for extract)" })),
-  callSiteLine: Type.Optional(Type.Number({ description: "1-based call site line (for inline)" })),
+  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  callSiteLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
 });
 
 /** Exported for renderer unit tests. */
@@ -118,23 +128,73 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       _onUpdate,
       extCtx,
     ) {
-      const bridge = bridgeFor(ctx, extCtx.cwd);
       const commandMap: Record<string, string> = {
         move: "move_symbol",
         extract: "extract_function",
         inline: "inline_symbol",
       };
-      const req: Record<string, unknown> = { file: params.filePath };
-      if (params.symbol !== undefined) req.symbol = params.symbol;
-      if (params.destination !== undefined) req.destination = params.destination;
-      if (params.scope !== undefined) req.scope = params.scope;
-      if (params.name !== undefined) req.name = params.name;
-      if (params.startLine !== undefined) req.start_line = params.startLine;
-      // Agent uses inclusive end_line; Rust extract_function expects exclusive.
-      if (params.endLine !== undefined) {
-        req.end_line = params.op === "extract" ? params.endLine + 1 : params.endLine;
+      // Per-op required-field validation using isEmptyParam so empty strings
+      // ("") sent by GPT-family models trigger the proper "required" error
+      // instead of being passed through to Rust as a valid empty value.
+      if ((params.op === "move" || params.op === "inline") && isEmptyParam(params.symbol)) {
+        throw new Error(`'symbol' is required for '${params.op}' op`);
       }
-      if (params.callSiteLine !== undefined) req.call_site_line = params.callSiteLine;
+      if (params.op === "move" && isEmptyParam(params.destination)) {
+        throw new Error("'destination' is required for 'move' op");
+      }
+      if (params.op === "extract" && isEmptyParam(params.name)) {
+        throw new Error("'name' is required for 'extract' op");
+      }
+      const startLine = coerceOptionalInt(
+        params.startLine,
+        "startLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      const endLine = coerceOptionalInt(params.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+      const callSiteLine = coerceOptionalInt(
+        params.callSiteLine,
+        "callSiteLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (params.op === "extract") {
+        if (startLine === undefined) throw new Error("'startLine' is required for 'extract' op");
+        if (endLine === undefined) throw new Error("'endLine' is required for 'extract' op");
+      }
+      if (params.op === "inline" && callSiteLine === undefined) {
+        throw new Error("'callSiteLine' is required for 'inline' op");
+      }
+
+      const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+      const destination = !isEmptyParam(params.destination)
+        ? await resolvePathArg(extCtx.cwd, params.destination as string)
+        : undefined;
+      const permissionTargets =
+        params.op === "move" && destination !== undefined ? [filePath, destination] : [filePath];
+      const checked = new Set<string>();
+      for (const target of permissionTargets) {
+        if (checked.has(target)) continue;
+        checked.add(target);
+        await assertExternalDirectoryPermission(extCtx, target, "modify", {
+          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+        });
+      }
+
+      const bridge = bridgeFor(ctx, extCtx.cwd);
+      const req: Record<string, unknown> = { file: filePath };
+      // Use isEmptyParam everywhere so "" / [] / null don't slip through as
+      // valid string params that Rust then has to deal with.
+      if (!isEmptyParam(params.symbol)) req.symbol = params.symbol;
+      if (destination !== undefined) req.destination = destination;
+      if (!isEmptyParam(params.scope)) req.scope = params.scope;
+      if (!isEmptyParam(params.name)) req.name = params.name;
+      if (startLine !== undefined) req.start_line = startLine;
+      // Agent uses inclusive end_line; Rust extract_function expects exclusive.
+      if (endLine !== undefined) {
+        req.end_line = params.op === "extract" ? endLine + 1 : endLine;
+      }
+      if (callSiteLine !== undefined) req.call_site_line = callSiteLine;
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

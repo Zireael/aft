@@ -17,7 +17,7 @@ describe("semantic renderer", () => {
         makeContext({ query: "find auth logic", topK: 5 }),
       ),
     );
-    expect(output).toContain("semantic search");
+    expect(output).toContain("search");
     expect(output).toContain("find auth logic");
   });
 
@@ -26,6 +26,9 @@ describe("semantic renderer", () => {
       renderSemanticResult(
         makeResult("", {
           status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "hybrid",
+          query_kind: "Identifier",
           results: [
             {
               file: "/repo/src/auth.ts",
@@ -44,9 +47,136 @@ describe("semantic renderer", () => {
       ),
     );
 
-    expect(output).toContain("index: ready");
+    expect(output).toContain("semantic: ready");
     expect(output).toContain("src/auth.ts");
     expect(output).toContain("login [function] lines 4-8 score 0.910");
+  });
+
+  test("renderSemanticResult surfaces semantic honesty flags", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "hybrid",
+          more_available: true,
+          engine_capped: true,
+          fully_degraded: true,
+          complete: false,
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "login",
+              kind: "function",
+              start_line: 4,
+              end_line: 8,
+            },
+          ],
+        }),
+        { query: "auth", topK: 5 },
+        mockTheme,
+        makeContext({ query: "auth", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain(
+      "Search status: more results available; enumeration capped; fully degraded; partial/incomplete.",
+    );
+  });
+
+  test("renderSemanticResult renders file_summary results as summaries", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "semantic",
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "auth.ts",
+              kind: "file_summary",
+              start_line: null,
+              end_line: null,
+              location: "[file summary]",
+              score: 0.82,
+              source: "semantic",
+              snippet: "Exports login and session helpers.",
+            },
+          ],
+        }),
+        { query: "auth", topK: 5 },
+        mockTheme,
+        makeContext({ query: "auth", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("src/auth.ts");
+    expect(output).toContain("Exports login and session helpers.");
+    expect(output).toContain("[file summary score 0.820]");
+    expect(output).not.toContain("lines ?");
+  });
+
+  test("renderSemanticResult renders lexical file_summary results as lexical matches", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "hybrid",
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "auth.ts",
+              kind: "file_summary",
+              start_line: null,
+              end_line: null,
+              location: "[lexical match]",
+              score: 0.77,
+              source: "lexical",
+              snippet: "Exports login and session helpers.",
+            },
+          ],
+        }),
+        { query: "login", topK: 5 },
+        mockTheme,
+        makeContext({ query: "login", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("src/auth.ts");
+    expect(output).toContain("[lexical match — score 0.770]");
+    expect(output).toContain("Exports login and session helpers.");
+    expect(output).not.toContain("[file summary");
+  });
+
+  test("renderSemanticResult renders GrepLine results", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "disabled",
+          interpreted_as: "regex",
+          query_kind: "Regex",
+          results: [
+            {
+              kind: "GrepLine",
+              file: "/repo/src/auth.ts",
+              line: 12,
+              column: 5,
+              line_text: "export function login() {}",
+            },
+          ],
+        }),
+        { query: ".*login", topK: 5, hint: "regex" },
+        mockTheme,
+        makeContext({ query: ".*login", topK: 5, hint: "regex" }),
+      ),
+    );
+
+    expect(output).toContain("mode=regex");
+    expect(output).toContain("src/auth.ts");
+    expect(output).toContain("line 12:5 export function login() {}");
   });
 
   test("renderSemanticResult handles non-ready, error, and empty payloads", () => {
@@ -67,7 +197,7 @@ describe("semantic renderer", () => {
       ),
     );
 
-    expect(building).toContain("index: building");
+    expect(building).toContain("semantic: building");
     expect(error).toContain("embedding failed");
   });
 });

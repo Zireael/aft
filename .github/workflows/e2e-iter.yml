@@ -1,0 +1,100 @@
+name: E2E iter (manual)
+
+# Fast iteration: triggered on push to branches matching `iter/*` or via
+# manual dispatch. Runs ONLY the macOS + Linux E2E. No publish, no unit
+# tests, no Windows, no Pi RPC. Use to debug a single failing E2E
+# scenario without waiting 20-30min for the full release pipeline.
+#
+# Branch convention: push to `iter/<topic>` to trigger.
+#
+# Cycle time target: ~5-10 minutes. Linux Docker is ~3-5min; macOS native
+# is ~6-8min cold. Both run in parallel.
+
+on:
+  push:
+    branches:
+      - "iter/**"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  e2e-linux:
+    name: E2E iter (Linux Docker)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps + build plugin
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+          bun run --cwd packages/opencode-plugin build
+
+      - name: Build Linux x64 binary in Docker
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-build-linux \
+            -f tests/docker/Dockerfile.build-linux .
+
+      - name: Extract built binary
+        run: |
+          CID=$(docker create --platform linux/amd64 aft-build-linux true)
+          docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
+          docker rm "$CID"
+
+      - name: Build E2E test image
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-e2e-linux-x64 \
+            -f tests/docker/Dockerfile.linux-x64 .
+
+      - name: Run E2E test
+        run: docker run --rm --platform linux/amd64 aft-e2e-linux-x64
+
+      # Always dump the aimock + plugin log artifact, even on failure, so
+      # we can grep the actual lines that fired during the failing scenario.
+      - name: Upload plugin log on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-e2e-logs
+          path: |
+            /tmp/aft-iter-*.log
+          if-no-files-found: ignore
+
+  e2e-macos:
+    name: E2E iter (macOS native)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (macOS native)
+        run: cargo build --release -p agent-file-tools
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+
+      - name: Build OpenCode plugin dist
+        run: bun run --cwd packages/opencode-plugin build
+
+      - name: Run macOS E2E suite
+        run: bash tests/macos-e2e/run.sh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
+          AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist

@@ -8,9 +8,10 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { __ptyCacheSizeForTests, __resetPtyCacheForTests } from "../shared/pty-cache.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashStatusTool, createBashTool } from "../tools/bash.js";
+import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
-import { noopAsk } from "./test-helpers";
+import { noopAsk, toolResultText } from "./test-helpers";
 
 const tempDirs: string[] = [];
 
@@ -67,12 +68,20 @@ async function spill(contents: string): Promise<string> {
 }
 
 describe("OpenCode bash PTY layer", () => {
-  test("Test 20: pty true requires background true", async () => {
-    const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+  test("Test 20: pty true implies background true (no explicit flag needed)", async () => {
+    const { ctx: pluginCtx, calls } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-implied-bg",
+    }));
     const bash = createBashTool(pluginCtx);
-    await expect(bash.execute({ command: "python", pty: true }, runtime())).rejects.toThrow(
-      "PTY mode requires background: true",
-    );
+    // Caller omits background: true — plugin must auto-promote because pty:true
+    // requires the polling background lifecycle.
+    const output = toolResultText(await bash.execute({ command: "python", pty: true }, runtime()));
+    expect(output).toContain("bash-pty-implied-bg");
+    // Rust spawn payload sees background:true and pty:true.
+    const lastCall = calls.at(-1);
+    expect(lastCall?.params).toMatchObject({ pty: true, background: true });
   });
 
   test("Test 21: subagent pty true is rejected", async () => {
@@ -136,6 +145,62 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).toContain("there");
   });
 
+  test("Test 25b: bash_status renders custom PTY dimensions", async () => {
+    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+      pty_rows: 50,
+      pty_cols: 120,
+    }));
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-wide-screen", outputMode: "screen" },
+      runtime(),
+    );
+    expect(result).toContain("left");
+    expect(result).toContain("wide");
+  });
+
+  test("bash_status preserves full coordinated non-PTY preview", async () => {
+    const preview = `BEGIN-${"x".repeat(2500)}-END`;
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pipes",
+      output_preview: preview,
+    }));
+
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-long-preview" },
+      runtime(),
+    );
+
+    expect(result).toContain(preview);
+    expect(result).toContain("-END");
+  });
+
+  test("bash_status PTY path ignores compressed output_preview", async () => {
+    const outputPath = await spill("raw pty bytes");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      mode: "pty",
+      output_path: outputPath,
+      output_preview: "COMPRESSED PIPE PREVIEW SHOULD NOT RENDER",
+    }));
+
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-pty-raw-guard", outputMode: "raw" },
+      runtime(),
+    );
+
+    expect(result).toContain("raw pty bytes");
+    expect(result).not.toContain("COMPRESSED PIPE PREVIEW");
+  });
+
   test("Test 26: bash_status cache reuses terminal across calls", async () => {
     const outputPath = await spill("first");
     const { ctx: pluginCtx } = ctx(() => ({
@@ -153,7 +218,7 @@ describe("OpenCode bash PTY layer", () => {
     expect(__ptyCacheSizeForTests()).toBe(1);
   });
 
-  test("Test 26b: bash_status waitFor matches PTY bytes", async () => {
+  test("Test 26b: bash_watch pattern matches PTY bytes", async () => {
     const outputPath = await spill("booting\nready on pty\n");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
@@ -161,12 +226,35 @@ describe("OpenCode bash PTY layer", () => {
       mode: "pty",
       output_path: outputPath,
     }));
-    const result = await createBashStatusTool(pluginCtx).execute(
-      { taskId: "bash-pty-wait", waitFor: "ready on pty" },
+    const result = await createBashWatchTool(pluginCtx).execute(
+      { taskId: "bash-pty-wait", pattern: "ready on pty" },
       runtime(),
     );
     expect(result).toContain('matched "ready on pty" at offset 8');
     expect(result).toContain("ready on pty");
+    expect(__ptyCacheSizeForTests()).toBe(0);
+  });
+
+  test("Test 26c: bash_watch PTY scan is independent from bash_status cursor", async () => {
+    const outputPath = await spill("rea");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-pty-shared", outputMode: "raw" },
+      runtime(),
+    );
+    await appendFile(outputPath, "dy\n");
+
+    const result = await createBashWatchTool(pluginCtx).execute(
+      { taskId: "bash-pty-shared", pattern: "ready", timeoutMs: 1 },
+      runtime(),
+    );
+
+    expect(result).toContain('matched "ready" at offset 0');
   });
 
   test("Test 27: bash_status cache disposes on terminal status", async () => {

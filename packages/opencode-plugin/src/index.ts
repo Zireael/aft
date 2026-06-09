@@ -1,17 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
 import {
   BridgePool,
-  cleanupUrlCache,
   ensureBinary,
   ensureOnnxRuntime,
   ensureStorageMigrated,
   findBinary,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
+  markAnnouncementSeen,
   resolveCortexKitStorageRoot,
   setActiveLogger,
+  shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 import {
@@ -20,10 +19,15 @@ import {
   handleIdleBgCompletions,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
+  handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import {
+  enqueueConfigureWarningsForSession,
+  flushConfigureWarningsOnIdle,
+} from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
-import { bridgeLogger, error, log, warn } from "./logger.js";
+import { bridgeLogger, debug, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
@@ -32,7 +36,6 @@ import {
 } from "./lsp-github-install.js";
 import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
-import { consumeToolMetadata } from "./metadata-store.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import {
   cleanupWarnings,
@@ -40,7 +43,8 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
-import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
+import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
+import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
@@ -51,12 +55,18 @@ import {
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
-import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
+import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
+import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
-import { lspTools } from "./tools/lsp.js";
+import {
+  createInspectTier2IdleScheduler,
+  inspectToolSurfaceEnabled,
+  inspectTools,
+} from "./tools/inspect.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
 import { refactoringTools } from "./tools/refactoring.js";
@@ -66,6 +76,16 @@ import { semanticTools } from "./tools/semantic.js";
 import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
+
+type BashPatternMatchPayload = {
+  session_id: string;
+  task_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+};
 
 type BashLongRunningPayload = {
   session_id: string;
@@ -77,6 +97,7 @@ type BashLongRunningPayload = {
 
 type BridgePendingState = {
   hasPendingRequests(): boolean;
+  getCwd(): string;
 };
 
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
@@ -109,11 +130,6 @@ function throwSentinel(command: string): never {
 // value pushed into the hooks array — `undefined` returns then crash
 // the host on every `hook.config?.(cfg)` / `hook.provider?.(...)` /
 // etc. iteration. Helpers stay in sibling modules.
-import {
-  drainPendingEagerWarnings,
-  handleConfigureWarningsForSession,
-} from "./configure-warnings.js";
-
 async function sendIgnoredMessage(client: unknown, sessionID: string, text: string): Promise<void> {
   const typedClient = client as {
     session?: {
@@ -122,10 +138,29 @@ async function sendIgnoredMessage(client: unknown, sessionID: string, text: stri
     };
   };
 
-  const body = {
+  // Resolve the current agent (used by the user in this session) so the
+  // notification renders under that agent in the OpenCode UI. Without
+  // `agent`, OpenCode renders under its default agent — which surfaces
+  // as the "AFT uses non-current agent" bug when users switch agents
+  // via oh-my-openagent. See issue #62. `agent` is honored on the
+  // `noReply: true` path too (no LLM call, just appended as a synthetic
+  // user message recorded under that agent).
+  let agent: string | undefined;
+  try {
+    const ctx = await resolvePromptContext(
+      client as Parameters<typeof resolvePromptContext>[0],
+      sessionID,
+    );
+    agent = ctx?.agent;
+  } catch {
+    agent = undefined;
+  }
+
+  const body: Record<string, unknown> = {
     noReply: true,
     parts: [{ type: "text", text, ignored: true }],
   };
+  if (agent) body.agent = agent;
   const promptInput = { path: { id: sessionID }, body };
 
   if (typeof typedClient.session?.prompt === "function") {
@@ -164,11 +199,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.28.0";
+const ANNOUNCEMENT_VERSION = "0.36.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Bash hoisting is now default-on. Configure with top-level `bash: { rewrite, compress, background }` instead of `experimental.bash.*` — old config migrates automatically on first launch.",
-  "Vue, Astro, and Svelte language servers now auto-install when the framework appears in your package.json (fixes #48).",
-  "Native Windows ARM64 binary — ARM64 hosts no longer fall back to x64 under emulation.",
+  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
+  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
+  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
+  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
 ];
 
 /**
@@ -178,7 +214,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
  *
  * Leave empty (`""`) to suppress.
  */
-const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
+const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 
 /**
  * AFT (Agent File Toolkit) plugin for OpenCode.
@@ -195,9 +231,8 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
  * - Safety: aft_safety
  * - Imports: aft_import
  * - Structure: aft_transform
- * - Navigation: aft_navigate
+ * - Navigation: aft_callgraph
  * - Refactoring: aft_refactor
- * - LSP: aft_lsp_diagnostics (inline diagnostics on edits are automatic)
  */
 // OpenCode currently calls this function more than once per process when a
 // single plugin is configured — see https://github.com/anomalyco/opencode/issues/26812.
@@ -242,6 +277,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...resolveProjectOverridesForConfigure(aftConfig),
     bash_permissions: true,
   };
+  // url_fetch_allow_private is user-config only (project config is stripped in loadAftConfig).
+  if (aftConfig.url_fetch_allow_private !== undefined) {
+    configOverrides.url_fetch_allow_private = aftConfig.url_fetch_allow_private;
+  }
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -397,6 +436,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+    onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
@@ -459,27 +499,25 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
-      const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];
-      // Avoid re-entering bridge.send() from the synchronous configure callback
-      // before aft-bridge marks the lazy-spawned bridge configured.
-      setTimeout(() => {
-        void handleConfigureWarningsForSession({
-          projectRoot,
-          sessionId,
-          client,
-          bridge,
-          warnings: [...pendingWarnings, ...warnings],
-          fallbackClient: input.client,
-          storageDir: configOverrides.storage_dir as string,
-          pluginVersion: PLUGIN_VERSION,
-        });
-      }, 0);
+      const projectConfig = loadAftConfig(projectRoot);
+      enqueueConfigureWarningsForSession({
+        projectRoot,
+        sessionId,
+        client,
+        bridge,
+        warnings,
+        fallbackClient: input.client,
+        storageDir: configOverrides.storage_dir as string,
+        pluginVersion: PLUGIN_VERSION,
+        serverUrl: input.serverUrl?.toString(),
+        delivery: projectConfig.configure_warnings_delivery ?? "toast",
+      });
     },
-    onBashCompletion: (completion) => {
-      // Prefer the cached session directory; fall back to plugin-init cwd
-      // when we haven't seen this session yet (e.g. completion arriving
-      // before any tool call has populated the cache).
-      const sessionDir = getSessionDirectoryCached(completion.session_id) ?? input.directory;
+    onBashCompletion: (completion, bridge) => {
+      // Use the callback bridge's project root: the pushed completion originated
+      // from that bridge, so draining/acking against a session-dir cache fallback
+      // can target the wrong project on cold/stale cache.
+      const sessionDir = bridge.getCwd();
       void handlePushedBgCompletion(
         {
           ctx,
@@ -495,8 +533,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         completion,
       );
     },
-    onBashLongRunning: (reminder) => {
-      const sessionDir = getSessionDirectoryCached(reminder.session_id) ?? input.directory;
+    onBashLongRunning: (reminder, bridge) => {
+      const sessionDir = bridge.getCwd();
       void handlePushedBgLongRunning(
         {
           ctx,
@@ -508,6 +546,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           serverUrl: input.serverUrl?.toString(),
         },
         reminder,
+      );
+    },
+    onBashPatternMatch: (frame, bridge) => {
+      const sessionDir = bridge.getCwd();
+      void handlePushedPatternMatch(
+        {
+          ctx,
+          directory: sessionDir,
+          sessionID: frame.session_id,
+          client: input.client,
+          serverUrl: input.serverUrl?.toString(),
+        },
+        frame,
       );
     },
   };
@@ -537,11 +588,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   void probeServerReachable(input.serverUrl?.toString())
     .then((reachable) => {
       setLiveServerWakeAvailable(reachable);
-      log(
-        reachable
-          ? "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active)."
-          : "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
-      );
+      if (reachable) {
+        log(
+          "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active).",
+        );
+      } else {
+        // Normal OpenCode TUI flow: the optional live HTTP listener is absent,
+        // so bg-notifications uses the reliable in-process wake path. Keep the
+        // duplicate-runner workaround nudge in DEBUG instead of surfacing it as
+        // a user-actionable warning.
+        debug(
+          "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
+        );
+      }
     })
     .catch(() => {
       // Probe failures stay on the safe default (in-process fallback).
@@ -597,9 +656,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // get an orderly shutdown when the Node host receives a termination signal.
   // Without this, OS propagates SIGTERM to children before OpenCode calls dispose,
   // and (together with bridge.ts signal handling) we want the shutdown path we
-  // control, not implicit process-group death. The returned unregister is called
-  // from dispose so plugin reloads don't leak stale cleanup callbacks.
-  const unregisterShutdown = registerShutdownCleanup(async () => {
+  // control, not implicit process-group death. Plugin dispose runs this same
+  // cleanup set through runCleanups("dispose") so reloads do not leak children.
+  let clearInspectTier2Idle = () => {};
+  registerShutdownCleanup(async () => {
+    autoUpdateAbort.abort();
+    clearInspectTier2Idle();
     await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
     try {
       rpcServer.stop();
@@ -619,14 +681,21 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // synthetic "not_initialized" status so the sidebar shows something
     // sensible without triggering project indexing.
     //
-    // Try the session-stored directory first (fixes `opencode -s` from a
-    // different cwd), then fall back to the plugin-init cwd.
+    // Prefer THIS server's own project (the plugin-init cwd) first, then fall
+    // back to the session-stored directory. Order matters: in OpenCode Desktop a
+    // single process hosts one RPC server per open project, all sharing this
+    // process's session-dir cache. Resolving the session-cached dir first let
+    // project A's server serve project B's bridge when the cache mapped this
+    // session elsewhere ("another session's data" in the sidebar). Serving our
+    // own directory first removes that cross-project bleed; the session-dir
+    // fallback still fixes `opencode -s` from a different cwd, where the
+    // plugin-init cwd has no bridge and the real project lives in the cache.
     const cachedDir = getSessionDirectoryCached(sessionID);
     const candidateDirs = new Set<string>();
+    candidateDirs.add(input.directory);
     if (typeof cachedDir === "string" && cachedDir.length > 0) {
       candidateDirs.add(cachedDir);
     }
-    candidateDirs.add(input.directory);
     let bridge: ReturnType<typeof pool.getActiveBridgeForRoot> = null;
     for (const dir of candidateDirs) {
       bridge = pool.getActiveBridgeForRoot(dir);
@@ -669,22 +738,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
       return { show: false };
     }
-    if (storageDir) {
-      // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-      // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-      // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-      // spawn at every plugin init. Deferred to a future version that decides whether
-      // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-      // other writer; this file stays in sync via direct legacy-file writes.
-      const versionFile = join(storageDir, "last_announced_version");
-      try {
-        if (existsSync(versionFile)) {
-          const lastVersion = readFileSync(versionFile, "utf-8").trim();
-          if (lastVersion === ANNOUNCEMENT_VERSION) return { show: false };
-        }
-      } catch {
-        // proceed
-      }
+    if (!storageDir) {
+      // No storage path → we can't persist "seen" state, so suppress the
+      // announcement to avoid spamming users whose storage isn't configured.
+      return { show: false };
+    }
+    // shouldShowAnnouncement silently seeds the marker on first-install /
+    // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't
+    // see the changelog dialog every boot (per magic-context#99). Real
+    // upgrades from a persisted older version still surface here.
+    if (!shouldShowAnnouncement(storageDir, "opencode", ANNOUNCEMENT_VERSION)) {
+      return { show: false };
     }
     return {
       show: true,
@@ -696,12 +760,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   rpcServer.handle("mark-announced", async () => {
     if (storageDir && ANNOUNCEMENT_VERSION) {
-      try {
-        mkdirSync(storageDir, { recursive: true });
-        writeFileSync(join(storageDir, "last_announced_version"), ANNOUNCEMENT_VERSION);
-      } catch {
-        // best-effort
-      }
+      markAnnouncementSeen(storageDir, "opencode", ANNOUNCEMENT_VERSION);
     }
     return { success: true };
   });
@@ -721,13 +780,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   });
 
   rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
-
-  // Periodic URL cache cleanup (fire-and-forget, removes entries older than 24 hours)
-  try {
-    cleanupUrlCache(storageDir);
-  } catch {
-    // best-effort
-  }
 
   try {
     ensureTuiPluginEntry();
@@ -785,13 +837,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
-  //   recommended: minimal + hoisted + lsp_diagnostics + ast_grep_* + aft_import (default)
-  //   all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
+  //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
+  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
   const ALL_ONLY_TOOLS = new Set([
-    "aft_navigate",
+    "aft_callgraph",
     "aft_delete",
     "aft_move",
     "aft_transform",
@@ -813,11 +865,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // AST tools: recommended+
     ...(surface !== "minimal" && astTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
+    ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
-    // LSP diagnostics: recommended+
-    ...(surface !== "minimal" && lspTools(ctx)),
     // Git conflicts: recommended+
     ...(surface !== "minimal" && conflictTools(ctx)),
   });
@@ -846,6 +897,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     log(`Disabled ${disabled.size} tool(s): ${[...disabled].join(", ")}`);
   }
 
+  // Wrap every tool's execute() with latency instrumentation: one log line per
+  // call breaking total time into pre-bridge / bridge round-trip / post-bridge.
+  // Applied after disabled-tool filtering so suppressed tools aren't wrapped.
+  instrumentToolMap(allTools);
+
   const autoUpdateEventHook = createAutoUpdateCheckerHook(input, {
     enabled: true,
     autoUpdate: aftConfig.auto_update ?? true,
@@ -867,7 +923,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_outline",
     "aft_zoom",
     "aft_search",
-    "aft_navigate",
+    "aft_callgraph",
+    "aft_inspect",
     "grep",
     "aft_grep",
     "bash",
@@ -875,6 +932,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
+  const aftSearchRegistered = registeredTools.has("aft_search");
+  // Tell Rust whether `aft_search` is registered for this surface so the
+  // grep-rewrite footer can steer to it (vs the grep tool). The pool holds
+  // configOverrides by reference and bridges spawn lazily, so a late set here
+  // reaches every bridge — same pattern as `_ort_dylib_dir`/`lsp_paths_extra`.
+  pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
+  // Also expose the same surface decision to the TypeScript-side native bash
+  // output finalizer, which catches leading grep/rg commands that Rust could
+  // not rewrite (for example, greps with unsupported flags or pipes).
+  (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
+    aftSearchRegistered;
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);
@@ -883,6 +951,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   if (hintsBlock) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }
+
+  const inspectTier2Idle = createInspectTier2IdleScheduler({
+    isEnabled: () => registeredTools.has("aft_inspect"),
+    idleMinutes: () => aftConfig.inspect?.tier2_idle_minutes,
+    warn,
+    run: async (sessionID: string): Promise<void> => {
+      const sessionDir =
+        (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
+      const response = await bridge.send("inspect_tier2_run", { session_id: sessionID });
+      if (response.success === false) {
+        warn((response.message as string) || "inspect_tier2_run failed");
+      }
+    },
+  });
+  clearInspectTier2Idle = () => inspectTier2Idle.clearAll();
 
   return {
     tool: allTools,
@@ -896,9 +980,16 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
     event: async (eventInput: { event: { type: string; properties?: unknown } }) => {
       await autoUpdateEventHook(eventInput);
-      if (eventInput.event.type !== "session.idle") return;
+      const eventType = eventInput.event.type;
       const sessionID = extractSessionID(eventInput.event.properties);
+      if ((eventType === "session.deleted" || eventType === "session.shutdown") && sessionID) {
+        inspectTier2Idle.clear(sessionID);
+        clearStatusBarSession(sessionID);
+        return;
+      }
+      if (eventType !== "session.idle") return;
       if (!sessionID) return;
+      inspectTier2Idle.schedule(sessionID);
       // Use the session's stored directory rather than the plugin-init cwd:
       // OpenCode passes process.cwd() in `input.directory`, which can be wrong
       // for `-s` resumes from another folder.
@@ -911,6 +1002,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         client: input.client,
         serverUrl: input.serverUrl?.toString(),
       });
+      await flushConfigureWarningsOnIdle(sessionID);
     },
     "chat.message": async (messageInput: {
       sessionID?: string;
@@ -921,6 +1013,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
+    },
+    "tool.execute.before": async (toolInput: { sessionID?: string }) => {
+      if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);
     },
     "command.execute.before": async (
       commandInput: { command: string; sessionID: string },
@@ -961,21 +1056,21 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       await sendIgnoredMessage(input.client, commandInput.sessionID, formatStatusMarkdown(status));
       throwSentinel(commandInput.command);
     },
-    // Restore metadata that fromPlugin() overwrites (opencode bug workaround)
+    // Post-process tool output: append bash hints, drain in-turn background
+    // completions, and append the agent status bar. (UI title/diff metadata is
+    // now returned directly from each tool's execute() — OpenCode's fromPlugin
+    // preserves it — so the old metadata-store merge is gone; see #96.)
     "tool.execute.after": async (
       toolInput: { tool: string; sessionID: string; callID: string },
       output: { title: string; output: string; metadata: Record<string, unknown> } | undefined,
     ) => {
       if (!output) return;
-      const stored = consumeToolMetadata(toolInput.sessionID, toolInput.callID);
-      if (stored) {
-        if (stored.title) output.title = stored.title;
-        if (stored.metadata) output.metadata = { ...output.metadata, ...stored.metadata };
-      }
-      // Bash output hints — see shared/bash-hints.ts for the gating logic.
+      // Bash output hints — see shared/bash-hints.ts. The grep/rg code-search
+      // redirect is emitted by the Rust bash rewriter (it owns the rewrite and
+      // now reads `aft_search_registered` from config), so the plugin only adds
+      // the conflicts hint here.
       if (toolInput.tool === "bash" && output.output) {
         output.output = maybeAppendConflictsHint(output.output);
-        output.output = maybeAppendGrepHint(output.output);
       }
       // Use cached session directory so bg-completion drains target the
       // right project bridge after `opencode -s` from another cwd.
@@ -984,6 +1079,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         { ctx, directory: sessionDir, sessionID: toolInput.sessionID },
         output,
       );
+      // Agent status bar — IDE-style health glance, appended on emit-on-change.
+      // Read from the active bridge (no spawn); the Rust side keeps counts current.
+      // Force it on aft_inspect: the bar IS that call's summary line, so it must
+      // always show even if counts are unchanged since the last emit.
+      if (output.output !== undefined) {
+        const activeBridge = ctx.pool.getActiveBridgeForRoot(sessionDir);
+        const suffix = statusBarSuffixForSession(
+          toolInput.sessionID,
+          activeBridge?.getStatusBar(),
+          toolInput.tool === "aft_inspect",
+        );
+        if (suffix) output.output += suffix;
+      }
     },
     config: async (config: { command?: Record<string, unknown> } | undefined) => {
       // Defensive guard: if OpenCode passes undefined or a non-object,
@@ -1003,12 +1111,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       };
     },
     dispose: async () => {
-      autoUpdateAbort.abort();
-      unregisterShutdown();
-      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      rpcServer.stop();
-      await disposeAllPtyTerminals();
-      await pool.shutdown();
+      await runCleanups("dispose");
     },
   };
 }

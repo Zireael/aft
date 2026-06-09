@@ -155,6 +155,182 @@ fn add_import_ts_relative_group() {
 }
 
 #[test]
+fn add_import_ts_allows_parent_relative_module() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("parent_relative.ts");
+    fs::write(&file, "export const x = 1;\n").unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-parent-relative",
+        &file.display().to_string(),
+        "../config",
+        Some(&["Config"]),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "relative add should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import { Config } from '../config';"),
+        "single-parent ES relative imports must remain allowed:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_c_allows_parent_relative_include() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("relative_include.c");
+    fs::write(&file, "int main(void) { return 0; }\n").unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-c-parent-relative",
+        &file.display().to_string(),
+        "\"../foo.h\"",
+        None,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "parent-relative C include should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("#include \"../foo.h\""),
+        "C include should preserve the parent-relative local path:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_solidity_allows_parent_relative_import() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("RelativeImport.sol");
+    fs::write(
+        &file,
+        "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+    )
+    .unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-sol-parent-relative",
+        &file.display().to_string(),
+        "../lib/X.sol",
+        None,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "parent-relative Solidity import should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import \"../lib/X.sol\";"),
+        "Solidity import should preserve the parent-relative path:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_c_rejects_absolute_modules() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("unsafe_include.c");
+    let original = "int main(void) { return 0; }\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    for (id, module) in [
+        ("imp-c-posix-absolute", "/etc/passwd"),
+        ("imp-c-drive-absolute", "C:\\evil"),
+        ("imp-c-unc-absolute", "\\\\srv\\x"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "absolute module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            original,
+            "rejected module {module:?} must not mutate the file"
+        );
+    }
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_java_and_php_reject_filesystem_modules() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+
+    let java_file = dir.path().join("Unsafe.java");
+    let java_original = "package demo;\n\nclass Unsafe {}\n";
+    fs::write(&java_file, java_original).unwrap();
+    let java_file_str = java_file.display().to_string();
+
+    for (id, module) in [
+        ("imp-java-parent", "../evil"),
+        ("imp-java-slash", "/evil"),
+        ("imp-java-drive", "C:\\evil"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &java_file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "Java filesystem module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(fs::read_to_string(&java_file).unwrap(), java_original);
+    }
+
+    let php_file = dir.path().join("unsafe.php");
+    let php_original = "<?php\n\nnamespace Demo;\n\nclass C {}\n";
+    fs::write(&php_file, php_original).unwrap();
+    let php_file_str = php_file.display().to_string();
+
+    for (id, module) in [
+        ("imp-php-parent", "..\\Evil"),
+        ("imp-php-slash", "/tmp/Evil"),
+        ("imp-php-drive", "C:\\evil"),
+    ] {
+        let resp = send_add_import(&mut aft, id, &php_file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "PHP filesystem module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(fs::read_to_string(&php_file).unwrap(), php_original);
+    }
+
+    fs::remove_file(&java_file).ok();
+    fs::remove_file(&php_file).ok();
+    aft.shutdown();
+}
+
+#[test]
 fn add_import_ts_dedup() {
     let mut aft = AftProcess::spawn();
     let (_dir, file) = temp_copy("imports_ts.ts");
@@ -345,7 +521,10 @@ fn add_import_unsupported_language_returns_error() {
         resp["success"], false,
         "should fail for unsupported language"
     );
-    assert_eq!(resp["code"], "invalid_request");
+    assert_eq!(
+        resp["code"], "unsupported_language",
+        "unsupported file type uses the actionable standardized code, not invalid_request"
+    );
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -829,6 +1008,31 @@ fn remove_import_missing_module_reports_not_removed() {
     assert_eq!(resp["success"], true, "request should complete: {resp:?}");
     assert_eq!(resp["removed"], false, "nothing should be removed");
     assert_eq!(resp["reason"], "module_not_found");
+    assert_eq!(resp["no_op"], true, "no-match removes must report no_op");
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn remove_import_missing_name_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let (_dir, file) = temp_copy("imports_ts.ts");
+    let file_str = file.display().to_string();
+
+    let resp = send_remove_import(
+        &mut aft,
+        "rm-missing-name",
+        &file_str,
+        "react",
+        Some("useMemo"),
+    );
+
+    assert_eq!(resp["success"], true, "request should complete: {resp:?}");
+    assert_eq!(resp["removed"], false, "nothing should be removed");
+    assert_eq!(resp["reason"], "name_not_found");
+    assert_eq!(resp["name"], "useMemo");
+    assert_eq!(resp["no_op"], true, "name misses must report no_op");
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -876,6 +1080,71 @@ fn remove_import_preserves_default_when_named_removed() {
 // ===========================================================================
 // organize_imports tests
 // ===========================================================================
+
+#[test]
+fn organize_imports_without_imports_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("no_imports.ts");
+    let original = "export const x = 1;\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-no-imports", &file.display().to_string());
+
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
+    assert_eq!(resp["removed_duplicates"], 0);
+    assert_eq!(resp["no_op"], true, "no-import organize must report no_op");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_rejects_multi_namespace_php_without_mutating() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("multi_namespace.php");
+    let original = r#"<?php
+
+namespace Foo {
+use Zed\Last;
+
+class X {}
+}
+
+namespace Bar {
+use App\Alpha;
+
+class Y {}
+}
+"#;
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-multi-php", &file.display().to_string());
+
+    assert_eq!(
+        resp["success"], false,
+        "multi-namespace PHP organize should be refused: {resp:?}"
+    );
+    assert_eq!(resp["code"], "multi_region_imports");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("span multiple code regions"),
+        "error should explain the multi-region refusal: {resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "refused organize must leave the PHP file byte-for-byte unchanged"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
 
 #[test]
 fn organize_imports_ts_regroups_and_sorts() {
@@ -967,12 +1236,185 @@ fn organize_imports_preserves_side_effect_order() {
         "side-effect imports keep original relative order (b before a):\n{content}"
     );
     assert!(
-        polyfill_a_pos < react_pos,
-        "side-effects come before value imports within the same group:\n{content}"
+        zod_pos < polyfill_a_pos,
+        "value imports before a side-effect barrier must not cross it:\n{content}"
     );
     assert!(
-        react_pos < zod_pos,
-        "value imports alphabetized (react before zod):\n{content}"
+        polyfill_a_pos < react_pos,
+        "side-effects keep their source position relative to following value imports:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_preserves_inter_import_comments() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "organize_comment_gap_{}.ts",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original =
+        "import A from 'a';\n// keep me\nimport B from 'b';\n\nexport const x = A || B;\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-comment-gap", &file.display().to_string());
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    let content = fs::read_to_string(&file).unwrap();
+    assert_eq!(content, original, "comment gap must be preserved");
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_remove_import_refuse_csharp_and_php_multi_region_imports() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let cs_file = dir.path().join(format!("multi_region_{n}.cs"));
+    fs::write(
+        &cs_file,
+        "namespace A {\nusing Common;\nclass A {}\n}\nnamespace B {\nusing Common;\nclass B {}\n}\n",
+    )
+    .unwrap();
+    let cs_file_str = cs_file.display().to_string();
+    let add_cs = send_add_import(
+        &mut aft,
+        "cs-multi-add",
+        &cs_file_str,
+        "System",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(add_cs["success"], false, "C# add should refuse: {add_cs:?}");
+    assert_eq!(add_cs["code"], "multi_region_imports");
+    let remove_cs = send_remove_import(&mut aft, "cs-multi-remove", &cs_file_str, "Common", None);
+    assert_eq!(
+        remove_cs["success"], false,
+        "C# remove should refuse: {remove_cs:?}"
+    );
+    assert_eq!(remove_cs["code"], "multi_region_imports");
+
+    let php_file = dir.path().join(format!("multi_region_{n}.php"));
+    fs::write(
+        &php_file,
+        "<?php\nnamespace A {\nuse Common\\Thing;\nclass A {}\n}\nnamespace B {\nuse Common\\Thing;\nclass B {}\n}\n",
+    )
+    .unwrap();
+    let php_file_str = php_file.display().to_string();
+    let add_php = send_add_import(
+        &mut aft,
+        "php-multi-add",
+        &php_file_str,
+        "Other\\Thing",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        add_php["success"], false,
+        "PHP add should refuse: {add_php:?}"
+    );
+    assert_eq!(add_php["code"], "multi_region_imports");
+    let remove_php = send_remove_import(
+        &mut aft,
+        "php-multi-remove",
+        &php_file_str,
+        "Common\\Thing",
+        None,
+    );
+    assert_eq!(
+        remove_php["success"], false,
+        "PHP remove should refuse: {remove_php:?}"
+    );
+    assert_eq!(remove_php["code"], "multi_region_imports");
+
+    fs::remove_file(&cs_file).ok();
+    fs::remove_file(&php_file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn php_grouped_use_refuses_memberwise_add_and_remove() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "php_grouped_use_{}.php",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original = "<?php\nuse App\\{Foo, Bar as Baz};\n\nclass C {}\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    let add_resp = send_add_import(
+        &mut aft,
+        "php-group-add",
+        &file_str,
+        "App\\Foo",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        add_resp["success"], false,
+        "add should refuse: {add_resp:?}"
+    );
+    assert_eq!(add_resp["code"], "unsupported_grouped_import");
+
+    let remove_resp = send_remove_import(&mut aft, "php-group-remove", &file_str, "App\\Foo", None);
+    assert_eq!(
+        remove_resp["success"], false,
+        "remove should refuse: {remove_resp:?}"
+    );
+    assert_eq!(remove_resp["code"], "unsupported_grouped_import");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_go_grouped_block_refuses_internal_comments() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "organize_go_grouped_comments_{}.go",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original = "package main\n\nimport (\n\t\"fmt\"\n\t// keep me with this block\n\t\"os\"\n)\n\nfunc main() {}\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(
+        &mut aft,
+        "org-go-grouped-comments",
+        &file.display().to_string(),
+    );
+    assert_eq!(
+        resp["success"], false,
+        "commented Go grouped imports should be refused: {resp:?}"
+    );
+    assert_eq!(resp["code"], "unsupported_import_comments");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "refused organize must leave the Go file byte-for-byte unchanged"
     );
 
     fs::remove_file(&file).ok();
@@ -1200,6 +1642,65 @@ fn main() {}
     assert!(serde_pos < crate_pos, "external before internal");
 
     assert_eq!(resp["syntax_valid"], true);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_rs_preserves_nested_use_tree() {
+    // Regression: a nested use tree like
+    //   use std::collections::{hash_map::{Entry, HashMap}, BTreeMap};
+    // was split on raw commas, corrupting the nested subtree into
+    //   `hash_map::{Entry` / `HashMap}` / `BTreeMap`, which regrouped into
+    //   `use std::collections::{BTreeMap, HashMap}, hash_map::{Entry};`
+    // — invalid Rust. Brace-aware splitting must keep the subtree intact.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let file = dir.path().join(format!("organize_rs_nested_{}.rs", n));
+
+    fs::write(
+        &file,
+        "\
+use std::collections::{hash_map::{Entry, HashMap}, BTreeMap};
+use std::fmt;
+
+fn main() {}
+",
+    )
+    .unwrap();
+
+    let file_str = file.display().to_string();
+    let resp = send_organize_imports(&mut aft, "org-rs-nested", &file_str);
+
+    assert_eq!(
+        resp["success"], true,
+        "organize_imports should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["syntax_valid"], true,
+        "organized Rust must stay syntactically valid: {resp:?}"
+    );
+
+    let content = fs::read_to_string(&file).unwrap();
+
+    // The nested subtree must survive as one item, not be exploded into
+    // sibling top-level entries.
+    assert!(
+        content.contains("hash_map::{Entry, HashMap}"),
+        "nested subtree must be preserved intact. content:\n{content}"
+    );
+    // The corruption signature must NOT appear: a brace tree followed by a
+    // comma and another path at the same level inside one use statement.
+    assert!(
+        !content.contains("}, hash_map::{Entry};")
+            && !content.contains("{BTreeMap, HashMap}, hash_map"),
+        "must not produce invalid comma-joined brace trees. content:\n{content}"
+    );
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -1598,4 +2099,69 @@ fn generate_ts_namespace_import_line_round_trips_default_and_namespace() {
     );
 
     assert_eq!(line, "import Foo, * as ns from './mod';");
+}
+
+// --- Merge into existing same-module import ---
+
+/// When the target module already has a named-import statement of the same
+/// kind, `add_import` should merge new `names` into that existing statement
+/// instead of inserting a duplicate `import { ... } from "lib"` line.
+///
+/// Regression for the Pi-reported bug where adding `{ baz }` to a file with
+/// `import { foo } from "lib"` produced two separate `import { ... } from "lib"`
+/// statements that the linter then complained about.
+#[test]
+fn add_import_merges_into_existing_same_module_named_import() {
+    let mut aft = AftProcess::spawn();
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("merge.ts");
+    fs::write(
+        &file,
+        "import { foo } from \"lib\";\n\nexport function use() {\n  return foo();\n}\n",
+    )
+    .unwrap();
+
+    // Configure aft against the temp dir as project root.
+    aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
+    ));
+
+    let resp = send_add_import(
+        &mut aft,
+        "merge1",
+        file.to_str().unwrap(),
+        "lib",
+        Some(&["baz"]),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "merge add should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["added"], true, "should report added=true: {:?}", resp);
+
+    let content = fs::read_to_string(&file).unwrap();
+
+    // Single merged statement (no duplicate `from "lib"` line)
+    let from_lib_count =
+        content.matches("from \"lib\"").count() + content.matches("from 'lib'").count();
+    assert_eq!(
+        from_lib_count, 1,
+        "should have exactly one statement importing from 'lib':\n{}",
+        content
+    );
+
+    // Both names present
+    assert!(
+        content.contains("baz") && content.contains("foo"),
+        "merged statement should contain both names:\n{}",
+        content
+    );
+
+    aft.shutdown();
 }

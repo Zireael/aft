@@ -10,27 +10,44 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
       disabledTools: new Set(),
     });
     expect(out).not.toBeNull();
     expect(out).toContain("## Prefer AFT tools for token efficiency");
+    expect(out).toContain("**Parallel tool calls**");
+    expect(out).toContain("emit them in ONE response instead of serializing");
+    expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("**Web/URL access**");
     expect(out).toContain("**Code exploration**");
-    expect(out).toContain("For exact identifiers (`useState`, function names, env vars)");
-    expect(out).toContain(
-      "For broad concepts ('where is X handled', 'how does Y work') → `aft_search`",
-    );
-    expect(out).toContain("Use `aft_navigate`");
+    expect(out).toContain("`aft_search` is the primary code-search tool");
+    expect(out).toContain('`hint: "regex"`');
+    expect(out).toContain("auto-routes concepts, identifiers, regex");
+    // Imperative anti-bash-grep + parallel-wave steer must be present.
+    expect(out).toContain("fire independent lookups in ONE parallel tool-call wave");
+    expect(out).toContain("DO NOT run `grep`/`rg`/`find` through `bash` to locate code");
+    expect(out).toContain("the bash path is unindexed, unranked, serial");
+    expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("- `callers`");
     expect(out).toContain("- `impact`");
     expect(out).toContain("- `trace_to`");
     expect(out).toContain("- `trace_data`");
+    expect(out).toContain("**Codebase health & diagnostics**");
+    expect(out).toContain("`aft_inspect`");
+    expect(out).toContain("diagnostics");
+    expect(out).toContain("before you run tests or commit");
+    expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
     expect(out).toContain("`bash({ background: true })`");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back when waiting for a background task.
-    expect(out).toContain("A completion reminder is delivered automatically");
-    expect(out).toContain("do not poll");
+    expect(out).toContain("a completion reminder arrives automatically");
+    expect(out).toContain("Do not poll");
+    // Anti-sync-block steer: agents must not sync-wait bash_watch on a long task
+    // (it freezes the turn and locks the user out); end the turn or use async.
+    expect(out).toContain("end your turn");
+    expect(out).toContain("do not sync-wait with `bash_watch` for a long task");
+    expect(out).toContain("background: true");
   });
 
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {
@@ -39,6 +56,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(out).not.toBeNull();
@@ -51,15 +69,42 @@ describe("buildWorkflowHints", () => {
     expect(out).not.toContain("30 seconds");
   });
 
+  test("shows pipe guidance only when compression is enabled", () => {
+    const on = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: true,
+      disabledTools: new Set(),
+    });
+    expect(on).toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
+
+    const off = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      disabledTools: new Set(),
+    });
+    expect(off).not.toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
+  });
+
   test("omits the navigate section at tool_surface=recommended", () => {
     const out = buildWorkflowHints({
       toolSurface: "recommended",
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
-    expect(out).not.toContain("Use `aft_navigate`");
+    expect(out).not.toContain("Use `aft_callgraph`");
     expect(out).not.toContain("- `callers`");
   });
 
@@ -69,6 +114,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: false,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(out).toContain("`aft_grep`");
@@ -81,6 +127,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(off).not.toContain("aft_search");
@@ -90,9 +137,34 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(on).toContain("aft_search");
+  });
+
+  test("inspect hint is gated by registered tool availability", () => {
+    const registered = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      disabledTools: new Set(),
+    });
+    expect(registered).toContain("**Codebase health & diagnostics**");
+    expect(registered).toContain("aft_inspect");
+
+    const minimal = buildWorkflowHints({
+      toolSurface: "minimal",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      disabledTools: new Set(),
+    });
+    expect(minimal).not.toContain("**Codebase health & diagnostics**");
+    expect(minimal).not.toContain("aft_inspect");
   });
 
   test("returns null at minimal surface — only safety tool present", () => {
@@ -105,12 +177,15 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       // Disable all tools that could produce a hint section. At minimal
-      // surface, aft_navigate/grep/aft_search are already absent; disabling
+      // surface, aft_callgraph/grep/aft_search are already absent; disabling
       // outline+zoom kills URL+exploration sections, bash kills the timeout
       // hint, leaving nothing to render.
       disabledTools: new Set(["aft_outline", "aft_zoom", "bash"]),
     });
+    // null proves the parallel-tool-call frame is never emitted on its own
+    // (unshift runs only when sections already have content).
     expect(empty).toBeNull();
   });
 
@@ -120,10 +195,11 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
-      disabledTools: new Set(["aft_navigate", "bash_status"]),
+      bashCompressionEnabled: true,
+      disabledTools: new Set(["aft_callgraph", "bash_status"]),
     });
-    // navigate section gated off (aft_navigate disabled).
-    expect(out).not.toContain("Use `aft_navigate`");
+    // navigate section gated off (aft_callgraph disabled).
+    expect(out).not.toContain("Use `aft_callgraph`");
     // bg-bash section gated off (bash_status disabled) — and there's no
     // 30s fallback anymore, foreground bash auto-promotes silently.
     expect(out).not.toContain("**Long-running commands**");

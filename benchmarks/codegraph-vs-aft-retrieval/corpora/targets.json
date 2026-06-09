@@ -1,0 +1,19 @@
+{
+  "opencode-aft": {
+    "kind": "local",
+    "defaultPath": "/workspace",
+    "description": "The current AFT checkout mounted/copied into the benchmark image."
+  },
+  "ripgrep": {
+    "kind": "git",
+    "url": "https://github.com/BurntSushi/ripgrep.git",
+    "commit": "4857d6fa67db69a95cd4b6f2adda5d807d4d0119",
+    "description": "Pinned ripgrep checkout for optional larger Rust retrieval runs."
+  },
+  "elasticsearch": {
+    "kind": "git",
+    "url": "https://github.com/elastic/elasticsearch.git",
+    "commit": "6fadd28b3129f514e50ba50b55f5d750c149dcb5",
+    "description": "Pinned Elasticsearch checkout for optional larger Java retrieval runs."
+  }
+}

@@ -78,3 +78,12 @@ export function registerShutdownCleanup(fn: Cleanup): () => void {
     state.cleanups.delete(fn);
   };
 }
+
+export function __shutdownCleanupCountForTests(): number {
+  return getState().cleanups.size;
+}
+
+export function __resetShutdownCleanupsForTests(): void {
+  getState().cleanups.clear();
+  shuttingDown = false;
+}

@@ -1,6 +1,6 @@
 /// <reference path="../../bun-test.d.ts" />
 
-import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
@@ -28,11 +28,20 @@ mock.module("../../shared/live-server-client.js", () => ({
   },
   useLiveServerWake: () => true,
   setLiveServerWakeAvailable: () => {},
+  // Bun's `mock.module()` is process-global and partial mocks leak across
+  // test files; the live-server-client unit tests import from this same
+  // path, so probe-related exports MUST be included even if this file
+  // doesn't exercise them.
+  probeServerReachable: async () => true,
   __resetLiveServerClientCacheForTests: () => {
     e2eLiveServerClient = null;
   },
   __resetLiveServerWakeForTests: () => {},
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import {
   __resetBgNotificationStateForTests,
@@ -166,7 +175,7 @@ async function spawnBackground(
   bash: ReturnType<typeof createBashTool>,
   command: string,
 ): Promise<string> {
-  const output = await bash.execute({ command, background: true }, {
+  const result = await bash.execute({ command, background: true }, {
     sessionID: "e2e-session",
     messageID: "e2e-message",
     agent: "e2e-agent",
@@ -177,6 +186,9 @@ async function spawnBackground(
     ask: noopAsk,
     callID: `call-${Date.now()}`,
   } as ToolContext);
+  // The bash tool returns `{ output, title, metadata }` (UI metadata on the
+  // result); the agent-visible text is `output`.
+  const output = typeof result === "string" ? result : (result?.output ?? "");
   // Spawn-line format: "Background task started: <taskId>. <anti-poll reminder>."
   // Match the taskId between the colon and the trailing period so the test
   // works regardless of any anti-poll text we append. taskId charset is

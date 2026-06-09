@@ -5,9 +5,10 @@
 //! detection.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Instant;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
@@ -21,7 +22,8 @@ use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
-use crate::symbols::{Range, SymbolKind};
+use crate::symbols::{Range, Symbol, SymbolKind};
+use crate::{slog_debug, slog_info};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -31,11 +33,98 @@ type SharedPath = Arc<PathBuf>;
 type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
 type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
+type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
 static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const JS_TS_INDEX_FILES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.mts",
+    "index.cts",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+];
+
+fn symbol_identity(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+    }
+}
+
+fn symbol_unqualified_name(symbol: &str) -> &str {
+    symbol.rsplit("::").next().unwrap_or(symbol)
+}
+
+fn symbol_query_matches(symbol: &str, query: &str) -> bool {
+    symbol == query || symbol_unqualified_name(symbol) == query
+}
+
+pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
+    full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
+}
+
+fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
+
+    let mut consider = |candidate: &str| {
+        let matches = if qualified_query {
+            candidate == symbol_name
+        } else {
+            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
+        };
+
+        if matches && seen.insert(candidate.to_string()) {
+            candidates.push(candidate.to_string());
+        }
+    };
+
+    for candidate in file_data.symbol_metadata.keys() {
+        consider(candidate);
+    }
+    for candidate in file_data.calls_by_symbol.keys() {
+        consider(candidate);
+    }
+    for candidate in &file_data.exported_symbols {
+        consider(candidate);
+    }
+
+    candidates.sort();
+    candidates
+}
+
+pub(crate) fn resolve_symbol_query_in_data(
+    file_data: &FileCallData,
+    file: &Path,
+    symbol_name: &str,
+) -> Result<String, AftError> {
+    let candidates = symbol_query_candidates(file_data, symbol_name);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol_name.to_string(),
+            file: file.display().to_string(),
+        }),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates,
+        }),
+    }
+}
 
 /// A single call site within a function body.
 #[derive(Debug, Clone)]
@@ -85,6 +174,30 @@ pub struct FileCallData {
     pub lang: LangId,
 }
 
+impl FileCallData {
+    /// Look up metadata for an exported symbol name.
+    ///
+    /// `exported_symbols` stores bare names (e.g. `total_disk_bytes`), but
+    /// `symbol_metadata` is keyed by scoped identity (e.g.
+    /// `BackupStore::total_disk_bytes` for impl methods, via
+    /// [`symbol_identity`]). A bare-name `.get()` therefore misses scoped
+    /// symbols and forces callers into degraded `unknown`/line-1 fallbacks.
+    /// This resolves an exact key first, then falls back to the first entry
+    /// whose unqualified name matches — recovering correct kind and line for
+    /// methods. (Bare-name exports are already ambiguous across scopes, so
+    /// first-match is the best available signal; this only affects displayed
+    /// metadata, never liveness, which keys on the symbol name.)
+    pub fn symbol_metadata_for(&self, name: &str) -> Option<&SymbolMeta> {
+        if let Some(meta) = self.symbol_metadata.get(name) {
+            return Some(meta);
+        }
+        self.symbol_metadata
+            .iter()
+            .find(|(key, _)| symbol_unqualified_name(key) == name)
+            .map(|(_, meta)| meta)
+    }
+}
+
 /// Result of resolving a cross-file call edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeResolution {
@@ -98,6 +211,32 @@ pub enum EdgeResolution {
 struct ResolvedSymbol {
     file: PathBuf,
     symbol: String,
+}
+
+#[derive(Debug, Clone)]
+struct RustCrateInfo {
+    lib_name: String,
+    lib_root: Option<PathBuf>,
+    main_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RustModuleBase {
+    src_dir: PathBuf,
+    root_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RustUseEntry {
+    module_path: String,
+    local_name: String,
+    kind: RustUseKind,
+}
+
+#[derive(Debug, Clone)]
+enum RustUseKind {
+    Item { imported_name: String },
+    Module,
 }
 
 /// A single caller site: who calls a given symbol and from where.
@@ -154,6 +293,10 @@ pub struct CallersResult {
     pub total_callers: usize,
     /// Number of files scanned to build the reverse index.
     pub scanned_files: usize,
+    /// Whether recursive caller expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 /// A node in the forward call tree.
@@ -172,6 +315,10 @@ pub struct CallTreeNode {
     pub resolved: bool,
     /// Child calls (recursive).
     pub children: Vec<CallTreeNode>,
+    /// Whether traversal below this node stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of child call edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +372,7 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -236,7 +384,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Lua
         | LangId::Perl
         | LangId::Html
-        | LangId::Markdown => false,
+        | LangId::Markdown
+        | LangId::Yaml => false,
     }
 }
 
@@ -286,6 +435,38 @@ pub struct TraceToResult {
     pub truncated_paths: usize,
 }
 
+/// A single hop in a `trace_to_symbol` path.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolHop {
+    /// Symbol name at this hop.
+    pub symbol: String,
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Candidate target location for an ambiguous `trace_to_symbol` request.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolCandidate {
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Result of a `trace_to_symbol` query.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolResult {
+    /// Shortest path from the origin symbol to the target symbol, if found.
+    pub path: Option<Vec<TraceToSymbolHop>>,
+    /// Whether traversal was complete within the requested depth.
+    pub complete: bool,
+    /// Machine-readable explanation when `path` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Impact analysis types
 // ---------------------------------------------------------------------------
@@ -329,6 +510,10 @@ pub struct ImpactResult {
     pub affected_files: usize,
     /// Enriched caller details.
     pub callers: Vec<ImpactCaller>,
+    /// Whether transitive impact expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +712,12 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
+    /// Memoized `std::fs::canonicalize` results. canonicalize is a realpath
+    /// syscall (disk I/O, slow on large repos / Windows) and the same file paths
+    /// are canonicalized repeatedly across reverse-index builds (every cold
+    /// callers/impact/trace query and after each invalidation). A file's
+    /// canonical form is stable for the life of the graph, so cache it.
+    canon_cache: RefCell<HashMap<PathBuf, Arc<PathBuf>>>,
 }
 
 impl CallGraph {
@@ -538,6 +729,31 @@ impl CallGraph {
             project_root,
             project_files: None,
             reverse_index: None,
+            canon_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Canonicalize a path, memoized. The first call does the realpath syscall;
+    /// repeat calls for the same path (common across reverse-index rebuilds)
+    /// return the cached `Arc` without touching disk. Falls back to the input
+    /// path when canonicalize fails (e.g. the file was deleted), same as the
+    /// previous inline behavior.
+    fn canonicalize_cached(&self, path: &Path) -> Arc<PathBuf> {
+        if let Some(hit) = self.canon_cache.borrow().get(path) {
+            return Arc::clone(hit);
+        }
+        match std::fs::canonicalize(path) {
+            Ok(canon) => {
+                let canon = Arc::new(canon);
+                self.canon_cache
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), Arc::clone(&canon));
+                canon
+            }
+            // Do NOT cache the fallback: canonicalize fails for a (temporarily)
+            // missing file, and caching the non-canonical input would serve a
+            // stale path if the file returns. Re-resolve next time instead.
+            Err(_) => Arc::new(path.to_path_buf()),
         }
     }
 
@@ -560,6 +776,24 @@ impl CallGraph {
     {
         let caller_dir = caller_file.parent().unwrap_or(Path::new("."));
 
+        // Rust uses `::` module paths rather than JS/TS specifiers. Keep this
+        // branch gated to `.rs` callers so the existing JS/TS resolver below
+        // remains unchanged.
+        if is_rust_source_file(caller_file) {
+            if let Some(target) = resolve_rust_cross_file_edge(
+                full_callee,
+                short_name,
+                caller_file,
+                import_block,
+                &mut file_exports_symbol,
+            ) {
+                return EdgeResolution::Resolved {
+                    file: target.file,
+                    symbol: target.symbol,
+                };
+            }
+        }
+
         // Check namespace imports: "utils.foo" where utils is a namespace import
         if full_callee.contains('.') {
             let parts: Vec<&str> = full_callee.splitn(2, '.').collect();
@@ -572,10 +806,17 @@ impl CallGraph {
                         if let Some(resolved_path) =
                             resolve_module_path(caller_dir, &imp.module_path)
                         {
-                            return EdgeResolution::Resolved {
-                                file: resolved_path,
-                                symbol: member.to_owned(),
-                            };
+                            if let Some(target) = resolve_reexported_symbol(
+                                &resolved_path,
+                                member,
+                                &mut file_exports_symbol,
+                                &mut file_default_export_symbol,
+                            ) {
+                                return EdgeResolution::Resolved {
+                                    file: target.file,
+                                    symbol: target.symbol,
+                                };
+                            }
                         }
                     }
                 }
@@ -690,6 +931,14 @@ impl CallGraph {
         Ok(&self.data[&canon])
     }
 
+    /// Resolve a user-provided symbol query to the unique scoped symbol identity
+    /// used internally by the call graph.
+    pub fn resolve_symbol_query(&mut self, file: &Path, symbol: &str) -> Result<String, AftError> {
+        let canon = self.canonicalize(file)?;
+        let file_data = self.build_file(&canon)?;
+        resolve_symbol_query_in_data(file_data, &canon, symbol)
+    }
+
     /// Resolve a cross-file call edge.
     ///
     /// Given a callee expression and the calling file's import block,
@@ -747,8 +996,13 @@ impl CallGraph {
         symbol: &str,
         max_depth: usize,
     ) -> Result<CallTreeNode, AftError> {
+        let canon = self.canonicalize(file)?;
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
         let mut visited = HashSet::new();
-        self.forward_tree_inner(file, symbol, max_depth, 0, &mut visited)
+        self.forward_tree_inner(&canon, &resolved_symbol, max_depth, 0, &mut visited)
     }
 
     fn forward_tree_inner(
@@ -775,6 +1029,8 @@ impl CallGraph {
                 signature,
                 resolved: true,
                 children: vec![], // cycle — stop recursion
+                depth_limited: false,
+                truncated: 0,
             });
         }
 
@@ -798,6 +1054,8 @@ impl CallGraph {
 
         // Build children
         let mut children = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
 
         if current_depth < max_depth {
             for call_site in &call_sites {
@@ -820,7 +1078,11 @@ impl CallGraph {
                             current_depth + 1,
                             visited,
                         ) {
-                            Ok(child) => children.push(child),
+                            Ok(child) => {
+                                depth_limited |= child.depth_limited;
+                                truncated += child.truncated;
+                                children.push(child);
+                            }
                             Err(_) => {
                                 // Target file can't be parsed — mark as unresolved leaf
                                 children.push(CallTreeNode {
@@ -830,6 +1092,8 @@ impl CallGraph {
                                     signature: None,
                                     resolved: false,
                                     children: vec![],
+                                    depth_limited: false,
+                                    truncated: 0,
                                 });
                             }
                         }
@@ -844,6 +1108,8 @@ impl CallGraph {
                             current_depth,
                             visited,
                         )? {
+                            depth_limited |= local_child.depth_limited;
+                            truncated += local_child.truncated;
                             children.push(local_child);
                             continue;
                         }
@@ -854,10 +1120,15 @@ impl CallGraph {
                             signature: None,
                             resolved: false,
                             children: vec![],
+                            depth_limited: false,
+                            truncated: 0,
                         });
                     }
                 }
             }
+        } else if !call_sites.is_empty() {
+            depth_limited = true;
+            truncated = call_sites.len();
         }
 
         visited.remove(&visit_key);
@@ -869,6 +1140,8 @@ impl CallGraph {
             signature: sym_signature,
             resolved: true,
             children,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -882,26 +1155,34 @@ impl CallGraph {
         current_depth: usize,
         visited: &mut HashSet<(PathBuf, String)>,
     ) -> Result<Option<CallTreeNode>, AftError> {
-        let has_local_symbol = self
-            .lookup_file_data(canon)
-            .map(|data| data.symbol_metadata.contains_key(callee_name))
-            .unwrap_or(false);
-        if !has_local_symbol {
-            return Ok(None);
-        }
-        if callee_name == current_symbol {
+        if !is_bare_callee(&call_site.full_callee, callee_name) {
             return Ok(None);
         }
 
-        match self.forward_tree_inner(canon, callee_name, max_depth, current_depth + 1, visited) {
+        let target_symbol = match self
+            .lookup_file_data(canon)
+            .and_then(|data| resolve_symbol_query_in_data(data, canon, callee_name).ok())
+        {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
+
+        if target_symbol == current_symbol {
+            return Ok(None);
+        }
+
+        match self.forward_tree_inner(canon, &target_symbol, max_depth, current_depth + 1, visited)
+        {
             Ok(child) => Ok(Some(child)),
             Err(_) => Ok(Some(CallTreeNode {
-                name: callee_name.to_string(),
+                name: target_symbol,
                 file: self.relative_path(canon),
                 line: call_site.line,
                 signature: None,
                 resolved: false,
                 children: vec![],
+                depth_limited: false,
+                truncated: 0,
             })),
         }
     }
@@ -943,12 +1224,17 @@ impl CallGraph {
             .count()
     }
 
-    /// Build the reverse index by scanning all project files.
-    ///
-    /// For each file, builds the call data (if not cached), then for each
-    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
-    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
-    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+    /// Build call data for all project files, failing fast when the configured
+    /// source-file cap is exceeded.
+    /// Parse all uncached project files in parallel (bounded pool) and cache the
+    /// results, so subsequent `build_file` calls are cache hits. Used by the
+    /// tier2 dead_code snapshot, whose loop would otherwise parse every file
+    /// sequentially on one thread. No-op when the cache is already warm.
+    pub(crate) fn prewarm_project_files(&mut self, max_files: usize) -> Result<(), AftError> {
+        self.ensure_project_files_built(max_files)
+    }
+
+    fn ensure_project_files_built(&mut self, max_files: usize) -> Result<(), AftError> {
         // Bounded count first — never populate project_files on oversized roots.
         // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
         // iterator), so this costs at most (max_files + 1) directory entries
@@ -963,33 +1249,74 @@ impl CallGraph {
 
         // TODO(v0.16): rust-side deadline for graceful timeout recovery
         // (unbounded walks remain a soft cliff for users who raise the cap).
-        // Discover all project files first
+        // Discover all project files first.
         let all_files = self.project_files().to_vec();
 
-        // Build file data for all project files
+        // Build file data for all project files.
         let uncached_files: Vec<PathBuf> = all_files
             .iter()
             .filter(|f| self.lookup_file_data(f).is_none())
             .cloned()
             .collect();
 
-        let computed: Vec<(PathBuf, FileCallData)> = uncached_files
-            .par_iter()
-            .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
-            .collect();
+        // Parsing every uncached source file is the dominant cost of a cold
+        // call-graph query on a large repo. Log it so a slow (near-timeout)
+        // first call is attributable to parse work rather than appearing as an
+        // opaque bridge hang. Cheap no-op when nothing is uncached (warm cache).
+        if !uncached_files.is_empty() {
+            let started = Instant::now();
+            // Parse on a BOUNDED pool (half the cores, cap 8), not the global
+            // rayon pool. A cold `callers`/`impact`/`trace`/dead_code query runs
+            // this parse, and on the global all-cores pool it pins every core and
+            // starves the single-threaded bridge (the 800% spike). Half-cores
+            // matches the store cold-build and inspect dispatch pools. 8MB worker
+            // stacks match the main thread (tree-sitter AST walks are deep).
+            let pool = callgraph_parse_pool();
+            let computed: Vec<(PathBuf, FileCallData)> = pool.install(|| {
+                uncached_files
+                    .par_iter()
+                    .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
+                    .collect()
+            });
 
-        for (file, data) in computed {
-            self.data.insert(file, data);
+            let parsed = computed.len();
+            for (file, data) in computed {
+                self.data.insert(file, data);
+            }
+            slog_info!(
+                "perf callgraph: parsed {} uncached files ({} total project files) in {}ms (bounded {}-thread pool)",
+                parsed,
+                all_files.len(),
+                started.elapsed().as_millis(),
+                pool.current_num_threads(),
+            );
         }
+
+        Ok(())
+    }
+
+    /// Build the reverse index by scanning all project files.
+    ///
+    /// For each file, builds the call data (if not cached), then for each
+    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
+    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
+    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+        self.ensure_project_files_built(max_files)?;
+        let all_files = self.project_files().to_vec();
+
+        // Cross-file edge resolution is the second dominant cost (after parsing)
+        // of a cold callers/impact query; time it so a slow first call is fully
+        // attributable across the two phases.
+        let reverse_started = Instant::now();
 
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
 
         for caller_file in &all_files {
-            // Canonicalize the caller file path for consistent lookups
-            let canon_caller = Arc::new(
-                std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.clone()),
-            );
+            // Canonicalize the caller file path for consistent lookups (memoized
+            // so repeated reverse-index builds don't re-issue the realpath
+            // syscall for every project file).
+            let canon_caller = self.canonicalize_cached(caller_file);
             let file_data = match self
                 .data
                 .get(caller_file)
@@ -1015,7 +1342,19 @@ impl CallGraph {
                     let (target_file, target_symbol, resolved) = match edge {
                         EdgeResolution::Resolved { file, symbol } => (file, symbol, true),
                         EdgeResolution::Unresolved { callee_name } => {
-                            (canon_caller.as_ref().clone(), callee_name, false)
+                            if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                                continue;
+                            }
+
+                            let Ok(target_symbol) = resolve_symbol_query_in_data(
+                                file_data,
+                                canon_caller.as_ref(),
+                                &callee_name,
+                            ) else {
+                                continue;
+                            };
+
+                            (canon_caller.as_ref().clone(), target_symbol, false)
                         }
                     };
 
@@ -1039,7 +1378,17 @@ impl CallGraph {
             }
         }
 
+        let edges: usize = reverse
+            .values()
+            .map(|m| m.values().map(Vec::len).sum::<usize>())
+            .sum();
         self.reverse_index = Some(reverse);
+        slog_debug!(
+            "callgraph: built reverse index ({} edges over {} files) in {}ms",
+            edges,
+            all_files.len(),
+            reverse_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -1065,8 +1414,11 @@ impl CallGraph {
     ) -> Result<CallersResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built (may already be cached)
-        self.build_file(&canon)?;
+        // Ensure file is built (may already be cached) and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1078,13 +1430,17 @@ impl CallGraph {
 
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
         // Group by file
@@ -1119,11 +1475,13 @@ impl CallGraph {
         callers.sort_by(|a, b| a.file.cmp(&b.file));
 
         Ok(CallersResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             callers,
             total_callers,
             scanned_files,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -1141,8 +1499,11 @@ impl CallGraph {
     ) -> Result<TraceToResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1163,15 +1524,20 @@ impl CallGraph {
         // Get line/signature for the target symbol
         let (target_line, target_sig) = self
             .lookup_file_data(&canon)
-            .map(|data| get_symbol_meta_from_data(data, symbol))
-            .unwrap_or_else(|| get_symbol_meta(&canon, symbol));
+            .map(|data| get_symbol_meta_from_data(data, &resolved_symbol))
+            .unwrap_or_else(|| get_symbol_meta(&canon, &resolved_symbol));
 
         // Check if target itself is an entry point
         let target_is_entry = self
             .lookup_file_data(&canon)
             .and_then(|fd| {
-                let meta = fd.symbol_metadata.get(symbol)?;
-                Some(is_entry_point(symbol, &meta.kind, meta.exported, fd.lang))
+                let meta = fd.symbol_metadata.get(&resolved_symbol)?;
+                Some(is_entry_point(
+                    &resolved_symbol,
+                    &meta.kind,
+                    meta.exported,
+                    fd.lang,
+                ))
             })
             .unwrap_or(false);
 
@@ -1185,7 +1551,7 @@ impl CallGraph {
         // Initial path starts at the target
         let initial: Vec<PathElem> = vec![(
             Arc::new(canon.clone()),
-            Arc::from(symbol),
+            Arc::from(resolved_symbol.as_str()),
             target_line,
             target_sig,
         )];
@@ -1327,21 +1693,21 @@ impl CallGraph {
             a_entry.cmp(b_entry).then(a.hops.len().cmp(&b.hops.len()))
         });
 
-        // Count distinct entry points
-        let mut entry_point_names: HashSet<String> = HashSet::new();
+        // Count distinct entry points by identity, not just display name.
+        let mut entry_points: HashSet<(String, String)> = HashSet::new();
         for p in &paths {
             if let Some(first) = p.hops.first() {
                 if first.is_entry_point {
-                    entry_point_names.insert(first.symbol.clone());
+                    entry_points.insert((first.file.clone(), first.symbol.clone()));
                 }
             }
         }
 
         let total_paths = paths.len();
-        let entry_points_found = entry_point_names.len();
+        let entry_points_found = entry_points.len();
 
         Ok(TraceToResult {
-            target_symbol: symbol.to_string(),
+            target_symbol: resolved_symbol,
             target_file: target_rel,
             paths,
             total_paths,
@@ -1349,6 +1715,253 @@ impl CallGraph {
             max_depth_reached,
             truncated_paths,
         })
+    }
+
+    /// Find all files that define a symbol matching a `trace_to_symbol` target query.
+    ///
+    /// The result is de-duplicated by file because `toFile` is only required
+    /// when a target symbol name exists in multiple files.
+    pub fn trace_to_symbol_candidates(
+        &mut self,
+        to_symbol: &str,
+        max_files: usize,
+    ) -> Result<Vec<TraceToSymbolCandidate>, AftError> {
+        self.ensure_project_files_built(max_files)?;
+
+        let mut candidates_by_file: HashMap<PathBuf, u32> = HashMap::new();
+        let all_files = self.project_files().to_vec();
+
+        for file in all_files {
+            let canon = self.canonicalize(&file)?;
+            let Some(file_data) = self
+                .lookup_file_data(&canon)
+                .or_else(|| self.lookup_file_data(&file))
+            else {
+                continue;
+            };
+
+            let symbol_candidates = symbol_query_candidates(file_data, to_symbol);
+            if symbol_candidates.is_empty() {
+                continue;
+            }
+
+            let line = symbol_candidates
+                .iter()
+                .filter_map(|symbol| file_data.symbol_metadata.get(symbol).map(|meta| meta.line))
+                .min()
+                .unwrap_or(1);
+
+            candidates_by_file
+                .entry(canon)
+                .and_modify(|existing| *existing = (*existing).min(line))
+                .or_insert(line);
+        }
+
+        let mut candidates: Vec<TraceToSymbolCandidate> = candidates_by_file
+            .into_iter()
+            .map(|(file, line)| TraceToSymbolCandidate {
+                file: self.relative_path(&file),
+                line,
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        Ok(candidates)
+    }
+
+    /// Find the shortest forward call path from one symbol to another symbol.
+    ///
+    /// Performs breadth-first traversal over resolved call edges. A global
+    /// `(file, symbol)` visited set keeps cycles finite while preserving BFS's
+    /// shortest-path guarantee.
+    pub fn trace_to_symbol(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+        max_files: usize,
+    ) -> Result<TraceToSymbolResult, AftError> {
+        let canon = self.canonicalize(file)?;
+
+        // Ensure the origin file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
+
+        self.ensure_project_files_built(max_files)?;
+
+        let target_file = to_file.map(|path| self.canonicalize(path)).transpose()?;
+        let effective_max = if max_depth == 0 {
+            10
+        } else {
+            max_depth.min(16)
+        };
+
+        let start_hop = self.trace_to_symbol_hop(&canon, &resolved_symbol);
+        if Self::trace_to_symbol_matches_target(&canon, &resolved_symbol, to_symbol, &target_file) {
+            return Ok(TraceToSymbolResult {
+                path: Some(vec![start_hop]),
+                complete: true,
+                reason: None,
+            });
+        }
+
+        let mut queue: VecDeque<(PathBuf, String, Vec<TraceToSymbolHop>, usize)> = VecDeque::new();
+        queue.push_back((canon.clone(), resolved_symbol.clone(), vec![start_hop], 0));
+
+        let mut visited: HashSet<(PathBuf, String)> = HashSet::new();
+        visited.insert((canon, resolved_symbol));
+        let mut max_depth_exhausted = false;
+
+        while let Some((current_file, current_symbol, path, depth)) = queue.pop_front() {
+            let callees = self.forward_resolved_callees(&current_file, &current_symbol)?;
+
+            if depth >= effective_max {
+                if callees
+                    .iter()
+                    .any(|(file, symbol)| !visited.contains(&(file.clone(), symbol.clone())))
+                {
+                    max_depth_exhausted = true;
+                }
+                continue;
+            }
+
+            for (callee_file, callee_symbol) in callees {
+                let visit_key = (callee_file.clone(), callee_symbol.clone());
+                if !visited.insert(visit_key) {
+                    continue;
+                }
+
+                let mut next_path = path.clone();
+                next_path.push(self.trace_to_symbol_hop(&callee_file, &callee_symbol));
+
+                if Self::trace_to_symbol_matches_target(
+                    &callee_file,
+                    &callee_symbol,
+                    to_symbol,
+                    &target_file,
+                ) {
+                    return Ok(TraceToSymbolResult {
+                        path: Some(next_path),
+                        complete: true,
+                        reason: None,
+                    });
+                }
+
+                queue.push_back((callee_file, callee_symbol, next_path, depth + 1));
+            }
+        }
+
+        if max_depth_exhausted {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: false,
+                reason: Some("max_depth_exhausted".to_string()),
+            })
+        } else {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: true,
+                reason: Some("no_path_found".to_string()),
+            })
+        }
+    }
+
+    fn trace_to_symbol_matches_target(
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: &Option<PathBuf>,
+    ) -> bool {
+        if !symbol_query_matches(symbol, to_symbol) {
+            return false;
+        }
+
+        if let Some(target_file) = to_file {
+            file == target_file
+        } else {
+            true
+        }
+    }
+
+    fn trace_to_symbol_hop(&self, file: &Path, symbol: &str) -> TraceToSymbolHop {
+        let (line, _) = self
+            .lookup_file_data(file)
+            .map(|data| get_symbol_meta_from_data(data, symbol))
+            .unwrap_or_else(|| get_symbol_meta(file, symbol));
+
+        TraceToSymbolHop {
+            symbol: symbol.to_string(),
+            file: self.relative_path(file),
+            line,
+        }
+    }
+
+    fn forward_resolved_callees(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+    ) -> Result<Vec<(PathBuf, String)>, AftError> {
+        let canon = self.canonicalize(file)?;
+        let (import_block, call_sites) = {
+            let file_data = self.build_file(&canon)?;
+            (
+                file_data.import_block.clone(),
+                file_data
+                    .calls_by_symbol
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+
+        let mut callees = Vec::new();
+        for call_site in call_sites {
+            let edge = self.resolve_cross_file_edge(
+                &call_site.full_callee,
+                &call_site.callee_name,
+                &canon,
+                &import_block,
+            );
+
+            match edge {
+                EdgeResolution::Resolved {
+                    file: target_file,
+                    symbol: target_symbol,
+                } => {
+                    let target_canon = self.canonicalize(&target_file)?;
+                    if self.build_file(&target_canon).is_err() {
+                        continue;
+                    }
+
+                    let resolved_target_symbol = self
+                        .lookup_file_data(&target_canon)
+                        .and_then(|data| {
+                            resolve_symbol_query_in_data(data, &target_canon, &target_symbol).ok()
+                        })
+                        .unwrap_or(target_symbol);
+
+                    callees.push((target_canon, resolved_target_symbol));
+                }
+                EdgeResolution::Unresolved { callee_name } => {
+                    if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                        continue;
+                    }
+
+                    let local_symbol = self.lookup_file_data(&canon).and_then(|data| {
+                        resolve_symbol_query_in_data(data, &canon, &callee_name).ok()
+                    });
+
+                    if let Some(local_symbol) = local_symbol {
+                        callees.push((canon.clone(), local_symbol));
+                    }
+                }
+            }
+        }
+
+        Ok(callees)
     }
 
     /// Impact analysis: enriched callers query.
@@ -1365,8 +1978,11 @@ impl CallGraph {
     ) -> Result<ImpactResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1385,7 +2001,7 @@ impl CallGraph {
                     })
                 }
             };
-            let meta = file_data.symbol_metadata.get(symbol);
+            let meta = file_data.symbol_metadata.get(&resolved_symbol);
             let sig = meta.and_then(|m| m.signature.clone());
             let lang = file_data.lang;
             let params = sig
@@ -1398,13 +2014,17 @@ impl CallGraph {
         // Collect all caller sites (transitive)
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
         // Deduplicate sites by (file, symbol, line)
@@ -1473,13 +2093,15 @@ impl CallGraph {
         let affected_files = affected_file_set.len();
 
         Ok(ImpactResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             signature: target_signature,
             parameters: target_parameters,
             total_affected,
             affected_files,
             callers,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -1504,32 +2126,11 @@ impl CallGraph {
         let canon = self.canonicalize(file)?;
         let rel_file = self.relative_path(&canon);
 
-        // Ensure file data is built
-        self.build_file(&canon)?;
-
-        // Verify symbol exists
-        {
-            let fd = match self.data.get(&canon) {
-                Some(d) => d,
-                None => {
-                    return Err(AftError::InvalidRequest {
-                        message: "file data missing after build".to_string(),
-                    })
-                }
-            };
-            let has_symbol = fd.calls_by_symbol.contains_key(symbol)
-                || fd.exported_symbols.iter().any(|name| name == symbol)
-                || fd.symbol_metadata.contains_key(symbol);
-            if !has_symbol {
-                return Err(AftError::InvalidRequest {
-                    message: format!(
-                        "trace_data: symbol '{}' not found in {}",
-                        symbol,
-                        file.display()
-                    ),
-                });
-            }
-        }
+        // Ensure file data is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Bounded count: short-circuits at `max_files + 1` so oversized roots
         // reject in microseconds instead of paying the full walk/collect cost.
@@ -1547,7 +2148,7 @@ impl CallGraph {
 
         self.trace_data_inner(
             &canon,
-            symbol,
+            &resolved_symbol,
             expression,
             max_depth,
             0,
@@ -1559,7 +2160,7 @@ impl CallGraph {
         Ok(TraceDataResult {
             expression: expression.to_string(),
             origin_file: rel_file,
-            origin_symbol: symbol.to_string(),
+            origin_symbol: resolved_symbol,
             hops,
             depth_limited,
         })
@@ -1613,7 +2214,10 @@ impl CallGraph {
             Ok(symbols) => symbols,
             Err(_) => return,
         };
-        let sym_info = match symbols.iter().find(|s| s.name == symbol) {
+        let sym_info = match symbols
+            .iter()
+            .find(|s| symbol_identity(s) == symbol || s.name == symbol)
+        {
             Some(s) => s,
             None => return,
         };
@@ -2006,23 +2610,21 @@ impl CallGraph {
                 }
             }
             EdgeResolution::Unresolved { callee_name } => {
-                // Check if it's a same-file call
-                let has_local = self
-                    .data
-                    .get(file)
-                    .map(|fd| {
-                        fd.calls_by_symbol.contains_key(&callee_name)
-                            || fd.symbol_metadata.contains_key(&callee_name)
-                    })
-                    .unwrap_or(false);
+                let local_symbol = if is_bare_callee(&full_callee, &callee_name) {
+                    self.data
+                        .get(file)
+                        .and_then(|fd| resolve_symbol_query_in_data(fd, file, &callee_name).ok())
+                } else {
+                    None
+                };
 
-                if has_local {
-                    // Same-file call — get param info
+                if let Some(local_symbol) = local_symbol {
+                    // Same-file bare call — get param info
                     let (params, target_line) = {
                         let Some(fd) = self.data.get(file) else {
                             return;
                         };
-                        let meta = fd.symbol_metadata.get(&callee_name);
+                        let meta = fd.symbol_metadata.get(&local_symbol);
                         let sig = meta.and_then(|m| m.signature.clone());
                         let params = sig
                             .as_deref()
@@ -2038,7 +2640,7 @@ impl CallGraph {
                         if let Some(param_name) = params.get(*pos) {
                             hops.push(DataFlowHop {
                                 file: file_rel.clone(),
-                                symbol: callee_name.clone(),
+                                symbol: local_symbol.clone(),
                                 variable: param_name.clone(),
                                 line: target_line,
                                 flow_type: "parameter".to_string(),
@@ -2048,7 +2650,7 @@ impl CallGraph {
                             // Recurse into same-file function
                             self.trace_data_inner(
                                 file,
-                                &callee_name.clone(),
+                                &local_symbol,
                                 param_name,
                                 max_depth,
                                 current_depth + 1,
@@ -2093,14 +2695,25 @@ impl CallGraph {
         current_depth: usize,
         visited: &mut HashSet<(PathBuf, SharedStr)>,
         result: &mut Vec<CallerSite>,
+        depth_limited: &mut bool,
+        truncated: &mut usize,
     ) {
-        if current_depth >= max_depth {
-            return;
-        }
-
         // Canonicalize for consistent reverse index lookup
         let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         let key_symbol: SharedStr = Arc::from(symbol);
+
+        if current_depth >= max_depth {
+            let omitted = self
+                .reverse_sites(&canon, key_symbol.as_ref())
+                .map(|sites| sites.len())
+                .unwrap_or(0);
+            if omitted > 0 {
+                *depth_limited = true;
+                *truncated += omitted;
+            }
+            return;
+        }
+
         if !visited.insert((canon.clone(), Arc::clone(&key_symbol))) {
             return; // cycle detection
         }
@@ -2123,7 +2736,18 @@ impl CallGraph {
                         current_depth + 1,
                         visited,
                         result,
+                        depth_limited,
+                        truncated,
                     );
+                } else {
+                    let omitted = self
+                        .reverse_sites(site.caller_file.as_ref(), site.caller_symbol.as_ref())
+                        .map(|sites| sites.len())
+                        .unwrap_or(0);
+                    if omitted > 0 {
+                        *depth_limited = true;
+                        *truncated += omitted;
+                    }
                 }
             }
         }
@@ -2149,10 +2773,16 @@ impl CallGraph {
     /// Return a path relative to the project root, or the absolute path if
     /// it's outside the project.
     fn relative_path(&self, path: &Path) -> String {
+        // Emit forward slashes on every platform so the agent-facing `file`
+        // field is consistent across the whole call-graph surface (the
+        // persisted store's `relative_path` already normalizes to `/`, and
+        // Windows accepts `/` as a path input). Without this, legacy ops
+        // (trace_data, dead_code) emitted `src\foo.ts` on Windows while
+        // store-backed ops emitted `src/foo.ts`.
         path.strip_prefix(&self.project_root)
             .unwrap_or(path)
-            .display()
-            .to_string()
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     /// Canonicalize a path, falling back to the original if canonicalization fails.
@@ -2195,7 +2825,32 @@ impl CallGraph {
 // ---------------------------------------------------------------------------
 
 /// Build call data for a single file.
-fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
+/// Bounded rayon pool for the cold parse pass: half the cores (cap 8), 8MB
+/// worker stacks. Built fresh per cold build (infrequent, and the parse cost
+/// dominates the pool-spawn cost). Bounds the parse so it never monopolizes
+/// every core and starves the single-threaded bridge — matching
+/// `callgraph_store::build_pool_size` and `inspect::dispatch::default_pool_size`.
+fn callgraph_parse_pool() -> rayon::ThreadPool {
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .div_ceil(2)
+        .clamp(1, 8);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("aft-callgraph-{i}"))
+        .stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap_or_else(|_| {
+            // Fallback: a 1-thread pool (still off the global pool).
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread rayon pool must build")
+        })
+}
+
+pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
     let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
         message: format!("unsupported file for call graph: {}", path.display()),
     })?;
@@ -2236,17 +2891,19 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
 
         let sites: Vec<CallSite> = raw_calls
             .into_iter()
-            .map(|(full, short, line)| CallSite {
-                callee_name: short,
-                full_callee: full,
-                line,
-                byte_start,
-                byte_end,
-            })
+            .map(
+                |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                    callee_name: short,
+                    full_callee: full,
+                    line,
+                    byte_start: call_byte_start,
+                    byte_end: call_byte_end,
+                },
+            )
             .collect();
 
         if !sites.is_empty() {
-            calls_by_symbol.insert(sym.name.clone(), sites);
+            calls_by_symbol.insert(symbol_identity(sym), sites);
         }
     }
 
@@ -2290,14 +2947,16 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
             let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
             let sites: Vec<CallSite> = raw_calls
                 .into_iter()
-                .filter(|(_, short, _)| *short != default_export.symbol)
-                .map(|(full, short, line)| CallSite {
-                    callee_name: short,
-                    full_callee: full,
-                    line,
-                    byte_start,
-                    byte_end,
-                })
+                .filter(|(_, short, _, _, _)| *short != default_export.symbol)
+                .map(
+                    |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                        callee_name: short,
+                        full_callee: full,
+                        line,
+                        byte_start: call_byte_start,
+                        byte_end: call_byte_end,
+                    },
+                )
                 .collect();
             if !sites.is_empty() {
                 calls_by_symbol.insert(default_export.symbol.clone(), sites);
@@ -2325,7 +2984,7 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         .iter()
         .map(|s| {
             (
-                s.name.clone(),
+                symbol_identity(s),
                 SymbolMeta {
                     kind: s.kind.clone(),
                     exported: s.exported,
@@ -2528,7 +3187,7 @@ fn get_symbol_meta(path: &Path, symbol_name: &str) -> (u32, Option<String>) {
     match provider.list_symbols(path) {
         Ok(symbols) => {
             for s in &symbols {
-                if s.name == symbol_name {
+                if symbol_identity(s) == symbol_name || s.name == symbol_name {
                     return (s.range.start_line + 1, s.signature.clone());
                 }
             }
@@ -2731,10 +3390,9 @@ fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
         return Some(std::fs::canonicalize(&base).unwrap_or(base));
     }
 
-    // Try common extensions
-    let extensions = [".ts", ".tsx", ".js", ".jsx"];
-    for ext in &extensions {
-        let with_ext = base.with_extension(ext.trim_start_matches('.'));
+    // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
+    for ext in JS_TS_EXTENSIONS {
+        let with_ext = base.with_extension(ext);
         if with_ext.is_file() {
             return Some(std::fs::canonicalize(&with_ext).unwrap_or(with_ext));
         }
@@ -2754,6 +3412,577 @@ fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<P
     let (package_name, subpath) = split_package_import(module_path)?;
     let package_root = find_package_root_for_import(from_dir, &package_name)?;
     resolve_package_entry(&package_root, &subpath)
+}
+
+fn is_rust_source_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+}
+
+fn resolve_rust_cross_file_edge<F>(
+    full_callee: &str,
+    short_name: &str,
+    caller_file: &Path,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if let Some(target) = resolve_rust_qualified_call(caller_file, full_callee, file_exports_symbol)
+    {
+        return Some(target);
+    }
+
+    resolve_rust_imported_call(
+        caller_file,
+        full_callee,
+        short_name,
+        import_block,
+        file_exports_symbol,
+    )
+}
+
+fn resolve_rust_qualified_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if !full_callee.contains("::") {
+        return None;
+    }
+
+    let segments = rust_path_segments(full_callee)?;
+    resolve_rust_call_segments(caller_file, &segments, file_exports_symbol)
+}
+
+fn resolve_rust_imported_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    short_name: &str,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let call_segments = rust_path_segments(full_callee).unwrap_or_default();
+    let bare_call_name = if call_segments.len() <= 1 {
+        call_segments
+            .first()
+            .map(String::as_str)
+            .unwrap_or(short_name)
+    } else {
+        short_name
+    };
+
+    for imp in &import_block.imports {
+        for entry in rust_use_entries(imp) {
+            match &entry.kind {
+                RustUseKind::Item { imported_name } if call_segments.len() <= 1 => {
+                    if entry.local_name != bare_call_name {
+                        continue;
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &entry.module_path)
+                    else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, imported_name) {
+                        return Some(ResolvedSymbol {
+                            file,
+                            symbol: imported_name.clone(),
+                        });
+                    }
+                }
+                RustUseKind::Module if call_segments.len() >= 2 => {
+                    if call_segments.first().map(String::as_str) != Some(entry.local_name.as_str())
+                    {
+                        continue;
+                    }
+                    let symbol = call_segments.last()?.clone();
+                    let mut module_path = entry.module_path.clone();
+                    for segment in &call_segments[1..call_segments.len().saturating_sub(1)] {
+                        module_path.push_str("::");
+                        module_path.push_str(segment);
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &module_path) else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, &symbol) {
+                        return Some(ResolvedSymbol { file, symbol });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_rust_call_segments<F>(
+    caller_file: &Path,
+    segments: &[String],
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let symbol = segments.last()?.clone();
+    let module_path = segments[..segments.len() - 1].join("::");
+    let file = resolve_rust_module_path(caller_file, &module_path)?;
+    if file_exports_symbol(&file, &symbol) {
+        Some(ResolvedSymbol { file, symbol })
+    } else {
+        None
+    }
+}
+
+fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<PathBuf> {
+    let segments = rust_path_segments(module_path)?;
+    let first = segments.first()?.as_str();
+
+    match first {
+        "std" | "core" | "alloc" => None,
+        "crate" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+        "self" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            if segments.len() == 1 {
+                return Some(canonicalize_path(caller_file));
+            }
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        "super" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.pop();
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        crate_name => {
+            let caller_dir = caller_file.parent().unwrap_or_else(|| Path::new("."));
+            let workspace_crates = rust_workspace_crates(caller_dir)?;
+            let crate_info = workspace_crates.get(crate_name)?;
+            let base = rust_lib_module_base(crate_info)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+    }
+}
+
+fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
+    let Some(body) = rust_use_body(&imp.raw_text) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    expand_rust_use_tree(body, &mut entries);
+    entries
+}
+
+fn rust_use_body(raw: &str) -> Option<&str> {
+    let use_pos = raw.find("use ")?;
+    let body = raw[use_pos + 4..].trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    (!body.is_empty()).then_some(body)
+}
+
+fn expand_rust_use_tree(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+
+    if let Some((prefix, inner)) = split_rust_use_braces(path) {
+        let prefix = prefix.trim().trim_end_matches("::").trim();
+        for part in split_top_level_commas(inner) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "self" {
+                if let Some(local_name) = rust_last_path_segment(prefix) {
+                    entries.push(RustUseEntry {
+                        module_path: prefix.to_string(),
+                        local_name,
+                        kind: RustUseKind::Module,
+                    });
+                }
+                continue;
+            }
+            let combined = if prefix.is_empty() {
+                part.to_string()
+            } else {
+                format!("{prefix}::{part}")
+            };
+            expand_rust_use_tree(&combined, entries);
+        }
+        return;
+    }
+
+    add_rust_use_leaf(path, entries);
+}
+
+fn split_rust_use_braces(path: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (idx, ch) in path.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let start = start?;
+                    if !path[idx + ch.len_utf8()..].trim().is_empty() {
+                        return None;
+                    }
+                    return Some((&path[..start], &path[start + 1..idx]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&value[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn add_rust_use_leaf(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let (path, alias) = split_rust_alias(path);
+    let Some(segments) = rust_path_segments(path) else {
+        return;
+    };
+    if segments.is_empty() || segments.last().map(String::as_str) == Some("*") {
+        return;
+    }
+
+    let imported_name = segments.last().cloned().unwrap_or_default();
+    let local_name = alias.unwrap_or(&imported_name).to_string();
+    if segments.len() >= 2 {
+        entries.push(RustUseEntry {
+            module_path: segments[..segments.len() - 1].join("::"),
+            local_name: local_name.clone(),
+            kind: RustUseKind::Item {
+                imported_name: imported_name.clone(),
+            },
+        });
+    }
+
+    entries.push(RustUseEntry {
+        module_path: segments.join("::"),
+        local_name,
+        kind: RustUseKind::Module,
+    });
+}
+
+fn split_rust_alias(path: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = path.rfind(" as ") {
+        let original = path[..idx].trim();
+        let alias = path[idx + 4..].trim();
+        if !original.is_empty() && !alias.is_empty() {
+            return (original, Some(alias));
+        }
+    }
+    (path.trim(), None)
+}
+
+fn rust_path_segments(path: &str) -> Option<Vec<String>> {
+    let path = path.trim().trim_end_matches(';').trim();
+    if path.is_empty() || path.contains('{') || path.contains('}') {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    for raw_segment in path.split("::") {
+        let segment = raw_segment.trim();
+        if segment.is_empty() || segment == "*" || segment.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let segment = segment.strip_prefix("r#").unwrap_or(segment);
+        if segment
+            .chars()
+            .any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        {
+            return None;
+        }
+        segments.push(segment.to_string());
+    }
+
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn rust_last_path_segment(path: &str) -> Option<String> {
+    rust_path_segments(path)?.last().cloned()
+}
+
+fn find_rust_crate_root(from: &Path) -> Option<PathBuf> {
+    let mut current = if from.is_file() {
+        from.parent()
+    } else {
+        Some(from)
+    };
+    while let Some(dir) = current {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let root = canonicalize_path(crate_root);
+    if let Some(cached) = RUST_CRATE_INFO_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&root).cloned())
+    {
+        return cached;
+    }
+
+    let resolved = read_rust_crate_info(&root);
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.insert(root, resolved.clone());
+    }
+    resolved
+}
+
+fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let cargo = rust_manifest_value(&crate_root.join("Cargo.toml"))?;
+    let package = cargo.get("package")?;
+    let package_name = package.get("name")?.as_str()?;
+    let lib_name = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(|name| name.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| package_name.replace('-', "_"));
+
+    let lib_root = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(|path| path.as_str())
+        .map(|path| crate_root.join(path))
+        .unwrap_or_else(|| crate_root.join("src/lib.rs"));
+    let lib_root = lib_root.is_file().then(|| canonicalize_path(&lib_root));
+
+    let main_root = crate_root.join("src/main.rs");
+    let main_root = main_root.is_file().then(|| canonicalize_path(&main_root));
+
+    Some(RustCrateInfo {
+        lib_name,
+        lib_root,
+        main_root,
+    })
+}
+
+fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
+    let source = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&source).ok()
+}
+
+fn rust_module_base_for_caller(
+    crate_info: &RustCrateInfo,
+    caller_file: &Path,
+) -> Option<RustModuleBase> {
+    let caller = canonicalize_path(caller_file);
+    if crate_info.main_root.as_ref() == Some(&caller) {
+        return rust_main_module_base(crate_info);
+    }
+    rust_lib_module_base(crate_info).or_else(|| rust_main_module_base(crate_info))
+}
+
+fn rust_lib_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.lib_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn rust_main_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.main_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn resolve_rust_module_segments(base: &RustModuleBase, segments: &[String]) -> Option<PathBuf> {
+    if segments.is_empty() {
+        return Some(base.root_file.clone());
+    }
+
+    let module_base = segments
+        .iter()
+        .fold(base.src_dir.clone(), |path, segment| path.join(segment));
+    let file_path = module_base.with_extension("rs");
+    if file_path.is_file() {
+        return Some(canonicalize_path(&file_path));
+    }
+
+    let mod_path = module_base.join("mod.rs");
+    if mod_path.is_file() {
+        return Some(canonicalize_path(&mod_path));
+    }
+
+    None
+}
+
+fn rust_module_segments_for_file(src_dir: &Path, file: &Path) -> Option<Vec<String>> {
+    let src_dir = canonicalize_path(src_dir);
+    let file = canonicalize_path(file);
+    let rel = file.strip_prefix(&src_dir).ok()?;
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let last = parts.pop()?;
+    if last == "lib.rs" || last == "main.rs" {
+        return Some(Vec::new());
+    }
+    if last == "mod.rs" {
+        return Some(parts);
+    }
+    let stem = Path::new(&last).file_stem()?.to_str()?.to_string();
+    parts.push(stem);
+    Some(parts)
+}
+
+fn rust_workspace_crates(from_dir: &Path) -> Option<HashMap<String, RustCrateInfo>> {
+    let workspace_root =
+        find_rust_workspace_root(from_dir).or_else(|| find_rust_crate_root(from_dir))?;
+    let workspace_root = canonicalize_path(&workspace_root);
+
+    if let Some(cached) = RUST_WORKSPACE_CRATE_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&workspace_root).cloned())
+    {
+        return Some(cached);
+    }
+
+    let mut crates = HashMap::new();
+    for member in rust_workspace_member_dirs(&workspace_root) {
+        if let Some(info) = rust_crate_info(&member) {
+            if info.lib_root.is_some() {
+                crates.insert(info.lib_name.clone(), info);
+            }
+        }
+    }
+    if let Some(info) = rust_crate_info(&workspace_root) {
+        if info.lib_root.is_some() {
+            crates.insert(info.lib_name.clone(), info);
+        }
+    }
+
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.insert(workspace_root, crates.clone());
+    }
+    Some(crates)
+}
+
+fn find_rust_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        let cargo = dir.join("Cargo.toml");
+        if rust_manifest_value(&cargo)
+            .and_then(|value| value.get("workspace").cloned())
+            .is_some()
+        {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(cargo) = rust_manifest_value(&workspace_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Some(members) = cargo
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut dirs = Vec::new();
+    for member in members.iter().filter_map(|member| member.as_str()) {
+        dirs.extend(expand_rust_workspace_member(workspace_root, member));
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<PathBuf> {
+    let member = member.trim();
+    if member.is_empty() {
+        return Vec::new();
+    }
+
+    if member.contains('*') || member.contains('?') || member.contains('[') {
+        let pattern = workspace_root.join(member).to_string_lossy().to_string();
+        return glob::glob(&pattern)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|path| path.join("Cargo.toml").is_file())
+            .map(|path| canonicalize_path(&path))
+            .collect();
+    }
+
+    let path = workspace_root.join(member);
+    if path.join("Cargo.toml").is_file() {
+        vec![canonicalize_path(&path)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn resolve_tsconfig_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
@@ -2872,6 +4101,12 @@ fn clear_workspace_package_cache() {
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.clear();
     }
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.clear();
+    }
 }
 
 fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Option<PathBuf> {
@@ -2879,12 +4114,10 @@ fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Optio
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
-    if let Some(cached) = WORKSPACE_PACKAGE_CACHE
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned())
-    {
-        return cached;
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return cached.clone();
+        }
     }
 
     let resolved = workspace_member_dirs(&workspace_root)
@@ -3165,6 +4398,25 @@ fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Optio
     }
 }
 
+pub(crate) fn resolve_reexported_symbol_target<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+) -> Option<(PathBuf, String)>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    resolve_reexported_symbol(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+    )
+    .map(|target| (target.file, target.symbol))
+}
+
 fn resolve_reexported_symbol<F, D>(
     file: &Path,
     symbol_name: &str,
@@ -3288,7 +4540,9 @@ where
     F: FnMut(&Path, &str) -> bool,
     D: FnMut(&Path) -> Option<String>,
 {
-    let source_node = node.child_by_field_name("source")?;
+    let source_node = node
+        .child_by_field_name("source")
+        .or_else(|| find_child_by_kind(node, "string"))?;
     let module_path = string_literal_content(source, source_node)?;
     let target_file = resolve_module_path(from_dir, &module_path)?;
     let raw_export = node_text(node, source);
@@ -3384,8 +4638,7 @@ fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<Strin
 
 /// Find an index file in a directory.
 fn find_index_file(dir: &Path) -> Option<PathBuf> {
-    let candidates = ["index.ts", "index.tsx", "index.js", "index.jsx"];
-    for name in &candidates {
+    for name in JS_TS_INDEX_FILES {
         let p = dir.join(name);
         if p.is_file() {
             return Some(std::fs::canonicalize(&p).unwrap_or(p));
@@ -3447,6 +4700,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .git_ignore(true)     // respect .gitignore
         .git_global(true)     // respect global gitignore
         .git_exclude(true)    // respect .git/info/exclude
+        .add_custom_ignore_filename(".aftignore") // AFT-specific ignores (e.g. submodules)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
@@ -3477,6 +4731,50 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn symbol_metadata_for_recovers_scoped_method_by_bare_name() {
+        // exported_symbols carries the bare name; symbol_metadata is keyed by
+        // scoped identity (impl method). A plain .get(bare) misses and would
+        // force the degraded unknown/line-1 fallback. symbol_metadata_for must
+        // recover the scoped entry via unqualified-name match.
+        let mut symbol_metadata = HashMap::new();
+        symbol_metadata.insert(
+            "BackupStore::total_disk_bytes".to_string(),
+            SymbolMeta {
+                kind: SymbolKind::Method,
+                exported: true,
+                signature: None,
+                line: 703,
+                range: Range {
+                    start_line: 702,
+                    start_col: 0,
+                    end_line: 705,
+                    end_col: 0,
+                },
+            },
+        );
+        let file_data = FileCallData {
+            calls_by_symbol: HashMap::new(),
+            exported_symbols: vec!["total_disk_bytes".to_string()],
+            symbol_metadata,
+            default_export_symbol: None,
+            import_block: ImportBlock::empty(),
+            lang: LangId::Rust,
+        };
+
+        let meta = file_data
+            .symbol_metadata_for("total_disk_bytes")
+            .expect("scoped method recovered by bare name");
+        assert_eq!(meta.kind, SymbolKind::Method);
+        assert_eq!(
+            meta.line, 703,
+            "real declaration line, not the line-1 fallback"
+        );
+
+        // A genuinely-absent symbol still returns None (no false recovery).
+        assert!(file_data.symbol_metadata_for("does_not_exist").is_none());
+    }
 
     /// Create a temp directory with TypeScript files for testing.
     fn setup_ts_project() -> TempDir {
@@ -3791,6 +5089,11 @@ export function funcB() {
             .unwrap();
 
         assert_eq!(tree.name, "main");
+        assert!(tree.depth_limited, "depth limit should be reported");
+        assert!(
+            tree.truncated > 0,
+            "truncated edge count should be reported"
+        );
 
         // At depth 1, children should exist (direct calls) but their children should be empty
         for child in &tree.children {
@@ -3922,10 +5225,55 @@ export function funcB() {
     }
 
     #[test]
+    fn callgraph_walker_excludes_aftignored() {
+        let dir = TempDir::new().unwrap();
+
+        // .aftignore is honored without a git repo (custom ignore file).
+        fs::write(dir.path().join(".aftignore"), "vendored/\n").unwrap();
+        fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::create_dir(dir.path().join("vendored")).unwrap();
+        fs::write(
+            dir.path().join("vendored").join("sub.ts"),
+            "export function sub() {}",
+        )
+        .unwrap();
+
+        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let file_names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            file_names.contains(&"main.ts".to_string()),
+            "Should include main.ts, got: {:?}",
+            file_names
+        );
+        assert!(
+            !file_names.contains(&"sub.ts".to_string()),
+            "Should exclude .aftignored sub.ts, got: {:?}",
+            file_names
+        );
+    }
+
+    #[test]
     fn callgraph_walker_only_source_files() {
         let dir = TempDir::new().unwrap();
 
         fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::write(dir.path().join("module.mts"), "export function esm() {}").unwrap();
+        fs::write(dir.path().join("common.cts"), "export function cjs() {}").unwrap();
+        fs::write(
+            dir.path().join("runtime.mjs"),
+            "export function runtime() {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("legacy.cjs"),
+            "exports.legacy = function() {};",
+        )
+        .unwrap();
+        fs::write(dir.path().join("types.pyi"), "def typed() -> None: ...").unwrap();
         fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
 
@@ -3936,6 +5284,19 @@ export function funcB() {
             .collect();
 
         assert!(file_names.contains(&"main.ts".to_string()));
+        for modern_ext_file in [
+            "module.mts",
+            "common.cts",
+            "runtime.mjs",
+            "legacy.cjs",
+            "types.pyi",
+        ] {
+            assert!(
+                file_names.contains(&modern_ext_file.to_string()),
+                "walker should include {modern_ext_file}, got: {:?}",
+                file_names
+            );
+        }
         assert!(
             file_names.contains(&"readme.md".to_string()),
             "Markdown is now a supported source language"
@@ -4461,6 +5822,250 @@ function testValidation() {
         assert!(
             trivial.is_some(),
             "should have a trivial path with just the entry point itself"
+        );
+    }
+
+    #[test]
+    fn namespace_import_follows_barrel_reexport_and_rejects_private_member() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"import * as lib from './index';
+
+export function main() {
+    lib.helper();
+    lib.hidden();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "export { helper } from './utils';\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("utils.ts"),
+            r#"export function helper() {}
+function hidden() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let main_path = dir.path().join("main.ts");
+        let import_block = graph.build_file(&main_path).unwrap().import_block.clone();
+
+        let helper =
+            graph.resolve_cross_file_edge("lib.helper", "helper", &main_path, &import_block);
+        match helper {
+            EdgeResolution::Resolved { file, symbol } => {
+                assert!(
+                    file.ends_with("utils.ts"),
+                    "helper should resolve through barrel: {file:?}"
+                );
+                assert_eq!(symbol, "helper");
+            }
+            other => panic!("expected helper to resolve through barrel, got {other:?}"),
+        }
+
+        let hidden =
+            graph.resolve_cross_file_edge("lib.hidden", "hidden", &main_path, &import_block);
+        assert_eq!(
+            hidden,
+            EdgeResolution::Unresolved {
+                callee_name: "hidden".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_package_resolution_prefers_modern_ts_source_extensions() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let package_dir = dir.path().join("packages/lib");
+        fs::create_dir_all(package_dir.join("src")).unwrap();
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"@scope/lib","exports":{".":"./dist/index.mjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            package_dir.join("src/index.mts"),
+            "export function helper() {}\n",
+        )
+        .unwrap();
+        fs::write(package_dir.join("dist/index.mjs"), "export{};\n").unwrap();
+
+        let resolved = resolve_module_path(dir.path(), "@scope/lib").unwrap();
+        assert!(
+            resolved.ends_with("src/index.mts"),
+            "dist/index.mjs should map to src/index.mts, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_member_calls_do_not_become_same_file_callers() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"function caller() {
+    db.connect();
+}
+
+function connect() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .callers_of(&dir.path().join("main.ts"), "connect", 1, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_callers, 0,
+            "db.connect() must not call local connect"
+        );
+    }
+
+    #[test]
+    fn same_named_methods_use_scoped_symbol_identity() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("classes.ts"),
+            r#"class A {
+    run() { helperA(); }
+}
+
+class B {
+    run() { helperB(); }
+}
+
+function helperA() {}
+function helperB() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let path = dir.path().join("classes.ts");
+        let data = graph.build_file(&path).unwrap();
+
+        assert!(
+            data.symbol_metadata.contains_key("A::run"),
+            "A::run metadata missing"
+        );
+        assert!(
+            data.symbol_metadata.contains_key("B::run"),
+            "B::run metadata missing"
+        );
+        assert!(
+            data.calls_by_symbol["A::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperA"),
+            "A::run calls should not be overwritten"
+        );
+        assert!(
+            data.calls_by_symbol["B::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperB"),
+            "B::run calls should not be overwritten"
+        );
+
+        assert!(matches!(
+            graph.resolve_symbol_query(&path, "run"),
+            Err(AftError::AmbiguousSymbol { .. })
+        ));
+        assert_eq!(
+            graph.resolve_symbol_query(&path, "A::run").unwrap(),
+            "A::run"
+        );
+    }
+
+    #[test]
+    fn trace_to_counts_same_named_entry_points_by_file_and_symbol() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::create_dir_all(dir.path().join("cli")).unwrap();
+        fs::write(
+            dir.path().join("target.ts"),
+            r#"export function target() {
+    leaf();
+}
+
+function leaf() {}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("web/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("cli/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .trace_to(&dir.path().join("target.ts"), "leaf", 10, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_paths, 3,
+            "target plus two main entry paths expected"
+        );
+        assert_eq!(
+            result.entry_points_found, 3,
+            "same-named main entry points in different files must both count"
+        );
+    }
+
+    #[test]
+    fn callers_and_impact_report_depth_truncation() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        let callers = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            callers.depth_limited,
+            "callers should report omitted transitive callers"
+        );
+        assert!(
+            callers.truncated > 0,
+            "callers should report truncated edge count"
+        );
+
+        let impact = graph
+            .impact(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            impact.depth_limited,
+            "impact should report omitted transitive callers"
+        );
+        assert!(
+            impact.truncated > 0,
+            "impact should report truncated edge count"
         );
     }
 

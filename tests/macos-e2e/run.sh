@@ -105,10 +105,11 @@ export PATH="$HOME/.opencode/bin:$PATH"
 opencode --version
 
 # ---- Install aimock --------------------------------------------------------
-# Pinned to 1.17.0 to match the Linux harness — 1.18.0 renamed mock.onTurn(...)
-# and breaks our fixtures with `mock.onTurn is not a function`.
+# Pinned to the same version as bun.lock and the Linux harness. The mock server
+# relies on function-valued LLMock responses for turn logging and sequenceIndex
+# sibling progression for scripted turns; older 1.17.x installs lack that.
 echo "── Installing aimock ──"
-npm install -g @copilotkit/aimock@1.17.0
+npm install -g @copilotkit/aimock@1.24.0
 
 # ---- Set up test project ---------------------------------------------------
 # Mirror the structure Dockerfile.linux-x64 builds at /test/project.
@@ -137,7 +138,7 @@ mkdir -p "$OC_CONFIG_DIR"
 cat > "$OC_CONFIG_DIR/opencode.json" <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
-  "plugin": ["@cortexkit/aft-opencode@latest"],
+  "plugin": ["@cortexkit/aft-opencode"],
   "provider": {
     "mock": {
       "api": "openai",
@@ -164,19 +165,26 @@ EOF
 cat > "$OC_CONFIG_DIR/tui.json" <<'EOF'
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@cortexkit/aft-opencode@latest"]
+  "plugin": ["@cortexkit/aft-opencode"]
 }
 EOF
 
-# ---- Pre-install plugin from npm + override binary/dist locally ------------
-# Mirrors the Dockerfile flow: install @latest from npm so paths exist, then
-# overwrite the plugin dist + binary cache with our locally-built artifacts so
-# the test exercises the unreleased code under change.
+# ---- Pre-install locally packed plugin + bridge -----------------------------
+# Install local package artifacts so package metadata and dependency resolution
+# come from this checkout. The Darwin platform package wrapper still comes from
+# npm, while the actual executable cache is populated from AFT_BINARY_PATH below.
 PLUGIN_NPM_DIR="$HOME/.cache/opencode/packages"
-mkdir -p "$PLUGIN_NPM_DIR"
+LOCAL_PACK_DIR="$RUNNER_TEMP/aft-local-packs"
+rm -rf "$LOCAL_PACK_DIR"
+mkdir -p "$PLUGIN_NPM_DIR" "$LOCAL_PACK_DIR"
+npm pack "$REPO_ROOT/packages/aft-bridge" --pack-destination "$LOCAL_PACK_DIR" >/dev/null
+npm pack "$REPO_ROOT/packages/opencode-plugin" --pack-destination "$LOCAL_PACK_DIR" >/dev/null
 (
     cd "$PLUGIN_NPM_DIR"
-    npm install --silent @cortexkit/aft-opencode@latest @cortexkit/aft-darwin-arm64@latest
+    npm install --silent \
+        "$LOCAL_PACK_DIR"/cortexkit-aft-bridge-*.tgz \
+        "$LOCAL_PACK_DIR"/cortexkit-aft-opencode-*.tgz \
+        @cortexkit/aft-darwin-arm64@latest
 )
 
 # Inject locally-built AFT binary into the versioned cache

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 
 type SpawnSyncForMigration = typeof spawnSync;
@@ -33,6 +34,9 @@ export interface MigrationStatus {
   migrated_at?: string;
   source_path?: string;
   aft_version?: string;
+  source_marker_path?: string;
+  source_marker_present?: boolean;
+  partial_state?: boolean;
 }
 
 const TARGET_MARKER = ".migrated_from_legacy";
@@ -99,7 +103,7 @@ function migrationLogPath(
 export async function ensureStorageMigrated(opts: MigrationOptions): Promise<void> {
   const legacyRoot = resolveLegacyStorageRoot(opts.harness);
   const newRoot = resolveCortexKitStorageRoot();
-  const targetMarker = join(newRoot, opts.harness, TARGET_MARKER);
+  const targetMarker = resolveHarnessStoragePath(newRoot, opts.harness, TARGET_MARKER);
   const info = opts.logger?.info ?? opts.logger?.log;
 
   if (existsSync(targetMarker)) {
@@ -204,10 +208,20 @@ export async function getMigrationStatus(opts: {
   binaryPath?: string;
 }): Promise<MigrationStatus> {
   const newRoot = resolveCortexKitStorageRoot();
+  const legacyRoot = resolveLegacyStorageRoot(opts.harness);
   const binaryPath = opts.binaryPath ?? (await findBinary());
   const result = spawnSyncForMigration(
     binaryPath,
-    ["migrate-storage", "--status", "--to", newRoot, "--harness", opts.harness],
+    [
+      "migrate-storage",
+      "--status",
+      "--from",
+      legacyRoot,
+      "--to",
+      newRoot,
+      "--harness",
+      opts.harness,
+    ],
     {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

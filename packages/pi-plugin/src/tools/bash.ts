@@ -1,5 +1,12 @@
 import * as fs from "node:fs/promises";
-import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import {
+  type BinaryBridge,
+  type BridgeRequestOptions,
+  maybeAppendConflictsHint,
+  maybeAppendGrepSearchHint,
+  maybeStripCompressorPipe,
+  resolveBashKillTimeout,
+} from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -10,10 +17,14 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
   consumeBgCompletion,
+  markBgCompletionDelivered,
+  markExplicitControl,
   markTaskWaiting,
   trackBgTask,
+  unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
+import { resolveBashConfig } from "../config.js";
 import {
   disposePtyTerminal,
   getOrCreatePtyTerminal,
@@ -21,17 +32,39 @@ import {
   renderScreen,
 } from "../shared/pty-cache.js";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, resolveSessionId, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  optionalInt,
+  resolveSessionId,
+  textResult,
+} from "./_shared.js";
 
 // Foreground polling wait-window: how long the plugin blocks the agent before
 // promoting the task to background and returning. INTENTIONALLY decoupled
 // from the task's own kill cap (`params.timeout`). Council decision:
 // .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-const FOREGROUND_WAIT_WINDOW_MS = 5_000;
+// The value is resolved per-call from bash config (default 8000ms, floored at
+// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
 const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
+
+// Test-only override for the foreground wait window. Production resolves the
+// window from config (floored at 5000ms), but bun caps each test at 5000ms, so
+// promotion tests need a sub-floor window to exercise the promote path
+// deterministically. Mirrors the Rust `AFT_CALLGRAPH_BUILD_WAIT_MS` test seam.
+// Never set outside tests.
+function resolveForegroundWaitMs(configured: number): number {
+  const override = process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return configured;
+}
 // Bridge transport budget for `bash` calls. Rust returns `running` immediately
 // and the plugin polls separately, so transport only needs to cover spawn +
 // protocol round-trip; not a function of params.timeout. See council audit
@@ -59,13 +92,7 @@ const BashParams = Type.Object({
   command: Type.String({
     description: "Shell command to execute. Supports pipes, redirections, and shell syntax.",
   }),
-  timeout: Type.Optional(
-    Type.Integer({
-      minimum: 1,
-      description:
-        "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~5s; otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
-    }),
-  ),
+  timeout: optionalInt(1, Number.MAX_SAFE_INTEGER),
   workdir: Type.Optional(
     Type.String({
       description:
@@ -93,9 +120,11 @@ const BashParams = Type.Object({
   pty: Type.Optional(
     Type.Boolean({
       description:
-        'Spawn the command in a real PTY for interactive programs. Requires background: true. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
+        'Spawn the command in a real PTY for interactive programs. Implies background: true automatically. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
     }),
   ),
+  ptyRows: optionalInt(1, 60),
+  ptyCols: optionalInt(1, 140),
 });
 
 const BashTaskParams = Type.Object({
@@ -114,33 +143,16 @@ const BashStatusParams = Type.Object({
         "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
     }),
   ),
-  wait_for: Type.Optional(
-    Type.Union(
-      [
-        Type.String(),
-        Type.Object({
-          regex: Type.String(),
-        }),
-      ],
-      {
-        description:
-          "Wait until this text pattern appears in the task's output. String form: substring match. Object form: regex match (JavaScript regex syntax). The call returns as soon as the pattern is found OR the task reaches terminal status OR timeout_ms elapses.",
-      },
-    ),
-  ),
-  exit: Type.Optional(
-    Type.Boolean({
-      description:
-        "Wait until the task reaches a terminal status (completed/failed/killed/timed_out). Useful for explicitly awaiting a background bash task before returning. Can be combined with wait_for — the call returns on whichever condition fires first.",
-    }),
-  ),
-  timeout_ms: Type.Optional(
-    Type.Integer({
-      minimum: 1,
-      description:
-        "Maximum wait time in milliseconds. Default: 30000 (30s). Hard-capped at 300000 (5min). Ignored when neither wait_for nor exit is specified.",
-    }),
-  ),
+});
+
+const BashWatchParams = Type.Object({
+  task_id: Type.String({
+    description: "Background bash task id returned by bash({ background: true }).",
+  }),
+  pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
+  background: Type.Optional(Type.Boolean()),
+  timeout_ms: optionalInt(1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS),
+  once: Type.Optional(Type.Boolean()),
 });
 
 const BashWriteParams = Type.Object({
@@ -201,6 +213,8 @@ interface BashStatusDetails {
   command?: string;
   mode?: string;
   output_path?: string;
+  pty_rows?: number;
+  pty_cols?: number;
   waited?: BashStatusWaited;
 }
 
@@ -214,10 +228,26 @@ interface BashKillDetails {
   status: string;
 }
 
+interface BashWatchDetails extends Record<string, unknown> {}
+
 /** Local shape for Pi's render context — mirrors hoisted.ts pattern. */
 interface RenderContextLike {
   lastComponent: import("@earendil-works/pi-tui").Component | undefined;
   isError: boolean;
+}
+
+async function callBashBridge(
+  bridge: BinaryBridge,
+  command: string,
+  params: Record<string, unknown> = {},
+  extCtx?: ExtensionContext,
+  options?: BridgeRequestOptions,
+): Promise<Record<string, unknown>> {
+  return await callBridge(bridge, command, params, extCtx, {
+    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
+    ...options,
+    keepBridgeOnTimeout: true,
+  });
 }
 
 /** Truncate output to last N visual lines for terminal width. */
@@ -250,9 +280,12 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
   return api.hooks?.bashSpawn;
 }
 
-export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
+export function registerBashTool(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  aftSearchRegistered = false,
+): void {
   const spawnHook = getBashSpawnHook(pi);
-
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
     label: "bash",
@@ -267,9 +300,27 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     parameters: BashParams,
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      if (params.pty === true && params.background !== true) {
-        throw new Error("PTY mode requires background: true");
-      }
+      const bashCfg = resolveBashConfig(ctx.config);
+      const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
+      // ptyRows/ptyCols are silently ignored when pty is false so agents
+      // that defensively pass them on normal bash calls don't get stuck in
+      // a retry loop. pty: true silently implies background: true (Rust
+      // bash.rs handles the auto-promote); we mirror that here so the
+      // Pi-side spawn payload also reflects the auto-promotion.
+      const timeout = coerceOptionalInt(params.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
+      const ptyRows = coerceOptionalInt(params.ptyRows, "ptyRows", 1, 60);
+      const ptyCols = coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
+      const effectiveBackground = params.background === true || params.pty === true;
+      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
+      // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
+      // FOREGROUND path a `timeout` below the foreground wait window is
+      // incoherent (the task would be killed before we promote it to
+      // background), so treat it as unset and let the bridge apply its
+      // 30-minute default — this is the #102 fix. Used for the bridge payload,
+      // the wait calc, and the promotion message so all three agree.
+      const effectiveTimeout = effectiveBackground
+        ? timeout
+        : resolveBashKillTimeout(timeout, foregroundWaitMs);
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -289,30 +340,34 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         }
       }
 
+      const compressionEnabled = bashCfg.compress && params.compressed !== false;
+      const pipeStrip = maybeStripCompressorPipe(spawnContext.command, compressionEnabled);
+      const bridgeCommand = pipeStrip.command;
+
       let streamed = "";
-      const response = await callBridge(
+      const response = await callBashBridge(
         bridge,
         "bash",
         {
-          command: spawnContext.command,
-          timeout: params.timeout,
+          command: bridgeCommand,
+          timeout: effectiveTimeout,
           workdir: spawnContext.cwd ?? params.workdir,
           env: spawnContext.env,
           description: params.description,
-          background: params.background,
-          notify_on_completion: params.background === true,
+          background: effectiveBackground,
+          notify_on_completion: effectiveBackground,
           compressed: params.compressed,
           pty: params.pty,
+          pty_rows: ptyRows,
+          pty_cols: ptyCols,
         },
         extCtx,
         {
-          transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
           // Rust bash has its own watchdog that kills the child shell on the
           // bash-level timeout and returns a normal timed_out response well
           // before our transport timeout fires. If we hit the transport
           // deadline anyway it means the response is just late — don't
           // sacrifice the bridge (and all its warm state) for that.
-          keepBridgeOnTimeout: true,
           onProgress: ({ text }) => {
             streamed += text;
             // Stream truncated output to avoid overwhelming the UI
@@ -337,47 +392,69 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
 
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
-        if (params.background === true) {
+        if (effectiveBackground) {
           trackBgTask(resolveSessionId(extCtx), taskId);
-          return bashResult(formatBackgroundLaunch(taskId, params.pty === true), {
-            task_id: taskId,
-          });
+          // Surface the strip note on the background path too, so the agent
+          // knows their pipe was dropped when they read the task output later.
+          return bashResult(
+            appendPipeStripNote(
+              formatBackgroundLaunch(taskId, params.pty === true),
+              pipeStrip.note,
+            ),
+            { task_id: taskId },
+          );
         }
 
         // Wait-window decoupled from params.timeout. Always cap polling at
-        // FOREGROUND_WAIT_WINDOW_MS so agents get a fast promotion message
+        // foregroundWaitMs so agents get a fast promotion message
         // for unexpectedly long commands. Honor a shorter explicit timeout
         // when present — polling beyond the task's kill cap is pointless.
-        // Schema validation guarantees params.timeout is a positive integer
-        // or undefined, so this Math.min is always well-defined.
+        // effectiveTimeout already folded the sub-window guard (#102): it is
+        // either >= foregroundWaitMs or undefined, so this Math.min can no
+        // longer collapse the wait window below the configured value.
         const waitTimeoutMs =
-          params.timeout !== undefined
-            ? Math.min(params.timeout, FOREGROUND_WAIT_WINDOW_MS)
-            : FOREGROUND_WAIT_WINDOW_MS;
+          effectiveTimeout !== undefined
+            ? Math.min(effectiveTimeout, foregroundWaitMs)
+            : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
-          const status = await callBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
+          const status = await callBashBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
           if (status.success === false) {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            return bashResult(formatForegroundResult(status), {
-              exit_code: status.exit_code as number | undefined,
-              duration_ms: status.duration_ms as number | undefined,
-              truncated: status.output_truncated as boolean | undefined,
-              output_path: status.output_path as string | undefined,
-              task_id: taskId,
-            });
+            return bashResult(
+              appendPipeStripNote(
+                withBashHints(formatForegroundResult(status), bridgeCommand, aftSearchRegistered),
+                pipeStrip.note,
+              ),
+              {
+                exit_code: status.exit_code as number | undefined,
+                duration_ms: status.duration_ms as number | undefined,
+                truncated: status.output_truncated as boolean | undefined,
+                output_path: status.output_path as string | undefined,
+                task_id: taskId,
+              },
+            );
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
-            const promoted = await callBridge(bridge, "bash_promote", { task_id: taskId }, extCtx);
+            const promoted = await callBashBridge(
+              bridge,
+              "bash_promote",
+              { task_id: taskId },
+              extCtx,
+            );
             if (promoted.success === false) {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(formatPromotionMessage(taskId, params.timeout), {
-              task_id: taskId,
-            });
+            return bashResult(
+              appendPipeStripNote(
+                formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs),
+                pipeStrip.note,
+              ),
+              { task_id: taskId },
+            );
           }
           await sleep(FOREGROUND_POLL_INTERVAL_MS);
         }
@@ -392,7 +469,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       };
 
       const output = (response.output as string | undefined) ?? "";
-      return bashResult(output, details);
+      return bashResult(
+        appendPipeStripNote(
+          withBashHints(output, bridgeCommand, aftSearchRegistered),
+          pipeStrip.note,
+        ),
+        details,
+      );
     },
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
@@ -409,8 +492,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   // flag only gates explicit `bash({ background: true })` spawning, not the
   // promotion path.
   pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
+  pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
   pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
   pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+}
+
+function appendPipeStripNote(output: string, note: string | undefined): string {
+  return note ? `${output}\n\n${note}` : output;
 }
 
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
@@ -423,15 +511,32 @@ function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
-function formatPromotionMessage(taskId: string, timeout: number | undefined): string {
+function formatPromotionMessage(
+  taskId: string,
+  timeout: number | undefined,
+  waitWindowMs: number,
+): string {
   // Reports actual elapsed wait, not the user's full kill cap. The agent
   // already has the original command in its tool-call args; bash_status
   // returns it on demand if a downstream tool ever needs it.
-  const waited =
-    timeout !== undefined
-      ? Math.min(timeout, FOREGROUND_WAIT_WINDOW_MS)
-      : FOREGROUND_WAIT_WINDOW_MS;
-  return `Foreground bash didn't finish within ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
+  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
+  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
+}
+
+/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
+function formatSeconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(1))}s`;
+}
+
+/**
+ * Append AFT bash-output hints (conflicts / grep) to a foreground bash result.
+ * Pi knows the exact command, so the grep hint is matched against it directly
+ * rather than the echoed first output line. Mirrors OpenCode's
+ * `tool.execute.after` nudges; only fires on terminal bash output (not
+ * background-spawn/promotion messages, which have no real output yet).
+ */
+function withBashHints(output: string, command: string, aftSearchRegistered: boolean): string {
+  return maybeAppendGrepSearchHint(maybeAppendConflictsHint(output), command, aftSearchRegistered);
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {
@@ -462,8 +567,8 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     description:
-      'Check the status of a background bash task. For PTY tasks, pass output_mode: "screen" (default), "raw", or "both". Pass exit: true and/or wait_for to block until the task exits, the text/regex appears, or timeout_ms elapses.',
-    promptSnippet: "Poll or explicitly wait for a background bash task by task_id",
+      "Read-only snapshot of a background bash task. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
+    promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
       _toolCallId: string,
@@ -473,28 +578,89 @@ export function createBashStatusTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const waitFor = parseWaitPattern(params.wait_for);
-      const shouldWait = waitFor !== undefined || params.exit === true;
-      const effectiveWaitMs = Math.min(
-        params.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-        MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
-      );
-      const data = shouldWait
-        ? await waitForBashStatus(
-            bridge,
-            extCtx,
-            params.task_id,
-            params.output_mode,
-            waitFor,
-            params.exit === true,
-            effectiveWaitMs,
-          )
-        : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      // bash_status is snapshot-only. wait_for / exit / timeout_ms moved to
+      // bash_watch; if the agent passes them here they're silently ignored
+      // at the TypeBox schema layer.
+      const data = await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode),
         details,
       );
+    },
+  };
+}
+
+export function createBashWatchTool(ctx: PluginContext) {
+  return {
+    name: "bash_watch",
+    label: "bash_watch",
+    description:
+      "Watch a background bash task. Two modes. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use this to be pinged when a specific line appears or the task exits, without freezing your turn. Sync (default) blocks until a pattern matches/the task exits/timeout, and is ONLY for short bounded waits (seconds, e.g. a dev server printing a readiness line). Do NOT sync-wait for a long task (build/test/install): blocking locks the user out until it ends — instead end your turn and let the automatic completion reminder arrive, or use async mode.",
+    promptSnippet: "Wait for or watch a background bash task",
+    parameters: BashWatchParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof BashWatchParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: ((update: AgentToolResult<BashWatchDetails>) => void) | undefined,
+      extCtx: ExtensionContext,
+    ) {
+      const bridge = bridgeFor(ctx, extCtx.cwd);
+      const waitFor = parseWaitPattern(params.pattern);
+      if (params.background === true) {
+        if (!waitFor) {
+          throw new Error(
+            "invalid_request: Use auto-reminder; bash_watch without pattern in async mode is redundant",
+          );
+        }
+        const notifyParams: Record<string, unknown> = {
+          task_id: params.task_id,
+          once: params.once !== false,
+        };
+        if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
+        else notifyParams.pattern = waitFor.value;
+        const sessionId = resolveSessionId(extCtx);
+        markExplicitControl(sessionId, params.task_id, false);
+        let registered: Record<string, unknown>;
+        try {
+          registered = await callBashBridge(bridge, "bash_notify", notifyParams, extCtx);
+        } catch (err) {
+          unmarkExplicitControl(sessionId, params.task_id);
+          throw err;
+        }
+        if (registered.success === false) {
+          unmarkExplicitControl(sessionId, params.task_id);
+          const message = String(registered.message ?? "bash_notify failed");
+          throw new Error(`${String(registered.code ?? "invalid_request")}: ${message}`);
+        }
+        const watchDetails = { registered: true, watchId: registered.watch_id } as BashWatchDetails;
+        return textResult(
+          `Watch registered: ${registered.watch_id} on task ${params.task_id}\nA notification will fire when the pattern matches or the task exits.`,
+          watchDetails,
+        );
+      }
+      const data = await waitForBashStatus(
+        ctx,
+        bridge,
+        extCtx,
+        params.task_id,
+        undefined,
+        waitFor,
+        true,
+        Math.min(
+          coerceOptionalInt(params.timeout_ms, "timeout_ms", 1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS) ??
+            DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+          MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+        ),
+      );
+      const text = await formatBashStatus(
+        extCtx,
+        params.task_id,
+        data as unknown as BashStatusDetails,
+        undefined,
+      );
+      return textResult(text, data as BashWatchDetails);
     },
   };
 }
@@ -519,7 +685,7 @@ export function createBashWriteTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const data = await callBridge(
+      const data = await callBashBridge(
         bridge,
         "bash_write",
         { task_id: params.task_id, input: params.input },
@@ -549,7 +715,7 @@ export function createBashKillTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const data = await callBridge(bridge, "bash_kill", { task_id: params.task_id }, extCtx);
+      const data = await callBashBridge(bridge, "bash_kill", { task_id: params.task_id }, extCtx);
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
@@ -600,7 +766,10 @@ function bashKillResult(
   };
 }
 
-type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; value: RegExp };
+type BashWaitPattern =
+  | { kind: "substring"; value: string }
+  | { kind: "regex"; value: RegExp; source: string };
+type OutputCursor = { output: number; stderr: number; combined: number };
 
 async function bashStatusSnapshot(
   bridge: BinaryBridge,
@@ -609,7 +778,7 @@ async function bashStatusSnapshot(
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  return await callBridge(
+  return await callBashBridge(
     bridge,
     "bash_status",
     { task_id: taskId, output_mode: outputMode },
@@ -619,6 +788,7 @@ async function bashStatusSnapshot(
 }
 
 async function waitForBashStatus(
+  ctx: PluginContext,
   bridge: BinaryBridge,
   extCtx: ExtensionContext,
   taskId: string,
@@ -629,7 +799,7 @@ async function waitForBashStatus(
 ): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
   const startedAt = Date.now();
   const deadline = startedAt + effectiveWaitMs;
-  let spillCursor = 0;
+  let spillCursor: OutputCursor = { output: 0, stderr: 0, combined: 0 };
   let scanText = "";
   let scanBaseOffset = 0;
   const bridgeOptions = {
@@ -646,11 +816,7 @@ async function waitForBashStatus(
   try {
     while (true) {
       const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
-      if (waitForExit && isTerminalStatus(data.status)) {
-        sawTerminal = true;
-        consumeBgCompletion(sessionId, taskId);
-        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
-      }
+      const terminal = isTerminalStatus(data.status);
 
       if (waitFor) {
         const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
@@ -660,6 +826,14 @@ async function waitForBashStatus(
           scanText += scan.text;
           const match = findWaitMatch(scanText, waitFor);
           if (match) {
+            if (waitForExit && terminal) {
+              sawTerminal = true;
+              consumeBgCompletion(sessionId, taskId);
+              await markBgCompletionDelivered(
+                { ctx, directory: extCtx.cwd, sessionID: sessionId },
+                taskId,
+              );
+            }
             return withWaited(data, {
               reason: "matched",
               elapsed_ms: Date.now() - startedAt,
@@ -669,9 +843,18 @@ async function waitForBashStatus(
             });
           }
         }
-        if (isTerminalStatus(data.status)) {
-          return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
+
+      if (terminal) {
+        if (waitForExit) {
+          sawTerminal = true;
+          consumeBgCompletion(sessionId, taskId);
+          await markBgCompletionDelivered(
+            { ctx, directory: extCtx.cwd, sessionID: sessionId },
+            taskId,
+          );
         }
+        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
       }
 
       if (Date.now() >= deadline) {
@@ -681,6 +864,9 @@ async function waitForBashStatus(
     }
   } finally {
     if (waitForExit && !sawTerminal) unmarkTaskWaiting(sessionId, taskId);
+    if (waitFor) {
+      await disposePtyTerminal(watchPtyCacheKey(extCtx, taskId));
+    }
   }
 }
 
@@ -688,19 +874,47 @@ async function readNewTaskOutput(
   extCtx: ExtensionContext,
   taskId: string,
   data: Record<string, unknown>,
-  cursor: number,
-): Promise<{ text: string; baseOffset: number; nextCursor: number } | undefined> {
+  cursor: OutputCursor,
+): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
-  if (!outputPath) return undefined;
   if (data.mode === "pty") {
-    const state = await getOrCreatePtyTerminal(ptyCacheKey(extCtx, taskId), outputPath);
+    if (!outputPath) return undefined;
+    const { rows, cols } = ptyDimensions(data);
+    const state = await getOrCreatePtyTerminal(
+      watchPtyCacheKey(extCtx, taskId),
+      outputPath,
+      rows,
+      cols,
+    );
     const baseOffset = state.offset;
     const bytes = await readPtyBytes(state);
-    return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
+    if (bytes.length === 0) return undefined;
+    return {
+      text: bytes.toString("utf8"),
+      baseOffset,
+      nextCursor: { output: state.offset, stderr: 0, combined: state.offset },
+    };
   }
 
-  const bytes = await readFileBytesFrom(outputPath, cursor);
-  return { text: bytes.toString("utf8"), baseOffset: cursor, nextCursor: cursor + bytes.length };
+  const stderrPath = data.stderr_path as string | undefined;
+  if (!outputPath && !stderrPath) return undefined;
+  const stdoutBytes = outputPath
+    ? await readFileBytesFrom(outputPath, cursor.output)
+    : Buffer.alloc(0);
+  const stderrBytes = stderrPath
+    ? await readFileBytesFrom(stderrPath, cursor.stderr)
+    : Buffer.alloc(0);
+  const bytesRead = stdoutBytes.length + stderrBytes.length;
+  if (bytesRead === 0) return undefined;
+  return {
+    text: Buffer.concat([stdoutBytes, stderrBytes]).toString("utf8"),
+    baseOffset: cursor.combined,
+    nextCursor: {
+      output: cursor.output + stdoutBytes.length,
+      stderr: cursor.stderr + stderrBytes.length,
+      combined: cursor.combined + bytesRead,
+    },
+  };
 }
 
 async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
@@ -723,7 +937,8 @@ async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Bu
 
 function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
-  if (isRegexWaitObject(value)) return { kind: "regex", value: new RegExp(value.regex) };
+  if (isRegexWaitObject(value))
+    return { kind: "regex", value: new RegExp(value.regex), source: value.regex };
   return undefined;
 }
 
@@ -781,11 +996,13 @@ async function formatBashStatus(
     text += `
 ${formatWaitSummary(details.waited, details)}`;
   if (details.mode === "pty") {
+    // PTY output is rendered from the raw terminal spill file; never feed it
+    // through the piped-output compression/line renderer.
     text += await formatPtyStatus(extCtx, taskId, details, requestedOutputMode);
   } else {
     if (isTerminalStatus(details.status) && details.output_preview) {
       text += `
-${details.output_preview.slice(0, 2000)}`;
+${details.output_preview}`;
     }
     if (!isTerminalStatus(details.status)) {
       text += `
@@ -803,7 +1020,8 @@ async function formatPtyStatus(
 ): Promise<string> {
   if (!details.output_path) return "\n[PTY output path unavailable]";
   const key = ptyCacheKey(extCtx, taskId);
-  const state = await getOrCreatePtyTerminal(key, details.output_path);
+  const { rows, cols } = ptyDimensions(details);
+  const state = await getOrCreatePtyTerminal(key, details.output_path, rows, cols);
   const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
   let suffix = "";
@@ -815,9 +1033,9 @@ ${raw.toString("utf8")}`
         : "";
   } else if (outputMode === "both") {
     suffix = `
-${JSON.stringify({ screen: renderScreen(state, 24, 80), raw: raw.toString("utf8") }, null, 2)}`;
+${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, 24, 80);
+    const screen = renderScreen(state, rows, cols);
     suffix = screen
       ? `
 ${screen}`
@@ -831,8 +1049,20 @@ ${screen}`
   return suffix;
 }
 
+function ptyDimensions(data: { pty_rows?: unknown; pty_cols?: unknown }): {
+  rows: number;
+  cols: number;
+} {
+  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
+  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
+  return { rows, cols };
+}
+
 function ptyCacheKey(extCtx: ExtensionContext, taskId: string): string {
   return `${extCtx.cwd}::${resolveSessionId(extCtx) ?? "__default__"}::${taskId}`;
+}
+function watchPtyCacheKey(extCtx: ExtensionContext, taskId: string): string {
+  return `${ptyCacheKey(extCtx, taskId)}::watch`;
 }
 
 function isTerminalStatus(status: unknown): boolean {
@@ -881,19 +1111,14 @@ function renderBashResult(
   container.clear();
   container.addChild(new Spacer(1));
 
-  // Output preview — last 25 lines, matching Pi built-in bash behaviour
+  // Output preview is already capped by Rust's coordinated bash-output policy.
   const rawOutput = result.content
     .filter((c) => c.type === "text")
     .map((c) => (c as { text?: string }).text ?? "")
     .join("\n")
     .trim();
   if (rawOutput) {
-    const lines = rawOutput.split("\n");
-    const preview =
-      lines.length > 25
-        ? `... (${lines.length - 25} lines omitted)\n${lines.slice(-25).join("\n")}`
-        : rawOutput;
-    container.addChild(new Text(preview, 1, 0));
+    container.addChild(new Text(rawOutput, 1, 0));
     container.addChild(new Spacer(1));
   }
 

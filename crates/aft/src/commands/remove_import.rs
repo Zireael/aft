@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
@@ -71,7 +72,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {
             return Response::error(
                 &req.id,
-                "invalid_request",
+                "unsupported_language",
                 format!(
                     "remove_import: unsupported file extension: {}",
                     path.extension()
@@ -85,7 +86,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
     if !imports::is_supported(lang) {
         return Response::error(
             &req.id,
-            "invalid_request",
+            "unsupported_language",
             format!(
                 "remove_import: import management not yet supported for {:?}",
                 lang
@@ -93,20 +94,72 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    let (module_owned, include_import_kind) = if matches!(lang, LangId::C | LangId::Cpp) {
+        imports::normalize_include_module(module)
+    } else {
+        (module.to_string(), None)
+    };
+    let module = module_owned.as_str();
+
     // --- Parse file and imports ---
-    let (source, _tree, block) = match imports::parse_file_imports(&path, lang) {
+    let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
         Ok(result) => result,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
 
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&tree) {
+            return Response::error(&req.id, err.code(), err.message("remove_import"));
+        }
+    }
+
+    if matches!(lang, LangId::CSharp | LangId::Php)
+        && organize_imports::imports_span_multiple_code_regions(&source, lang, &block.imports)
+    {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "remove_import: imports in {file} span multiple code regions; refusing to remove because the target region is ambiguous"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
+    if lang == LangId::Php
+        && block.imports.iter().any(|imp| {
+            imports::php_grouped_use_shares_prefix(imp, module)
+                || imports::php_grouped_use_matches_module(imp, module)
+        })
+    {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_grouped_import",
+            format!(
+                "remove_import: PHP grouped use declarations matching '{module}' are not safe to edit member-wise; expand the grouped use first"
+            ),
+            serde_json::json!({ "file": file, "module": module }),
+        );
+    }
+
     // --- Find matching import ---
     let matching: Vec<(usize, &imports::ImportStatement)> = block
         .imports
         .iter()
         .enumerate()
-        .filter(|(_, imp)| imp.module_path == module)
+        .filter(|(_, imp)| {
+            if imp.module_path != module {
+                return false;
+            }
+            if matches!(lang, LangId::C | LangId::Cpp) {
+                if let Some(kind) = include_import_kind {
+                    return imp.default_import.as_deref() == Some(kind);
+                }
+            }
+            true
+        })
         .collect();
 
     if matching.is_empty() {
@@ -115,6 +168,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
             "removed": false,
             "module": module,
             "reason": "module_not_found",
+            "no_op": true,
         });
         if let Some(ref n) = name {
             result["name"] = serde_json::json!(n);
@@ -141,6 +195,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
             "removed": false,
             "module": module,
             "reason": reason,
+            "no_op": true,
         });
         if let Some(ref n) = name {
             result["name"] = serde_json::json!(n);
@@ -173,6 +228,19 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
+    }
+
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — the import was NOT removed. Report that honestly with an error
+    // instead of claiming `removed: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "remove_import: removing '{module}' from {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
     }
 
     log::debug!("remove_import: {}", file);
@@ -226,6 +294,19 @@ fn remove_name_from_imports(
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     for (_, imp) in matching {
+        if lang == LangId::Scala {
+            if let Some(replacement) = remove_name_from_scala_import(imp, target_name) {
+                match replacement {
+                    Some(new_line) => edits.push((imp.byte_range.clone(), new_line)),
+                    None => {
+                        let range = line_range(source, &imp.byte_range);
+                        edits.push((range, String::new()));
+                    }
+                }
+            }
+            continue;
+        }
+
         // Match against either the imported name or the local binding so the
         // caller can ask to remove `input` even when the specifier is stored
         // verbatim as `stdin as input` (TS/JS).
@@ -249,27 +330,47 @@ fn remove_name_from_imports(
                 edits.push((range, String::new()));
             } else {
                 // Other bindings remain — regenerate without target
-                let new_line = imports::generate_import_line(
+                let new_line = imports::generate_import_line_with_namespace(
                     lang,
                     &imp.module_path,
                     &new_names,
                     imp.default_import.as_deref(),
+                    imp.namespace_import.as_deref(),
                     imp.kind == imports::ImportKind::Type,
                 );
                 edits.push((imp.byte_range.clone(), new_line));
             }
         } else if imp.default_import.as_deref() == Some(target_name) {
             // Removing the default import
-            if imp.names.is_empty() {
+            if imp.names.is_empty() && imp.namespace_import.is_none() {
                 // Only default — remove entire statement
                 let range = line_range(source, &imp.byte_range);
                 edits.push((range, String::new()));
             } else {
-                // Has named imports too — regenerate without default
-                let new_line = imports::generate_import_line(
+                // Has named or namespace imports too — regenerate without default
+                let new_line = imports::generate_import_line_with_namespace(
                     lang,
                     &imp.module_path,
                     &imp.names,
+                    None,
+                    imp.namespace_import.as_deref(),
+                    imp.kind == imports::ImportKind::Type,
+                );
+                edits.push((imp.byte_range.clone(), new_line));
+            }
+        } else if imp.namespace_import.as_deref() == Some(target_name) {
+            // Removing the namespace import
+            if imp.names.is_empty() && imp.default_import.is_none() {
+                // Only namespace — remove entire statement
+                let range = line_range(source, &imp.byte_range);
+                edits.push((range, String::new()));
+            } else {
+                // Has default or named imports too — regenerate without namespace
+                let new_line = imports::generate_import_line_with_namespace(
+                    lang,
+                    &imp.module_path,
+                    &imp.names,
+                    imp.default_import.as_deref(),
                     None,
                     imp.kind == imports::ImportKind::Type,
                 );
@@ -290,6 +391,106 @@ fn remove_name_from_imports(
     }
 
     result
+}
+
+fn remove_name_from_scala_import(
+    imp: &imports::ImportStatement,
+    target_name: &str,
+) -> Option<Option<String>> {
+    let any_match = imp
+        .names
+        .iter()
+        .any(|name| imports::specifier_matches(name, target_name));
+    if !any_match {
+        return None;
+    }
+
+    let remaining_names: Vec<String> = imp
+        .names
+        .iter()
+        .filter(|name| !imports::specifier_matches(name, target_name))
+        .cloned()
+        .collect();
+    if remaining_names.is_empty() {
+        return Some(None);
+    }
+
+    let replacement =
+        rewrite_scala_selector_list(&imp.raw_text, target_name).unwrap_or_else(|| {
+            imports::generate_import_line(
+                LangId::Scala,
+                &imp.module_path,
+                &remaining_names,
+                imp.default_import.as_deref(),
+                false,
+            )
+        });
+    Some(Some(replacement))
+}
+
+fn rewrite_scala_selector_list(raw_text: &str, target_name: &str) -> Option<String> {
+    let open = raw_text.find('{')?;
+    let close = raw_text.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+
+    let body = &raw_text[open + 1..close];
+    let selectors = split_scala_selectors(body);
+    if selectors.is_empty() {
+        return None;
+    }
+
+    let kept: Vec<String> = selectors
+        .iter()
+        .filter(|selector| !scala_selector_matches(selector, target_name))
+        .map(|selector| selector.trim().to_string())
+        .filter(|selector| !selector.is_empty())
+        .collect();
+
+    if kept.len() == selectors.len() || kept.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{}{}{}",
+        &raw_text[..open + 1],
+        kept.join(", "),
+        &raw_text[close..]
+    ))
+}
+
+fn split_scala_selectors(body: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in body.char_indices() {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                selectors.push(body[start..idx].to_string());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    selectors.push(body[start..].to_string());
+    selectors
+}
+
+fn scala_selector_matches(selector: &str, target_name: &str) -> bool {
+    let normalized = normalize_scala_selector(selector);
+    imports::specifier_matches(&normalized, target_name)
+}
+
+fn normalize_scala_selector(selector: &str) -> String {
+    let trimmed = selector.trim();
+    if let Some((from, to)) = trimmed.split_once("=>") {
+        format!("{} as {}", from.trim(), to.trim())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Remove entire import statements for all matching imports.

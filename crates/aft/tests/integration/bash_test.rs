@@ -50,7 +50,13 @@ fn bash_streams_progress_and_returns_final_response() {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert_eq!(status["output_preview"], "hello\n");
+    assert_eq!(
+        status["output_preview"]
+            .as_str()
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "hello\n"
+    );
     assert_eq!(status["exit_code"], 0);
     assert!(status["duration_ms"].is_u64());
 
@@ -77,6 +83,82 @@ fn bash_rejects_blocked_env_vars() {
     assert_eq!(response["success"], false, "response: {response:?}");
     assert_eq!(response["code"], "blocked_env_var");
     assert!(response["message"].as_str().unwrap().contains("LD_PRELOAD"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_rejects_invalid_pty_dimensions() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-bg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "storage_dir": dir.path().join("storage"),
+            "experimental_bash_background": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let cases = [
+        (
+            "pty-rows-too-large",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_rows": 61,
+            }),
+            "ptyRows must be an integer between 1 and 60",
+        ),
+        (
+            "pty-cols-too-large",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_cols": 141,
+            }),
+            "ptyCols must be an integer between 1 and 140",
+        ),
+        (
+            "pty-rows-float",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_rows": 1.5,
+            }),
+            "invalid params",
+        ),
+    ];
+
+    for (id, params, message) in cases {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "method": "bash",
+                "params": params
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], false, "case {id}: {response:?}");
+        assert_eq!(
+            response["code"], "invalid_request",
+            "case {id}: {response:?}"
+        );
+        assert!(
+            response["message"].as_str().unwrap().contains(message),
+            "case {id}: expected message containing {message:?}, got {response:?}"
+        );
+    }
 
     assert!(aft.shutdown().success());
 }

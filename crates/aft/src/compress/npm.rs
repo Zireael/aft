@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct NpmCompressor;
 
@@ -15,23 +15,89 @@ impl Compressor for NpmCompressor {
             .is_some_and(|head| head == "npm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match npm_subcommand(command).as_deref() {
-            Some("install" | "i" | "ci") => compress_install(output),
-            Some("run" | "test") => GenericCompressor::compress_output(output),
-            Some("audit") => compress_audit(output),
-            Some("publish") => compress_install(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("install" | "i" | "ci") => compress_install(output).into(),
+            Some("run" | "test") => GenericCompressor::compress_output(output).into(),
+            Some("audit") => compress_audit(output).into(),
+            Some("publish") => compress_install(output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 }
+
+/// Known npm subcommands. Same rationale as bun.rs::BUN_SUBCOMMANDS —
+/// using a whitelist instead of "first non-flag" avoids returning flag
+/// values like `--prefix <dir>` as the subcommand for command lines
+/// such as `npm --prefix packages/foo install`.
+const NPM_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "i",
+    "ci",
+    "uninstall",
+    "remove",
+    "rm",
+    "update",
+    "up",
+    "audit",
+    "outdated",
+    "publish",
+    "pack",
+    "run",
+    "run-script",
+    "test",
+    "t",
+    "start",
+    "stop",
+    "restart",
+    "exec",
+    "x",
+    "init",
+    "create",
+    "build",
+    "link",
+    "unlink",
+    "view",
+    "info",
+    "show",
+    "config",
+    "help",
+    "version",
+    "search",
+    "ls",
+    "list",
+    "ping",
+    "whoami",
+    "login",
+    "logout",
+    "dedupe",
+    "dist-tag",
+    "team",
+    "owner",
+    "doctor",
+    "fund",
+    "explain",
+    "diff",
+    "rebuild",
+    "deprecate",
+    "hook",
+    "org",
+    "profile",
+    "set-script",
+    "pkg",
+];
 
 fn npm_subcommand(command: &str) -> Option<String> {
     command
         .split_whitespace()
         .skip_while(|token| *token != "npm")
         .skip(1)
-        .find(|token| !token.starts_with('-'))
+        .find(|token| NPM_SUBCOMMANDS.contains(token))
         .map(ToString::to_string)
 }
 

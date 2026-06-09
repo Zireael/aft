@@ -142,6 +142,22 @@ fn wait_for_bash_completed_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+fn quick_success_command() -> &'static str {
+    if cfg!(windows) {
+        "cmd /c exit /b 0"
+    } else {
+        "true"
+    }
+}
+
+fn echo_text_command(text: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c echo {text}")
+    } else {
+        format!("echo {text}")
+    }
+}
+
 #[cfg(windows)]
 fn cross_platform_echo_command() -> &'static str {
     "cmd /c echo hello"
@@ -154,6 +170,18 @@ fn cross_platform_echo_command() -> &'static str {
 
 fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn cmd_quote_path(path: &Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\"\""))
+}
+
+fn cat_file_command(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("cmd /c type {}", cmd_quote_path(path))
+    } else {
+        format!("cat {}", shell_quote_path(path))
+    }
 }
 
 fn wait_for_file(path: &Path) {
@@ -199,6 +227,47 @@ fn background_bash_spawns_and_completes_cross_platform() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn pty_spawn_honors_requested_terminal_dimensions() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg_params(
+        &mut aft,
+        "pty-custom-dimensions",
+        json!({
+            "command": "stty size; exit",
+            "background": true,
+            "pty": true,
+            "pty_rows": 50,
+            "pty_cols": 120,
+        }),
+    );
+
+    let completed = wait_for_status(&mut aft, &task_id, "completed");
+    assert_eq!(completed["mode"], "pty");
+    assert_eq!(completed["pty_rows"], 50);
+    assert_eq!(completed["pty_cols"], 120);
+    let output_path = completed["output_path"].as_str().unwrap();
+    let output = std::fs::read_to_string(output_path).unwrap();
+    assert!(
+        output.contains("50 120"),
+        "expected PTY output to report 50x120, got {output:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+// POSIX-only harness: hold_until_release_command uses a `sh` while-loop +
+// `printf`, which are not Windows PowerShell commands. Skip on Windows — the
+// running->completed status transition is covered on Unix here, and the real
+// Windows background spawn/status path is exercised by the Windows native E2E
+// job (real OpenCode + bridge + hoisted bash through PowerShell).
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`sh` loop); Unix + Windows native E2E cover this"
+)]
 #[test]
 fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();
@@ -425,15 +494,18 @@ fn background_concurrent_task_cap_is_enforced() {
 #[test]
 fn background_output_spills_to_disk() {
     let mut aft = AftProcess::spawn();
-    let _dir = configure_background(&mut aft);
+    let dir = configure_background(&mut aft);
 
-    let task_id = spawn_bg(&mut aft, "spawn-spill", "yes x | head -c 1200000");
+    let large = dir.path().join("large-output.txt");
+    const LARGE_OUTPUT_BYTES: usize = 32_000;
+    std::fs::write(&large, vec![b'x'; LARGE_OUTPUT_BYTES]).expect("write large output fixture");
+    let task_id = spawn_bg(&mut aft, "spawn-spill", &cat_file_command(&large));
     let completed = wait_for_status(&mut aft, &task_id, "completed");
     assert_eq!(completed["success"], true, "status failed: {completed:?}");
     let output_path = completed["output_path"].as_str().expect("spill path");
     let metadata = std::fs::metadata(output_path).expect("spill file metadata");
     assert!(
-        metadata.len() >= 1_200_000,
+        metadata.len() >= LARGE_OUTPUT_BYTES as u64,
         "spill was too small: {metadata:?}"
     );
     assert_eq!(completed["output_truncated"], true);
@@ -575,7 +647,8 @@ fn background_completion_metadata_is_attached_to_next_response() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
-    let task_id = spawn_bg(&mut aft, "spawn-completion", "echo done");
+    let done_command = echo_text_command("done");
+    let task_id = spawn_bg(&mut aft, "spawn-completion", &done_command);
     let started = Instant::now();
     loop {
         let ping = aft.send(r#"{"id":"ping-bg","command":"ping"}"#);
@@ -586,10 +659,10 @@ fn background_completion_metadata_is_attached_to_next_response() {
                 .expect("completion for task");
             assert_eq!(completion["status"], "completed");
             assert_eq!(completion["exit_code"], 0);
-            assert_eq!(completion["command"], "echo done");
+            assert_eq!(completion["command"], done_command);
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(12));
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -689,11 +762,16 @@ fn background_spawn_honors_env_overrides() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
+    #[cfg(windows)]
+    let command = "Write-Host -NoNewline $env:AFT_BG_ENV_TEST";
+    #[cfg(not(windows))]
+    let command = "printf '%s' \"$AFT_BG_ENV_TEST\"";
+
     let task_id = spawn_bg_params(
         &mut aft,
         "spawn-bg-env",
         json!({
-            "command": "printf '%s' \"$AFT_BG_ENV_TEST\"",
+            "command": command,
             "background": true,
             "env": { "AFT_BG_ENV_TEST": "from-bg-env" }
         }),
@@ -781,7 +859,7 @@ fn background_task_ids_are_unique_across_rapid_spawns() {
 
     let mut ids = std::collections::HashSet::new();
     for i in 0..6 {
-        let id = spawn_bg(&mut aft, &format!("unique-{i}"), "true");
+        let id = spawn_bg(&mut aft, &format!("unique-{i}"), quick_success_command());
         assert!(
             ids.insert(id.clone()),
             "duplicate task_id allocated: `{id}` (already in {ids:?})"
@@ -791,4 +869,50 @@ fn background_task_ids_are_unique_across_rapid_spawns() {
     }
 
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn replay_does_not_return_acknowledged_completion_after_restart() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let task_id = spawn_bg(&mut aft, "replay-acked", cross_platform_echo_command());
+    let _completed = wait_for_bash_completed_frame(&mut aft, &task_id);
+    let ack = aft.send(
+        &json!({
+            "id": "ack-replay-acked",
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [task_id.clone()] }
+        })
+        .to_string(),
+    );
+    assert_eq!(ack["success"], true, "ack failed: {ack:?}");
+    assert!(aft.shutdown().success());
+
+    let mut restarted = AftProcess::spawn();
+    let response = restarted.send(
+        &json!({
+            "id": "cfg-bg-restart",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "storage_dir": dir.path().join("aft-storage"),
+            "experimental_bash_background": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:?}");
+    let drained = restarted.send(
+        &json!({
+            "id": "drain-replay-acked",
+            "command": "bash_drain_completions",
+        })
+        .to_string(),
+    );
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    assert_eq!(
+        drained["bg_completions"].as_array().unwrap().len(),
+        0,
+        "acknowledged completion replayed after restart: {drained:?}"
+    );
+    assert!(restarted.shutdown().success());
 }

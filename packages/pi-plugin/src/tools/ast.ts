@@ -4,10 +4,16 @@
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -89,6 +95,32 @@ function appendScopeSections(response: Record<string, unknown>, sections: string
     sections.push(
       `${theme.fg("muted", "Scope warnings:")}\n${warningStrings.map((w) => `  ${w}`).join("\n")}`,
     );
+  }
+}
+async function resolveAstPaths(
+  extCtx: ExtensionContext,
+  paths: unknown,
+): Promise<string[] | undefined> {
+  if (isEmptyParam(paths) || !Array.isArray(paths)) return undefined;
+  return Promise.all(
+    paths
+      .filter((path): path is string => typeof path === "string")
+      .map((path) => resolvePathArg(extCtx.cwd, path)),
+  );
+}
+
+async function assertAstPathsPermission(
+  extCtx: ExtensionContext,
+  paths: string[] | undefined,
+  action: "modify" | "search",
+  restrictToProjectRoot: boolean,
+): Promise<void> {
+  if (paths === undefined || paths.length === 0) return;
+  const checked = new Set<string>();
+  for (const path of paths) {
+    if (checked.has(path)) continue;
+    checked.add(path);
+    await assertExternalDirectoryPermission(extCtx, path, action, { restrictToProjectRoot });
   }
 }
 
@@ -261,14 +293,25 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        const paths = await resolveAstPaths(extCtx, params.paths);
+        await assertAstPathsPermission(
+          extCtx,
+          paths,
+          "search",
+          ctx.config.restrict_to_project_root ?? false,
+        );
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
           pattern: params.pattern,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
-        if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+        // Use isEmptyParam so empty arrays sent by GPT-family models don't
+        // get forwarded to Rust as "scope present" — let Rust default to whole
+        // project_root instead of round-tripping a useless empty scope.
+        if (!isEmptyParam(paths)) req.paths = paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
+        if (params.contextLines !== undefined) req.context = params.contextLines;
         const response = await callBridge(bridge, "ast_search", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
       },
@@ -295,14 +338,23 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        const paths = await resolveAstPaths(extCtx, params.paths);
+        await assertAstPathsPermission(
+          extCtx,
+          paths,
+          params.dryRun === true ? "search" : "modify",
+          ctx.config.restrict_to_project_root ?? false,
+        );
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
           pattern: params.pattern,
           rewrite: params.rewrite,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
+        // Use isEmptyParam — see ast_search above for rationale.
+        if (!isEmptyParam(paths)) req.paths = paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
         // Rust ast_replace defaults to dry_run=true; apply by default to match description.
         req.dry_run = params.dryRun === true;
         const response = await callBridge(bridge, "ast_replace", req, extCtx);

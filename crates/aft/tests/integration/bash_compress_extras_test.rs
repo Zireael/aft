@@ -1,4 +1,5 @@
 use aft::compress::bun::BunCompressor;
+use aft::compress::caps::DropClass;
 use aft::compress::npm::NpmCompressor;
 use aft::compress::pnpm::PnpmCompressor;
 use aft::compress::pytest::PytestCompressor;
@@ -66,6 +67,17 @@ fn bun_install_drops_resolver_noise_but_keeps_errors_and_summary() {
 }
 
 #[test]
+fn bun_i_alias_uses_install_compressor() {
+    let output = "Resolving dependencies 1/30\nDownloaded dep-1\nDownloaded dep-2\n42 packages installed [1234.00ms]\nSaved lockfile\n";
+
+    let compressed = BunCompressor.compress("bun i", output);
+    assert!(!compressed.contains("Resolving dependencies"));
+    assert!(!compressed.contains("Downloaded dep-"));
+    assert!(compressed.contains("42 packages installed"));
+    assert!(compressed.contains("Saved lockfile"));
+}
+
+#[test]
 fn pnpm_install_limits_progress_and_keeps_auth_warning_error_summary() {
     let mut output =
         String::from("Lockfile is up to date\nAlready up-to-date\nAlready up-to-date\n");
@@ -95,7 +107,10 @@ fn pnpm_install_limits_progress_and_keeps_auth_warning_error_summary() {
 #[test]
 fn pytest_drops_passes_keeps_failures_summary_and_warning_cap() {
     let mut output = String::from("============================= test session starts =============================\nplatform darwin -- Python 3.12.1, pytest-8.1.1\nrootdir: /repo\ncollected 45 items\n\ntests/test_ok.py ............................ PASSED\ntests/test_more.py sssxxx PASSED\ntests/test_bad.py::test_breaks FAILED\n\n=================================== FAILURES ===================================\n______________________________ test_breaks ______________________________\nE   AssertionError: boom\n\n=============================== warnings summary ===============================\n");
-    for index in 0..8 {
+    // Emit cap + 3 warnings so exactly 3 are dropped by the shared Warning cap.
+    let warn_cap = DropClass::Warning.default_cap();
+    let warn_total = warn_cap + 3;
+    for index in 0..warn_total {
         output.push_str(&format!(
             "tests/test_warn.py:{index}: DeprecationWarning: deprecated api {index}\n"
         ));
@@ -109,7 +124,13 @@ fn pytest_drops_passes_keeps_failures_summary_and_warning_cap() {
     assert!(!compressed.contains("tests/test_ok.py"));
     assert!(compressed.contains("tests/test_bad.py::test_breaks FAILED"));
     assert!(compressed.contains("AssertionError: boom"));
-    assert!(compressed.contains("... and 3 more warnings"));
+    // Warnings past the cap are dropped via class-drop metadata (surfaced to the
+    // agent through the recovery marker), not an in-body trailer.
+    assert_eq!(
+        compressed.dropped_by_class.get(&DropClass::Warning),
+        Some(&3),
+        "dropped-warnings count must be reported in metadata: {compressed:?}"
+    );
     assert!(compressed.contains("short test summary info"));
     assert!(compressed.contains("44 passed, 1 failed"));
 
@@ -189,10 +210,15 @@ fn bun_test_pass_only_keeps_header_and_summary() {
     let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/__tests__/foo.test.ts:\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\n";
 
     let compressed = BunCompressor.compress("bun test", output);
-    assert!(compressed.contains("bun test v1.3.14"));
+    // Header kept but version + commit hash stripped (per-call token tax).
+    assert!(compressed.contains("bun test"));
+    assert!(!compressed.contains("v1.3.14"));
+    assert!(!compressed.contains("0d9b296a"));
     assert!(compressed.contains("12 pass"));
     assert!(compressed.contains("0 fail"));
-    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+    // Ran-summary kept but its [Xms] duration stripped.
+    assert!(compressed.contains("Ran 12 tests across 1 file."));
+    assert!(!compressed.contains("[42.00ms]"));
 }
 
 #[test]
@@ -230,9 +256,10 @@ fn bun_test_preserves_single_failure_block_when_middle_truncation_would_hit() {
     assert!(compressed.contains("at <anonymous>"));
     // Must preserve the file section header that owns the failure.
     assert!(compressed.contains("src/failing.test.ts:"));
-    // Must preserve the summary tail.
+    // Must preserve the summary tail (duration stripped).
     assert!(compressed.contains("1 fail"));
-    assert!(compressed.contains("Ran 50 tests across 50 files. [142.00ms]"));
+    assert!(compressed.contains("Ran 50 tests across 50 files."));
+    assert!(!compressed.contains("[142.00ms]"));
 
     // Pass-only section headers should be dropped (no failure beneath them).
     assert!(!compressed.contains("src/pass_only_0.test.ts:"));
@@ -279,7 +306,7 @@ fn bun_test_multiple_failures_all_preserved_under_cap() {
         );
     }
     assert!(compressed.contains("3 fail"));
-    assert!(compressed.contains("Ran 3 tests across 1 file. [12.00ms]"));
+    assert!(compressed.contains("Ran 3 tests across 1 file."));
     assert!(!compressed.contains("+0 more failures"));
 }
 
@@ -303,28 +330,32 @@ fn bun_test_catastrophic_failure_count_is_capped() {
 
     let compressed = BunCompressor.compress("bun test", &output);
 
-    // First 25 failures must be preserved (MAX_FAILURES = 25).
-    for index in 0..25 {
+    // Failure blocks share the shared class cap (DropClass::Failure == CAP_ERRORS
+    // == 20). The first 20 failures are preserved in the body.
+    let cap = DropClass::Failure.default_cap();
+    for index in 0..cap {
         assert!(
             compressed.contains(&format!("failure_marker_{index}")),
             "missing kept failure {index}"
         );
     }
-    // Failures past 25 must be dropped from the body.
-    for index in 25..total {
+    // Failures past the cap must be dropped from the body.
+    for index in cap..total {
         assert!(
             !compressed.contains(&format!("failure_marker_{index}")),
             "did not drop failure {index}"
         );
     }
-    // Drop trailer must report the count of dropped failures.
-    assert!(
-        compressed.contains(&format!("+{} more failures", total - 25)),
-        "missing dropped-failures trailer in: {compressed}"
+    // Dropped failures are reported via class-drop metadata (surfaced to the
+    // agent through the recovery marker), not an in-body trailer.
+    assert_eq!(
+        compressed.dropped_by_class.get(&DropClass::Failure),
+        Some(&(total - cap)),
+        "dropped-failures count must be reported in metadata: {compressed:?}"
     );
     // Summary intact.
     assert!(compressed.contains(&format!("{total} fail")));
-    assert!(compressed.contains(&format!("Ran {total} tests across 1 file. [12.00ms]")));
+    assert!(compressed.contains(&format!("Ran {total} tests across 1 file.")));
 }
 
 #[test]
@@ -348,7 +379,7 @@ fn bun_test_dispatch_routes_through_test_compressor_not_generic() {
     assert!(compressed.contains("(fail) c case"));
     // Summary tail preserved.
     assert!(compressed.contains("1 fail"));
-    assert!(compressed.contains("Ran 1 tests across 3 files. [3.00ms]"));
+    assert!(compressed.contains("Ran 1 tests across 3 files."));
 }
 
 // ---------------------------------------------------------------------------
@@ -370,10 +401,12 @@ fn bun_test_pass_only_preserves_chained_command_output() {
     let output = "bun test v1.3.14 (0d9b296a)\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\ndone\ntotal 16\n-rw-r--r--  1 user  staff  4096 May 22 19:00 bundle.js\n-rw-r--r--  1 user  staff   512 May 22 19:00 styles.css\n";
 
     let compressed = BunCompressor.compress("bun test", output);
-    // bun test header + summary preserved as before
-    assert!(compressed.contains("bun test v1.3.14"));
+    // bun test header + summary preserved (version/hash + [Xms] stripped)
+    assert!(compressed.contains("bun test"));
+    assert!(!compressed.contains("v1.3.14"));
     assert!(compressed.contains("12 pass"));
-    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+    assert!(compressed.contains("Ran 12 tests across 1 file."));
+    assert!(!compressed.contains("[42.00ms]"));
     // Chained command output (echo, ls) must survive
     assert!(
         compressed.contains("done"),
@@ -397,11 +430,173 @@ fn bun_test_with_failures_preserves_chained_command_output() {
     // failure block preserved
     assert!(compressed.contains("error: expect(received).toBe(expected)"));
     assert!(compressed.contains("(fail) foo case"));
-    // summary preserved
-    assert!(compressed.contains("Ran 1 tests across 1 files. [42.00ms]"));
+    // summary preserved (duration stripped)
+    assert!(compressed.contains("Ran 1 tests across 1 files."));
+    assert!(!compressed.contains("[42.00ms]"));
     // Chained command output after `Ran ...` preserved
     assert!(
         compressed.contains("always runs"),
         "lost chained command output that runs after `bun test` (with `;` separator)"
     );
+}
+
+// ----------------------------------------------------------------------------
+// Subcommand-detector flag-value regression tests
+// ----------------------------------------------------------------------------
+//
+// All three package-manager compressors (bun, npm, pnpm) previously
+// extracted the subcommand by skipping past the program name and
+// returning the first non-flag token. That broke for invocations with
+// a flag-with-value PRECEDING the subcommand:
+//
+//   bun --cwd packages/opencode-plugin test ...
+//   npm --prefix packages/foo install ...
+//   pnpm --filter ./packages/foo test ...
+//
+// The detector returned the flag's VALUE (e.g. `packages/opencode-plugin`)
+// as the subcommand, so the per-subcommand path (`bun test` ->
+// `compress_test`) was missed and output fell through to the generic
+// compressor. For `bun test` specifically this dropped failure blocks
+// entirely (only the summary footer survived) and forced agents to
+// rerun with `grep` to find the failing test.
+//
+// Each compressor now uses a known-verb whitelist (see the
+// `*_SUBCOMMANDS` const in each compressor module).
+
+#[test]
+fn bun_test_with_cwd_flag_preserves_failure_block() {
+    // The exact shape AFT's CI + local Bun workspace tests use:
+    //   bun --cwd packages/opencode-plugin test src/__tests__/bash.test.ts
+    let output = "bun test v1.3.14 (0d9b296a)\n\
+\n\
+src/__tests__/bash.test.ts:\n\
+12 | expect(1 + 1).toBe(3);\n\
+                  ^\n\
+error: expect(received).toBe(expected)\n\
+\n\
+Expected: 3\n\
+Received: 2\n\
+\n\
+      at <anonymous> (/path/bash.test.ts:12:19)\n\
+(fail) bash adapter > rejects bad input [0.67ms]\n\
+\n\
+ 0 pass\n\
+ 1 fail\n\
+ 1 expect() calls\n\
+Ran 1 tests across 1 file. [37.00ms]\n";
+
+    let compressed = BunCompressor.compress(
+        "bun --cwd packages/opencode-plugin test src/__tests__/bash.test.ts",
+        output,
+    );
+
+    // The bug: failure block dropped, only summary footer survived.
+    assert!(
+        compressed.contains("error: expect(received).toBe(expected)"),
+        "regression: `bun --cwd <dir> test` lost the per-test failure block. \
+         Output was: {compressed}"
+    );
+    assert!(
+        compressed.contains("(fail) bash adapter > rejects bad input"),
+        "regression: lost the (fail) marker for `bun --cwd <dir> test`. \
+         Output was: {compressed}"
+    );
+    // Summary preserved (compressor strips some whitespace, so match the
+    // counted-pass/fail tokens without leading space).
+    assert!(compressed.contains("1 fail"));
+    assert!(compressed.contains("Ran 1 tests across 1 file"));
+}
+
+#[test]
+fn bun_test_with_multiple_flags_still_finds_subcommand() {
+    // Compound flag-with-value forms.
+    let output = "bun test v1.3.14 (0d9b296a)\n\
+\n\
+src/foo.test.ts:\n\
+5 | expect(2).toBe(3);\n\
+              ^\n\
+error: assertion failed\n\
+(fail) foo test [0.1ms]\n\
+\n\
+ 0 pass\n\
+ 1 fail\n\
+ 1 expect() calls\n\
+Ran 1 tests across 1 file. [10.00ms]\n";
+
+    for cmd in [
+        "bun --cwd /tmp/proj test src/foo.test.ts",
+        "bun --cwd /tmp/proj --silent test src/foo.test.ts",
+        "bun --silent --cwd /tmp/proj test",
+        "bun -c /tmp/bunfig.toml --cwd /tmp/proj test",
+    ] {
+        let compressed = BunCompressor.compress(cmd, output);
+        assert!(
+            compressed.contains("error: assertion failed"),
+            "regression: `{cmd}` lost the failure block. Output was: {compressed}"
+        );
+    }
+}
+
+#[test]
+fn npm_install_with_prefix_flag_uses_install_compressor() {
+    // npm --prefix <dir> install ...
+    // Previously `--prefix`'s value was returned as the subcommand,
+    // falling through to generic and missing npm-install-specific
+    // progress filtering.
+    let output = "npm http fetch GET 200 https://registry.npmjs.org/foo 123ms\n\
+npm http fetch GET 200 https://registry.npmjs.org/bar 456ms\n\
+npm WARN deprecated old-pkg@1.0.0: Use new-pkg instead\n\
+\n\
+added 42 packages in 2s\n\
+\n\
+audited 100 packages in 2s\n\
+\n\
+3 packages are looking for funding\n\
+  run `npm fund` for details\n\
+\n\
+found 0 vulnerabilities\n";
+
+    let compressed = NpmCompressor.compress("npm --prefix /tmp/proj install", output);
+
+    // Progress lines should be filtered (install-specific behavior).
+    assert!(
+        !compressed.contains("npm http fetch GET 200"),
+        "regression: `npm --prefix <dir> install` fell through to generic and kept progress lines. \
+         Output was: {compressed}"
+    );
+    // Summary preserved.
+    assert!(compressed.contains("audited 100 packages"));
+    assert!(compressed.contains("found 0 vulnerabilities"));
+}
+
+#[test]
+fn pnpm_install_with_filter_flag_uses_package_compressor() {
+    // pnpm --filter ./packages/foo install
+    // Previously `--filter`'s value was returned as the subcommand.
+    let output = "Progress: resolved 10, downloaded 5, added 0\n\
+Progress: resolved 50, downloaded 25, added 10\n\
+Progress: resolved 100, downloaded 50, added 25\n\
+Progress: resolved 200, downloaded 100, added 50\n\
+Progress: resolved 300, downloaded 150, added 75\n\
+dependencies:\n\
++ foo 1.0.0\n\
++ bar 2.0.0\n\
+\n\
+Done in 5.2s\n";
+
+    let compressed = PnpmCompressor.compress("pnpm --filter ./packages/foo install", output);
+
+    // Should hit the package compressor: progress is capped to 2 entries.
+    let progress_count = compressed
+        .lines()
+        .filter(|l| l.contains("Progress: resolved"))
+        .count();
+    assert!(
+        progress_count <= 2,
+        "regression: `pnpm --filter <pattern> install` fell through to generic and kept all \
+         {progress_count} progress lines (should be <= 2). Output was: {compressed}"
+    );
+    // Summary preserved.
+    assert!(compressed.contains("Done in 5.2s"));
+    assert!(compressed.contains("dependencies:"));
 }

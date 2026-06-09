@@ -1,0 +1,14 @@
+services:
+  codegraph-replication:
+    build:
+      context: ../..
+      dockerfile: benchmarks/codegraph-replication/Dockerfile
+    environment:
+      CODEGRAPH_REPLICATION_DRIVER: ${CODEGRAPH_REPLICATION_DRIVER:-aft}
+      CODEGRAPH_REPLICATION_CORPUS: ${CODEGRAPH_REPLICATION_CORPUS:-codegraph}
+      CODEGRAPH_REPLICATION_TOP_K: ${CODEGRAPH_REPLICATION_TOP_K:-10}
+      CODEGRAPH_REPLICATION_RUNS: ${CODEGRAPH_REPLICATION_RUNS:-1}
+      CODEGRAPH_REPLICATION_READY_TIMEOUT_MS: ${CODEGRAPH_REPLICATION_READY_TIMEOUT_MS:-600000}
+      CODEGRAPH_REPLICATION_VERBOSE: ${CODEGRAPH_REPLICATION_VERBOSE:-}
+    volumes:
+      - ./results:/workspace/benchmarks/codegraph-replication/results

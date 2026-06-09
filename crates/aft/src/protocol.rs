@@ -83,6 +83,20 @@ pub struct BashLongRunningFrame {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BashPatternMatchFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub watch_id: String,
+    pub match_text: String,
+    pub match_offset: u64,
+    pub context: String,
+    pub once: bool,
+    pub reason: &'static str,
+}
+
 /// Pushed after configure has completed, when the deferred file walk and
 /// language detection produce warnings (missing formatter/checker/LSP binaries,
 /// or "project too large" file-count exceeded). The walk runs in a background
@@ -129,6 +143,7 @@ pub enum PushFrame {
     Progress(ProgressFrame),
     BashCompleted(BashCompletedFrame),
     BashLongRunning(BashLongRunningFrame),
+    BashPatternMatch(BashPatternMatchFrame),
     ConfigureWarnings(ConfigureWarningsFrame),
     StatusChanged(StatusChangedFrame),
 }
@@ -201,9 +216,22 @@ impl StatusChangedFrame {
         Self {
             frame_type: "status_changed",
             session_id,
-            snapshot,
+            snapshot: status_push_payload(snapshot),
         }
     }
+}
+
+fn status_push_payload(mut snapshot: StatusPayload) -> StatusPayload {
+    if let Some(object) = snapshot.as_object_mut() {
+        object.remove("session");
+        if let Some(compression) = object
+            .get_mut("compression")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            compression.remove("session");
+        }
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -291,6 +319,27 @@ mod tests {
         assert_eq!(json["snapshot"]["cache_role"], "main");
         assert_eq!(json["snapshot"]["project_root"], "/repo");
     }
+
+    #[test]
+    fn status_changed_frame_strips_session_scoped_push_fields() {
+        let frame = StatusChangedFrame::new(
+            None,
+            json!({
+                "version": "0.24.0",
+                "checkpoints_total": 7,
+                "session": { "id": "default", "tracked_files": 2, "checkpoints": 1 },
+                "compression": {
+                    "project": { "events": 3 },
+                    "session": { "events": 99 }
+                }
+            }),
+        );
+
+        assert!(frame.snapshot.get("session").is_none());
+        assert_eq!(frame.snapshot["checkpoints_total"], 7);
+        assert_eq!(frame.snapshot["compression"]["project"]["events"], 3);
+        assert!(frame.snapshot["compression"].get("session").is_none());
+    }
 }
 
 impl BashCompletedFrame {
@@ -335,6 +384,49 @@ impl BashLongRunningFrame {
             session_id: session_id.into(),
             command: command.into(),
             elapsed_ms,
+        }
+    }
+}
+
+impl BashPatternMatchFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        watch_id: impl Into<String>,
+        match_text: impl Into<String>,
+        match_offset: u64,
+        context: impl Into<String>,
+        once: bool,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: watch_id.into(),
+            match_text: match_text.into(),
+            match_offset,
+            context: context.into(),
+            once,
+            reason: "pattern_match",
+        }
+    }
+
+    pub fn task_exit(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        match_text: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: "exit".to_string(),
+            match_text: match_text.into(),
+            match_offset: 0,
+            context: context.into(),
+            once: true,
+            reason: "task_exit",
         }
     }
 }

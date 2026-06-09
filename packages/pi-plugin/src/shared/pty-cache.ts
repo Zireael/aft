@@ -9,6 +9,8 @@ export interface PtyTerminalState {
   terminal: Terminal;
   fileHandle: fs.FileHandle;
   offset: number;
+  rows: number;
+  cols: number;
   lastAccessMs: number;
 }
 
@@ -17,18 +19,27 @@ const terminals = new Map<string, PtyTerminalState>();
 export async function getOrCreatePtyTerminal(
   key: string,
   outputPath: string,
+  rows = DEFAULT_ROWS,
+  cols = DEFAULT_COLS,
 ): Promise<PtyTerminalState> {
   const existing = terminals.get(key);
   if (existing) {
     existing.lastAccessMs = Date.now();
-    return existing;
+    if (existing.rows === rows && existing.cols === cols) {
+      return existing;
+    }
+    terminals.delete(key);
+    existing.terminal.dispose();
+    await existing.fileHandle.close().catch(() => undefined);
   }
 
   const fileHandle = await fs.open(outputPath, "r");
   const state: PtyTerminalState = {
-    terminal: new Terminal({ cols: DEFAULT_COLS, rows: DEFAULT_ROWS, allowProposedApi: true }),
+    terminal: new Terminal({ cols, rows, allowProposedApi: true }),
     fileHandle,
     offset: 0,
+    rows,
+    cols,
     lastAccessMs: Date.now(),
   };
   terminals.set(key, state);
@@ -64,8 +75,8 @@ export async function disposeAllPtyTerminals(): Promise<void> {
 
 export function renderScreen(
   state: PtyTerminalState,
-  rows = DEFAULT_ROWS,
-  cols = DEFAULT_COLS,
+  rows = state.rows,
+  cols = state.cols,
 ): string {
   const active = state.terminal.buffer.active;
   const lines: string[] = [];

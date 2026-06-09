@@ -7,7 +7,7 @@ import { $ } from "bun";
 import { createBashStatusTool, createBashTool } from "../../tools/bash.js";
 import { createBashWriteTool } from "../../tools/bash_write.js";
 import type { PluginContext } from "../../types.js";
-import { noopAsk } from "../test-helpers";
+import { noopAsk, toolResultText } from "../test-helpers";
 import { cleanupHarnesses, createHarness, type E2EHarness, prepareBinary } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -88,21 +88,39 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
     return String(await status.execute({ taskId, outputMode: "screen" }, runtime(h)));
   }
 
+  async function waitForScreenText(
+    status: ReturnType<typeof createBashStatusTool>,
+    h: E2EHarness,
+    taskId: string,
+    expected: string[],
+    timeoutMs = 5_000,
+  ): Promise<string> {
+    const started = Date.now();
+    let out = "";
+    while (Date.now() - started < timeoutMs) {
+      out = await screen(status, h, taskId);
+      if (expected.every((text) => out.includes(text))) return out;
+      await sleep(100);
+    }
+    throw new Error(
+      `timed out waiting for PTY screen to contain ${expected.join(", ")}; last screen:
+${out}`,
+    );
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   test.skipIf(!python)("Test 28: pty_e2e_python_repl", async () => {
     const { h, bash, status, write } = await pluginHarness();
-    const launched = String(
+    const launched = toolResultText(
       await bash.execute({ command: `${python} -q`, pty: true, background: true }, runtime(h)),
     );
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
     await write.execute({ taskId, input: "print('hello')\n" }, runtime(h));
-    const started = Date.now();
-    let out = "";
-    while (Date.now() - started < 5_000) {
-      out = await screen(status, h, taskId!);
-      if (out.includes("hello")) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const out = await waitForScreenText(status, h, taskId!, ["hello"]);
     expect(out).toContain("hello");
     await write.execute({ taskId, input: "exit()\n" }, runtime(h));
   });
@@ -110,18 +128,12 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
   test("Test 29: pty_e2e_ansi_screen_rendering", async () => {
     const { h, bash, status } = await pluginHarness();
     const command = `printf '\\033[2J\\033[Halpha\\033[10;5Hbeta'`;
-    const launched = String(
+    const launched = toolResultText(
       await bash.execute({ command, pty: true, background: true }, runtime(h)),
     );
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
-    const started = Date.now();
-    let out = "";
-    while (Date.now() - started < 5_000) {
-      out = await screen(status, h, taskId!);
-      if (out.includes("alpha") && out.includes("beta")) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const out = await waitForScreenText(status, h, taskId!, ["alpha", "beta"]);
     expect(out).toContain("alpha");
     expect(out).toContain("beta");
   });

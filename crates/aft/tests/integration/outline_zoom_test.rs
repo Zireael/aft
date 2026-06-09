@@ -18,13 +18,13 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-fn create_dir_symlink(src: &Path, dst: &Path) {
-    std::os::unix::fs::symlink(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn create_dir_symlink(src: &Path, dst: &Path) {
-    std::os::windows::fs::symlink_dir(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
 }
 
 #[test]
@@ -104,7 +104,12 @@ fn outline_directory_skips_symlink_loops() {
         "src/main.ts",
         "export function reachable(): void {}\n",
     );
-    create_dir_symlink(dir.path(), &dir.path().join("src/loop"));
+    if let Err(error) = create_dir_symlink(dir.path(), &dir.path().join("src/loop")) {
+        eprintln!(
+            "skipping symlink loop outline test: directory symlink unavailable in this environment: {error}"
+        );
+        return;
+    }
 
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
@@ -327,7 +332,7 @@ function unused(): void {
     let mut aft = AftProcess::spawn();
     let resp = send(
         &mut aft,
-        json!({"id": "zoom-compute", "command": "zoom", "file": file, "symbol": "compute"}),
+        json!({"id": "zoom-compute", "command": "zoom", "file": file, "symbol": "compute", "callgraph": true}),
     );
 
     assert_eq!(resp["success"], true, "zoom should succeed: {:?}", resp);

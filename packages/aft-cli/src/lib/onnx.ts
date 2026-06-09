@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, isAbsolute, join, resolve, win32 } from "node:path";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -29,24 +29,136 @@ export function getManualInstallHint(): string {
   return "ONNX Runtime must be installed manually for this platform";
 }
 
+function pathEnvValue(): string {
+  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+}
+
+function pathEntriesForPlatform(): string[] {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathEnvValue()
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter((entry) => {
+      if (!entry || entry === "." || entry.includes("\0")) return false;
+      return isAbsolute(entry) || win32.isAbsolute(entry);
+    });
+}
+
+function directoryContainsLibrary(dir: string, libName: string): boolean {
+  try {
+    const entries = readdirSync(dir);
+    if (process.platform === "win32") {
+      const expected = libName.toLowerCase();
+      return entries.some((entry) => entry.toLowerCase() === expected);
+    }
+    return entries.includes(libName);
+  } catch {
+    return false;
+  }
+}
+
 export function findSystemOnnxRuntime(): string | null {
   const libName = getOnnxLibraryName();
-  const searchPaths =
-    process.platform === "darwin"
-      ? ["/opt/homebrew/lib", "/usr/local/lib"]
-      : process.platform === "linux"
-        ? ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/local/lib"]
-        : [];
+  const searchPaths: string[] = [];
 
-  for (const path of searchPaths) {
-    if (existsSync(join(path, libName))) return path;
+  if (process.platform === "darwin") {
+    searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");
+  } else if (process.platform === "linux") {
+    searchPaths.push(
+      "/usr/lib",
+      "/usr/lib/x86_64-linux-gnu",
+      "/usr/lib/aarch64-linux-gnu",
+      "/usr/local/lib",
+    );
+  } else if (process.platform === "win32") {
+    // Start with absolute PATH entries (via pathEntriesForPlatform) to
+    // discover Scoop/manual-zip installs, then add common install paths.
+    searchPaths.push(...pathEntriesForPlatform());
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    searchPaths.push(
+      join(programFiles, "onnxruntime", "lib"),
+      join(programFiles, "Microsoft ONNX Runtime", "lib"),
+      join(programFiles, "Microsoft Machine Learning", "lib"),
+      join(programFilesX86, "onnxruntime", "lib"),
+      ...(() => {
+        const nugetPaths: string[] = [];
+        const userProfile = process.env.USERPROFILE ?? "";
+        if (!userProfile) return nugetPaths;
+        const nugetPackageDir = join(userProfile, ".nuget", "packages", "microsoft.ml.onnxruntime");
+        if (!existsSync(nugetPackageDir)) return nugetPaths;
+        try {
+          for (const entry of readdirSync(nugetPackageDir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            if (entry.name === "__globalPackagesFolder" || entry.name.startsWith(".")) continue;
+            nugetPaths.push(
+              join(nugetPackageDir, entry.name, "runtimes", "win-x64", "native"),
+              join(nugetPackageDir, entry.name, "runtimes", "win-arm64", "native"),
+            );
+          }
+        } catch {
+          // Doctor probing is best-effort; ignore unreadable NuGet caches.
+        }
+        return nugetPaths;
+      })(),
+    );
   }
+  // Deduplicate paths.
+  // On case-insensitive filesystems (Windows, macOS) normalize casing for
+  // comparison; on Linux the raw path casing is the authority.
+  const normalizeCase = process.platform === "win32" || process.platform === "darwin";
+  const seen = new Set<string>();
+  const unknownVersionPaths: string[] = [];
+  for (const dir of searchPaths) {
+    let key = resolve(dir).replace(/[/\\]+$/, "");
+    if (normalizeCase) key = key.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!directoryContainsLibrary(dir, libName)) continue;
+
+    const version = detectOrtVersion(dir);
+    if (!version) {
+      unknownVersionPaths.push(dir);
+      continue;
+    }
+    if (!isOrtVersionCompatible(version)) continue;
+    return dir;
+  }
+  return unknownVersionPaths[0] ?? null;
+}
+export function findCachedOnnxRuntime(storageDir: string): string | null {
+  const ortDir = join(storageDir, "onnxruntime", ONNX_RUNTIME_VERSION);
+  const libName = getOnnxLibraryName();
+  // Our own download flattens the library into the version root; a manual
+  // install of Microsoft's archive leaves it under lib/. Accept either and
+  // return the directory that actually contains the library (#71).
+  if (existsSync(join(ortDir, libName))) return ortDir;
+  const libSubdir = join(ortDir, "lib");
+  if (existsSync(join(libSubdir, libName))) return libSubdir;
   return null;
 }
 
-export function findCachedOnnxRuntime(storageDir: string): string | null {
-  const ortDir = join(storageDir, "onnxruntime", ONNX_RUNTIME_VERSION);
-  return existsSync(join(ortDir, getOnnxLibraryName())) ? ortDir : null;
+const INVALID_ORT_VERSION = "<invalid>";
+
+function parseOrtVersionFromPath(value: string): string | null {
+  const name = basename(value);
+  const semverish = name.match(
+    /(?:^|[._-])(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\.(?:dylib|dll))?$/,
+  );
+  if (semverish) return semverish[1].split(/[-+]/, 1)[0];
+  return /\d+\.\d+\.\d+/.test(name) ? INVALID_ORT_VERSION : null;
+}
+
+function parseOrtVersionFromDirectoryPath(value: string): string | null {
+  const parts = value
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .reverse();
+  for (const part of parts) {
+    const version = parseOrtVersionFromPath(part);
+    if (version) return version;
+  }
+  return null;
 }
 
 /**
@@ -57,34 +169,39 @@ export function findCachedOnnxRuntime(storageDir: string): string | null {
 export function detectOrtVersion(libDir: string): string | null {
   if (!existsSync(libDir)) return null;
 
-  // Match both libonnxruntime.so.1.24.4 and symlinks pointing at it.
+  // Match libonnxruntime.so.1.24.4, libonnxruntime.1.24.4.dylib,
+  // onnxruntime.1.24.4.dll, symlink targets, and Windows NuGet parent dirs.
   const libName = getOnnxLibraryName();
   try {
     const entries = readdirSync(libDir);
+    const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
+    const expectedPrefix = process.platform === "win32" ? barePrefix.toLowerCase() : barePrefix;
     for (const entry of entries) {
-      if (!entry.startsWith(libName)) continue;
-      const match = entry.match(/\.(\d+\.\d+\.\d+)$/);
-      if (match) return match[1];
+      const comparable = process.platform === "win32" ? entry.toLowerCase() : entry;
+      if (!comparable.startsWith(expectedPrefix)) continue;
+      const version = parseOrtVersionFromPath(entry);
+      if (version) return version;
     }
 
-    // Fall back: libonnxruntime.so or .dylib → follow symlink.
+    // Fall back: libonnxruntime.so/.dylib or onnxruntime.dll → follow symlink.
     const base = join(libDir, libName);
     if (existsSync(base)) {
       try {
         const real = realpathSync(base);
-        const suffix = real.match(/\.(\d+\.\d+\.\d+)$/);
-        if (suffix) return suffix[1];
+        const version = parseOrtVersionFromPath(real) ?? parseOrtVersionFromDirectoryPath(real);
+        if (version) return version;
       } catch {
         // ignore
       }
       try {
         const target = readlinkSync(base);
-        const suffix = target.match(/\.(\d+\.\d+\.\d+)$/);
-        if (suffix) return suffix[1];
+        const version = parseOrtVersionFromPath(target);
+        if (version) return version;
       } catch {
         // not a symlink
       }
     }
+    return parseOrtVersionFromDirectoryPath(libDir);
   } catch {
     // ignore
   }

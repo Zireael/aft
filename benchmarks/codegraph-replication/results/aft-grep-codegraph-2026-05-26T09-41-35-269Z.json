@@ -1,0 +1,764 @@
+{
+  "timestamp": "2026-05-26T09:41:35.269Z",
+  "benchmark": "codegraph-replication",
+  "codebasePath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588",
+  "codegraphSha": "1be8e7830f7ca37e42a378186b0274e684b1d4d8",
+  "aftSha": "c6dac3b6d1c6be88271924f3ea4a666445313e8e",
+  "driver": "aft-grep",
+  "corpus": "codegraph",
+  "corpusPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication/corpora/codegraph.json",
+  "topK": 10,
+  "runs": 1,
+  "summary": {
+    "total": 12,
+    "passed": 6,
+    "failed": 6,
+    "skipped": 0,
+    "meanRecall": 0.520833,
+    "meanMRR": 0.583333,
+    "meanPrecisionAt1": 0.583333,
+    "meanPrecisionAt5": 0.4,
+    "meanPrecisionAt10": 0.366667,
+    "latencyMsMedian": 13.183,
+    "latencyMsP95": 20.973
+  },
+  "results": [
+    {
+      "caseId": "search-class-exact",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 1
+      },
+      "foundSymbols": [
+        "BinaryBridge"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 16.005,
+      "latencySamplesMs": [
+        16.005
+      ],
+      "latencyMsMedian": 16.005,
+      "latencyMsP95": 16.005,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/src/drivers.ts",
+          "line": 3,
+          "kind": "line",
+          "text": "import { BinaryBridge } from \"../../../packages/aft-bridge/src/index.ts\";"
+        },
+        {
+          "rank": 2,
+          "file": "benchmarks/codegraph-replication/src/drivers.ts",
+          "line": 26,
+          "kind": "line",
+          "text": "  private bridge: BinaryBridge | null = null;"
+        },
+        {
+          "rank": 3,
+          "file": "benchmarks/codegraph-replication/src/drivers.ts",
+          "line": 39,
+          "kind": "line",
+          "text": "    this.bridge = new BinaryBridge("
+        },
+        {
+          "rank": 4,
+          "file": "benchmarks/codegraph-replication/src/cli.ts",
+          "line": 130,
+          "kind": "line",
+          "text": "  aft          AFT hybrid semantic+lexical search via BinaryBridge semantic_search"
+        },
+        {
+          "rank": 5,
+          "file": "benchmarks/codegraph-replication/src/cli.ts",
+          "line": 131,
+          "kind": "line",
+          "text": "  aft-grep     AFT indexed grep via BinaryBridge grep"
+        },
+        {
+          "rank": 6,
+          "file": "benchmarks/codegraph-replication/corpora/aft.json",
+          "line": 8,
+          "kind": "line",
+          "text": "      \"query\": \"Outline BinaryBridge file\","
+        },
+        {
+          "rank": 7,
+          "file": "benchmarks/codegraph-replication/corpora/aft.json",
+          "line": 11,
+          "kind": "line",
+          "text": "      \"expectedSymbols\": [\"BinaryBridge\", \"send\", \"shutdown\"],"
+        },
+        {
+          "rank": 8,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 10,
+          "kind": "line",
+          "text": "      \"query\": \"BinaryBridge\","
+        },
+        {
+          "rank": 9,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 13,
+          "kind": "line",
+          "text": "      \"expectedSymbols\": [\"BinaryBridge\"],"
+        },
+        {
+          "rank": 10,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 17,
+          "kind": "line",
+          "text": "      \"notes\": \"CodeGraph exact class lookup translated from TransportService to AFT's BinaryBridge class.\""
+        }
+      ]
+    },
+    {
+      "caseId": "search-method-qualified",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.4,
+        "p10": 0.2
+      },
+      "foundSymbols": [
+        "send"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 16.494,
+      "latencySamplesMs": [
+        16.494
+      ],
+      "latencyMsMedian": 16.494,
+      "latencyMsP95": 16.494,
+      "resultCount": 2,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 22,
+          "kind": "line",
+          "text": "      \"query\": \"BinaryBridge send\","
+        },
+        {
+          "rank": 2,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 29,
+          "kind": "line",
+          "text": "      \"notes\": \"Qualified method lookup translated from TransportService sendRequest to BinaryBridge send.\""
+        }
+      ]
+    },
+    {
+      "caseId": "search-interface",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 1
+      },
+      "foundSymbols": [
+        "BridgeOptions"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 11.342,
+      "latencySamplesMs": [
+        11.342
+      ],
+      "latencyMsMedian": 11.342,
+      "latencyMsP95": 11.342,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 34,
+          "kind": "line",
+          "text": "      \"query\": \"BridgeOptions\","
+        },
+        {
+          "rank": 2,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 37,
+          "kind": "line",
+          "text": "      \"expectedSymbols\": [\"BridgeOptions\"],"
+        },
+        {
+          "rank": 3,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 41,
+          "kind": "line",
+          "text": "      \"notes\": \"Interface lookup translated from ActionListener to BridgeOptions.\""
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/__tests__/e2e/helpers.ts",
+          "line": 6,
+          "kind": "line",
+          "text": "import { BinaryBridge, type BridgeOptions, setActiveLogger } from \"@cortexkit/aft-bridge\";"
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/__tests__/e2e/helpers.ts",
+          "line": 112,
+          "kind": "line",
+          "text": "    bridgeOptions?: BridgeOptions;"
+        },
+        {
+          "rank": 6,
+          "file": "packages/aft-bridge/src/protocol.ts",
+          "line": 61,
+          "kind": "line",
+          "text": " * and dispatches them through {@link BridgeOptions.onPushFrame} rather than"
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 4,
+          "kind": "line",
+          "text": "import { BinaryBridge, type BridgeOptions } from \"./bridge.js\";"
+        },
+        {
+          "rank": 8,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 71,
+          "kind": "line",
+          "text": "export interface PoolOptions extends BridgeOptions {"
+        },
+        {
+          "rank": 9,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 125,
+          "kind": "line",
+          "text": "  private readonly bridgeOptions: BridgeOptions;"
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-bridge/src/index.ts",
+          "line": 15,
+          "kind": "line",
+          "text": "  BridgeOptions,"
+        }
+      ]
+    },
+    {
+      "caseId": "search-enum",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 1
+      },
+      "foundSymbols": [
+        "SemanticIndexStatus"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "crates/aft/src/context.rs"
+      ],
+      "missedFiles": [],
+      "latencyMs": 13.671,
+      "latencySamplesMs": [
+        13.671
+      ],
+      "latencyMsMedian": 13.671,
+      "latencyMsP95": 13.671,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 46,
+          "kind": "line",
+          "text": "      \"query\": \"SemanticIndexStatus\","
+        },
+        {
+          "rank": 2,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 49,
+          "kind": "line",
+          "text": "      \"expectedSymbols\": [\"SemanticIndexStatus\"],"
+        },
+        {
+          "rank": 3,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 53,
+          "kind": "line",
+          "text": "      \"notes\": \"Enum lookup translated from RestStatus to SemanticIndexStatus.\""
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/main.rs",
+          "line": 3,
+          "kind": "line",
+          "text": "use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/main.rs",
+          "line": 750,
+          "kind": "line",
+          "text": "            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {"
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/main.rs",
+          "line": 810,
+          "kind": "line",
+          "text": "                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {"
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/main.rs",
+          "line": 819,
+          "kind": "line",
+          "text": "                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/main.rs",
+          "line": 825,
+          "kind": "line",
+          "text": "                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);"
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/context.rs",
+          "line": 88,
+          "kind": "line",
+          "text": "pub enum SemanticIndexStatus {"
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/context.rs",
+          "line": 309,
+          "kind": "line",
+          "text": "    semantic_index_status: RefCell<SemanticIndexStatus>,"
+        }
+      ]
+    },
+    {
+      "caseId": "search-exception",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 1
+      },
+      "foundSymbols": [
+        "HomeProjectRootError"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 13.455,
+      "latencySamplesMs": [
+        13.455
+      ],
+      "latencyMsMedian": 13.455,
+      "latencyMsP95": 13.455,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 58,
+          "kind": "line",
+          "text": "      \"query\": \"HomeProjectRootError\","
+        },
+        {
+          "rank": 2,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 61,
+          "kind": "line",
+          "text": "      \"expectedSymbols\": [\"HomeProjectRootError\"],"
+        },
+        {
+          "rank": 3,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 65,
+          "kind": "line",
+          "text": "      \"notes\": \"Exception/error-class lookup translated from SearchPhaseExecutionException to HomeProjectRootError.\""
+        },
+        {
+          "rank": 4,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 29,
+          "kind": "line",
+          "text": "export class HomeProjectRootError extends Error {"
+        },
+        {
+          "rank": 5,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 36,
+          "kind": "line",
+          "text": "    this.name = \"HomeProjectRootError\";"
+        },
+        {
+          "rank": 6,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "line": 198,
+          "kind": "line",
+          "text": "    // degraded mode — see HomeProjectRootError doc-comment above."
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/index.ts",
+          "line": 59,
+          "kind": "line",
+          "text": "export { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from \"./pool.js\";"
+        },
+        {
+          "rank": 8,
+          "file": "packages/aft-bridge/src/__tests__/pool-home-guard.test.ts",
+          "line": 34,
+          "kind": "line",
+          "text": "import { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from \"../pool.js\";"
+        },
+        {
+          "rank": 9,
+          "file": "packages/aft-bridge/src/__tests__/pool-home-guard.test.ts",
+          "line": 95,
+          "kind": "line",
+          "text": "describe(\"HomeProjectRootError (legacy export)\", () => {"
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-bridge/src/__tests__/pool-home-guard.test.ts",
+          "line": 99,
+          "kind": "line",
+          "text": "    const err = new HomeProjectRootError(\"/fake/home\");"
+        }
+      ]
+    },
+    {
+      "caseId": "search-nested-class",
+      "api": "searchNodes",
+      "driver": "aft-grep",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.2,
+        "p10": 0.1
+      },
+      "foundSymbols": [
+        "BridgeReplacedDuringVersionCheck"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 11.611,
+      "latencySamplesMs": [
+        11.611
+      ],
+      "latencyMsMedian": 11.611,
+      "latencyMsP95": 11.611,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 70,
+          "kind": "line",
+          "text": "      \"query\": \"BinaryBridge BridgeReplacedDuringVersionCheck\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-plugin-bridge",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "callBridge",
+        "bridgeFor",
+        "BinaryBridge",
+        "BridgePool"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/opencode-plugin/src/tools/_shared.ts",
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "latencyMs": 10.405,
+      "latencySamplesMs": [
+        10.405
+      ],
+      "latencyMsMedian": 10.405,
+      "latencyMsP95": 10.405,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 82,
+          "kind": "line",
+          "text": "      \"query\": \"How do OpenCode plugin tools call into the AFT bridge?\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-semantic-search",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "semanticTools",
+        "handle_semantic_search",
+        "SemanticIndex",
+        "SearchIndex"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs",
+        "crates/aft/src/semantic_index.rs",
+        "crates/aft/src/search_index.rs"
+      ],
+      "latencyMs": 13.183,
+      "latencySamplesMs": [
+        13.183
+      ],
+      "latencyMsMedian": 13.183,
+      "latencyMsP95": 13.183,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 98,
+          "kind": "line",
+          "text": "      \"query\": \"How does AFT semantic search execute from tool request to indexed results?\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-background-bash",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BgTaskRegistry",
+        "PersistedTask",
+        "replay_session",
+        "write_task"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/bash_background/registry.rs",
+        "crates/aft/src/bash_background/persistence.rs"
+      ],
+      "latencyMs": 17.355,
+      "latencySamplesMs": [
+        17.355
+      ],
+      "latencyMsMedian": 17.355,
+      "latencyMsP95": 17.355,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 115,
+          "kind": "line",
+          "text": "      \"query\": \"How are background bash tasks persisted and restored after restart?\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-lsp-diagnostics",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "LspManager",
+        "wait_for_diagnostics",
+        "pull_file_diagnostics",
+        "PostEditWaitOutcome"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/lsp/manager.rs"
+      ],
+      "latencyMs": 11.477,
+      "latencySamplesMs": [
+        11.477
+      ],
+      "latencyMsMedian": 11.477,
+      "latencyMsP95": 11.477,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 130,
+          "kind": "line",
+          "text": "      \"query\": \"How does AFT wait for LSP diagnostics and pull server responses?\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-bridge-search",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0.25,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.2,
+        "p10": 0.1
+      },
+      "foundSymbols": [
+        "BinaryBridge"
+      ],
+      "missedSymbols": [
+        "send",
+        "semanticTools",
+        "handle_semantic_search"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs"
+      ],
+      "latencyMs": 12.522,
+      "latencySamplesMs": [
+        12.522
+      ],
+      "latencyMsMedian": 12.522,
+      "latencyMsP95": 12.522,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 142,
+          "kind": "line",
+          "text": "      \"query\": \"How does BinaryBridge connect plugin tool calls to semantic search?\","
+        }
+      ]
+    },
+    {
+      "caseId": "explore-import-organization",
+      "api": "findRelevantContext",
+      "driver": "aft-grep",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "handle_organize_imports",
+        "parse_imports",
+        "classify_group",
+        "generate_import_line"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/commands/organize_imports.rs",
+        "crates/aft/src/imports.rs"
+      ],
+      "latencyMs": 20.973,
+      "latencySamplesMs": [
+        20.973
+      ],
+      "latencyMsMedian": 20.973,
+      "latencyMsP95": 20.973,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "benchmarks/codegraph-replication/corpora/codegraph.json",
+          "line": 158,
+          "kind": "line",
+          "text": "      \"query\": \"What are the import organization components for parsing, grouping, and generating imports?\","
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "binaryPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/target/release/aft",
+    "latencyNote": "latencySamplesMs are wall-clock measurements around each actual driver dispatch",
+    "harnessDir": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication",
+    "methodology": "AFT replication of codegraph/__tests__/evaluation structured retrieval-quality eval"
+  }
+}

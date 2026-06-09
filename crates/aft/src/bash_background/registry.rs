@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,16 +12,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::compress::caps::DropClass;
+use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
 use crate::harness::Harness;
-use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, PushFrame};
+use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use super::buffer::{combine_streams, BgBuffer, TokenCountInput};
+use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
+use super::output::{
+    cap_completion_output, cap_completion_output_with_marker, cap_final_output,
+    cap_final_output_with_marker, json_output_pointer, quote_path, COMPLETION_OUTPUT_PREVIEW_BYTES,
+    COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
+    FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
+    RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
+};
 use super::persistence::{
     create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
     task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, BgMode,
@@ -34,6 +43,7 @@ use super::process::terminate_pgid;
 use super::process::terminate_pid;
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
+use super::watches::{PatternMatch, WatchPattern, WatchRegistry};
 use super::{BgTaskInfo, BgTaskStatus};
 // Note: `resolve_windows_shell` is no longer imported at module scope —
 // production code in `spawn_detached_child` uses `shell_candidates()`
@@ -47,13 +57,10 @@ const STALE_RUNNING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Tail-bytes captured into BashCompletedFrame and BgCompletion records so the
-/// plugin can inline a preview into the system-reminder. Sized for ~3-4 lines
-/// of typical command output (git status, test results, exit messages) — short
-/// enough that round-tripping multiple completions in one reminder stays well
-/// under the model's context budget but long enough that most successful runs
-/// don't need a follow-up `bash_status` call.
-const BG_COMPLETION_PREVIEW_BYTES: usize = 300;
+/// Completion previews are derived from the per-task terminal render cache using
+/// a small char-boundary-safe head+tail cap. Keep this bounded: completion
+/// reminders may batch multiple tasks into one prompt injection.
+const BG_COMPLETION_PREVIEW_BYTES: usize = COMPLETION_OUTPUT_PREVIEW_BYTES;
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,7 +73,7 @@ pub struct BgCompletion {
     pub status: BgTaskStatus,
     pub exit_code: Option<i32>,
     pub command: String,
-    /// Tail of stdout+stderr (≤300 bytes) at completion time, read once and
+    /// Small head+tail preview of the cached terminal render at completion time,
     /// cached so push-frame consumers and `bash_drain_completions` callers see
     /// the same preview without racing against later output rotation. Empty
     /// when not captured (e.g., persisted task seen on startup before buffer
@@ -107,6 +114,45 @@ pub struct BgTaskSnapshot {
     pub output_truncated: bool,
     pub output_path: Option<String>,
     pub stderr_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_rows: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_cols: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOutputKind {
+    Compressed,
+    Raw,
+    Structured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalOutputCache {
+    output_preview: String,
+    output_truncated: bool,
+    kind: TerminalOutputKind,
+    output_path: Option<String>,
+    stderr_path: Option<String>,
+    recovery: Option<RecoveryContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryContext {
+    dropped_by_class: BTreeMap<DropClass, usize>,
+    had_inner_drop: bool,
+    offset_hint_eligible: bool,
+    offset_start_line: Option<usize>,
+    byte_truncated: bool,
+    output_path: Option<String>,
+    stderr_path: Option<String>,
+    include_stderr_path: bool,
+}
+
+impl RecoveryContext {
+    fn has_visible_drop(&self) -> bool {
+        self.byte_truncated || self.had_inner_drop || !self.dropped_by_class.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -126,15 +172,17 @@ pub(crate) struct RegistryInner {
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
     /// Output compression callback. Set by `AppContext` after construction.
-    /// Takes (command, raw_output) and returns compressed text. Called from
+    /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
     /// uncompressed.
-    pub(crate) compressor: Mutex<Option<Box<dyn Fn(&str, String) -> String + Send + Sync>>>,
+    pub(crate) compressor:
+        Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
+    pub(crate) watch_registry: Mutex<WatchRegistry>,
 }
 
 pub(crate) struct BgTask {
@@ -168,6 +216,7 @@ pub(crate) struct BgTaskState {
     /// continue to fall through to the `is_process_alive` probe path.
     pub(crate) child_exit_observed: bool,
     pub(crate) buffer: BgBuffer,
+    terminal_output_cache: Option<TerminalOutputCache>,
     /// PTY-only: set for timeout kill intent before signaling the child.
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
@@ -192,6 +241,7 @@ impl BgTaskRegistry {
                 db_harness: RwLock::new(None),
                 wake_tx,
                 wake_rx,
+                watch_registry: Mutex::new(WatchRegistry::default()),
             }),
         }
     }
@@ -220,7 +270,16 @@ impl BgTaskRegistry {
     /// reference. When called multiple times, the latest installation wins.
     pub fn set_compressor<F>(&self, compressor: F)
     where
-        F: Fn(&str, String) -> String + Send + Sync + 'static,
+        F: Fn(&str, String) -> CompressionResult + Send + Sync + 'static,
+    {
+        self.set_compressor_with_exit_code(move |command, output, _exit_code| {
+            compressor(command, output)
+        });
+    }
+
+    pub fn set_compressor_with_exit_code<F>(&self, compressor: F)
+    where
+        F: Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync + 'static,
     {
         if let Ok(mut slot) = self.inner.compressor.lock() {
             *slot = Some(Box::new(compressor));
@@ -229,14 +288,113 @@ impl BgTaskRegistry {
 
     /// Apply the installed compressor (if any) to `output`. Returns `output`
     /// untouched when no compressor is installed.
-    pub(crate) fn compress_output(&self, command: &str, output: String) -> String {
+    pub(crate) fn compress_output(
+        &self,
+        command: &str,
+        output: String,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
         let Ok(slot) = self.inner.compressor.lock() else {
-            return output;
+            return CompressionResult::new(output);
         };
         match slot.as_ref() {
-            Some(compressor) => compressor(command, output),
-            None => output,
+            Some(compressor) => compressor(command, output, exit_code),
+            None => CompressionResult::new(output),
         }
+    }
+
+    fn ensure_terminal_output_cache(&self, task: &Arc<BgTask>) -> Option<TerminalOutputCache> {
+        let (metadata, buffer) = {
+            let state = task.state.lock().ok()?;
+            if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
+                return None;
+            }
+            if let Some(cache) = state.terminal_output_cache.clone() {
+                return Some(cache);
+            }
+            (state.metadata.clone(), state.buffer.clone())
+        };
+
+        let mut cap_buffer = buffer.clone();
+        cap_buffer.enforce_terminal_cap();
+        let cache = self.render_terminal_output(&metadata, &buffer);
+        let mut state = task.state.lock().ok()?;
+        if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
+            return None;
+        }
+        if let Some(existing) = state.terminal_output_cache.clone() {
+            return Some(existing);
+        }
+        state.terminal_output_cache = Some(cache.clone());
+        Some(cache)
+    }
+
+    fn render_terminal_output(
+        &self,
+        metadata: &PersistedTask,
+        buffer: &BgBuffer,
+    ) -> TerminalOutputCache {
+        if metadata.mode == BgMode::Pty {
+            return TerminalOutputCache {
+                output_preview: String::new(),
+                output_truncated: false,
+                kind: TerminalOutputKind::Raw,
+                output_path: buffer.output_path().map(|path| path.display().to_string()),
+                stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+                recovery: None,
+            };
+        }
+
+        if let Some(structured) = render_structured_output(&metadata.command, buffer) {
+            return structured;
+        }
+
+        if !metadata.compressed {
+            return render_raw_passthrough(buffer);
+        }
+
+        let raw = buffer.read_combined_head_tail(
+            COMPRESS_INPUT_CAP_BYTES,
+            COMPRESS_INPUT_HEAD_BYTES,
+            COMPRESS_INPUT_TAIL_BYTES,
+        );
+        let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
+        render_compressed_with_recovery(buffer, compressed, raw.truncated)
+    }
+
+    fn snapshot_with_terminal_cache(
+        &self,
+        task: &Arc<BgTask>,
+        preview_bytes: usize,
+    ) -> BgTaskSnapshot {
+        let mut snapshot = task.snapshot(preview_bytes);
+        self.maybe_compress_snapshot(task, &mut snapshot);
+        snapshot
+    }
+
+    fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        let (metadata, buffer) = {
+            let state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if !state.metadata.status.is_terminal() {
+                return Ok(());
+            }
+            (state.metadata.clone(), state.buffer.clone())
+        };
+
+        let mut cap_buffer = buffer.clone();
+        cap_buffer.enforce_terminal_cap();
+        let cache = self.ensure_terminal_output_cache(task);
+        self.enqueue_completion_from_parts(
+            &metadata,
+            Some(&buffer),
+            None,
+            emit_frame,
+            cache.as_ref(),
+        );
+        Ok(())
     }
 
     fn persist_task(&self, paths: &TaskPaths, metadata: &PersistedTask) -> std::io::Result<()> {
@@ -394,6 +552,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
         });
@@ -450,6 +609,8 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.mode = BgMode::Pty;
+        metadata.pty_rows = Some(rows);
+        metadata.pty_cols = Some(cols);
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
         create_capture_file(&paths.pty)
@@ -498,6 +659,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 buffer: BgBuffer::pty(paths.pty.clone()),
+                terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
         });
@@ -594,6 +756,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
         });
@@ -726,11 +889,13 @@ impl BgTaskRegistry {
             let paths = task_paths(storage_dir, session_id, &metadata.task_id);
             match metadata.status {
                 BgTaskStatus::Starting => {
+                    let completion_was_delivered = metadata.completion_delivered;
                     metadata.mark_terminal(
                         BgTaskStatus::Failed,
                         None,
                         Some("spawn aborted".to_string()),
                     );
+                    metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                     self.insert_rehydrated_task(metadata, paths, true)?;
@@ -738,28 +903,34 @@ impl BgTaskRegistry {
                 BgTaskStatus::Running | BgTaskStatus::Killing => {
                     if metadata.mode == BgMode::Pty {
                         if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
+                            let completion_was_delivered = metadata.completion_delivered;
                             metadata = terminal_metadata_from_marker(metadata, marker, None);
+                            metadata.completion_delivered |= completion_was_delivered;
                             let _ = self.persist_task(&paths, &metadata);
                             self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                             self.insert_rehydrated_task(metadata, paths, true)?;
                         } else if metadata.status.is_terminal() {
                             self.insert_rehydrated_task(metadata, paths, true)?;
                         } else {
+                            let completion_was_delivered = metadata.completion_delivered;
                             metadata.mark_terminal(
                                 BgTaskStatus::Killed,
                                 None,
                                 Some("pty_lost_on_bridge_restart".to_string()),
                             );
+                            metadata.completion_delivered |= completion_was_delivered;
                             let _ = self.persist_task(&paths, &metadata);
                             self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                             self.insert_rehydrated_task(metadata, paths, true)?;
                         }
                     } else if self.running_metadata_is_stale(&metadata) {
+                        let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
                             BgTaskStatus::Killed,
                             None,
                             Some("orphaned (>24h)".to_string()),
                         );
+                        metadata.completion_delivered |= completion_was_delivered;
                         if !paths.exit.exists() {
                             let _ = write_kill_marker_if_absent(&paths.exit);
                         }
@@ -774,7 +945,9 @@ impl BgTaskRegistry {
                             crate::slog_warn!("background task {} had killing state with exit marker; preferring marker",
                             metadata.task_id);
                         }
+                        let completion_was_delivered = metadata.completion_delivered;
                         metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                        metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                         self.insert_rehydrated_task(metadata, paths, true)?;
@@ -782,20 +955,24 @@ impl BgTaskRegistry {
                         if !paths.exit.exists() {
                             let _ = write_kill_marker_if_absent(&paths.exit);
                         }
+                        let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
                             BgTaskStatus::Killed,
                             None,
                             Some("recovered from inconsistent killing state on replay".to_string()),
                         );
+                        metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.child_pid.is_some_and(|pid| !is_process_alive(pid)) {
+                        let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
                             BgTaskStatus::Failed,
                             None,
                             Some("process exited without exit marker".to_string()),
                         );
+                        metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                         self.insert_rehydrated_task(metadata, paths, true)?;
@@ -885,6 +1062,211 @@ impl BgTaskRegistry {
         Ok(tasks)
     }
 
+    pub fn register_watch(
+        &self,
+        task_id: String,
+        pattern: WatchPattern,
+        once: bool,
+    ) -> Result<String, &'static str> {
+        let task = self.task(&task_id).ok_or("task_not_found")?;
+        let (mode, terminal_at_registration, stdout, stderr, pty) = task
+            .state
+            .lock()
+            .map(|state| {
+                (
+                    state.metadata.mode.clone(),
+                    state.metadata.status.is_terminal(),
+                    task.paths.stdout.clone(),
+                    task.paths.stderr.clone(),
+                    task.paths.pty.clone(),
+                )
+            })
+            .map_err(|_| "background_task_lock_poisoned")?;
+
+        let mut terminal_matches = Vec::new();
+        let scanned_terminal = terminal_at_registration;
+        let watch_id = {
+            let mut registry = self
+                .inner
+                .watch_registry
+                .lock()
+                .map_err(|_| "watch_registry_poisoned")?;
+            let watch_id = registry.register(task_id.clone(), pattern, once)?;
+            match &mode {
+                BgMode::Pipes => {
+                    let stdout_key = format!("{task_id}:stdout");
+                    let stderr_key = format!("{task_id}:stderr");
+                    if terminal_at_registration {
+                        registry.set_file_cursor(&stdout_key, 0);
+                        registry.set_file_cursor(&stderr_key, 0);
+                        terminal_matches.extend(registry.scan_file_new_bytes(
+                            &stdout_key,
+                            &task_id,
+                            &stdout,
+                        ));
+                        terminal_matches.extend(registry.scan_file_new_bytes(
+                            &stderr_key,
+                            &task_id,
+                            &stderr,
+                        ));
+                    } else {
+                        registry.prime_file_cursor(&stdout_key, &stdout);
+                        registry.prime_file_cursor(&stderr_key, &stderr);
+                    }
+                }
+                BgMode::Pty => {
+                    let pty_key = format!("{task_id}:pty");
+                    if terminal_at_registration {
+                        registry.set_file_cursor(&pty_key, 0);
+                        terminal_matches
+                            .extend(registry.scan_file_new_bytes(&pty_key, &task_id, &pty));
+                    } else {
+                        registry.prime_file_cursor(&pty_key, &pty);
+                    }
+                }
+            }
+            watch_id
+        };
+
+        if task.is_terminal() {
+            if !scanned_terminal {
+                terminal_matches = {
+                    let mut registry = self
+                        .inner
+                        .watch_registry
+                        .lock()
+                        .map_err(|_| "watch_registry_poisoned")?;
+                    match &mode {
+                        BgMode::Pipes => {
+                            let stdout_key = format!("{task_id}:stdout");
+                            let stderr_key = format!("{task_id}:stderr");
+                            registry.set_file_cursor(&stdout_key, 0);
+                            registry.set_file_cursor(&stderr_key, 0);
+                            let mut matches =
+                                registry.scan_file_new_bytes(&stdout_key, &task_id, &stdout);
+                            matches.extend(registry.scan_file_new_bytes(
+                                &stderr_key,
+                                &task_id,
+                                &stderr,
+                            ));
+                            matches
+                        }
+                        BgMode::Pty => {
+                            let pty_key = format!("{task_id}:pty");
+                            registry.set_file_cursor(&pty_key, 0);
+                            registry.scan_file_new_bytes(&pty_key, &task_id, &pty)
+                        }
+                    }
+                };
+            }
+
+            let (watch_controlled, watch_matched) = self.task_watch_state(&task_id);
+            if terminal_matches.is_empty() && (!watch_controlled || watch_matched) {
+                if watch_matched {
+                    let _ = task.set_completion_delivered(true, self);
+                    self.clear_task_watch_state(&task_id);
+                }
+                return Ok(watch_id);
+            }
+
+            let completion = self
+                .remove_pending_completion(&task_id)
+                .or_else(|| self.completion_snapshot_for_task(&task, BG_COMPLETION_PREVIEW_BYTES));
+            if terminal_matches.is_empty() {
+                if let Some(completion) = completion.as_ref() {
+                    self.emit_bash_watch_exit(completion);
+                }
+            } else {
+                for pattern_match in terminal_matches {
+                    self.emit_bash_pattern_match(&task.session_id, pattern_match);
+                }
+            }
+            let _ = task.set_completion_delivered(true, self);
+            self.clear_task_watch_state(&task_id);
+        }
+
+        Ok(watch_id)
+    }
+
+    pub fn unregister_watch(&self, task_id: &str, watch_id: &str) {
+        if let Ok(mut registry) = self.inner.watch_registry.lock() {
+            registry.unregister(task_id, watch_id);
+        }
+    }
+
+    pub fn active_watch_count(&self, task_id: &str) -> usize {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.active_count(task_id))
+            .unwrap_or(0)
+    }
+
+    fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| {
+                (
+                    registry.has_controlled_task(task_id),
+                    registry.has_matched_task(task_id),
+                )
+            })
+            .unwrap_or((false, false))
+    }
+
+    fn task_has_watch_control(&self, task_id: &str) -> bool {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.has_controlled_task(task_id))
+            .unwrap_or(false)
+    }
+
+    fn clear_task_watch_state(&self, task_id: &str) {
+        if let Ok(mut registry) = self.inner.watch_registry.lock() {
+            registry.clear_task(task_id);
+        }
+    }
+
+    pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
+        let (mode, stdout, stderr, pty) = match task.state.lock() {
+            Ok(state) => (
+                state.metadata.mode.clone(),
+                task.paths.stdout.clone(),
+                task.paths.stderr.clone(),
+                task.paths.pty.clone(),
+            ),
+            Err(_) => return,
+        };
+        let mut matches = Vec::new();
+        if let Ok(mut registry) = self.inner.watch_registry.lock() {
+            match mode {
+                BgMode::Pipes => {
+                    let stdout_key = format!("{}:stdout", task.task_id);
+                    let stderr_key = format!("{}:stderr", task.task_id);
+                    matches.extend(registry.scan_file_new_bytes(
+                        &stdout_key,
+                        &task.task_id,
+                        &stdout,
+                    ));
+                    matches.extend(registry.scan_file_new_bytes(
+                        &stderr_key,
+                        &task.task_id,
+                        &stderr,
+                    ));
+                }
+                BgMode::Pty => {
+                    let pty_key = format!("{}:pty", task.task_id);
+                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, &pty));
+                }
+            }
+        }
+        for pattern_match in matches {
+            self.emit_bash_pattern_match(&task.session_id, pattern_match);
+        }
+    }
+
     pub fn status(
         &self,
         task_id: &str,
@@ -910,9 +1292,7 @@ impl BgTaskRegistry {
             );
         };
         let _ = self.poll_task(&task);
-        let mut snapshot = task.snapshot(preview_bytes);
-        self.maybe_compress_snapshot(&task, &mut snapshot);
-        Some(snapshot)
+        Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
     fn status_relaxed_task(
@@ -1068,9 +1448,7 @@ impl BgTaskRegistry {
     ) -> Option<BgTaskSnapshot> {
         let task = self.status_relaxed_task(task_id, project_root, storage_dir)?;
         let _ = self.poll_task(&task);
-        let mut snapshot = task.snapshot(preview_bytes);
-        self.maybe_compress_snapshot(&task, &mut snapshot);
-        Some(snapshot)
+        Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
     pub fn kill_relaxed(
@@ -1180,35 +1558,24 @@ impl BgTaskRegistry {
             .into_iter()
             .map(|task| {
                 let _ = self.poll_task(&task);
-                let mut snapshot = task.snapshot(preview_bytes);
-                self.maybe_compress_snapshot(&task, &mut snapshot);
-                snapshot
+                self.snapshot_with_terminal_cache(&task, preview_bytes)
             })
             .collect()
     }
 
-    /// Compress `output_preview` in place when the task is in a terminal
-    /// state. Live tail of running tasks stays raw so agents debugging
-    /// long-running bash see exactly what the process emitted, not a
-    /// heuristic-collapsed view. Per-task opt-out via the `compressed`
-    /// field on `PersistedTask` short-circuits before the compress pipeline.
+    /// Replace terminal pipe snapshots with the task's cached rendered output.
+    /// Running tasks stay raw (tail-only) so agents debugging a live process see
+    /// exactly what it emitted. PTY tasks are explicitly excluded: their raw
+    /// terminal bytes are rendered by the plugin's PTY path, not the line
+    /// compressor.
     fn maybe_compress_snapshot(&self, task: &Arc<BgTask>, snapshot: &mut BgTaskSnapshot) {
-        if !snapshot.info.status.is_terminal() {
+        if !snapshot.info.status.is_terminal() || snapshot.info.mode == BgMode::Pty {
             return;
         }
-        let (compressed_flag, mode) = task
-            .state
-            .lock()
-            .map(|state| (state.metadata.compressed, state.metadata.mode.clone()))
-            .unwrap_or((true, BgMode::Pipes));
-        if mode == BgMode::Pty {
-            return;
+        if let Some(cache) = self.ensure_terminal_output_cache(task) {
+            snapshot.output_preview = cache.output_preview;
+            snapshot.output_truncated = cache.output_truncated;
         }
-        if !compressed_flag {
-            return;
-        }
-        let raw = std::mem::take(&mut snapshot.output_preview);
-        snapshot.output_preview = self.compress_output(&snapshot.info.command, raw);
     }
 
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
@@ -1219,20 +1586,22 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
-        let mut state = task
-            .state
-            .lock()
-            .map_err(|_| "background task lock poisoned".to_string())?;
-        let updated = self
-            .update_task_metadata(&task.paths, |metadata| {
-                metadata.notify_on_completion = true;
-                metadata.completion_delivered = false;
-            })
-            .map_err(|e| format!("failed to promote background task: {e}"))?;
-        state.metadata = updated;
-        if state.metadata.status.is_terminal() {
-            state.buffer.enforce_terminal_cap();
-            self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+        let terminal_after_promote = {
+            let mut state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            let updated = self
+                .update_task_metadata(&task.paths, |metadata| {
+                    metadata.notify_on_completion = true;
+                    metadata.completion_delivered = false;
+                })
+                .map_err(|e| format!("failed to promote background task: {e}"))?;
+            state.metadata = updated;
+            state.metadata.status.is_terminal()
+        };
+        if terminal_after_promote {
+            self.post_terminal_transition(&task, true)?;
         }
         Ok(true)
     }
@@ -1322,30 +1691,35 @@ impl BgTaskRegistry {
         if task_ids.is_empty() {
             return Vec::new();
         }
-        let task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
-        let mut completions = match self.inner.completions.lock() {
-            Ok(completions) => completions,
-            Err(_) => return Vec::new(),
-        };
-        let mut acked = Vec::new();
-        completions.retain(|completion| {
-            let session_matches = session_id
-                .map(|session_id| completion.session_id == session_id)
-                .unwrap_or(true);
-            if session_matches && task_ids.contains(completion.task_id.as_str()) {
-                acked.push((completion.task_id.clone(), completion.session_id.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        drop(completions);
+        let requested_task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut completion_sessions = HashMap::new();
+        if let Ok(mut completions) = self.inner.completions.lock() {
+            completions.retain(|completion| {
+                let session_matches = session_id
+                    .map(|session_id| completion.session_id == session_id)
+                    .unwrap_or(true);
+                if session_matches && requested_task_ids.contains(completion.task_id.as_str()) {
+                    completion_sessions
+                        .insert(completion.task_id.clone(), completion.session_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         let mut delivered = Vec::new();
-        for (task_id, completion_session_id) in acked {
-            if let Some(task) = self.task_for_session(&task_id, &completion_session_id) {
+        for task_id in task_ids {
+            let task = if let Some(session_id) = session_id {
+                self.task_for_session(task_id, session_id)
+            } else if let Some(completion_session_id) = completion_sessions.get(task_id) {
+                self.task_for_session(task_id, completion_session_id)
+            } else {
+                self.task(task_id)
+            };
+            if let Some(task) = task {
                 if task.set_completion_delivered(true, self).is_ok() {
-                    delivered.push(task_id);
+                    delivered.push(task_id.clone());
                 }
             }
         }
@@ -1365,6 +1739,44 @@ impl BgTaskRegistry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {
+        let mut completions = self.inner.completions.lock().ok()?;
+        let idx = completions
+            .iter()
+            .position(|completion| completion.task_id == task_id)?;
+        completions.remove(idx)
+    }
+
+    fn completion_snapshot_for_task(
+        &self,
+        task: &Arc<BgTask>,
+        _preview_bytes: usize,
+    ) -> Option<BgCompletion> {
+        let snapshot = self.snapshot_with_terminal_cache(task, RUNNING_OUTPUT_PREVIEW_BYTES);
+        if !snapshot.info.status.is_terminal() {
+            return None;
+        }
+        let (output_preview, output_truncated) = if snapshot.info.mode == BgMode::Pty {
+            (String::new(), false)
+        } else {
+            self.ensure_terminal_output_cache(task)
+                .map(|cache| completion_preview_for_cache(&cache))
+                .unwrap_or_else(|| (String::new(), false))
+        };
+        Some(BgCompletion {
+            task_id: snapshot.info.task_id,
+            session_id: task.session_id.clone(),
+            status: snapshot.info.status,
+            exit_code: snapshot.exit_code,
+            command: snapshot.info.command,
+            output_preview,
+            output_truncated,
+            original_tokens: None,
+            compressed_tokens: None,
+            tokens_skipped: false,
+        })
     }
 
     pub fn detach(&self) {
@@ -1403,9 +1815,14 @@ impl BgTaskRegistry {
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
         if let Ok(state) = task.state.lock() {
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
-                let complete = pty.reader_done.load(Ordering::SeqCst)
-                    && pty.exit_observed.load(Ordering::SeqCst);
-                if !complete {
+                // On Windows ConPTY, the reader may not observe EOF while the
+                // master handle is still held in `PtyRuntime`. The waiter writes
+                // the authoritative exit marker before setting `exit_observed`,
+                // so once exit is observed we can finalize from that marker and
+                // drop the runtime, which lets the reader finish. Waiting for
+                // `reader_done && exit_observed` wedges completed PTY tasks on
+                // Windows.
+                if !pty.exit_observed.load(Ordering::SeqCst) {
                     return Ok(());
                 }
             }
@@ -1419,61 +1836,75 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn reap_child(&self, task: &Arc<BgTask>) {
-        let Ok(mut state) = task.state.lock() else {
-            return;
-        };
-        match &mut state.runtime {
-            TaskRuntime::Piped(child_slot) => {
-                if let Some(child) = child_slot.as_mut() {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        *child_slot = None;
-                        state.detached = true;
-                        state.child_exit_observed = true;
-                    }
-                } else if state.detached {
-                    let child_known_dead = state.child_exit_observed
-                        || state
-                            .metadata
-                            .child_pid
-                            .is_some_and(|pid| !is_process_alive(pid));
-                    if child_known_dead {
-                        self.fail_without_exit_marker_if_needed(task, &mut state);
+        let mut needs_completion = false;
+        {
+            let Ok(mut state) = task.state.lock() else {
+                return;
+            };
+            match &mut state.runtime {
+                TaskRuntime::Piped(child_slot) => {
+                    if let Some(child) = child_slot.as_mut() {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            *child_slot = None;
+                            state.detached = true;
+                            state.child_exit_observed = true;
+                        }
+                    } else if state.detached {
+                        let child_known_dead = state.child_exit_observed
+                            || state
+                                .metadata
+                                .child_pid
+                                .is_some_and(|pid| !is_process_alive(pid));
+                        if child_known_dead {
+                            needs_completion =
+                                self.fail_without_exit_marker_if_needed(task, &mut state);
+                        }
                     }
                 }
-            }
-            TaskRuntime::Pty(Some(pty)) => {
-                let complete = pty.reader_done.load(Ordering::SeqCst)
-                    && pty.exit_observed.load(Ordering::SeqCst);
-                if complete {
-                    drop(state);
-                    let _ = self.poll_task(task);
+                TaskRuntime::Pty(Some(pty)) => {
+                    if pty.exit_observed.load(Ordering::SeqCst) {
+                        drop(state);
+                        let _ = self.poll_task(task);
+                        return;
+                    }
                 }
+                TaskRuntime::Pty(None) => {}
             }
-            TaskRuntime::Pty(None) => {}
+        }
+        if needs_completion {
+            let _ = self.post_terminal_transition(task, true);
         }
     }
 
-    fn fail_without_exit_marker_if_needed(&self, task: &Arc<BgTask>, state: &mut BgTaskState) {
+    fn fail_without_exit_marker_if_needed(
+        &self,
+        task: &Arc<BgTask>,
+        state: &mut BgTaskState,
+    ) -> bool {
         if state.metadata.status.is_terminal() {
-            return;
+            return false;
         }
         if matches!(read_exit_marker(&task.paths.exit), Ok(Some(_))) {
-            return;
+            return false;
         }
+        let watch_controlled = self.task_has_watch_control(&task.task_id);
         let updated = self.update_task_metadata(&task.paths, |metadata| {
             metadata.mark_terminal(
                 BgTaskStatus::Failed,
                 None,
                 Some("process exited without exit marker".to_string()),
             );
+            if watch_controlled {
+                metadata.completion_delivered = true;
+            }
         });
         if let Ok(metadata) = updated {
             state.pending_terminal_override = None;
             state.metadata = metadata;
             task.mark_terminal_now();
-            state.buffer.enforce_terminal_cap();
-            self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+            return true;
         }
+        false
     }
 
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
@@ -1528,6 +1959,7 @@ impl BgTaskRegistry {
                 } else {
                     BgBuffer::new(paths.stdout.clone(), paths.stderr.clone())
                 },
+                terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
         });
@@ -1548,6 +1980,7 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        let mut terminalized = false;
 
         {
             let mut state = task
@@ -1556,99 +1989,156 @@ impl BgTaskRegistry {
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
-                return Ok(task.snapshot_locked(&state, 5 * 1024));
-            }
-
-            if let Ok(Some(marker)) = read_exit_marker(&task.paths.exit) {
+            } else if let Ok(Some(marker)) = read_exit_marker(&task.paths.exit) {
                 state.metadata =
                     terminal_metadata_from_marker(state.metadata.clone(), marker, None);
+                if self.task_has_watch_control(&task.task_id) {
+                    state.metadata.completion_delivered = true;
+                }
                 state.pending_terminal_override = None;
                 task.mark_terminal_now();
                 match &mut state.runtime {
-                    TaskRuntime::Piped(child) => *child = None,
+                    // Exit marker already present: the child finished on its
+                    // own before this kill observed it. Reap it rather than
+                    // dropping the handle so it doesn't become a zombie
+                    // (issue #91). The active-kill branch below already
+                    // `wait()`s after signaling, so this is the only kill
+                    // path that needed the explicit reap.
+                    TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
                     TaskRuntime::Pty(runtime) => *runtime = None,
                 }
                 state.detached = true;
-                state.buffer.enforce_terminal_cap();
                 self.persist_task(&task.paths, &state.metadata)
                     .map_err(|e| format!("failed to persist terminal state: {e}"))?;
-                self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
-                return Ok(task.snapshot_locked(&state, 5 * 1024));
-            }
+                terminalized = true;
+            } else {
+                let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
+                if !was_already_killing {
+                    state.metadata.status = BgTaskStatus::Killing;
+                    self.persist_task(&task.paths, &state.metadata)
+                        .map_err(|e| format!("failed to persist killing state: {e}"))?;
+                }
 
-            let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
-            if !was_already_killing {
-                state.metadata.status = BgTaskStatus::Killing;
-                self.persist_task(&task.paths, &state.metadata)
-                    .map_err(|e| format!("failed to persist killing state: {e}"))?;
-            }
+                #[cfg(unix)]
+                let pgid = state.metadata.pgid;
+                #[cfg(windows)]
+                let child_pid = state.metadata.child_pid;
+                if !was_already_killing
+                    && state.metadata.mode == BgMode::Pty
+                    && terminal_status == BgTaskStatus::TimedOut
+                {
+                    state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
+                }
 
-            let pgid = state.metadata.pgid;
-            #[cfg(windows)]
-            let child_pid = state.metadata.child_pid;
-            if !was_already_killing
-                && state.metadata.mode == BgMode::Pty
-                && terminal_status == BgTaskStatus::TimedOut
-            {
-                state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
-            }
+                #[cfg(windows)]
+                let mut pty_forced_terminal_status: Option<BgTaskStatus> = None;
 
-            match &mut state.runtime {
-                TaskRuntime::Piped(child_slot) => {
-                    #[cfg(unix)]
-                    if let Some(pgid) = pgid {
-                        terminate_pgid(pgid, child_slot.as_mut());
+                match &mut state.runtime {
+                    TaskRuntime::Piped(child_slot) => {
+                        #[cfg(unix)]
+                        if let Some(pgid) = pgid {
+                            terminate_pgid(pgid, child_slot.as_mut());
+                        }
+                        #[cfg(windows)]
+                        if let Some(child) = child_slot.as_mut() {
+                            super::process::terminate_process(child);
+                        } else if let Some(pid) = child_pid {
+                            terminate_pid(pid);
+                        }
+                        if let Some(child) = child_slot.as_mut() {
+                            let _ = child.wait();
+                        }
+                        *child_slot = None;
+                        state.detached = true;
+
+                        if !task.paths.exit.exists() {
+                            write_kill_marker_if_absent(&task.paths.exit)
+                                .map_err(|e| format!("failed to write kill marker: {e}"))?;
+                        }
+
+                        let exit_code = if terminal_status == BgTaskStatus::TimedOut {
+                            Some(124)
+                        } else {
+                            None
+                        };
+                        state
+                            .metadata
+                            .mark_terminal(terminal_status, exit_code, None);
+                        if self.task_has_watch_control(&task.task_id) {
+                            state.metadata.completion_delivered = true;
+                        }
+                        state.pending_terminal_override = None;
+                        task.mark_terminal_now();
+                        self.persist_task(&task.paths, &state.metadata)
+                            .map_err(|e| format!("failed to persist killed state: {e}"))?;
+                        terminalized = true;
                     }
-                    #[cfg(windows)]
-                    if let Some(child) = child_slot.as_mut() {
-                        super::process::terminate_process(child);
-                    } else if let Some(pid) = child_pid {
-                        terminate_pid(pid);
-                    }
-                    if let Some(child) = child_slot.as_mut() {
-                        let _ = child.wait();
-                    }
-                    *child_slot = None;
-                    state.detached = true;
+                    TaskRuntime::Pty(Some(pty)) => {
+                        pty.was_killed.store(true, Ordering::SeqCst);
+                        if let Err(error) = pty.killer.kill() {
+                            crate::slog_warn!(
+                                "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
+                            );
+                        }
+                        if let Some(pid) = pty.child_pid {
+                            #[cfg(unix)]
+                            terminate_pgid(pid as i32, None);
+                            #[cfg(windows)]
+                            terminate_pid(pid);
+                        }
+                        drop(pty.master.take());
 
+                        #[cfg(windows)]
+                        {
+                            let default_status = if terminal_status == BgTaskStatus::TimedOut {
+                                BgTaskStatus::TimedOut
+                            } else {
+                                BgTaskStatus::Killed
+                            };
+                            pty_forced_terminal_status = Some(
+                                state
+                                    .pending_terminal_override
+                                    .take()
+                                    .unwrap_or(default_status),
+                            );
+                        }
+                    }
+                    TaskRuntime::Pty(None) => {}
+                }
+
+                #[cfg(windows)]
+                if let Some(target_status) = pty_forced_terminal_status {
                     if !task.paths.exit.exists() {
                         write_kill_marker_if_absent(&task.paths.exit)
                             .map_err(|e| format!("failed to write kill marker: {e}"))?;
                     }
 
-                    let exit_code = if terminal_status == BgTaskStatus::TimedOut {
+                    let exit_code = if target_status == BgTaskStatus::TimedOut {
                         Some(124)
                     } else {
                         None
                     };
-                    state
-                        .metadata
-                        .mark_terminal(terminal_status, exit_code, None);
+                    state.metadata.mark_terminal(target_status, exit_code, None);
+                    if self.task_has_watch_control(&task.task_id) {
+                        state.metadata.completion_delivered = true;
+                    }
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
+                    if let TaskRuntime::Pty(runtime) = &mut state.runtime {
+                        *runtime = None;
+                    }
+                    state.detached = true;
                     self.persist_task(&task.paths, &state.metadata)
-                        .map_err(|e| format!("failed to persist killed state: {e}"))?;
-                    state.buffer.enforce_terminal_cap();
-                    self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+                        .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+                    terminalized = true;
                 }
-                TaskRuntime::Pty(Some(pty)) => {
-                    pty.was_killed.store(true, Ordering::SeqCst);
-                    if let Err(error) = pty.killer.kill() {
-                        crate::slog_warn!("[pty-kill] {task_id} ChildKiller::kill failed: {error}");
-                    }
-                    if let Some(pid) = pty.child_pid {
-                        #[cfg(unix)]
-                        terminate_pgid(pid as i32, None);
-                        #[cfg(windows)]
-                        terminate_pid(pid);
-                    }
-                    drop(pty.master.take());
-                }
-                TaskRuntime::Pty(None) => {}
             }
         }
 
-        Ok(task.snapshot(5 * 1024))
+        if terminalized {
+            self.post_terminal_transition(&task, true)?;
+        }
+        Ok(self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES))
     }
 
     fn finalize_from_marker(
@@ -1657,45 +2147,71 @@ impl BgTaskRegistry {
         marker: ExitMarker,
         reason: Option<String>,
     ) -> Result<(), String> {
-        let mut state = task
-            .state
-            .lock()
-            .map_err(|_| "background task lock poisoned".to_string())?;
-        if state.metadata.status.is_terminal() {
-            state.pending_terminal_override = None;
-            return Ok(());
+        let watch_controlled = self.task_has_watch_control(&task.task_id);
+        let mut pty_reader_done = None;
+        {
+            let mut state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if state.metadata.status.is_terminal() {
+                state.pending_terminal_override = None;
+                return Ok(());
+            }
+
+            let pending_override = state.pending_terminal_override.take();
+            let is_pty = state.metadata.mode == BgMode::Pty;
+            let updated = self
+                .update_task_metadata(&task.paths, |metadata| {
+                    let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
+                        let mut metadata = metadata.clone();
+                        let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
+                        let exit_code = if target_status == BgTaskStatus::TimedOut {
+                            Some(124)
+                        } else {
+                            None
+                        };
+                        metadata.mark_terminal(target_status, exit_code, reason);
+                        metadata
+                    } else {
+                        terminal_metadata_from_marker(metadata.clone(), marker, reason)
+                    };
+                    if watch_controlled {
+                        new_metadata.completion_delivered = true;
+                    }
+                    *metadata = new_metadata;
+                })
+                .map_err(|e| format!("failed to persist terminal state: {e}"))?;
+            state.metadata = updated;
+            task.mark_terminal_now();
+            match &mut state.runtime {
+                // Reap the exited direct child instead of dropping it, so it
+                // does not linger as a `<defunct>` zombie (issue #91). The
+                // wrapper writes the exit marker as its final act, so the
+                // child is already exiting and `wait()` returns immediately.
+                TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
+                TaskRuntime::Pty(runtime) => {
+                    pty_reader_done = runtime
+                        .as_ref()
+                        .map(|runtime| Arc::clone(&runtime.reader_done));
+                    *runtime = None;
+                }
+            }
+            state.detached = true;
         }
 
-        let pending_override = state.pending_terminal_override.take();
-        let is_pty = state.metadata.mode == BgMode::Pty;
-        let updated = self
-            .update_task_metadata(&task.paths, |metadata| {
-                let new_metadata = if is_pty && marker == ExitMarker::Killed {
-                    let mut metadata = metadata.clone();
-                    let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
-                    let exit_code = if target_status == BgTaskStatus::TimedOut {
-                        Some(124)
-                    } else {
-                        None
-                    };
-                    metadata.mark_terminal(target_status, exit_code, reason);
-                    metadata
-                } else {
-                    terminal_metadata_from_marker(metadata.clone(), marker, reason)
-                };
-                *metadata = new_metadata;
-            })
-            .map_err(|e| format!("failed to persist terminal state: {e}"))?;
-        state.metadata = updated;
-        task.mark_terminal_now();
-        match &mut state.runtime {
-            TaskRuntime::Piped(child) => *child = None,
-            TaskRuntime::Pty(runtime) => *runtime = None,
+        if let Some(reader_done) = pty_reader_done {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while !reader_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        state.detached = true;
-        state.buffer.enforce_terminal_cap();
-        self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
-        Ok(())
+
+        // One final scan runs before terminal notification routing so bytes
+        // printed immediately before exit can win over the exit safety net.
+        self.scan_task_watch_output(task);
+
+        self.post_terminal_transition(task, true)
     }
 
     fn enqueue_completion_if_needed(
@@ -1705,17 +2221,22 @@ impl BgTaskRegistry {
         emit_frame: bool,
     ) {
         if metadata.status.is_terminal() && !metadata.completion_delivered {
-            self.enqueue_completion_from_parts(metadata, None, paths, emit_frame);
+            let cache =
+                paths.and_then(|paths| self.render_terminal_output_from_paths(metadata, paths));
+            self.enqueue_completion_from_parts(metadata, None, paths, emit_frame, cache.as_ref());
         }
     }
 
-    fn enqueue_completion_locked(
+    fn render_terminal_output_from_paths(
         &self,
         metadata: &PersistedTask,
-        buffer: Option<&BgBuffer>,
-        emit_frame: bool,
-    ) {
-        self.enqueue_completion_from_parts(metadata, buffer, None, emit_frame);
+        paths: &TaskPaths,
+    ) -> Option<TerminalOutputCache> {
+        if metadata.mode == BgMode::Pty {
+            return None;
+        }
+        let buffer = BgBuffer::new(paths.stdout.clone(), paths.stderr.clone());
+        Some(self.render_terminal_output(metadata, &buffer))
     }
 
     fn enqueue_completion_from_parts(
@@ -1724,6 +2245,7 @@ impl BgTaskRegistry {
         buffer: Option<&BgBuffer>,
         paths: Option<&TaskPaths>,
         emit_frame: bool,
+        terminal_render: Option<&TerminalOutputCache>,
     ) {
         // Only the terminal-state guard prevents double-recording here. The
         // `completion_delivered` flag is NOT used to gate compression-event
@@ -1738,30 +2260,32 @@ impl BgTaskRegistry {
         if !metadata.status.is_terminal() {
             return;
         }
-        // Read tail once at completion time and cache on the BgCompletion so
-        // both the push-frame consumer (running session) and any later
-        // `bash_drain_completions` poll (different session, restart) see the
-        // same preview without racing against rotation.
-        let (raw_preview, output_truncated) = if metadata.mode == BgMode::Pty {
-            (String::new(), false)
+
+        let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
+            paths.map(|paths| BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()))
         } else {
-            match buffer {
-                Some(buf) => buf.read_tail(BG_COMPLETION_PREVIEW_BYTES),
-                None => paths
-                    .map(|paths| read_tail_from_disk(metadata, paths, BG_COMPLETION_PREVIEW_BYTES))
-                    .unwrap_or_else(|| (String::new(), false)),
-            }
+            None
         };
-        // Compress at completion time so push-frame consumers and later
-        // `bash_drain_completions` poll-callers see the same compressed text.
-        // Per-task `compressed: false` opts out; otherwise the compressor is
-        // a no-op when `experimental.bash.compress=false`.
-        let output_preview = if metadata.compressed {
-            self.compress_output(&metadata.command, raw_preview)
+        let render_buffer = buffer.or(owned_buffer.as_ref());
+        let owned_render = if terminal_render.is_none() {
+            render_buffer.map(|buffer| self.render_terminal_output(metadata, buffer))
         } else {
-            raw_preview
+            None
         };
-        let token_counts = self.completion_token_counts(metadata, buffer, paths);
+        let render = terminal_render.or(owned_render.as_ref());
+
+        // Completion reminders use the already-rendered terminal output and a
+        // smaller head+tail cap. They never invoke the compressor themselves.
+        let (output_preview, output_truncated) = render
+            .map(completion_preview_for_cache)
+            .unwrap_or_else(|| (String::new(), false));
+
+        let token_counts = self.completion_token_counts(
+            metadata,
+            buffer,
+            paths,
+            render.map(|render| render.output_preview.as_str()),
+        );
         let completion = BgCompletion {
             task_id: metadata.task_id.clone(),
             session_id: metadata.session_id.clone(),
@@ -1786,6 +2310,15 @@ impl BgTaskRegistry {
         // meant compression accounting was effectively dead for >99% of
         // real-world bash usage.
         self.record_compression_event_if_applicable(metadata, &token_counts);
+
+        let (watch_controlled, watch_matched) = self.task_watch_state(&metadata.task_id);
+        if watch_controlled {
+            if emit_frame && !watch_matched {
+                self.emit_bash_watch_exit(&completion);
+            }
+            self.clear_task_watch_state(&metadata.task_id);
+            return;
+        }
 
         // Push-frame queue is gated on `completion_delivered` so foreground
         // bash with `notify_on_completion=false` does not leak a user-visible
@@ -1936,6 +2469,61 @@ impl BgTaskRegistry {
         }
     }
 
+    fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::BashPatternMatch(BashPatternMatchFrame::new(
+                pattern_match.task_id,
+                session_id.to_string(),
+                pattern_match.watch_id,
+                pattern_match.match_text,
+                pattern_match.match_offset,
+                pattern_match.context,
+                pattern_match.once,
+            )));
+        }
+    }
+
+    fn emit_bash_watch_exit(&self, completion: &BgCompletion) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        let Some(sender) = progress_sender.as_ref() else {
+            return;
+        };
+        let status = completion_status_text(&completion.status, completion.exit_code);
+        let preview = completion.output_preview.trim_end();
+        let context = if preview.is_empty() {
+            format!("task {} exited ({status})", completion.task_id)
+        } else {
+            format!(
+                "task {} exited ({status})
+{preview}",
+                completion.task_id
+            )
+        };
+        sender(PushFrame::BashPatternMatch(
+            BashPatternMatchFrame::task_exit(
+                completion.task_id.clone(),
+                completion.session_id.clone(),
+                format!("exited ({status})"),
+                context,
+            ),
+        ));
+    }
+
     fn emit_bash_completed(&self, completion: BgCompletion) {
         let Ok(progress_sender) = self
             .inner
@@ -1974,6 +2562,7 @@ impl BgTaskRegistry {
         metadata: &PersistedTask,
         buffer: Option<&BgBuffer>,
         paths: Option<&TaskPaths>,
+        rendered_output: Option<&str>,
     ) -> CompletionTokenCounts {
         if metadata.mode == BgMode::Pty {
             return CompletionTokenCounts::skipped();
@@ -1994,12 +2583,8 @@ impl BgTaskRegistry {
 
         let original_tokens = token_count_u32(&raw_output);
         let original_bytes = raw_output.len() as i64;
-        let compressed_output = if metadata.compressed {
-            self.compress_output(&metadata.command, raw_output)
-        } else {
-            raw_output
-        };
-        let compressed_tokens = token_count_u32(&compressed_output);
+        let compressed_output = rendered_output.unwrap_or(&raw_output);
+        let compressed_tokens = token_count_u32(compressed_output);
         let compressed_bytes = compressed_output.len() as i64;
         CompletionTokenCounts {
             original_tokens: Some(original_tokens),
@@ -2134,6 +2719,466 @@ impl BgTaskRegistry {
     }
 }
 
+fn render_compressed_with_recovery(
+    buffer: &BgBuffer,
+    mut compressed: CompressionResult,
+    input_truncated: bool,
+) -> TerminalOutputCache {
+    // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
+    // the legitimate final newline that `echo` and most commands emit, so
+    // agent-facing output diverged from native bash ("hello" vs "hello\n") and
+    // broke the no-JSON-envelope contract. Collapse excess trailing blank lines
+    // to one, but keep that one when the content had a trailing newline. NOTE:
+    // the check must read the ORIGINAL text — strip_plain_truncation_marker_lines
+    // rebuilds via `.lines().join("\n")`, which itself drops the trailing newline.
+    let had_trailing_newline = compressed.text.ends_with('\n');
+    let mut text = strip_plain_truncation_marker_lines(&compressed.text)
+        .trim_end()
+        .to_string();
+    if had_trailing_newline && !text.is_empty() {
+        text.push('\n');
+    }
+    compressed.text = text;
+
+    let output_path = buffer.output_path().map(|path| path.display().to_string());
+    let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
+    let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
+    let mut recovery = RecoveryContext {
+        dropped_by_class: compressed.dropped_by_class,
+        had_inner_drop: compressed.had_inner_drop,
+        offset_hint_eligible: compressed.offset_hint_eligible,
+        offset_start_line: compressed.offset_start_line,
+        byte_truncated: input_truncated,
+        output_path: output_path.clone(),
+        stderr_path: stderr_path.clone(),
+        include_stderr_path,
+    };
+
+    let (output_preview, output_truncated) =
+        render_body_with_recovery_marker(&compressed.text, &mut recovery);
+    TerminalOutputCache {
+        output_preview,
+        output_truncated,
+        kind: TerminalOutputKind::Compressed,
+        output_path,
+        stderr_path,
+        recovery: Some(recovery),
+    }
+}
+
+fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
+    render_body_with_recovery_marker_at_cap(
+        body,
+        recovery,
+        FINAL_OUTPUT_CAP_BYTES,
+        cap_final_output,
+        cap_final_output_with_marker,
+    )
+}
+
+fn render_raw_body_with_recovery_marker(
+    body: &str,
+    recovery: &mut RecoveryContext,
+) -> (String, bool) {
+    render_body_with_recovery_marker_at_cap(
+        body,
+        recovery,
+        RAW_PASSTHROUGH_CAP_BYTES,
+        |input| {
+            super::output::cap_head_tail(
+                input,
+                RAW_PASSTHROUGH_CAP_BYTES,
+                RAW_PASSTHROUGH_HEAD_BYTES,
+                RAW_PASSTHROUGH_TAIL_BYTES,
+            )
+        },
+        |input, marker| {
+            super::output::cap_head_tail_with_marker(
+                input,
+                RAW_PASSTHROUGH_CAP_BYTES,
+                RAW_PASSTHROUGH_HEAD_BYTES,
+                RAW_PASSTHROUGH_TAIL_BYTES,
+                marker,
+            )
+        },
+    )
+}
+
+fn render_body_with_recovery_marker_at_cap<F, G>(
+    body: &str,
+    recovery: &mut RecoveryContext,
+    cap_bytes: usize,
+    cap_plain: F,
+    cap_with_marker: G,
+) -> (String, bool)
+where
+    F: Fn(&str) -> super::output::CappedText,
+    G: Fn(&str, &str) -> super::output::CappedText,
+{
+    let needs_marker = recovery.has_visible_drop();
+    if body.len() > cap_bytes {
+        recovery.byte_truncated = true;
+        if let Some(marker) = recovery_marker(recovery) {
+            let capped = cap_with_marker(body, &marker);
+            return (capped.text, true);
+        }
+        let capped = cap_plain(body);
+        return (capped.text, capped.truncated || needs_marker);
+    }
+
+    if !needs_marker {
+        return (body.to_string(), false);
+    }
+
+    let Some(marker) = recovery_marker(recovery) else {
+        return (body.to_string(), true);
+    };
+    let with_marker = append_recovery_marker(body, &marker);
+    if with_marker.len() <= cap_bytes {
+        return (with_marker, true);
+    }
+
+    recovery.byte_truncated = true;
+    let marker = recovery_marker(recovery).unwrap_or(marker);
+    let capped = cap_with_marker(body, &marker);
+    (capped.text, true)
+}
+
+fn append_recovery_marker(body: &str, marker: &str) -> String {
+    if body.is_empty() {
+        return marker.to_string();
+    }
+    let mut output = body.trim_end().to_string();
+    output.push('\n');
+    output.push_str(marker);
+    output
+}
+
+fn recovery_marker(recovery: &RecoveryContext) -> Option<String> {
+    let mut parts = Vec::new();
+    for (class, count) in &recovery.dropped_by_class {
+        let label = if *count == 1 {
+            class.singular()
+        } else {
+            class.plural()
+        };
+        parts.push(format!("+{count} more {label}"));
+    }
+    if recovery.byte_truncated {
+        parts.push("truncated output".to_string());
+    } else if recovery.had_inner_drop && parts.is_empty() {
+        parts.push("omitted output".to_string());
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let hint = recovery_hint(recovery);
+    Some(format!("[{}; {hint}]", parts.join(", ")))
+}
+
+fn recovery_hint(recovery: &RecoveryContext) -> String {
+    // AFT stores stdout/stderr separately and combines them in memory. Class caps,
+    // middle truncation, and mixed stdout/stderr renders are not line-offset
+    // portable. Only a single-file contiguous-prefix drop may use `tail -n +N`.
+    if recovery.offset_hint_eligible
+        && !recovery.byte_truncated
+        && recovery.dropped_by_class.is_empty()
+        && !recovery.include_stderr_path
+    {
+        if let (Some(path), Some(line)) =
+            (recovery.output_path.as_deref(), recovery.offset_start_line)
+        {
+            return format!("see remaining: tail -n +{line} {}", quote_path(path));
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Some(path) = recovery.output_path.as_deref() {
+        paths.push(path);
+    }
+    if recovery.include_stderr_path {
+        if let Some(path) = recovery.stderr_path.as_deref() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        return "full output unavailable".to_string();
+    }
+
+    let reads = paths
+        .into_iter()
+        .map(|path| format!("read {}", quote_path(path)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("full output: {reads}")
+}
+
+fn strip_plain_truncation_marker_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !is_plain_truncation_marker(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_recovery_marker_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !is_recovery_marker(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_plain_truncation_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("...<truncated ") else {
+        return false;
+    };
+    let Some(bytes) = rest.strip_suffix(" bytes>...") else {
+        return false;
+    };
+    !bytes.is_empty() && bytes.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_recovery_marker(line: &str) -> bool {
+    line.starts_with('[')
+        && line.ends_with(']')
+        && (line.contains("full output: read ")
+            || line.contains("see remaining: tail -n +")
+            || line.contains("full output unavailable"))
+}
+
+fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<TerminalOutputCache> {
+    if !is_gh_structured_command(command) {
+        return None;
+    }
+
+    let output_path = buffer
+        .output_path()
+        .map(|path| path.display().to_string())?;
+    let stdout_bytes = buffer.stream_len(StreamKind::Stdout);
+    if stdout_bytes == 0 {
+        return None;
+    }
+
+    if stdout_bytes > STRUCTURED_OUTPUT_CAP_BYTES as u64 {
+        if !stream_starts_like_json(buffer, StreamKind::Stdout) {
+            return None;
+        }
+        return Some(TerminalOutputCache {
+            output_preview: json_output_pointer(stdout_bytes, &output_path),
+            output_truncated: true,
+            kind: TerminalOutputKind::Structured,
+            output_path: Some(output_path),
+            stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+            recovery: None,
+        });
+    }
+
+    let stdout = buffer.read_stream_bounded(StreamKind::Stdout, STRUCTURED_OUTPUT_CAP_BYTES);
+    if stdout.truncated || !is_structured_body(&stdout.text) {
+        return None;
+    }
+
+    Some(TerminalOutputCache {
+        output_preview: stdout.text,
+        output_truncated: false,
+        kind: TerminalOutputKind::Structured,
+        output_path: Some(output_path),
+        stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+        recovery: None,
+    })
+}
+
+fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
+    let raw = buffer.read_combined_head_tail(
+        RAW_PASSTHROUGH_CAP_BYTES,
+        RAW_PASSTHROUGH_HEAD_BYTES,
+        RAW_PASSTHROUGH_TAIL_BYTES,
+    );
+    let output_path = buffer.output_path().map(|path| path.display().to_string());
+    let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
+    if !raw.truncated {
+        return TerminalOutputCache {
+            output_preview: raw.text,
+            output_truncated: false,
+            kind: TerminalOutputKind::Raw,
+            output_path,
+            stderr_path,
+            recovery: None,
+        };
+    }
+
+    let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
+    let mut recovery = RecoveryContext {
+        dropped_by_class: BTreeMap::new(),
+        had_inner_drop: false,
+        offset_hint_eligible: false,
+        offset_start_line: None,
+        byte_truncated: true,
+        output_path: output_path.clone(),
+        stderr_path: stderr_path.clone(),
+        include_stderr_path,
+    };
+    let (output_preview, output_truncated) =
+        render_raw_body_with_recovery_marker(&raw.text, &mut recovery);
+    TerminalOutputCache {
+        output_preview,
+        output_truncated,
+        kind: TerminalOutputKind::Raw,
+        output_path,
+        stderr_path,
+        recovery: Some(recovery),
+    }
+}
+
+fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
+    if cache.kind == TerminalOutputKind::Structured
+        && cache.output_preview.len() > BG_COMPLETION_PREVIEW_BYTES
+    {
+        if let Some(path) = cache.output_path.as_deref() {
+            return (
+                json_output_pointer(cache.output_preview.len() as u64, path),
+                true,
+            );
+        }
+        return (cache.output_preview.clone(), cache.output_truncated);
+    }
+
+    if let Some(recovery) = cache.recovery.as_ref() {
+        if cache.output_preview.len() <= BG_COMPLETION_PREVIEW_BYTES {
+            return (cache.output_preview.clone(), cache.output_truncated);
+        }
+        let body = strip_recovery_marker_lines(&cache.output_preview);
+        let mut completion_recovery = recovery.clone();
+        completion_recovery.byte_truncated = true;
+        if let Some(marker) = recovery_marker(&completion_recovery) {
+            let capped = cap_completion_output_with_marker(&body, &marker);
+            return (capped.text, true);
+        }
+    }
+
+    let capped = cap_completion_output(&cache.output_preview);
+    (capped.text, cache.output_truncated || capped.truncated)
+}
+
+fn is_gh_structured_command(command: &str) -> bool {
+    let normalized = crate::compress::normalize_command_for_dispatch(command)
+        .unwrap_or_else(|| command.trim_start().to_string());
+    let tokens = shell_words_for_flags(&normalized);
+    let Some(head) = tokens.first() else {
+        return false;
+    };
+    let head_name = Path::new(head)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(head);
+    if !(head_name == "gh" || head_name.eq_ignore_ascii_case("gh.exe")) {
+        return false;
+    }
+    tokens.iter().any(|token| {
+        matches!(token.as_str(), "--json" | "--jq" | "--template")
+            || token.starts_with("--json=")
+            || token.starts_with("--jq=")
+            || token.starts_with("--template=")
+    })
+}
+
+fn shell_words_for_flags(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if matches!(ch, ';' | '&' | '|') && !in_single && !in_double {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn is_structured_body(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return true;
+    }
+
+    let mut saw_line = false;
+    for line in trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        saw_line = true;
+        if serde_json::from_str::<serde_json::Value>(line).is_err() {
+            return false;
+        }
+    }
+    saw_line
+}
+
+fn stream_starts_like_json(buffer: &BgBuffer, stream: StreamKind) -> bool {
+    let path = match (buffer, stream) {
+        (BgBuffer::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
+        (BgBuffer::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
+        (BgBuffer::Pty { combined_path }, _) => Some(combined_path),
+    };
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut limited = file.take(512);
+    let mut bytes = Vec::new();
+    if limited.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&bytes)
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n'))
+}
+
 struct CompletionTokenCounts {
     original_tokens: Option<u32>,
     compressed_tokens: Option<u32>,
@@ -2151,6 +3196,16 @@ impl CompletionTokenCounts {
             compressed_bytes: None,
             tokens_skipped: true,
         }
+    }
+}
+
+fn completion_status_text(status: &BgTaskStatus, exit_code: Option<i32>) -> String {
+    match status {
+        BgTaskStatus::TimedOut => "timed out".to_string(),
+        BgTaskStatus::Killed => "killed".to_string(),
+        _ => exit_code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_else(|| format!("{status:?}").to_lowercase()),
     }
 }
 
@@ -2335,33 +3390,6 @@ fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn read_tail_from_disk(
-    metadata: &PersistedTask,
-    paths: &TaskPaths,
-    max_bytes: usize,
-) -> (String, bool) {
-    if metadata.mode == BgMode::Pty {
-        return read_file_tail_capped(&paths.pty, max_bytes)
-            .map(|bytes| {
-                let truncated = fs::metadata(&paths.pty)
-                    .map(|metadata| metadata.len() > max_bytes as u64)
-                    .unwrap_or(false);
-                (String::from_utf8_lossy(&bytes).into_owned(), truncated)
-            })
-            .unwrap_or_else(|_| (String::new(), false));
-    }
-    let stdout = fs::read(&paths.stdout).unwrap_or_default();
-    let stderr = fs::read(&paths.stderr).unwrap_or_default();
-    let mut bytes = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
-    bytes.extend_from_slice(&stdout);
-    bytes.extend_from_slice(&stderr);
-    if bytes.len() <= max_bytes {
-        return (String::from_utf8_lossy(&bytes).into_owned(), false);
-    }
-    let start = bytes.len().saturating_sub(max_bytes);
-    (String::from_utf8_lossy(&bytes[start..]).into_owned(), true)
-}
-
 fn read_for_token_count_from_disk(
     metadata: &PersistedTask,
     paths: &TaskPaths,
@@ -2431,6 +3459,12 @@ impl BgTask {
         });
         let (output_preview, output_truncated) = if metadata.mode == BgMode::Pty {
             (String::new(), false)
+        } else if metadata.status.is_terminal() {
+            state
+                .terminal_output_cache
+                .as_ref()
+                .map(|cache| (cache.output_preview.clone(), cache.output_truncated))
+                .unwrap_or_else(|| (String::new(), false))
         } else {
             state.buffer.read_tail(preview_bytes)
         };
@@ -2456,6 +3490,8 @@ impl BgTask {
                 .buffer
                 .stderr_path()
                 .map(|path| path.display().to_string()),
+            pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
+            pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
         }
     }
 
@@ -2467,6 +3503,13 @@ impl BgTask {
                     || (state.metadata.mode == BgMode::Pty
                         && state.metadata.status == BgTaskStatus::Killing)
             })
+            .unwrap_or(false)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false)
     }
 
@@ -2495,6 +3538,44 @@ impl BgTask {
         state.metadata = updated;
         Ok(())
     }
+}
+
+/// Reap an exited direct child handle, then clear the slot.
+///
+/// Dropping a [`std::process::Child`] does NOT `wait()` on the underlying OS
+/// process. On Unix a finished-but-unreaped child lingers as a `<defunct>`
+/// zombie until the AFT process itself exits (issue #91: `[mv] <defunct>`).
+/// The terminal-transition paths that learn of completion from the
+/// exit-marker file — rather than from [`BgTaskRegistry::reap_child`]'s
+/// `try_wait()` — must therefore reap the handle explicitly instead of just
+/// nulling it.
+///
+/// The exit marker is written by the wrapper's final statement (an atomic
+/// `mv` rename), so by the time we observe the marker the direct child has
+/// finished its work and is exiting; `wait()` returns essentially
+/// immediately. We attempt a non-blocking `try_wait()` first so the common
+/// case never blocks at all, falling back to a (bounded) `wait()` only to
+/// cover the microsecond window between the rename and process teardown.
+///
+/// Callers hold the task state mutex, so this is serialized against
+/// `reap_child` — there is no double-`wait()` hazard: whichever path acquires
+/// the lock first reaps and clears the slot, and the other observes `None`.
+#[cfg(unix)]
+fn reap_piped_child(child_slot: &mut Option<Child>) {
+    if let Some(mut child) = child_slot.take() {
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Windows has no zombie/`<defunct>` concept: dropping the [`Child`] closes
+/// the process handle, which is the correct release. Preserve the historical
+/// behavior of simply clearing the slot so the documented Windows PID-recycle
+/// handling in `reap_child` is unaffected.
+#[cfg(windows)]
+fn reap_piped_child(child_slot: &mut Option<Child>) {
+    *child_slot = None;
 }
 
 fn terminal_metadata_from_marker(
@@ -2573,7 +3654,7 @@ fn detached_shell_command_for(
     // body's internal quotes never reach the shell command line — the
     // shell reads them from disk by file syntax rules, not command-line
     // parser rules.
-    let wrapper_body = shell.wrapper_script(command, exit_path);
+    let wrapper_body = shell.wrapper_script_bytes(command, exit_path);
     let wrapper_ext = match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => "ps1",
         WindowsShell::Cmd => "bat",
@@ -2804,8 +3885,8 @@ fn random_slug() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    #[cfg(windows)]
     use std::fs;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     #[cfg(windows)]
@@ -2822,6 +3903,497 @@ mod tests {
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
+
+    fn insert_terminal_piped_task(
+        registry: &BgTaskRegistry,
+        dir: &tempfile::TempDir,
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        compressed: bool,
+    ) -> (String, Arc<BgTask>) {
+        let task_id = format!("bash-test-{}", random_slug());
+        let paths = task_paths(dir.path(), "session", &task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.stdout, stdout).unwrap();
+        fs::write(&paths.stderr, stderr).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            command.to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            compressed,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .expect("insert terminal task");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        (task_id, task)
+    }
+
+    fn insert_terminal_pty_task(
+        registry: &BgTaskRegistry,
+        dir: &tempfile::TempDir,
+        pty_output: &str,
+    ) -> (String, Arc<BgTask>) {
+        let task_id = format!("bash-test-{}", random_slug());
+        let paths = task_paths(dir.path(), "session", &task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.pty, pty_output).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "python".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            true,
+        );
+        metadata.mode = BgMode::Pty;
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .expect("insert terminal pty task");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        (task_id, task)
+    }
+
+    #[test]
+    fn recognizes_all_recovery_marker_forms() {
+        assert!(is_recovery_marker(
+            "[truncated output; full output: read \"/tmp/out\"]"
+        ));
+        assert!(is_recovery_marker(
+            "[omitted output; see remaining: tail -n +42 \"/tmp/out\"]"
+        ));
+        assert!(is_recovery_marker(
+            "[truncated output; full output unavailable]"
+        ));
+    }
+
+    #[test]
+    fn terminal_status_polls_use_cached_render_once_and_off_lock() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "custom-tool --verbose",
+            &"stdout line\n".repeat(200_000),
+            "",
+            true,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_unlocked_state = Arc::new(AtomicBool::new(false));
+        let task_holder = Arc::new(Mutex::new(Some(Arc::clone(&task))));
+        let calls_for_closure = Arc::clone(&calls);
+        let unlocked_for_closure = Arc::clone(&saw_unlocked_state);
+        let task_for_closure = Arc::clone(&task_holder);
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            if let Some(task) = task_for_closure.lock().unwrap().as_ref() {
+                if task.state.try_lock().is_ok() {
+                    unlocked_for_closure.store(true, Ordering::SeqCst);
+                }
+            }
+            CompressionResult::new(format!("compressed {} bytes", output.len()))
+        });
+
+        let first = registry
+            .status(
+                &task.task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+        let second = registry
+            .status(
+                &task.task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+        let listed = registry.list(RUNNING_OUTPUT_PREVIEW_BYTES);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "terminal render must be cached"
+        );
+        assert!(
+            saw_unlocked_state.load(Ordering::SeqCst),
+            "compressor must run after releasing the task state lock"
+        );
+        assert!(first.output_preview.starts_with("compressed "));
+        assert_eq!(second.output_preview, first.output_preview);
+        assert_eq!(listed[0].output_preview, first.output_preview);
+    }
+
+    #[test]
+    fn completion_preview_uses_head_and_tail_not_blind_tail() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
+        let (_task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "cat big.log", &output, "", false);
+
+        registry.post_terminal_transition(&task, true).unwrap();
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        let preview = &completions[0].output_preview;
+        assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
+        assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+        assert!(
+            preview.contains("...<truncated "),
+            "preview was {preview:?}"
+        );
+    }
+
+    #[test]
+    fn structured_gh_json_survives_intact_and_ignores_stderr() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            CompressionResult::new(output)
+        });
+        let (task_id, _task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "gh pr view 123 --json body",
+            "{\"body\":\"hello\"}",
+            "warning: stderr must not join json",
+            true,
+        );
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.output_preview, "{\"body\":\"hello\"}");
+        assert!(!snapshot.output_preview.contains("warning"));
+        assert!(!snapshot.output_truncated);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "structured JSON bypasses compression"
+        );
+    }
+
+    #[test]
+    fn registry_emits_single_recovery_marker_for_class_drops() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        registry.set_compressor_with_exit_code(move |_command, _output, _exit_code| {
+            let mut dropped = BTreeMap::new();
+            dropped.insert(DropClass::Error, 18);
+            dropped.insert(DropClass::Warning, 6);
+            CompressionResult::with_class_drops("kept diagnostic", dropped)
+        });
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "custom-tool", "raw", "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.output_preview.matches("full output:").count(), 1);
+        assert!(snapshot.output_preview.contains("+18 more errors"));
+        assert!(snapshot.output_preview.contains("+6 more warnings"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn registry_marker_reports_semantic_and_byte_drops_once() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        registry.set_compressor_with_exit_code(move |_command, _output, _exit_code| {
+            let mut dropped = BTreeMap::new();
+            dropped.insert(DropClass::Error, 1);
+            CompressionResult::with_class_drops(
+                format!("HEAD-SIGNAL\n{}TAIL-SIGNAL", "middle\n".repeat(8_000)),
+                dropped,
+            )
+        });
+        let (task_id, _task) =
+            insert_terminal_piped_task(&registry, &dir, "custom-tool", "raw", "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.output_preview.matches("full output:").count(), 1);
+        assert!(snapshot.output_preview.contains("+1 more error"));
+        assert!(snapshot.output_preview.contains("truncated output"));
+        assert!(snapshot.output_preview.contains("HEAD-SIGNAL"));
+        assert!(snapshot.output_preview.contains("TAIL-SIGNAL"));
+        assert!(!snapshot.output_preview.contains("...<truncated"));
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn cargo_stderr_class_drops_name_both_capture_paths() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let filter_registry = crate::compress::toml_filter::FilterRegistry::default();
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            crate::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &filter_registry,
+            )
+        });
+        let stderr = (0..22)
+            .map(|index| {
+                format!(
+                    "error: cargo failure {index}\n  --> src/lib.rs:{}:1\n   |\n{} | boom\n",
+                    index + 1,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "cargo check",
+            "Finished dev [unoptimized] target(s) in 0.01s\n",
+            &stderr,
+            true,
+        );
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.contains("+2 more errors"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+    }
+
+    #[test]
+    fn over_ceiling_structured_json_uses_pointer_not_partial_json() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{{\"body\":\"{}\"}}", "x".repeat(60 * 1024));
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "cd /repo && gh pr view 123 --json body",
+            &body,
+            "",
+            true,
+        );
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.starts_with("[JSON output "));
+        assert!(snapshot
+            .output_preview
+            .contains(&task.paths.stdout.display().to_string()));
+        assert!(!snapshot.output_preview.contains(&"x".repeat(1024)));
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn toml_strip_tail_cap_uses_full_output_hint_not_offset_hint() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let filter_registry = crate::compress::toml_filter::build_registry(
+            crate::compress::builtin_filters::ALL,
+            None,
+            None,
+        );
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            crate::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &filter_registry,
+            )
+        });
+        let stdout = format!(
+            "make[1]: Entering directory `/tmp`\n{}",
+            (0..100)
+                .map(|index| format!("compile line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "make all", &stdout, "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.contains("compile line 99"));
+        assert!(snapshot.output_preview.contains(&format!(
+            "full output: read \"{}\"",
+            task.paths.stdout.display()
+        )));
+        assert!(!snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+    }
+
+    #[test]
+    fn compressed_false_raw_passthrough_uses_wider_head_tail_cap() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!("RAW-HEAD\n{}RAW-TAIL\n", "raw-middle\n".repeat(8_000));
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "cat raw.log", &output, "RAW-ERR\n", false);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.contains("RAW-HEAD"));
+        assert!(snapshot.output_preview.contains("RAW-TAIL"));
+        assert!(snapshot.output_preview.contains("truncated output"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+        assert!(snapshot.output_preview.len() > 16 * 1024);
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn pty_terminal_snapshot_bypasses_line_compression() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            CompressionResult::new(output)
+        });
+        let (task_id, _task) = insert_terminal_pty_task(&registry, &dir, "raw\u{1b}[31m pty bytes");
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.info.mode, BgMode::Pty);
+        assert_eq!(snapshot.output_preview, "");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pty_dimensions_are_persisted_and_returned_in_snapshot() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                50,
+                120,
+            )
+            .unwrap();
+
+        let paths = task_paths(dir.path(), "session", &task_id);
+        let metadata = read_task(&paths.json).unwrap();
+        assert_eq!(
+            metadata.schema_version,
+            crate::bash_background::persistence::SCHEMA_VERSION
+        );
+        assert_eq!(metadata.mode, BgMode::Pty);
+        assert_eq!(metadata.pty_rows, Some(50));
+        assert_eq!(metadata.pty_cols, Some(120));
+
+        let snapshot = registry
+            .status(&task_id, "session", None, Some(dir.path()), 1024)
+            .unwrap();
+        assert_eq!(snapshot.pty_rows, Some(50));
+        assert_eq!(snapshot.pty_cols, Some(120));
+    }
 
     /// Spawn a child process that exits immediately and return it after
     /// it has terminated. Used by reap_child tests to simulate the
@@ -2862,6 +4434,134 @@ mod tests {
             }
         }
         child
+    }
+
+    #[test]
+    fn ack_marks_delivered_even_when_completion_was_already_consumed_locally() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
+        assert_eq!(
+            registry
+                .drain_completions_for_session(Some("session"))
+                .len(),
+            1
+        );
+
+        // Simulate the plugin consuming a sync bash_watch({ exit:true }) result
+        // locally before the Rust completion queue is drained/acked.
+        registry.inner.completions.lock().unwrap().clear();
+
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+            vec![task_id.clone()]
+        );
+        assert!(registry
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
+
+        let paths = task_paths(dir.path(), "session", &task_id);
+        let metadata = read_task(&paths.json).unwrap();
+        assert!(metadata.completion_delivered);
+
+        let replayed = BgTaskRegistry::default();
+        replayed
+            .replay_session_inner(dir.path(), "session", None)
+            .unwrap();
+        assert!(replayed
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
+    }
+
+    #[test]
+    fn register_watch_rejects_unknown_task() {
+        let registry = BgTaskRegistry::default();
+
+        let result = registry.register_watch(
+            "missing-task".to_string(),
+            WatchPattern::Substring("READY".into()),
+            true,
+        );
+
+        assert_eq!(result, Err("task_not_found"));
+    }
+
+    #[test]
+    fn register_watch_on_terminal_task_scans_existing_output() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+            captured.lock().unwrap().push(frame);
+        })
+            as Box<dyn Fn(PushFrame) + Send + Sync>);
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        std::fs::write(&task.paths.stdout, "READY\n").unwrap();
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
+        frames.lock().unwrap().clear();
+        registry.inner.completions.lock().unwrap().clear();
+
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+
+        let frames = frames.lock().unwrap();
+        let frame = frames
+            .iter()
+            .find_map(|frame| match frame {
+                PushFrame::BashPatternMatch(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("terminal watch registration should emit pattern frame");
+        assert_eq!(frame.reason, "pattern_match");
+        assert_eq!(frame.task_id, task_id);
+        assert_eq!(frame.session_id, "session");
+        assert_eq!(frame.match_text, "READY");
+        assert_eq!(frame.match_offset, 0);
+        assert_eq!(registry.active_watch_count(&frame.task_id), 0);
+        let metadata = read_task(&task.paths.json).unwrap();
+        assert!(metadata.completion_delivered);
     }
 
     #[test]
@@ -3201,6 +4901,243 @@ mod tests {
             state.metadata.status,
             BgTaskStatus::Running,
             "reap_child must defer to poll_task when marker exists"
+        );
+    }
+
+    /// Read a process's `ps` state string ("Z", "S", "R", etc). Returns
+    /// `None` once the PID has been fully reaped (no row), which is the
+    /// post-reap state we want.
+    #[cfg(unix)]
+    fn pid_stat(pid: u32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stat.is_empty() {
+            None
+        } else {
+            Some(stat)
+        }
+    }
+
+    /// A `<defunct>` zombie carries `ps` state starting with 'Z'.
+    #[cfg(unix)]
+    fn is_zombie(pid: u32) -> bool {
+        pid_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
+    }
+
+    /// Spawn a child that exits immediately and wait — via `ps`, NOT
+    /// `try_wait()`/`wait()` — until it is observably a `<defunct>` zombie,
+    /// then return the still-unreaped handle. This reproduces the exact
+    /// state issue #91 leaves behind: an exited OS child whose parent has
+    /// not reaped it.
+    #[cfg(unix)]
+    fn spawn_unreaped_zombie() -> std::process::Child {
+        let child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn zombie stand-in");
+        let pid = child.id();
+        let started = Instant::now();
+        while !is_zombie(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "stand-in child should become a zombie within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Return WITHOUT reaping — the handle still owns an unwaited zombie.
+        child
+    }
+
+    /// Regression test for issue #91: the exit-marker terminal path
+    /// (`poll_task` -> `finalize_from_marker`) must REAP the direct child
+    /// handle, not merely drop it. Dropping a `std::process::Child` does not
+    /// `wait()` on Unix, so the exited child lingers as a `[mv] <defunct>`
+    /// zombie until AFT exits.
+    ///
+    /// We install a known-unreaped zombie into the task's child slot and
+    /// drive the marker finalize path, then assert the child is gone (reaped)
+    /// rather than still `<defunct>`.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_from_marker_reaps_child_no_zombie() {
+        use std::sync::atomic::Ordering;
+
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+
+        // Stop the watchdog so the ONLY terminal-transition path under test
+        // is the exit-marker finalize (not reap_child's try_wait, which would
+        // reap the child for us and mask the bug).
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        // Wait for the wrapper's exit marker to land. We deliberately do NOT
+        // call try_wait()/wait() on the real child here — doing so would reap
+        // it and defeat the test.
+        let started = Instant::now();
+        while !task.paths.exit.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "exit marker should land quickly for `true`"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Reset to a fresh Running shape and install a guaranteed-unreaped
+        // zombie as the child handle, so the finalize path's reap behavior is
+        // exercised deterministically regardless of how the real child was
+        // handled. Persist Running so update_task's terminal-rollback guard
+        // sees a non-terminal starting point.
+        let zombie_pid;
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            state.metadata.exit_code = None;
+            state.metadata.finished_at = None;
+            state.metadata.duration_ms = None;
+            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
+                .expect("persist reset Running metadata");
+            let zombie = spawn_unreaped_zombie();
+            zombie_pid = zombie.id();
+            state.runtime = TaskRuntime::Piped(Some(zombie));
+        }
+        *task.terminal_at.lock().unwrap() = None;
+
+        // Precondition: the installed child is genuinely a `<defunct>` zombie.
+        assert!(
+            is_zombie(zombie_pid),
+            "precondition: stand-in child {zombie_pid} must be a zombie before finalize"
+        );
+
+        // Drive the exit-marker terminal path. Before the fix this nulled the
+        // Child handle without wait(), leaving the zombie behind.
+        registry.poll_task(&task).unwrap();
+
+        {
+            let state = task.state.lock().unwrap();
+            assert!(
+                matches!(state.runtime, TaskRuntime::Piped(None)),
+                "child handle must be released after marker finalize"
+            );
+            assert!(
+                state.metadata.status.is_terminal(),
+                "task must be terminal after marker finalize: {:?}",
+                state.metadata.status
+            );
+        }
+
+        // The core assertion: the child must have been REAPED, not just
+        // dropped. A reaped PID has no `ps` row (or at minimum is not 'Z').
+        assert!(
+            !is_zombie(zombie_pid),
+            "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
+             after the exit-marker terminal transition"
+        );
+    }
+
+    /// Companion to the above for the kill path: when a kill observes an
+    /// already-present exit marker (the child finished on its own first), it
+    /// must reap the child handle rather than dropping it.
+    #[cfg(unix)]
+    #[test]
+    fn kill_with_existing_marker_reaps_child_no_zombie() {
+        use std::sync::atomic::Ordering;
+
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        let started = Instant::now();
+        while !task.paths.exit.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "exit marker should land quickly for `true`"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let zombie_pid;
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            state.metadata.exit_code = None;
+            state.metadata.finished_at = None;
+            state.metadata.duration_ms = None;
+            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
+                .expect("persist reset Running metadata");
+            let zombie = spawn_unreaped_zombie();
+            zombie_pid = zombie.id();
+            state.runtime = TaskRuntime::Piped(Some(zombie));
+        }
+        *task.terminal_at.lock().unwrap() = None;
+
+        assert!(
+            is_zombie(zombie_pid),
+            "precondition: stand-in child {zombie_pid} must be a zombie before kill"
+        );
+
+        // Kill observes the existing marker and finalizes from it.
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .expect("kill should succeed");
+
+        {
+            let state = task.state.lock().unwrap();
+            assert!(
+                matches!(state.runtime, TaskRuntime::Piped(None)),
+                "child handle must be released after marker-aware kill"
+            );
+            assert!(state.metadata.status.is_terminal());
+        }
+
+        assert!(
+            !is_zombie(zombie_pid),
+            "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
+             after a marker-aware kill"
         );
     }
 

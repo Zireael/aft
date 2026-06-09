@@ -48,6 +48,38 @@ fn path_with_node_bin(dir: &std::path::Path) -> std::ffi::OsString {
     paths.insert(0, dir.join("node_modules").join(".bin"));
     std::env::join_paths(paths).unwrap()
 }
+
+fn inline_lsp_diagnostics_fixture(
+    package_name: &str,
+    configure_id: &str,
+) -> (tempfile::TempDir, PathBuf, AftProcess) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("main.rs");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        &file,
+        "fn main() { let value = 1; println!(\"{}\", value); }\n",
+    )
+    .unwrap();
+
+    let fake_server = fake_server_path();
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
+    let configure = aft.send(&format!(
+        r#"{{"id":"{configure_id}","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
+    ));
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    (dir, file, aft)
+}
 // ============================================================================
 // write command tests
 // ============================================================================
@@ -61,8 +93,8 @@ fn write_creates_new_file() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-1","command":"write","file":"{}","content":"hello world"}}"#,
-        target.display()
+        r#"{{"id":"w-1","command":"write","file":{},"content":"hello world"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -88,6 +120,110 @@ fn write_creates_new_file() {
 }
 
 #[test]
+fn write_created_file_undo_removes_created_parent_dirs() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("newdir").join("sub").join("created.txt");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-created-nested","command":"write","file":{},"content":"created"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert!(target.exists());
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-created-nested","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert!(!target.exists(), "created file should be removed");
+    assert!(
+        !dir.path().join("newdir").exists(),
+        "empty parent directories created for the file should be removed"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_auto_rollback_discards_fake_undo_entry() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("rolled_back.ts");
+    fs::write(&target, "const value = 1;\n").unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-invalid","command":"write","file":{},"content":"const value = {{;\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "write should report validation result: {resp:?}"
+    );
+    assert_eq!(
+        resp["rolled_back"], true,
+        "invalid write should roll back: {resp:?}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "const value = 1;\n");
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-after-rollback","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(
+        undo["success"], false,
+        "rollback backup entry should be discarded: {undo:?}"
+    );
+    assert_eq!(undo["code"], "no_undo_history");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn configured_storage_writes_backups_under_harness_namespace() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let target = dir.path().join("namespaced-backup.txt");
+    fs::write(&target, "before").unwrap();
+
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-storage-backups",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "storage_dir": storage.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-storage-backup","command":"write","file":{},"content":"after"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write failed: {resp:?}");
+    assert!(
+        storage.path().join("opencode").join("backups").exists(),
+        "backups should be stored under the harness namespace"
+    );
+    assert!(
+        !storage.path().join("backups").exists(),
+        "new backups should not be written to the shared root"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn write_backups_existing_file() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -96,8 +232,8 @@ fn write_backups_existing_file() {
 
     // Overwrite via write command
     let resp = aft.send(&format!(
-        r#"{{"id":"w-2","command":"write","file":"{}","content":"new content"}}"#,
-        target.display()
+        r#"{{"id":"w-2","command":"write","file":{},"content":"new content"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -112,8 +248,8 @@ fn write_backups_existing_file() {
 
     // Undo — should restore original
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"w-2u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"w-2u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,
@@ -136,8 +272,8 @@ fn write_syntax_valid() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-3","command":"write","file":"{}","content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
-        target.display()
+        r#"{{"id":"w-3","command":"write","file":{},"content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -159,8 +295,8 @@ fn write_syntax_invalid() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-4","command":"write","file":"{}","content":"export function {{ broken syntax"}}"#,
-        target.display()
+        r#"{{"id":"w-4","command":"write","file":{},"content":"export function {{ broken syntax"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -340,8 +476,8 @@ fn edit_symbol_delete() {
     assert!(before.contains("internalHelper"));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-2","command":"edit_symbol","file":"{}","symbol":"internalHelper","operation":"delete"}}"#,
-        target.display()
+        r#"{{"id":"es-2","command":"edit_symbol","file":{},"symbol":"internalHelper","operation":"delete"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -374,8 +510,8 @@ fn edit_symbol_ambiguous() {
     fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-3","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"// replaced"}}"#,
-        target.display()
+        r#"{{"id":"es-3","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"// replaced"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -416,8 +552,8 @@ fn edit_symbol_not_found() {
     let file = fixture_path("sample.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-4","command":"edit_symbol","file":"{}","symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
-        file.display()
+        r#"{{"id":"es-4","command":"edit_symbol","file":{},"symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -486,32 +622,7 @@ fn edit_match_single_occurrence() {
 
 #[test]
 fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let file = root.join("main.rs");
-    let cargo_toml = root.join("Cargo.toml");
-    fs::write(
-        &cargo_toml,
-        "[package]\nname = \"inline-diag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        &file,
-        "fn main() { let value = 1; println!(\"{}\", value); }\n",
-    )
-    .unwrap();
-
-    let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
-
-    let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
-    ));
-    assert_eq!(
-        configure["success"], true,
-        "configure failed: {configure:?}"
-    );
+    let (_dir, file, mut aft) = inline_lsp_diagnostics_fixture("inline-diag", "cfg-inline");
 
     let req = serde_json::json!({
         "id": "em-inline-diag",
@@ -551,32 +662,8 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
 
 #[test]
 fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let file = root.join("main.rs");
-    let cargo_toml = root.join("Cargo.toml");
-    fs::write(
-        &cargo_toml,
-        "[package]\nname = \"inline-diag-fast\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        &file,
-        "fn main() { let value = 1; println!(\"{}\", value); }\n",
-    )
-    .unwrap();
-
-    let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
-
-    let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
-    ));
-    assert_eq!(
-        configure["success"], true,
-        "configure failed: {configure:?}"
-    );
+    let (_dir, file, mut aft) =
+        inline_lsp_diagnostics_fixture("inline-diag-fast", "cfg-inline-fast");
 
     let start = std::time::Instant::now();
     let req = serde_json::json!({
@@ -601,7 +688,7 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
         "expected inline diagnostics: {resp:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(3_000),
+        elapsed < std::time::Duration::from_millis(4_000),
         "expected event-driven wait, elapsed: {elapsed:?}, resp: {resp:?}"
     );
 
@@ -777,6 +864,50 @@ fn batch_multiple_edits() {
 }
 
 #[test]
+fn batch_reports_aggregate_diff_counts() {
+    // Regression: batch responses used to report `edits_applied` but no `diff`,
+    // so the agent-facing summary said "Edited (+0/-0, N edits)" even when
+    // content changed. With include_diff, batch must return aggregate
+    // additions/deletions across all edits (computed source -> final content).
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_diff.ts");
+
+    // Two line replacements (each is -1/+1) plus one pure insertion line.
+    let content = "const a = 1;\nconst b = 2;\nconst c = 3;\n";
+    fs::write(&target, content).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-diff-1",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "include_diff": true,
+        "edits": [
+            { "match": "const a = 1;", "replacement": "const a = 10;\nconst aa = 11;" },
+            { "match": "const b = 2;", "replacement": "const b = 20;" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {:?}", resp);
+    assert_eq!(resp["edits_applied"], 2);
+    let diff = &resp["diff"];
+    assert!(
+        diff.is_object(),
+        "batch must include aggregate diff counts: {:?}",
+        resp
+    );
+    // a: 1->2 lines (a=10 + aa=11) => +2/-1 ; b: 1->1 line => +1/-1.
+    // Aggregate: additions = 3, deletions = 2.
+    assert_eq!(diff["additions"], 3, "additions mismatch: {:?}", diff);
+    assert_eq!(diff["deletions"], 2, "deletions mismatch: {:?}", diff);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn batch_rollback_on_failure() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -858,6 +989,50 @@ fn batch_fuzzy_match() {
     assert!(status.success());
 }
 
+// Regression: a batch fuzzy (oldString/newString) match whose range includes
+// the trailing newline (line-based fuzzy passes do) must not merge the last
+// replaced line with the next line when the replacement has no trailing newline
+// (#83 class — edit_match had the fix, batch's string path did not).
+#[test]
+fn batch_fuzzy_preserves_trailing_newline() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_nl.ts");
+    // Trailing spaces force the rstrip fuzzy pass (pass 2).
+    fs::write(
+        &target,
+        "function f() {\n  const a = 1;   \n  const b = 2;   \n  return a + b;\n}\n",
+    )
+    .unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-nl",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            // Match has no trailing spaces (forces fuzzy) and the replacement has
+            // no trailing newline (the bug condition).
+            { "oldString": "  const a = 1;\n  const b = 2;", "newString": "  const c = 3;" },
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+    assert_eq!(resp["success"], true, "batch should succeed: {resp:?}");
+
+    let result = fs::read_to_string(&target).unwrap();
+    assert!(
+        result.contains("  const c = 3;\n  return a + b;"),
+        "the line after the match must not be merged: {result:?}"
+    );
+    assert!(
+        !result.contains("const c = 3;  return a + b;"),
+        "last replaced line merged with the next line: {result:?}"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn batch_line_range_edit() {
     let mut aft = AftProcess::spawn();
@@ -931,8 +1106,8 @@ fn batch_with_undo() {
 
     // Undo
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"b-4u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"b-4u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,

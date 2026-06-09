@@ -2,11 +2,13 @@
  * aft_safety — operation undo, per-file history, named checkpoints, restore, list.
  */
 
+import { coerceStringArray } from "@cortexkit/aft-bridge";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -22,12 +24,21 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
+function responsePaths(response: Record<string, unknown>): string[] {
+  return Array.isArray(response.paths)
+    ? response.paths.filter((path): path is string => typeof path === "string" && path.length > 0)
+    : [];
+}
+
 const SafetyParams = Type.Object({
   op: StringEnum(["undo", "history", "checkpoint", "restore", "list"] as const, {
     description: "Safety operation",
   }),
   filePath: Type.Optional(
-    Type.String({ description: "File path (required for history, optional for undo)" }),
+    Type.String({
+      description:
+        "File path (required for history, optional for undo). Absolute or relative to project root.",
+    }),
   ),
   name: Type.Optional(
     Type.String({ description: "Checkpoint name (required for checkpoint, restore)" }),
@@ -169,7 +180,52 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if ((params.op === "checkpoint" || params.op === "restore") && !params.name) {
         throw new Error(`op='${params.op}' requires 'name'`);
       }
+
+      const filePath = params.filePath
+        ? await resolvePathArg(extCtx.cwd, params.filePath)
+        : undefined;
+      // Coerce at the boundary: a bare-string/JSON-stringified `files` would
+      // otherwise crash the unchecked `.map` below before validation.
+      const fileInputs = coerceStringArray(params.files);
+      const files =
+        fileInputs.length > 0
+          ? await Promise.all(fileInputs.map((file) => resolvePathArg(extCtx.cwd, file)))
+          : undefined;
       const bridge = bridgeFor(ctx, extCtx.cwd);
+      const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
+
+      if (params.op === "undo") {
+        const previewReq: Record<string, unknown> = {};
+        if (filePath) previewReq.file = filePath;
+        const preview = await callBridge(bridge, "undo_preview", previewReq, extCtx);
+        for (const file of new Set(responsePaths(preview))) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot,
+          });
+        }
+      }
+      if (params.op === "checkpoint") {
+        const checkpointFiles = files ?? (filePath ? [filePath] : undefined);
+        if (Array.isArray(checkpointFiles)) {
+          const checked = new Set<string>();
+          for (const file of checkpointFiles) {
+            if (checked.has(file)) continue;
+            checked.add(file);
+            await assertExternalDirectoryPermission(extCtx, file, "modify", {
+              restrictToProjectRoot,
+            });
+          }
+        }
+      }
+      if (params.op === "restore" && params.name) {
+        const preview = await callBridge(bridge, "checkpoint_paths", { name: params.name }, extCtx);
+        for (const file of new Set(responsePaths(preview))) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot,
+          });
+        }
+      }
+
       const commandMap: Record<string, string> = {
         undo: "undo",
         history: "edit_history",
@@ -185,15 +241,15 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         // auto-promote it into a single-entry `files` list rather than
         // silently dropping it and falling back to the whole tracked-file
         // set.
-        if (params.files) {
-          req.files = params.files;
-        } else if (params.filePath) {
-          req.files = [params.filePath];
+        if (files) {
+          req.files = files;
+        } else if (filePath) {
+          req.files = [filePath];
         }
       } else {
         // undo / history / restore / list all take `file` as-is.
-        if (params.filePath) req.file = params.filePath;
-        if (params.files) req.files = params.files;
+        if (filePath) req.file = filePath;
+        if (files) req.files = files;
       }
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));

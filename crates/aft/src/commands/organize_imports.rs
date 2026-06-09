@@ -10,11 +10,12 @@
 //! `use std::path::{Path, PathBuf};`). This implements D045's deferred merging.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::context::AppContext;
 use crate::edit;
-use crate::imports::{self, ImportGroup, ImportKind, ImportStatement};
+use crate::imports::{self, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 
@@ -56,7 +57,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {
             return Response::error(
                 &req.id,
-                "invalid_request",
+                "unsupported_language",
                 format!(
                     "organize_imports: unsupported file extension: {}",
                     path.extension()
@@ -70,7 +71,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     if !imports::is_supported(lang) {
         return Response::error(
             &req.id,
-            "invalid_request",
+            "unsupported_language",
             format!(
                 "organize_imports: import management not yet supported for {:?}",
                 lang
@@ -86,6 +87,12 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&_tree) {
+            return Response::error(&req.id, err.code(), err.message("organize_imports"));
+        }
+    }
+
     if block.imports.is_empty() {
         log::debug!("organize_imports: {} (no imports)", file);
         return Response::success(
@@ -94,7 +101,36 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
                 "file": file,
                 "groups": [],
                 "removed_duplicates": 0,
+                "no_op": true,
             }),
+        );
+    }
+
+    let spans_multiple_regions = if lang == LangId::Go {
+        go_import_declarations_span_multiple_code_regions(&source, &_tree)
+    } else {
+        imports_span_multiple_code_regions(&source, lang, &block.imports)
+    };
+
+    if spans_multiple_regions {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "organize_imports: imports in {file} span multiple code regions; refusing to organize because replacing the combined import range would corrupt intervening code"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
+    if lang == LangId::Go && go_grouped_import_block_has_comments(&_tree) {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_import_comments",
+            format!(
+                "organize_imports: Go grouped import block in {file} contains comments; refusing to organize because regrouping would drop or detach them"
+            ),
+            serde_json::json!({ "file": file }),
         );
     }
 
@@ -114,7 +150,8 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Organize: group, sort, dedup ---
     let original_count = block.imports.len();
-    let (grouped, removed_duplicates) = organize(&block.imports, lang);
+    let comment_gaps = import_gaps_contain_comments(&source, lang, &block.imports);
+    let (mut grouped, mut removed_duplicates) = organize(&block.imports, lang);
 
     // --- Generate new import block ---
     let grouped_go_range = if matches!(lang, LangId::Go) {
@@ -122,14 +159,29 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
+    let go_import_declarations_range = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
+        imports::go_import_declarations_range(&source, &_tree)
+    } else {
+        None
+    };
     let new_import_text = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
         generate_go_grouped_block(&grouped)
+    } else if comment_gaps {
+        let (preserved_grouped, preserved_removed, preserved_text) =
+            organize_preserving_comment_gaps(&source, lang, &block.imports);
+        grouped = preserved_grouped;
+        removed_duplicates = preserved_removed;
+        preserved_text
     } else {
         generate_organized_block(&grouped, lang)
     };
 
     // --- Replace import region ---
-    let import_range = match grouped_go_range.as_ref().or(block.byte_range.as_ref()) {
+    let import_range = match go_import_declarations_range
+        .as_ref()
+        .or(grouped_go_range.as_ref())
+        .or(block.byte_range.as_ref())
+    {
         Some(range) => range,
         None => {
             return Response::error(
@@ -160,6 +212,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
+    }
+
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — imports were NOT reorganized. Report that honestly with an
+    // error instead of claiming `organized: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "organize_imports: reorganizing imports in {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
     }
 
     log::debug!("organize_imports: {}", file);
@@ -207,16 +272,297 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, result)
 }
 
+fn go_import_declarations_span_multiple_code_regions(
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_declaration" {
+                ranges.push(node.byte_range());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    ranges.windows(2).any(|pair| {
+        let previous = &pair[0];
+        let next = &pair[1];
+        previous.end > next.start
+            || !import_gap_is_trivia(source, LangId::Go, previous.end..next.start)
+    })
+}
+
+fn go_grouped_import_block_has_comments(tree: &tree_sitter::Tree) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_declaration"
+                && go_import_declaration_is_grouped(&node)
+                && node_contains_comment(node)
+            {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn go_import_declaration_is_grouped(node: &tree_sitter::Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().kind() == "import_spec_list" {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn node_contains_comment(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() == "comment" {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if node_contains_comment(cursor.node()) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+pub(crate) fn imports_span_multiple_code_regions(
+    source: &str,
+    lang: LangId,
+    imports: &[ImportStatement],
+) -> bool {
+    imports.windows(2).any(|pair| {
+        let previous = &pair[0];
+        let next = &pair[1];
+        if previous.byte_range.end > next.byte_range.start {
+            return true;
+        }
+
+        !import_gap_is_trivia(source, lang, previous.byte_range.end..next.byte_range.start)
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImportGapTrivia {
+    has_comment: bool,
+}
+
+fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool {
+    scan_import_gap(source, lang, range).is_some()
+}
+
+fn import_gap_has_comment(source: &str, lang: LangId, range: Range<usize>) -> bool {
+    scan_import_gap(source, lang, range)
+        .map(|gap| gap.has_comment)
+        .unwrap_or(false)
+}
+
+fn scan_import_gap(source: &str, lang: LangId, range: Range<usize>) -> Option<ImportGapTrivia> {
+    let gap = source.get(range)?;
+
+    let mut offset = 0;
+    let mut has_comment = false;
+    while offset < gap.len() {
+        let rest = &gap[offset..];
+        let ch = rest
+            .chars()
+            .next()
+            .expect("offset is within the trivia gap");
+
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--[[") {
+            let end = rest.find("]]")?;
+            offset += end + 2;
+            has_comment = true;
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--") {
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
+        }
+
+        if supports_slash_line_comments(lang) && rest.starts_with("//") {
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
+        }
+
+        if supports_block_comments(lang) && rest.starts_with("/*") {
+            let end = rest.find("*/")?;
+            offset += end + 2;
+            has_comment = true;
+            continue;
+        }
+
+        if supports_hash_line_comments(lang) && rest.starts_with('#') {
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
+        }
+
+        return None;
+    }
+
+    Some(ImportGapTrivia { has_comment })
+}
+
+fn line_comment_len(rest: &str) -> usize {
+    rest.find('\n').unwrap_or(rest.len())
+}
+
+fn supports_slash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Go
+            | LangId::Rust
+            | LangId::Solidity
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Swift
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+    )
+}
+
+fn supports_block_comments(lang: LangId) -> bool {
+    supports_slash_line_comments(lang)
+}
+
+fn supports_hash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Python | LangId::Ruby | LangId::Perl | LangId::Php
+    )
+}
+
+fn import_gaps_contain_comments(source: &str, lang: LangId, imports: &[ImportStatement]) -> bool {
+    imports.windows(2).any(|pair| {
+        import_gap_has_comment(
+            source,
+            lang,
+            pair[0].byte_range.end..pair[1].byte_range.start,
+        )
+    })
+}
+
+fn organize_preserving_comment_gaps(
+    source: &str,
+    lang: LangId,
+    imports: &[ImportStatement],
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize, String) {
+    let mut grouped = Vec::new();
+    let mut removed_duplicates = 0;
+    let mut output = String::new();
+    let mut segment_start = 0;
+
+    for idx in 0..imports.len() {
+        let next_gap = imports.get(idx + 1).map(|next| {
+            let range = imports[idx].byte_range.end..next.byte_range.start;
+            (import_gap_has_comment(source, lang, range.clone()), range)
+        });
+        let is_boundary = next_gap
+            .as_ref()
+            .map(|(has_comment, _)| *has_comment)
+            .unwrap_or(true);
+
+        if !is_boundary {
+            continue;
+        }
+
+        let mut refs: Vec<&ImportStatement> = imports[segment_start..=idx].iter().collect();
+        refs.sort_by_key(|imp| imp.byte_range.start);
+        let (segment_grouped, segment_removed) = organize_ordered_import_refs(&refs, lang);
+        output.push_str(&generate_organized_block(&segment_grouped, lang));
+        grouped.extend(segment_grouped);
+        removed_duplicates += segment_removed;
+
+        if let Some((true, range)) = next_gap {
+            if let Some(gap) = source.get(range) {
+                output.push_str(gap);
+            }
+        }
+
+        segment_start = idx + 1;
+    }
+
+    (grouped, removed_duplicates, output)
+}
+
 /// Organize imports: group by convention, sort within groups, deduplicate.
 /// Returns (grouped imports in order, count of removed duplicates).
 fn organize(
     imports: &[ImportStatement],
     lang: LangId,
 ) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
+    let mut refs: Vec<&ImportStatement> = imports.iter().collect();
+    refs.sort_by_key(|imp| imp.byte_range.start);
+    organize_ordered_import_refs(&refs, lang)
+}
+
+fn organize_ordered_import_refs(
+    refs: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
+    if preserves_side_effect_order(lang)
+        && refs.iter().any(|imp| imp.kind == ImportKind::SideEffect)
+    {
+        return organize_preserving_side_effect_order(refs, lang);
+    }
+
+    organize_import_refs(refs, lang)
+}
+
+fn organize_import_refs(
+    imports: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
     // Group imports
     let mut groups: BTreeMap<ImportGroup, Vec<&ImportStatement>> = BTreeMap::new();
     for imp in imports {
-        groups.entry(imp.group).or_default().push(imp);
+        groups.entry(imp.group).or_default().push(*imp);
     }
 
     let mut result: Vec<(ImportGroup, Vec<OrganizedImport>)> = Vec::new();
@@ -225,6 +571,8 @@ fn organize(
     for (group, imps) in &groups {
         let (organized, removed) = if matches!(lang, LangId::Rust) {
             organize_rust_group(imps)
+        } else if should_preserve_raw_on_organize(lang) {
+            organize_raw_preserving_group(imps)
         } else {
             organize_generic_group(imps, lang)
         };
@@ -237,6 +585,84 @@ fn organize(
     (result, total_removed)
 }
 
+fn preserves_side_effect_order(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue | LangId::Lua
+    )
+}
+
+fn organize_preserving_side_effect_order(
+    imports: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
+    let mut result = Vec::new();
+    let mut total_removed = 0;
+    let mut segment: Vec<&ImportStatement> = Vec::new();
+
+    for imp in imports {
+        if imp.kind == ImportKind::SideEffect {
+            let (mut grouped, removed) = organize_import_refs(&segment, lang);
+            result.append(&mut grouped);
+            total_removed += removed;
+            segment.clear();
+
+            result.push((imp.group, vec![organized_from_statement(imp, lang)]));
+        } else {
+            segment.push(*imp);
+        }
+    }
+
+    let (mut grouped, removed) = organize_import_refs(&segment, lang);
+    result.append(&mut grouped);
+    total_removed += removed;
+
+    (result, total_removed)
+}
+
+fn organized_from_statement(imp: &ImportStatement, lang: LangId) -> OrganizedImport {
+    let mut names = imp.names.clone();
+    sort_named_specifiers(&mut names);
+    let raw_override = should_preserve_raw_on_organize(lang)
+        .then(|| imp.raw_text.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    OrganizedImport {
+        module_path: imp.module_path.clone(),
+        names,
+        default_import: imp.default_import.clone(),
+        namespace_import: imp.namespace_import.clone(),
+        kind: imp.kind,
+        raw_override,
+    }
+}
+
+fn should_preserve_raw_on_organize(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Scala
+            | LangId::Java
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Kotlin
+            | LangId::Solidity
+            | LangId::Swift
+            | LangId::Ruby
+            | LangId::Lua
+            | LangId::Perl
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+            // Python: the structured parser captures only the FIRST module of a
+            // multi-module `import os, sys` statement, so the generic regenerate
+            // path dropped `sys` (silent data loss). Raw-preserve keeps each
+            // statement's source text verbatim — no merge of `from X import a` +
+            // `from X import b`, but zero corruption. Grouping/sort/dedup still
+            // apply per group.
+            | LangId::Python
+    )
+}
+
 /// An organized import ready for code generation.
 #[derive(Debug, Clone)]
 struct OrganizedImport {
@@ -245,6 +671,11 @@ struct OrganizedImport {
     default_import: Option<String>,
     namespace_import: Option<String>,
     kind: ImportKind,
+    /// When set, the import is rendered verbatim from this string instead of
+    /// being regenerated from the structured fields. Used by dialect-sensitive
+    /// languages (e.g. Scala) where re-rendering would normalize across
+    /// incompatible syntax variants and corrupt the source.
+    raw_override: Option<String>,
 }
 
 /// Organize a group of non-Rust imports: sort by module path, deduplicate.
@@ -306,10 +737,70 @@ fn organize_generic_group(
             default_import: imp.default_import.clone(),
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
+            raw_override: None,
         });
     }
 
     (organized, removed)
+}
+
+fn organize_raw_preserving_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usize) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut side_effects: Vec<&ImportStatement> = Vec::new();
+    let mut sorted: Vec<&ImportStatement> = Vec::new();
+    let mut removed = 0;
+
+    for imp in imps {
+        let raw = imp.raw_text.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        let key = raw_preserving_dedup_key(imp);
+        if !seen.insert(key) {
+            removed += 1;
+            continue;
+        }
+
+        if imp.kind == ImportKind::SideEffect {
+            side_effects.push(*imp);
+        } else {
+            sorted.push(*imp);
+        }
+    }
+
+    sorted.sort_by(|a, b| a.raw_text.trim().cmp(b.raw_text.trim()));
+    side_effects.extend(sorted);
+
+    let organized = side_effects
+        .into_iter()
+        .map(|imp| OrganizedImport {
+            module_path: imp.module_path.clone(),
+            names: imp.names.clone(),
+            default_import: imp.default_import.clone(),
+            namespace_import: imp.namespace_import.clone(),
+            kind: imp.kind,
+            raw_override: Some(imp.raw_text.trim().to_string()),
+        })
+        .collect();
+
+    (organized, removed)
+}
+
+fn raw_preserving_dedup_key(imp: &ImportStatement) -> String {
+    let mut form = imp.form.clone();
+    match &mut form {
+        ImportForm::Structured { named, .. }
+        | ImportForm::Solidity { named, .. }
+        | ImportForm::Es { named, .. }
+        | ImportForm::Python { named, .. }
+        | ImportForm::RustUse { named, .. } => sort_named_specifiers(named),
+        ImportForm::Go { .. } => {}
+    }
+
+    format!("{}|{:?}|{:?}", imp.module_path, imp.kind, form)
 }
 
 fn sort_named_specifiers(names: &mut [String]) {
@@ -336,14 +827,17 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
         /// Leaf item(s) for merging (e.g. ["Path"])
         items: Vec<String>,
         kind: ImportKind,
-        is_pub: bool,
+        /// Exact visibility text (`pub`, `pub(crate)`, …) or None for private.
+        /// Part of the merge key so different visibilities don't merge, and
+        /// re-emitted verbatim so `pub(crate) use` isn't widened to `pub use`.
+        visibility: Option<String>,
     }
 
     let mut paths: Vec<UsePath> = Vec::new();
     let mut removed = 0;
 
     for imp in imps {
-        let is_pub = imp.default_import.as_deref() == Some("pub");
+        let visibility = imp.default_import.clone();
         let mp = &imp.module_path;
 
         // Check if this already has a use list (contains '{')
@@ -353,8 +847,14 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             if let Some(brace_pos) = mp.find("::{") {
                 let prefix = mp[..brace_pos].to_string();
                 let items_str = &mp[brace_pos + 3..mp.len() - 1]; // strip ::{ and }
-                let items: Vec<String> = items_str
-                    .split(',')
+                                                                  // Split on TOP-LEVEL commas only. A naive split(',') corrupts
+                                                                  // nested use trees like `hash_map::{Entry, HashMap}, BTreeMap`
+                                                                  // into `hash_map::{Entry` / `HashMap}` / `BTreeMap`, which then
+                                                                  // sort and regroup into invalid Rust. Brace-aware splitting keeps
+                                                                  // each nested subtree intact as one opaque item, so re-emitting
+                                                                  // `prefix::{items}` stays syntactically valid.
+                let items: Vec<String> = split_top_level_commas(items_str)
+                    .into_iter()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -363,7 +863,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     prefix: Some(prefix),
                     items,
                     kind: imp.kind,
-                    is_pub,
+                    visibility: visibility.clone(),
                 });
             } else {
                 paths.push(UsePath {
@@ -371,7 +871,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     prefix: None,
                     items: vec![],
                     kind: imp.kind,
-                    is_pub,
+                    visibility: visibility.clone(),
                 });
             }
         } else if let Some(last_sep) = mp.rfind("::") {
@@ -383,7 +883,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                 prefix: Some(prefix),
                 items: vec![item],
                 kind: imp.kind,
-                is_pub,
+                visibility: visibility.clone(),
             });
         } else {
             // Single-segment like "serde" — no prefix to merge on
@@ -392,14 +892,15 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                 prefix: None,
                 items: vec![],
                 kind: imp.kind,
-                is_pub,
+                visibility: visibility.clone(),
             });
         }
     }
 
-    // Group by (prefix, kind, is_pub) for merging
-    // key: (prefix, kind_discriminant, is_pub)
-    let mut merge_groups: BMap<(String, u8, bool), Vec<String>> = BMap::new();
+    // Group by (prefix, kind, visibility) for merging. Visibility is part of the
+    // key so `pub(crate) use a::X` never merges with `pub use a::Y`, and it is
+    // re-emitted verbatim (was: widened to bare `pub`).
+    let mut merge_groups: BMap<(String, u8, Option<String>), Vec<String>> = BMap::new();
     let mut no_prefix: Vec<OrganizedImport> = Vec::new();
 
     for up in &paths {
@@ -409,7 +910,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                 ImportKind::Type => 1,
                 ImportKind::SideEffect => 2,
             };
-            let key = (prefix.clone(), kind_d, up.is_pub);
+            let key = (prefix.clone(), kind_d, up.visibility.clone());
             let entry = merge_groups.entry(key).or_default();
             for item in &up.items {
                 if !entry.contains(item) {
@@ -423,7 +924,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             let already = no_prefix.iter().any(|o| {
                 o.module_path == up.full_path
                     && o.kind == up.kind
-                    && (o.default_import.as_deref() == Some("pub")) == up.is_pub
+                    && o.default_import == up.visibility
             });
             if already {
                 removed += 1;
@@ -431,13 +932,10 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                 no_prefix.push(OrganizedImport {
                     module_path: up.full_path.clone(),
                     names: vec![],
-                    default_import: if up.is_pub {
-                        Some("pub".to_string())
-                    } else {
-                        None
-                    },
+                    default_import: up.visibility.clone(),
                     namespace_import: None,
                     kind: up.kind,
+                    raw_override: None,
                 });
             }
         }
@@ -446,7 +944,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
     // Convert merge groups into OrganizedImport entries
     let mut organized: Vec<OrganizedImport> = Vec::new();
 
-    for ((prefix, kind_d, is_pub), mut items) in merge_groups {
+    for ((prefix, kind_d, visibility), mut items) in merge_groups {
         items.sort();
         let kind = match kind_d {
             1 => ImportKind::Type,
@@ -465,13 +963,10 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
         organized.push(OrganizedImport {
             module_path,
             names: vec![],
-            default_import: if is_pub {
-                Some("pub".to_string())
-            } else {
-                None
-            },
+            default_import: visibility,
             namespace_import: None,
             kind,
+            raw_override: None,
         });
     }
 
@@ -489,23 +984,61 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
     (organized, removed)
 }
 
+/// Split a Rust use-list body on TOP-LEVEL commas only, treating nested
+/// `{...}` (and defensively `[...]`/`(...)`) as opaque so commas inside a
+/// nested subtree do not split it.
+///
+/// `"hash_map::{Entry, HashMap}, BTreeMap"` -> `["hash_map::{Entry, HashMap}", "BTreeMap"]`
+/// `"Deserialize, Serialize"`               -> `["Deserialize", "Serialize"]`
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(s[start..].to_string());
+    items
+}
+
 /// Generate the full organized import block text.
 fn generate_organized_block(
     grouped: &[(ImportGroup, Vec<OrganizedImport>)],
     lang: LangId,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut output = String::new();
+    let mut previous_group: Option<ImportGroup> = None;
 
-    for (_, imps) in grouped {
+    for (group, imps) in grouped {
         let mut lines: Vec<String> = Vec::new();
         for imp in imps {
             let line = generate_organized_line(imp, lang);
             lines.push(line);
         }
-        parts.push(lines.join("\n"));
+        if lines.is_empty() {
+            continue;
+        }
+
+        if !output.is_empty() {
+            if previous_group == Some(*group) {
+                output.push('\n');
+            } else {
+                output.push_str("\n\n");
+            }
+        }
+        output.push_str(&lines.join("\n"));
+        previous_group = Some(*group);
     }
 
-    parts.join("\n\n")
+    output
 }
 
 fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) -> String {
@@ -529,14 +1062,18 @@ fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) ->
 
 /// Generate a single import line from an OrganizedImport.
 fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
+    if let Some(ref raw) = imp.raw_override {
+        return raw.clone();
+    }
     match lang {
         LangId::Rust => {
-            let prefix = if imp.default_import.as_deref() == Some("pub") {
-                "pub "
-            } else {
-                ""
-            };
-            format!("{}use {};", prefix, imp.module_path)
+            // default_import carries the exact visibility text (`pub`,
+            // `pub(crate)`, `pub(super)`, …); emit it verbatim so restricted
+            // visibilities aren't widened to bare `pub`.
+            match imp.default_import.as_deref() {
+                Some(vis) if !vis.is_empty() => format!("{} use {};", vis, imp.module_path),
+                _ => format!("use {};", imp.module_path),
+            }
         }
         LangId::Go => {
             // Go organize: regenerate as standalone imports
@@ -557,11 +1094,12 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
         }
         _ => {
             // TS/JS/TSX/Python — use the standard generator
-            imports::generate_import_line(
+            imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
                 &imp.names,
                 imp.default_import.as_deref(),
+                imp.namespace_import.as_deref(),
                 imp.kind == ImportKind::Type,
             )
         }

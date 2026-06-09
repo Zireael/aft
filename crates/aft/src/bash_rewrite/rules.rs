@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
-use crate::bash_rewrite::footer::add_footer;
+use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
 use crate::bash_rewrite::parser::parse;
 use crate::bash_rewrite::RewriteRule;
 use crate::context::AppContext;
@@ -32,9 +32,9 @@ impl RewriteRule for GrepRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "grep").ok_or("not a grep rewrite")?;
-        try_call_and_footer(
+        try_call_and_grep_footer(
             crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
-            "grep",
+            ctx,
         )
     }
 }
@@ -55,9 +55,9 @@ impl RewriteRule for RgRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "rg").ok_or("not an rg rewrite")?;
-        try_call_and_footer(
+        try_call_and_grep_footer(
             crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
-            "grep",
+            ctx,
         )
     }
 }
@@ -196,22 +196,43 @@ fn request(command: &str, params: Value, session_id: Option<&str>) -> RawRequest
 /// Returning a wrapped error response would surprise the agent (e.g. read's
 /// `outside project root` rejecting a sed that bash would have allowed).
 fn try_call_and_footer(response: Response, replacement_tool: &str) -> Result<Response, String> {
-    if !response.success {
-        let message = response
-            .data
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| response.data.get("code").and_then(Value::as_str))
-            .unwrap_or("error");
-        return Err(format!("{} declined: {}", replacement_tool, message));
+    if let Some(err) = declined_error(&response, replacement_tool) {
+        return Err(err);
     }
     Ok(call_and_footer(response, replacement_tool))
 }
 
-fn call_and_footer(mut response: Response, replacement_tool: &str) -> Response {
+/// Grep/rg variant: same decline handling, but the footer is the enforced
+/// code-search redirect, steering to `aft_search` when it's registered.
+fn try_call_and_grep_footer(response: Response, ctx: &AppContext) -> Result<Response, String> {
+    if let Some(err) = declined_error(&response, "grep") {
+        return Err(err);
+    }
     let output = response_output(&response.data);
-    let output = add_footer(&output, replacement_tool);
+    let footered = add_grep_footer(&output, ctx.config().aft_search_registered);
+    Ok(apply_footer(response, footered))
+}
 
+fn declined_error(response: &Response, replacement_tool: &str) -> Option<String> {
+    if response.success {
+        return None;
+    }
+    let message = response
+        .data
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| response.data.get("code").and_then(Value::as_str))
+        .unwrap_or("error");
+    Some(format!("{replacement_tool} declined: {message}"))
+}
+
+fn call_and_footer(response: Response, replacement_tool: &str) -> Response {
+    let output = response_output(&response.data);
+    let footered = add_footer(&output, replacement_tool);
+    apply_footer(response, footered)
+}
+
+fn apply_footer(mut response: Response, output: String) -> Response {
     if let Some(object) = response.data.as_object_mut() {
         object.insert("output".to_string(), Value::String(output.clone()));
 
@@ -343,7 +364,17 @@ fn find_request(command: &str) -> Option<Value> {
     if path == "." {
         Some(json!({ "pattern": pattern }))
     } else {
-        Some(json!({ "path": path.trim_end_matches('/'), "pattern": pattern }))
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            // Filesystem root (`find / ...`, `find // ...`): trimming the slash
+            // yields "" which downstream resolves as the PROJECT ROOT — silently
+            // searching the project instead of the whole filesystem. Don't
+            // rewrite; fall through to native `find`, which does what was asked.
+            // (A non-empty absolute path like `/tmp/foo` is preserved as-is.)
+            None
+        } else {
+            Some(json!({ "path": trimmed, "pattern": pattern }))
+        }
     }
 }
 
@@ -499,5 +530,13 @@ mod tests {
             find_request(r#"find /tmp/foo/ -name "*.ts""#),
             Some(json!({ "path": "/tmp/foo", "pattern": "**/*.ts" }))
         );
+    }
+
+    #[test]
+    fn find_filesystem_root_is_not_rewritten() {
+        // `find /` must NOT rewrite — trimming the slash would yield "" which
+        // resolves as the project root, silently searching the wrong scope.
+        assert_eq!(find_request(r#"find / -name "*.rs""#), None);
+        assert_eq!(find_request(r#"find // -name "*.rs""#), None);
     }
 }

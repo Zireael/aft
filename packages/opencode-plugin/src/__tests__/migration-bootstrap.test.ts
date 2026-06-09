@@ -5,8 +5,22 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { registerShutdownCleanup } from "../shutdown-hooks.js";
 
 type OpenCodePlugin = typeof import("../index.js").default;
+
+// Match PLUGIN_VERSION from package.json so the fake binary the resolver finds
+// satisfies the version-match expectation in findBinary. Without this, every
+// release that bumps the plugin version breaks the test because the resolver
+// rejects the cached fake at the old version path.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require("../../package.json") as { version: string }).version;
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 describe.serial("OpenCode migration bootstrap", () => {
   let tempDir: string;
@@ -16,7 +30,7 @@ describe.serial("OpenCode migration bootstrap", () => {
   let cachedAft: string;
 
   function writeFakeAft(exitCode: number): void {
-    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft 0.26.4"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
+    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft ${PLUGIN_VERSION}"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
     writeFileSync(aftPath, contents, "utf8");
     chmodSync(aftPath, 0o755);
     writeFileSync(cachedAft, contents, "utf8");
@@ -42,8 +56,8 @@ describe.serial("OpenCode migration bootstrap", () => {
       AFT_MIGRATION_ARGS_LOG: argsLog,
     });
 
-    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.26.4", "aft");
-    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.26.4"), { recursive: true });
+    cachedAft = join(xdgCacheHome, "aft", "bin", `v${PLUGIN_VERSION}`, "aft");
+    mkdirSync(join(xdgCacheHome, "aft", "bin", `v${PLUGIN_VERSION}`), { recursive: true });
     writeFakeAft(0);
 
     mkdirSync(opencodeConfigDir, { recursive: true });
@@ -98,6 +112,25 @@ describe.serial("OpenCode migration bootstrap", () => {
     expect(argv).toContain(join(process.env.XDG_DATA_HOME as string, "cortexkit", "aft"));
 
     await hooks.dispose?.();
+  });
+
+  test("opencode_plugin_exposes_dispose_that_runs_shutdown_cleanups", async () => {
+    const plugin = await loadPlugin();
+    const hooks = (await plugin({
+      directory: tempDir,
+      client: {},
+    } as Parameters<OpenCodePlugin>[0])) as {
+      dispose?: () => Promise<void>;
+    };
+    let cleanupRan = false;
+    registerShutdownCleanup(() => {
+      cleanupRan = true;
+    });
+
+    expect(typeof hooks.dispose).toBe("function");
+    await hooks.dispose?.();
+
+    expect(cleanupRan).toBe(true);
   });
 
   test("opencode_plugin_aborts_on_migration_error", async () => {

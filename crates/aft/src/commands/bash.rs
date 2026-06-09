@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -14,8 +14,11 @@ use crate::protocol::{RawRequest, Response, ERROR_PERMISSION_REQUIRED};
 // layer's polling wait-window, decoupled from the task budget. See council
 // decision in .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
 // for the full rationale.
-#[cfg(test)]
-const INLINE_OUTPUT_LIMIT: usize = 30 * 1024;
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+const MAX_PTY_ROWS: u16 = 60;
+const MAX_PTY_COLS: u16 = 140;
+
 const BLOCKED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -42,6 +45,10 @@ struct BashParams {
     background: bool,
     #[serde(default)]
     pty: bool,
+    #[serde(default)]
+    pty_rows: Option<u16>,
+    #[serde(default)]
+    pty_cols: Option<u16>,
     #[serde(default = "default_notify_on_completion")]
     notify_on_completion: bool,
     #[serde(default = "default_compressed")]
@@ -75,12 +82,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         log::debug!("bash description: {description}");
     }
 
-    if params.pty && !params.background {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            "PTY mode requires background: true",
-        );
+    // NOTE (v0.30.1 prep, unblock-only): the previous two rejections
+    // ("PTY mode requires background: true" and "ptyRows/ptyCols require
+    // pty: true") have been removed so that:
+    //   1. pty:true silently implies background:true (handled below by
+    //      passing `params.background || params.pty` to bash_background::spawn)
+    //   2. ptyRows/ptyCols are silently ignored when pty:false instead of
+    //      rejecting agent calls that defensively include the params
+    // Bounds validation (1..60 rows, 1..140 cols) still applies via
+    // `validate_pty_dimensions` below.
+
+    if let Err(message) = validate_pty_dimensions(params.pty_rows, params.pty_cols) {
+        return Response::error(&req.id, "invalid_request", message);
     }
 
     if let Some(blocked) = blocked_env_var(&params.env) {
@@ -111,19 +124,43 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if let Some(mut response) =
-        crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
-    {
-        // Rewriter rules build their own internal request with a placeholder id
-        // (e.g. "bash_rewrite") to call into read/grep/glob handlers. Stamp the
-        // original bash request id back onto the response so the bridge correlates
-        // it with the in-flight `send()` instead of timing out.
-        response.id = req.id.clone();
-        return response;
+    // Rewrite (cat→read, grep→grep tool, append→edit, …) resolves relative
+    // paths via ctx.validate_path, i.e. against the PROJECT ROOT — it has no
+    // notion of the bash cwd. So it's only faithful when the effective workdir
+    // IS the project root. With an explicit different `workdir`, a rewritten
+    // `echo hi >> notes.txt` would write project_root/notes.txt instead of
+    // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
+    // optimization, so skip it and let native bash (which honors cwd) run the
+    // command verbatim when the workdir differs from the project root.
+    if workdir_matches_project_root(&workdir, ctx) {
+        if let Some(mut response) =
+            crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
+        {
+            // Rewriter rules build their own internal request with a placeholder
+            // id (e.g. "bash_rewrite") to call into read/grep/glob handlers.
+            // Stamp the original bash request id back onto the response so the
+            // bridge correlates it with the in-flight `send()` instead of timing
+            // out.
+            response.id = req.id.clone();
+            return response;
+        }
     }
 
     let workdir = params.workdir.clone();
     let env = (!params.env.is_empty()).then_some(params.env.clone());
+    // pty:true silently implies background:true so agents don't need to know
+    // both flags. The PTY runtime requires a polling lifecycle regardless.
+    let effective_background = params.background || params.pty;
+    // Treat ptyRows/ptyCols == 0 as "use default" so empty-sentinel-style
+    // agent calls don't trip bounds validation.
+    let pty_rows = params
+        .pty_rows
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PTY_ROWS);
+    let pty_cols = params
+        .pty_cols
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PTY_COLS);
     crate::bash_background::spawn(
         &req.id,
         req.session(),
@@ -132,11 +169,25 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         env,
         params.timeout,
         ctx,
-        params.background,
+        effective_background,
         params.notify_on_completion,
         params.compressed,
         params.pty,
+        pty_rows,
+        pty_cols,
     )
+}
+
+fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &'static str> {
+    // 0 is silently treated as "use default" (see handle()); only reject
+    // explicit out-of-bound positive values.
+    if rows.is_some_and(|value| value > MAX_PTY_ROWS) {
+        return Err("ptyRows must be an integer between 1 and 60");
+    }
+    if cols.is_some_and(|value| value > MAX_PTY_COLS) {
+        return Err("ptyCols must be an integer between 1 and 140");
+    }
+    Ok(())
 }
 
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {
@@ -181,6 +232,23 @@ fn default_compressed() -> bool {
 
 fn default_notify_on_completion() -> bool {
     true
+}
+
+/// Is the effective bash workdir the same directory as the project root? Used
+/// to gate command rewriting, which resolves relative paths against the project
+/// root and would otherwise target the wrong file when an explicit workdir
+/// differs. Canonicalizes both sides so a relative workdir or a /var↔/private/var
+/// symlink alias still compares equal; falls back to a plain compare when
+/// canonicalization fails (e.g. a not-yet-existing dir — native bash handles it).
+fn workdir_matches_project_root(workdir: &Path, ctx: &AppContext) -> bool {
+    let Some(root) = ctx.config().project_root.clone() else {
+        // No project root → rewrite handlers resolve against process cwd via
+        // default_workdir, which equals the workdir default here. Only match when
+        // the caller didn't pass a divergent explicit workdir.
+        return workdir == default_workdir(ctx);
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(workdir) == canon(&root) || workdir == root
 }
 
 fn default_workdir(ctx: &AppContext) -> PathBuf {
@@ -254,89 +322,42 @@ where
     ))
 }
 
-/// Compute the byte index where the last `INLINE_OUTPUT_LIMIT` bytes of
-/// `output` start, snapped forward to a UTF-8 character boundary so we
-/// never split a multi-byte char.
-///
-/// The earlier implementation walked `char_indices().rev().find_map(...)`,
-/// which returned the LAST char's start index on the very first iteration
-/// (because `output.len() - idx == 1 <= INLINE_OUTPUT_LIMIT`). That bug
-/// made the inline preview a single character for any output above the
-/// limit. This helper computes the suffix start by byte arithmetic and
-/// keeps approximately `INLINE_OUTPUT_LIMIT` trailing bytes intact.
-#[cfg(test)]
-fn inline_output_suffix_start(output: &str) -> usize {
-    let mut start = output.len().saturating_sub(INLINE_OUTPUT_LIMIT);
-    while start < output.len() && !output.is_char_boundary(start) {
-        start += 1;
-    }
-    start
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::windows_shell::WindowsShell;
 
-    /// Regression: prior reverse `char_indices` logic returned only the LAST
-    /// character of `output` because the first reverse-iteration index already
-    /// satisfied `output.len() - idx == 1 <= INLINE_OUTPUT_LIMIT`. The new
-    /// implementation must keep approximately `INLINE_OUTPUT_LIMIT` trailing
-    /// bytes intact for ASCII input.
-    #[test]
-    fn inline_output_suffix_keeps_full_limit_for_ascii() {
-        let total = INLINE_OUTPUT_LIMIT * 2;
-        let output: String = "x".repeat(total);
-        let start = inline_output_suffix_start(&output);
-        let suffix_len = output.len() - start;
-        assert!(
-            suffix_len > INLINE_OUTPUT_LIMIT / 2,
-            "ascii suffix too short: got {suffix_len} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        assert!(
-            suffix_len <= INLINE_OUTPUT_LIMIT,
-            "ascii suffix exceeded limit: got {suffix_len} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        // Guard against a regression to the 1-char bug.
-        assert!(suffix_len > 1, "suffix collapsed to a single character");
+    fn ctx_with_root(root: &std::path::Path) -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        )
     }
 
-    /// The suffix-start index must always land on a UTF-8 char boundary so
-    /// `output[start..]` is a valid `&str`. Multi-byte chars (like 4-byte
-    /// emoji) require boundary snapping when the raw byte split lands inside
-    /// a code point.
+    // Command rewriting resolves relative paths against the project root, so it
+    // must only run when the effective workdir IS the project root — otherwise a
+    // rewritten `echo hi >> notes.txt` with workdir=subdir writes the wrong file.
     #[test]
-    fn inline_output_suffix_respects_utf8_boundaries() {
-        // Each crab is 4 bytes. 20_000 of them = 80_000 bytes, well over the
-        // inline limit. The byte index `len - INLINE_OUTPUT_LIMIT` is unlikely
-        // to be a 4-byte boundary.
-        let output: String = "🦀".repeat(20_000);
-        let start = inline_output_suffix_start(&output);
-        assert!(
-            output.is_char_boundary(start),
-            "suffix split a multi-byte char"
-        );
-        // Slicing must succeed without panic.
-        let suffix = &output[start..];
-        let suffix_bytes = suffix.len();
-        assert!(
-            suffix_bytes <= INLINE_OUTPUT_LIMIT + 4,
-            "utf8 suffix far above limit: got {suffix_bytes} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        assert!(
-            suffix_bytes > INLINE_OUTPUT_LIMIT / 2,
-            "utf8 suffix too short: got {suffix_bytes} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-    }
+    fn workdir_gate_matches_root_and_rejects_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sub = root.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let ctx = ctx_with_root(root);
 
-    /// Output below the inline limit is returned by `maybe_truncate` directly,
-    /// but the helper must still return `0` so callers slicing `output[start..]`
-    /// get the full string.
-    #[test]
-    fn inline_output_suffix_returns_zero_for_short_input() {
-        let output = "small";
-        assert_eq!(inline_output_suffix_start(output), 0);
+        // Project root itself matches (incl. /var↔/private/var symlink alias via
+        // canonicalize).
+        assert!(workdir_matches_project_root(root, &ctx));
+        assert!(workdir_matches_project_root(
+            &std::fs::canonicalize(root).unwrap(),
+            &ctx
+        ));
+        // A real subdirectory must NOT match → rewrite is skipped, native bash runs.
+        assert!(!workdir_matches_project_root(&sub, &ctx));
     }
 
     /// Issue #27: `WindowsShell::args` must produce shell-appropriate flags.

@@ -118,6 +118,7 @@ export interface PoolOptions extends BridgeOptions {
 export class BridgePool {
   /** Project-root → bridge. Key is a normalized canonical path. */
   private readonly bridges = new Map<string, PoolEntry>();
+  private readonly staleBridges = new Set<BinaryBridge>();
   private binaryPath: string;
   private readonly maxPoolSize: number;
   private readonly idleTimeoutMs: number;
@@ -147,8 +148,13 @@ export class BridgePool {
       onConfigureWarnings: options.onConfigureWarnings,
       onBashCompletion: options.onBashCompletion,
       onBashLongRunning: options.onBashLongRunning,
+      onBashPatternMatch: options.onBashPatternMatch,
       errorPrefix: options.errorPrefix,
       logger: options.logger,
+      // Forward the per-child env override so a pooled bridge honors the
+      // documented `BridgeOptions.childEnv` (PoolOptions extends BridgeOptions);
+      // omitting it silently dropped the override for pooled spawns.
+      childEnv: options.childEnv,
     };
     this.configOverrides = configOverrides;
     // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
@@ -238,6 +244,12 @@ export class BridgePool {
         this.bridges.delete(dir);
       }
     }
+
+    for (const bridge of this.staleBridges) {
+      if (bridge.hasPendingRequests()) continue;
+      bridge.shutdown().catch((err) => this.error("stale cleanup shutdown failed:", err));
+      this.staleBridges.delete(bridge);
+    }
   }
 
   /** Evict the least recently used bridge to make room. */
@@ -264,8 +276,12 @@ export class BridgePool {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
-    const shutdowns = Array.from(this.bridges.values()).map((e) => e.bridge.shutdown());
+    const shutdowns = [
+      ...Array.from(this.bridges.values(), (e) => e.bridge.shutdown()),
+      ...Array.from(this.staleBridges.values(), (bridge) => bridge.shutdown()),
+    ];
     this.bridges.clear();
+    this.staleBridges.clear();
     await Promise.allSettled(shutdowns);
   }
 
@@ -275,16 +291,20 @@ export class BridgePool {
    */
   async replaceBinary(newPath: string): Promise<string> {
     this.binaryPath = newPath;
-    // Clear the pool so next getBridge() creates fresh bridges with the new binary.
-    // Do NOT call shutdown() here: when replaceBinary() is invoked from a bridge's
-    // onVersionMismatch callback, shutdown() marks that in-flight bridge as
-    // shutting down before BinaryBridge.replaceCurrentBinary() can restart it,
-    // breaking the transparent retry path. Existing bridge processes are left to
-    // finish their current calls; the current bridge owns its coordinated restart
-    // after the callback returns.
+    // Move current pool entries aside so next getBridge() creates fresh bridges
+    // with the new binary, while still keeping the old processes reachable for
+    // cleanup/shutdown. Do NOT call shutdown() here: when replaceBinary() is
+    // invoked from a bridge's onVersionMismatch callback, shutdown() marks that
+    // in-flight bridge as shutting down before BinaryBridge.replaceCurrentBinary()
+    // can restart it, breaking the transparent retry path. Existing bridge
+    // processes are left to finish their current calls; cleanup drains them once
+    // they no longer have pending work.
+    for (const entry of this.bridges.values()) {
+      this.staleBridges.add(entry.bridge);
+    }
     this.bridges.clear();
     this.log(
-      `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
+      `Binary path updated to ${newPath}. Active bridges marked stale — next calls will use the new binary.`,
     );
     return newPath;
   }
@@ -351,6 +371,16 @@ export class BridgePool {
    */
   _testGetConfigOverrides(): Readonly<Record<string, unknown>> {
     return { ...this.configOverrides };
+  }
+
+  /**
+   * Test-only view of the per-bridge options forwarded to every spawned
+   * `BinaryBridge`. Lets tests assert that documented `BridgeOptions` fields
+   * (e.g. `childEnv`) are actually propagated through the pool rather than
+   * silently dropped.
+   */
+  _testGetBridgeOptions(): Readonly<BridgeOptions> {
+    return { ...this.bridgeOptions };
   }
 }
 

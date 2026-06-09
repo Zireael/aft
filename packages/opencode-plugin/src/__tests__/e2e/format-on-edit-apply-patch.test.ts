@@ -7,7 +7,7 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
-import { noopAsk } from "../test-helpers";
+import { noopAsk, toolResultText } from "../test-helpers";
 import {
   BIOME_TS_EXCLUDED_PRESET,
   BIOME_TS_PRESET,
@@ -68,6 +68,21 @@ function createSdkContext(directory: string): ToolContext {
   };
 }
 
+async function waitForBridgeReady(
+  pool: BridgePool,
+  directory: string,
+  sessionId: string | undefined,
+): Promise<void> {
+  const response = await pool.getBridge(directory).send("ping", {
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  if (response.success !== true) {
+    throw new Error(
+      `bridge readiness check failed: ${String(response.message ?? response.code ?? "unknown")}`,
+    );
+  }
+}
+
 async function createToolHarness(
   preparedBinary: PreparedBinary,
   preset: FormatPreset,
@@ -85,10 +100,12 @@ async function createToolHarness(
     { timeoutMs: 20_000 },
     { storage_dir: join(h.tempDir, ".storage"), harness: "opencode", ...configOverrides },
   );
+  const sdkCtx = createSdkContext(h.tempDir);
+  await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
   return {
     h,
     tools: hoistedTools(createPluginContext(pool, join(h.tempDir, ".storage"))),
-    sdkCtx: createSdkContext(h.tempDir),
+    sdkCtx,
     pool,
   };
 }
@@ -131,7 +148,7 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Created new.ts");
+    expect(toolResultText(output)).toContain("Created new.ts");
     expect(await readTextFile(h.path("new.ts"))).toBe(
       FIXTURES.ts_deformatted.replace(/ {2,}/g, " "),
     );
@@ -153,7 +170,7 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Updated existing.ts");
+    expect(toolResultText(output)).toContain("Updated existing.ts");
     expect(await readTextFile(h.path("existing.ts"))).toBe("export const value = 2;\n");
   });
 
@@ -175,8 +192,8 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Created added.ts");
-    expect(output).toContain("Updated old.ts");
+    expect(toolResultText(output)).toContain("Created added.ts");
+    expect(toolResultText(output)).toContain("Updated old.ts");
     expect(await readTextFile(h.path("added.ts"))).toBe("export const added = 1;\n");
     expect(await readTextFile(h.path("old.ts"))).toBe("export const oldValue = 2;\n");
   });
@@ -198,7 +215,7 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Updated and moved from.ts → nested/to.ts");
+    expect(toolResultText(output)).toContain("Updated and moved from.ts → nested/to.ts");
     await expect(readTextFile(h.path("from.ts"))).rejects.toThrow();
     expect(await readTextFile(h.path("nested", "to.ts"))).toBe("export const value = 3;\n");
   });
@@ -217,7 +234,7 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Deleted delete-me.ts");
+    expect(toolResultText(output)).toContain("Deleted delete-me.ts");
     await expect(readTextFile(h.path("delete-me.ts"))).rejects.toThrow();
     expect(await readTextFile(h.path("kept.ts"))).toBe("export    const   kept   = 1;\n");
   });
@@ -251,8 +268,8 @@ EOF
       sdkCtx,
     );
 
-    expect(output).toContain("Created src.ts");
-    expect(output).toContain("Created main.rs");
+    expect(toolResultText(output)).toContain("Created src.ts");
+    expect(toolResultText(output)).toContain("Created main.rs");
     expect(await readTextFile(h.path("src.ts"))).toBe("export const tsValue = 1;\n");
     expect(await readTextFile(h.path("main.rs"))).toBe("fn main() {\n    let x = 42;\n}\n");
   });
@@ -271,7 +288,7 @@ EOF
       sdkCtx,
     );
 
-    expect(output).toContain("Created scratch/foo.ts");
+    expect(toolResultText(output)).toContain("Created scratch/foo.ts");
     expect(await readTextFile(h.path("scratch", "foo.ts"))).toBe("export    const   foo   = 1;\n");
     const response = await h.bridge.send("write", {
       file: h.path("scratch", "probe.ts"),
@@ -315,7 +332,7 @@ EOF
       sdkCtx,
     );
 
-    expect(output).toContain("Created error.ts");
+    expect(toolResultText(output)).toContain("Created error.ts");
     expect(await readTextFile(h.path("error.ts"))).toBe("export    const   badFormat   = 1;\n");
     const response = await h.bridge.send("write", {
       file: h.path("error-probe.ts"),
@@ -343,9 +360,9 @@ EOF
       sdkCtx,
     );
 
-    expect(output).toContain("Created ok.ts");
-    expect(output).toContain("Failed to update target.ts");
-    expect(output).toContain("Patch partially applied");
+    expect(toolResultText(output)).toContain("Created ok.ts");
+    expect(toolResultText(output)).toContain("Failed to update target.ts");
+    expect(toolResultText(output)).toContain("Patch partially applied");
     expect(await readTextFile(h.path("ok.ts"))).toBe("export const ok = 1;\n");
     expect(await readTextFile(h.path("target.ts"))).toBe("export const target = 1;\n");
   });
@@ -386,7 +403,7 @@ EOF
       sdkCtx,
     );
 
-    expect(output).toContain("Created disabled.ts");
+    expect(toolResultText(output)).toContain("Created disabled.ts");
     expect(await readTextFile(h.path("disabled.ts"))).toBe("export    const   disabled   = 1;\n");
   });
 });

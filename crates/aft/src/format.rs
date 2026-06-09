@@ -20,12 +20,14 @@ pub struct ExternalToolResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub truncated: bool,
 }
 
 struct SubprocessOutcome {
     stdout: String,
     stderr: String,
     status: ExitStatus,
+    truncated: bool,
 }
 
 /// Errors from external tool execution.
@@ -102,9 +104,8 @@ fn isolate_in_process_group(cmd: &mut Command) {
 
 #[cfg(not(unix))]
 fn isolate_in_process_group(_cmd: &mut Command) {
-    // Best-effort no-op on Windows; child.kill() does not propagate
-    // to grandchildren but reader threads will still close pipes
-    // when the immediate child exits.
+    // Best-effort no-op outside Unix. Windows timeout cleanup uses taskkill /T
+    // in kill_process_tree so .cmd wrappers and grandchildren are terminated.
 }
 
 /// Kill the child and (on Unix) its entire process group, so orphaned
@@ -122,7 +123,19 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
@@ -175,37 +188,35 @@ pub fn run_external_tool(
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         exit_code,
+        truncated: outcome.truncated,
     })
 }
+
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 fn wait_with_timeout(
     mut child: Child,
     command: &str,
     timeout_secs: u32,
 ) -> Result<SubprocessOutcome, FormatError> {
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_thread =
+        thread::spawn(move || read_bounded_to_string(stdout_pipe, MAX_CAPTURE_BYTES));
+    let stderr_thread =
+        thread::spawn(move || read_bounded_to_string(stderr_pipe, MAX_CAPTURE_BYTES));
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = stdout_thread.join().unwrap_or_default();
-                let stderr = stderr_thread.join().unwrap_or_default();
+                let (stdout, stdout_truncated) = stdout_thread.join().unwrap_or_default();
+                let (stderr, stderr_truncated) = stderr_thread.join().unwrap_or_default();
                 return Ok(SubprocessOutcome {
                     stdout,
                     stderr,
                     status,
+                    truncated: stdout_truncated || stderr_truncated,
                 });
             }
             Ok(None) => {
@@ -234,6 +245,33 @@ fn wait_with_timeout(
             }
         }
     }
+}
+
+fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool) {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut scratch = [0u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let read = match reader.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = remaining.min(read);
+            bytes.extend_from_slice(&scratch[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
 /// TTL for tool availability and resolution cache entries.
@@ -296,20 +334,21 @@ fn resolve_tool(command: &str, project_root: Option<&Path>) -> Option<String> {
     resolved.map(|path| path.to_string_lossy().to_string())
 }
 
-fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<PathBuf> {
-    // 1. Check node_modules/.bin/<command> relative to project root
+pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<PathBuf> {
+    // 1. Check node_modules/.bin/<command> relative to project root. On
+    // Windows, package managers usually create .cmd/.bat/.ps1 shims rather
+    // than extensionless executables, so probe PATHEXT-style variants too.
     if let Some(root) = project_root {
-        let local_bin = root.join("node_modules").join(".bin").join(command);
-        if local_bin.exists() {
-            return Some(local_bin);
+        let local_bin_dir = root.join("node_modules").join(".bin");
+        for local_bin in local_node_bin_candidates(&local_bin_dir, command) {
+            if local_bin.exists() {
+                return Some(local_bin);
+            }
         }
     }
 
-    // 2. Try PATH lookup first. This is the fast common path: spawning the
-    // tool with `--version` and waiting briefly for it to exit. When the
-    // editor (OpenCode, Pi, etc.) is launched from a login shell the PATH
-    // is usually complete, so this finds Homebrew/cargo/etc. binaries.
-    if let Some(path) = try_path_lookup(command) {
+    // 2. PATH via `which` + manual walk (mirrors magic-context findOnPath).
+    if let Some(path) = crate::tool_path::resolve_on_path(command) {
         return Some(path);
     }
 
@@ -322,37 +361,51 @@ fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<P
     try_well_known_path_lookup(command)
 }
 
-/// Try spawning the tool via the inherited PATH. Returns the bare command
-/// name on success (downstream `Command::new` re-resolves through PATH),
-/// or None if the spawn fails or the tool exits with non-zero status.
-fn try_path_lookup(command: &str) -> Option<PathBuf> {
-    let mut child = Command::new(command)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    let timeout = Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Some(PathBuf::from(command))
-                } else {
-                    None
-                };
+fn local_node_bin_candidates(bin_dir: &Path, command: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let command_path = Path::new(command);
+        if command_path.extension().is_some() {
+            return vec![bin_dir.join(command)];
+        }
+
+        let mut candidates = vec![bin_dir.join(command)];
+        candidates.extend(
+            windows_local_node_bin_extensions(std::env::var_os("PATHEXT").as_deref())
+                .into_iter()
+                .map(|ext| bin_dir.join(format!("{command}{ext}"))),
+        );
+        candidates
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![bin_dir.join(command)]
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    const DEFAULT_ORDER: [&str; 4] = [".cmd", ".exe", ".bat", ".ps1"];
+    let allowed: HashSet<&str> = DEFAULT_ORDER.into_iter().collect();
+
+    let mut ordered = Vec::new();
+    if let Some(pathext) = pathext.and_then(|value| value.to_str()) {
+        for ext in pathext.split(';') {
+            let normalized = ext.trim().to_ascii_lowercase();
+            if allowed.contains(normalized.as_str()) && !ordered.contains(&normalized) {
+                ordered.push(normalized);
             }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
         }
     }
+
+    for ext in DEFAULT_ORDER {
+        if !ordered.iter().any(|existing| existing == ext) {
+            ordered.push(ext.to_string());
+        }
+    }
+
+    ordered
 }
 
 /// Look up `command` in the well-known install locations that GUI-launched
@@ -362,25 +415,33 @@ fn try_path_lookup(command: &str) -> Option<PathBuf> {
 /// Search order is built by `well_known_search_paths`:
 /// 1. `/opt/homebrew/bin` (Apple Silicon Homebrew)
 /// 2. `/usr/local/bin` (Intel Mac Homebrew + most manual Linux installs)
-/// 3. `$HOME/.cargo/bin` (cargo install — rustfmt, etc.)
-/// 4. `$HOME/go/bin` (`go install` default GOPATH layout)
-/// 5. `$HOME/.local/bin` (pip --user, pipx, npm prefix, many shell scripts)
+/// 3. `/usr/local/go/bin` (official go.dev installer)
+/// 4. `/usr/bin` (distro-packaged tools)
+/// 5. `/snap/bin` (snap-packaged tools)
+/// 6. `$HOME/.cargo/bin` (cargo install — rustfmt, etc.)
+/// 7. `$HOME/go/bin` (`go install` default GOPATH layout)
+/// 8. `$HOME/.local/bin` (pip --user, pipx, npm prefix, many shell scripts)
 ///
 /// Each candidate is verified to (a) exist as a regular file and (b) be
 /// executable; we don't spawn `--version` here because spawning an
 /// absolute-path candidate that doesn't accept `--version` would emit a
 /// false negative (and Rust's `fs::metadata` is much cheaper than a spawn).
 fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
-    if cfg!(windows) {
-        // On Windows, well-known POSIX paths don't apply. Skip the fallback
-        // entirely — the user's tool is either on PATH or genuinely missing.
-        return None;
-    }
     // Test-only escape hatch: integration tests that need to assert
     // "tool not installed" semantics set AFT_DISABLE_WELL_KNOWN_LOOKUP=1
     // so CI runners with a system tsc/biome/etc. at /usr/local/bin don't
     // silently make those tests pass. Production callers never set this.
     if std::env::var_os("AFT_DISABLE_WELL_KNOWN_LOOKUP").is_some() {
+        return None;
+    }
+    if cfg!(windows) {
+        for dir in crate::tool_path::well_known_windows_bin_dirs(
+            std::env::var_os("USERPROFILE").as_deref(),
+        ) {
+            if let Some(found) = crate::tool_path::probe_tool_in_dir(&dir, command) {
+                return Some(found);
+            }
+        }
         return None;
     }
     let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
@@ -391,9 +452,16 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
 /// Extracted so tests can drive the lookup with a controlled HOME without
 /// mutating process-global env vars.
 fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(8);
     candidates.push(PathBuf::from("/opt/homebrew/bin").join(command));
     candidates.push(PathBuf::from("/usr/local/bin").join(command));
+    // System/distro install locations a GUI-launched editor's truncated PATH
+    // often misses. /usr/local/go/bin is where the official go.dev installer
+    // puts the Go toolchain (gofmt, go); /snap/bin and /usr/bin cover
+    // distro-packaged installs (Go from apt/snap, etc.).
+    candidates.push(PathBuf::from("/usr/local/go/bin").join(command));
+    candidates.push(PathBuf::from("/usr/bin").join(command));
+    candidates.push(PathBuf::from("/snap/bin").join(command));
     if let Some(home) = home {
         let home_path = PathBuf::from(home);
         candidates.push(home_path.join(".cargo/bin").join(command));
@@ -403,6 +471,16 @@ fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec
     candidates
 }
 
+/// Build the candidate path list for the given command name using well-known
+/// Windows install locations. Extracted so tests can drive the lookup with a
+/// controlled USERPROFILE without mutating process-global env vars.
+///
+/// Search order:
+/// 1. `C:\Go\bin\<command>.exe` — Windows Go installer (default path)
+/// 2. `C:\Program Files\Go\bin\<command>.exe` — Windows Go installer (Program Files)
+/// 3. `%USERPROFILE%\.cargo\bin\<command>.exe` — `cargo install`
+/// 4. `%USERPROFILE%\go\bin\<command>.exe` — `go install` with default GOPATH
+///
 /// Walk a pre-built candidate list, returning the first file that exists and
 /// is executable. Extracted from `try_well_known_path_lookup` so tests can
 /// inject candidates anchored at a tempdir.
@@ -425,9 +503,10 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
-    // Windows: regular files in well-known POSIX paths don't apply
-    // (try_well_known_path_lookup returns early on Windows). This stub
-    // exists only so the file compiles on Windows.
+    // Windows: the well-known Windows paths in `try_well_known_path_lookup`
+    // construct .exe paths which are always executable (or the metadata check
+    // already filters out non-files). This stub exists for compile-time
+    // completeness on the POSIX candidate path used during non-Windows builds.
     true
 }
 
@@ -437,6 +516,15 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 /// `NOT_YET_IMPLEMENTED_*` stubs instead of formatted code. We parse the
 /// version from `ruff --version` (format: "ruff X.Y.Z") and require >= 0.1.2.
 /// Falls back to false if ruff is not found or version cannot be parsed.
+/// Whether a tool referenced by configure missing-tool warnings is resolvable.
+pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path>) -> bool {
+    if tool == "ruff" {
+        return resolve_tool_uncached("ruff", project_root).is_some()
+            && ruff_format_available(project_root);
+    }
+    resolve_tool_uncached(tool, project_root).is_some()
+}
+
 fn ruff_format_available(project_root: Option<&Path>) -> bool {
     let key = availability_cache_key("ruff-format", project_root);
     if let Ok(cache) = TOOL_AVAILABILITY_CACHE.lock() {
@@ -501,8 +589,9 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
 fn resolve_candidate_tool(
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> Option<String> {
-    if candidate.tool == "ruff" && !ruff_format_available(project_root) {
+    if require_ruff_format && candidate.tool == "ruff" && !ruff_format_available(project_root) {
         return None;
     }
 
@@ -521,6 +610,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
         LangId::Solidity => "solidity",
+        LangId::Scss => "scss",
         LangId::Vue => "vue",
         LangId::Json => "json",
         LangId::Scala => "scala",
@@ -533,6 +623,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
     }
 }
 
@@ -681,6 +772,7 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -693,6 +785,7 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
+        LangId::Yaml => Vec::new(),
     }
 }
 
@@ -708,7 +801,11 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
                 vec![ToolCandidate {
                     tool: "biome".to_string(),
                     source: "biome.json".to_string(),
-                    args: vec!["check".to_string(), file_str.to_string()],
+                    args: vec![
+                        "check".to_string(),
+                        "--reporter=json".to_string(),
+                        file_str.to_string(),
+                    ],
                     required: true,
                 }]
             } else if has_project_config(project_root, &["tsconfig.json"]) {
@@ -771,7 +868,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
                     ToolCandidate {
                         tool: "staticcheck".to_string(),
                         source: "go.mod".to_string(),
-                        args: vec![file_str.to_string()],
+                        args: vec!["-f".to_string(), "json".to_string(), file_str.to_string()],
                         required: false,
                     },
                     ToolCandidate {
@@ -791,6 +888,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -803,6 +901,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
+        LangId::Yaml => Vec::new(),
     }
 }
 
@@ -887,7 +986,11 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
         "biome" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "checker config".to_string(),
-            args: vec!["check".to_string(), file_str.to_string()],
+            args: vec![
+                "check".to_string(),
+                "--reporter=json".to_string(),
+                file_str.to_string(),
+            ],
             required: true,
         }],
         "pyright" => vec![ToolCandidate {
@@ -909,7 +1012,7 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
         "staticcheck" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "checker config".to_string(),
-            args: vec![file_str.to_string()],
+            args: vec!["-f".to_string(), "json".to_string(), file_str.to_string()],
             required: true,
         }],
         _ => Vec::new(),
@@ -919,6 +1022,7 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
 fn resolve_tool_candidates(
     candidates: Vec<ToolCandidate>,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> ToolDetection {
     if candidates.is_empty() {
         return ToolDetection::NotConfigured;
@@ -926,7 +1030,8 @@ fn resolve_tool_candidates(
 
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root, require_ruff_format)
+        {
             return ToolDetection::Found(command, candidate.args);
         }
         if candidate.required && missing_required.is_none() {
@@ -940,13 +1045,8 @@ fn resolve_tool_candidates(
     }
 }
 
-fn checker_command(candidate: &ToolCandidate, resolved: String) -> String {
-    match candidate.tool.as_str() {
-        "tsc" | "tsgo" => resolved,
-        "cargo" => "cargo".to_string(),
-        "go" => "go".to_string(),
-        _ => resolved,
-    }
+fn checker_command(_candidate: &ToolCandidate, resolved: String) -> String {
+    resolved
 }
 
 fn checker_args(candidate: &ToolCandidate) -> Vec<String> {
@@ -966,6 +1066,7 @@ fn detect_formatter_for_path(path: &Path, lang: LangId, config: &Config) -> Tool
     resolve_tool_candidates(
         formatter_candidates(lang, config, &file_str),
         config.project_root.as_deref(),
+        true,
     )
 }
 
@@ -979,7 +1080,7 @@ fn detect_checker_for_path(path: &Path, lang: LangId, config: &Config) -> ToolDe
     let project_root = config.project_root.as_deref();
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root, false) {
             return ToolDetection::Found(
                 checker_command(&candidate, command),
                 checker_args(&candidate),
@@ -1016,6 +1117,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::CSharp => "aft_tool_detection.cs",
         LangId::Bash => "aft_tool_detection.sh",
         LangId::Solidity => "aft_tool_detection.sol",
+        LangId::Scss => "aft-tool-detection.scss",
         LangId::Vue => "aft-tool-detection.vue",
         LangId::Json => "aft-tool-detection.json",
         LangId::Scala => "aft-tool-detection.scala",
@@ -1028,6 +1130,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Perl => "aft-tool-detection.pl",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
+        LangId::Yaml => "aft-tool-detection.yaml",
     };
     project_root.join(filename)
 }
@@ -1053,13 +1156,17 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "rustfmt" => "Install: `rustup component add rustfmt`".to_string(),
         "rust-analyzer" => "Install: `rustup component add rust-analyzer`".to_string(),
         "cargo" => "Install Rust from https://rustup.rs/.".to_string(),
-        "go" => [
-            "Install Go from https://go.dev/dl/, or — if it's already installed —",
-            "ensure its bin directory is on PATH (Homebrew typically uses",
-            "/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).",
-            "GUI-launched editors often don't inherit login-shell PATH.",
-        ]
-        .join(" "),
+        "go" => if cfg!(windows) {
+            "Install Go from https://go.dev/dl/. Common install paths:\
+                 C:\\Go\\bin, C:\\Program Files\\Go\\bin. \
+                 GUI-launched editors often don't inherit login-shell PATH."
+        } else {
+            "Install Go from https://go.dev/dl/, or — if it's already installed —\
+                 ensure its bin directory is on PATH (Homebrew typically uses\
+                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).\
+                 GUI-launched editors often don't inherit login-shell PATH."
+        }
+        .to_string(),
         "gopls" => "Install: `go install golang.org/x/tools/gopls@latest`".to_string(),
         "bash-language-server" => "Install: `npm install -g bash-language-server`".to_string(),
         "yaml-language-server" => "Install: `npm install -g yaml-language-server`".to_string(),
@@ -1096,8 +1203,11 @@ fn missing_tool_warning(
     language: &str,
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> Option<MissingTool> {
-    if !candidate.required || resolve_candidate_tool(candidate, project_root).is_some() {
+    if !candidate.required
+        || resolve_candidate_tool(candidate, project_root, require_ruff_format).is_some()
+    {
         return None;
     }
 
@@ -1126,6 +1236,7 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
+                true,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1143,6 +1254,7 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
+                false,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1397,6 +1509,7 @@ pub fn run_external_tool_capture(
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         exit_code: outcome.status.code().unwrap_or(-1),
+        truncated: outcome.truncated,
     })
 }
 
@@ -1444,17 +1557,102 @@ pub fn parse_checker_output(
     file: &Path,
     checker: &str,
 ) -> Vec<ValidationError> {
-    let checker_name = Path::new(checker)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(checker);
-    match checker_name {
+    let checker_name = checker_executable_name(checker);
+    match checker_name.as_str() {
         "npx" | "tsc" | "tsgo" => parse_tsc_output(stdout, stderr, file),
+        "biome" => parse_biome_output(stdout, stderr, file),
         "pyright" => parse_pyright_output(stdout, file),
+        "ruff" => parse_ruff_output(stdout, stderr, file),
         "cargo" => parse_cargo_output(stdout, stderr, file),
         "go" => parse_go_vet_output(stderr, file),
+        "staticcheck" => parse_staticcheck_output(stdout, stderr, file),
         _ => Vec::new(),
     }
+}
+
+fn checker_executable_name(checker: &str) -> String {
+    let name = checker
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(checker)
+        .to_ascii_lowercase();
+
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+
+    name
+}
+
+fn normalize_path_for_compare(path: &str) -> String {
+    path.trim_start_matches("file://")
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn diagnostic_path_matches(file: &Path, diagnostic_file: &str) -> bool {
+    if diagnostic_file.is_empty() {
+        return true;
+    }
+
+    let file_str = normalize_path_for_compare(&file.to_string_lossy());
+    let diagnostic_str = normalize_path_for_compare(diagnostic_file);
+    file_str == diagnostic_str
+        || file_str.ends_with(&diagnostic_str)
+        || diagnostic_str.ends_with(&file_str)
+}
+
+fn line_column_for_byte_offset(source: &str, offset: usize) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut column = 1u32;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+fn json_string_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn json_u32_at(value: &serde_json::Value, path: &[&str]) -> Option<u32> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_u64().map(|n| n as u32)
+}
+
+fn json_location_path(value: &serde_json::Value) -> Option<&str> {
+    json_string_at(value, &["location", "path", "file"])
+        .or_else(|| json_string_at(value, &["location", "path"]))
+        .or_else(|| json_string_at(value, &["filename"]))
+        .or_else(|| json_string_at(value, &["file"]))
+}
+
+fn diagnostic_message(value: &serde_json::Value) -> String {
+    json_string_at(value, &["description"])
+        .or_else(|| json_string_at(value, &["message"]))
+        .or_else(|| json_string_at(value, &["text"]))
+        .or_else(|| json_string_at(value, &["category"]))
+        .unwrap_or("unknown error")
+        .to_string()
 }
 
 /// Parse tsc output lines like: `path(line,col): error TSxxxx: message`
@@ -1502,22 +1700,149 @@ fn parse_tsc_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationEr
     errors
 }
 
+fn parse_biome_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for output in [stdout, stderr] {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            parse_biome_json_value(&json, file, &mut errors);
+        }
+    }
+    errors
+}
+
+fn parse_biome_json_value(
+    json: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    let diagnostics: Vec<&serde_json::Value> = if let Some(diags) = json
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.as_array())
+    {
+        diags.iter().collect()
+    } else if let Some(diags) = json.as_array() {
+        diags.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let source = std::fs::read_to_string(file).ok();
+    for diag in diagnostics {
+        if let Some(diag_file) = json_location_path(diag) {
+            if !diagnostic_path_matches(file, diag_file) {
+                continue;
+            }
+        }
+
+        let (line, column) = biome_line_column(diag, source.as_deref());
+        errors.push(ValidationError {
+            line,
+            column,
+            message: diagnostic_message(diag),
+            severity: diag
+                .get("severity")
+                .and_then(|severity| severity.as_str())
+                .unwrap_or("error")
+                .to_lowercase(),
+        });
+    }
+}
+
+fn biome_line_column(diag: &serde_json::Value, source: Option<&str>) -> (u32, u32) {
+    if let Some(line) =
+        json_u32_at(diag, &["location", "line"]).or_else(|| json_u32_at(diag, &["line"]))
+    {
+        let column = json_u32_at(diag, &["location", "column"])
+            .or_else(|| json_u32_at(diag, &["column"]))
+            .unwrap_or(0);
+        return (line, column);
+    }
+
+    let offset = diag
+        .get("location")
+        .and_then(|location| location.get("span"))
+        .and_then(|span| span.as_array())
+        .and_then(|span| span.first())
+        .and_then(|offset| offset.as_u64())
+        .map(|offset| offset as usize);
+
+    match (source, offset) {
+        (Some(source), Some(offset)) => line_column_for_byte_offset(source, offset),
+        _ => (0, 0),
+    }
+}
+
+fn parse_ruff_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for output in [stdout, stderr] {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            parse_ruff_json_value(&json, file, &mut errors);
+        }
+    }
+    errors
+}
+
+fn parse_ruff_json_value(json: &serde_json::Value, file: &Path, errors: &mut Vec<ValidationError>) {
+    let diagnostics: Vec<&serde_json::Value> = if let Some(diags) = json.as_array() {
+        diags.iter().collect()
+    } else if let Some(diags) = json.get("diagnostics").and_then(|d| d.as_array()) {
+        diags.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    for diag in diagnostics {
+        let diag_file = diag
+            .get("filename")
+            .and_then(|filename| filename.as_str())
+            .unwrap_or("");
+        if !diagnostic_path_matches(file, diag_file) {
+            continue;
+        }
+
+        let message = match (
+            diag.get("code").and_then(|code| code.as_str()),
+            diag.get("message").and_then(|message| message.as_str()),
+        ) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (None, Some(message)) => message.to_string(),
+            (Some(code), None) => code.to_string(),
+            (None, None) => "unknown error".to_string(),
+        };
+
+        errors.push(ValidationError {
+            line: json_u32_at(diag, &["location", "row"])
+                .or_else(|| json_u32_at(diag, &["location", "line"]))
+                .unwrap_or(0),
+            column: json_u32_at(diag, &["location", "column"]).unwrap_or(0),
+            message,
+            severity: diag
+                .get("severity")
+                .and_then(|severity| severity.as_str())
+                .unwrap_or("error")
+                .to_lowercase(),
+        });
+    }
+}
+
 /// Parse pyright JSON output.
 fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let file_str = file.to_string_lossy();
-
     // pyright --outputjson emits JSON with generalDiagnostics array
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout) {
         if let Some(diags) = json.get("generalDiagnostics").and_then(|d| d.as_array()) {
             for diag in diags {
                 // Filter to our file
                 let diag_file = diag.get("file").and_then(|f| f.as_str()).unwrap_or("");
-                if !diag_file.is_empty()
-                    && !file_str.ends_with(diag_file)
-                    && !diag_file.ends_with(&*file_str)
-                    && diag_file != &*file_str
-                {
+                if !diagnostic_path_matches(file, diag_file) {
                     continue;
                 }
 
@@ -1545,8 +1870,8 @@ fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
                     .to_lowercase();
 
                 errors.push(ValidationError {
-                    line: line_num + 1, // pyright uses 0-indexed lines
-                    column: col_num,
+                    line: line_num + 1,  // pyright uses 0-indexed lines
+                    column: col_num + 1, // pyright uses 0-indexed columns
                     message,
                     severity,
                 });
@@ -1631,43 +1956,163 @@ fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<Validatio
 /// Parse go vet output lines like: `path:line:col: message`
 fn parse_go_vet_output(stderr: &str, file: &Path) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let file_str = file.to_string_lossy();
+    let pattern =
+        regex::Regex::new(r"^(?P<file>.+?):(?P<line>\d+)(?::(?P<col>\d+))?:\s*(?P<message>.*)$")
+            .expect("valid go vet diagnostic regex");
 
     for line in stderr.lines() {
-        // Format: path:line:col: message  OR  path:line: message
-        let parts: Vec<&str> = line.splitn(4, ':').collect();
-        if parts.len() < 3 {
+        let Some(captures) = pattern.captures(line) else {
             continue;
-        }
-
-        let err_file = parts[0].trim();
-        if !file_str.ends_with(err_file)
-            && !err_file.ends_with(&*file_str)
-            && err_file != &*file_str
-        {
-            continue;
-        }
-
-        let line_num: u32 = parts[1].trim().parse().unwrap_or(0);
-        let (col_num, message) = if parts.len() >= 4 {
-            if let Ok(col) = parts[2].trim().parse::<u32>() {
-                (col, parts[3].trim().to_string())
-            } else {
-                // parts[2] is part of the message, not a column
-                (0, format!("{}:{}", parts[2].trim(), parts[3].trim()))
-            }
-        } else {
-            (0, parts[2].trim().to_string())
         };
 
+        let err_file = captures
+            .name("file")
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .trim();
+        if !diagnostic_path_matches(file, err_file) {
+            continue;
+        }
+
         errors.push(ValidationError {
-            line: line_num,
-            column: col_num,
-            message,
+            line: captures
+                .name("line")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
+            column: captures
+                .name("col")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
+            message: captures
+                .name("message")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| "unknown error".to_string()),
             severity: "error".to_string(),
         });
     }
     errors
+}
+
+fn parse_staticcheck_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let combined = format!("{}\n{}", stdout, stderr);
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut errors = Vec::new();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        parse_staticcheck_json_value(&json, file, &mut errors);
+        return errors;
+    }
+
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            parse_staticcheck_json_value(&json, file, &mut errors);
+        }
+    }
+
+    errors
+}
+
+fn parse_staticcheck_json_value(
+    json: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(diags) = json.as_array() {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else if let Some(diags) = json.get("diagnostics").and_then(|d| d.as_array()) {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else if let Some(diags) = json.get("issues").and_then(|d| d.as_array()) {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else {
+        parse_staticcheck_diag(json, file, errors);
+    }
+}
+
+fn parse_staticcheck_diag(
+    diag: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    let diag_file = json_string_at(diag, &["location", "file"])
+        .or_else(|| json_string_at(diag, &["file"]))
+        .unwrap_or("");
+    if !diagnostic_path_matches(file, diag_file) {
+        return;
+    }
+
+    let message = match (
+        diag.get("code").and_then(|code| code.as_str()),
+        diag.get("message").and_then(|message| message.as_str()),
+    ) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (None, Some(message)) => message.to_string(),
+        (Some(code), None) => code.to_string(),
+        (None, None) => "unknown error".to_string(),
+    };
+
+    errors.push(ValidationError {
+        line: json_u32_at(diag, &["location", "line"])
+            .or_else(|| json_u32_at(diag, &["line"]))
+            .unwrap_or(0),
+        column: json_u32_at(diag, &["location", "column"])
+            .or_else(|| json_u32_at(diag, &["column"]))
+            .unwrap_or(0),
+        message,
+        severity: diag
+            .get("severity")
+            .and_then(|severity| severity.as_str())
+            .unwrap_or("error")
+            .to_lowercase(),
+    });
+}
+
+fn output_tail_summary(stdout: &str, stderr: &str, truncated: bool) -> String {
+    let mut parts = Vec::new();
+    if let Some(tail) = short_output_tail(stderr) {
+        parts.push(format!("stderr: {tail}"));
+    }
+    if let Some(tail) = short_output_tail(stdout) {
+        parts.push(format!("stdout: {tail}"));
+    }
+    if truncated {
+        parts.push("output truncated".to_string());
+    }
+
+    if parts.is_empty() {
+        "no output".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn short_output_tail(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<&str> = trimmed.lines().rev().take(3).collect();
+    lines.reverse();
+    let mut tail = lines.join(" | ");
+    const MAX_TAIL_CHARS: usize = 500;
+    if tail.len() > MAX_TAIL_CHARS {
+        let start = tail.len().saturating_sub(MAX_TAIL_CHARS);
+        tail = format!("…{}", &tail[start..]);
+    }
+    Some(tail)
 }
 
 /// Run the project's type checker and return structured validation errors.
@@ -1729,6 +2174,16 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
     ) {
         Ok(result) => {
             let errors = parse_checker_output(&result.stdout, &result.stderr, path, &cmd);
+            if result.exit_code != 0 && errors.is_empty() {
+                let summary = output_tail_summary(&result.stdout, &result.stderr, result.truncated);
+                log::debug!(
+                    "validate: {} (skipped: error: checker exited {} with {})",
+                    path.display(),
+                    result.exit_code,
+                    summary
+                );
+                return (Vec::new(), Some("error".to_string()));
+            }
             log::debug!(
                 "validate: {} ({}, {} errors)",
                 path.display(),
@@ -1886,7 +2341,14 @@ mod tests {
         let result = detect_formatter(&path, LangId::Rust, &config);
         if resolve_tool("rustfmt", config.project_root.as_deref()).is_some() {
             let (cmd, args) = result.unwrap();
-            assert_eq!(cmd, "rustfmt");
+            // Windows resolves to `rustfmt.exe` and may include a full path
+            // (e.g. `C:\Users\...\.cargo\bin\rustfmt.exe`). Just require the
+            // command stem to be `rustfmt`.
+            let stem = std::path::Path::new(&cmd)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            assert_eq!(stem, "rustfmt", "expected rustfmt, got {cmd}");
             assert!(args.iter().any(|a| a.ends_with("test.rs")));
         } else {
             assert!(result.is_none());
@@ -1905,11 +2367,25 @@ mod tests {
         let result = detect_formatter(&path, LangId::Go, &config);
         if resolve_tool("goimports", config.project_root.as_deref()).is_some() {
             let (cmd, args) = result.unwrap();
-            assert_eq!(cmd, "goimports");
+            assert_eq!(
+                std::path::Path::new(&cmd)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                "goimports",
+                "expected goimports, got {cmd}"
+            );
             assert!(args.contains(&"-w".to_string()));
         } else if resolve_tool("gofmt", config.project_root.as_deref()).is_some() {
             let (cmd, args) = result.unwrap();
-            assert_eq!(cmd, "gofmt");
+            assert_eq!(
+                std::path::Path::new(&cmd)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                "gofmt",
+                "expected gofmt, got {cmd}"
+            );
             assert!(args.contains(&"-w".to_string()));
         } else {
             assert!(result.is_none());
@@ -1928,7 +2404,14 @@ mod tests {
         let result = detect_formatter(&path, LangId::Python, &config);
         if ruff_format_available(config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
-            assert_eq!(cmd, "ruff");
+            assert_eq!(
+                std::path::Path::new(&cmd)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                "ruff",
+                "expected ruff, got {cmd}"
+            );
             assert!(args.contains(&"format".to_string()));
         } else {
             assert!(result.is_none());
@@ -2237,7 +2720,7 @@ mod tests {
         let errors = parse_pyright_output(stdout, file);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].line, 5); // 0-indexed → 1-indexed
-        assert_eq!(errors[0].column, 10);
+        assert_eq!(errors[0].column, 11);
         assert_eq!(errors[0].severity, "error");
         assert!(errors[0].message.contains("Type error here"));
     }
@@ -2266,7 +2749,14 @@ mod tests {
         let result = detect_type_checker(&path, LangId::Rust, &config);
         if resolve_tool("cargo", config.project_root.as_deref()).is_some() {
             let (cmd, args) = result.unwrap();
-            assert_eq!(cmd, "cargo");
+            assert_eq!(
+                std::path::Path::new(&cmd)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                "cargo",
+                "expected cargo, got {cmd}"
+            );
             assert!(args.contains(&"check".to_string()));
         } else {
             assert!(result.is_none());
@@ -2285,8 +2775,12 @@ mod tests {
         let result = detect_type_checker(&path, LangId::Go, &config);
         if resolve_tool("go", config.project_root.as_deref()).is_some() {
             let (cmd, _args) = result.unwrap();
-            // Could be staticcheck or go vet depending on what's installed
-            assert!(cmd == "go" || cmd == "staticcheck");
+            // Resolved paths may be absolute after PATH / well-known lookup.
+            let name = checker_executable_name(&cmd);
+            assert!(
+                name == "go" || name == "staticcheck",
+                "expected go or staticcheck, got {cmd}"
+            );
         } else {
             assert!(result.is_none());
         }
@@ -2421,19 +2915,25 @@ mod tests {
         // tool wins over a HOME-rooted shim.
         assert_eq!(strs[0], "/opt/homebrew/bin/toolx");
         assert_eq!(strs[1], "/usr/local/bin/toolx");
-        assert_eq!(strs[2], "/Users/test-home/.cargo/bin/toolx");
-        assert_eq!(strs[3], "/Users/test-home/go/bin/toolx");
-        assert_eq!(strs[4], "/Users/test-home/.local/bin/toolx");
-        assert_eq!(strs.len(), 5);
+        assert_eq!(strs[2], "/usr/local/go/bin/toolx");
+        assert_eq!(strs[3], "/usr/bin/toolx");
+        assert_eq!(strs[4], "/snap/bin/toolx");
+        assert_eq!(strs[5], "/Users/test-home/.cargo/bin/toolx");
+        assert_eq!(strs[6], "/Users/test-home/go/bin/toolx");
+        assert_eq!(strs[7], "/Users/test-home/.local/bin/toolx");
+        assert_eq!(strs.len(), 8);
     }
 
     #[cfg(unix)]
     #[test]
     fn well_known_search_paths_skips_home_when_unset() {
         let paths = well_known_search_paths("toolx", None);
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 5);
         assert!(paths[0].ends_with("opt/homebrew/bin/toolx"));
         assert!(paths[1].ends_with("usr/local/bin/toolx"));
+        assert!(paths[2].ends_with("usr/local/go/bin/toolx"));
+        assert!(paths[3].ends_with("usr/bin/toolx"));
+        assert!(paths[4].ends_with("snap/bin/toolx"));
     }
 
     #[cfg(unix)]
@@ -2483,10 +2983,30 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn try_well_known_path_lookup_is_noop_on_windows() {
-        // On Windows we deliberately skip POSIX well-known paths; only PATH
-        // lookup applies. The public entry point should always return None.
-        assert!(try_well_known_path_lookup("biome").is_none());
+    fn try_well_known_path_lookup_finds_npm_global_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let npm_bin = dir.path().join("npm");
+        fs::create_dir_all(&npm_bin).unwrap();
+        let shim = npm_bin.join("biome.cmd");
+        fs::write(&shim, "@echo off\n").unwrap();
+
+        let saved_disable = std::env::var_os("AFT_DISABLE_WELL_KNOWN_LOOKUP");
+        std::env::remove_var("AFT_DISABLE_WELL_KNOWN_LOOKUP");
+        let saved_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", dir.path());
+
+        let found = try_well_known_path_lookup("biome");
+
+        if let Some(value) = saved_appdata {
+            std::env::set_var("APPDATA", value);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+        if let Some(value) = saved_disable {
+            std::env::set_var("AFT_DISABLE_WELL_KNOWN_LOOKUP", value);
+        }
+
+        assert_eq!(found.as_deref(), Some(shim.as_path()));
     }
 
     // GitHub issue #47: wording must not claim "but not installed" — the tool
@@ -2516,5 +3036,218 @@ mod tests {
             "go install hint should mention PATH: got {:?}",
             hint
         );
+    }
+
+    #[test]
+    fn read_bounded_to_string_truncates_after_limit() {
+        let (text, truncated) = read_bounded_to_string(std::io::Cursor::new(b"abcdef"), 4);
+        assert_eq!(text, "abcd");
+        assert!(truncated);
+
+        let (text, truncated) = read_bounded_to_string(std::io::Cursor::new(b"abc"), 4);
+        assert_eq!(text, "abc");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn windows_local_node_bin_extensions_follow_pathext_then_defaults() {
+        let pathext = std::ffi::OsString::from(".EXE;.CMD;.BAT;.CMD");
+        let extensions = windows_local_node_bin_extensions(Some(&pathext));
+        assert_eq!(extensions, vec![".exe", ".cmd", ".bat", ".ps1"]);
+    }
+
+    #[test]
+    fn checker_executable_name_strips_paths_and_windows_extensions() {
+        assert_eq!(checker_executable_name("/usr/local/bin/ruff"), "ruff");
+        assert_eq!(checker_executable_name(r"C:\Go\bin\go.exe"), "go");
+        assert_eq!(
+            checker_executable_name(r"C:\repo\node_modules\.bin\biome.cmd"),
+            "biome"
+        );
+    }
+
+    #[test]
+    fn parse_biome_output_json_reporter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src/app.ts");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "const value = 1;\nconsole.log(value);\n").unwrap();
+        // Build the JSON via serde so the path is correctly escaped on Windows
+        // (backslashes in paths would otherwise break a raw JSON string literal).
+        let stdout = serde_json::json!({
+            "diagnostics": [
+                {
+                    "severity": "warning",
+                    "description": "Avoid console.log",
+                    "location": {
+                        "path": { "file": file.to_string_lossy() },
+                        "span": [17, 28],
+                    },
+                },
+            ],
+        })
+        .to_string();
+
+        let errors = parse_biome_output(&stdout, "", &file);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 2);
+        assert_eq!(errors[0].column, 1);
+        assert_eq!(errors[0].severity, "warning");
+        assert!(errors[0].message.contains("Avoid console.log"));
+    }
+
+    #[test]
+    fn parse_ruff_output_json() {
+        let stdout = r#"[{"filename":"pkg/main.py","location":{"row":3,"column":5},"code":"F401","message":"`os` imported but unused"}]"#;
+        let errors = parse_ruff_output(stdout, "", Path::new("pkg/main.py"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 3);
+        assert_eq!(errors[0].column, 5);
+        assert!(errors[0].message.contains("F401"));
+    }
+
+    #[test]
+    fn parse_staticcheck_output_json_lines() {
+        let stdout = r#"{"code":"SA4006","severity":"error","location":{"file":"C:\\repo\\main.go","line":10,"column":5},"message":"value is never used"}"#;
+        let errors = parse_staticcheck_output(stdout, "", Path::new(r"C:\repo\main.go"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert!(errors[0].message.contains("SA4006"));
+    }
+
+    #[test]
+    fn parse_go_vet_output_handles_windows_drive_letters() {
+        let stderr = r"C:\repo\main.go:10:5: unreachable code
+C:\repo\other.go:1:1: other file
+";
+        let errors = parse_go_vet_output(stderr, Path::new(r"C:\repo\main.go"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert_eq!(errors[0].message, "unreachable code");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_biome_uses_json_reporter() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("biome");
+        fs::write(&fake, "#!/bin/sh\necho 1.0.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("src/app.ts");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_type_checker(&path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.ends_with("biome"), "expected biome, got: {cmd}");
+        assert_eq!(args[0], "check");
+        assert!(args.contains(&"--reporter=json".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_ruff_does_not_require_formatter_version() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ruff.toml"), "\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("ruff");
+        fs::write(&fake, "#!/bin/sh\necho 'ruff 0.0.1'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("main.py");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        assert!(!ruff_format_available(config.project_root.as_deref()));
+        let (cmd, args) = detect_type_checker(&path, LangId::Python, &config).unwrap();
+        assert!(cmd.ends_with("ruff"), "expected ruff checker, got: {cmd}");
+        assert_eq!(args[0], "check");
+        assert!(args.contains(&"--output-format=json".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_staticcheck_uses_json_reporter() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("staticcheck");
+        fs::write(&fake, "#!/bin/sh\necho staticcheck\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("main.go");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_type_checker(&path, LangId::Go, &config).unwrap();
+        assert!(
+            cmd.ends_with("staticcheck"),
+            "expected staticcheck, got: {cmd}"
+        );
+        assert_eq!(args[0], "-f");
+        assert_eq!(args[1], "json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_uses_resolved_cargo_and_go_paths() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["cargo", "go"] {
+            let fake = bin_dir.join(name);
+            fs::write(&fake, "#!/bin/sh\necho fake\n").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+        let rust_config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let (cargo_cmd, _) =
+            detect_type_checker(&dir.path().join("src/main.rs"), LangId::Rust, &rust_config)
+                .unwrap();
+        assert_eq!(cargo_cmd, bin_dir.join("cargo").to_string_lossy());
+
+        fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
+        fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
+        let mut go_config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        go_config.checker.insert("go".to_string(), "go".to_string());
+        let (go_cmd, _) =
+            detect_type_checker(&dir.path().join("main.go"), LangId::Go, &go_config).unwrap();
+        assert_eq!(go_cmd, bin_dir.join("go").to_string_lossy());
     }
 }

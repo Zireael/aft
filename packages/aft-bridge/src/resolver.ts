@@ -1,10 +1,20 @@
-import { execSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { execSync } from "node:child_process";
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log, warn } from "./active-logger.js";
-import { ensureBinary, getCacheDir } from "./downloader.js";
+import { ensureBinary, getCacheDir, readBinaryVersion } from "./downloader.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 type EnsureBinary = typeof ensureBinary;
@@ -17,31 +27,7 @@ export function __setEnsureBinaryForTests(impl: EnsureBinary | null): void {
 
 type ResolverEnv = typeof process.env;
 
-/**
- * Read the version string from an `aft` binary by invoking it with
- * `--version`. Returns the bare version (e.g. `"0.22.1"`) without the
- * leading `v` or the `aft` prefix, or `null` if the invocation fails.
- *
- * Exported so tests and the resolver can use it for version-match checks
- * before deciding to return a candidate binary.
- */
-export function readBinaryVersion(binaryPath: string): string | null {
-  try {
-    const result = spawnSync(binaryPath, ["--version"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-    });
-    const stdoutVersion = result.stdout?.trim();
-    const stderrVersion = result.stderr?.trim();
-    const rawVersion = stdoutVersion || stderrVersion;
-    if (!rawVersion) return null;
-    // `aft --version` outputs "aft 0.9.0" — extract just the version number
-    return rawVersion.replace(/^aft\s+/, "");
-  } catch {
-    return null;
-  }
-}
+export { readBinaryVersion };
 
 /**
  * Copy an npm platform binary to the versioned cache so we never run from
@@ -78,6 +64,14 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     copyFileSync(npmBinaryPath, tmpPath);
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
+    }
+    // Best-effort replace — unlink first on Windows where renameSync fails if target exists
+    if (process.platform === "win32" && existsSync(cachedPath)) {
+      try {
+        unlinkSync(cachedPath);
+      } catch {
+        // best-effort; renameSync will surface the error if unlink fails
+      }
     }
     renameSync(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
@@ -119,6 +113,81 @@ function isExpectedCachedBinary(binaryPath: string, expectedVersion: string): bo
     `Cached binary at ${binaryPath} reports ${actual ?? "no version"}, expected ${expected}; skipping cache candidate`,
   );
   return false;
+}
+
+function probeBinaryCandidate(
+  binaryPath: string,
+  source: string,
+  expectedVersion?: string,
+): string | null {
+  const actual = readBinaryVersion(binaryPath);
+  if (actual === null) {
+    warn(`${source} binary at ${binaryPath} did not report a version; skipping`);
+    return null;
+  }
+  if (expectedVersion && actual !== normalizeBareVersion(expectedVersion)) {
+    warn(
+      `${source} binary at ${binaryPath} reports ${actual}, expected ${normalizeBareVersion(expectedVersion)}; skipping`,
+    );
+    return null;
+  }
+  return binaryPath;
+}
+
+function parsePathLookupOutput(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((candidate) => candidate.trim())
+    .filter(Boolean);
+}
+
+/**
+ * True when `binaryPath` begins with a recognized native-executable magic
+ * number (Mach-O, ELF, or PE/`MZ`). False for script shims that start with a
+ * shebang (`#!`) or anything else.
+ *
+ * This is the guard against a `which aft` / `where aft` PATH lookup resolving to
+ * the `@cortexkit/aft` CLI's OWN node-script shim. The CLI publishes a `bin`
+ * named `aft` (same name as the native binary), and npx prepends its
+ * `node_modules/.bin` to PATH, so `which aft` can resolve to that shim. Probing
+ * it with `--version` re-enters the CLI, which probes `which aft` again, which
+ * forks `opencode --version` / `pi --version` for its harness report — an
+ * exponential fork bomb (issue: self-resolution recursion). Native binaries
+ * never start with `#!`, so a magic-number check rejects the shim regardless of
+ * where it lives (npx cache, global `npm i -g`, etc.).
+ */
+export function isNativeExecutable(binaryPath: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = openSync(binaryPath, "r");
+    const buf = Buffer.alloc(4);
+    const read = readSync(fd, buf, 0, 4, 0);
+    if (read < 2) return false;
+    const b0 = buf[0];
+    const b1 = buf[1];
+    // Shebang script shim (`#!`) — the recursion vector. Reject outright.
+    if (b0 === 0x23 && b1 === 0x21) return false;
+    const m32 = buf.readUInt32BE(0);
+    // Mach-O: feedface/feedfacf (BE) + cefaedfe/cffaedfe (LE) + cafebabe (fat).
+    const machO = new Set([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe]);
+    if (read >= 4 && machO.has(m32)) return true;
+    // ELF: 0x7f 'E' 'L' 'F'.
+    if (read >= 4 && m32 === 0x7f454c46) return true;
+    // PE (Windows .exe): 'MZ'.
+    if (b0 === 0x4d && b1 === 0x5a) return true;
+    return false;
+  } catch {
+    // If we can't read it, don't trust it as a native binary.
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // best-effort
+      }
+    }
+  }
 }
 
 /**
@@ -229,17 +298,35 @@ export function findBinarySync(expectedVersion?: string): string | null {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-    if (result) return result;
+    for (const candidate of parsePathLookupOutput(result)) {
+      // Guard against self-resolution: a `which aft` hit can be the
+      // @cortexkit/aft CLI's own node-script shim (npx prepends its
+      // node_modules/.bin to PATH). Probing it with --version re-enters the CLI
+      // and fork-bombs. Only accept native executables here.
+      if (!isNativeExecutable(candidate)) {
+        warn(`PATH binary at ${candidate} is not a native executable (script shim?); skipping`);
+        continue;
+      }
+      const usable = probeBinaryCandidate(candidate, "PATH", expectedVersion);
+      if (usable) return usable;
+    }
   } catch {
     // not in PATH
   }
 
   // 4. Check ~/.cargo/bin/aft
   const cargoPath = join(homeDirFromEnv(env), ".cargo", "bin", `aft${ext}`);
-  if (existsSync(cargoPath)) return cargoPath;
+  if (existsSync(cargoPath)) {
+    const usable = probeBinaryCandidate(cargoPath, "cargo", expectedVersion);
+    if (usable) return usable;
+  }
 
   return null;
 }
+
+export const __test__ = {
+  parsePathLookupOutput,
+};
 
 /**
  * Locate the `aft` binary, with auto-download as a last resort.

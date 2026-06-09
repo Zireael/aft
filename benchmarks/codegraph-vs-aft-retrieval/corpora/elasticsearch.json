@@ -1,0 +1,38 @@
+{
+  "name": "elasticsearch",
+  "description": "Optional pinned real-codebase corpus for elastic/elasticsearch. Use RETRIEVAL_CORPUS=elasticsearch PREPARE_TARGET=1 to clone and evaluate it.",
+  "target": {
+    "name": "elasticsearch",
+    "kind": "git",
+    "url": "https://github.com/elastic/elasticsearch.git",
+    "commit": "6fadd28b3129f514e50ba50b55f5d750c149dcb5"
+  },
+  "cases": [
+    {
+      "id": "elasticsearch-search-request",
+      "query": "SearchRequest",
+      "mode": "search",
+      "kind": "class",
+      "expectedSymbols": ["SearchRequest"],
+      "groundTruth": [{ "file": "server/src/main/java/org/elasticsearch/action/search/SearchRequest.java", "symbol": "SearchRequest" }]
+    },
+    {
+      "id": "elasticsearch-bool-query-builder",
+      "query": "BoolQueryBuilder",
+      "mode": "search",
+      "kind": "class",
+      "expectedSymbols": ["BoolQueryBuilder"],
+      "groundTruth": [{ "file": "server/src/main/java/org/elasticsearch/index/query/BoolQueryBuilder.java", "symbol": "BoolQueryBuilder" }]
+    },
+    {
+      "id": "elasticsearch-rest-search-flow",
+      "query": "How does Elasticsearch register REST search actions and build search requests?",
+      "mode": "context",
+      "expectedSymbols": ["RestSearchAction", "SearchRequest"],
+      "groundTruth": [
+        { "file": "server/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java", "symbol": "RestSearchAction" },
+        { "file": "server/src/main/java/org/elasticsearch/action/search/SearchRequest.java", "symbol": "SearchRequest" }
+      ]
+    }
+  ]
+}

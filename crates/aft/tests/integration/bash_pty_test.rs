@@ -3,16 +3,24 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aft::bash_background::persistence::{
-    task_bundle_files, task_paths, write_task, BgMode, PersistedTask,
+    task_bundle_files, task_paths, write_task, BgMode, PersistedTask, SCHEMA_VERSION,
 };
 use aft::bash_background::pty_runtime::CompletionCoordinator;
-use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
+use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
 use serde_json::json;
 
 const SESSION: &str = "pty-phase-1a";
 
 fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
+}
+
+fn pty_completed_print_command(text: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c echo {text}")
+    } else {
+        format!("printf {text}")
+    }
 }
 
 fn base_task(
@@ -64,6 +72,21 @@ fn wait_for_status(
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "timed out waiting for {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_completion(registry: &BgTaskRegistry, task_id: &str) -> BgCompletion {
+    let started = Instant::now();
+    loop {
+        let completions = registry.drain_completions_for_session(Some(SESSION));
+        if let Some(completion) = completions.into_iter().find(|c| c.task_id == task_id) {
+            return completion;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for completion for {task_id}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -326,10 +349,9 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let registry = registry();
-    let started = Instant::now();
     let task_id = registry
         .spawn_pty(
-            "printf wake",
+            "/bin/sh -c 'while [ ! -f wake-ready ]; do sleep 0.01; done; printf wake'",
             SESSION.to_string(),
             project.path().to_path_buf(),
             Default::default(),
@@ -343,8 +365,25 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
             80,
         )
         .unwrap();
-    let _snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // Start the budget AFTER spawn returns, not before. The watchdog's 500ms
+    // periodic-poll clock starts at task registration (during spawn_pty), so the
+    // wake-vs-poll race is measured from spawn-completion. Timing from before
+    // spawn folded PTY allocation + fork + `/bin/sh` startup into the budget —
+    // the heavy, CI-variable cost that flaked this assertion under load.
+    let started = Instant::now();
+    fs::write(project.path().join("wake-ready"), b"ready").unwrap();
+
+    // Do not poll status here: status() calls poll_task directly and can
+    // complete PTY tasks without the watchdog. Draining completions observes
+    // the completion frame queued by the watchdog thread.
+    let completion = wait_for_completion(&registry, &task_id);
+    assert_eq!(completion.status, BgTaskStatus::Completed);
+
+    // The command waits for this test to arm it after spawn_pty returns, so the
+    // reader/waiter cannot signal before the task is registered. A completion
+    // under 450ms is below the 500ms watchdog interval, leaving a 50ms guard at
+    // the boundary while still proving the wake channel beat the periodic poll.
+    assert!(started.elapsed() < Duration::from_millis(450));
 }
 
 #[test]
@@ -356,7 +395,7 @@ fn pty_task_bundle_files_includes_pty_spill() {
 }
 
 #[test]
-fn pty_v2_task_rehydrates_then_upgrades_to_v3_on_next_persist() {
+fn pty_v2_task_rehydrates_then_upgrades_to_current_schema_on_next_persist() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let paths = task_paths(storage.path(), SESSION, "v2-upgrade");
@@ -398,7 +437,7 @@ fn pty_v2_task_rehydrates_then_upgrades_to_v3_on_next_persist() {
     assert_eq!(acked, vec!["v2-upgrade".to_string()]);
     let after: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&paths.json).unwrap()).unwrap();
-    assert_eq!(after["schema_version"], 3);
+    assert_eq!(after["schema_version"], SCHEMA_VERSION);
 }
 
 fn spawn_pty_task(
@@ -564,7 +603,7 @@ fn pty_write_exited_task() {
         &registry,
         storage.path(),
         project.path(),
-        "printf done",
+        &pty_completed_print_command("done"),
         Duration::from_secs(30),
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
@@ -605,7 +644,7 @@ fn pty_write_too_large() {
 }
 
 #[test]
-fn pty_validation_no_background() {
+fn pty_true_implies_background() {
     use aft::config::Config;
     use aft::context::AppContext;
     use aft::parser::TreeSitterProvider;
@@ -622,19 +661,19 @@ fn pty_validation_no_background() {
         },
     );
     let req: RawRequest = serde_json::from_value(json!({
-        "id": "pty-no-bg",
+        "id": "pty-implies-bg",
         "command": "bash",
-        "params": { "command": "cat", "pty": true }
+        "params": { "command": "printf hi", "pty": true }
     }))
     .unwrap();
 
     let response = aft::commands::bash::handle(&req, &ctx);
-    assert!(!response.success);
-    assert_eq!(response.data["code"], "invalid_request");
-    assert!(response.data["message"]
-        .as_str()
-        .unwrap()
-        .contains("background"));
+    assert!(
+        response.success,
+        "pty:true should imply background: {response:?}"
+    );
+    assert_eq!(response.data["status"], "running");
+    assert_eq!(response.data["mode"], "pty");
 }
 
 #[test]
@@ -715,6 +754,36 @@ fn pty_kill_terminates_pwsh_infinite_loop() {
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
 }
 
+#[cfg(windows)]
+#[test]
+fn pty_kill_terminates_pwsh_infinite_loop_within_bounded_time() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "pwsh -NoProfile -Command while($true){Start-Sleep -Milliseconds 100}",
+        Duration::from_secs(30),
+    );
+
+    let started = Instant::now();
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Windows PTY kill did not reach terminal status within bounded time"
+    );
+}
+
+// POSIX-only harness: spawns `cat`, which is not a Windows PowerShell command.
+// Skip on Windows — the kill-marker invariant is covered on Unix; the real
+// Windows kill path is gated by pty_kill_terminates_pwsh_infinite_loop.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`cat`); Unix covers the invariant"
+)]
 #[test]
 fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
     let project = tempfile::tempdir().unwrap();
@@ -734,6 +803,11 @@ fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
     assert_eq!(marker.trim(), "killed");
 }
 
+// POSIX-only harness: spawns `cat`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`cat`); Unix covers the invariant"
+)]
 #[test]
 fn pty_kill_with_clones_outstanding_still_terminates() {
     let project = tempfile::tempdir().unwrap();
@@ -773,6 +847,12 @@ fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
     assert_eq!(snapshot.exit_code, Some(124));
 }
 
+// POSIX-only harness: spawns `printf`, not a Windows command. Skip on Windows;
+// the snapshot/preview invariant is covered on Unix.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
     let project = tempfile::tempdir().unwrap();
@@ -794,6 +874,11 @@ fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
     assert_eq!(snapshot.stderr_path, None);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_completion_preview_is_empty() {
     let project = tempfile::tempdir().unwrap();
@@ -808,12 +893,16 @@ fn pty_completion_preview_is_empty() {
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
 
-    let completions = registry.drain_completions_for_session(Some(SESSION));
-    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    let completion = wait_for_completion(&registry, &task_id);
     assert_eq!(completion.output_preview, "");
     assert!(!completion.output_truncated);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_completion_token_counts_returns_skipped_sentinel() {
     let project = tempfile::tempdir().unwrap();
@@ -828,13 +917,17 @@ fn pty_completion_token_counts_returns_skipped_sentinel() {
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
 
-    let completions = registry.drain_completions_for_session(Some(SESSION));
-    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    let completion = wait_for_completion(&registry, &task_id);
     assert_eq!(completion.original_tokens, None);
     assert_eq!(completion.compressed_tokens, None);
     assert!(completion.tokens_skipped);
 }
 
+// POSIX-only harness: spawns `printf`. Skip on Windows; Unix covers the invariant.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`printf`); Unix covers the invariant"
+)]
 #[test]
 fn pty_parallel_smoke_10_tasks() {
     let project = tempfile::tempdir().unwrap();

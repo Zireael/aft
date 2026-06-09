@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { maybeAppendConflictsHint, maybeAppendGrepHint } from "../shared/bash-hints";
+import { maybeAppendConflictsHint } from "../shared/bash-hints";
 
 describe("maybeAppendConflictsHint", () => {
   // Real `git merge` output for a content conflict.
@@ -58,31 +58,5 @@ describe("maybeAppendConflictsHint", () => {
 
   test("does NOT append hint when output is empty", () => {
     expect(maybeAppendConflictsHint("")).toBe("");
-  });
-});
-
-describe("maybeAppendGrepHint", () => {
-  test("appends hint when first line is a rg invocation", () => {
-    const output = "rg -n 'pattern' src/\nsrc/foo.ts:42:match\n";
-    const result = maybeAppendGrepHint(output);
-    expect(result).toContain("[Hint] Use the grep tool");
-  });
-
-  test("appends hint when first line is a grep invocation", () => {
-    const output = "grep -rn 'pattern' src/\nsrc/foo.ts:42:match\n";
-    const result = maybeAppendGrepHint(output);
-    expect(result).toContain("[Hint] Use the grep tool");
-  });
-
-  test("does NOT fire when grep token appears only on a later line", () => {
-    const output = "running tests...\n  grep is used inside\n";
-    const result = maybeAppendGrepHint(output);
-    expect(result).toBe(output);
-  });
-
-  test("does NOT fire on unrelated output", () => {
-    const output = "ls -la\ntotal 12\n-rw-r--r-- file.txt\n";
-    const result = maybeAppendGrepHint(output);
-    expect(result).toBe(output);
   });
 });

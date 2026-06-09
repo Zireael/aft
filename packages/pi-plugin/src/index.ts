@@ -17,14 +17,13 @@
  *   - aft_outline    Structural outline (symbols, headings) for files/URLs
  *   - aft_zoom       Symbol-level inspection with call-graph annotations
  *   - aft_search     Semantic search (when semantic_search=true)
- *   - aft_navigate   Call-graph navigation (callers, call_tree, impact, trace_to, trace_data)
+ *   - aft_callgraph   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
  *   - aft_conflicts  One-call merge conflict inspection
  *   - aft_import     Language-aware import add/remove/organize
  *   - aft_safety     Per-file undo, checkpoints, restore
  *   - aft_delete     Delete file with backup
  *   - aft_move       Move/rename file
  *   - ast_grep_search / ast_grep_replace  AST-aware pattern search/rewrite
- *   - lsp_diagnostics On-demand LSP diagnostics
  *
  * Commands:
  *   - /aft-status    Status dialog (index states, LSP servers, storage dir)
@@ -47,6 +46,7 @@ import {
   appendToolResultBgCompletions,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
+  handlePushedPatternMatch,
   handleTurnEndBgCompletions,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
@@ -71,6 +71,7 @@ import {
   deliverConfigureWarnings,
   sendFeatureAnnouncement,
 } from "./notifications.js";
+import { statusBarBlockForSession } from "./status-bar-inject.js";
 
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
@@ -84,7 +85,7 @@ import { registerConflictsTool } from "./tools/conflicts.js";
 import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
-import { registerLspTools } from "./tools/lsp.js";
+import { registerInspectTool } from "./tools/inspect.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
@@ -100,6 +101,17 @@ type BashLongRunningPayload = {
   command: string;
   elapsed_ms: number;
   mode?: "pipes" | "pty" | string;
+};
+
+type BashPatternMatchPayload = {
+  session_id: string;
+  task_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+  reason?: "pattern_match" | "task_exit";
 };
 
 type BridgePendingState = {
@@ -172,11 +184,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.28.0";
+const ANNOUNCEMENT_VERSION = "0.36.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Bash hoisting is now default-on. Configure with top-level `bash: { rewrite, compress, background }` instead of `experimental.bash.*` — old config migrates automatically on first launch.",
-  "Vue, Astro, and Svelte language servers now auto-install when the framework appears in your package.json (fixes #48).",
-  "Native Windows ARM64 binary — ARM64 hosts no longer fall back to x64 under emulation.",
+  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
+  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
+  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
+  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
 ];
 
 /**
@@ -186,10 +199,10 @@ const ANNOUNCEMENT_FEATURES: string[] = [
  *
  * Leave empty (`""`) to suppress.
  */
-const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
+const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 
 const ALL_ONLY_TOOLS = new Set([
-  "aft_navigate",
+  "aft_callgraph",
   "aft_delete",
   "aft_move",
   "aft_transform",
@@ -224,6 +237,11 @@ function shouldPrepareOnnxRuntime(
 ): boolean {
   const isFastembedSemanticBackend = (config.semantic?.backend ?? "fastembed") === "fastembed";
   return config.semantic_search === true && isFastembedSemanticBackend;
+}
+
+function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string {
+  const cwd = (bridge as { cwd?: unknown } | undefined)?.cwd;
+  return typeof cwd === "string" && cwd.length > 0 ? cwd : fallback;
 }
 
 // IMPORTANT: NOT exported as a named export — only via the __test__
@@ -291,9 +309,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   hoistWrite: boolean;
   hoistEdit: boolean;
   hoistGrep: boolean;
+  restrictToProjectRoot: boolean;
   outline: boolean;
   zoom: boolean;
   semantic: boolean;
+  inspect: boolean;
   navigate: boolean;
   conflicts: boolean;
   importTool: boolean;
@@ -302,7 +322,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  lspDiagnostics: boolean;
   structure: boolean;
   refactor: boolean;
 } {
@@ -310,6 +329,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   const disabled = new Set(config.disabled_tools ?? []);
   const ok = (name: string): boolean => !disabled.has(name);
   const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
+  // Mirrors the Pi-side default in `configureOverrides` below: false means
+  // "no plugin-side restriction; let Rust accept any path." Threaded into
+  // ToolSurfaceFlags so hoisted tools can suppress the external_directory
+  // prompt that Pi has no host-level allow-list to back.
+  const restrictToProjectRoot = config.restrict_to_project_root ?? false;
 
   if (surface === "minimal") {
     return {
@@ -318,9 +342,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot,
       outline: ok("aft_outline"),
       zoom: ok("aft_zoom"),
       semantic: false,
+      inspect: false,
       navigate: false,
       conflicts: false,
       importTool: false,
@@ -329,7 +355,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       move: false,
       astSearch: false,
       astReplace: false,
-      lspDiagnostics: false,
       structure: false,
       refactor: false,
     };
@@ -342,9 +367,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     hoistWrite: ok("write"),
     hoistEdit: ok("edit"),
     hoistGrep: ok("grep") && config.search_index === true,
+    restrictToProjectRoot,
     outline: ok("aft_outline"),
     zoom: ok("aft_zoom"),
     semantic: ok("aft_search") && config.semantic_search === true,
+    inspect: ok("aft_inspect") && config.inspect?.enabled !== false,
     navigate: false,
     conflicts: ok("aft_conflicts"),
     importTool: ok("aft_import"),
@@ -353,7 +380,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    lspDiagnostics: ok("lsp_diagnostics"),
     structure: false,
     refactor: false,
   };
@@ -361,7 +387,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   if (surface === "all") {
     return {
       ...base,
-      navigate: allOnly("aft_navigate"),
+      navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
       structure: allOnly("aft_transform"),
@@ -451,6 +477,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   Object.assign(configOverrides, resolveExperimentalConfigForConfigure(config));
   Object.assign(configOverrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) configOverrides.semantic = config.semantic;
+  if (config.inspect !== undefined) configOverrides.inspect = config.inspect;
   if (config.max_callgraph_files !== undefined)
     configOverrides.max_callgraph_files = config.max_callgraph_files;
   // url_fetch_allow_private: USER ONLY. Forwarded only when set (Rust default false).
@@ -547,6 +574,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let pool: BridgePool;
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+    onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
     errorPrefix: "[aft-pi]",
     minVersion: PLUGIN_VERSION,
@@ -569,31 +597,51 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         });
       }, 0);
     },
-    onBashCompletion: (completion) => {
+    onBashCompletion: (completion, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
       void handlePushedBgCompletion(
         {
           ctx,
-          directory: process.cwd(),
+          directory,
           sessionID: completion.session_id,
           runtime: pi,
         },
         completion,
       );
     },
-    onBashLongRunning: (reminder) => {
+    onBashLongRunning: (reminder, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
       void handlePushedBgLongRunning(
         {
           ctx,
-          directory: process.cwd(),
+          directory,
           sessionID: reminder.session_id,
           runtime: pi,
         },
         reminder,
       );
     },
+    onBashPatternMatch: (frame, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
+      void handlePushedPatternMatch(
+        {
+          ctx,
+          directory,
+          sessionID: frame.session_id,
+          runtime: pi,
+        },
+        frame,
+      );
+    },
   };
   pool = new BridgePool(binaryPath, poolOptions, configOverrides);
   pool.setConfigureOverride("harness", "pi");
+  // Tell Rust whether `aft_search` is registered for this surface so the
+  // grep-rewrite footer steers there (vs the grep tool). Set before the eager
+  // warmup spawn below so even the first bridge configures with the flag.
+  // `resolveToolSurface` is pure; `.semantic` is the same predicate the tool
+  // registration uses (ok("aft_search") && semantic_search === true).
+  pool.setConfigureOverride("aft_search_registered", resolveToolSurface(config).semantic);
   const ctx: PluginContext = { pool, config, storageDir };
 
   // Settle the ONNX runtime download promise (started above) and patch the
@@ -624,6 +672,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Eager async configure: warm the bridge for `process.cwd()` so the first
   // tool call doesn't pay the spawn + configure latency. Errors are swallowed —
   // the next real tool call will surface a proper error.
+  //
+  // AUDIT NOTE (intentional — do not flag as a bug): unlike the OpenCode
+  // plugin, Pi keeps eager warmup ON PURPOSE. Pi runs one bridge per process
+  // (one session per process) and has no OpenCode-Desktop-style sidebar that
+  // multiplies plugin instances across many projects/worktrees. The reason
+  // OpenCode went lazy (avoid spawning N bridges for N sidebar projects at
+  // startup) does not apply here, so eager warmup is the correct trade for Pi:
+  // it removes first-tool-call latency without the bridge-storm downside.
+  // The $HOME guard below is the only case we skip. See the home-dir note.
   void (async () => {
     try {
       // Note #65: skip eager configure when Pi was launched from the user's
@@ -696,7 +753,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // resolved config. registerBashTool handles per-flag gating internally
   // for bash_status / bash_kill.
   if (surface.hoistBash && resolveBashConfig(config).enabled) {
-    registerBashTool(pi, ctx);
+    registerBashTool(pi, ctx, surface.semantic);
   }
   registerHoistedTools(pi, ctx, surface);
 
@@ -706,6 +763,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.semantic) {
     registerSemanticTool(pi, ctx);
+  }
+  if (surface.inspect) {
+    registerInspectTool(pi, ctx);
   }
   if (surface.navigate) {
     registerNavigateTool(pi, ctx);
@@ -724,9 +784,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.delete || surface.move) {
     registerFsTools(pi, ctx, surface);
-  }
-  if (surface.lspDiagnostics) {
-    registerLspTools(pi, ctx);
   }
   if (surface.structure) {
     registerStructureTool(pi, ctx);
@@ -759,11 +816,28 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ) => unknown,
     ) => void
   )("tool_result", async (event, extCtx) => {
-    const content = await appendToolResultBgCompletions(
-      { ctx, directory: extCtx.cwd, sessionID: resolveSessionId(extCtx) },
+    const sessionID = resolveSessionId(extCtx);
+    const bgContent = await appendToolResultBgCompletions(
+      { ctx, directory: extCtx.cwd, sessionID },
       event.content,
     );
-    if (!content) return undefined;
+    // Start from the bg-completion-augmented content if present, else original.
+    let content = bgContent ?? event.content;
+    // Agent status bar — IDE-style health glance, appended on emit-on-change.
+    // Read from the active bridge (no spawn); the Rust side keeps counts current.
+    // Force it on aft_inspect (the bar IS that call's summary line). The Pi
+    // tool_result event doesn't carry the tool name, so detect inspect by its
+    // distinctive top-level `scanner_state` key on the response (passed as
+    // `details`) — only inspect emits it.
+    const isInspect =
+      typeof event.details === "object" &&
+      event.details !== null &&
+      "scanner_state" in (event.details as Record<string, unknown>);
+    const activeBridge = pool.getActiveBridgeForRoot(extCtx.cwd);
+    const bar = statusBarBlockForSession(sessionID, activeBridge?.getStatusBar(), isInspect);
+    if (bar) content = [...content, { type: "text", text: bar }];
+    // Nothing to add → leave the tool result untouched.
+    if (content === event.content) return undefined;
     return { content, details: event.details, isError: event.isError };
   });
 
@@ -784,22 +858,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   });
 
-  // Clean up bridges on session shutdown.
-  pi.on("session_shutdown", async () => {
-    try {
-      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      await disposeAllPtyTerminals();
-      await pool.shutdown();
-      log("Bridge pool shut down");
-    } catch (err) {
-      warn(`Error during bridge shutdown: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
-
   // Also register process-level signal handlers so children get an orderly
   // shutdown when Pi's host Node process is killed directly (terminal close,
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
-  registerShutdownCleanup(async () => {
+  const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await disposeAllPtyTerminals();
@@ -809,10 +871,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   });
 
+  // Clean up bridges on session shutdown.
+  pi.on("session_shutdown", async () => {
+    try {
+      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
+      await disposeAllPtyTerminals();
+      await pool.shutdown();
+      log("Bridge pool shut down");
+    } catch (err) {
+      warn(`Error during bridge shutdown: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      unregisterShutdownCleanup();
+    }
+  });
+
   log(`AFT extension ready (surface=${config.tool_surface ?? "recommended"})`);
 }
 
 export const __test__ = {
+  bridgeDirectoryFromCallback,
   resolveToolSurface,
   handleConfigureWarningsForSession,
   shouldPrepareOnnxRuntime,

@@ -1,0 +1,1260 @@
+{
+  "timestamp": "2026-05-26T09:42:18.550Z",
+  "benchmark": "codegraph-replication",
+  "codebasePath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588",
+  "codegraphSha": "1be8e7830f7ca37e42a378186b0274e684b1d4d8",
+  "aftSha": "c6dac3b6d1c6be88271924f3ea4a666445313e8e",
+  "driver": "list-files",
+  "corpus": "codegraph",
+  "corpusPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication/corpora/codegraph.json",
+  "topK": 10,
+  "runs": 1,
+  "summary": {
+    "total": 12,
+    "passed": 0,
+    "failed": 12,
+    "skipped": 0,
+    "meanRecall": 0,
+    "meanMRR": 0,
+    "meanPrecisionAt1": 0,
+    "meanPrecisionAt5": 0,
+    "meanPrecisionAt10": 0,
+    "latencyMsMedian": 0.105,
+    "latencyMsP95": 0.297
+  },
+  "results": [
+    {
+      "caseId": "search-class-exact",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BinaryBridge"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 0.297,
+      "latencySamplesMs": [
+        0.297
+      ],
+      "latencyMsMedian": 0.297,
+      "latencyMsP95": 0.297,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "search-method-qualified",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "send"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 0.122,
+      "latencySamplesMs": [
+        0.122
+      ],
+      "latencyMsMedian": 0.122,
+      "latencyMsP95": 0.122,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "search-interface",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BridgeOptions"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 0.11,
+      "latencySamplesMs": [
+        0.11
+      ],
+      "latencyMsMedian": 0.11,
+      "latencyMsP95": 0.11,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "search-enum",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "SemanticIndexStatus"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/context.rs"
+      ],
+      "latencyMs": 0.116,
+      "latencySamplesMs": [
+        0.116
+      ],
+      "latencyMsMedian": 0.116,
+      "latencyMsP95": 0.116,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "search-exception",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "HomeProjectRootError"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "latencyMs": 0.113,
+      "latencySamplesMs": [
+        0.113
+      ],
+      "latencyMsMedian": 0.113,
+      "latencyMsP95": 0.113,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "search-nested-class",
+      "api": "searchNodes",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BridgeReplacedDuringVersionCheck"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 0.105,
+      "latencySamplesMs": [
+        0.105
+      ],
+      "latencyMsMedian": 0.105,
+      "latencyMsP95": 0.105,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-plugin-bridge",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "callBridge",
+        "bridgeFor",
+        "BinaryBridge",
+        "BridgePool"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/opencode-plugin/src/tools/_shared.ts",
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "latencyMs": 0.106,
+      "latencySamplesMs": [
+        0.106
+      ],
+      "latencyMsMedian": 0.106,
+      "latencyMsP95": 0.106,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-semantic-search",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "semanticTools",
+        "handle_semantic_search",
+        "SemanticIndex",
+        "SearchIndex"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs",
+        "crates/aft/src/semantic_index.rs",
+        "crates/aft/src/search_index.rs"
+      ],
+      "latencyMs": 0.104,
+      "latencySamplesMs": [
+        0.104
+      ],
+      "latencyMsMedian": 0.104,
+      "latencyMsP95": 0.104,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-background-bash",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BgTaskRegistry",
+        "PersistedTask",
+        "replay_session",
+        "write_task"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/bash_background/registry.rs",
+        "crates/aft/src/bash_background/persistence.rs"
+      ],
+      "latencyMs": 0.094,
+      "latencySamplesMs": [
+        0.094
+      ],
+      "latencyMsMedian": 0.094,
+      "latencyMsP95": 0.094,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-lsp-diagnostics",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "LspManager",
+        "wait_for_diagnostics",
+        "pull_file_diagnostics",
+        "PostEditWaitOutcome"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/lsp/manager.rs"
+      ],
+      "latencyMs": 0.094,
+      "latencySamplesMs": [
+        0.094
+      ],
+      "latencyMsMedian": 0.094,
+      "latencyMsP95": 0.094,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-bridge-search",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "BinaryBridge",
+        "send",
+        "semanticTools",
+        "handle_semantic_search"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs"
+      ],
+      "latencyMs": 0.095,
+      "latencySamplesMs": [
+        0.095
+      ],
+      "latencyMsMedian": 0.095,
+      "latencyMsP95": 0.095,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    },
+    {
+      "caseId": "explore-import-organization",
+      "api": "findRelevantContext",
+      "driver": "list-files",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0,
+        "p10": 0
+      },
+      "foundSymbols": [],
+      "missedSymbols": [
+        "handle_organize_imports",
+        "parse_imports",
+        "classify_group",
+        "generate_import_line"
+      ],
+      "foundFiles": [],
+      "missedFiles": [
+        "crates/aft/src/commands/organize_imports.rs",
+        "crates/aft/src/imports.rs"
+      ],
+      "latencyMs": 0.091,
+      "latencySamplesMs": [
+        0.091
+      ],
+      "latencyMsMedian": 0.091,
+      "latencyMsP95": 0.091,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": ".alfonso/plans/codegraph-benchmark-replication.md",
+          "name": "codegraph-benchmark-replication.md",
+          "kind": "file",
+          "text": ".alfonso/plans/codegraph-benchmark-replication.md"
+        },
+        {
+          "rank": 2,
+          "file": ".alfonso/release-notes/v0.20.0.md",
+          "name": "v0.20.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.0.md"
+        },
+        {
+          "rank": 3,
+          "file": ".alfonso/release-notes/v0.20.1.md",
+          "name": "v0.20.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.20.1.md"
+        },
+        {
+          "rank": 4,
+          "file": ".alfonso/release-notes/v0.21.0.md",
+          "name": "v0.21.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.21.0.md"
+        },
+        {
+          "rank": 5,
+          "file": ".alfonso/release-notes/v0.22.0.md",
+          "name": "v0.22.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.0.md"
+        },
+        {
+          "rank": 6,
+          "file": ".alfonso/release-notes/v0.22.1.md",
+          "name": "v0.22.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.22.1.md"
+        },
+        {
+          "rank": 7,
+          "file": ".alfonso/release-notes/v0.23.0.md",
+          "name": "v0.23.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.23.0.md"
+        },
+        {
+          "rank": 8,
+          "file": ".alfonso/release-notes/v0.24.0.md",
+          "name": "v0.24.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.24.0.md"
+        },
+        {
+          "rank": 9,
+          "file": ".alfonso/release-notes/v0.25.0.md",
+          "name": "v0.25.0.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.0.md"
+        },
+        {
+          "rank": 10,
+          "file": ".alfonso/release-notes/v0.25.1.md",
+          "name": "v0.25.1.md",
+          "kind": "file",
+          "text": ".alfonso/release-notes/v0.25.1.md"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "binaryPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/target/release/aft",
+    "latencyNote": "latencySamplesMs are wall-clock measurements around each actual driver dispatch",
+    "harnessDir": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication",
+    "methodology": "AFT replication of codegraph/__tests__/evaluation structured retrieval-quality eval"
+  }
+}

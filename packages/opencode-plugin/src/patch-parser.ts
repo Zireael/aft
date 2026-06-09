@@ -423,10 +423,19 @@ export function applyUpdateChunks(
     }
 
     if (chunk.old_lines.length === 0) {
-      const insertionIdx =
-        originalLines.length > 0 && originalLines[originalLines.length - 1] === ""
-          ? originalLines.length - 1
-          : originalLines.length;
+      // Pure-insertion chunk (only `+` lines after the `@@` header, no context
+      // or `-` lines in the body). When the `@@` header carried a
+      // change_context, `lineIndex` was already advanced to just after the
+      // matched context line — insert there. Only fall back to end-of-file when
+      // there was no context to anchor against (a bare trailing insertion).
+      let insertionIdx: number;
+      if (chunk.change_context) {
+        insertionIdx = lineIndex;
+      } else if (originalLines.length > 0 && originalLines[originalLines.length - 1] === "") {
+        insertionIdx = originalLines.length - 1;
+      } else {
+        insertionIdx = originalLines.length;
+      }
       replacements.push([insertionIdx, 0, chunk.new_lines]);
       continue;
     }

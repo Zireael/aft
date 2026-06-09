@@ -1,0 +1,39 @@
+{
+  "name": "ripgrep",
+  "description": "Optional pinned real-codebase corpus for BurntSushi/ripgrep. Use TARGET=ripgrep or --target ripgrep to clone and evaluate it.",
+  "target": {
+    "name": "ripgrep",
+    "kind": "git",
+    "url": "https://github.com/BurntSushi/ripgrep.git",
+    "commit": "4857d6fa67db69a95cd4b6f2adda5d807d4d0119"
+  },
+  "cases": [
+    {
+      "id": "ripgrep-regex-matcher",
+      "query": "RegexMatcher",
+      "mode": "search",
+      "kind": "struct",
+      "expectedSymbols": ["RegexMatcher"],
+      "groundTruth": [{ "file": "crates/pcre2/src/matcher.rs", "symbol": "RegexMatcher", "startLine": 302 }]
+    },
+    {
+      "id": "ripgrep-searcher-builder",
+      "query": "SearcherBuilder",
+      "mode": "search",
+      "kind": "struct",
+      "expectedSymbols": ["SearcherBuilder"],
+      "groundTruth": [{ "file": "crates/searcher/src/searcher/mod.rs", "symbol": "SearcherBuilder", "startLine": 298 }]
+    },
+    {
+      "id": "ripgrep-searcher-flow",
+      "query": "How does ripgrep build a searcher and report line matches?",
+      "mode": "context",
+      "expectedSymbols": ["Searcher", "SearcherBuilder", "SinkMatch"],
+      "groundTruth": [
+        { "file": "crates/searcher/src/searcher/mod.rs", "symbol": "Searcher", "startLine": 597 },
+        { "file": "crates/searcher/src/searcher/mod.rs", "symbol": "SearcherBuilder", "startLine": 298 },
+        { "file": "crates/searcher/src/sink.rs", "symbol": "SinkMatch" }
+      ]
+    }
+  ]
+}

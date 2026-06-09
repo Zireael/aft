@@ -1,12 +1,12 @@
 {
   "name": "@cortexkit/aft",
-  "version": "0.29.1",
+  "version": "0.36.1",
   "type": "module",
   "description": "Unified CLI for Agent File Tools (AFT) — setup, doctor, and diagnostics across supported agent harnesses (OpenCode, Pi)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortexkit/aft"
+    "url": "git+https://github.com/cortexkit/aft.git"
   },
   "bin": {
     "aft": "dist/index.js"
@@ -19,11 +19,12 @@
     "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "test:unit": "bun test"
   },
   "dependencies": {
     "@clack/prompts": "^1.2.0",
-    "@cortexkit/aft-bridge": "0.29.1",
+    "@cortexkit/aft-bridge": "0.36.1",
     "comment-json": "^4.6.2"
   },
   "devDependencies": {

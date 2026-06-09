@@ -49,6 +49,11 @@ fn canonical_path_string(path: &Path) -> String {
         .expect("canonicalize path")
         .display()
         .to_string()
+        .replace('\\', "/")
+}
+
+fn normalize_path_text(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 fn match_files(response: &Value) -> HashSet<String> {
@@ -56,7 +61,12 @@ fn match_files(response: &Value) -> HashSet<String> {
         .as_array()
         .expect("matches array")
         .iter()
-        .map(|entry| entry["file"].as_str().expect("file path").to_string())
+        .map(|entry| {
+            entry["file"]
+                .as_str()
+                .expect("file path")
+                .replace('\\', "/")
+        })
         .collect()
 }
 
@@ -92,8 +102,9 @@ fn grep_multi_path_happy_path() {
             files.contains(&expected),
             "missing {relative}: {response:?}"
         );
+        let text = response["text"].as_str().expect("text").replace('\\', "/");
         assert!(
-            response["text"].as_str().expect("text").contains(relative),
+            text.contains(relative),
             "text should mention {relative}: {response:?}"
         );
     }
@@ -131,10 +142,98 @@ fn grep_multi_path_with_overlap_deduplicates_files() {
     assert_eq!(
         matches
             .iter()
-            .filter(|entry| entry["file"] == feature_path)
+            .filter(|entry| {
+                entry["file"]
+                    .as_str()
+                    .is_some_and(|path| normalize_path_text(path) == feature_path)
+            })
             .count(),
         1,
         "feature file should not be duplicated: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_multi_path_keeps_sibling_dirs_with_shared_prefix() {
+    let project = setup_project(&[
+        (
+            "packages/app/main.ts",
+            "const value = 'shared-prefix-needle';\n",
+        ),
+        (
+            "packages/app-old/main.ts",
+            "const value = 'shared-prefix-needle';\n",
+        ),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-sibling-prefix",
+            "command": "grep",
+            "pattern": "shared-prefix-needle",
+            "path": "packages/app packages/app-old",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 2,
+        "sibling directory with shared lexical prefix must not be dropped: {response:?}"
+    );
+    let files = match_files(&response);
+    assert!(files.contains(&canonical_path_string(
+        &project.path().join("packages/app/main.ts")
+    )));
+    assert!(files.contains(&canonical_path_string(
+        &project.path().join("packages/app-old/main.ts")
+    )));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_multi_path_keeps_explicit_file_under_aftignored_parent() {
+    let project = setup_project(&[
+        (
+            "vendored/sub.rs",
+            "pub fn vendored() { let _ = \"needle\"; }\n",
+        ),
+        (".aftignore", "vendored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-explicit-under-aftignored-parent",
+            "command": "grep",
+            "pattern": "needle",
+            "path": [".", "vendored/sub.rs"],
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 1,
+        "explicit file nested under an .aftignored directory must still be searched: {response:?}"
+    );
+    assert_eq!(
+        normalize_path_text(response["matches"][0]["file"].as_str().expect("file path")),
+        canonical_path_string(&project.path().join("vendored/sub.rs"))
     );
 
     let status = aft.shutdown();
@@ -189,7 +288,7 @@ fn grep_legitimate_single_path_with_space_is_not_split() {
     );
     assert_eq!(response["total_matches"], 1);
     assert_eq!(
-        response["matches"][0]["file"],
+        normalize_path_text(response["matches"][0]["file"].as_str().expect("file path")),
         canonical_path_string(&project.path().join("with space/file.ts"))
     );
 
@@ -255,7 +354,7 @@ fn glob_multi_path_happy_path() {
         .as_array()
         .expect("files array")
         .iter()
-        .map(|entry| entry.as_str().expect("file path").to_string())
+        .map(|entry| normalize_path_text(entry.as_str().expect("file path")))
         .collect();
     for relative in ["a/one.ts", "b/two.ts", "c/three.ts"] {
         assert!(

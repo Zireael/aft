@@ -4,16 +4,21 @@
 //! using the fixtures in `tests/fixtures/callgraph/`.
 
 use crate::helpers::{fixture_path, AftProcess};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(&format!(
-        r#"{{"id":"configure","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"configure","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+}
+
+fn path_text_ends_with(path: &str, suffix: &str) -> bool {
+    path.replace('\\', "/").ends_with(suffix)
 }
 
 /// `configure` sets project root and returns success.
@@ -24,8 +29,8 @@ fn callgraph_configure_sets_project_root() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(
@@ -79,15 +84,15 @@ fn callgraph_cross_file_tree() {
 
     // Configure first
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     // Get call tree for main
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}/main.ts","symbol":"main","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"main","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/main.ts", root))
     ));
 
     assert_eq!(
@@ -171,14 +176,14 @@ fn callgraph_depth_limit_truncates() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     // Depth 1: main → processData (no deeper)
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}/main.ts","symbol":"main","depth":1}}"#,
-        root
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"main","depth":1}}"#,
+        crate::helpers::json_string(&format!("{}/main.ts", root))
     ));
 
     assert_eq!(resp["success"], true);
@@ -199,6 +204,31 @@ fn callgraph_depth_limit_truncates() {
     aft.shutdown();
 }
 
+/// `call_tree` rejects files outside project_root even when generic path validation is relaxed.
+#[test]
+fn callgraph_call_tree_rejects_path_outside_project_root() {
+    let mut aft = AftProcess::spawn();
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(
+        outside.path().join("outside.ts"),
+        "export function main() {}\n",
+    )
+    .unwrap();
+
+    configure_project(&mut aft, root.path());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"main"}}"#,
+        crate::helpers::json_string(&outside.path().join("outside.ts").display())
+    ));
+
+    assert_eq!(resp["success"], false, "outside path should fail: {resp:?}");
+    assert_eq!(resp["code"], "path_outside_project_root");
+
+    aft.shutdown();
+}
+
 /// `call_tree` for an unknown symbol returns error.
 #[test]
 fn callgraph_unknown_symbol_error() {
@@ -207,13 +237,13 @@ fn callgraph_unknown_symbol_error() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}/main.ts","symbol":"nonexistent"}}"#,
-        root
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"nonexistent"}}"#,
+        crate::helpers::json_string(&format!("{}/main.ts", root))
     ));
 
     assert_eq!(
@@ -234,13 +264,13 @@ fn callgraph_aliased_import_resolution() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}/aliased.ts","symbol":"runCheck","depth":3}}"#,
-        root
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"runCheck","depth":3}}"#,
+        crate::helpers::json_string(&format!("{}/aliased.ts", root))
     ));
 
     assert_eq!(
@@ -296,15 +326,15 @@ fn callgraph_callers_cross_file() {
 
     // Configure first
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     // Get callers of validate in helpers.ts
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
@@ -356,14 +386,14 @@ fn callgraph_callers_empty_result() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     // main is an entry point — nothing calls it
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/main.ts","symbol":"main"}}"#,
-        root
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"main"}}"#,
+        crate::helpers::json_string(&format!("{}/main.ts", root))
     ));
 
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
@@ -385,15 +415,15 @@ fn callgraph_callers_recursive() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     // checkFormat is called by validate (same file), validate called by processData (utils.ts)
     // With depth 2, we should see transitive callers
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":2}}"#,
-        root
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":2}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(
@@ -462,8 +492,8 @@ export function runWorkspaceImport(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_display
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_display)
     ));
     assert_eq!(
         resp["success"], true,
@@ -472,8 +502,8 @@ export function runWorkspaceImport(): string {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"workspaceTarget","depth":1}}"#,
-        pkg_a.join("src/target.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"workspaceTarget","depth":1}}"#,
+        crate::helpers::json_string(&pkg_a.join("src/target.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
     assert_eq!(
@@ -484,8 +514,7 @@ export function runWorkspaceImport(): string {
     let pkg_b_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-b/src/main.ts")
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-b/src/main.ts"))
     });
     assert!(
         pkg_b_group.is_some(),
@@ -494,8 +523,8 @@ export function runWorkspaceImport(): string {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"3","command":"call_tree","file":"{}","symbol":"runWorkspaceImport","depth":2}}"#,
-        pkg_b.join("src/main.ts").display()
+        r#"{{"id":"3","command":"call_tree","file":{},"symbol":"runWorkspaceImport","depth":2}}"#,
+        crate::helpers::json_string(&pkg_b.join("src/main.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -511,8 +540,7 @@ export function runWorkspaceImport(): string {
     assert!(
         target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-a/src/target.ts"),
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-a/src/target.ts")),
         "workspaceTarget should resolve through package export to source file: {:?}",
         target_child
     );
@@ -604,8 +632,8 @@ export function registerPiReadingTools(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_display
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_display)
     ));
     assert_eq!(
         resp["success"], true,
@@ -618,9 +646,9 @@ export function registerPiReadingTools(): string {
         ("3", bridge.join("src/zoom-format.ts"), "formatZoomText"),
     ] {
         let resp = aft.send(&format!(
-            r#"{{"id":"{}","command":"callers","file":"{}","symbol":"{}","depth":1}}"#,
+            r#"{{"id":"{}","command":"callers","file":{},"symbol":"{}","depth":1}}"#,
             id,
-            file.display(),
+            crate::helpers::json_string(&file.display()),
             symbol
         ));
         assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
@@ -637,8 +665,7 @@ export function registerPiReadingTools(): string {
             assert!(
                 callers.iter().any(|group| group["file"]
                     .as_str()
-                    .unwrap_or("")
-                    .ends_with(expected_file)),
+                    .is_some_and(|path| path_text_ends_with(path, expected_file))),
                 "{symbol} caller should include {expected_file}: {:?}",
                 callers
             );
@@ -703,8 +730,8 @@ export function runWorkspaceImport(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_display
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_display)
     ));
     assert_eq!(
         resp["success"], true,
@@ -713,8 +740,8 @@ export function runWorkspaceImport(): string {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"workspaceTarget","depth":1}}"#,
-        pkg_a.join("src/target.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"workspaceTarget","depth":1}}"#,
+        crate::helpers::json_string(&pkg_a.join("src/target.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
     assert_eq!(
@@ -726,8 +753,7 @@ export function runWorkspaceImport(): string {
     let pkg_b_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-b/src/main.ts")
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-b/src/main.ts"))
     });
     assert!(
         pkg_b_group.is_some(),
@@ -736,8 +762,8 @@ export function runWorkspaceImport(): string {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"3","command":"call_tree","file":"{}","symbol":"runWorkspaceImport","depth":2}}"#,
-        pkg_b.join("src/main.ts").display()
+        r#"{{"id":"3","command":"call_tree","file":{},"symbol":"runWorkspaceImport","depth":2}}"#,
+        crate::helpers::json_string(&pkg_b.join("src/main.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -753,16 +779,14 @@ export function runWorkspaceImport(): string {
     assert!(
         target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-a/src/target.ts"),
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-a/src/target.ts")),
         "workspaceTarget should resolve to source target instead of dist bundle: {:?}",
         target_child
     );
     assert!(
         !target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .contains("/dist/"),
+            .is_some_and(|path| path.replace('\\', "/").contains("/dist/")),
         "workspaceTarget should not resolve to dist bundle: {:?}",
         target_child
     );
@@ -799,8 +823,8 @@ test("calls target", () => {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_display
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_display)
     ));
     assert_eq!(
         resp["success"], true,
@@ -809,8 +833,8 @@ test("calls target", () => {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"testTarget","depth":1}}"#,
-        root.join("src/shared/model.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"testTarget","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/shared/model.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
     assert_eq!(
@@ -821,8 +845,7 @@ test("calls target", () => {
     let test_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("src/__tests__/model.test.ts")
+            .is_some_and(|path| path_text_ends_with(path, "src/__tests__/model.test.ts"))
     });
     assert!(
         test_group.is_some(),
@@ -867,8 +890,8 @@ export function render(): unknown {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_display
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_display)
     ));
     assert_eq!(
         resp["success"], true,
@@ -877,8 +900,8 @@ export function render(): unknown {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}","symbol":"render","depth":1}}"#,
-        app.join("src/main.ts").display()
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"render","depth":1}}"#,
+        crate::helpers::json_string(&app.join("src/main.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -921,8 +944,8 @@ fn callgraph_reexport_alias_resolves_to_source_symbol() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
-        root.join("real.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"foo","depth":1}}"#,
+        crate::helpers::json_string(&root.join("real.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -951,8 +974,8 @@ fn callgraph_aliased_import_follows_reexport_barrel() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
-        root.join("real.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"foo","depth":1}}"#,
+        crate::helpers::json_string(&root.join("real.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -985,8 +1008,8 @@ fn callgraph_default_reexport_resolves_real_default_symbol() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"targetDefault","depth":1}}"#,
-        root.join("real.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"targetDefault","depth":1}}"#,
+        crate::helpers::json_string(&root.join("real.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -1009,8 +1032,8 @@ fn callgraph_call_tree_resolves_same_file_calls() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"call_tree","file":"{}","symbol":"main","depth":3}}"#,
-        root.join("local.ts").display()
+        r#"{{"id":"1","command":"call_tree","file":{},"symbol":"main","depth":3}}"#,
+        crate::helpers::json_string(&root.join("local.ts").display())
     ));
     assert_eq!(resp["success"], true, "call_tree should succeed: {resp:?}");
     let helper = resp["children"]
@@ -1059,8 +1082,8 @@ fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"target","depth":1}}"#,
-        pkg.join("src/index.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"target","depth":1}}"#,
+        crate::helpers::json_string(&pkg.join("src/index.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -1074,8 +1097,8 @@ fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
     fs::write(pkg.join("package.json"), r#"{"name":"@scope/new"}"#).unwrap();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"target","depth":1}}"#,
-        pkg.join("src/index.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"target","depth":1}}"#,
+        crate::helpers::json_string(&pkg.join("src/index.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -1102,9 +1125,9 @@ fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
     configure_project(&mut aft, root);
     for (id, symbol) in [("1", "Widget"), ("2", "Service")] {
         let resp = aft.send(&format!(
-            r#"{{"id":"{}","command":"callers","file":"{}","symbol":"{}","depth":1}}"#,
+            r#"{{"id":"{}","command":"callers","file":{},"symbol":"{}","depth":1}}"#,
             id,
-            root.join("component.tsx").display(),
+            crate::helpers::json_string(&root.join("component.tsx").display()),
             symbol
         ));
         assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
@@ -1134,8 +1157,8 @@ fn callgraph_source_less_export_alias_resolves_local_symbol() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
-        root.join("module.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"foo","depth":1}}"#,
+        crate::helpers::json_string(&root.join("module.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -1154,16 +1177,16 @@ fn callgraph_commands_accept_private_leaf_symbols() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let tree = aft.send(&format!(
-        r#"{{"id":"1","command":"call_tree","file":"{}","symbol":"leaf","depth":1}}"#,
-        root.join("leaf.ts").display()
+        r#"{{"id":"1","command":"call_tree","file":{},"symbol":"leaf","depth":1}}"#,
+        crate::helpers::json_string(&root.join("leaf.ts").display())
     ));
     assert_eq!(
         tree["success"], true,
         "call_tree should accept private leaf: {tree:?}"
     );
     let callers = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"leaf","depth":1}}"#,
-        root.join("leaf.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"leaf","depth":1}}"#,
+        crate::helpers::json_string(&root.join("leaf.ts").display())
     ));
     assert_eq!(
         callers["success"], true,
@@ -1205,8 +1228,8 @@ fn callgraph_detects_pnpm_workspace_and_skips_empty_nested_workspaces() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"pnpmTarget","depth":1}}"#,
-        pkg.join("src/index.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"pnpmTarget","depth":1}}"#,
+        crate::helpers::json_string(&pkg.join("src/index.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -1253,8 +1276,8 @@ fn callgraph_workspace_globs_support_recursive_patterns_and_negations() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"recursiveTarget","depth":1}}"#,
-        recursive.join("src/index.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"recursiveTarget","depth":1}}"#,
+        crate::helpers::json_string(&recursive.join("src/index.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -1265,8 +1288,8 @@ fn callgraph_workspace_globs_support_recursive_patterns_and_negations() {
         "recursive glob should include nested package: {resp:?}"
     );
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}","symbol":"legacyTarget","depth":1}}"#,
-        legacy.join("src/index.ts").display()
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"legacyTarget","depth":1}}"#,
+        crate::helpers::json_string(&legacy.join("src/index.ts").display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -1299,8 +1322,8 @@ fn callgraph_resolves_tsconfig_paths_aliases() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"pathTarget","depth":1}}"#,
-        root.join("src/lib/target.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"pathTarget","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/lib/target.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -1319,8 +1342,8 @@ fn callgraph_computed_member_call_uses_static_property_name() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"method","depth":1}}"#,
-        root.join("computed.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"method","depth":1}}"#,
+        crate::helpers::json_string(&root.join("computed.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
@@ -1344,13 +1367,222 @@ fn callgraph_keeps_external_member_call_with_same_short_name_as_caller() {
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":"{}","symbol":"add","depth":1}}"#,
-        root.join("math.ts").display()
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"add","depth":1}}"#,
+        crate::helpers::json_string(&root.join("math.ts").display())
     ));
     assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
     assert_eq!(
         resp["total_callers"], 1,
         "external math.add call should not be filtered as self-recursion: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+fn write_rust_manifest(root: &Path, package_name: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+}
+
+fn assert_single_caller(
+    resp: &serde_json::Value,
+    expected_file_suffix: &str,
+    expected_symbol: &str,
+) {
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "expected exactly one caller: {resp:?}"
+    );
+    let callers = resp["callers"].as_array().expect("callers array");
+    let group = callers
+        .iter()
+        .find(|group| {
+            group["file"]
+                .as_str()
+                .is_some_and(|path| path_text_ends_with(path, expected_file_suffix))
+        })
+        .unwrap_or_else(|| panic!("caller should include {expected_file_suffix}: {callers:?}"));
+    let entries = group["callers"].as_array().expect("caller entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["symbol"].as_str().unwrap_or("") == expected_symbol),
+        "caller should include symbol {expected_symbol}: {entries:?}"
+    );
+}
+
+#[test]
+fn callgraph_rust_crate_qualified_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-qualified-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/target.rs"),
+        "pub fn crate_qualified_target() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "pub fn run_crate_qualified() {\n    crate::target::crate_qualified_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"crate_qualified_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_single_caller(&resp, "src/caller.rs", "run_crate_qualified");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_use_imported_short_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-use-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/target.rs"), "pub fn imported_target() {}\n").unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "use crate::target::imported_target;\n\npub fn run_imported() {\n    imported_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"imported_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_single_caller(&resp, "src/caller.rs", "run_imported");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_self_and_super_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-relative-fixture");
+    fs::create_dir_all(root.join("src/parent")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod current;\npub mod parent;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/current.rs"),
+        "pub fn self_target() {}\n\npub fn run_self() {\n    self::self_target();\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/parent.rs"),
+        "pub mod child;\n\npub fn super_target() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/parent/child.rs"),
+        "pub fn run_super() {\n    super::super_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let self_resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"self_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/current.rs").display())
+    ));
+    assert_single_caller(&self_resp, "src/current.rs", "run_self");
+
+    let super_resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"super_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/parent.rs").display())
+    ));
+    assert_single_caller(&super_resp, "src/parent/child.rs", "run_super");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_workspace_lib_name_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"libpkg\", \"app\"]\n",
+    )
+    .unwrap();
+
+    let libpkg = root.join("libpkg");
+    let app = root.join("app");
+    fs::create_dir_all(libpkg.join("src")).unwrap();
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        libpkg.join("Cargo.toml"),
+        "[package]\nname = \"lib-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"fixture_lib\"\n",
+    )
+    .unwrap();
+    fs::write(libpkg.join("src/lib.rs"), "pub mod api;\n").unwrap();
+    fs::write(libpkg.join("src/api.rs"), "pub fn workspace_target() {}\n").unwrap();
+    write_rust_manifest(&app, "app");
+    fs::write(
+        app.join("src/main.rs"),
+        "pub fn dispatch() {\n    fixture_lib::api::workspace_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"workspace_target","depth":1}}"#,
+        crate::helpers::json_string(&libpkg.join("src/api.rs").display())
+    ));
+    assert_single_caller(&resp, "app/src/main.rs", "dispatch");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_external_paths_stay_unresolved() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-external-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/target.rs"), "pub fn new() {}\n").unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "use std::collections::HashMap;\n\npub fn run_external() {\n    let _map: HashMap<String, String> = HashMap::new();\n    unknown_crate::target::new();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"new","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 0,
+        "std and unknown external paths must not become callers: {resp:?}"
     );
     aft.shutdown();
 }
@@ -1381,13 +1613,13 @@ fn callgraph_trace_to_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_to","file":"{}/helpers.ts","symbol":"nonexistent"}}"#,
-        root
+        r#"{{"id":"2","command":"trace_to","file":{},"symbol":"nonexistent"}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(
@@ -1411,13 +1643,13 @@ fn callgraph_trace_to_single_path() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_to","file":"{}/helpers.ts","symbol":"checkFormat","depth":10}}"#,
-        root
+        r#"{{"id":"2","command":"trace_to","file":{},"symbol":"checkFormat","depth":10}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(resp["success"], true, "trace_to should succeed: {:?}", resp);
@@ -1471,13 +1703,13 @@ fn callgraph_trace_to_multi_path() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_to","file":"{}/helpers.ts","symbol":"validate","depth":10}}"#,
-        root
+        r#"{{"id":"2","command":"trace_to","file":{},"symbol":"validate","depth":10}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(resp["success"], true, "trace_to should succeed: {:?}", resp);
@@ -1539,13 +1771,13 @@ fn callgraph_trace_to_no_entry_points() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_to","file":"{}/main.ts","symbol":"main","depth":10}}"#,
-        root
+        r#"{{"id":"2","command":"trace_to","file":{},"symbol":"main","depth":10}}"#,
+        crate::helpers::json_string(&format!("{}/main.ts", root))
     ));
 
     assert_eq!(
@@ -1595,14 +1827,14 @@ fn callgraph_default_import_targets_real_default_export_name() {
     let mut aft = AftProcess::spawn();
     let root_str = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root_str
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root_str)
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"call_tree","file":"{}","symbol":"main","depth":2}}"#,
-        main.display()
+        r#"{{"id":"2","command":"call_tree","file":{},"symbol":"main","depth":2}}"#,
+        crate::helpers::json_string(&main.display())
     ));
     assert_eq!(resp["success"], true, "call_tree should succeed: {resp:?}");
 
@@ -1619,273 +1851,6 @@ fn callgraph_default_import_targets_real_default_export_name() {
     assert_eq!(default_child["resolved"], true);
     assert_eq!(default_child["name"], "realName");
     assert_ne!(default_child["name"], "default");
-
-    aft.shutdown();
-}
-
-// ---------------------------------------------------------------------------
-// file watcher invalidation cycle
-// ---------------------------------------------------------------------------
-
-/// Helper: copy a fixture directory into a temp dir for watcher tests.
-/// Returns the temp dir (auto-cleaned on drop) and its path as a String.
-fn setup_watcher_fixture() -> (tempfile::TempDir, String) {
-    let fixtures = fixture_path("callgraph");
-    let tmp = tempfile::tempdir().expect("create temp dir");
-
-    // Copy all fixture files into the temp dir
-    for entry in std::fs::read_dir(&fixtures).expect("read fixtures dir") {
-        let entry = entry.expect("read entry");
-        let src = entry.path();
-        if src.is_file() {
-            let dst = tmp.path().join(entry.file_name());
-            std::fs::copy(&src, &dst).expect("copy fixture file");
-        }
-    }
-
-    let root = tmp.path().display().to_string();
-    (tmp, root)
-}
-
-/// Poll for a watcher-driven callgraph update with retry.
-///
-/// Watcher tests are timing-sensitive: macOS FSEvents and Linux inotify
-/// can take anywhere from milliseconds to a couple of seconds to deliver
-/// file change notifications, especially under cargo-test parallelism
-/// load. A single sleep(500ms) + ping is flaky on busy runners (~20%
-/// failure rate observed locally on macOS).
-///
-/// This helper optionally mutates, then sends ping → query in a loop until the predicate matches
-/// or the timeout elapses. The ping forces `drain_watcher_events` to run,
-/// which flushes any pending invalidations into the callgraph.
-///
-/// Args:
-///   - `aft`: live AFT process to query
-///   - `query`: NDJSON request to send (must be a `callers`/`call_tree`/etc.)
-///   - `predicate`: returns true when the response reflects the expected change
-///   - `description`: human-readable for the panic message on timeout
-///
-/// Returns the final response if the predicate matched. Panics on timeout.
-fn poll_watcher_update_after_mutation<M, F>(
-    aft: &mut AftProcess,
-    query: &str,
-    mut mutate: M,
-    predicate: F,
-    description: &str,
-) -> serde_json::Value
-where
-    M: FnMut(u32),
-    F: Fn(&serde_json::Value) -> bool,
-{
-    // 10s upper bound — generous enough to absorb FSEvents coalescing latency
-    // under cargo-test parallelism, short enough that a real regression still fails fast.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let poll_interval = std::time::Duration::from_millis(100);
-    let mut last_response = serde_json::Value::Null;
-    let mut ping_id = 1000;
-    let mut attempt = 0;
-
-    while std::time::Instant::now() < deadline {
-        attempt += 1;
-        mutate(attempt);
-
-        // Drain pending watcher events into the callgraph.
-        ping_id += 1;
-        aft.send(&format!(r#"{{"id":"ping-{}","command":"ping"}}"#, ping_id));
-
-        let resp = aft.send(query);
-        if predicate(&resp) {
-            return resp;
-        }
-        last_response = resp;
-        std::thread::sleep(poll_interval);
-    }
-
-    panic!(
-        "watcher update did not propagate within 10s: {}\nlast response: {:?}",
-        description, last_response
-    );
-}
-
-/// File watcher: modify a file to add a new caller, verify it appears.
-///
-/// configure → callers for validate → add new caller in a new file →
-/// wait for OS event delivery → send command (triggers drain) →
-/// callers again → assert new caller appears.
-#[test]
-fn callgraph_watcher_add_caller() {
-    let (_tmp, root) = setup_watcher_fixture();
-    let mut aft = AftProcess::spawn();
-
-    // Configure with temp dir
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "configure should succeed: {:?}",
-        resp
-    );
-
-    // Query callers of validate — should show processData from utils.ts
-    let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "initial callers should succeed: {:?}",
-        resp
-    );
-    let initial_total = resp["total_callers"].as_u64().unwrap();
-    assert!(initial_total > 0, "validate should have initial callers");
-
-    let new_file = std::path::Path::new(&root).join("extra_caller.ts");
-
-    // Poll until the watcher delivers the file-create/modify event and the
-    // callgraph picks up the new caller. The mutation is repeated inside the
-    // poll loop so a configure response that arrives before the watcher is
-    // armed cannot lose the only create event.
-    let query = format!(
-        r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
-    );
-    let resp = poll_watcher_update_after_mutation(
-        &mut aft,
-        &query,
-        |attempt| {
-            std::fs::write(
-                &new_file,
-                format!(
-                    r#"import {{ validate }} from './helpers';
-
-export function extraCheck(input: string): boolean {{
-    // mutation attempt {attempt}
-    return validate(input);
-}}
-"#
-                ),
-            )
-            .expect("write new caller file");
-        },
-        |r| {
-            r["success"] == true
-                && r["total_callers"].as_u64().unwrap_or(0) > initial_total
-                && r["callers"]
-                    .as_array()
-                    .map(|cs| {
-                        cs.iter()
-                            .any(|g| g["file"].as_str().unwrap_or("").contains("extra_caller.ts"))
-                    })
-                    .unwrap_or(false)
-        },
-        "extra_caller.ts should appear as a new caller of validate",
-    );
-
-    let new_total = resp["total_callers"].as_u64().unwrap();
-    assert!(
-        new_total > initial_total,
-        "adding a caller should increase total_callers: initial={}, new={}",
-        initial_total,
-        new_total
-    );
-
-    aft.shutdown();
-}
-
-/// File watcher: remove a call from a file, verify it disappears.
-///
-/// configure → callers for validate → modify utils.ts to remove the validate
-/// call → wait for OS event delivery → send command (triggers drain) →
-/// callers again → assert the removed caller is gone.
-#[test]
-fn callgraph_watcher_remove_caller() {
-    let (_tmp, root) = setup_watcher_fixture();
-    let mut aft = AftProcess::spawn();
-
-    // Configure with temp dir
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "configure should succeed: {:?}",
-        resp
-    );
-
-    // Query callers of validate — processData from utils.ts should be there
-    let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "initial callers should succeed: {:?}",
-        resp
-    );
-    let callers = resp["callers"].as_array().expect("callers array");
-    let utils_group = callers
-        .iter()
-        .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
-    assert!(
-        utils_group.is_some(),
-        "validate should initially be called from utils.ts"
-    );
-
-    let utils_path = std::path::Path::new(&root).join("utils.ts");
-
-    // Poll until the watcher delivers the file-modify event and the
-    // callgraph drops the removed caller. The rewrite is repeated inside the
-    // poll loop so a watcher-arming race cannot lose the only modify event.
-    let query = format!(
-        r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
-    );
-    poll_watcher_update_after_mutation(
-        &mut aft,
-        &query,
-        |attempt| {
-            std::fs::write(
-                &utils_path,
-                format!(
-                    r#"export function processData(input: string): string {{
-    // validate call removed on attempt {attempt}
-    return input.toUpperCase();
-}}
-"#
-                ),
-            )
-            .expect("rewrite utils.ts");
-        },
-        |r| {
-            if r["success"] != true {
-                return false;
-            }
-            // The match: utils.ts is either gone from the caller list, or
-            // still listed but no longer has a `validate` callee in it.
-            let callers = match r["callers"].as_array() {
-                Some(cs) => cs,
-                None => return false,
-            };
-            let utils_group = callers
-                .iter()
-                .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
-            match utils_group {
-                None => true, // utils.ts disappeared — strongest signal
-                Some(group) => group["callers"]
-                    .as_array()
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .all(|e| e["callee"].as_str().unwrap_or("") != "validate")
-                    })
-                    .unwrap_or(false),
-            }
-        },
-        "validate call should be removed from utils.ts after rewrite",
-    );
 
     aft.shutdown();
 }
@@ -1915,13 +1880,13 @@ fn callgraph_impact_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"impact","file":"{}/helpers.ts","symbol":"nonexistent"}}"#,
-        root
+        r#"{{"id":"2","command":"impact","file":{},"symbol":"nonexistent"}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(
@@ -1948,13 +1913,13 @@ fn callgraph_impact_multi_caller() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"impact","file":"{}/helpers.ts","symbol":"validate","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"impact","file":{},"symbol":"validate","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
     assert_eq!(resp["success"], true, "impact should succeed: {:?}", resp);
@@ -2071,13 +2036,13 @@ fn callgraph_trace_data_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"nonexistent","expression":"x"}}"#,
-        root
+        r#"{{"id":"2","command":"trace_data","file":{},"symbol":"nonexistent","expression":"x"}}"#,
+        crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
     assert_eq!(
@@ -2105,13 +2070,13 @@ fn callgraph_trace_data_assignment_tracking() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"transformData","expression":"rawInput","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"trace_data","file":{},"symbol":"transformData","expression":"rawInput","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
     assert_eq!(
@@ -2163,13 +2128,13 @@ fn callgraph_trace_data_cross_file() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"transformData","expression":"rawInput","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"trace_data","file":{},"symbol":"transformData","expression":"rawInput","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
     assert_eq!(
@@ -2233,13 +2198,13 @@ fn callgraph_trace_data_approximation() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"complexFlow","expression":"data","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"trace_data","file":{},"symbol":"complexFlow","expression":"data","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
     assert_eq!(
@@ -2285,27 +2250,27 @@ fn callgraph_navigation_rejects_paths_outside_project_root() {
     let outside_path = outside_file.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
     let requests = [
         format!(
-            r#"{{"id":"2","command":"callers","file":"{}","symbol":"outside"}}"#,
-            outside_path
+            r#"{{"id":"2","command":"callers","file":{},"symbol":"outside"}}"#,
+            crate::helpers::json_string(&outside_path)
         ),
         format!(
-            r#"{{"id":"3","command":"impact","file":"{}","symbol":"outside"}}"#,
-            outside_path
+            r#"{{"id":"3","command":"impact","file":{},"symbol":"outside"}}"#,
+            crate::helpers::json_string(&outside_path)
         ),
         format!(
-            r#"{{"id":"4","command":"trace_to","file":"{}","symbol":"outside"}}"#,
-            outside_path
+            r#"{{"id":"4","command":"trace_to","file":{},"symbol":"outside"}}"#,
+            crate::helpers::json_string(&outside_path)
         ),
         format!(
-            r#"{{"id":"5","command":"trace_data","file":"{}","symbol":"outside","expression":"value"}}"#,
-            outside_path
+            r#"{{"id":"5","command":"trace_data","file":{},"symbol":"outside","expression":"value"}}"#,
+            crate::helpers::json_string(&outside_path)
         ),
     ];
 
@@ -2342,8 +2307,8 @@ fn callgraph_configure_small_repo_does_not_flag_exceeds() {
 
     // Default cap is 20_000; the 9-file fixture is nowhere near it.
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(
@@ -2375,8 +2340,8 @@ fn callgraph_configure_reports_source_file_count_exceeds_max() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(
@@ -2393,82 +2358,90 @@ fn callgraph_configure_reports_source_file_count_exceeds_max() {
     aft.shutdown();
 }
 
-/// `callers` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `callers` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_callers_project_too_large() {
+fn callgraph_callers_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
     // Configure with cap=1 so the 9-file fixture trips the guard.
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
-        root
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
-    // Error message should mention max_callgraph_files so users know what to tune.
-    let msg = resp["message"].as_str().unwrap_or("");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed callers should succeed: {resp:?}"
+    );
     assert!(
-        msg.contains("max_callgraph_files"),
-        "error message should mention max_callgraph_files: {}",
-        msg
+        resp["total_callers"].as_u64().unwrap_or(0) > 0,
+        "validate should still report callers despite cap=1: {resp:?}"
     );
 
     aft.shutdown();
 }
 
-/// `trace_to` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `trace_to` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_trace_to_project_too_large() {
+fn callgraph_trace_to_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_to","file":"{}/helpers.ts","symbol":"validate","depth":5}}"#,
-        root
+        r#"{{"id":"2","command":"trace_to","file":{},"symbol":"validate","depth":5}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed trace_to should succeed: {resp:?}"
+    );
+    assert!(resp["total_paths"].as_u64().is_some());
 
     aft.shutdown();
 }
 
-/// `impact` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `impact` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_impact_project_too_large() {
+fn callgraph_impact_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"impact","file":"{}/helpers.ts","symbol":"validate"}}"#,
-        root
+        r#"{{"id":"2","command":"impact","file":{},"symbol":"validate"}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed impact should succeed: {resp:?}"
+    );
+    assert!(
+        resp["total_affected"].as_u64().unwrap_or(0) > 0,
+        "validate should still report impact callers despite cap=1: {resp:?}"
+    );
 
     aft.shutdown();
 }
@@ -2481,14 +2454,14 @@ fn callgraph_trace_data_project_too_large() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"transformData","expression":"rawInput"}}"#,
-        root
+        r#"{{"id":"2","command":"trace_data","file":{},"symbol":"transformData","expression":"rawInput"}}"#,
+        crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
     assert_eq!(resp["success"], false);
@@ -2507,8 +2480,8 @@ fn callgraph_configure_rejects_zero_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":0}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":0}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(resp["success"], false, "configure should reject 0");
@@ -2531,8 +2504,8 @@ fn callgraph_configure_rejects_negative_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":-5}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":-5}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(resp["success"], false, "configure should reject -5");
@@ -2550,8 +2523,8 @@ fn callgraph_configure_accepts_positive_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":42}}"#,
-        root
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":42}}"#,
+        crate::helpers::json_string(&root)
     ));
 
     assert_eq!(resp["success"], true);
@@ -2589,8 +2562,9 @@ fn callgraph_configure_rejects_non_integer_max_callgraph_files_payloads() {
     for (label, payload) in rejected_payloads {
         let mut aft = AftProcess::spawn();
         let resp = aft.send(&format!(
-            r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":{}}}"#,
-            root, payload
+            r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":{}}}"#,
+            crate::helpers::json_string(&root),
+            payload
         ));
 
         assert_eq!(
@@ -2609,4 +2583,74 @@ fn callgraph_configure_rejects_non_integer_max_callgraph_files_payloads() {
 
         aft.shutdown();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Async cold-build lifecycle (A1): the five ops never block the request thread
+// on a cold build. With the inline-wait window disabled (`= 0`), the first op
+// after configure returns `callgraph_building`; the store is installed via the
+// drain loop and a subsequent op succeeds.
+// ---------------------------------------------------------------------------
+
+/// With pure-async cold build (wait window 0), the first callgraph op returns
+/// `callgraph_building`, then retries succeed once the background build lands.
+#[test]
+fn callgraph_ops_return_building_then_ready_async() {
+    // Disable the inline-wait window so the cold build is fully asynchronous.
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_CALLGRAPH_BUILD_WAIT_MS", OsStr::new("0"))]);
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+
+    // First op kicks off the background cold build and must NOT block: it
+    // returns the transient `callgraph_building` signal.
+    let first = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
+    ));
+    assert_eq!(
+        first["success"], false,
+        "first async op should report building, not a synchronous result: {first:?}"
+    );
+    assert_eq!(
+        first["code"], "callgraph_building",
+        "first async op should report callgraph_building: {first:?}"
+    );
+
+    // Retry until the background build lands and the store is installed via the
+    // drain loop. Bounded retries so a genuine regression fails the test.
+    let mut succeeded = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let resp = aft.send(&format!(
+            r#"{{"id":"3","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+            crate::helpers::json_string(&format!("{}/helpers.ts", root))
+        ));
+        if resp["success"] == true {
+            assert_eq!(resp["symbol"], "validate");
+            assert!(
+                resp["total_callers"].as_u64().unwrap() > 0,
+                "validate should have callers once the store is ready: {resp:?}"
+            );
+            succeeded = true;
+            break;
+        }
+        // While building, the only acceptable non-success code is the transient
+        // building signal — never a silent empty/clean result.
+        assert_eq!(
+            resp["code"], "callgraph_building",
+            "op should be either ready or building, got: {resp:?}"
+        );
+    }
+    assert!(
+        succeeded,
+        "callgraph store should finish building and serve callers within the retry window"
+    );
+
+    aft.shutdown();
 }

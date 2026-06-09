@@ -50,7 +50,12 @@ export interface HarnessAdapter {
   readonly pluginPackageName: string;
   readonly pluginEntryWithVersion: string;
 
-  /** Is the harness's host CLI (`opencode`, `pi`) on PATH? */
+  /**
+   * Is the harness present on this machine? "Present" is broader than "CLI on
+   * PATH": OpenCode Desktop ships as a GUI app with no `opencode` on PATH, so
+   * the OpenCode adapter also treats its config dir / app bundle as installed.
+   * `getHostVersion()` stays CLI-only and returns null when only Desktop exists.
+   */
   isInstalled(): boolean;
   getHostVersion(): string | null;
 

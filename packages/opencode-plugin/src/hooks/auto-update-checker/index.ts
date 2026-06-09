@@ -1,5 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import { isNpmAvailable, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import { log, warn } from "../../logger.js";
@@ -24,6 +34,10 @@ type ToastVariant = "info" | "warning" | "error" | "success";
 type ResolvedAutoUpdateCheckerOptions = Required<
   Omit<AutoUpdateCheckerOptions, "enabled" | "storageDir">
 > & { storageDir: string | null };
+
+type CheckSlotLock = {
+  release: () => void;
+};
 
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_INIT_DELAY_MS = 5_000;
@@ -52,7 +66,7 @@ const TIMESTAMP_FILENAME = "last-update-check.json";
  *     `session.created`.
  *
  * Multi-project coordination is now handled by an on-disk timestamp at
- * `<storageDir>/last-update-check.json`. Every plugin instance reads
+ * `<storageDir>/opencode/last-update-check.json`. Every plugin instance reads
  * the timestamp before checking; if it's within `checkIntervalMs` of
  * now, the check is skipped. The first instance to claim the slot
  * writes the timestamp atomically (temp + rename) so concurrent
@@ -129,54 +143,99 @@ async function maybeRunCheck(
   if (options.signal.aborted) return;
 
   // Honor the cross-process dedup window first. If another plugin
-  // instance recently checked, skip silently.
-  if (!claimCheckSlot(options.storageDir, options.checkIntervalMs)) {
+  // instance recently checked or is currently checking, skip silently. The
+  // lock stays held until the full check/install path completes so two
+  // plugin processes cannot race through preparePackageUpdate() and
+  // runNpmInstallSafe() against the same OpenCode install root.
+  const checkSlot = claimCheckSlot(options.storageDir, options.checkIntervalMs);
+  if (!checkSlot) {
     log("[auto-update-checker] Skipping check (another instance ran one recently)");
     return;
   }
 
-  await runStartupCheck(ctx, options);
+  try {
+    await runStartupCheck(ctx, options);
+  } finally {
+    checkSlot.release();
+  }
 }
 
 /**
- * Try to claim the next check slot via the on-disk timestamp file.
+ * Try to claim the next check slot via the on-disk timestamp file plus an
+ * atomic lockfile. The returned lock must be released after the check (and any
+ * install) completes.
  *
- * Returns true if this caller should run the check. Returns false if
- * another instance already claimed the slot inside `intervalMs` of now,
- * or if the storage directory isn't usable (we fail open in that case
- * by returning true — the worst outcome is a duplicate npm hit, not a
- * missed check).
- *
- * Race semantics: read → check window → write. With concurrent plugin
- * inits, two callers can race here and both pass the window check before
- * either writes. That's tolerable: at worst we hit npm twice in one
- * launch. The atomic temp+rename write ensures the file is always
- * fully-formed JSON for the next read, even mid-race.
+ * The timestamp preserves the cross-process dedup window. The lock closes the
+ * TOCTOU gap around that timestamp and, more importantly, stays held through
+ * preparePackageUpdate() + runNpmInstallSafe() so one updater cannot roll back
+ * another updater's successful install from a separate process.
  */
-function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean {
-  if (!storageDir) return true; // No storage available — fail open.
+function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlotLock | null {
+  if (!storageDir) return { release: () => {} }; // No storage available — fail open.
+
+  const file = repairRootScopedStorageFile(storageDir, "opencode", TIMESTAMP_FILENAME);
   try {
-    const file = join(storageDir, TIMESTAMP_FILENAME);
-    if (existsSync(file)) {
-      try {
-        const raw = JSON.parse(readFileSync(file, "utf-8")) as { lastCheckedMs?: unknown };
-        const last = typeof raw.lastCheckedMs === "number" ? raw.lastCheckedMs : 0;
-        if (Number.isFinite(last) && Date.now() - last < intervalMs) {
-          return false;
-        }
-      } catch {
-        // Corrupt timestamp file — overwrite it below.
-      }
-    }
+    if (hasRecentCheckTimestamp(file, intervalMs)) return null;
+
     mkdirSync(dirname(file), { recursive: true });
-    const tmp = `${file}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify({ lastCheckedMs: Date.now() }), "utf-8");
-    renameSync(tmp, file);
-    return true;
+    const lockPath = `${file}.lock`;
+    let lockFd: number;
+    try {
+      // `wx` maps to O_CREAT | O_EXCL | O_WRONLY: exactly one process wins.
+      lockFd = openSync(lockPath, "wx");
+      writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedMs: Date.now() }));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        warn(`[auto-update-checker] Could not acquire update lock: ${String(err)}`);
+      }
+      return null;
+    }
+
+    const lock: CheckSlotLock = {
+      release: () => {
+        try {
+          closeSync(lockFd);
+        } catch {
+          // best-effort
+        }
+        rmSync(lockPath, { force: true });
+      },
+    };
+
+    try {
+      if (hasRecentCheckTimestamp(file, intervalMs)) {
+        lock.release();
+        return null;
+      }
+
+      writeCheckTimestamp(file);
+      return lock;
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   } catch (err) {
     warn(`[auto-update-checker] Could not coordinate via timestamp file: ${String(err)}`);
-    return true;
+    return null;
   }
+}
+
+function hasRecentCheckTimestamp(file: string, intervalMs: number): boolean {
+  if (!existsSync(file)) return false;
+  try {
+    const raw = JSON.parse(readFileSync(file, "utf-8")) as { lastCheckedMs?: unknown };
+    const last = typeof raw.lastCheckedMs === "number" ? raw.lastCheckedMs : 0;
+    return Number.isFinite(last) && Date.now() - last < intervalMs;
+  } catch {
+    // Corrupt timestamp file — overwrite it after the lock is acquired.
+    return false;
+  }
+}
+
+function writeCheckTimestamp(file: string): void {
+  const tmp = `${file}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ lastCheckedMs: Date.now() }), "utf-8");
+  renameSync(tmp, file);
 }
 
 async function runStartupCheck(
@@ -277,6 +336,26 @@ async function runBackgroundUpdateCheck(
     return;
   }
 
+  // Pre-flight: confirm npm is runnable BEFORE preparePackageUpdate() deletes
+  // the installed package and lock entry. Without this, a GUI launch with no
+  // npm on PATH would delete the working package, fail to reinstall, and depend
+  // on the restore-on-failure snapshot to recover — a crash/quit in that window
+  // would brick the plugin. If npm is unreachable, skip the destructive steps
+  // entirely and tell the user how to fix it.
+  if (!isNpmAvailable()) {
+    showToast(
+      ctx,
+      `AFT ${latestVersion} available`,
+      `v${latestVersion} is ready, but npm was not found so it can't auto-install. Run \`npx @cortexkit/aft doctor --fix\` from a terminal, or launch OpenCode from a shell where npm is on PATH.`,
+      "warning",
+      10000,
+    );
+    warn(
+      "[auto-update-checker] npm not found on PATH or known version-manager locations; skipping destructive auto-update steps",
+    );
+    return;
+  }
+
   const installDir = preparePackageUpdate(latestVersion, PACKAGE_NAME);
   if (!installDir) {
     showToast(
@@ -290,8 +369,8 @@ async function runBackgroundUpdateCheck(
     return;
   }
 
-  const installSuccess = await runNpmInstallSafe(installDir, { signal: options.signal });
-  if (installSuccess) {
+  const installResult = await runNpmInstallSafe(installDir, { signal: options.signal });
+  if (installResult.ok) {
     showToast(
       ctx,
       "AFT Updated!",
@@ -310,7 +389,13 @@ async function runBackgroundUpdateCheck(
     "error",
     8000,
   );
-  warn("[auto-update-checker] npm install failed; update not installed");
+  const failureDetail = installResult.reason ? `: ${installResult.reason}` : "";
+  const stderrDetail = installResult.stderrTail
+    ? `\nstderr tail:\n${installResult.stderrTail}`
+    : "";
+  warn(
+    `[auto-update-checker] npm install failed; update not installed${failureDetail}${stderrDetail}`,
+  );
 }
 
 export function getAutoUpdateInstallDir(): string {
@@ -324,7 +409,9 @@ function showToast(
   variant: ToastVariant = "info",
   duration = 3000,
 ): void {
-  ctx.client.tui.showToast({ body: { title, message, variant, duration } }).catch(() => {});
+  const tui = ctx.client.tui;
+  if (typeof tui?.showToast !== "function") return;
+  tui.showToast({ body: { title, message, variant, duration } }).catch(() => {});
 }
 
 export type { AutoUpdateCheckerOptions } from "./types.js";

@@ -10,7 +10,7 @@ import { formatZoomBatchResult, readingTools } from "../tools/reading.js";
 import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import type { PluginContext } from "../types.js";
-import { noopAsk } from "./test-helpers";
+import { noopAsk, toolResultText } from "./test-helpers";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -183,25 +183,22 @@ describe("Tool round-trips", () => {
 
     // Now replace the symbol
     const newContent = 'export function hello(): string {\n  return "world";\n}\n';
-    const resultStr = await tools.aft_edit.execute(
-      {
-        mode: "symbol",
-        file: filePath,
-        symbol: "hello",
-        operation: "replace",
-        content: newContent,
-      },
-      sdkCtx,
+    const resultStr = toolResultText(
+      await tools.aft_edit.execute(
+        {
+          mode: "symbol",
+          file: filePath,
+          symbol: "hello",
+          operation: "replace",
+          content: newContent,
+        },
+        sdkCtx,
+      ),
     );
-    const result = JSON.parse(resultStr);
+    // Agent-facing output is the compact summary, not raw JSON.
+    expect(resultStr).toMatch(/^Edited \(\+\d+\/-\d+\)/);
 
-    expect(result.success).toBe(true);
-    expect(result.backup_id).toBeDefined();
-    expect(typeof result.backup_id).toBe("string");
-    expect(result.symbol).toBe("hello");
-    expect(result.operation).toBe("replace");
-
-    // Verify the file was actually changed
+    // Behavior is verified from disk: the symbol body was actually replaced.
     const fileContent = await readFile(filePath, "utf-8");
     expect(fileContent).toContain("world");
     expect(fileContent).not.toContain('"hi"');
@@ -224,7 +221,7 @@ describe("Tool round-trips", () => {
     // Edit the symbol
     const replacement =
       "export function greet(name: string): string {\n  return `Goodbye, ${name}!`;\n}\n";
-    const editResult = JSON.parse(
+    const editResult = toolResultText(
       await editTools.aft_edit.execute(
         {
           mode: "symbol",
@@ -236,7 +233,7 @@ describe("Tool round-trips", () => {
         sdkCtx,
       ),
     );
-    expect(editResult.success).toBe(true);
+    expect(editResult).toMatch(/^Edited \(\+\d+\/-\d+\)/);
 
     // Verify file was changed
     let content = await readFile(filePath, "utf-8");
@@ -253,75 +250,6 @@ describe("Tool round-trips", () => {
     content = await readFile(filePath, "utf-8");
     expect(content).toContain("Hello");
     expect(content).not.toContain("Goodbye");
-  });
-
-  test("transaction success applies multiple file writes", async () => {
-    createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
-    sdkCtx = createMockSdkContext(tmpDir);
-
-    const file1 = resolve(tmpDir, "a.ts");
-    const file2 = resolve(tmpDir, "b.ts");
-
-    const resultStr = await tools.aft_edit.execute(
-      {
-        mode: "transaction",
-        operations: [
-          { file: file1, command: "write", content: "export const a = 1;\n" },
-          { file: file2, command: "write", content: "export const b = 2;\n" },
-        ],
-      },
-      sdkCtx,
-    );
-    const result = JSON.parse(resultStr);
-
-    expect(result.success).toBe(true);
-    expect(result.files_modified).toBe(2);
-    expect(Array.isArray(result.results)).toBe(true);
-    expect(result.results.length).toBe(2);
-
-    // Verify both files were created
-    const content1 = await readFile(file1, "utf-8");
-    const content2 = await readFile(file2, "utf-8");
-    expect(content1).toContain("a = 1");
-    expect(content2).toContain("b = 2");
-  });
-
-  test("transaction rollback on syntax error", async () => {
-    createBridge();
-    const editTools = aftPrefixedTools(createPluginContext(pool));
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
-    sdkCtx = createMockSdkContext(tmpDir);
-
-    // Create a valid file that should be restored on rollback
-    const existingFile = resolve(tmpDir, "existing.ts");
-    const originalContent = "export const x = 1;\n";
-    await editTools.aft_edit.execute(
-      { mode: "write", file: existingFile, content: originalContent },
-      sdkCtx,
-    );
-
-    // Transaction: write valid content to existing file, then write broken syntax to new file
-    const brokenFile = resolve(tmpDir, "broken.ts");
-    // Transaction should throw due to syntax error instead of reporting a
-    // successful tool call with `{ success: false }` payload.
-    await expect(
-      editTools.aft_edit.execute(
-        {
-          mode: "transaction",
-          operations: [
-            { file: existingFile, command: "write", content: "export const x = 999;\n" },
-            { file: brokenFile, command: "write", content: "export const {{{broken = ;\n" },
-          ],
-        },
-        sdkCtx,
-      ),
-    ).rejects.toThrow("syntax error");
-
-    // Existing file should be restored to original content
-    const restoredContent = await readFile(existingFile, "utf-8");
-    expect(restoredContent).toBe(originalContent);
   });
 
   // ---------------------------------------------------------------------

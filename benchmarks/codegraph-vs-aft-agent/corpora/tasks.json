@@ -1,0 +1,83 @@
+{
+  "name": "agent-fixture",
+  "description": "Deterministic OpenCode agent tasks over a small checkout service fixture. The tasks cover code finding, call navigation, and edits with post-condition scoring.",
+  "fixturePath": "corpora/agent-fixture",
+  "tasks": [
+    {
+      "id": "answer-loyalty-discount",
+      "kind": "answer",
+      "prompt": "Find the function that applies loyalty discounts. Reply with a compact JSON object containing keys file and symbol only.",
+      "checks": [{ "type": "answer_contains", "values": ["src/pricing.ts", "applyLoyaltyDiscount"] }]
+    },
+    {
+      "id": "answer-payment-caller",
+      "kind": "answer",
+      "prompt": "Which checkout function calls chargePayment? Reply with JSON containing file and symbol.",
+      "checks": [{ "type": "answer_contains", "values": ["src/checkout.ts", "submitOrder", "chargePayment"] }]
+    },
+    {
+      "id": "answer-inventory-reservation",
+      "kind": "answer",
+      "prompt": "Find where inventory is reserved during checkout. Reply with JSON containing the function and file.",
+      "checks": [{ "type": "answer_contains", "values": ["src/inventory.ts", "reserveInventory"] }]
+    },
+    {
+      "id": "answer-checkout-route",
+      "kind": "answer",
+      "prompt": "Which route maps to submitOrder? Reply with JSON containing route, file, and symbol.",
+      "checks": [{ "type": "answer_contains", "values": ["POST /checkout", "src/routes.ts", "submitOrder"] }]
+    },
+    {
+      "id": "answer-retry-helper",
+      "kind": "answer",
+      "prompt": "Find the retry helper used by payment charging. Reply with JSON containing file and symbol.",
+      "checks": [{ "type": "answer_contains", "values": ["src/retry.ts", "withRetry"] }]
+    },
+    {
+      "id": "edit-cart-limit",
+      "kind": "edit",
+      "prompt": "Change the maximum cart item limit from 25 to 50. Do not change tests. Run npm test when done.",
+      "checks": [
+        { "type": "file_contains", "path": "src/cart.ts", "value": "export const MAX_CART_ITEMS = 50;" },
+        { "type": "command", "command": "npm test" }
+      ]
+    },
+    {
+      "id": "edit-free-shipping-threshold",
+      "kind": "edit",
+      "prompt": "Change the free shipping threshold from 7500 cents to 10000 cents. Do not change tests. Run npm test when done.",
+      "checks": [
+        { "type": "file_contains", "path": "src/pricing.ts", "value": "export const FREE_SHIPPING_THRESHOLD = 10000;" },
+        { "type": "command", "command": "npm test" }
+      ]
+    },
+    {
+      "id": "edit-tax-rate",
+      "kind": "edit",
+      "prompt": "Change the sales tax rate from 0.08 to 0.075. Do not change tests. Run npm test when done.",
+      "checks": [
+        { "type": "file_contains", "path": "src/pricing.ts", "value": "export const SALES_TAX_RATE = 0.075;" },
+        { "type": "command", "command": "npm test" }
+      ]
+    },
+    {
+      "id": "edit-pending-status",
+      "kind": "edit",
+      "prompt": "Allow checkout results to use status \"queued\" instead of \"pending\" in the CheckoutResult type. Do not change runtime status \"paid\". Run npm test when done.",
+      "checks": [
+        { "type": "file_contains", "path": "src/checkout.ts", "value": "status: \"queued\" | \"paid\";" },
+        { "type": "file_contains", "path": "src/checkout.ts", "value": "status: \"paid\"," },
+        { "type": "command", "command": "npm test" }
+      ]
+    },
+    {
+      "id": "edit-retry-attempts",
+      "kind": "edit",
+      "prompt": "Change payment retry attempts from 3 to 4 in the chargePayment flow only. Do not change tests. Run npm test when done.",
+      "checks": [
+        { "type": "file_contains", "path": "src/payments.ts", "value": "{ attempts: 4, delayMs: 25 }" },
+        { "type": "command", "command": "npm test" }
+      ]
+    }
+  ]
+}

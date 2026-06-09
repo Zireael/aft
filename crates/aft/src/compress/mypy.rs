@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi};
-use crate::compress::Compressor;
+use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 300;
 
@@ -16,9 +16,60 @@ impl Compressor for MypyCompressor {
                 .any(|window| matches!(window, [python, flag, module] if (python == "python" || python == "python3") && flag == "-m" && module == "mypy"))
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_mypy(output)
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        if matches!(exit_code, Some(code) if code != 0)
+            && output.trim().starts_with("Success: no issues found")
+        {
+            return GenericCompressor::compress_output(output).into();
+        }
+        compress_mypy(output).into()
     }
+
+    fn matches_output(&self, output: &str) -> bool {
+        output.lines().any(|line| {
+            let trimmed = line.trim();
+            is_mypy_success_signature(trimmed) || is_mypy_error_summary_signature(trimmed)
+        })
+    }
+}
+
+fn is_mypy_success_signature(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("Success: no issues found in ") else {
+        return false;
+    };
+    let Some((count, rest)) = rest.split_once(" source file") else {
+        return false;
+    };
+    !count.is_empty() && count.chars().all(|ch| ch.is_ascii_digit()) && matches!(rest, "" | "s")
+}
+
+fn is_mypy_error_summary_signature(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("Found ") else {
+        return false;
+    };
+    let Some((error_count, rest)) = rest.split_once(' ') else {
+        return false;
+    };
+    if error_count.is_empty() || !error_count.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some(rest) = rest
+        .strip_prefix("error in ")
+        .or_else(|| rest.strip_prefix("errors in "))
+    else {
+        return false;
+    };
+    let Some((file_count, rest)) = rest.split_once(' ') else {
+        return false;
+    };
+    !file_count.is_empty()
+        && file_count.chars().all(|ch| ch.is_ascii_digit())
+        && (rest.starts_with("file") || rest.starts_with("files"))
 }
 
 fn compress_mypy(output: &str) -> String {

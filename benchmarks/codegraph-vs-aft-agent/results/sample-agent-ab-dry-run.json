@@ -1,0 +1,172 @@
+{
+  "benchmark": "codegraph-vs-aft-agent",
+  "timestamp": "2026-05-27T03:53:18.319Z",
+  "model": "opencode-go/deepseek-v4-flash-free",
+  "fallbackModel": "opencode-go/deepseek-v4-pro",
+  "corpus": "agent-fixture",
+  "arms": [
+    "aft",
+    "codegraph"
+  ],
+  "taskCount": 2,
+  "summary": {
+    "aft": {
+      "runs": 2,
+      "successRate": 1,
+      "successes": 2,
+      "tokensTotal": 0,
+      "tokensMedian": 0,
+      "wallTimeMsMedian": 0.126,
+      "wallTimeMsP95": 0.263,
+      "toolCallsMedian": 0
+    },
+    "codegraph": {
+      "runs": 2,
+      "successRate": 1,
+      "successes": 2,
+      "tokensTotal": 0,
+      "tokensMedian": 0,
+      "wallTimeMsMedian": 0.188,
+      "wallTimeMsP95": 0.217,
+      "toolCallsMedian": 0
+    }
+  },
+  "results": [
+    {
+      "arm": "aft",
+      "taskId": "answer-loyalty-discount",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 0.263,
+      "exitCode": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "total": 0
+      },
+      "toolCalls": 0,
+      "answerText": "{\"type\":\"message\",\"role\":\"assistant\",\"content\":{\"value1\":\"src/pricing.ts\",\"value2\":\"applyLoyaltyDiscount\"},\"usage\":{\"input_tokens\":0,\"completion_tokens\":0}}\n",
+      "stdoutPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/aft/opencode.stdout.jsonl",
+      "stderrPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/aft/opencode.stderr.log",
+      "repoPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/aft/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/pricing.ts",
+              "applyLoyaltyDiscount"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    },
+    {
+      "arm": "codegraph",
+      "taskId": "answer-loyalty-discount",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 0.217,
+      "exitCode": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "total": 0
+      },
+      "toolCalls": 0,
+      "answerText": "{\"type\":\"message\",\"role\":\"assistant\",\"content\":{\"value1\":\"src/pricing.ts\",\"value2\":\"applyLoyaltyDiscount\"},\"usage\":{\"input_tokens\":0,\"completion_tokens\":0}}\n",
+      "stdoutPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/codegraph/opencode.stdout.jsonl",
+      "stderrPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/codegraph/opencode.stderr.log",
+      "repoPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-loyalty-discount/codegraph/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/pricing.ts",
+              "applyLoyaltyDiscount"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    },
+    {
+      "arm": "aft",
+      "taskId": "answer-payment-caller",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 0.126,
+      "exitCode": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "total": 0
+      },
+      "toolCalls": 0,
+      "answerText": "{\"type\":\"message\",\"role\":\"assistant\",\"content\":{\"value1\":\"src/checkout.ts\",\"value2\":\"submitOrder\",\"value3\":\"chargePayment\"},\"usage\":{\"input_tokens\":0,\"completion_tokens\":0}}\n",
+      "stdoutPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/aft/opencode.stdout.jsonl",
+      "stderrPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/aft/opencode.stderr.log",
+      "repoPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/aft/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/checkout.ts",
+              "submitOrder",
+              "chargePayment"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    },
+    {
+      "arm": "codegraph",
+      "taskId": "answer-payment-caller",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 0.188,
+      "exitCode": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "total": 0
+      },
+      "toolCalls": 0,
+      "answerText": "{\"type\":\"message\",\"role\":\"assistant\",\"content\":{\"value1\":\"src/checkout.ts\",\"value2\":\"submitOrder\",\"value3\":\"chargePayment\"},\"usage\":{\"input_tokens\":0,\"completion_tokens\":0}}\n",
+      "stdoutPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/codegraph/opencode.stdout.jsonl",
+      "stderrPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/codegraph/opencode.stderr.log",
+      "repoPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_470d03cf/benchmarks/codegraph-vs-aft-agent/.bench/sample-runs/answer-payment-caller/codegraph/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/checkout.ts",
+              "submitOrder",
+              "chargePayment"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "dryRun": true,
+    "fixturePath": "corpora/agent-fixture",
+    "methodology": "OpenCode CLI runs the same deterministic tasks with either AFT plugin tools or CodeGraph MCP tools. Scoring checks final answers, file contents, and optional commands.",
+    "auth": "API keys are read from OPENCODE_API_KEY/OPENAI_API_KEY or mounted ~/.local/share/opencode/auth.json; keys are never written to reports."
+  }
+}

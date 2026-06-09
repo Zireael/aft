@@ -1,0 +1,9 @@
+{
+  "name": "aft-agent-benchmark-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run-tests.mjs"
+  }
+}

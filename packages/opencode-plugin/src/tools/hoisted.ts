@@ -11,26 +11,26 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import { coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
+import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
-import { storeToolMetadata } from "../metadata-store.js";
 import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import {
+  callBridge,
+  optionalInt,
+  resolvePathFromProjectRoot,
+  resolveProjectRoot,
+} from "./_shared.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
+import { createBashWatchTool } from "./bash_watch.js";
 import { createBashWriteTool } from "./bash_write.js";
 import {
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
   runAsk,
 } from "./permissions.js";
-
-/** Extract callID from plugin context (exists on object but not in TS type). */
-function getCallID(ctx: unknown): string | undefined {
-  const c = ctx as { callID?: string; callId?: string; call_id?: string };
-  return c.callID ?? c.callId ?? c.call_id;
-}
 
 /** Get relative path matching opencode's format — the desktop UI parses it to extract filename + dir. */
 function relativeToWorktree(fp: string, worktree: string): string {
@@ -341,6 +341,12 @@ function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): numbe
 }
 
 const z = tool.schema;
+const DIAGNOSTICS_PARAM_DESCRIPTION =
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
@@ -364,8 +370,7 @@ Examples:
   Read lines 50-100: { "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
   Read 30 lines from line 200: { "filePath": "src/app.ts", "offset": 200, "limit": 30 }
   List directory: { "filePath": "src/" }
-
-Returns: Line-numbered file content string. For directories: newline-joined sorted entries. For binary files: size/message string.`;
+`;
 
 /**
  * Creates the simple read tool. Registers as "read" when hoisted, "aft_read" when not.
@@ -377,21 +382,25 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       filePath: z
         .string()
         .describe("Path to file or directory (absolute or relative to project root)"),
-      startLine: z.number().optional().describe("1-based line to start reading from"),
-      endLine: z.number().optional().describe("1-based line to stop reading at (inclusive)"),
-      limit: z.number().optional().describe("Max lines to return (default: 2000)"),
-      offset: z
-        .number()
-        .optional()
-        .describe(
-          "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
-        ),
+      startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line to start reading from",
+      ),
+      endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line to stop reading at (inclusive)",
+      ),
+      limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "Max lines to return (default: 2000)",
+      ),
+      offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+      ),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       const file = args.filePath as string;
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      // Resolve relative paths
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      // Resolve relative paths from the same session/project root used by the bridge.
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
       // External-directory check first (mirrors opencode-native ordering in
       // tool/read.ts:175). Out-of-project paths prompt the user via the
@@ -451,19 +460,16 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
               ? `${(fileSize / 1024).toFixed(0)}KB`
               : `${fileSize} bytes`;
         const msg = `${label} read successfully`;
-        const imgCallID = getCallID(context);
-        if (imgCallID) {
-          storeToolMetadata(context.sessionID, imgCallID, {
-            title: path.relative(context.worktree, filePath),
-            metadata: {
-              preview: msg,
-              filepath: filePath,
-              isImage,
-              isPdf: mime === "application/pdf",
-            },
-          });
-        }
-        return `${msg} (${ext.slice(1).toUpperCase()}, ${sizeStr}). File: ${filePath}`;
+        return {
+          output: `${msg} (${ext.slice(1).toUpperCase()}, ${sizeStr}). File: ${filePath}`,
+          title: path.relative(projectRoot, filePath),
+          metadata: {
+            preview: msg,
+            filepath: filePath,
+            isImage,
+            isPdf: mime === "application/pdf",
+          },
+        };
       }
 
       // Normalize offset/limit to startLine/endLine (backward compat with opencode's read)
@@ -490,31 +496,23 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         throw new Error((data.message as string) || "read failed");
       }
 
-      const readCallID = getCallID(context);
+      const dp = relativeToWorktree(filePath, projectRoot) || file;
 
       // Directory response
       if (data.entries) {
-        if (readCallID) {
-          const dp = relativeToWorktree(filePath, context.worktree) || file;
-          storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
-        }
-        return (data.entries as string[]).join("\n");
+        return {
+          output: (data.entries as string[]).join("\n"),
+          title: dp,
+          metadata: { title: dp },
+        };
       }
 
       // Binary response
       if (data.binary) {
-        if (readCallID) {
-          const dp = relativeToWorktree(filePath, context.worktree) || file;
-          storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
-        }
-        return data.message as string;
+        return { output: data.message as string, title: dp, metadata: { title: dp } };
       }
 
       // File content — already line-numbered from Rust
-      if (readCallID) {
-        const dp = relativeToWorktree(filePath, context.worktree) || file;
-        storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
-      }
       let output = data.content as string;
 
       // Three-case footer: see formatReadFooter() doc.
@@ -526,7 +524,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       const footer = formatReadFooter(agentSpecifiedRange, data);
       if (footer) output += footer;
 
-      return output;
+      return { output, title: dp, metadata: { title: dp } };
     },
   };
 }
@@ -540,17 +538,18 @@ function getWriteDescription(editToolName: string): string {
 
 Automatically creates parent directories. Backs up existing files before overwriting.
 If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
-is auto-formatted after writing. Returns inline LSP diagnostics when available.
+is auto-formatted after writing. Edits return as soon as the write completes unless
+the configured \`lsp.diagnostics_on_edit\` default or a per-call \`diagnostics: true\`
+asks for legacy sync-wait behavior. Call \`aft_inspect\` afterward to check
+diagnostics across a batch of edits.
 
 **Behavior:**
 - Creates parent directories automatically (no need to mkdir first)
 - Existing files are backed up before overwriting (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- Returns LSP error-level diagnostics inline if type errors are introduced
+- LSP diagnostics follow \`lsp.diagnostics_on_edit\` by default; pass \`diagnostics\` to override per call
 - Use this for creating new files or completely replacing file contents
-- For partial edits (find/replace), use the \`${editToolName}\` tool instead
-
-Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines.`;
+- For partial edits (find/replace), use the \`${editToolName}\` tool instead`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -561,14 +560,16 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
       content: z.string().describe("The full content to write to the file"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       const file = args.filePath as string;
       const content = args.content as string;
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
-      const relPath = path.relative(context.worktree, filePath);
+      const relPath = path.relative(projectRoot, filePath);
 
       // External-directory check first (mirrors opencode-native write.ts:43).
       {
@@ -590,13 +591,22 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         file: filePath,
         content,
         create_dirs: true,
-        diagnostics: true,
-        include_diff: true,
+        diagnostics: args.diagnostics ?? diagnosticsOnEditDefault(ctx),
+        include_diff_content: true,
       });
 
       // Error response (e.g. path validation failure)
       if (data.success === false) {
         throw new Error((data.message as string) || "write failed");
+      }
+
+      // Honesty: Rust reverts the write when the result fails syntax validation
+      // and returns `rolled_back: true` with success:true (the op completed, the
+      // file is unchanged). Saying "Created/File updated" here would be a lie —
+      // surface the rollback so the agent retries. Mirrors formatEditSummary,
+      // which OC's edit tool already uses.
+      if (data.rolled_back === true) {
+        return "Write rolled back: the content produced invalid syntax, so the file was left unchanged.";
       }
 
       let output = data.created ? "Created new file." : "File updated.";
@@ -630,38 +640,40 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const pendingServers = data.lsp_pending_servers as string[] | undefined;
       const exitedServers = data.lsp_exited_servers as string[] | undefined;
       if (pendingServers && pendingServers.length > 0) {
-        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
+        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
       }
       if (exitedServers && exitedServers.length > 0) {
         output += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
       }
 
-      // Store metadata for tool.execute.after hook (fromPlugin overwrites context.metadata)
+      // Return UI metadata directly on the result. OpenCode's `fromPlugin`
+      // (registry.ts) preserves a tool's returned `title`/`metadata` (since
+      // v1.4.8; our floor is far past that), so there's no need for the old
+      // module-level store + `tool.execute.after` merge — that workaround
+      // intermittently lost the diff under duplicate plugin loads (`--port 0`
+      // / Desktop) because the store Map lived in one ESM graph and the merge
+      // ran in another. See GitHub #96.
       const diff = data.diff as
         | { before?: string; after?: string; additions?: number; deletions?: number }
         | undefined;
-      const callID = getCallID(context);
-      if (callID) {
-        const dp = relativeToWorktree(filePath, context.worktree);
-        const beforeContent = diff?.before ?? "";
-        const afterContent = diff?.after ?? content;
-        storeToolMetadata(context.sessionID, callID, {
-          title: dp,
-          metadata: {
-            diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
-            filediff: {
-              file: filePath,
-              before: beforeContent,
-              after: afterContent,
-              additions: diff?.additions ?? 0,
-              deletions: diff?.deletions ?? 0,
-            },
-            diagnostics: {},
+      const dp = relativeToWorktree(filePath, projectRoot);
+      const beforeContent = diff?.before ?? "";
+      const afterContent = diff?.after ?? content;
+      return {
+        output,
+        title: dp,
+        metadata: {
+          diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
+          filediff: {
+            file: filePath,
+            before: beforeContent,
+            after: afterContent,
+            additions: diff?.additions ?? 0,
+            deletions: diff?.deletions ?? 0,
           },
-        });
-      }
-
-      return output;
+          diagnostics: {},
+        },
+      };
     },
   };
 }
@@ -675,59 +687,47 @@ function getEditDescription(writeToolName: string): string {
 
 **Modes** (determined by which parameters you provide):
 
-Mode priority: operations > appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit "write" fallback.
+Mode priority: appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit "write" fallback. To edit multiple files, make parallel \`edit\` calls in one response.
 
-1. **Multi-file transaction** — pass \`operations\` array
-   Edits across multiple files with checkpoint-based rollback on failure.
-   Each operation: \`{ "file": "path", "command": "edit_match" | "write", ... }\`.
-   For \`edit_match\`: include \`match\`, \`replacement\`. For \`write\`: include \`content\`.
-   Example: \`{ "operations": [{ "file": "a.ts", "command": "edit_match", "match": "old", "replacement": "new" }, { "file": "b.ts", "command": "write", "content": "..." }] }\`
-
-2. **Append** — pass \`filePath\` + \`appendContent\`
+1. **Append** — pass \`filePath\` + \`appendContent\`
    Appends text to the end of a file, creating the file if it does not exist.
    Example: \`{ "filePath": "notes.txt", "appendContent": "new line\\n" }\`
 
-3. **Batch edits** — pass \`filePath\` + \`edits\` array
+2. **Batch edits** — pass \`filePath\` + \`edits\` array
    Multiple edits in one file atomically. Each edit is either:
    - \`{ "oldString": "old", "newString": "new" }\` — find/replace
    - \`{ "startLine": 5, "endLine": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
    Set content to empty string to delete lines.
 
-4. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
+3. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
    Replaces an entire named symbol (function, class, type) with new content.
    Includes decorators, attributes, and doc comments in the replacement range.
    **Important:** You must NOT provide \`oldString\` when using symbol mode — if present, the tool silently falls back to find/replace mode.
    Example: \`{ "filePath": "src/app.ts", "symbol": "handleRequest", "content": "function handleRequest() { ... }" }\`
 
-5. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
+4. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
    Finds the exact text in \`oldString\` and replaces it with \`newString\`.
    Supports fuzzy matching (handles whitespace differences automatically).
    If multiple matches exist, specify which one with \`occurrence\` or use \`replaceAll: true\`.
    Example: \`{ "filePath": "src/app.ts", "oldString": "const x = 1", "newString": "const x = 2" }\`
 
-6. **Replace all occurrences** — add \`replaceAll: true\`
+5. **Replace all occurrences** — add \`replaceAll: true\`
    Replaces every occurrence of \`oldString\` in the file.
    Example: \`{ "filePath": "src/app.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }\`
 
-7. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
+6. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
    When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).
    Example: \`{ "filePath": "src/app.ts", "oldString": "TODO", "newString": "DONE", "occurrence": 0 }\`
 
-Note: Modes 6 and 7 are options on mode 5 (find/replace) — they require \`oldString\`.
+Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldString\`.
 
 **Behavior:**
 - Backs up files before editing (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- LSP error-level diagnostics are returned automatically after edits
-
-Returns: JSON string for the selected edit mode. Edits may append inline LSP error lines.
-
-Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
-  // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
-  // vary by Rust command and documenting each would bloat the description for minimal gain.
-  // Agents can parse the JSON response generically — key fields include 'success' and 'diff'.
+- Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
+- Response is a JSON string for the selected edit mode; key fields include success, diff, backup_id, syntax_valid, and mode-specific fields.`;
 }
 
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
@@ -737,21 +737,23 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       filePath: z
         .string()
         .optional()
-        .describe(
-          "Path to the file to edit (absolute or relative to project root). Required for all modes except 'operations' multi-file transactions",
-        ),
+        .describe("Path to the file to edit (absolute or relative to project root)"),
       oldString: z.string().optional().describe("Text to find (exact match, with fuzzy fallback)"),
       newString: z
         .string()
         .optional()
         .describe("Text to replace with (omit or set to empty string to delete the matched text)"),
       replaceAll: z.boolean().optional().describe("Replace all occurrences"),
-      occurrence: z
-        .number()
-        .optional()
-        .describe("0-indexed occurrence to replace when multiple matches exist"),
+      occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "0-indexed occurrence to replace when multiple matches exist",
+      ),
       symbol: z.string().optional().describe("Named symbol to replace (function, class, type)"),
-      content: z.string().optional().describe("New content for symbol replace or file write"),
+      content: z
+        .string()
+        .optional()
+        .describe(
+          "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+        ),
       appendContent: z
         .string()
         .optional()
@@ -762,14 +764,9 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe(
           "Batch edits — array of { oldString: string, newString: string } or { startLine: number (1-based), endLine: number (1-based, inclusive), content: string }",
         ),
-      operations: z
-        .array(z.record(z.string(), z.unknown()))
-        .optional()
-        .describe(
-          "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback. Note: uses 'file'/'match'/'replacement' (not filePath/oldString/newString)",
-        ),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       // Footgun guard: top-level startLine/endLine are not valid params on
       // edit. They only exist nested inside `edits[]` for batch line-range
       // mode. Without this guard, Zod silently strips the unknown keys and
@@ -785,54 +782,13 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         );
       }
 
-      // Transaction mode — multi-file
-      if (Array.isArray(args.operations)) {
-        const ops = args.operations as Array<Record<string, unknown>>;
-        const files = ops.map((op) => op.file as string).filter(Boolean);
-
-        // External-directory check first (mirrors opencode-native edit.ts:68).
-        {
-          const asked = new Set<string>();
-          for (const file of files) {
-            const absPath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
-            if (asked.has(absPath)) continue;
-            asked.add(absPath);
-            const denial = await assertExternalDirectoryPermission(context, absPath);
-            if (denial) return permissionDeniedResponse(denial);
-          }
-        }
-
-        await runAsk(
-          context.ask({
-            permission: "edit",
-            patterns: files.map((f) =>
-              path.relative(context.worktree, path.resolve(context.directory, f)),
-            ),
-            always: ["*"],
-            metadata: {},
-          }),
-        );
-
-        const resolvedOps = ops.map((op) => ({
-          ...op,
-          file: path.isAbsolute(op.file as string)
-            ? op.file
-            : path.resolve(context.directory, op.file as string),
-        }));
-
-        const response = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
-        if (response.success === false) {
-          throw new Error((response.message as string | undefined) ?? "transaction failed");
-        }
-        return JSON.stringify(response);
-      }
-
       const file = args.filePath as string;
       if (!file) throw new Error("'filePath' parameter is required");
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
-      const relPath = path.relative(context.worktree, filePath);
+      const relPath = path.relative(projectRoot, filePath);
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -901,17 +857,30 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         const hint =
           typeof args.content === "string"
             ? ` To write the whole file, use the '${writeToolName}' tool. To edit existing content, provide 'oldString' (and optionally 'newString'), 'symbol' + 'content', or an 'edits' array.`
-            : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', 'edits' array, or 'operations' array.";
+            : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', or an 'edits' array.";
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      params.diagnostics = true;
+      params.diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      params.include_diff = true;
+      params.include_diff_content = true;
 
       const data = await callBridge(ctx, context, command, params);
 
-      // Store metadata for tool.execute.after hook (fromPlugin overwrites context.metadata)
+      // callBridge returns `{ success: false }` responses as DATA (it does not
+      // throw), so a failed edit (match-not-found, ambiguous, syntax rollback,
+      // glob with zero matches) must be surfaced as an error here. Otherwise
+      // formatEditSummary would report a false `Edited (+0/-0).` for an edit
+      // that never applied. Mirrors the write/apply_patch contract.
+      if (data.success === false) {
+        throw new Error((data.message as string) || "edit failed");
+      }
+
+      // UI metadata returned directly on the result (see write tool for the
+      // rationale; replaces the old metadata-store + after-hook merge that
+      // intermittently lost the diff under duplicate plugin loads — GitHub #96).
+      let uiMeta: Record<string, unknown> | undefined;
+      let uiTitle: string | undefined;
       if (data.success && data.diff) {
         const diff = data.diff as {
           before?: string;
@@ -919,29 +888,30 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
           additions?: number;
           deletions?: number;
         };
-        const callID = getCallID(context);
-        if (callID) {
-          const dp = relativeToWorktree(filePath, context.worktree);
-          const beforeContent = diff.before ?? "";
-          const afterContent = diff.after ?? "";
-          storeToolMetadata(context.sessionID, callID, {
-            title: dp,
-            metadata: {
-              diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
-              filediff: {
-                file: filePath,
-                before: beforeContent,
-                after: afterContent,
-                additions: diff.additions ?? 0,
-                deletions: diff.deletions ?? 0,
-              },
-              diagnostics: {},
-            },
-          });
-        }
+        uiTitle = relativeToWorktree(filePath, projectRoot);
+        const beforeContent = diff.before ?? "";
+        const afterContent = diff.after ?? "";
+        uiMeta = {
+          diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
+          filediff: {
+            file: filePath,
+            before: beforeContent,
+            after: afterContent,
+            additions: diff.additions ?? 0,
+            deletions: diff.deletions ?? 0,
+          },
+          diagnostics: {},
+        };
       }
 
-      let result = JSON.stringify(data);
+      // Agent-facing result is a compact summary sentence, NOT the raw Rust
+      // JSON envelope. The model supplied the path and the content, so echoing
+      // back the path, before/after, backup id, status-bar counts, etc. is
+      // pure token waste that scales with file size. The rich data stays in
+      // the UI `metadata` (stored above); the status-bar line is injected
+      // separately by the bridge. Matches the `write`/`apply_patch` contract
+      // and keeps OpenCode/Pi agent-facing output in parity.
+      let result = formatEditSummary(data as Record<string, unknown>);
 
       const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
       if (globSkipNote) result += `\n\n${globSkipNote}`;
@@ -973,12 +943,15 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       const pendingServers = data.lsp_pending_servers as string[] | undefined;
       const exitedServers = data.lsp_exited_servers as string[] | undefined;
       if (pendingServers && pendingServers.length > 0) {
-        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
+        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
       }
       if (exitedServers && exitedServers.length > 0) {
         result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
       }
 
+      if (uiMeta) {
+        return { output: result, title: uiTitle ?? "", metadata: uiMeta };
+      }
       return result;
     },
   };
@@ -1031,7 +1004,7 @@ Example patch:
 \`\`\`
 
 **Behavior:**
-- All file changes are applied with checkpoint-based rollback — if any file fails, previous changes are rolled back (best-effort)
+- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use \`aft_safety\` undo if you need to revert.
 - Files are backed up before modification
 - Parent directories are created automatically for new files
 - Fuzzy matching for context anchors (handles whitespace and Unicode differences)
@@ -1041,16 +1014,18 @@ Example patch:
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with \`+\` even when creating a new file
 
-Returns: Status message string listing created, updated, moved, deleted, or failed file operations. May include inline LSP errors if type errors are introduced by the patch.`;
+Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       const patchText = args.patchText as string;
+      const diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
@@ -1065,6 +1040,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         throw new Error("Empty patch: no file operations found");
       }
 
+      const projectRoot = await resolveProjectRoot(ctx, context);
+
       // Resolve every path this patch touches — SOURCES (h.path) and
       // DESTINATIONS (h.move_path for move hunks). Move destinations have to
       // be tracked because the old code only checkpointed sources; a partial
@@ -1077,13 +1054,13 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       const newlyCreatedAbs = new Set<string>();
 
       for (const h of hunks) {
-        const srcAbs = path.resolve(context.directory, h.path);
+        const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
         affectedAbs.add(srcAbs);
         if (h.type === "add") {
           newlyCreatedAbs.add(srcAbs);
         }
         if (h.type === "update" && h.move_path) {
-          const dstAbs = path.resolve(context.directory, h.move_path);
+          const dstAbs = resolvePathFromProjectRoot(projectRoot, h.move_path);
           affectedAbs.add(dstAbs);
           // Snapshot the destination if it exists so rollback restores the
           // original contents. If it doesn't exist, track it as newly
@@ -1094,7 +1071,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
+      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(projectRoot, abs));
       const multiFileWritePaths = Array.from(affectedAbs);
 
       // External-directory check first (mirrors opencode-native patch.ts:298).
@@ -1169,7 +1146,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       }> = [];
 
       for (const hunk of hunks) {
-        const filePath = path.resolve(context.directory, hunk.path);
+        const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
 
         switch (hunk.type) {
           case "add": {
@@ -1192,10 +1169,22 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 file: filePath,
                 content,
                 create_dirs: true,
-                diagnostics: true,
-                include_diff: true,
+                diagnostics,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
+              // callBridge returns `{ success: false }` as data, not a throw,
+              // so without this check a failed write would be falsely recorded
+              // as `Created` and the hunk would never reach `failures`.
+              if (writeResult.success === false) {
+                throw new Error((writeResult.message as string | undefined) ?? "write failed");
+              }
+              // Rust reverts a write that fails syntax validation and returns
+              // rolled_back:true with success:true. The file did NOT change, so
+              // this hunk must count as a failure, not a green "Created".
+              if (writeResult.rolled_back === true) {
+                throw new Error("produced invalid syntax (rolled back)");
+              }
               const wrDiff = writeResult.diff as
                 | { before?: string; after?: string; additions?: number; deletions?: number }
                 | undefined;
@@ -1218,10 +1207,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               // hunk. Best-effort cleanup so we don't leave orphan partials.
               // (Failures here are tolerated: the agent will see the
               // creation failure in `results` either way.)
-              const filePath = path.resolve(context.directory, hunk.path);
+              const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
               if (fs.existsSync(filePath)) {
                 try {
-                  await callBridge(ctx, context, "delete_file", { file: filePath });
+                  fs.rmSync(filePath, { force: true });
                 } catch {
                   // ignore — surfaced through the parent failure already
                 }
@@ -1233,7 +1222,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           case "delete": {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
-              await callBridge(ctx, context, "delete_file", { file: filePath });
+              const deleteResult = await callBridge(ctx, context, "delete_file", {
+                file: filePath,
+              });
+              if (deleteResult.success === false) {
+                throw new Error((deleteResult.message as string | undefined) ?? "delete failed");
+              }
               // delete_file doesn't return a diff. The counts are unambiguous:
               // every prior line is a deletion; nothing is added.
               perFileDiffs.push({
@@ -1258,17 +1252,34 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               const newContent = applyUpdateChunks(original, filePath, hunk.chunks);
 
               const targetPath = hunk.move_path
-                ? path.resolve(context.directory, hunk.move_path)
+                ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
                 : filePath;
 
               const writeResult = await callBridge(ctx, context, "write", {
                 file: targetPath,
                 content: newContent,
                 create_dirs: true,
-                diagnostics: true,
-                include_diff: true,
+                diagnostics,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
+              // CRITICAL for move hunks: the destination write returns
+              // `{ success: false }` as data, not a throw. Without this check a
+              // failed destination write would be treated as success and the
+              // code below would proceed to DELETE THE SOURCE — losing the file
+              // entirely. Throwing here routes to the catch → `failures` and
+              // leaves the source intact.
+              if (writeResult.success === false) {
+                throw new Error((writeResult.message as string | undefined) ?? "write failed");
+              }
+              // Same hazard as success:false for move hunks: a destination write
+              // that fails syntax validation returns rolled_back:true (the file
+              // is unchanged). Treating it as success would mark the hunk applied
+              // and, for a move, proceed to DELETE THE SOURCE — losing the file.
+              // Throw → routes to the catch → `failures`, source intact.
+              if (writeResult.rolled_back === true) {
+                throw new Error("produced invalid syntax (rolled back)");
+              }
 
               // Collect diagnostics from this file
               const diags = writeResult.lsp_diagnostics as
@@ -1277,7 +1288,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               if (diags && diags.length > 0) {
                 const errors = diags.filter((d) => d.severity === "error");
                 if (errors.length > 0) {
-                  const relPath = path.relative(context.worktree, targetPath);
+                  const relPath = path.relative(projectRoot, targetPath);
                   const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
                   results.push(`\nLSP errors detected in ${relPath}, please fix:\n${diagLines}`);
                 }
@@ -1410,9 +1421,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // Store metadata for tool.execute.after hook (match opencode built-in format)
-      const callID = getCallID(context);
-      if (callID) {
+      // UI metadata returned directly on the result (matches opencode built-in
+      // apply_patch shape). Replaces the old metadata-store + after-hook merge
+      // that intermittently lost diffs under duplicate plugin loads (#96).
+      {
         // Index per-file diffs by absolute filePath for fast lookup when
         // building the metadata.files array. Each entry NEEDS to carry the
         // per-file `patch` string plus `additions`/`deletions` counts —
@@ -1438,15 +1450,25 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         // numbers (e.g. +399/-400 for a single-line removal). See
         // perFileDiffs population above for how counts are derived per
         // hunk type.
-        const files = hunks.map((h) => {
-          const filePath = path.resolve(context.directory, h.path);
+        // Only successfully-applied hunks belong in the UI metadata. A failed
+        // hunk has no diff entry (its catch pushed to `failures`, not
+        // perFileDiffs), so including it would emit an empty-patch row the UI
+        // drops anyway AND list it under the "Success" title below. Scope to
+        // the hunks that actually landed. (Total failure throws earlier, so
+        // here we're at full or partial success.)
+        const failedPaths = new Set(failures);
+        const appliedHunks = hunks.filter((h) => !failedPaths.has(h.path));
+        const files = appliedHunks.map((h) => {
+          const filePath = resolvePathFromProjectRoot(projectRoot, h.path);
           // `move_path` only exists on UpdateHunk variants — narrow first.
           const rawMovePath = h.type === "update" ? h.move_path : undefined;
-          const movePath = rawMovePath ? path.resolve(context.directory, rawMovePath) : undefined;
+          const movePath = rawMovePath
+            ? resolvePathFromProjectRoot(projectRoot, rawMovePath)
+            : undefined;
           // For moved files, render the destination path as the visible
           // location (matches OpenCode's apply_patch behaviour).
           const displayPath = movePath ?? filePath;
-          const relPath = path.relative(context.worktree, displayPath);
+          const relPath = path.relative(projectRoot, displayPath);
 
           const diffEntry = diffByPath.get(filePath);
           const patch = diffEntry
@@ -1472,13 +1494,18 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         });
 
         // Build title matching built-in: "Success. Updated the following files:\nM path/to/file.ts"
+        // On PARTIAL failure (some hunks failed but others landed), don't claim
+        // "Success" — say so and list only what actually applied.
         const fileList = files
           .map((f) => {
             const prefix = f.type === "add" ? "A" : f.type === "delete" ? "D" : "M";
             return `${prefix} ${f.relativePath}`;
           })
           .join("\n");
-        const title = `Success. Updated the following files:\n${fileList}`;
+        const title =
+          failures.length > 0
+            ? `Partially applied (${files.length} of ${hunks.length}). Updated:\n${fileList}`
+            : `Success. Updated the following files:\n${fileList}`;
 
         // Aggregate unified diff for the top-level metadata.diff field
         // (OpenCode's renderer also uses this for some views).
@@ -1487,16 +1514,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           .filter(Boolean)
           .join("\n");
 
-        storeToolMetadata(context.sessionID, callID, {
+        return {
+          output: results.join("\n"),
           title,
           metadata: {
             diff: diffText,
             files,
           },
-        });
+        };
       }
-
-      return results.join("\n");
     },
   };
 }
@@ -1510,10 +1536,7 @@ const DELETE_DESCRIPTION =
   "Each file is backed up before deletion — use aft_safety undo to recover any of them. " +
   "For directories, every file inside is individually backed up before the tree is removed.\n\n" +
   "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
-  "Returns: { success, complete, deleted: [paths], skipped_files: [{file, reason}] }. " +
-  "Partial success is allowed: files that can be deleted are deleted; files that fail " +
-  "(missing, permission denied, etc.) are reported in skipped_files. " +
-  "`complete: false` indicates at least one file was skipped.";
+  "Partial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.";
 
 function createDeleteTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -1531,11 +1554,16 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         ),
     },
     execute: async (args, context): Promise<string> => {
-      const inputs = args.files as string[];
+      // Coerce at the boundary: some hosts deliver `files` as a bare string or
+      // a JSON-stringified array despite the schema, which would crash the
+      // unchecked `.map` below before any validation runs.
+      const inputs = coerceStringArray(args.files);
+      if (inputs.length === 0) {
+        throw new Error("delete: `files` must be a non-empty array of paths");
+      }
       const recursive = args.recursive === true;
-      const absolutePaths = inputs.map((f) =>
-        path.isAbsolute(f) ? f : path.resolve(context.directory, f),
-      );
+      const projectRoot = await resolveProjectRoot(ctx, context);
+      const absolutePaths = inputs.map((f) => resolvePathFromProjectRoot(projectRoot, f));
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -1598,22 +1626,23 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 
 const MOVE_DESCRIPTION =
   "Move or rename a file with backup. Creates parent directories for destination automatically\n" +
-  "Note: This moves/renames files at the OS level.";
+  "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead.";
 
 function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
     description: MOVE_DESCRIPTION,
     args: {
-      filePath: z.string().describe("Source file path to move"),
-      destination: z.string().describe("Destination file path"),
+      filePath: z
+        .string()
+        .describe("Source file path to move (absolute or relative to project root)"),
+      destination: z
+        .string()
+        .describe("Destination file path (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
-      const filePath = path.isAbsolute(args.filePath as string)
-        ? (args.filePath as string)
-        : path.resolve(context.directory, args.filePath as string);
-      const destPath = path.isAbsolute(args.destination as string)
-        ? (args.destination as string)
-        : path.resolve(context.directory, args.destination as string);
+      const projectRoot = await resolveProjectRoot(ctx, context);
+      const filePath = resolvePathFromProjectRoot(projectRoot, args.filePath as string);
+      const destPath = resolvePathFromProjectRoot(projectRoot, args.destination as string);
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -1690,6 +1719,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     tools.bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 
@@ -1746,8 +1776,9 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
           typeof normalizedArgs.content === "string"
         ) {
           const file = normalizedArgs.filePath as string;
-          const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
-          const relPath = path.relative(context.worktree, filePath);
+          const projectRoot = await resolveProjectRoot(ctx, context);
+          const filePath = resolvePathFromProjectRoot(projectRoot, file);
+          const relPath = path.relative(projectRoot, filePath);
 
           // External-directory check first (mirrors opencode-native write.ts:43).
           {
@@ -1767,7 +1798,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             file: filePath,
             content: normalizedArgs.content as string,
             create_dirs: normalizedArgs.create_dirs !== false,
-            diagnostics: true,
+            diagnostics: normalizedArgs.diagnostics ?? diagnosticsOnEditDefault(ctx),
           };
           const response = await callBridge(ctx, context, "write", writeParams);
           if (response.success === false) {
@@ -1792,6 +1823,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     tools.aft_bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 

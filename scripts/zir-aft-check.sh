@@ -481,7 +481,11 @@ _filter_passing() {
       continue
     fi
     # Skip individual passing test lines (nextest, cargo test, etc.)
-    if [[ "$line" =~ ^[[:space:]]*(PASS|[0-9]+ passed) ]]; then
+    # but always keep failures, panics, and compile errors visible.
+    if [[ "$line" =~ ^[[:space:]]*(PASS|[0-9]+ passed) ]] \
+      && [[ "$line" != *FAIL* ]] \
+      && [[ "$line" != *"error:"* ]] \
+      && [[ "$line" != *"panicked at"* ]]; then
       prev_blank=0
       continue
     fi

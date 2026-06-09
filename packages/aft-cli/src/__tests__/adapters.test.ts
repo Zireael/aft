@@ -47,6 +47,14 @@ describe("OpenCodeAdapter configuration", () => {
     releaseEnv = undefined;
   });
 
+  test("isInstalled returns true when the OpenCode config dir exists (Desktop, no CLI on PATH)", () => {
+    // beforeEach points OPENCODE_CONFIG_DIR at an existing tmp dir, mirroring an
+    // OpenCode Desktop install that never put `opencode` on PATH. Setup must
+    // still recognize OpenCode so it doesn't bail with "no harness detected".
+    const adapter = new OpenCodeAdapter();
+    expect(adapter.isInstalled()).toBe(true);
+  });
+
   test("hasPluginEntry returns false when no config", () => {
     const adapter = new OpenCodeAdapter();
     expect(adapter.hasPluginEntry()).toBe(false);

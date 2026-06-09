@@ -309,10 +309,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Prepare the text to add to destination: ensure it has export prefix.
     // When start_byte was extended above, the symbol_text already includes
     // `export`; prepare_exported_symbol's idempotency check leaves it alone.
+    let moved_symbol_is_default = symbol_text.trim_start().starts_with("export default");
     let dest_symbol_text = prepare_exported_symbol(symbol_text);
 
     // Prepare source with symbol removed
-    let new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
+    let mut new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
         Ok(s) => s,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
@@ -373,6 +374,24 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // `lang` already detected above for the export-keyword extension.
 
+    // If the original source still references the moved symbol after removing
+    // its declaration, it is also a consumer. Run the same import-rewrite path
+    // against the post-removal source text so those local references resolve.
+    let source_rewritten_as_consumer = if let Some(rewritten) = rewrite_consumer_imports(
+        &new_source,
+        source_path,
+        source_path,
+        dest_path,
+        symbol_name,
+        Some(source_lang),
+        moved_symbol_is_default,
+    ) {
+        new_source = rewritten;
+        true
+    } else {
+        false
+    };
+
     // --- Compute consumer rewrites ---
     let mut consumer_rewrites: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, new)
     for consumer_file in &consumer_files {
@@ -391,6 +410,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             dest_path,
             symbol_name,
             Some(source_lang),
+            moved_symbol_is_default,
         );
 
         if let Some(rewritten) = new_consumer {
@@ -462,6 +482,24 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // 1. Write source file (symbol removed)
     match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
+        // A rolled-back write means the result was invalid syntax and the file
+        // was reverted (symbol NOT removed). Continuing would add the symbol to
+        // the destination too, leaving it defined in BOTH files. Treat it like a
+        // write failure: restore and bail.
+        Ok(wr) if wr.rolled_back => {
+            if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
+            return move_error(
+                &req.id,
+                file,
+                &written_files,
+                &new_files,
+                "removing the symbol from the source produced invalid syntax; the move was rolled back and nothing changed",
+            );
+        }
         Ok(wr) => {
             if let Ok(final_content) = std::fs::read_to_string(source_path) {
                 ctx.lsp_notify_file_changed(source_path, &final_content);
@@ -492,6 +530,31 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // 2. Write destination file (symbol added)
     match edit::write_format_validate(&dest_path, &new_dest, &ctx.config(), &req.params) {
+        // CRITICAL: the source already had the symbol removed. If the
+        // destination write is rolled back (invalid syntax — e.g. moving
+        // TS-only syntax into a .js file), the symbol would be defined NOWHERE —
+        // silent data loss with success:true. Restore everything and fail, same
+        // as the Err branch below.
+        Ok(wr) if wr.rolled_back => {
+            let mut files_to_delete = new_files.clone();
+            if !dest_existed {
+                files_to_delete.push(dest_path.to_path_buf());
+            }
+            let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
+            cleanup_new_files(&files_to_delete);
+            if restored {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
+            return move_error(
+                &req.id,
+                destination,
+                &written_files,
+                &new_files,
+                "adding the symbol to the destination produced invalid syntax; the move was rolled back and nothing changed",
+            );
+        }
         Ok(wr) => {
             if let Ok(final_content) = std::fs::read_to_string(dest_path) {
                 ctx.lsp_notify_file_changed(dest_path, &final_content);
@@ -531,9 +594,28 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 3. Write consumer files (imports rewritten)
-    let mut consumers_updated = 0;
+    let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
         match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
+            // A rolled-back consumer rewrite leaves the move half-applied (this
+            // consumer still imports from the old location while others were
+            // updated). Restore everything and fail, same as the Err branch.
+            Ok(wr) if wr.rolled_back => {
+                let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
+                cleanup_new_files(&new_files);
+                if restored {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
+                return move_error(
+                    &req.id,
+                    &path.display().to_string(),
+                    &written_files,
+                    &new_files,
+                    "rewriting a consumer's import produced invalid syntax; the move was rolled back and nothing changed",
+                );
+            }
             Ok(wr) => {
                 if let Ok(final_content) = std::fs::read_to_string(&path) {
                     ctx.lsp_notify_file_changed(path, &final_content);
@@ -884,25 +966,60 @@ fn append_symbol_to_dest(dest_content: &str, symbol_text: &str) -> String {
     }
 }
 
+/// Collect TS/JS/TSX files in the project to scan for references to the moved
+/// symbol.
+///
+/// Respects `.gitignore` / `.aftignore` (so gitignored compiled output under
+/// `dist/`/`build/` is NOT rewritten — the corruption bug this guards against)
+/// and skips heavy non-source dirs (node_modules, target, .git, dist, build, …).
+/// Unlike the shared `walk_project_files`, it deliberately includes HIDDEN dirs
+/// (`.hidden(false)`), so tracked consumers in `.storybook/`, `.config/`, etc.
+/// are still found and rewritten — otherwise the move leaves dangling imports in
+/// them. The `dist`/`build` name-exclusion is kept (a deliberate prior decision:
+/// un-gitignored compiled output stays untouched); a tracked *source* dir named
+/// literally `build/` is a known, rare limitation.
 fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, dest_path: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
-                continue;
+    use ignore::WalkBuilder;
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false) // include .storybook/, .config/, etc. (tracked consumers)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                return !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    "node_modules"
+                        | "target"
+                        | ".git"
+                        | "__pycache__"
+                        | ".tox"
+                        | ".venv"
+                        | "venv"
+                        | "dist"
+                        | "build"
+                );
             }
-            collect_ts_js_files(&path, out, source_path, dest_path);
-        } else if matches!(
+            true
+        })
+        .build();
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if !matches!(
             detect_language(&path),
             Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
         ) {
-            let canon = std::fs::canonicalize(&path).unwrap_or(path);
-            if canon != source_path && canon != dest_path {
-                out.push(canon);
-            }
+            continue;
+        }
+        let canon = std::fs::canonicalize(&path).unwrap_or(path);
+        if canon != source_path && canon != dest_path {
+            out.push(canon);
         }
     }
 }
@@ -919,6 +1036,7 @@ fn rewrite_consumer_imports(
     dest_file: &Path,
     symbol_name: &str,
     lang: Option<LangId>,
+    moved_symbol_is_default: bool,
 ) -> Option<String> {
     let lang = lang?;
 
@@ -927,13 +1045,10 @@ fn rewrite_consumer_imports(
         return None;
     }
 
-    // Parse imports
-    let (_source_text, _tree, block) = match imports::parse_file_imports(consumer_file, lang) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
+    // Parse imports from the content passed in. For the source file this is
+    // the post-removal text, not the original on-disk content.
+    let (tree, block) = parse_imports_from_content(consumer_content, lang)?;
 
-    // Use the consumer_content we already read (should match source_text)
     let content = consumer_content;
 
     // Find imports from the source file that reference the moved symbol
@@ -953,65 +1068,54 @@ fn rewrite_consumer_imports(
     let mut made_changes = false;
 
     for (_, imp) in &matching_imports {
-        // Match on the imported name (pre-`as`) so `import { foo as bar }`
-        // still matches when we're moving `foo`. The TS/JS specifier is
-        // stored verbatim (`"foo as bar"`); see `imports::specifier_matches`.
-        let has_moved_symbol = imp
-            .names
-            .iter()
-            .any(|n| imports::specifier_matches(n, symbol_name))
-            || imp.default_import.as_deref() == Some(symbol_name);
-
-        if !has_moved_symbol {
+        let moved_bindings = moved_bindings_for_import(imp, symbol_name, moved_symbol_is_default);
+        if moved_bindings.is_empty() {
             continue;
         }
 
         let new_import_path = compute_relative_import_path(consumer_file, dest_file);
 
-        // Check if this import has other symbols besides the moved one
+        // Check if this import has other symbols besides the moved one. Default
+        // imports are only moved when the target declaration was the default
+        // export, preserving the consumer's local alias (`import Bar ...`).
         let remaining_names: Vec<String> = imp
             .names
             .iter()
-            .filter(|n| !imports::specifier_matches(n, symbol_name))
+            .filter(|n| !moved_bindings.named.iter().any(|moved| moved == *n))
             .cloned()
             .collect();
-        let remaining_default = if imp.default_import.as_deref() == Some(symbol_name) {
+        let remaining_default = if moved_bindings.default_import.is_some() {
             None
         } else {
             imp.default_import.clone()
         };
+        let remaining_namespace = if moved_bindings.namespace_import.is_some() {
+            None
+        } else {
+            imp.namespace_import.clone()
+        };
 
         let type_only = imp.kind == imports::ImportKind::Type;
+        let moved_import =
+            generate_import_for_bindings(lang, &new_import_path, &moved_bindings, type_only);
 
         // Build the replacement text
-        if remaining_names.is_empty() && remaining_default.is_none() {
-            // All symbols in this import are moving — replace entire import with new path
-            // Preserve the original import structure but change the path
-            let new_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
-            );
-            edits.push((imp.byte_range.clone(), new_import));
+        if remaining_names.is_empty()
+            && remaining_default.is_none()
+            && remaining_namespace.is_none()
+        {
+            // All symbols in this import are moving — replace entire import with
+            // a same-kind import from the new path.
+            edits.push((imp.byte_range.clone(), moved_import));
         } else {
-            // Some symbols remain — keep old import for remaining, add new import for moved
-            let kept_import = imports::generate_import_line(
+            // Some symbols remain — keep old import for remaining, add new import for moved.
+            let kept_import = imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
                 &remaining_names,
                 remaining_default.as_deref(),
+                remaining_namespace.as_deref(),
                 type_only,
-            );
-
-            // Generate new import for the moved symbol
-            let moved_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
             );
 
             let replacement = format!("{}\n{}", kept_import, moved_import);
@@ -1019,63 +1123,76 @@ fn rewrite_consumer_imports(
         }
     }
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar_for(lang)).is_ok() {
-        if let Some(tree) = parser.parse(content, None) {
-            let root = tree.root_node();
-            let mut exports = Vec::new();
-            let mut cursor = root.walk();
-            if cursor.goto_first_child() {
-                loop {
-                    let node = cursor.node();
-                    if node.kind() == "export_statement"
-                        && export_path_matches_file(content, &node, consumer_file, source_file)
-                    {
-                        exports.push(node);
-                    }
-                    if !cursor.goto_next_sibling() {
-                        break;
-                    }
+    {
+        let root = tree.root_node();
+        let mut exports = Vec::new();
+        let mut cursor = root.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let node = cursor.node();
+                if node.kind() == "export_statement"
+                    && export_path_matches_file(content, &node, consumer_file, source_file)
+                {
+                    exports.push(node);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
                 }
             }
+        }
 
-            exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
-            for node in exports {
-                if export_statement_has_wildcard(content, &node) {
-                    // TODO: safely rewrite `export * from "..."` once moved-symbol
-                    // provenance can distinguish which names are provided by the star.
-                    crate::slog_warn!(
-                        "move_symbol: leaving wildcard re-export unchanged in {}",
-                        consumer_file.display()
-                    );
-                    continue;
-                }
-                if !export_statement_contains_name(content, &node, symbol_name) {
-                    continue;
-                }
-                let Some(module_range) = export_module_string_range(content, &node) else {
-                    continue;
-                };
-                let Some((moved_specs, remaining_specs)) =
-                    partition_export_specifiers(content, &node, symbol_name)
-                else {
-                    continue;
-                };
-                let new_import_path = compute_relative_import_path(consumer_file, dest_file);
-                if remaining_specs.is_empty() {
-                    edits.push((module_range, new_import_path));
-                } else {
-                    let old_path = &content[module_range];
-                    let replacement = format!(
-                        "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
-                        remaining_specs.join(", "),
-                        old_path,
-                        moved_specs.join(", "),
-                        new_import_path
-                    );
-                    edits.push((node.byte_range(), replacement));
-                }
+        exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
+        for node in exports {
+            if export_statement_has_wildcard(content, &node) {
+                // TODO: safely rewrite `export * from "..."` once moved-symbol
+                // provenance can distinguish which names are provided by the star.
+                crate::slog_warn!(
+                    "move_symbol: leaving wildcard re-export unchanged in {}",
+                    consumer_file.display()
+                );
+                continue;
             }
+            if !export_statement_contains_name(content, &node, symbol_name) {
+                continue;
+            }
+            let Some(module_range) = export_module_string_range(content, &node) else {
+                continue;
+            };
+            let Some((moved_specs, remaining_specs)) =
+                partition_export_specifiers(content, &node, symbol_name)
+            else {
+                continue;
+            };
+            let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+            if remaining_specs.is_empty() {
+                edits.push((module_range, new_import_path));
+            } else {
+                let old_path = &content[module_range];
+                let replacement = format!(
+                    "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
+                    remaining_specs.join(", "),
+                    old_path,
+                    moved_specs.join(", "),
+                    new_import_path
+                );
+                edits.push((node.byte_range(), replacement));
+            }
+        }
+    }
+
+    if paths_equivalent(consumer_file, source_file)
+        && content_references_identifier(content, lang, symbol_name)
+    {
+        if let Some(insert_edit) = build_add_moved_import_edit(
+            content,
+            &block,
+            consumer_file,
+            dest_file,
+            symbol_name,
+            lang,
+            moved_symbol_is_default,
+        ) {
+            edits.push(insert_edit);
         }
     }
 
@@ -1178,37 +1295,713 @@ fn partition_export_specifiers(
     Some((moved, remaining))
 }
 
-/// Generate an import statement preserving any alias from the original import text.
-///
-/// If the original import has `{ X as Y }`, the new import preserves the alias.
-fn generate_import_with_alias(
-    original_raw: &str,
-    symbol_name: &str,
-    new_module_path: &str,
-    type_only: bool,
-    _lang: LangId,
-) -> String {
-    // Check if the original import uses an alias for this symbol
-    // Pattern: `X as Y` inside braces
-    let alias = extract_alias(original_raw, symbol_name);
+#[derive(Debug, Default)]
+struct MovedImportBindings {
+    named: Vec<String>,
+    default_import: Option<String>,
+    namespace_import: Option<String>,
+}
 
-    let names = if let Some(alias_name) = &alias {
-        vec![format!("{} as {}", symbol_name, alias_name)]
+impl MovedImportBindings {
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.default_import.is_none() && self.namespace_import.is_none()
+    }
+}
+
+fn moved_bindings_for_import(
+    imp: &imports::ImportStatement,
+    symbol_name: &str,
+    moved_symbol_is_default: bool,
+) -> MovedImportBindings {
+    let named = if moved_symbol_is_default {
+        Vec::new()
+    } else {
+        imp.names
+            .iter()
+            .filter(|n| imports::specifier_matches(n, symbol_name))
+            .cloned()
+            .collect()
+    };
+
+    let default_import = if moved_symbol_is_default {
+        imp.default_import.clone()
+    } else {
+        None
+    };
+
+    MovedImportBindings {
+        named,
+        default_import,
+        namespace_import: None,
+    }
+}
+
+fn generate_import_for_bindings(
+    lang: LangId,
+    module_path: &str,
+    bindings: &MovedImportBindings,
+    type_only: bool,
+) -> String {
+    imports::generate_import_line_with_namespace(
+        lang,
+        module_path,
+        &bindings.named,
+        bindings.default_import.as_deref(),
+        bindings.namespace_import.as_deref(),
+        type_only,
+    )
+}
+
+fn parse_imports_from_content(
+    content: &str,
+    lang: LangId,
+) -> Option<(tree_sitter::Tree, imports::ImportBlock)> {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content.as_bytes(), None)?;
+    let block = imports::parse_imports(content, &tree, lang);
+    Some((tree, block))
+}
+
+fn build_add_moved_import_edit(
+    content: &str,
+    block: &imports::ImportBlock,
+    consumer_file: &Path,
+    dest_file: &Path,
+    symbol_name: &str,
+    lang: LangId,
+    moved_symbol_is_default: bool,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+    let names = if moved_symbol_is_default {
+        Vec::new()
     } else {
         vec![symbol_name.to_string()]
     };
+    let default_import = moved_symbol_is_default.then_some(symbol_name);
 
-    let type_prefix = if type_only { "type " } else { "" };
-    let names_str = names.join(", ");
-    format!(
-        "import {}{{ {} }} from '{}';",
-        type_prefix, names_str, new_module_path
+    if imports::is_duplicate(block, &new_import_path, &names, default_import, false) {
+        return None;
+    }
+
+    let group = imports::classify_group(lang, &new_import_path);
+    let (insert_offset, needs_blank_before, needs_blank_after) =
+        imports::find_insertion_point(content, block, group, &new_import_path, false);
+    let import_line =
+        imports::generate_import_line(lang, &new_import_path, &names, default_import, false);
+
+    let mut insert_text = String::new();
+    if needs_blank_before {
+        insert_text.push('\n');
+    }
+    insert_text.push_str(&import_line);
+    insert_text.push('\n');
+    if needs_blank_after {
+        insert_text.push('\n');
+    }
+
+    Some((insert_offset..insert_offset, insert_text))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentifierNamespace {
+    Value,
+    Type,
+}
+
+fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(content.as_bytes(), None) else {
+        return false;
+    };
+
+    let root = tree.root_node();
+    if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        node_references_identifier(&root, content, symbol_name)
+    } else {
+        node_references_identifier_naive(&root, content, symbol_name)
+    }
+}
+
+fn node_references_identifier(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        let namespace = reference_namespace(node);
+        if !identifier_is_binding_position(node, content, symbol_name, namespace)
+            && !identifier_is_shadowed_by_enclosing_scope(node, content, symbol_name, namespace)
+        {
+            return true;
+        }
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn node_references_identifier_naive(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier_naive(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_reference_identifier_node(kind: &str) -> bool {
+    matches!(kind, "identifier" | "type_identifier" | "jsx_identifier")
+}
+
+fn reference_namespace(node: &tree_sitter::Node) -> IdentifierNamespace {
+    if node.kind() == "type_identifier" {
+        IdentifierNamespace::Type
+    } else {
+        IdentifierNamespace::Value
+    }
+}
+
+fn identifier_is_binding_position(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "import_statement" {
+            return true;
+        }
+
+        if declaration_name_matches_target(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+
+        match parent.kind() {
+            "variable_declarator" if namespace == IdentifierNamespace::Value => {
+                if parent.child_by_field_name("name").is_some_and(|name| {
+                    pattern_contains_binding_node(&name, node, content, symbol_name)
+                }) {
+                    return true;
+                }
+            }
+            "formal_parameters" | "required_parameter" | "optional_parameter" | "rest_pattern"
+            | "assignment_pattern" | "object_pattern" | "array_pattern" | "pair_pattern"
+                if namespace == IdentifierNamespace::Value =>
+            {
+                if pattern_contains_binding_node(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            "catch_clause" if namespace == IdentifierNamespace::Value => {
+                if parent
+                    .child_by_field_name("parameter")
+                    .is_some_and(|param| {
+                        pattern_contains_binding_node(&param, node, content, symbol_name)
+                    })
+                {
+                    return true;
+                }
+            }
+            "type_parameter" if namespace == IdentifierNamespace::Type => {
+                if type_parameter_name_matches_target(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+fn identifier_is_shadowed_by_enclosing_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if scope_introduces_shadowing_binding(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+        current = parent;
+    }
+
+    false
+}
+
+fn scope_introduces_shadowing_binding(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match scope.kind() {
+        kind if is_function_like_scope(kind) => {
+            function_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        "statement_block" | "switch_body" => {
+            block_scope_binds_name(scope, content, symbol_name, namespace)
+        }
+        "catch_clause" => catch_scope_binds_name(scope, reference, content, symbol_name, namespace),
+        "for_statement" | "for_in_statement" | "for_of_statement" => {
+            loop_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        _ => false,
+    }
+}
+
+fn is_function_like_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
     )
+}
+
+fn function_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    match namespace {
+        IdentifierNamespace::Value => {
+            function_inner_name_binds_name(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("parameters")
+                    .is_some_and(|params| pattern_binds_name(&params, content, symbol_name))
+                || function_var_declarations_bind_name(scope, content, symbol_name)
+        }
+        IdentifierNamespace::Type => {
+            class_declaration_name_matches(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("type_parameters")
+                    .is_some_and(|params| type_parameters_bind_name(&params, content, symbol_name))
+        }
+    }
+}
+
+fn function_inner_name_binds_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if scope.kind() == "method_definition" {
+        return false;
+    }
+    name_field_matches(scope, content, symbol_name)
+}
+
+fn class_declaration_name_matches(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    ) && name_field_matches(node, content, symbol_name)
+}
+
+fn function_var_declarations_bind_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    scope
+        .child_by_field_name("body")
+        .is_some_and(|body| var_declarations_bind_name_in_scope(&body, content, symbol_name))
+}
+
+fn var_declarations_bind_name_in_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if is_function_like_scope(child.kind()) {
+            continue;
+        }
+        if child.kind() == "variable_declaration"
+            && declaration_binds_name(&child, content, symbol_name, IdentifierNamespace::Value)
+        {
+            return true;
+        }
+        if var_declarations_bind_name_in_scope(&child, content, symbol_name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn block_scope_binds_name(
+    block: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = block.child_count();
+    for i in 0..child_count {
+        let Some(child) = block.child(i as u32) else {
+            continue;
+        };
+        if direct_scope_child_binds_name(&child, content, symbol_name, namespace) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn direct_scope_child_binds_name(
+    child: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if declaration_binds_name(child, content, symbol_name, namespace) {
+        return true;
+    }
+
+    if child.kind() == "export_statement" {
+        let child_count = child.child_count();
+        for i in 0..child_count {
+            if let Some(export_child) = child.child(i as u32) {
+                if declaration_binds_name(&export_child, content, symbol_name, namespace) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn catch_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value {
+        return false;
+    }
+
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    scope
+        .child_by_field_name("parameter")
+        .is_some_and(|param| pattern_binds_name(&param, content, symbol_name))
+}
+
+fn loop_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value
+        || !reference_is_in_loop_bound_scope(scope, reference)
+    {
+        return false;
+    }
+
+    ["initializer", "left"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| loop_header_declares_name(&node, content, symbol_name))
+    })
+}
+
+fn reference_is_in_loop_bound_scope(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+) -> bool {
+    ["condition", "increment", "body"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| node_contains(&node, reference))
+    })
+}
+
+fn loop_header_declares_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    matches!(
+        node.kind(),
+        "lexical_declaration" | "variable_declaration" | "variable_declarator"
+    ) && declaration_binds_name(node, content, symbol_name, IdentifierNamespace::Value)
+}
+
+fn declaration_binds_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match node.kind() {
+        "variable_declarator" if namespace == IdentifierNamespace::Value => node
+            .child_by_field_name("name")
+            .is_some_and(|name| pattern_binds_name(&name, content, symbol_name)),
+        "lexical_declaration" | "variable_declaration"
+            if namespace == IdentifierNamespace::Value =>
+        {
+            node_children_bind_name(node, content, symbol_name, namespace)
+        }
+        "function_declaration" | "generator_function_declaration" => {
+            namespace == IdentifierNamespace::Value
+                && name_field_matches(node, content, symbol_name)
+        }
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => {
+            name_field_matches(node, content, symbol_name)
+        }
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type && name_field_matches(node, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if declaration_binds_name(&child, content, symbol_name, namespace) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn declaration_name_matches_target(
+    declaration: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let name_binds_namespace = match declaration.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function" => namespace == IdentifierNamespace::Value,
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => true,
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type
+        }
+        _ => false,
+    };
+
+    name_binds_namespace
+        && declaration.child_by_field_name("name").is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameter_name_matches_target(
+    type_parameter: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    type_parameter
+        .child_by_field_name("name")
+        .is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameters_bind_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if node.kind() == "type_parameter" && name_field_matches(node, content, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if type_parameters_bind_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_binds_name(pattern: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            node_text_matches(content, pattern, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => pattern
+            .child_by_field_name("pattern")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "assignment_pattern" => pattern
+            .child_by_field_name("left")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_binds_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_contains_binding_node(
+    pattern: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if !node_contains(pattern, target) {
+        return false;
+    }
+
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            same_node(pattern, target) && node_text_matches(content, target, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => {
+            pattern.child_by_field_name("pattern").is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            })
+        }
+        "assignment_pattern" => pattern.child_by_field_name("left").is_some_and(|child| {
+            pattern_contains_binding_node(&child, target, content, symbol_name)
+        }),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            }),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_contain_binding_node(
+    node: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_contains_binding_node(&child, target, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn name_field_matches(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    node.child_by_field_name("name")
+        .is_some_and(|name| node_text_matches(content, &name, symbol_name))
+}
+
+fn same_node(a: &tree_sitter::Node, b: &tree_sitter::Node) -> bool {
+    a.kind() == b.kind() && a.start_byte() == b.start_byte() && a.end_byte() == b.end_byte()
+}
+
+fn node_contains(container: &tree_sitter::Node, node: &tree_sitter::Node) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+}
+
+fn node_text_matches(content: &str, node: &tree_sitter::Node, expected: &str) -> bool {
+    content
+        .get(node.byte_range())
+        .is_some_and(|text| text == expected)
 }
 
 /// Extract an alias for a symbol from an import statement's raw text.
 ///
 /// Looks for `symbol_name as alias` pattern in the import text.
+#[cfg(test)]
 fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
     // Look for `symbolName as aliasName` pattern
     let pattern = format!("{} as ", symbol_name);

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,11 +18,12 @@ const checkerMocks = {
 const cacheMocks = {
   preparePackageUpdate: mock(() => "/tmp/opencode"),
   resolveInstallContext: mock(() => ({ installDir: "/tmp/opencode" })),
-  runNpmInstallSafe: mock(async () => true),
+  runNpmInstallSafe: mock(async () => ({ ok: true })),
 };
 
 mock.module("../../logger.js", () => ({
   log: logMock,
+  debug: mock(() => {}),
   warn: warnMock,
   error: mock(() => {}),
 }));
@@ -82,7 +83,7 @@ describe("auto-update-checker/index", () => {
     cacheMocks.resolveInstallContext.mockReset();
     cacheMocks.resolveInstallContext.mockImplementation(() => ({ installDir: "/tmp/opencode" }));
     cacheMocks.runNpmInstallSafe.mockReset();
-    cacheMocks.runNpmInstallSafe.mockImplementation(async () => true);
+    cacheMocks.runNpmInstallSafe.mockImplementation(async () => ({ ok: true }));
   });
 
   afterEach(() => {
@@ -202,9 +203,35 @@ describe("auto-update-checker/index", () => {
 
     // Verify the timestamp file was updated to a recent value.
     const after = JSON.parse(
-      readFileSync(join(testStorageDir, "last-update-check.json"), "utf-8"),
+      readFileSync(join(testStorageDir, "opencode", "last-update-check.json"), "utf-8"),
     ) as { lastCheckedMs: number };
     expect(after.lastCheckedMs).toBeGreaterThan(stale);
+  });
+
+  test("repairs root-scoped timestamp into opencode harness path", async () => {
+    checkerMocks.getLocalDevVersion.mockImplementation(() => "0.17.2-dev");
+    const { createAutoUpdateCheckerHook } = await freshIndexImport();
+    const { ctx, showToast } = createCtx();
+    const recent = Date.now();
+    writeFileSync(
+      join(testStorageDir, "last-update-check.json"),
+      JSON.stringify({ lastCheckedMs: recent }),
+      "utf-8",
+    );
+
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      storageDir: testStorageDir,
+      checkIntervalMs: 60 * 60 * 1000,
+      initDelayMs: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(showToast).not.toHaveBeenCalled();
+    expect(existsSync(join(testStorageDir, "last-update-check.json"))).toBe(false);
+    const repaired = JSON.parse(
+      readFileSync(join(testStorageDir, "opencode", "last-update-check.json"), "utf-8"),
+    ) as { lastCheckedMs: number };
+    expect(repaired.lastCheckedMs).toBe(recent);
   });
 
   test("shows success toast after updating the active install root", async () => {
@@ -347,7 +374,11 @@ describe("auto-update-checker/index", () => {
     }));
     checkerMocks.getCachedVersion.mockImplementation(() => "0.17.1");
     checkerMocks.getLatestVersion.mockImplementation(async () => "0.17.2");
-    cacheMocks.runNpmInstallSafe.mockImplementation(async () => false);
+    cacheMocks.runNpmInstallSafe.mockImplementation(async () => ({
+      ok: false,
+      reason: "npm install exited with code 1",
+      stderrTail: "MODULE_NOT_FOUND\n",
+    }));
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 

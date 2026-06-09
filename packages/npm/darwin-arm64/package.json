@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-darwin-arm64",
-  "version": "0.29.1",
+  "version": "0.36.1",
   "description": "AFT binary for macOS ARM64 (Apple Silicon)",
   "os": [
     "darwin"
@@ -15,6 +15,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortexkit/aft"
+    "url": "git+https://github.com/cortexkit/aft.git"
   }
 }

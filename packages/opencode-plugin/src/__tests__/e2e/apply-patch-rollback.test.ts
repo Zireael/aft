@@ -7,7 +7,7 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
-import { noopAsk } from "../test-helpers";
+import { noopAsk, toolResultText } from "../test-helpers";
 import {
   cleanupHarnesses,
   createHarness,
@@ -104,8 +104,8 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Updated one.txt");
-    expect(output).toContain("Updated two.txt");
+    expect(toolResultText(output)).toContain("Updated one.txt");
+    expect(toolResultText(output)).toContain("Updated two.txt");
     expect(await readTextFile(h.path("one.txt"))).toBe("alpha changed\n");
     expect(await readTextFile(h.path("two.txt"))).toBe("bravo changed\n");
   });
@@ -127,7 +127,7 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Updated and moved from.txt → nested/to.txt");
+    expect(toolResultText(output)).toContain("Updated and moved from.txt → nested/to.txt");
     await expect(readTextFile(h.path("from.txt"))).rejects.toThrow();
     expect(await readTextFile(h.path("nested", "to.txt"))).toBe("move me please\n");
   });
@@ -191,9 +191,9 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
       sdkCtx,
     );
 
-    expect(output).toContain("Updated kept.txt");
-    expect(output).toContain("Failed to create exists.txt");
-    expect(output).toContain("Patch partially applied");
+    expect(toolResultText(output)).toContain("Updated kept.txt");
+    expect(toolResultText(output)).toContain("Failed to create exists.txt");
+    expect(toolResultText(output)).toContain("Patch partially applied");
     expect(await readTextFile(h.path("kept.txt"))).toBe("after\n");
     expect(await readTextFile(h.path("exists.txt"))).toBe("already here\n");
   });

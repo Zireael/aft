@@ -1,0 +1,3 @@
+import Foo from './mod';
+
+export const x = Foo;

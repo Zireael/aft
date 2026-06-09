@@ -22,11 +22,27 @@ const TS_QUERY: &str = r#"
 (function_declaration
   name: (identifier) @fn.name) @fn.def
 
-;; arrow functions assigned to const/let/var
+;; function-like values assigned to const/let/var
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body)) @arrow.def
+    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
+
+;; anonymous default exports
+(export_statement
+  value: (function_expression) @default.body) @default.def
+(export_statement
+  value: (generator_function) @default.body) @default.def
+(export_statement
+  value: (class) @default.body) @default.def
 
 ;; class declarations
 (class_declaration
@@ -54,7 +70,7 @@ const TS_QUERY: &str = r#"
 ;; top-level const/let variable declarations
 (lexical_declaration
   (variable_declarator
-    name: (identifier) @var.name)) @var.def
+    name: (identifier) @var.name) @var.decl) @var.def
 
 ;; export statement wrappers (top-level only)
 (export_statement) @export.stmt
@@ -65,11 +81,27 @@ const JS_QUERY: &str = r#"
 (function_declaration
   name: (identifier) @fn.name) @fn.def
 
-;; arrow functions assigned to const/let/var
+;; function-like values assigned to const/let/var
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body)) @arrow.def
+    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
+
+;; anonymous default exports
+(export_statement
+  value: (function_expression) @default.body) @default.def
+(export_statement
+  value: (generator_function) @default.body) @default.def
+(export_statement
+  value: (class) @default.body) @default.def
 
 ;; class declarations
 (class_declaration
@@ -85,7 +117,7 @@ const JS_QUERY: &str = r#"
 ;; top-level const/let variable declarations
 (lexical_declaration
   (variable_declarator
-    name: (identifier) @var.name)) @var.def
+    name: (identifier) @var.name) @var.decl) @var.def
 
 ;; export statement wrappers (top-level only)
 (export_statement) @export.stmt
@@ -338,6 +370,8 @@ const SOL_QUERY: &str = r#"
 
 (constructor_definition) @constructor.def
 
+(fallback_receive_definition) @fallback_receive.def
+
 ;; events / errors
 (event_definition
   name: (identifier) @event.name) @event.def
@@ -355,6 +389,21 @@ const SOL_QUERY: &str = r#"
 ;; state variables (top-level inside a contract)
 (state_variable_declaration
   name: (identifier) @var.name) @var.def
+"#;
+
+const SCSS_QUERY: &str = r#"
+;; SCSS definitions
+(mixin_statement
+  name: (identifier) @mixin.name) @mixin.def
+
+(function_statement
+  name: (identifier) @fn.name) @fn.def
+
+(declaration
+  (property_name) @var.name) @var.def
+
+(rule_set
+  (selectors) @selector.name) @selector.def
 "#;
 
 const SCALA_QUERY: &str = r#"
@@ -497,6 +546,16 @@ const LUA_QUERY: &str = r#"
   (assignment_statement
     (variable_list
       name: (identifier) @var.name))) @var.def
+(variable_declaration
+  (assignment_statement
+    (variable_list
+      name: (variable) @var.name))) @var.def
+(variable_declaration
+  (variable_list
+    name: (identifier) @var.name)) @var.def
+(variable_declaration
+  (variable_list
+    name: (variable) @var.name)) @var.def
 "#;
 
 const PERL_QUERY: &str = r#"
@@ -532,6 +591,7 @@ pub enum LangId {
     Html,
     Markdown,
     Solidity,
+    Scss,
     Vue,
     Json,
     Scala,
@@ -542,16 +602,17 @@ pub enum LangId {
     Php,
     Lua,
     Perl,
+    Yaml,
 }
 
 /// Maps file extension to language identifier.
 pub fn detect_language(path: &Path) -> Option<LangId> {
     let ext = path.extension()?.to_str()?;
     match ext {
-        "ts" => Some(LangId::TypeScript),
+        "ts" | "mts" | "cts" => Some(LangId::TypeScript),
         "tsx" => Some(LangId::Tsx),
-        "js" | "jsx" => Some(LangId::JavaScript),
-        "py" => Some(LangId::Python),
+        "js" | "jsx" | "mjs" | "cjs" => Some(LangId::JavaScript),
+        "py" | "pyi" => Some(LangId::Python),
         "rs" => Some(LangId::Rust),
         "go" => Some(LangId::Go),
         "c" | "h" => Some(LangId::C),
@@ -562,6 +623,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "html" | "htm" => Some(LangId::Html),
         "md" | "markdown" | "mdx" => Some(LangId::Markdown),
         "sol" => Some(LangId::Solidity),
+        "scss" => Some(LangId::Scss),
         "vue" => Some(LangId::Vue),
         "json" | "jsonc" => Some(LangId::Json),
         "scala" | "sc" => Some(LangId::Scala),
@@ -569,9 +631,10 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "rb" => Some(LangId::Ruby),
         "kt" | "kts" => Some(LangId::Kotlin),
         "swift" => Some(LangId::Swift),
-        "php" => Some(LangId::Php),
+        "inc" | "php" => Some(LangId::Php),
         "lua" => Some(LangId::Lua),
         "pl" | "pm" | "t" => Some(LangId::Perl),
+        "yaml" | "yml" => Some(LangId::Yaml),
         _ => None,
     }
 }
@@ -593,6 +656,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Html => tree_sitter_html::LANGUAGE.into(),
         LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
         LangId::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+        LangId::Scss => tree_sitter_scss::language(),
         LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
         LangId::Json => tree_sitter_json::LANGUAGE.into(),
         LangId::Scala => tree_sitter_scala::LANGUAGE.into(),
@@ -603,6 +667,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         LangId::Lua => tree_sitter_lua::LANGUAGE.into(),
         LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
+        LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
     }
 }
 
@@ -622,6 +687,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Html => None, // HTML uses direct tree walking like Markdown
         LangId::Markdown => None,
         LangId::Solidity => Some(SOL_QUERY),
+        LangId::Scss => Some(SCSS_QUERY),
         LangId::Vue => None,
         LangId::Json => None,
         LangId::Scala => Some(SCALA_QUERY),
@@ -632,6 +698,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Php => Some(PHP_QUERY),
         LangId::Lua => Some(LUA_QUERY),
         LangId::Perl => Some(PERL_QUERY),
+        LangId::Yaml => None, // YAML uses direct tree walking like JSON
     }
 }
 
@@ -658,6 +725,8 @@ static BASH_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Bash));
 static SOL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Solidity));
+static SCSS_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Scss));
 static SCALA_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Scala));
 static JAVA_QUERY_CACHE: LazyLock<Result<Query, String>> =
@@ -696,6 +765,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
         LangId::Solidity => Some(&*SOL_QUERY_CACHE),
+        LangId::Scss => Some(&*SCSS_QUERY_CACHE),
         LangId::Scala => Some(&*SCALA_QUERY_CACHE),
         LangId::Java => Some(&*JAVA_QUERY_CACHE),
         LangId::Ruby => Some(&*RUBY_QUERY_CACHE),
@@ -704,7 +774,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Php => Some(&*PHP_QUERY_CACHE),
         LangId::Lua => Some(&*LUA_QUERY_CACHE),
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => None,
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
 
     query
@@ -852,6 +922,22 @@ impl SymbolCache {
         })
     }
 
+    /// Return a cached symbol count when file metadata exactly matches the cache entry.
+    ///
+    /// This is the fast path for directory file-tree summaries: when mtime and
+    /// size are unchanged, callers can use the count without cloning symbols or
+    /// re-reading the file to verify a content hash.
+    pub fn symbol_count_if_metadata_matches(
+        &self,
+        path: &Path,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Option<usize> {
+        self.entries.get(path).and_then(|cached| {
+            (cached.mtime == mtime && cached.size == size).then_some(cached.symbols.len())
+        })
+    }
+
     /// Whether the cache has a still-valid entry for the given file mtime.
     pub fn contains_path_with_mtime(&self, path: &Path, mtime: SystemTime) -> bool {
         self.entries
@@ -957,19 +1043,25 @@ impl SymbolCache {
     pub(crate) fn disk_entries(
         &self,
     ) -> Vec<(&PathBuf, SystemTime, u64, blake3::Hash, &Vec<Symbol>)> {
+        // Persist EVERY parsed entry, including files that legitimately parse to
+        // zero symbols (e.g. a TS file with only imports, a config-shaped file).
+        // Previously these were filtered out, so they were never written to disk;
+        // on the next spawn `load_from_disk` couldn't reload them, the prewarm
+        // skip-check (`contains_path_with_mtime`) missed, and they were re-parsed
+        // on every startup forever (the "N new" churn in issue #86). An empty
+        // entry serializes to `symbols: []` — a few bytes — and makes the prewarm
+        // skip it. It also makes the "persisted symbol cache: N files" count
+        // accurate (was overstated by the filtered-out empties).
         self.entries
             .iter()
-            .filter_map(|(path, cached)| {
-                if cached.symbols.is_empty() {
-                    return None;
-                }
-                Some((
+            .map(|(path, cached)| {
+                (
                     path,
                     cached.mtime,
                     cached.size,
                     cached.content_hash,
                     &cached.symbols,
-                ))
+                )
             })
             .collect()
     }
@@ -1200,6 +1292,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Json {
         return extract_json_symbols(source, &root);
     }
+    if lang == LangId::Yaml {
+        return extract_yaml_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -1217,6 +1312,7 @@ pub fn extract_symbols_from_tree(
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
         LangId::Solidity => extract_solidity_symbols(source, &root, query),
+        LangId::Scss => extract_scss_symbols(source, &root, query),
         LangId::Scala => extract_scala_symbols(source, &root, query),
         LangId::Java => extract_java_symbols(source, &root, query),
         LangId::Ruby => extract_ruby_symbols(source, &root, query),
@@ -1225,7 +1321,7 @@ pub fn extract_symbols_from_tree(
         LangId::Php => extract_php_symbols(source, &root, query),
         LangId::Lua => extract_lua_symbols(source, &root, query),
         LangId::Perl => extract_perl_symbols(source, &root, query),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => {
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
         }
     }
@@ -1298,15 +1394,18 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
                 // Include @decorator
                 kind == "decorator"
-                    // Include /** JSDoc */ comments
+                    // Include adjacent /** JSDoc */ comments, but do not let a
+                    // blank line attach file-level docs to the following symbol.
                     || (kind == "comment"
-                        && node_text(source, &prev).starts_with("/**"))
+                        && node_text(source, &prev).starts_with("/**")
+                        && is_adjacent_line(&prev, &current, source))
             }
             LangId::Go | LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
                 // Include doc comments only if immediately above (no blank line gap)
                 kind == "comment" && is_adjacent_line(&prev, &current, source)
             }
             LangId::Solidity
+            | LangId::Scss
             | LangId::Scala
             | LangId::Java
             | LangId::Kotlin
@@ -1330,7 +1429,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => false,
+            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => false,
         };
 
         if should_include {
@@ -1394,6 +1493,15 @@ fn lexical_declaration_has_function_value(node: &Node) -> bool {
     }
 
     false
+}
+
+fn variable_declarator_has_function_value(node: &Node) -> bool {
+    node.child_by_field_name("value").is_some_and(|value| {
+        matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    })
 }
 
 /// Collect byte ranges of all export_statement nodes from query matches.
@@ -1546,6 +1654,30 @@ fn extract_signature(source: &str, node: &Node) -> String {
     trimmed.to_string()
 }
 
+fn push_default_export_symbol(
+    symbols: &mut Vec<Symbol>,
+    source: &str,
+    lang: LangId,
+    body_node: Node,
+    def_node: Node,
+) {
+    let kind = if body_node.kind() == "class" {
+        SymbolKind::Class
+    } else {
+        SymbolKind::Function
+    };
+
+    symbols.push(Symbol {
+        name: "default".to_string(),
+        kind,
+        range: node_range_with_decorators(&def_node, source, lang),
+        signature: Some(extract_signature(source, &def_node)),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    });
+}
+
 /// Extract symbols from TypeScript / TSX source.
 fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::TypeScript;
@@ -1567,6 +1699,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut fn_def_node = None;
         let mut arrow_name_node = None;
         let mut arrow_def_node = None;
+        let mut arrow_decl_node = None;
         let mut class_name_node = None;
         let mut class_def_node = None;
         let mut method_class_name_node = None;
@@ -1580,6 +1713,9 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut type_alias_def_node = None;
         let mut var_name_node = None;
         let mut var_def_node = None;
+        let mut var_decl_node = None;
+        let mut default_body_node = None;
+        let mut default_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1590,6 +1726,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "fn.def" => fn_def_node = Some(cap.node),
                 "arrow.name" => arrow_name_node = Some(cap.node),
                 "arrow.def" => arrow_def_node = Some(cap.node),
+                "arrow.decl" => arrow_decl_node = Some(cap.node),
                 "class.name" => class_name_node = Some(cap.node),
                 "class.def" => class_def_node = Some(cap.node),
                 "method.class_name" => method_class_name_node = Some(cap.node),
@@ -1603,7 +1740,9 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "type_alias.def" => type_alias_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
-                // var.value/var.decl removed — not needed
+                "var.decl" => var_decl_node = Some(cap.node),
+                "default.body" => default_body_node = Some(cap.node),
+                "default.def" => default_def_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1621,17 +1760,23 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             });
         }
 
-        // Arrow function
+        // Arrow/function expression declarator
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators(&range_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
                 parent: None,
             });
+        }
+
+        // Anonymous/default function or class expression
+        if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
         }
 
         // Class declaration
@@ -1709,14 +1854,19 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 .parent()
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
-            let is_function_like = lexical_declaration_has_function_value(&def_node);
+            let range_node = var_decl_node.unwrap_or(def_node);
+            let is_function_like = if range_node.kind() == "variable_declarator" {
+                variable_declarator_has_function_value(&range_node)
+            } else {
+                lexical_declaration_has_function_value(&def_node)
+            };
             let name = node_text(source, &name_node).to_string();
             let already_captured = symbols.iter().any(|s| s.name == name);
             if is_top_level && !is_function_like && !already_captured {
                 symbols.push(Symbol {
                     name,
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&def_node, source, lang),
+                    range: node_range_with_decorators(&range_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -1753,11 +1903,17 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut fn_def_node = None;
         let mut arrow_name_node = None;
         let mut arrow_def_node = None;
+        let mut arrow_decl_node = None;
         let mut class_name_node = None;
         let mut class_def_node = None;
         let mut method_class_name_node = None;
         let mut method_name_node = None;
         let mut method_def_node = None;
+        let mut default_body_node = None;
+        let mut default_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut var_decl_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1768,11 +1924,17 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "fn.def" => fn_def_node = Some(cap.node),
                 "arrow.name" => arrow_name_node = Some(cap.node),
                 "arrow.def" => arrow_def_node = Some(cap.node),
+                "arrow.decl" => arrow_decl_node = Some(cap.node),
                 "class.name" => class_name_node = Some(cap.node),
                 "class.def" => class_def_node = Some(cap.node),
                 "method.class_name" => method_class_name_node = Some(cap.node),
                 "method.name" => method_name_node = Some(cap.node),
                 "method.def" => method_def_node = Some(cap.node),
+                "default.body" => default_body_node = Some(cap.node),
+                "default.def" => default_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "var.decl" => var_decl_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1790,15 +1952,20 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators(&range_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
                 parent: None,
             });
+        }
+
+        if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
         }
 
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
@@ -1826,6 +1993,37 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 exported: false,
                 parent: Some(class_name),
             });
+        }
+
+        // Top-level const/let/var declarations. JS_QUERY captures these the same
+        // way TS does, but the JS extractor previously dropped them (they fell
+        // into the `_ => {}` arm), so e.g. `export const VERSION = "1.0"` in a
+        // .js file produced no symbol for outline/dead_code/callgraph. Mirror the
+        // TS extractor: module-scope, non-function-valued, not already captured.
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            let is_top_level = def_node
+                .parent()
+                .map(|p| p.kind() == "program" || p.kind() == "export_statement")
+                .unwrap_or(false);
+            let range_node = var_decl_node.unwrap_or(def_node);
+            let is_function_like = if range_node.kind() == "variable_declarator" {
+                variable_declarator_has_function_value(&range_node)
+            } else {
+                lexical_declaration_has_function_value(&def_node)
+            };
+            let name = node_text(source, &name_node).to_string();
+            let already_captured = symbols.iter().any(|s| s.name == name);
+            if is_top_level && !is_function_like && !already_captured {
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    range: node_range_with_decorators(&range_node, source, lang),
+                    signature: Some(extract_signature(source, &def_node)),
+                    scope_chain: vec![],
+                    exported: is_exported(&def_node, &export_ranges),
+                    parent: None,
+                });
+            }
         }
     }
 
@@ -2026,6 +2224,23 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     Ok(symbols)
 }
 
+fn rust_mod_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                scopes.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    scopes.reverse();
+    scopes
+}
+
 /// Extract symbols from Rust source.
 /// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
 fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
@@ -2105,21 +2320,26 @@ fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             }
         }
 
-        // Free function (not inside impl block — check parent)
+        // Free function (skip impl/trait declaration lists; inline mod bodies are still free fns)
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
-            let parent = def_node.parent();
-            let in_impl = parent
-                .map(|p| p.kind() == "declaration_list")
-                .unwrap_or(false);
-            if !in_impl {
+            let declaration_list_owner = def_node
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .and_then(|parent| parent.parent());
+            let in_non_module_declaration_list = declaration_list_owner
+                .as_ref()
+                .is_some_and(|owner| owner.kind() != "mod_item");
+
+            if !in_non_module_declaration_list {
+                let scope_chain = rust_mod_scope_chain(&def_node, source);
                 symbols.push(Symbol {
                     name: node_text(source, &name_node).to_string(),
                     kind: SymbolKind::Function,
                     range: node_range_with_decorators(&def_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
-                    scope_chain: vec![],
+                    scope_chain: scope_chain.clone(),
                     exported: is_pub(&def_node),
-                    parent: None,
+                    parent: scope_chain.last().cloned(),
                 });
             }
         }
@@ -3319,6 +3539,7 @@ fn extract_solidity_symbols(
         let mut modifier_name_node = None;
         let mut modifier_def_node = None;
         let mut constructor_def_node = None;
+        let mut fallback_receive_def_node = None;
         let mut event_name_node = None;
         let mut event_def_node = None;
         let mut error_name_node = None;
@@ -3346,6 +3567,7 @@ fn extract_solidity_symbols(
                 "modifier.name" => modifier_name_node = Some(cap.node),
                 "modifier.def" => modifier_def_node = Some(cap.node),
                 "constructor.def" => constructor_def_node = Some(cap.node),
+                "fallback_receive.def" => fallback_receive_def_node = Some(cap.node),
                 "event.name" => event_name_node = Some(cap.node),
                 "event.def" => event_def_node = Some(cap.node),
                 "error.name" => error_name_node = Some(cap.node),
@@ -3440,6 +3662,26 @@ fn extract_solidity_symbols(
                 kind: SymbolKind::Method,
                 range: node_range_with_decorators(&def_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+
+        // receive() / fallback() — synthetic names, parent is the enclosing contract
+        if let Some(def_node) = fallback_receive_def_node {
+            let scope_chain = solidity_scope_chain(&def_node, source);
+            let signature = extract_signature(source, &def_node);
+            let name = if signature.trim_start().starts_with("receive") {
+                "receive"
+            } else {
+                "fallback"
+            };
+            symbols.push(Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Method,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(signature),
                 parent: scope_chain.last().cloned(),
                 scope_chain,
                 exported: true,
@@ -3557,6 +3799,343 @@ fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
     Ok(symbols)
 }
 
+/// Read a YAML scalar/key node as trimmed text, stripping surrounding quotes.
+fn yaml_scalar_text(source: &str, node: &Node) -> String {
+    node_text(source, node)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+/// Find the mapping that is the direct payload of `node`, descending only
+/// through wrapper nodes (`document`, `block_node`, `flow_node`) rather than
+/// arbitrary nested mappings. This keeps detection anchored to the document's
+/// top-level mapping instead of latching onto a mapping buried inside a
+/// sequence or nested value.
+fn yaml_find_mapping<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    let mut current = *node;
+    loop {
+        match current.kind() {
+            "block_mapping" | "flow_mapping" => return Some(current),
+            "document" | "block_node" | "flow_node" => {
+                let mut cursor = current.walk();
+                let next = current
+                    .named_children(&mut cursor)
+                    .find(|child| !matches!(child.kind(), "tag" | "anchor"));
+                match next {
+                    Some(inner) => current = inner,
+                    None => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Look up a top-level key in a YAML mapping and return its value node.
+fn yaml_get<'a>(mapping: &Node<'a>, source: &str, key: &str) -> Option<Node<'a>> {
+    let mut cursor = mapping.walk();
+    for pair in mapping.named_children(&mut cursor) {
+        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
+            continue;
+        }
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        if yaml_scalar_text(source, &key_node) == key {
+            return pair.child_by_field_name("value");
+        }
+    }
+    None
+}
+
+/// Flatten a YAML value node to clean text for embed_text. Scalars return their
+/// trimmed text; block/flow sequences are joined as comma-separated scalar items
+/// (so `verbs: [get, list, watch]` becomes `get,list,watch` instead of raw
+/// multi-line `- get\n- list` text). Nested mappings are ignored here.
+fn yaml_unwrap<'a>(node: &Node<'a>) -> Node<'a> {
+    let mut current = *node;
+    while current.kind() == "block_node" || current.kind() == "flow_node" {
+        let mut cursor = current.walk();
+        let next = current
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "tag" | "anchor"));
+        match next {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
+fn yaml_flatten_value(source: &str, node: &Node) -> String {
+    let node = &yaml_unwrap(node);
+    match node.kind() {
+        "block_sequence" | "flow_sequence" => {
+            let mut items = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                // block_sequence_item wraps a value; flow_sequence holds nodes directly.
+                let value = if child.kind() == "block_sequence_item" {
+                    child.named_child(0)
+                } else {
+                    Some(child)
+                };
+                if let Some(v) = value {
+                    let v = yaml_unwrap(&v);
+                    // Only flatten scalar leaves; skip mappings (handled elsewhere).
+                    if v.kind() != "block_mapping" && v.kind() != "flow_mapping" {
+                        let text = yaml_scalar_text(source, &v);
+                        if !text.is_empty() {
+                            items.push(text);
+                        }
+                    }
+                }
+            }
+            items.join(",")
+        }
+        // Mapping values (e.g. container `resources:` block) are not flattened
+        // here — their high-signal leaves (cpu/memory) are collected separately.
+        // Returning empty avoids dumping raw multi-line YAML into embed_text.
+        "block_mapping" | "flow_mapping" => String::new(),
+        _ => yaml_scalar_text(source, node),
+    }
+}
+
+/// Recursively collect `key=value` pairs for the given keys (e.g. image, cpu,
+/// memory, verbs) to enrich embed_text for semantic search. Sequence values are
+/// flattened to comma-joined scalars. Capped to avoid runaway output.
+fn yaml_collect_values(
+    source: &str,
+    node: &Node,
+    keys: &[&str],
+    out: &mut Vec<String>,
+    cap: usize,
+) {
+    if out.len() >= cap {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "block_mapping_pair" || child.kind() == "flow_pair" {
+            if let Some(key_node) = child.child_by_field_name("key") {
+                let key_text = yaml_scalar_text(source, &key_node);
+                if keys.contains(&key_text.as_str()) {
+                    if let Some(value_node) = child.child_by_field_name("value") {
+                        let value_text = yaml_flatten_value(source, &value_node);
+                        if !value_text.is_empty() && out.len() < cap {
+                            out.push(format!("{}={}", key_text, value_text));
+                        }
+                    }
+                }
+            }
+        }
+        yaml_collect_values(source, &child, keys, out, cap);
+    }
+}
+
+/// Collect the `name:` field from every item of a `<parent_key>:` sequence of
+/// mappings. The bare `name` key is too generic to match globally (it collides
+/// with metadata/container names), so these are gathered by parent key and
+/// emitted as `<label>=A,B,...`. Handles k8s `env: [{name,value}]` and Argo
+/// Workflow `templates: [{name, ...}]`. Capped.
+fn yaml_collect_named_items(
+    source: &str,
+    node: &Node,
+    parent_key: &str,
+    label: &str,
+    out: &mut Vec<String>,
+    cap: usize,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if (child.kind() == "block_mapping_pair" || child.kind() == "flow_pair")
+            && child
+                .child_by_field_name("key")
+                .map(|k| yaml_scalar_text(source, &k))
+                .as_deref()
+                == Some(parent_key)
+        {
+            if let Some(seq) = child.child_by_field_name("value") {
+                let seq = yaml_unwrap(&seq);
+                let mut names = Vec::new();
+                let mut seq_cursor = seq.walk();
+                for item in seq.named_children(&mut seq_cursor) {
+                    let value = if item.kind() == "block_sequence_item" {
+                        item.named_child(0)
+                    } else {
+                        Some(item)
+                    };
+                    if let Some(v) = value {
+                        if let Some(map) = yaml_find_mapping(&v) {
+                            if let Some(name_node) = yaml_get(&map, source, "name") {
+                                let n = yaml_scalar_text(source, &name_node);
+                                if !n.is_empty() && names.len() < 16 {
+                                    names.push(n);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !names.is_empty() && out.len() < cap {
+                    out.push(format!("{}={}", label, names.join(",")));
+                }
+            }
+        }
+        yaml_collect_named_items(source, &child, parent_key, label, out, cap);
+    }
+}
+
+/// Tier 1: if a document is a Kubernetes resource (has both apiVersion + kind),
+/// emit one rich symbol named `<ns>/<Kind>/<name>` with enriched signature.
+/// Generalizes to arbitrary CRDs since apiVersion+kind is the CRD contract.
+fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<Symbol> {
+    let api_version =
+        yaml_get(mapping, source, "apiVersion").map(|n| yaml_scalar_text(source, &n))?;
+    let kind = yaml_get(mapping, source, "kind").map(|n| yaml_scalar_text(source, &n))?;
+    if api_version.is_empty() || kind.is_empty() {
+        return None;
+    }
+
+    let (name, namespace) = match yaml_get(mapping, source, "metadata") {
+        Some(meta) => match yaml_find_mapping(&meta) {
+            Some(meta_map) => {
+                // Prefer `name`; fall back to `generateName` (common in Argo
+                // Workflows submitted without a fixed name) so the symbol still
+                // carries an identifier instead of collapsing to bare <Kind>.
+                let name = yaml_get(&meta_map, source, "name")
+                    .map(|n| yaml_scalar_text(source, &n))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        yaml_get(&meta_map, source, "generateName")
+                            .map(|n| yaml_scalar_text(source, &n))
+                            .filter(|s| !s.is_empty())
+                    });
+                (
+                    name,
+                    yaml_get(&meta_map, source, "namespace").map(|n| yaml_scalar_text(source, &n)),
+                )
+            }
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+
+    let res_name = name.clone().filter(|s| !s.is_empty());
+    let sym_name = match (&namespace, &res_name) {
+        (Some(ns), Some(n)) if !ns.is_empty() => format!("{}/{}/{}", ns, kind, n),
+        (_, Some(n)) => format!("{}/{}", kind, n),
+        _ => kind.clone(),
+    };
+
+    let mut sig = format!("apiVersion={} kind={}", api_version, kind);
+    if let Some(ns) = namespace.as_ref().filter(|s| !s.is_empty()) {
+        sig.push_str(&format!(" namespace={}", ns));
+    }
+    if let Some(n) = res_name.as_ref() {
+        sig.push_str(&format!(" name={}", n));
+    }
+    // Enrich with high-signal spec fields so intent queries match. Covers
+    // containers (image/ports), resource limits/requests (cpu/memory), RBAC
+    // rules (verbs/resources/apiGroups), and storage (volumeMounts mountPath).
+    let mut extras = Vec::new();
+    yaml_collect_values(
+        source,
+        mapping,
+        &[
+            "image",
+            "containerPort",
+            "port",
+            "targetPort",
+            "cpu",
+            "memory",
+            "storage",
+            "verbs",
+            "resources",
+            "apiGroups",
+            "mountPath",
+            "replicas",
+            // Argo Workflow high-signal scalars.
+            "entrypoint",
+            "command",
+            "args",
+            "schedule",
+        ],
+        &mut extras,
+        24,
+    );
+    // Sequence-of-mappings whose `name` key is ambiguous: collect by parent key.
+    // k8s env vars and Argo Workflow templates both use the `{name: ...}` shape.
+    yaml_collect_named_items(source, mapping, "env", "env", &mut extras, 24);
+    yaml_collect_named_items(source, mapping, "templates", "templates", &mut extras, 24);
+    if !extras.is_empty() {
+        sig.push(' ');
+        sig.push_str(&extras.join(" "));
+    }
+
+    Some(Symbol {
+        name: sym_name,
+        kind: SymbolKind::Class,
+        range: node_range(doc),
+        signature: Some(sig),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+/// Tier 2: generic YAML — emit top-level mapping keys as Variable symbols
+/// (docker-compose services, CI jobs, Helm values.yaml, etc.).
+fn yaml_generic_keys(source: &str, mapping: &Node, symbols: &mut Vec<Symbol>) {
+    let mut cursor = mapping.walk();
+    for pair in mapping.named_children(&mut cursor) {
+        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
+            continue;
+        }
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        let name = yaml_scalar_text(source, &key_node);
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(Symbol {
+            name,
+            kind: SymbolKind::Variable,
+            range: node_range(&pair),
+            signature: None,
+            scope_chain: vec![],
+            exported: false,
+            parent: None,
+        });
+    }
+}
+
+/// Extract symbols from a YAML stream. Handles multi-document (`---`) streams:
+/// each document becomes a Kubernetes resource symbol (Tier 1) when it carries
+/// apiVersion+kind, otherwise its top-level keys are emitted (Tier 2). Helm/Go
+/// templated YAML that yields no parseable mapping degrades gracefully (the
+/// document is skipped rather than failing the whole file).
+fn extract_yaml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    let mut cursor = root.walk();
+    for doc in root.named_children(&mut cursor) {
+        if doc.kind() != "document" {
+            continue;
+        }
+        let Some(mapping) = yaml_find_mapping(&doc) else {
+            continue;
+        };
+        if let Some(symbol) = yaml_k8s_resource_symbol(source, &doc, &mapping) {
+            symbols.push(symbol);
+        } else {
+            yaml_generic_keys(source, &mapping, &mut symbols);
+        }
+    }
+    Ok(symbols)
+}
+
 fn scala_scope_chain(node: &Node, source: &str) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = node.parent();
@@ -3664,7 +4243,7 @@ fn extract_scala_symbols(
         if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
-                kind: SymbolKind::Class,
+                kind: SymbolKind::Enum,
                 range: node_range_with_decorators(&def_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: scala_scope_chain(&def_node, source),
@@ -4217,13 +4796,13 @@ fn swift_scope_chain(node: &Node, source: &str) -> Vec<String> {
 }
 
 fn swift_type_kind(source: &str, node: &Node) -> SymbolKind {
-    let signature = extract_signature(source, node);
-    if signature.starts_with("struct ") {
-        SymbolKind::Struct
-    } else if signature.starts_with("enum ") {
-        SymbolKind::Enum
-    } else {
-        SymbolKind::Class
+    match node
+        .child_by_field_name("declaration_kind")
+        .map(|kind_node| node_text(source, &kind_node))
+    {
+        Some("struct") => SymbolKind::Struct,
+        Some("enum") => SymbolKind::Enum,
+        _ => SymbolKind::Class,
     }
 }
 
@@ -4367,6 +4946,99 @@ fn php_scope_chain(node: &Node, source: &str) -> Vec<String> {
 
     chain.reverse();
     chain
+}
+
+fn extract_scss_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Scss;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut mixin_name_node = None;
+        let mut mixin_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut selector_name_node = None;
+        let mut selector_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "mixin.name" => mixin_name_node = Some(cap.node),
+                "mixin.def" => mixin_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "selector.name" => selector_name_node = Some(cap.node),
+                "selector.def" => selector_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (mixin_name_node, mixin_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Function,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Function,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            if !node_text(source, &name_node).starts_with('$') {
+                continue;
+            }
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (selector_name_node, selector_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                vec![],
+                true,
+            );
+        }
+    }
+
+    Ok(symbols)
 }
 
 fn extract_php_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
@@ -4792,6 +5464,14 @@ fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
         .map(|tag| node_text(source, &tag).trim().to_string())
 }
 
+fn source_line_end_col(source: &str, line: u32) -> u32 {
+    source
+        .lines()
+        .nth(line as usize)
+        .map(|line| line.len() as u32)
+        .unwrap_or(0)
+}
+
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut headings: Vec<(u8, Symbol)> = Vec::new();
     collect_html_headings(source, root, &mut headings);
@@ -4810,7 +5490,7 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
             .unwrap_or_else(|| total_lines.saturating_sub(1));
         headings[i].1.range.end_line = section_end;
         if section_end != headings[i].1.range.start_line {
-            headings[i].1.range.end_col = 0;
+            headings[i].1.range.end_col = source_line_end_col(source, section_end);
         }
     }
 
@@ -4918,6 +5598,21 @@ fn extract_element_text(source: &str, node: &Node) -> String {
     text
 }
 
+fn markdown_atx_heading_level(line: &str) -> Option<u8> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+
+    let rest = &trimmed[level..];
+    let marker_is_closed = match rest.chars().next() {
+        Some(ch) => ch.is_whitespace(),
+        None => true,
+    };
+    marker_is_closed.then_some(level as u8)
+}
+
 /// Extract markdown headings as symbols.
 /// Each heading becomes a symbol with kind `Heading`, and its range covers the entire
 /// section (from the heading to the next heading at the same or higher level, or EOF).
@@ -4983,7 +5678,18 @@ fn extract_md_sections(
                 }
 
                 if !heading_name.is_empty() {
-                    let range = node_range(&child);
+                    let mut range = node_range(&child);
+                    if let Some(next_heading_level) = source
+                        .lines()
+                        .nth(range.end_line as usize)
+                        .and_then(markdown_atx_heading_level)
+                    {
+                        if next_heading_level <= heading_level && range.end_line > range.start_line
+                        {
+                            range.end_line -= 1;
+                            range.end_col = source_line_end_col(source, range.end_line);
+                        }
+                    }
                     let signature = format!(
                         "{} {}",
                         "#".repeat((heading_level as usize).min(6)),
@@ -5405,6 +6111,18 @@ fn node_contains_token(source: &str, node: &Node, token: &str) -> bool {
 }
 
 fn default_export_target_name(source: &str, export_stmt: &Node) -> Option<String> {
+    if let Some(value_node) = export_stmt.child_by_field_name("value") {
+        if let Some(name) = default_export_node_name(source, &value_node) {
+            return Some(name);
+        }
+    }
+
+    if let Some(declaration_node) = export_stmt.child_by_field_name("declaration") {
+        if let Some(name) = default_export_node_name(source, &declaration_node) {
+            return Some(name);
+        }
+    }
+
     let mut cursor = export_stmt.walk();
     if !cursor.goto_first_child() {
         return None;
@@ -5412,43 +6130,54 @@ fn default_export_target_name(source: &str, export_stmt: &Node) -> Option<String
 
     loop {
         let child = cursor.node();
-        match child.kind() {
-            "function_declaration"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "type_alias_declaration"
-            | "lexical_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    return Some(node_text(source, &name_node).to_string());
-                }
-
-                if child.kind() == "lexical_declaration" {
-                    let mut child_cursor = child.walk();
-                    if child_cursor.goto_first_child() {
-                        loop {
-                            let nested = child_cursor.node();
-                            if nested.kind() == "variable_declarator" {
-                                if let Some(name_node) = nested.child_by_field_name("name") {
-                                    return Some(node_text(source, &name_node).to_string());
-                                }
-                            }
-                            if !child_cursor.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            "identifier" | "type_identifier" => {
-                let text = node_text(source, &child);
-                if text != "export" && text != "default" {
-                    return Some(text.to_string());
-                }
-            }
-            _ => {}
+        if let Some(name) = default_export_node_name(source, &child) {
+            return Some(name);
         }
 
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn default_export_node_name(source: &str, node: &Node) -> Option<String> {
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function"
+        | "class_declaration"
+        | "class" => node
+            .child_by_field_name("name")
+            .map(|name_node| node_text(source, &name_node).to_string())
+            .or_else(|| Some("default".to_string())),
+        "interface_declaration" | "enum_declaration" | "type_alias_declaration" => node
+            .child_by_field_name("name")
+            .map(|name_node| node_text(source, &name_node).to_string()),
+        "lexical_declaration" => lexical_declaration_name(source, node),
+        "identifier" | "type_identifier" => {
+            let text = node_text(source, node);
+            (text != "export" && text != "default").then(|| text.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn lexical_declaration_name(source: &str, node: &Node) -> Option<String> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let child = cursor.node();
+        if child.kind() == "variable_declarator" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                return Some(node_text(source, &name_node).to_string());
+            }
+        }
         if !cursor.goto_next_sibling() {
             break;
         }
@@ -5485,7 +6214,7 @@ mod tests {
     use super::*;
     use crate::language::LanguageProvider;
     use crate::symbol_cache_disk;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5509,6 +6238,75 @@ mod tests {
             exported: true,
             parent: None,
         }
+    }
+
+    #[test]
+    fn inc_and_scss_extensions_are_detected() {
+        assert_eq!(
+            detect_language(Path::new("template.inc")),
+            Some(LangId::Php)
+        );
+        assert_eq!(
+            detect_language(Path::new("styles.scss")),
+            Some(LangId::Scss)
+        );
+        assert_eq!(detect_language(Path::new("template.tpl")), None);
+    }
+
+    #[test]
+    fn inc_files_parse_with_php_grammar() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file = tmp.path().join("partial.inc");
+        std::fs::write(&file, "<?php\nfunction render_partial() { return 1; }\n")
+            .expect("write inc file");
+
+        let mut parser = FileParser::new();
+        let symbols = parser
+            .extract_symbols(&file)
+            .expect("extract php inc symbols");
+        let function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "render_partial")
+            .expect("find PHP function in .inc");
+        assert_eq!(function.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn scss_symbols_include_mixin_variable_function_and_rule() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file = tmp.path().join("styles.scss");
+        std::fs::write(
+            &file,
+            r#"$brand-color: #336699;
+
+@mixin button-base($padding) {
+  padding: $padding;
+}
+
+@function double($value) {
+  @return $value * 2;
+}
+
+.card, .panel {
+  color: $brand-color;
+}
+"#,
+        )
+        .expect("write scss file");
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).expect("extract scss symbols");
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("button-base").kind, SymbolKind::Function);
+        assert_eq!(get("double").kind, SymbolKind::Function);
+        assert_eq!(get("$brand-color").kind, SymbolKind::Variable);
+        assert_eq!(get(".card, .panel").kind, SymbolKind::Class);
     }
 
     #[test]
@@ -6803,5 +7601,321 @@ mod tests {
         assert!(symbols
             .iter()
             .any(|s| s.name == "Bar" && s.kind == SymbolKind::Interface));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_k8s_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: web
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for K8s Deployment");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "web/Deployment/nginx");
+        assert_eq!(sym.kind, SymbolKind::Class);
+        assert!(sym.exported);
+    }
+
+    #[test]
+    fn extract_yaml_symbols_k8s_no_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("service.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-svc
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for K8s Service");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "Service/nginx-svc");
+        assert_eq!(sym.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn extract_yaml_symbols_multidoc() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("multidoc.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: b
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 2, "Expected 2 symbols for multi-doc YAML");
+        assert!(symbols.iter().any(|s| s.name == "Deployment/a"));
+        assert!(symbols.iter().any(|s| s.name == "Service/b"));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_generic_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("compose.yaml");
+        std::fs::write(
+            &file,
+            r#"version: "3"
+services:
+  web: {}
+volumes:
+  data: {}
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        // Should have top-level keys: version, services, volumes
+        assert_eq!(symbols.len(), 3, "Expected 3 symbols for generic YAML");
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "version" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "services" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "volumes" && s.kind == SymbolKind::Variable));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.yaml");
+        std::fs::write(&file, "").unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 0, "Expected 0 symbols for empty YAML");
+    }
+
+    #[test]
+    fn extract_yaml_symbols_resource_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: myapp:1.0
+        resources:
+          limits:
+            cpu: "2"
+            memory: 1Gi
+          requests:
+            cpu: "1"
+            memory: 512Mi
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Deployment");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "Deployment/app");
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(sig.contains("cpu="), "Signature should contain cpu= field");
+        assert!(
+            sig.contains("memory="),
+            "Signature should contain memory= field"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_env_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: myapp:1.0
+        env:
+        - name: FOO
+          value: "bar"
+        - name: BAR
+          value: "baz"
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Deployment");
+        let sym = &symbols[0];
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("env=FOO,BAR"),
+            "Signature should contain env=FOO,BAR"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_rbac_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("role.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reader
+rules:
+- apiGroups: [""]
+  resources: [pods, services]
+  verbs: [get, list, watch]
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Role");
+        let sym = &symbols[0];
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("verbs=get,list,watch"),
+            "Signature should contain verbs=get,list,watch"
+        );
+        assert!(
+            sig.contains("resources=pods,services"),
+            "Signature should contain resources=pods,services"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_argo_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("workflow.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: hello-world
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: alpine:3.18
+      command: [echo]
+      args: ["hello"]
+  - name: print
+    container:
+      image: alpine:3.18
+      command: [echo]
+      args: ["world"]
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Workflow");
+        let sym = &symbols[0];
+        assert!(
+            sym.name.contains("Workflow"),
+            "Symbol name should contain Workflow"
+        );
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("entrypoint=main"),
+            "Signature should contain entrypoint=main"
+        );
+        assert!(
+            sig.contains("templates=main,print"),
+            "Signature should contain templates=main,print"
+        );
+        assert!(
+            sig.contains("image=alpine:3.18"),
+            "Signature should contain image=alpine:3.18"
+        );
+        assert!(
+            sig.contains("command=echo"),
+            "Signature should contain command=echo"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_generatename_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("workflow.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: hello-
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: alpine:3.18
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Workflow");
+        let sym = &symbols[0];
+        assert!(
+            sym.name.contains("hello-"),
+            "Symbol name should contain generateName fallback 'hello-'"
+        );
     }
 }

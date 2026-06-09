@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile } from "../lib/jsonc.js";
-import { getTmpLogPath } from "../lib/paths.js";
+import { getCortexKitStorageRoot, getTmpLogPath } from "../lib/paths.js";
 import type {
   HarnessAdapter,
   HarnessConfigPaths,
@@ -149,7 +149,8 @@ export class PiAdapter implements HarnessAdapter {
 
   isInstalled(): boolean {
     try {
-      execSync("pi --version", { stdio: "ignore" });
+      // timeout: a misbehaving/booting host must never hang the probe.
+      execSync("pi --version", { stdio: "ignore", timeout: 5000 });
       return true;
     } catch {
       return false;
@@ -164,6 +165,7 @@ export class PiAdapter implements HarnessAdapter {
       const result = spawnSync("pi", ["--version"], {
         stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
+        timeout: 5000,
       });
       if (result.status !== 0) return null;
       const stdout = (result.stdout ?? "").trim();
@@ -263,8 +265,7 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   getStorageDir(): string {
-    // Pi's storage dir convention from packages/pi-plugin/src/index.ts.
-    return join(getPiAgentDir(), "aft");
+    return getCortexKitStorageRoot();
   }
 
   getLogFile(): string {

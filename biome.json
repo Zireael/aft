@@ -45,7 +45,8 @@
       "packages/**/*.tsx",
       "packages/**/*.js",
       "scripts/**/*.mjs",
-      "tests/pi-rpc/**/*.ts"
+      "tests/pi-rpc/**/*.ts",
+      "benchmarks/codegraph-replication/**/*.ts"
     ]
   },
   "overrides": [
@@ -81,6 +82,9 @@
           },
           "style": {
             "noNonNullAssertion": "off"
+          },
+          "a11y": {
+            "noStaticElementInteractions": "off"
           }
         }
       }

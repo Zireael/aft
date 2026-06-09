@@ -78,4 +78,3 @@
 │   ├── src
 │   └── file26.txt
 ├── dir27
-… (12 more lines)

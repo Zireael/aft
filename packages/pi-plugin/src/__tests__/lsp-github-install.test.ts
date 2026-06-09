@@ -256,6 +256,7 @@ describe("runGithubAutoInstall", () => {
     );
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("clangd");
     const clangdSkip = result.skipped.find((s) => s.id === "clangd");
     expect(clangdSkip).toBeDefined();
     expect(clangdSkip?.reason).toContain("grace window");
@@ -277,6 +278,7 @@ describe("runGithubAutoInstall", () => {
     );
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("clangd");
     const clangdSkip = result.skipped.find((s) => s.id === "clangd");
     expect(clangdSkip).toBeDefined();
     expect(clangdSkip?.reason).toContain("probe");

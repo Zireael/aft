@@ -1,5 +1,8 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { searchTools, splitIncludeArg } from "../tools/search.js";
@@ -9,6 +12,11 @@ import { noopAsk } from "./test-helpers";
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
 type BridgeCall = { projectRoot: string };
+type AskCall = {
+  permission?: string;
+  patterns?: string[];
+  metadata?: Record<string, unknown>;
+};
 
 function createMockClient(): any {
   return {
@@ -30,7 +38,10 @@ function createPluginContext(pool: BridgePool, config: Record<string, unknown>):
   };
 }
 
-function createMockSdkContext(directory = "/tmp/search-tests"): ToolContext {
+function createMockSdkContext(
+  directory = "/tmp/search-tests",
+  ask: ToolContext["ask"] = noopAsk,
+): ToolContext {
   return {
     sessionID: "search-session",
     messageID: "message-id",
@@ -39,8 +50,20 @@ function createMockSdkContext(directory = "/tmp/search-tests"): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: noopAsk,
+    ask,
   };
+}
+
+function recordingAsk(
+  calls: AskCall[],
+  deny?: { permission: string; message: string },
+): ToolContext["ask"] {
+  return (async (input: AskCall) => {
+    calls.push(input);
+    if (deny && input.permission === deny.permission) {
+      throw new Error(deny.message);
+    }
+  }) as unknown as ToolContext["ask"];
 }
 
 function createMockSearchHarness(
@@ -101,7 +124,7 @@ describe("searchTools", () => {
           "  42: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
           "  80: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
           "",
-          "Found 2 match(es) across 1 file(s). [index: ready]",
+          "Found 2 match across 1 file",
         ].join("\n"),
       }),
     );
@@ -126,7 +149,7 @@ describe("searchTools", () => {
         "  42: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
         "  80: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
         "",
-        "Found 2 match(es) across 1 file(s). [index: ready]",
+        "Found 2 match across 1 file",
       ].join("\n"),
     );
   });
@@ -200,6 +223,84 @@ describe("searchTools", () => {
     }));
     await tools.grep.execute({ pattern: "foo", include: "*.tsx,*.ts" }, createMockSdkContext());
     expect(sendCalls[0]?.params.include).toEqual(["**/*.tsx", "**/*.ts"]);
+  });
+
+  test("grep checks external permission per parsed multi-path fragment", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const inside = path.join(project, "src");
+      const external = path.join(tmpRoot, "external");
+      fs.mkdirSync(inside, { recursive: true });
+      fs.mkdirSync(external, { recursive: true });
+      const askCalls: AskCall[] = [];
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: true,
+        text: "ok",
+      }));
+
+      await tools.grep.execute(
+        { pattern: "TODO", path: `${inside} ${external}` },
+        createMockSdkContext(project, recordingAsk(askCalls)),
+      );
+
+      const externalAsks = askCalls.filter((call) => call.permission === "external_directory");
+      expect(externalAsks).toHaveLength(1);
+      expect(externalAsks[0]?.patterns).toEqual([path.join(external, "*").replaceAll("\\", "/")]);
+      expect(externalAsks[0]?.metadata?.filepath).toBe(external);
+      expect(sendCalls[0]?.params.path).toBe(`${inside} ${external}`);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob rejects when any parsed multi-path fragment is externally denied", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const inside = path.join(project, "src");
+      const external = path.join(tmpRoot, "external");
+      fs.mkdirSync(inside, { recursive: true });
+      fs.mkdirSync(external, { recursive: true });
+      const askCalls: AskCall[] = [];
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: true,
+        files: [],
+      }));
+
+      const raw = await tools.glob.execute(
+        { pattern: "**/*.ts", path: `${inside} ${external}` },
+        createMockSdkContext(
+          project,
+          recordingAsk(askCalls, {
+            permission: "external_directory",
+            message: "external denied",
+          }),
+        ),
+      );
+
+      expect(JSON.parse(raw).message).toBe("external denied");
+      expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+      expect(sendCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob splits exact absolute file patterns into path and basename", async () => {
+    const project = "/tmp/search-tests";
+    const absoluteFile = path.join(project, "src", "exact.ts");
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      files: [absoluteFile],
+    }));
+
+    await tools.glob.execute({ pattern: absoluteFile }, createMockSdkContext(project));
+
+    expect(sendCalls[0]?.params).toMatchObject({
+      pattern: "exact.ts",
+      path: path.dirname(absoluteFile),
+    });
   });
 });
 

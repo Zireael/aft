@@ -57,6 +57,9 @@ benchmarks/search-bench-results.json
 # Docker E2E test artifacts (cross-compiled binary, not committed)
 tests/docker/fixtures/aft-linux-x64
 
+# Docker E2E local npm-pack tarballs (produced at test time, not committed)
+tests/docker/fixtures/npm-packs/
+
 # E2E test fixture binary (locally-built aft, not committed)
 packages/pi-plugin/src/__tests__/e2e/fixtures/aft-bin
 packages/opencode-plugin/src/__tests__/e2e/fixtures/aft-bin

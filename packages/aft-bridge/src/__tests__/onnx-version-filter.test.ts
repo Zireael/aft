@@ -21,15 +21,31 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __onnxTest__ } from "../index.js";
+import { withEnv } from "./test-utils/env-guard.js";
 
-const { detectOnnxVersion, isOnnxVersionCompatible, REQUIRED_ORT_MAJOR, REQUIRED_ORT_MIN_MINOR } =
-  __onnxTest__;
+const {
+  detectOnnxVersion,
+  findSystemOnnxRuntime,
+  isOnnxVersionCompatible,
+  REQUIRED_ORT_MAJOR,
+  REQUIRED_ORT_MIN_MINOR,
+} = __onnxTest__;
 
 let workDir: string;
+
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
 
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "aft-onnx-version-filter-"));
@@ -87,10 +103,52 @@ describe("detectOnnxVersion", () => {
     expect(detectOnnxVersion(workDir, "libonnxruntime.dylib")).toBe("1.24.4");
   });
 
+  test("extracts prerelease suffixes and compares the base version", () => {
+    writeFileSync(join(workDir, "libonnxruntime.so.1.19.0-rc1"), "binary");
+    const version = detectOnnxVersion(workDir, "libonnxruntime.so");
+
+    expect(version).toBe("1.19.0");
+    expect(isOnnxVersionCompatible(version!)).toBe(false);
+  });
+
+  test("malformed version-shaped suffixes are incompatible instead of unknown", () => {
+    writeFileSync(join(workDir, "libonnxruntime.so.1.19.0_rc1"), "binary");
+    const version = detectOnnxVersion(workDir, "libonnxruntime.so");
+
+    expect(version).not.toBeNull();
+    expect(isOnnxVersionCompatible(version!)).toBe(false);
+  });
+
   test("follows symlink from bare lib name to versioned target", () => {
     writeFileSync(join(workDir, "libonnxruntime.so.1.9.0"), "binary");
     symlinkSync("libonnxruntime.so.1.9.0", join(workDir, "libonnxruntime.so"));
     expect(detectOnnxVersion(workDir, "libonnxruntime.so")).toBe("1.9.0");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "extracts version from a Windows DLL symlink target",
+    () => {
+      writeFileSync(join(workDir, "onnxruntime.1.24.4.dll"), "binary");
+      symlinkSync("onnxruntime.1.24.4.dll", join(workDir, "onnxruntime.dll"));
+      expect(detectOnnxVersion(workDir, "onnxruntime.dll")).toBe("1.24.4");
+    },
+  );
+
+  test("extracts version from Windows NuGet-style parent directories", () => {
+    const nativeDir = join(
+      workDir,
+      ".nuget",
+      "packages",
+      "microsoft.ml.onnxruntime",
+      "1.18.0",
+      "runtimes",
+      "win-x64",
+      "native",
+    );
+    mkdirSync(nativeDir, { recursive: true });
+    writeFileSync(join(nativeDir, "onnxruntime.dll"), "binary");
+
+    expect(detectOnnxVersion(nativeDir, "onnxruntime.dll")).toBe("1.18.0");
   });
 
   test("returns null when no library is present", () => {
@@ -139,5 +197,117 @@ describe("findSystemOnnxRuntime (Linux paths)", () => {
   test("filter contract: detect + compat must reject v1.9 and accept v1.24", () => {
     expect(isOnnxVersionCompatible("1.9.0")).toBe(false);
     expect(isOnnxVersionCompatible("1.24.4")).toBe(true);
+  });
+});
+
+describe("findSystemOnnxRuntime (Windows PATH)", () => {
+  test("finds onnxruntime.dll in PATH directories on Windows", async () => {
+    const missingDir = join(workDir, "missing");
+    const runtimeDir = join(workDir, "scoop", "onnxruntime", "bin");
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "onnxruntime.dll"), "binary");
+
+    await withEnv(
+      {
+        PATH: `${missingDir};${runtimeDir}`,
+        Path: undefined,
+        path: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBe(runtimeDir);
+      },
+    );
+  });
+
+  test("ignores non-existent PATH directories without throwing", async () => {
+    await withEnv(
+      {
+        PATH: `${join(workDir, "missing-a")};${join(workDir, "missing-b")}`,
+        Path: undefined,
+        path: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBeNull();
+      },
+    );
+  });
+
+  test("matches mixed-case ONNX Runtime DLL names case-insensitively", async () => {
+    const runtimeDir = join(workDir, "manual-install");
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "OnNxRuNtImE.DlL"), "binary");
+
+    await withEnv(
+      {
+        PATH: runtimeDir,
+        Path: undefined,
+        path: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBe(runtimeDir);
+      },
+    );
+  });
+
+  test("skips an incompatible Windows PATH candidate and selects a later compatible one", async () => {
+    const oldRuntimeDir = join(workDir, "onnxruntime-1.9.0", "bin");
+    const newRuntimeDir = join(workDir, "onnxruntime-1.24.4", "bin");
+    mkdirSync(oldRuntimeDir, { recursive: true });
+    mkdirSync(newRuntimeDir, { recursive: true });
+    writeFileSync(join(oldRuntimeDir, "onnxruntime.dll"), "old binary");
+    writeFileSync(join(newRuntimeDir, "onnxruntime.dll"), "new binary");
+
+    await withEnv(
+      {
+        PATH: `${oldRuntimeDir};${newRuntimeDir}`,
+        Path: undefined,
+        path: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBe(newRuntimeDir);
+      },
+    );
+  });
+
+  test("returns null for a detected incompatible Windows PATH candidate", async () => {
+    const oldRuntimeDir = join(workDir, "onnxruntime-1.9.0", "bin");
+    mkdirSync(oldRuntimeDir, { recursive: true });
+    writeFileSync(join(oldRuntimeDir, "onnxruntime.dll"), "old binary");
+
+    await withEnv(
+      {
+        PATH: oldRuntimeDir,
+        Path: undefined,
+        path: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBeNull();
+      },
+    );
   });
 });

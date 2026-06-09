@@ -1,15 +1,13 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk, toolResultText } from "../test-helpers";
 import {
-  BIOME_TS_EXCLUDED_PRESET,
   BIOME_TS_PRESET,
   biomeExcludedPathShim,
   createFormatHarness,
@@ -22,7 +20,6 @@ import { type E2EHarness, type PreparedBinary, prepareBinary } from "./helpers.j
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
-await commandAvailable("biome"); // unused — kept as a utility reference
 
 const DOCUMENTED_FORMAT_SKIP_REASONS = [
   "unsupported_language",
@@ -64,6 +61,21 @@ function createSdkContext(directory: string): ToolContext {
     metadata: () => {},
     ask: noopAsk,
   };
+}
+
+async function waitForBridgeReady(
+  pool: BridgePool,
+  directory: string,
+  sessionId: string | undefined,
+): Promise<void> {
+  const response = await pool.getBridge(directory).send("ping", {
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  if (response.success !== true) {
+    throw new Error(
+      `bridge readiness check failed: ${String(response.message ?? response.code ?? "unknown")}`,
+    );
+  }
 }
 
 function formatterPreset(tool: string): FormatPreset {
@@ -149,17 +161,15 @@ sleep 10
   };
 }
 
-async function commandAvailable(command: string): Promise<boolean> {
-  const paths = (process.env.PATH ?? "").split(":").filter(Boolean);
-  for (const dir of paths) {
-    try {
-      await access(join(dir, command));
-      return true;
-    } catch {
-      // keep searching
-    }
+async function withTemporaryPath<T>(pathValue: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.PATH;
+  process.env.PATH = pathValue;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.PATH;
+    else process.env.PATH = previous;
   }
-  return false;
 }
 
 maybeDescribe("e2e format_on_edit skip reasons", () => {
@@ -208,10 +218,10 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       },
     );
     pools.push(pool);
+    const sdkCtx = createSdkContext(h.tempDir);
+    await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
-    return toolResultText(
-      await tools.write.execute({ filePath, content }, createSdkContext(h.tempDir)),
-    );
+    return toolResultText(await tools.write.execute({ filePath, content }, sdkCtx));
   }
 
   async function executeHoistedEdit(
@@ -235,10 +245,10 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       },
     );
     pools.push(pool);
+    const sdkCtx = createSdkContext(h.tempDir);
+    await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage-edit")));
-    return toolResultText(
-      await tools.edit.execute({ filePath, oldString, newString }, createSdkContext(h.tempDir)),
-    );
+    return toolResultText(await tools.edit.execute({ filePath, oldString, newString }, sdkCtx));
   }
 
   async function writeAndExpectSkip(
@@ -367,21 +377,9 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
   });
 
   test("formatter_not_installed: explicit formatter configured but not found in harness", async () => {
-    // Use a shim for "prettier" so the formatter IS configured (Rust knows the name)
-    // but install a shim that doesn't exist as an actual binary to simulate not-installed.
-    // We can't rely on "prettier" being absent from CI PATH (some runners have it).
-    // Instead: use formatterPreset("prettier") which makes Rust try to resolve "prettier",
-    // then provide NO shim so it falls back to PATH — but wrap the test so that even if
-    // CI has prettier installed, we test the node_modules/.bin path by using suppressRealToolSymlinks=true.
-    // The simplest reliable approach: install a placeholder biome shim that immediately exits non-zero
-    // with an unrecognized error, which tests "formatter ran but failed" (the "error" skip reason),
-    // not "formatter_not_installed". So instead we use a harness that has no node_modules/.bin/
-    // prettier AND no PATH prettier — achieved by passing suppressRealToolSymlinks=true and
-    // a placeholder preset with no configFiles so PATH lookup is the only path.
-    // Actually the simplest: accept that CI has prettier and skip if it does.
-    const prettierOnPath = await commandAvailable("prettier");
-    if (prettierOnPath) return; // prettier installed in CI — this test can't be run reliably
-    const h = await formatHarness(formatterPreset("prettier"));
+    const h = await withTemporaryPath("/definitely/missing/aft-e2e-path", () =>
+      formatHarness(formatterPreset("prettier"), [], true),
+    );
     await writeAndExpectSkip(h, "src/missing-explicit.ts", TS_INPUT, "formatter_not_installed", {
       format_on_edit: true,
       validate_on_edit: "syntax",
@@ -389,18 +387,10 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     });
   });
 
-  // NOTE: "biome.json present but biome binary absent" is intentionally not
-  // tested here — it would require guaranteeing biome is NOT on PATH in CI,
-  // which is not reliable (some runners have it globally). The formatter_not_installed
-  // path is already covered by the "nonexistent explicit formatter" test above.
-
-  test.skipIf(true)(
-    "formatter_excluded_path: real biome refuses scratch/ via includes filter (skipped: biome unavailable or too slow in e2e)",
-    async () => {
-      const h = await formatHarness(BIOME_TS_EXCLUDED_PRESET);
-      await writeAndExpectSkip(h, "scratch/excluded.ts", TS_INPUT, "formatter_excluded_path");
-    },
-  );
+  // The old real-Biome excluded-path case was permanently skipIf(true), so it
+  // could never protect CI. Keep the deterministic shim-emulation test below;
+  // it exercises the same documented skip reason without depending on a global
+  // Biome install or real formatter timing.
 
   test("formatter_excluded_path: biome-style shim emulation", async () => {
     const h = await formatHarness(formatterPreset("biome"), [excludedPathShim()]);
@@ -471,13 +461,6 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       formatter: { typescript: "biome" },
     });
     expect(data.format_skipped_reason).not.toBe("formatter_excluded_path");
-  });
-
-  test("error edge: formatter exits 0 but leaves invalid file cannot repro cleanly", () => {
-    // AFT trusts a zero-exit formatter as formatted=true; syntax diagnostics are
-    // a separate validation side effect. There is no documented path that maps
-    // "exit 0 + invalid output" to format_skipped_reason="error".
-    expect(true).toBe(true);
   });
 
   test("honest reporting: success=true still carries top-level format_skipped_reason", async () => {

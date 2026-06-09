@@ -18,7 +18,7 @@
 
 import * as path from "node:path";
 
-const SCHEMA_URL = "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json";
+const SCHEMA_URL = "https://raw.githubusercontent.com/cortexkit/aft/main/assets/aft.schema.json";
 
 function buildSchema(): Record<string, unknown> {
   const formatterEnum = {
@@ -49,12 +49,14 @@ function buildSchema(): Record<string, unknown> {
         type: "array",
         items: { type: "string", minLength: 1 },
         minItems: 1,
-        description: "File extensions this server handles (e.g. ['.tf', '.tfvars']).",
+        description:
+          "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited.",
       },
       binary: {
         type: "string",
         minLength: 1,
-        description: "LSP binary command (must be on PATH or absolute path).",
+        description:
+          "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited.",
       },
       args: {
         type: "array",
@@ -84,7 +86,6 @@ function buildSchema(): Record<string, unknown> {
           "JSON value passed as `initializationOptions` in the LSP `initialize` request.",
       },
     },
-    required: ["extensions", "binary"],
     additionalProperties: false,
   };
 
@@ -134,6 +135,14 @@ function buildSchema(): Record<string, unknown> {
           "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
       },
 
+      configure_warnings_delivery: {
+        type: "string",
+        enum: ["toast", "log", "chat"],
+        default: "toast",
+        description:
+          "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead.",
+      },
+
       hoist_builtin_tools: {
         type: "boolean",
         default: true,
@@ -146,7 +155,7 @@ function buildSchema(): Record<string, unknown> {
         enum: ["minimal", "recommended", "all"],
         default: "recommended",
         description:
-          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor.",
+          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor.",
       },
 
       disabled_tools: {
@@ -203,7 +212,13 @@ function buildSchema(): Record<string, unknown> {
                 type: "boolean",
                 default: true,
                 description:
-                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag.",
+                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
+              },
+              subagent_background: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Allow subagents to run background bash. Default false — subagent `background: true` requests are otherwise converted to foreground so the subagent turn does not end early.",
               },
               long_running_reminder_enabled: {
                 type: "boolean",
@@ -217,6 +232,13 @@ function buildSchema(): Record<string, unknown> {
                 default: 600000,
                 description:
                   "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+              },
+              foreground_wait_window_ms: {
+                type: "integer",
+                minimum: 5000,
+                default: 8000,
+                description:
+                  "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
               },
             },
             additionalProperties: false,
@@ -372,6 +394,13 @@ function buildSchema(): Record<string, unknown> {
             minimum: 1,
             description: "Maximum batch size used by the semantic embedding pipeline.",
           },
+          max_files: {
+            type: "integer",
+            minimum: 1,
+            default: 20000,
+            description:
+              "Maximum number of project files to semantically index (default 20000). Guards local fastembed memory on large roots; raise it for remote backends that embed server-side.",
+          },
         },
         additionalProperties: false,
         description: "External semantic backend configuration for embedding and retrieval.",
@@ -382,7 +411,7 @@ function buildSchema(): Record<string, unknown> {
         minimum: 1,
         default: 5000,
         description:
-          "Maximum source files allowed for call-graph operations (callers, trace_to, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool.",
+          "Maximum source files allowed for call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool.",
       },
 
       auto_update: {

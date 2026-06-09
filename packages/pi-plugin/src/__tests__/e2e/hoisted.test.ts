@@ -58,9 +58,10 @@ maybeDescribe("hoisted tools (real bridge)", () => {
     const content = "export const hello = 'world';\n";
     const result = await harness.callTool("write", { filePath: rel, content });
 
-    // Agent-facing text: summary header.
+    // Agent-facing text: compact summary header (no path echoed).
     const text = harness.text(result);
-    expect(text).toMatch(/Wrote .*written\.ts \(\+\d+\/-\d+\)/);
+    expect(text).toMatch(/^Created file \(\+\d+\/-\d+\)/);
+    expect(text).not.toContain("written.ts");
 
     // Structured details: matches Pi's result-renderer contract.
     const details = result.details as { additions: number; deletions: number } | undefined;
@@ -84,12 +85,14 @@ maybeDescribe("hoisted tools (real bridge)", () => {
       newString: "'?'",
     });
 
-    // Summary header mentions replacements.
+    // Compact summary header (no path; single replacement count omitted).
     const text = harness.text(result);
-    expect(text).toMatch(/Edited .*edit-target\.ts \(\+\d+\/-\d+, 1 replacement\)/);
+    expect(text).toMatch(/^Edited \(\+\d+\/-\d+\)/);
+    expect(text).not.toContain("edit-target.ts");
 
-    // Diff text uses Pi's line-numbered format: "+NN content" / "-NN content".
-    expect(text).toMatch(/^[+-]\s*\d+ /m);
+    // Agent text is summary-only: the diff body is NOT echoed (it would scale
+    // the payload with file size). The line-numbered diff lives in details.
+    expect(text).not.toMatch(/^[+-]\s*\d+ /m);
 
     // Details carry the diff and firstChangedLine for the renderer.
     const details = result.details as

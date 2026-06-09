@@ -1,5 +1,70 @@
 import { describe, expect, test } from "bun:test";
-import { capBodyToGithubLimit, extractRecentErrors, MAX_GITHUB_BODY_BYTES } from "./issue-body";
+import {
+  capBodyToGithubLimit,
+  extractRecentErrors,
+  filterLogToSession,
+  MAX_GITHUB_BODY_BYTES,
+} from "./issue-body";
+
+describe("filterLogToSession", () => {
+  test("keeps matching-session and untagged lines while dropping other sessions", () => {
+    const log = [
+      "startup configured",
+      "[ses_abc123] matching line",
+      "[ses_other] other line",
+      "shutdown complete",
+    ].join("\n");
+
+    expect(filterLogToSession(log, "abc123")).toBe(
+      ["startup configured", "[ses_abc123] matching line", "shutdown complete"].join("\n"),
+    );
+  });
+
+  test("normalizes OpenCode ids that already include ses_", () => {
+    const log = ["[ses_17d1681a] keep", "[ses_else] drop", "general"].join("\n");
+    expect(filterLogToSession(log, "ses_17d1681a")).toBe(
+      ["[ses_17d1681a] keep", "general"].join("\n"),
+    );
+  });
+
+  test("uses ses_<bare uuid> token for Pi bare uuid ids", () => {
+    const id = "019e6307-0749-4000-9000-111111111111";
+    const log = [
+      `[ses_${id}] pi line`,
+      "[ses_019e6307-0749-4000-9000-222222222222] other pi line",
+      "untagged pi startup",
+    ].join("\n");
+
+    expect(filterLogToSession(log, id)).toBe(
+      [`[ses_${id}] pi line`, "untagged pi startup"].join("\n"),
+    );
+  });
+
+  // #8: Pi's logger emits a BARE uuid tag `[<uuid>]` (no `ses_` prefix), because
+  // Pi's getSessionId() returns a bare uuid. The filter must scope on that form
+  // too — previously every Pi line read as untagged and scoping silently no-oped.
+  test("scopes Pi logs tagged with a bare uuid (no ses_ prefix)", () => {
+    const id = "019e6307-0749-4000-9000-111111111111";
+    const other = "019e6307-0749-4000-9000-222222222222";
+    const log = [
+      `[${id}] kept pi line`,
+      `[${other}] dropped other pi session`,
+      "untagged pi startup",
+    ].join("\n");
+
+    expect(filterLogToSession(log, id)).toBe(
+      [`[${id}] kept pi line`, "untagged pi startup"].join("\n"),
+    );
+  });
+
+  // A line carrying ANOTHER session's bare-uuid tag must be dropped — proves the
+  // bare-uuid form is recognized as a session tag, not treated as untagged.
+  test("drops a different session's bare-uuid line", () => {
+    const id = "019e6307-0749-4000-9000-111111111111";
+    const log = ["[019e6307-0749-4000-9000-999999999999] foreign", "plain text"].join("\n");
+    expect(filterLogToSession(log, id)).toBe("plain text");
+  });
+});
 
 describe("extractRecentErrors", () => {
   test("matches the documented sessionLog / slog error shapes", () => {

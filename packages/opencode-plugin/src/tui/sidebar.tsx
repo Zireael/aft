@@ -11,7 +11,15 @@ import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus, type StatusCompression } from "../shared/status";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatSemanticIndexStatus,
+  formatSemanticRefreshing,
+  type StatusBar,
+  type StatusCompression,
+} from "../shared/status";
+import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 
 const SINGLE_BORDER = { type: "single" } as any;
 const REFRESH_DEBOUNCE_MS = 200;
@@ -135,6 +143,78 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string; marginTop
   </box>
 );
 
+// Map a status tone to a theme color — used for the collapsed-view status dots.
+function toneColor(theme: TuiThemeCurrent, tone: "ok" | "warn" | "err" | "muted"): string {
+  switch (tone) {
+    case "ok":
+      return theme.success ?? theme.accent;
+    case "warn":
+      return theme.warning;
+    case "err":
+      return theme.error;
+    default:
+      return theme.textMuted;
+  }
+}
+
+// Collapsed-view row: label on the left, a status dot (or compact value) on the
+// right. Mirrors the expanded StatRow layout so the columns line up.
+const CollapsedRow = (props: { theme: TuiThemeCurrent; label: string; children: JSX.Element }) => (
+  <box width="100%" flexDirection="row" justifyContent="space-between">
+    <text fg={props.theme.textMuted}>{props.label}</text>
+    {props.children}
+  </box>
+);
+
+// Compact "saved / ratio" string for the collapsed Compression row — e.g.
+// "7.6M / 64%". Uses the local `formatCount` (not the aft-bridge token
+// formatter) so the TUI bundle doesn't pull the bridge barrel, which exports
+// URL-fetch helpers unsuitable for Bun's TUI runtime. Returns null when no
+// compression has been recorded yet.
+export function collapsedCompressionValue(
+  compression: StatusCompression | undefined,
+): string | null {
+  if (!compression || compression.project.events <= 0) return null;
+  const { savings_tokens, original_tokens } = compression.project;
+  const pct = original_tokens > 0 ? Math.round((savings_tokens / original_tokens) * 100) : 0;
+  return `${formatCount(savings_tokens)} / ${pct}%`;
+}
+
+export type HealthLightTone = "ok" | "warn" | "err";
+
+export interface HealthLights {
+  // Diagnostics: red if any errors, yellow if any warnings, else green.
+  diagnostics: HealthLightTone;
+  // Code cruft: yellow if there is any duplicate, green when zero. Never red —
+  // cruft is not a build failure. NOTE: dead_code / unused_exports are
+  // temporarily excluded from this signal (and the expanded rows below) until
+  // the oxc-based resolver lands and makes those counts trustworthy on real
+  // TS/JS codebases. Restore them here when that engine ships.
+  code: HealthLightTone;
+  // TODOs: yellow if any, else green.
+  todos: HealthLightTone;
+}
+
+// Three traffic lights for the collapsed view, replacing the cramped
+// `E· W· | D· U· C· | T·` string. Returns null until populated.
+export function collapsedHealthLights(statusBar: StatusBar | undefined): HealthLights | null {
+  if (!statusBar) return null;
+  const diagnostics: HealthLightTone =
+    statusBar.errors > 0 ? "err" : statusBar.warnings > 0 ? "warn" : "ok";
+  const code: HealthLightTone =
+    // statusBar.dead_code > 0 || statusBar.unused_exports > 0 ||  // restore with oxc engine
+    statusBar.duplicates > 0 ? "warn" : "ok";
+  const todos: HealthLightTone = statusBar.todos > 0 ? "warn" : "ok";
+  return { diagnostics, code, todos };
+}
+
+// v0.27 moved AFT storage to the CortexKit root. TUI code must use a
+// lightweight local path helper rather than the shared bridge barrel, which
+// also exports URL-fetch helpers unsuitable for Bun's TUI runtime.
+export function resolveTuiStorageDir(): string {
+  return resolveCortexKitStorageRoot();
+}
+
 // One RPC client per project directory — same pattern as the /aft-status
 // dialog handler in tui/index.tsx. Sharing the map avoids opening a second
 // connection just for the sidebar.
@@ -142,15 +222,41 @@ const sidebarClients = new Map<string, AftRpcClient>();
 function getClient(directory: string): AftRpcClient {
   let client = sidebarClients.get(directory);
   if (client) return client;
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const dataHome = process.env.XDG_DATA_HOME || `${home}/.local/share`;
-  // v0.27 moved AFT storage to the CortexKit root. Must match the server
-  // plugin's `resolveCortexKitStorageRoot()` or the sidebar will poll a
-  // stale legacy port file and never connect to the live RPC server.
-  const storageDir = `${dataHome}/cortexkit/aft`;
-  client = new AftRpcClient(storageDir, directory);
+  client = new AftRpcClient(resolveTuiStorageDir(), directory);
   sidebarClients.set(directory, client);
   return client;
+}
+
+export type ScopedSidebarStatus = {
+  directory: string;
+  sessionID: string;
+  snapshot: AftStatusSnapshot;
+};
+
+export function scopedSidebarSnapshot(
+  scoped: ScopedSidebarStatus | null,
+  directory: string,
+  sessionID: string,
+): AftStatusSnapshot | null {
+  if (!scoped) return null;
+  if (scoped.directory !== directory || scoped.sessionID !== sessionID) return null;
+  return scoped.snapshot;
+}
+
+/**
+ * Stale-while-revalidate guard. A transient `not_initialized` snapshot (bridge
+ * mid-respawn after a binary swap, or a momentary session-dir key miss) arrives
+ * over RPC as `success: true`, so a naive `setStatus` would overwrite a good
+ * snapshot and collapse the panel to the lazy-bridge placeholder — the blank
+ * flicker that recovers on the next poll. Suppress the downgrade only when we
+ * already hold initialized data for the same context; never blocks the first
+ * real snapshot, and a genuine context switch clears separately.
+ */
+export function shouldSuppressUninitializedDowngrade(
+  incomingCacheRole: string | undefined,
+  haveInitializedForContext: boolean,
+): boolean {
+  return incomingCacheRole === "not_initialized" && haveInitializedForContext;
 }
 
 const SidebarContent = (props: {
@@ -159,39 +265,97 @@ const SidebarContent = (props: {
   theme: TuiThemeCurrent;
   pluginVersion: string;
 }) => {
-  const [status, setStatus] = createSignal<AftStatusSnapshot | null>(null);
-  // Once a request is in flight, suppress any overlapping refresh so we
-  // don't open a thundering herd of RPCs on rapid event bursts.
-  let inflight = false;
+  const [status, setStatus] = createSignal<ScopedSidebarStatus | null>(null);
+  // Collapsed/expanded toggle — local UI state (not persisted), mirroring
+  // OpenCode's native MCP sidebar section. Default expanded.
+  const [collapsed, setCollapsed] = createSignal(false);
+  let inflight: {
+    controller: AbortController;
+    generation: number;
+    directory: string;
+    sessionID: string;
+  } | null = null;
+  let generation = 0;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
+  const currentDirectory = () => props.api.state.path.directory ?? "";
+  const requestRender = () => {
+    try {
+      props.api.renderer.requestRender();
+    } catch {
+      // renderer may not be available during teardown; safe to ignore
+    }
+  };
+  const abortInflight = () => {
+    if (!inflight) return;
+    inflight.controller.abort();
+    inflight = null;
+  };
+  const clearStatusForContext = (directory: string, sessionID: string) => {
+    const current = status();
+    if (!current) return;
+    if (current.directory === directory && current.sessionID === sessionID) return;
+    setStatus(null);
+    requestRender();
+  };
+
   const refresh = async () => {
     const sid = props.sessionID();
-    if (!sid) return;
-    if (inflight) return;
-    const directory = props.api.state.path.directory ?? "";
-    if (!directory) return;
+    const directory = currentDirectory();
+    if (!sid || !directory) {
+      generation++;
+      abortInflight();
+      if (status()) {
+        setStatus(null);
+        requestRender();
+      }
+      return;
+    }
 
-    inflight = true;
+    clearStatusForContext(directory, sid);
+
+    if (inflight) {
+      if (inflight.directory === directory && inflight.sessionID === sid) return;
+      generation++;
+      abortInflight();
+    }
+
+    const requestGeneration = ++generation;
+    const controller = new AbortController();
+    inflight = { controller, generation: requestGeneration, directory, sessionID: sid };
+
     try {
       const client = getClient(directory);
-      const response = await client.call("status", { sessionID: sid });
+      const response = await client.call(
+        "status",
+        { sessionID: sid },
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted || requestGeneration !== generation) return;
+      if (currentDirectory() !== directory || props.sessionID() !== sid) return;
       if (response && (response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
-        setStatus(snapshot);
-        try {
-          props.api.renderer.requestRender();
-        } catch {
-          // renderer may not be available during teardown; safe to ignore
-        }
+        // Stale-while-revalidate: keep the last-good snapshot instead of
+        // flickering to the lazy-bridge placeholder on a transient
+        // not_initialized. See shouldSuppressUninitializedDowngrade.
+        const current = status();
+        const haveGoodForContext =
+          current !== null &&
+          current.directory === directory &&
+          current.sessionID === sid &&
+          current.snapshot.cache_role !== "not_initialized";
+        if (shouldSuppressUninitializedDowngrade(snapshot.cache_role, haveGoodForContext)) return;
+        setStatus({ directory, sessionID: sid, snapshot });
+        requestRender();
       }
     } catch {
+      if (controller.signal.aborted || requestGeneration !== generation) return;
       // RPC server may not be ready yet, or the bridge may be respawning
-      // after a binary swap — leave the previous snapshot visible rather
-      // than blanking the sidebar.
+      // after a binary swap. Keep the previous snapshot only when it belongs
+      // to the current project/session; mismatched snapshots were cleared above.
     } finally {
-      inflight = false;
+      if (inflight?.generation === requestGeneration) inflight = null;
     }
   };
 
@@ -204,6 +368,8 @@ const SidebarContent = (props: {
   };
 
   onCleanup(() => {
+    generation++;
+    abortInflight();
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollTimer) clearInterval(pollTimer);
   });
@@ -250,6 +416,8 @@ const SidebarContent = (props: {
               // best effort
             }
           }
+          generation++;
+          abortInflight();
           if (pollTimer) {
             clearInterval(pollTimer);
             pollTimer = undefined;
@@ -260,7 +428,7 @@ const SidebarContent = (props: {
     ),
   );
 
-  const s = createMemo(() => status());
+  const s = () => scopedSidebarSnapshot(status(), currentDirectory(), props.sessionID());
 
   // Lazy-bridge: while AFT has no live bridge yet, the RPC server returns a
   // synthetic snapshot with `cache_role === "not_initialized"`. In that state
@@ -274,10 +442,20 @@ const SidebarContent = (props: {
   // Pre-compute display values so the JSX stays readable. createMemo for
   // each derived field would be overkill — these are cheap derivations.
   const searchStatus = () => statusDisplay(s()?.search_index?.status ?? "disabled");
-  const semanticStatus = () => statusDisplay(s()?.semantic_index?.status ?? "disabled");
+  const semanticStatus = () => {
+    const rawStatus = s()?.semantic_index?.status ?? "disabled";
+    const display = statusDisplay(rawStatus);
+    return {
+      ...display,
+      label: formatSemanticIndexStatus(rawStatus, s()?.semantic_index?.stage),
+    };
+  };
+  const semanticRefreshing = () =>
+    formatSemanticRefreshing(s()?.semantic_index?.refreshing_count ?? 0);
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
+  const statusBar = () => s()?.status_bar;
 
   // Degraded-mode reason → human-readable hint. Distinct strings per reason
   // because the UX direction is different: "home_root" tells the user to
@@ -312,12 +490,27 @@ const SidebarContent = (props: {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: AFT badge + binary version + degraded badge (when active) */}
-      <box flexDirection="row" justifyContent="space-between" alignItems="center">
+      {/* Header: triangle toggle + AFT badge + binary version + degraded badge.
+          Clicking the header row collapses/expands the panel (mirrors OpenCode's
+          native MCP sidebar section). Only interactive once initialized — the
+          lazy-bridge placeholder has nothing to collapse. */}
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        alignItems="center"
+        onMouseDown={() => {
+          if (!notInitialized()) setCollapsed((x) => !x);
+        }}
+      >
         <box flexDirection="row" alignItems="center">
+          {/* Triangle lives inside the accent badge so the toggle reads as one
+              unit: "▶ AFT" / "▼ AFT". Hidden pre-init (nothing to collapse). */}
           <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
             <text fg={props.theme.background}>
-              <b>AFT</b>
+              <b>
+                {notInitialized() ? "" : collapsed() ? "▶ " : "▼ "}
+                AFT
+              </b>
             </text>
           </box>
           {s()?.degraded && (
@@ -338,7 +531,7 @@ const SidebarContent = (props: {
         )}
       </box>
 
-      {/* Degraded reason — explains why heavy tools (aft_search, aft_navigate)
+      {/* Degraded reason — explains why heavy tools (aft_search, aft_callgraph)
           are disabled. Surface this prominently so users know to open a real
           project subdirectory if they want full features. */}
       {s()?.degraded && degradedSummary() && (
@@ -363,8 +556,42 @@ const SidebarContent = (props: {
         </box>
       )}
 
+      {/* Collapsed view — condensed status dots + compact compression. Shown
+          only when initialized AND collapsed. Three rows mirroring the section
+          order of the expanded grid. */}
+      {!notInitialized() && collapsed() && (
+        <box width="100%" flexDirection="column">
+          <CollapsedRow theme={props.theme} label="Search Index">
+            <text fg={toneColor(props.theme, searchStatus().tone)}>●</text>
+          </CollapsedRow>
+          <CollapsedRow theme={props.theme} label="Semantic Index">
+            <text fg={toneColor(props.theme, semanticStatus().tone)}>●</text>
+          </CollapsedRow>
+          {collapsedHealthLights(statusBar()) && (
+            <CollapsedRow theme={props.theme} label="Code Health">
+              <box flexDirection="row" gap={1}>
+                <text fg={toneColor(props.theme, collapsedHealthLights(statusBar())!.diagnostics)}>
+                  ●
+                </text>
+                <text fg={toneColor(props.theme, collapsedHealthLights(statusBar())!.code)}>●</text>
+                <text fg={toneColor(props.theme, collapsedHealthLights(statusBar())!.todos)}>
+                  ●
+                </text>
+              </box>
+            </CollapsedRow>
+          )}
+          {collapsedCompressionValue(s()?.compression) && (
+            <CollapsedRow theme={props.theme} label="Compression">
+              <text fg={props.theme.textMuted}>
+                <b>{collapsedCompressionValue(s()?.compression)}</b>
+              </text>
+            </CollapsedRow>
+          )}
+        </box>
+      )}
+
       {/* Search index */}
-      {!notInitialized() && (
+      {!notInitialized() && !collapsed() && (
         <>
           <SectionHeader theme={props.theme} title="Search Index" />
           <StatRow
@@ -396,6 +623,11 @@ const SidebarContent = (props: {
             value={semanticStatus().label}
             tone={semanticStatus().tone}
           />
+          {semanticRefreshing() && (
+            <box width="100%">
+              <text fg={props.theme.textMuted}>{semanticRefreshing()}</text>
+            </box>
+          )}
           {/* When loading, magic-context-style progress hint helps users see
           background work is making progress instead of stuck. */}
           {s()?.semantic_index?.status === "loading" &&
@@ -424,6 +656,61 @@ const SidebarContent = (props: {
             value={formatBytes(semanticBytes())}
             tone="muted"
           />
+
+          {/* Code Health — the agent status-bar glance, surfaced for users.
+          Hidden until the Tier-2 cache is populated (status_bar undefined),
+          so it never shows fabricated zeros. Errors/warnings are live LSP
+          diagnostics; D/U/C/T come from the last background scan. A `~` on
+          the section header flags the Tier-2 counts as predating the latest
+          edit. */}
+          {statusBar() && (
+            <>
+              <SectionHeader
+                theme={props.theme}
+                title={statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}
+              />
+              <StatRow
+                theme={props.theme}
+                label="Errors"
+                value={formatCount(statusBar()!.errors)}
+                tone={statusBar()!.errors > 0 ? "err" : "muted"}
+              />
+              <StatRow
+                theme={props.theme}
+                label="Warnings"
+                value={formatCount(statusBar()!.warnings)}
+                tone={statusBar()!.warnings > 0 ? "warn" : "muted"}
+              />
+              {/* Dead Code / Unused Exports temporarily hidden until the
+              oxc-based resolver lands and makes these trustworthy on real
+              TS/JS codebases (current tree-sitter scanner over-reports via
+              barrel re-export gaps). Restore both rows when that ships. */}
+              {/* <StatRow
+                theme={props.theme}
+                label="Dead Code"
+                value={formatCount(statusBar()!.dead_code)}
+                tone="muted"
+              />
+              <StatRow
+                theme={props.theme}
+                label="Unused Exports"
+                value={formatCount(statusBar()!.unused_exports)}
+                tone="muted"
+              /> */}
+              <StatRow
+                theme={props.theme}
+                label="Duplicates"
+                value={formatCount(statusBar()!.duplicates)}
+                tone="muted"
+              />
+              <StatRow
+                theme={props.theme}
+                label="TODOs"
+                value={formatCount(statusBar()!.todos)}
+                tone="muted"
+              />
+            </>
+          )}
 
           {/* Compression aggregates. Tabular layout matching Search/Semantic
           Index above: each scope ("Session", "Project") renders as a

@@ -193,6 +193,25 @@ fn db_get_state_fallback_to_legacy_file() {
 }
 
 #[test]
+fn db_get_state_repairs_root_scoped_notification_file() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    fs::write(storage.path().join("last_announced_version"), "0.26.5").unwrap();
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+
+    let response = get_state(&mut aft, "last_announced_version");
+
+    assert_eq!(response["success"], true, "get_state failed: {response:?}");
+    assert_eq!(response["value"], "0.26.5");
+    assert!(!storage.path().join("last_announced_version").exists());
+    assert_eq!(
+        fs::read_to_string(storage.path().join("opencode/last_announced_version")).unwrap(),
+        "0.26.5"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn db_set_state_atomic_legacy_write() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

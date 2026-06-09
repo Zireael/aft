@@ -1,5 +1,5 @@
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi};
-use crate::compress::Compressor;
+use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 250;
 
@@ -10,9 +10,39 @@ impl Compressor for PrettierCompressor {
         command_tokens(command).any(|token| token == "prettier")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_prettier(output)
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = compress_prettier(output);
+        if matches!(exit_code, Some(code) if code != 0)
+            && compressed.starts_with("prettier: formatted")
+        {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed.into()
+        }
     }
+
+    fn matches_output(&self, output: &str) -> bool {
+        looks_like_prettier_check_output(output)
+    }
+}
+
+fn looks_like_prettier_check_output(output: &str) -> bool {
+    let mut has_checking = false;
+    let mut has_warn = false;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        has_checking |= trimmed == "Checking formatting...";
+        has_warn |= trimmed.starts_with("[warn] ");
+        if trimmed.starts_with("Code style issues found") {
+            return true;
+        }
+    }
+    has_checking && has_warn
 }
 
 fn compress_prettier(output: &str) -> String {

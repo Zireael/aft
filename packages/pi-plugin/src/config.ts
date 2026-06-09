@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { stripJsoncSymbols } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
 import { error, log, warn } from "./logger.js";
@@ -32,6 +33,9 @@ export type Checker =
   | "staticcheck"
   | "none";
 
+/** How configure-time missing-tool warnings are delivered (OpenCode plugin). */
+export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
+
 export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
 
 export interface SemanticConfig {
@@ -41,12 +45,15 @@ export interface SemanticConfig {
   api_key_env?: string;
   timeout_ms?: number;
   max_batch_size?: number;
+  max_files?: number;
 }
 
 export interface LspServerConfig {
   id: string;
-  extensions: string[];
-  binary: string;
+  /** Omitted when overriding a built-in server to inherit its extensions. */
+  extensions?: string[];
+  /** Omitted when overriding a built-in server to inherit its binary. */
+  binary?: string;
   args: string[];
   root_markers: string[];
   disabled: boolean;
@@ -54,10 +61,31 @@ export interface LspServerConfig {
   initialization_options?: unknown;
 }
 
+export interface InspectConfig {
+  enabled?: boolean;
+  tier2_idle_minutes?: number;
+  categories?: Record<string, boolean>;
+  tier2_soft_deadline_ms?: number;
+  max_drill_down_items?: number;
+  duplicates?: {
+    lower_bound?: number;
+    discard_cost?: number;
+    anonymize?: {
+      variables?: boolean;
+      fields?: boolean;
+      methods?: boolean;
+      types?: boolean;
+      literals?: boolean;
+    };
+  };
+}
+
 export interface LspConfig {
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
   python?: "pyright" | "ty" | "auto";
+  /** Restore legacy inline LSP waits on edit/write unless the tool call overrides diagnostics. */
+  diagnostics_on_edit?: boolean;
   auto_install?: boolean;
   grace_days?: number;
   versions?: Record<string, string>;
@@ -109,6 +137,11 @@ export interface BashConfig {
   background?: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * How long foreground bash blocks before auto-promoting to background.
+   * Default 8000ms; values below the 5000ms floor are clamped up.
+   */
+  foreground_wait_window_ms?: number;
 }
 
 export interface AftConfig {
@@ -124,11 +157,15 @@ export interface AftConfig {
   validate_on_edit?: "syntax" | "full";
   formatter?: Record<string, Formatter>;
   checker?: Record<string, Checker>;
+  /** Configure-time missing-tool warning delivery. Default: toast. */
+  configure_warnings_delivery?: ConfigureWarningsDelivery;
   tool_surface?: ToolSurface;
   disabled_tools?: string[];
   restrict_to_project_root?: boolean;
   search_index?: boolean;
   semantic_search?: boolean;
+  /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+  inspect?: InspectConfig;
   /**
    * Bash tool family (hoist + rewrite + compress + background execution).
    * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -147,7 +184,7 @@ export interface AftConfig {
   semantic?: SemanticConfig;
   /**
    * Maximum source files allowed for call-graph operations (callers, trace_to,
-   * trace_data, impact). Projects above this size return `project_too_large`.
+   * trace_to_symbol, trace_data, impact). Projects above this size return `project_too_large`.
    * Default: 20000 (applied Rust-side; undefined here means "use default").
    */
   max_callgraph_files?: number;
@@ -163,7 +200,17 @@ export interface ResolvedBashConfig {
   background: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * Foreground poll window before auto-promotion to background, in ms.
+   * Always resolved: defaults to 8000, floored at 5000.
+   */
+  foreground_wait_window_ms: number;
 }
+
+/** Default foreground wait-window before auto-promotion (ms). */
+export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 8_000;
+/** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
+export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
 
 /**
  * Single source of truth for bash config across the Pi plugin. Resolution
@@ -196,6 +243,15 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
     legacy?.long_running_reminder_interval_ms;
 
+  // Foreground wait-window: only the object form can set it; clamp to the
+  // 5000ms floor and default to 8000ms when unset.
+  const rawForegroundWait =
+    typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
+  const foregroundWaitWindowMs = Math.max(
+    FOREGROUND_WAIT_WINDOW_MIN_MS,
+    rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
+  );
+
   const base: ResolvedBashConfig = {
     enabled: false,
     rewrite: false,
@@ -203,6 +259,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
+    foreground_wait_window_ms: foregroundWaitWindowMs,
   };
 
   if (top === false) return base;
@@ -272,6 +329,8 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
+const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
+
 const SemanticConfigSchema = z.object({
   backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
   model: z.string().trim().min(1).optional(),
@@ -279,6 +338,7 @@ const SemanticConfigSchema = z.object({
   api_key_env: z.string().trim().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   max_batch_size: z.number().int().positive().optional(),
+  max_files: z.number().int().positive().optional(),
 });
 
 const LspExtensionSchema = z
@@ -290,8 +350,11 @@ const LspExtensionSchema = z
   });
 
 const LspServerEntrySchema = z.object({
-  extensions: z.array(LspExtensionSchema).min(1),
-  binary: z.string().trim().min(1),
+  // Optional: overriding a built-in server (e.g. `rust`) to tweak one field
+  // inherits the built-in's extensions/binary downstream. Requiring them here
+  // silently dropped the whole `lsp` section on a partial override.
+  extensions: z.array(LspExtensionSchema).min(1).optional(),
+  binary: z.string().trim().min(1).optional(),
   args: z.array(z.string()).optional().default([]),
   root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
   disabled: z.boolean().optional().default(false),
@@ -309,6 +372,11 @@ const LspConfigSchema = z.object({
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
+  /**
+   * Restore legacy edit behavior by waiting for inline LSP diagnostics on every
+   * edit/write call unless the tool call overrides diagnostics. Default: false.
+   */
+  diagnostics_on_edit: z.boolean().optional(),
   /**
    * Auto-install npm-distributed and GitHub-release language servers when
    * the project needs them. Default: true.
@@ -359,8 +427,32 @@ const BashFeaturesSchema = z.object({
   background: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
+  foreground_wait_window_ms: z.number().int().positive().optional(),
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
+
+const InspectConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  tier2_idle_minutes: z.number().min(0).optional(),
+  categories: z.record(z.string(), z.boolean()).optional(),
+  tier2_soft_deadline_ms: z.number().int().positive().optional(),
+  max_drill_down_items: z.number().int().positive().max(100).optional(),
+  duplicates: z
+    .object({
+      lower_bound: z.number().int().positive().optional(),
+      discard_cost: z.number().int().min(0).optional(),
+      anonymize: z
+        .object({
+          variables: z.boolean().optional(),
+          fields: z.boolean().optional(),
+          methods: z.boolean().optional(),
+          types: z.boolean().optional(),
+          literals: z.boolean().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
 
 export const AftConfigSchema = z
   .object({
@@ -375,11 +467,13 @@ export const AftConfigSchema = z
     validate_on_edit: z.enum(["syntax", "full"]).optional(),
     formatter: z.record(z.string(), FormatterEnum).optional(),
     checker: z.record(z.string(), CheckerEnum).optional(),
+    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
     tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
     disabled_tools: z.array(z.string()).optional(),
     restrict_to_project_root: z.boolean().optional(),
     search_index: z.boolean().optional(),
     semantic_search: z.boolean().optional(),
+    inspect: InspectConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
      * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -427,12 +521,16 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
     const entry: LspServerConfig = {
       id,
-      extensions: server.extensions.map(normalizeLspExtension),
-      binary: server.binary,
       args: server.args,
       root_markers: server.root_markers,
       disabled: server.disabled,
     };
+    if (server.extensions && server.extensions.length > 0) {
+      entry.extensions = server.extensions.map(normalizeLspExtension);
+    }
+    if (server.binary) {
+      entry.binary = server.binary;
+    }
     if (server.env && Object.keys(server.env).length > 0) {
       entry.env = server.env;
     }
@@ -728,7 +826,12 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
       return null;
     }
     migrateRawConfig(rawConfig, configPath, { log, warn });
-    const result = AftConfigSchema.safeParse(rawConfig);
+    // comment-json attaches Symbol(before/after:<key>) props to track comments.
+    // Zod stringifies keys when building error paths, which throws on those
+    // symbols and would silently drop the whole config to defaults (issue #88).
+    // Validate against a symbol-free deep copy.
+    const cleanConfig = stripJsoncSymbols(rawConfig);
+    const result = AftConfigSchema.safeParse(cleanConfig);
 
     if (result.success) {
       log(`Config loaded from ${configPath}`);
@@ -737,7 +840,7 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
 
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
-    return parseConfigPartially(rawConfig);
+    return parseConfigPartially(cleanConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
@@ -788,6 +891,7 @@ function mergeSemanticConfig(
   if (override?.model !== undefined) projectSafe.model = override.model;
   if (override?.timeout_ms !== undefined) projectSafe.timeout_ms = override.timeout_ms;
   if (override?.max_batch_size !== undefined) projectSafe.max_batch_size = override.max_batch_size;
+  if (override?.max_files !== undefined) projectSafe.max_files = override.max_files;
 
   const semantic: SemanticConfig = { ...base, ...projectSafe };
   if (Object.values(semantic).every((v) => v === undefined)) return undefined;
@@ -808,8 +912,14 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   // either — a hostile repo could silently disable LSP servers the user
   // relies on, suppressing diagnostics for its own malicious code
   // (audit v0.17 #5).
+  //
+  // SAFE project-level fields: python (per-language preference) and
+  // diagnostics_on_edit (agent workflow/latency preference only).
   const projectSafe: LspConfig = {};
   if (override?.python !== undefined) projectSafe.python = override.python;
+  if (override?.diagnostics_on_edit !== undefined) {
+    projectSafe.diagnostics_on_edit = override.diagnostics_on_edit;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = base?.disabled ?? [];
@@ -829,6 +939,40 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
  * OpenCode plugin so a project can override one sub-feature without nuking
  * the user's other sub-features. Handles boolean and object shapes.
  */
+function mergeInspectConfig(
+  baseInspect: AftConfig["inspect"],
+  overrideInspect: AftConfig["inspect"],
+): AftConfig["inspect"] {
+  const inspect = {
+    ...baseInspect,
+    ...overrideInspect,
+    duplicates:
+      baseInspect?.duplicates || overrideInspect?.duplicates
+        ? {
+            ...baseInspect?.duplicates,
+            ...overrideInspect?.duplicates,
+            anonymize:
+              baseInspect?.duplicates?.anonymize || overrideInspect?.duplicates?.anonymize
+                ? {
+                    ...baseInspect?.duplicates?.anonymize,
+                    ...overrideInspect?.duplicates?.anonymize,
+                  }
+                : undefined,
+          }
+        : undefined,
+  };
+
+  if (inspect.duplicates && inspect.duplicates.anonymize === undefined) {
+    delete inspect.duplicates.anonymize;
+  }
+  if (Object.values(inspect).every((value) => value === undefined)) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(inspect).filter(([, value]) => value !== undefined),
+  ) as AftConfig["inspect"];
+}
+
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
@@ -902,10 +1046,12 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // (Pi schema does not currently expose `hoist_builtin_tools`; if added, mark safe.)
   "format_on_edit",
   "validate_on_edit",
+  "configure_warnings_delivery",
   // Experimental flags: project-settable so users can enable globally
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in a
@@ -915,6 +1061,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
+  // "inspect" handled separately — deep-merged.
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "max_callgraph_files" — USER ONLY (resource budget).
@@ -947,6 +1094,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
+  const inspect = mergeInspectConfig(base.inspect, override.inspect);
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
   // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
@@ -955,6 +1103,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // would wipe out user's `bash: { rewrite: true }`.
   const safeOverride = pickProjectSafeFields(override);
   delete safeOverride.bash;
+  delete safeOverride.inspect;
 
   return {
     ...base,
@@ -963,6 +1112,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
+    ...(inspect !== undefined ? { inspect } : {}),
     experimental,
     semantic,
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),

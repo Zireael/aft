@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
@@ -6,11 +7,11 @@ use std::time::{Duration, Instant};
 use aft::commands::delete_file::handle_delete_file;
 use aft::commands::lsp_diagnostics::handle_lsp_diagnostics;
 use aft::commands::move_file::handle_move_file;
-use aft::commands::transaction::handle_transaction;
 use aft::commands::write::handle_write;
 use aft::config::{Config, UserServerDef};
 use aft::context::AppContext;
-use aft::lsp::client::LspEvent;
+use aft::lsp::child_registry::LspChildRegistry;
+use aft::lsp::client::{LspClient, LspEvent};
 use aft::lsp::diagnostics::DiagnosticSeverity;
 use aft::lsp::manager::LspManager;
 use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, ServerKind};
@@ -161,28 +162,6 @@ fn drain_watched_file_events_from_ctx(ctx: &AppContext) -> Vec<serde_json::Value
         .collect()
 }
 
-fn collect_watched_file_events_from_ctx_before_deadline(
-    ctx: &AppContext,
-    duration: Duration,
-) -> Option<serde_json::Value> {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if let Some(event) = collect_event(&mut ctx.lsp(), |event| {
-            matches!(
-                event,
-                LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
-            )
-        }) {
-            return match event {
-                LspEvent::Notification { params, .. } => params,
-                _ => None,
-            };
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    None
-}
-
 fn config_change_type(params: &serde_json::Value, suffix: &str) -> i64 {
     let changes = params["changes"].as_array().expect("changes array");
     changes
@@ -201,6 +180,54 @@ fn app_context_with_fake_lsp() -> AppContext {
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx
+}
+
+fn app_context_with_fake_typescript_lsp() -> AppContext {
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx
+}
+
+fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
+    let temp_dir = tempdir().expect("tempdir for crashing lsp");
+    #[cfg(windows)]
+    {
+        let script = temp_dir.keep().join("crashing_lsp.cmd");
+        let mut source = String::from("@echo off\r\n");
+        for line in stderr.lines() {
+            if line.is_empty() {
+                source.push_str("echo. 1>&2\r\n");
+            } else {
+                source.push_str(&format!("echo {line} 1>&2\r\n"));
+            }
+        }
+        source.push_str("exit /b 1\r\n");
+        fs::write(&script, source).expect("write crashing lsp cmd script");
+        return script;
+    }
+
+    #[cfg(not(windows))]
+    let script = temp_dir.keep().join("crashing_lsp.py");
+    #[cfg(not(windows))]
+    let source = format!(
+        "#!/usr/bin/env python3
+import sys
+sys.stderr.write({stderr:?})
+sys.stderr.flush()
+"
+    );
+    #[cfg(not(windows))]
+    fs::write(&script, source).expect("write crashing lsp script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod crashing lsp script");
+    }
+    #[cfg(not(windows))]
+    script
 }
 
 #[test]
@@ -439,56 +466,6 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     ];
     event_types.sort_unstable();
     assert_eq!(event_types, vec![1, 3]);
-}
-
-#[test]
-fn transaction_rollback_does_not_notify_lsp_for_reverted_file() {
-    let (_temp_dir, root, files) = typescript_workspace_with_files(&["open.ts"]);
-    let source = &files[0];
-    let first = root.join("txn_first.ts");
-    let second = root.join("txn_second.ts");
-    let original_first = "export const first = 1;\n";
-    let original_second = "export const second = 1;\n";
-    fs::write(&first, original_first).expect("write first");
-    fs::write(&second, original_second).expect("write second");
-
-    let config = Config {
-        project_root: Some(root.clone()),
-        ..Config::default()
-    };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
-    ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
-    wait_for_publish(&mut ctx.lsp());
-
-    let req: RawRequest = serde_json::from_value(serde_json::json!({
-        "id": "txn-lsp-rollback",
-        "command": "transaction",
-        "operations": [
-            {"file": first.display().to_string(), "command": "write", "content": "export const first = 2;\n"},
-            {"file": second.display().to_string(), "command": "write", "content": "export const second = {;\n"}
-        ]
-    }))
-    .expect("request parses");
-    let response = handle_transaction(&req, &ctx);
-    let json = serde_json::to_value(&response).expect("response serializes");
-    assert_eq!(json["success"], false, "transaction should fail: {json}");
-    assert_eq!(
-        fs::read_to_string(&first).expect("read first"),
-        original_first
-    );
-    assert_eq!(
-        fs::read_to_string(&second).expect("read second"),
-        original_second
-    );
-
-    let notified =
-        collect_watched_file_events_from_ctx_before_deadline(&ctx, Duration::from_millis(250));
-    assert!(
-        notified.is_none(),
-        "unexpected LSP watched-file notification: {notified:?}"
-    );
 }
 
 #[test]
@@ -819,6 +796,165 @@ fn test_diagnostics_clear_on_empty_array() {
 }
 
 #[test]
+fn test_lsp_post_initialize_exit_reports_stderr_and_caches_failure() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts", "lib.ts"]);
+    let first = &files[0];
+    let second = &files[1];
+    let ctx = app_context_with_fake_typescript_lsp();
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_EXIT_MODULE_NOT_FOUND", "1");
+
+    let first_req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-post-init-exit-1",
+        "command": "lsp_diagnostics",
+        "file": first.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let first_response = serde_json::to_value(handle_lsp_diagnostics(&first_req, &ctx))
+        .expect("response serializes");
+    let first_status = first_response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .expect("status string");
+    assert!(
+        first_status.contains("MODULE_NOT_FOUND"),
+        "missing stderr in first status: {first_status}"
+    );
+    assert!(
+        first_status.contains("npm install -g typescript-language-server --force"),
+        "missing reinstall hint in first status: {first_status}"
+    );
+    assert_eq!(ctx.lsp().active_client_count(), 0);
+
+    let second_req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-post-init-exit-2",
+        "command": "lsp_diagnostics",
+        "file": second.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let second_response = serde_json::to_value(handle_lsp_diagnostics(&second_req, &ctx))
+        .expect("response serializes");
+    let second_status = second_response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .expect("status string");
+    assert!(
+        second_status.starts_with("spawn_failed"),
+        "expected cached spawn failure, got: {second_status}"
+    );
+    assert!(
+        second_status.contains("MODULE_NOT_FOUND")
+            && second_status.contains("npm install -g typescript-language-server --force"),
+        "cached status lost stderr/hint: {second_status}"
+    );
+    assert_eq!(ctx.lsp().active_client_count(), 0);
+}
+
+#[test]
+fn test_lsp_initialize_crash_reports_stderr_and_hint() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_typescript_lsp();
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_INIT_CRASH_MODULE_NOT_FOUND", "1");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-init-crash",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    let status = response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .expect("status string");
+    assert!(
+        status.contains("server crashed during initialize"),
+        "status: {status}"
+    );
+    assert!(status.contains("MODULE_NOT_FOUND"), "status: {status}");
+    assert!(
+        status.contains("npm install -g typescript-language-server --force"),
+        "missing reinstall hint: {status}"
+    );
+}
+
+#[test]
+fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
+    let file = &files[0];
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let script = executable_crashing_lsp_script(
+        "Error: Cannot find module '/Users/me/.local/share/pnpm/global/5/.pnpm/typescript-language-server@4.3.4/node_modules/typescript-language-server/lib/cli.mjs'
+code: 'MODULE_NOT_FOUND'
+",
+    );
+    ctx.lsp().override_binary(ServerKind::TypeScript, script);
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-init-crash-pnpm",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    let status = response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .expect("status string");
+
+    assert!(
+        status.contains("stderr (last 64 lines)"),
+        "status: {status}"
+    );
+    assert!(
+        status.contains("Try reinstalling: pnpm install -g typescript-language-server --force"),
+        "missing pnpm reinstall hint: {status}"
+    );
+}
+
+#[test]
+fn test_lsp_stderr_tail_is_bounded_and_drained() {
+    let (_temp_dir, root, _files) = rust_workspace_with_files(&["main.rs"]);
+    let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+    let mut env = HashMap::new();
+    env.insert(
+        "AFT_FAKE_LSP_INIT_STDERR_BYTES".to_string(),
+        "200000".to_string(),
+    );
+    let mut client = LspClient::spawn(
+        ServerKind::Rust,
+        root.clone(),
+        &fake_server_path(),
+        &[],
+        &env,
+        event_tx,
+        LspChildRegistry::new(),
+    )
+    .expect("spawn fake lsp");
+
+    let _ = client
+        .initialize(&root, None)
+        .expect_err("initialize should fail");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while client.stderr_tail().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let tail = client.stderr_tail();
+    assert!(!tail.is_empty(), "stderr tail should be captured");
+    assert!(
+        tail.lines().count() <= 64,
+        "stderr tail exceeded line cap: {}",
+        tail.lines().count()
+    );
+    assert!(tail.contains("MODULE_NOT_FOUND"), "tail: {tail}");
+}
+
+#[test]
 fn test_lsp_diagnostics_command_response_format() {
     let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
     let file = &files[0];
@@ -835,20 +971,20 @@ fn test_lsp_diagnostics_command_response_format() {
     ]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(configure["success"], true);
 
     let write = aft.send(&format!(
-        r#"{{"id":"write-1","command":"write","file":"{}","content":"fn main() {{ println!(\"hello\"); }}\n"}}"#,
-        file.display()
+        r#"{{"id":"write-1","command":"write","file":{},"content":"fn main() {{ println!(\"hello\"); }}\n"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(write["success"], true, "write failed: {write:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"diag-1","command":"lsp_diagnostics","file":"{}","wait_ms":400}}"#,
-        file.display()
+        r#"{{"id":"diag-1","command":"lsp_diagnostics","file":{},"wait_ms":400}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["id"], "diag-1");
@@ -1124,6 +1260,103 @@ fn test_pull_diagnostics_falls_back_when_unsupported() {
         matches!(results[0].outcome, PullFileOutcome::PullNotSupported),
         "expected PullNotSupported, got {:?}",
         results[0].outcome
+    );
+}
+
+#[test]
+fn test_unchanged_pull_without_cache_falls_back_to_push() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_lsp();
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_UNCHANGED", "1");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-unchanged-no-cache",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 500
+    }))
+    .expect("request parses");
+
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+
+    assert_eq!(response["success"], true, "response: {response}");
+    assert_eq!(response["complete"], true, "response: {response}");
+    assert_eq!(
+        response["total"], 2,
+        "push fallback should return didOpen diagnostics"
+    );
+    assert_eq!(
+        response["lsp_servers_used"][0]["status"],
+        "pull_no_cache_for_unchanged"
+    );
+}
+
+fn assert_rejected_pull_falls_back_to_push(env_key: &str) {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_lsp();
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env(env_key, "1");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": format!("diag-rejected-{env_key}"),
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 500
+    }))
+    .expect("request parses");
+
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+
+    assert_eq!(response["success"], true, "response: {response}");
+    assert_eq!(response["complete"], true, "response: {response}");
+    assert_eq!(
+        response["total"], 2,
+        "push fallback should return didOpen diagnostics"
+    );
+    assert_eq!(
+        response["lsp_servers_used"][0]["status"],
+        "pull_rejected_push_fallback"
+    );
+}
+
+#[test]
+fn test_method_not_found_pull_rejection_falls_back_to_push() {
+    assert_rejected_pull_falls_back_to_push("AFT_FAKE_LSP_PULL_METHOD_NOT_FOUND");
+}
+
+#[test]
+fn test_invalid_params_pull_rejection_falls_back_to_push() {
+    assert_rejected_pull_falls_back_to_push("AFT_FAKE_LSP_PULL_INVALID_PARAMS");
+}
+
+#[test]
+fn closing_file_clears_cached_diagnostics_before_reopen() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let mut manager = manager_with_fake_server();
+
+    manager
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("open file");
+    wait_for_publish(&mut manager);
+    assert_eq!(manager.get_diagnostics_for_file(file).len(), 2);
+
+    manager
+        .notify_file_changed_default(file, "fn main() { println!(\"changed\"); }\n")
+        .expect("change file");
+    wait_for_publish(&mut manager);
+    assert_eq!(manager.get_diagnostics_for_file(file).len(), 1);
+
+    manager.notify_file_closed(file).expect("close file");
+
+    assert!(
+        manager.get_diagnostics_for_file(file).is_empty(),
+        "close should clear cached diagnostics immediately, before any reopen"
     );
 }
 
@@ -1496,9 +1729,13 @@ fn directory_mode_with_walk_truncation_reports_complete_false() {
     assert_eq!(json["success"], true);
     assert_eq!(json["complete"], false);
     assert_eq!(json["walk_truncated"], true);
+    // The directory walk stops at DIRECTORY_FILE_CAP (200) instead of
+    // enumerating the whole tree; walk_truncated is the honest gap signal that
+    // more files exist beyond the cap. unchecked_files lists the within-cap
+    // files that no server covered (here: all 200, since no LSP is registered).
     assert_eq!(
         json["unchecked_files"].as_array().expect("unchecked").len(),
-        50
+        200
     );
 }
 

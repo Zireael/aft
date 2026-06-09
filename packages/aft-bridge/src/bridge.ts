@@ -6,8 +6,10 @@ import { StringDecoder } from "node:string_decoder";
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
+import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
+const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 
@@ -156,6 +158,16 @@ class BridgeReplacedDuringVersionCheck extends Error {
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
+  /**
+   * Extra environment variables to set on the spawned `aft` child process,
+   * applied on top of the inherited `process.env` at spawn time. Use this to
+   * scope per-bridge child env (e.g. `AFT_CACHE_DIR` in tests) WITHOUT mutating
+   * the shared process-global `process.env` — mutating `process.env` races
+   * across concurrent bridges and, because spawn is lazy (first `send()`), is
+   * easily restored before the child actually inherits it. A value of
+   * `undefined` deletes the key from the child env.
+   */
+  childEnv?: Record<string, string | undefined>;
   /** Maximum restart attempts before giving up. Default: 3 */
   maxRestarts?: number;
   /** Minimum binary version required (semver). If the binary is older, onVersionMismatch is called. */
@@ -178,6 +190,8 @@ export interface BridgeOptions {
     reminder: BashLongRunningPayload,
     bridge: BinaryBridge,
   ) => void | Promise<void>;
+  /** Called for server-pushed bash pattern watch matches. */
+  onBashPatternMatch?: (frame: BashPatternMatchFrame, bridge: BinaryBridge) => void | Promise<void>;
   /**
    * Prefix for user-facing error messages thrown by the bridge (e.g. timeout,
    * stdin-write, configure-failure errors). Hosts pass their own tag so the
@@ -206,6 +220,17 @@ export interface BashLongRunningPayload {
   elapsed_ms: number;
 }
 
+export interface BashPatternMatchFrame {
+  type: "bash_pattern_match";
+  task_id: string;
+  session_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+}
+
 export interface StatusSnapshot {
   version?: string;
   project_root?: string | null;
@@ -227,12 +252,13 @@ export interface BridgeRequestOptions {
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
   transportTimeoutMs?: number;
   /**
-   * Skip the "kill the child process on timeout" behavior for this request.
+   * Skip bridge-hang escalation for this request.
    *
-   * The default (false) treats a transport-level timeout as evidence the bridge
-   * is wedged — Rust normally responds well within the budget, so silence past
-   * the deadline almost always means a stuck child. Killing forces a clean
-   * respawn on the next call.
+   * The default (false) treats a transport-level timeout as a possible bridge
+   * hang. The bridge now escalates cautiously: a single timeout while the child
+   * is still emitting stdout, or before the hang threshold is reached, rejects
+   * only that request and keeps warm state. Repeated silent timeouts still kill
+   * the child so the next call gets a fresh bridge.
    *
    * Some commands enforce their own timeouts on the Rust side (notably `bash`,
    * which uses a watchdog thread to terminate the child shell and return a
@@ -240,7 +266,7 @@ export interface BridgeRequestOptions {
    * lost or queued behind something else — the bridge itself is still healthy
    * and should keep its warm state (LSP servers, semantic index, callers
    * cache, undo history). Pass `keepBridgeOnTimeout: true` to reject the
-   * request without tearing down the bridge.
+   * request without contributing to hang escalation.
    */
   keepBridgeOnTimeout?: boolean;
 }
@@ -248,6 +274,7 @@ export interface BridgeRequestOptions {
 interface SendOptions extends BridgeRequestOptions {
   timeoutMs?: number;
   configureWarningClient?: unknown;
+  markConfiguredOnSuccess?: boolean;
 }
 
 /**
@@ -287,13 +314,28 @@ export class BinaryBridge {
   private onBashLongRunning:
     | ((reminder: BashLongRunningPayload, bridge: BinaryBridge) => void | Promise<void>)
     | undefined;
+  private onBashPatternMatch:
+    | ((frame: BashPatternMatchFrame, bridge: BinaryBridge) => void | Promise<void>)
+    | undefined;
   private cachedStatus: StatusSnapshot | null = null;
   private statusListeners = new Set<(snapshot: StatusSnapshot) => void>();
   /** Notification clients keyed by session_id for async configure warning pushes. */
   private configureWarningClients = new Map<string, unknown>();
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Updated after every successfully parsed stdout frame from the child. */
+  private lastChildActivityAt = 0;
+  /**
+   * Latest agent status-bar counts seen on any `data.status_bar` envelope. The
+   * Rust bridge attaches current counts to (almost) every response; we cache
+   * the freshest so the per-tool after-hook can render the bar without extra
+   * plumbing per call. `undefined` until the first attach (no scan yet).
+   */
+  private lastStatusBar: StatusBarCounts | undefined;
+  /** Consecutive non-bash-style request timeouts without an id-matched response. */
+  private consecutiveRequestTimeouts = 0;
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
+  private readonly childEnv: Record<string, string | undefined> | undefined;
 
   constructor(
     binaryPath: string,
@@ -311,8 +353,10 @@ export class BinaryBridge {
     this.onConfigureWarnings = options?.onConfigureWarnings;
     this.onBashCompletion = options?.onBashCompletion;
     this.onBashLongRunning = options?.onBashLongRunning;
+    this.onBashPatternMatch = options?.onBashPatternMatch;
     this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     this.logger = options?.logger;
+    this.childEnv = options?.childEnv;
   }
 
   private logVia(message: string, meta?: LogMeta): void {
@@ -403,6 +447,11 @@ export class BinaryBridge {
     return this.pending.size > 0;
   }
 
+  /** Project root this bridge was spawned/configured for. */
+  getCwd(): string {
+    return this.cwd;
+  }
+
   /** Returns the latest pushed or primed status snapshot, or null before the cold path completes. */
   getCachedStatus(): StatusSnapshot | null {
     return this.cachedStatus;
@@ -474,6 +523,18 @@ export class BinaryBridge {
         this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
       }
 
+      // Per-op timeout override: tool wrappers can pass longer budgets for
+      // commands that legitimately need them (callers, trace_to, grep on big
+      // repos). Defaults to the bridge-wide timeout otherwise.
+      const effectiveTimeoutMs =
+        options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
+      const implicitTransportOptions: SendOptions = {
+        ...(options?.transportTimeoutMs !== undefined || options?.timeoutMs !== undefined
+          ? { transportTimeoutMs: effectiveTimeoutMs }
+          : {}),
+        markConfiguredOnSuccess: false,
+      };
+
       // Auto-configure project root + plugin config on first command, then check version.
       // configured is set AFTER success to prevent skipping configuration on failure (#18).
       // When multiple parallel calls arrive before configure completes, they all await
@@ -493,11 +554,15 @@ export class BinaryBridge {
               typeof params.session_id === "string" ? (params.session_id as string) : undefined;
             this._configurePromise = (async () => {
               try {
-                const configResult = await this.send("configure", {
-                  project_root: this.cwd,
-                  ...this.configOverrides,
-                  ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
-                });
+                const configResult = await this.send(
+                  "configure",
+                  {
+                    project_root: this.cwd,
+                    ...this.configOverrides,
+                    ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
+                  },
+                  implicitTransportOptions,
+                );
                 if (configResult.success === false) {
                   throw new Error(
                     `${this.errorPrefix} Configure failed: ${configResult.message ?? "unknown error"}`,
@@ -507,7 +572,7 @@ export class BinaryBridge {
                 // and relayed through stderr → plugin log. No need to re-log here
                 // (doing so would just duplicate the same line in aft-plugin.log).
                 await this.deliverConfigureWarnings(configResult, params, options);
-                await this.checkVersion();
+                await this.checkVersion(implicitTransportOptions);
                 // Re-check liveness after version check — checkVersion() swallows
                 // errors as best-effort, so the bridge may have died without throwing.
                 if (!this.isAlive()) {
@@ -552,36 +617,59 @@ export class BinaryBridge {
       }
       const line = `${JSON.stringify(request)}\n`;
 
-      // Per-op timeout override: tool wrappers can pass longer budgets for
-      // commands that legitimately need them (callers, trace_to, grep on big
-      // repos). Defaults to the bridge-wide timeout otherwise.
-      const effectiveTimeoutMs =
-        options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
-
       const keepBridgeOnTimeout = options?.keepBridgeOnTimeout === true;
+      let requestSentAt = Date.now();
 
-      return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
         const timer = setTimeout(() => {
+          const entry = this.pending.get(id);
+          if (!entry) return;
           this.pending.delete(id);
-          const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
+          clearTimeout(entry.timer);
+
+          if (keepBridgeOnTimeout) {
+            const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`;
+            if (requestSessionId) {
+              this.sessionWarnVia(requestSessionId, timeoutMsg);
+            } else {
+              this.warnVia(timeoutMsg);
+            }
+            entry.reject(
+              new Error(
+                `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+              ),
+            );
+            return;
+          }
+
+          const childActiveSinceRequest = this.lastChildActivityAt > requestSentAt;
+          const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
+          this.consecutiveRequestTimeouts = consecutiveTimeouts;
+          const keepWarm =
+            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD;
+          const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
             this.sessionWarnVia(requestSessionId, timeoutMsg);
           } else {
             this.warnVia(timeoutMsg);
           }
-          reject(
+
+          if (keepWarm) {
+            entry.reject(
+              new Error(
+                `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry`,
+              ),
+            );
+            return;
+          }
+
+          entry.reject(
             new Error(
               `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
             ),
           );
-          // Kill the hung process so the next request gets a fresh bridge —
-          // unless the caller explicitly opted out (e.g. bash, which enforces
-          // its own timeout on the Rust side and shouldn't lose warm bridge
-          // state when its response is merely late).
-          if (!keepBridgeOnTimeout) {
-            this.handleTimeout(requestSessionId);
-          }
+          this.handleTimeout(requestSessionId);
         }, effectiveTimeoutMs);
 
         this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
@@ -593,6 +681,7 @@ export class BinaryBridge {
           return;
         }
 
+        requestSentAt = Date.now();
         this.process.stdin.write(line, (err) => {
           if (err) {
             const entry = this.pending.get(id);
@@ -606,6 +695,16 @@ export class BinaryBridge {
           }
         });
       });
+
+      if (
+        command === "configure" &&
+        response.success === true &&
+        options?.markConfiguredOnSuccess !== false
+      ) {
+        this.configured = true;
+      }
+
+      return response;
     } catch (err) {
       if (
         err instanceof BridgeReplacedDuringVersionCheck &&
@@ -684,7 +783,9 @@ export class BinaryBridge {
     const snapshot = frame.snapshot;
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
     this.cachedStatus = snapshot as StatusSnapshot;
-    this.logVia("Received status_changed push frame; cached AFT status snapshot");
+    // Status-changed frames arrive frequently (every Tier-2 completion,
+    // semantic progress tick, watcher refresh). Logging each one floods the
+    // plugin log, so this cache update is intentionally silent.
     for (const listener of this.statusListeners) {
       this.deliverStatusSnapshot(listener, this.cachedStatus);
     }
@@ -732,10 +833,10 @@ export class BinaryBridge {
   // ---- Internal ----
 
   /** Query binary version and compare against minVersion. Calls onVersionMismatch if outdated. */
-  private async checkVersion(): Promise<void> {
+  private async checkVersion(options?: SendOptions): Promise<void> {
     if (!this.minVersion) return;
     try {
-      const resp = await this.send("version");
+      const resp = await this.send("version", {}, options);
       if (resp.success === false) {
         throw new Error(
           `Binary version check failed: ${String(resp.code ?? "unknown")} — likely too old`,
@@ -806,6 +907,12 @@ export class BinaryBridge {
   }
 
   private spawnProcess(triggeringSessionId?: string): void {
+    // A freshly-spawned process has published no diagnostics yet, so its warm
+    // E/W set is empty. Drop the cached status bar from any prior process here
+    // (covers initial spawn, crash auto-restart, and version-swap respawn) so a
+    // dead process's stale counts are never re-emitted on the next tool result
+    // before the new process repopulates them (#6).
+    this.lastStatusBar = undefined;
     if (triggeringSessionId) {
       this.sessionLogVia(
         triggeringSessionId,
@@ -850,6 +957,17 @@ export class BinaryBridge {
       ...(envPath ? { PATH: envPath } : {}),
     };
 
+    // Diagnostic: prove the spawnProcess code path executes and what
+    // useFastembedBackend / parent ORT_DYLIB_PATH look like at spawn time.
+    // The E2E harness asserts ORT_DYLIB_PATH propagation through plugin log;
+    // earlier targeted log lines never appeared in CI runs even though the
+    // dist contained them, so this unconditional marker proves whether the
+    // code path is reached at all.
+    this.logVia(
+      `bridge.spawnProcess: useFastembedBackend=${useFastembedBackend}, ` +
+        `parentORT=${process.env.ORT_DYLIB_PATH ?? "(unset)"}, ` +
+        `ortLibraryPath=${ortLibraryPath ?? "(none)"}`,
+    );
     if (useFastembedBackend) {
       // Store fastembed model files alongside the semantic index, not the project cwd.
       // This is only relevant when the fastembed backend is selected.
@@ -860,8 +978,29 @@ export class BinaryBridge {
           : join(homedir() || "", ".cache", "fastembed"));
 
       // Point ort to the auto-downloaded or system ONNX Runtime library.
-      if (ortLibraryPath) {
+      // An explicit ORT_DYLIB_PATH in the parent environment wins — that
+      // lets users (and the Docker/macOS E2E harnesses) test what happens
+      // when ort can't load the library, without our managed-install
+      // resolution silently masking the bad path. Log either way so the
+      // E2E harness can assert the env var made it through.
+      if (process.env.ORT_DYLIB_PATH) {
+        this.logVia(`ORT_DYLIB_PATH inherited from parent env: ${process.env.ORT_DYLIB_PATH}`);
+      } else if (ortLibraryPath) {
         env.ORT_DYLIB_PATH = ortLibraryPath;
+        this.logVia(`ORT_DYLIB_PATH set from managed ONNX Runtime: ${ortLibraryPath}`);
+      }
+    }
+
+    // Per-bridge child env overrides (e.g. AFT_CACHE_DIR in tests). Applied last
+    // so they win over inherited/derived values, and scoped to THIS child only —
+    // no shared process.env mutation, so concurrent bridges can't race.
+    if (this.childEnv) {
+      for (const [key, value] of Object.entries(this.childEnv)) {
+        if (value === undefined) {
+          delete env[key];
+        } else {
+          env[key] = value;
+        }
       }
     }
 
@@ -879,6 +1018,7 @@ export class BinaryBridge {
     child.stdout?.on("end", () => {
       const remaining = stdoutDecoder.end();
       if (remaining) this.onStdoutData(remaining);
+      this.flushStdoutBuffer();
     });
 
     const stderrDecoder = new StringDecoder("utf8");
@@ -900,6 +1040,7 @@ export class BinaryBridge {
     child.on("exit", (code, signal) => {
       if (this.process !== currentChild) return;
       if (this._shuttingDown) return;
+      this.flushStdoutBuffer();
       this.logVia(`Process exited: code=${code}, signal=${signal}`);
       // External termination signals (SIGTERM/SIGKILL/SIGHUP/SIGINT) are almost
       // always intentional kills — from our own shutdown path, OpenCode tearing
@@ -926,6 +1067,8 @@ export class BinaryBridge {
     this.process = child;
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
+    this.lastChildActivityAt = 0;
+    this.consecutiveRequestTimeouts = 0;
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
     this.stderrTail = [];
@@ -988,69 +1131,108 @@ export class BinaryBridge {
 
       if (!line) continue;
 
-      try {
-        const response = JSON.parse(line) as Record<string, unknown>;
-        if (response.type === "progress") {
-          const requestId = response.request_id as string | undefined;
-          const entry = requestId ? this.pending.get(requestId) : undefined;
-          const kind = response.kind === "stderr" ? "stderr" : "stdout";
-          const text = typeof response.chunk === "string" ? response.chunk : "";
-          entry?.onProgress?.({ kind, text });
-          continue;
-        }
-        if (response.type === "permission_ask") {
-          const requestId = response.request_id as string | undefined;
-          const entry = requestId ? this.pending.get(requestId) : undefined;
-          if (requestId && entry) {
-            this.pending.delete(requestId);
-            clearTimeout(entry.timer);
-            entry.resolve({
-              success: false,
-              code: "permission_required",
-              message: "bash command requires permission",
-              asks: response.asks,
-            });
-          }
-          continue;
-        }
-        if (response.type === "bash_completed") {
-          this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
-          continue;
-        }
-        if (response.type === "bash_long_running") {
-          this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
-          continue;
-        }
-        if (response.type === "configure_warnings") {
-          this.handleConfigureWarningsFrame(response).catch((err) => {
-            this.warnVia(
-              `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-          continue;
-        }
-        if (response.type === "status_changed") {
-          this.handleStatusChangedFrame(response);
-          continue;
-        }
-        const id = response.id as string | undefined;
-        if (id && this.pending.has(id)) {
-          const entry = this.pending.get(id);
-          if (!entry) continue;
-          this.pending.delete(id);
-          clearTimeout(entry.timer);
-          this.scheduleRestartCountReset();
-          entry.resolve(response);
-        } else if (typeof response.type === "string") {
-          this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
-        }
-      } catch (_err) {
-        this.warnVia(`Failed to parse stdout line: ${line}`);
-      }
+      this.processStdoutLine(line);
     }
   }
 
+  private flushStdoutBuffer(): void {
+    const line = this.stdoutBuffer.trim();
+    this.stdoutBuffer = "";
+    if (!line) return;
+    this.processStdoutLine(line);
+  }
+
+  private processStdoutLine(line: string): void {
+    try {
+      const response = JSON.parse(line) as Record<string, unknown>;
+      this.lastChildActivityAt = Date.now();
+      if (response.type === "progress") {
+        const requestId = response.request_id as string | undefined;
+        const entry = requestId ? this.pending.get(requestId) : undefined;
+        const kind = response.kind === "stderr" ? "stderr" : "stdout";
+        const text = typeof response.chunk === "string" ? response.chunk : "";
+        entry?.onProgress?.({ kind, text });
+        return;
+      }
+      if (response.type === "permission_ask") {
+        const requestId = response.request_id as string | undefined;
+        const entry = requestId ? this.pending.get(requestId) : undefined;
+        if (requestId && entry) {
+          this.pending.delete(requestId);
+          clearTimeout(entry.timer);
+          entry.resolve({
+            success: false,
+            code: "permission_required",
+            message: "bash command requires permission",
+            asks: response.asks,
+          });
+        }
+        return;
+      }
+      if (response.type === "bash_completed") {
+        this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
+        return;
+      }
+      if (response.type === "bash_long_running") {
+        this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
+        return;
+      }
+      if (response.type === "bash_pattern_match") {
+        this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this);
+        return;
+      }
+      if (response.type === "configure_warnings") {
+        this.handleConfigureWarningsFrame(response).catch((err) => {
+          this.warnVia(
+            `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+        return;
+      }
+      if (response.type === "status_changed") {
+        this.handleStatusChangedFrame(response);
+        return;
+      }
+      const id = response.id as string | undefined;
+      if (id && this.pending.has(id)) {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        clearTimeout(entry.timer);
+        this.consecutiveRequestTimeouts = 0;
+        this.scheduleRestartCountReset();
+        this.captureStatusBar(response);
+        entry.resolve(response);
+      } else if (typeof response.type === "string") {
+        this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
+      }
+    } catch (_err) {
+      this.warnVia(`Failed to parse stdout line: ${line}`);
+    }
+  }
+
+  /**
+   * Cache the agent status-bar counts from a response. The Rust `Response.data`
+   * is `#[serde(flatten)]`, so the attached `status_bar` object lands at the
+   * TOP LEVEL of the wire envelope (`response.status_bar`), not nested under a
+   * `data` key — same as `bg_completions`.
+   */
+  private captureStatusBar(response: Record<string, unknown>): void {
+    const parsed = parseStatusBarCounts(response.status_bar);
+    if (parsed) this.lastStatusBar = parsed;
+  }
+
+  /**
+   * Latest agent status-bar counts seen on any response, or `undefined` before
+   * the first attach (no inspect scan has populated Tier-2 yet). The per-tool
+   * after-hook reads this and applies emit-on-change gating.
+   */
+  getStatusBar(): StatusBarCounts | undefined {
+    return this.lastStatusBar;
+  }
+
   private handleTimeout(triggeringSessionId?: string): void {
+    this.consecutiveRequestTimeouts = 0;
     // A timed-out request means the child is about to be SIGKILLed. Reject all
     // sibling in-flight requests now instead of leaving them parked until their
     // own independent timers fire.

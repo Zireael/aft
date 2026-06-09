@@ -1,0 +1,3 @@
+import Foo, * as NS from 'mod';
+
+export const x = Foo;

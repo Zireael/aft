@@ -19,10 +19,16 @@ use crate::lsp::diagnostics::{
 };
 use crate::lsp::document::DocumentStore;
 use crate::lsp::position::{uri_for_path, uri_to_path};
+use crate::lsp::pull_params::{
+    AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
+    AftWorkspaceDiagnosticRequest,
+};
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
 use crate::lsp::roots::{find_workspace_root, ServerKey};
 use crate::lsp::LspError;
 use crate::slog_error;
+
+const STDERR_REASON_BYTES: usize = 2 * 1024;
 
 /// Outcome of attempting to ensure a server is running for a single matching
 /// `ServerDef`. Returned per matching server so the caller can report exactly
@@ -70,6 +76,22 @@ impl EnsureServerOutcomes {
     /// True if no server in the registry matched this file's extension.
     pub fn no_server_registered(&self) -> bool {
         self.attempts.is_empty()
+    }
+
+    /// True when servers matched the file's extension but none actually apply
+    /// to this project — i.e. nothing started and every attempt failed the root
+    /// marker check (e.g. oxlint registered for `.ts` with no `.oxlintrc.json`).
+    /// Distinct from `no_server_registered` (extension unsupported) and from a
+    /// real outage (binary missing / spawn failed): a missing root marker is a
+    /// filesystem fact that never changes mid-scan, so such a file will never
+    /// produce diagnostics and must not be reported as "pending".
+    pub fn only_inapplicable_root_markers(&self) -> bool {
+        self.successful.is_empty()
+            && !self.attempts.is_empty()
+            && self
+                .attempts
+                .iter()
+                .all(|attempt| matches!(attempt.result, ServerAttemptResult::NoRootMarker { .. }))
     }
 }
 
@@ -174,9 +196,27 @@ pub struct PullWorkspaceResult {
     pub supports_workspace: bool,
 }
 
+pub struct DrainedLspEvents {
+    pub events: Vec<LspEvent>,
+    pub diagnostics_changed: bool,
+}
+
+impl IntoIterator for DrainedLspEvents {
+    type Item = LspEvent;
+    type IntoIter = std::vec::IntoIter<LspEvent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.into_iter()
+    }
+}
+
 pub struct LspManager {
     /// Active server instances, keyed by (ServerKind, workspace_root).
     clients: HashMap<ServerKey, LspClient>,
+    /// Binary names for active server instances. Kept separate from
+    /// `LspClient` so crash handling can report the installable binary name
+    /// after a post-initialize process exit.
+    server_binaries: HashMap<ServerKey, String>,
     /// Tracks opened documents and versions per active server.
     documents: HashMap<ServerKey, DocumentStore>,
     /// Stored publishDiagnostics payloads across all servers.
@@ -219,6 +259,7 @@ impl LspManager {
         let (event_tx, event_rx) = unbounded();
         Self {
             clients: HashMap::new(),
+            server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
             event_tx,
@@ -246,6 +287,13 @@ impl LspManager {
     /// Count active LSP server instances.
     pub fn server_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Apply the configured diagnostic LRU cap (the `lsp.diagnostic_cache_size`
+    /// knob). 0 disables the cap. Called at construction so the documented
+    /// config field actually takes effect instead of always using the default.
+    pub fn set_diagnostic_capacity(&mut self, capacity: usize) {
+        self.diagnostics.set_capacity(capacity);
     }
 
     /// For testing: override the binary for a server kind.
@@ -318,6 +366,7 @@ impl LspManager {
                 match self.spawn_server(&def, &key.root, config) {
                     Ok(client) => {
                         self.clients.insert(key.clone(), client);
+                        self.server_binaries.insert(key.clone(), def.binary.clone());
                         self.documents.entry(key.clone()).or_default();
                     }
                     Err(err) => {
@@ -598,13 +647,17 @@ impl LspManager {
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                // Only send after the server dynamically registers interest.
-                // `workspace/didChangeWatchedFiles` is client-owned; a server's
-                // initialize-time dynamicRegistration shape is not a subscription.
-                if !client.has_watched_file_registration() {
+                // Send when the server either advertised initialize-time
+                // watched-file support or dynamically registered a watcher.
+                // The dynamic client capability we send during initialize only
+                // permits runtime registration; it is tracked separately via
+                // `has_watched_file_registration()`.
+                let supports_static_watched_files = client.supports_watched_files();
+                let has_dynamic_registration = client.has_watched_file_registration();
+                if !(supports_static_watched_files || has_dynamic_registration) {
                     if self.watched_file_skip_logged.insert(key.clone()) {
                         log::debug!(
-                            "skipping didChangeWatchedFiles for {:?} (not dynamically registered)",
+                            "skipping didChangeWatchedFiles for {:?} (not supported or registered)",
                             key
                         );
                     }
@@ -644,6 +697,8 @@ impl LspManager {
             if let Some(store) = self.documents.get_mut(&key) {
                 store.close(&canonical_path);
             }
+            self.diagnostics
+                .clear_for_server_file(&key, &canonical_path);
         }
 
         Ok(())
@@ -679,13 +734,19 @@ impl LspManager {
     }
 
     /// Drain all pending LSP events. Call from the main loop.
-    pub fn drain_events(&mut self) -> Vec<LspEvent> {
+    pub fn drain_events(&mut self) -> DrainedLspEvents {
         let mut events = Vec::new();
+        let mut diagnostics_changed = false;
         while let Ok(event) = self.event_rx.try_recv() {
-            self.handle_event(&event);
+            if self.handle_event(&event).is_some() {
+                diagnostics_changed = true;
+            }
             events.push(event);
         }
-        events
+        DrainedLspEvents {
+            events,
+            diagnostics_changed,
+        }
     }
 
     /// Wait for diagnostics to arrive for a specific file until a timeout expires.
@@ -714,6 +775,29 @@ impl LspManager {
     #[doc(hidden)]
     pub fn diagnostics_store_for_test(&self) -> &DiagnosticsStore {
         &self.diagnostics
+    }
+
+    #[doc(hidden)]
+    pub fn diagnostics_store_mut_for_test(&mut self) -> &mut DiagnosticsStore {
+        &mut self.diagnostics
+    }
+
+    /// Error/warning counts across the entire warm diagnostics set (all files
+    /// any server has published for this session). Powers the agent status bar;
+    /// reads the continuously-drained store with no extra LSP round-trip.
+    pub fn warm_error_warning_counts(&self) -> (usize, usize) {
+        self.diagnostics.error_warning_counts()
+    }
+
+    /// Status-bar error/warning counts with a per-file `keep` predicate and
+    /// cross-server dedup applied (see
+    /// [`DiagnosticsStore::filtered_error_warning_counts`]). The caller supplies
+    /// the project-root + tsconfig-membership policy via `keep`.
+    pub fn filtered_error_warning_counts(
+        &self,
+        keep: impl FnMut(&std::path::Path) -> bool,
+    ) -> (usize, usize) {
+        self.diagnostics.filtered_error_warning_counts(keep)
     }
 
     /// Snapshot the current per-server epoch for every entry that exists
@@ -1036,7 +1120,7 @@ impl LspManager {
                 .and_then(|c| c.diagnostic_capabilities())
                 .and_then(|caps| caps.identifier.clone());
 
-            let params = lsp_types::DocumentDiagnosticParams {
+            let params = AftDocumentDiagnosticParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
                 identifier,
                 previous_result_id,
@@ -1046,9 +1130,28 @@ impl LspManager {
 
             let outcome = match self.send_pull_request(&key, params) {
                 Ok(report) => self.ingest_document_report(&key, &canonical_path, report),
-                Err(err) => PullFileOutcome::RequestFailed {
-                    reason: err.to_string(),
-                },
+                Err(err) => {
+                    if let Some(result) = self.cache_post_initialize_exit(&key, &err) {
+                        PullFileOutcome::RequestFailed {
+                            reason: server_attempt_result_reason(&result),
+                        }
+                    } else if recoverable_pull_rejection(&err)
+                        && self.clients.get(&key).is_some_and(|client| {
+                            matches!(
+                                client.state(),
+                                ServerState::Ready | ServerState::Initializing
+                            )
+                        })
+                    {
+                        PullFileOutcome::RequestFailed {
+                            reason: format!("pull_rejected_push_fallback: {err}"),
+                        }
+                    } else {
+                        PullFileOutcome::RequestFailed {
+                            reason: err.to_string(),
+                        }
+                    }
+                }
             };
 
             results.push(PullFileResult {
@@ -1093,7 +1196,7 @@ impl LspManager {
             .and_then(|c| c.diagnostic_capabilities())
             .and_then(|caps| caps.identifier.clone());
 
-        let params = lsp_types::WorkspaceDiagnosticParams {
+        let params = AftWorkspaceDiagnosticParams {
             identifier,
             previous_result_ids: Vec::new(),
             work_done_progress_params: Default::default(),
@@ -1104,9 +1207,8 @@ impl LspManager {
             .clients
             .get_mut(server_key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
-            .send_request_with_timeout::<lsp_types::request::WorkspaceDiagnosticRequest>(
-                params, timeout,
-            ) {
+            .send_request_with_timeout::<AftWorkspaceDiagnosticRequest>(params, timeout)
+        {
             Ok(result) => result,
             Err(LspError::Timeout(_)) => {
                 return Ok(PullWorkspaceResult {
@@ -1117,7 +1219,14 @@ impl LspManager {
                     supports_workspace: true,
                 });
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                if let Some(result) = self.cache_post_initialize_exit(server_key, &err) {
+                    return Err(LspError::ServerNotReady(server_attempt_result_reason(
+                        &result,
+                    )));
+                }
+                return Err(err);
+            }
         };
 
         // Extract the items list. Partial responses are not a complete
@@ -1163,17 +1272,57 @@ impl LspManager {
         })
     }
 
+    fn cache_post_initialize_exit(
+        &mut self,
+        key: &ServerKey,
+        err: &LspError,
+    ) -> Option<ServerAttemptResult> {
+        let binary = self
+            .server_binaries
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.kind.id_str().to_string());
+        let (status, stderr_tail) = {
+            let client = self.clients.get_mut(key)?;
+            let mut status = client.child_exit_status();
+            for _ in 0..10 {
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                status = client.child_exit_status();
+            }
+            let status = status?;
+            wait_for_stderr_tail(client);
+            (status, client.stderr_tail())
+        };
+        let reason = format_post_initialize_exit_reason(&binary, status, &stderr_tail, err);
+        let result = ServerAttemptResult::SpawnFailed { binary, reason };
+        self.clients.remove(key);
+        self.server_binaries.remove(key);
+        self.documents.remove(key);
+        self.diagnostics.clear_for_server(key);
+        self.failed_spawns.insert(key.clone(), result.clone());
+        Some(result)
+    }
+
     /// Issue the per-file diagnostic request and return the report.
     fn send_pull_request(
         &mut self,
         key: &ServerKey,
-        params: lsp_types::DocumentDiagnosticParams,
+        params: AftDocumentDiagnosticParams,
     ) -> Result<lsp_types::DocumentDiagnosticReportResult, LspError> {
         let client = self
             .clients
             .get_mut(key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?;
-        client.send_request::<lsp_types::request::DocumentDiagnosticRequest>(params)
+        // Use the documented 10s pull cap, not the global 30s request timeout —
+        // a stalled pull server must not blow the scoped aft_inspect 8s budget
+        // (or the lsp_diagnostics wait caps) all the way out to 30s.
+        client.send_request_with_timeout::<AftDocumentDiagnosticRequest>(
+            params,
+            Self::PULL_FILE_TIMEOUT,
+        )
     }
 
     /// Store the result of a per-file pull request and return a structured
@@ -1213,9 +1362,19 @@ impl LspManager {
                 }
             }
             lsp_types::DocumentDiagnosticReport::Unchanged(_unchanged) => {
-                // The server says cache is still valid. We don't refresh
-                // anything; the existing entry's diagnostics remain authoritative.
-                PullFileOutcome::Unchanged
+                // The server says cache is still valid. That is only usable if
+                // we already have a report for this exact server/file; an
+                // initial `unchanged` response cannot prove freshness.
+                if self
+                    .diagnostics
+                    .has_report_for_server_file(key, canonical_path)
+                {
+                    PullFileOutcome::Unchanged
+                } else {
+                    PullFileOutcome::RequestFailed {
+                        reason: "no_cache_for_unchanged".to_string(),
+                    }
+                }
             }
         }
     }
@@ -1227,6 +1386,7 @@ impl LspManager {
                 slog_error!("error shutting down {:?}: {}", key, err);
             }
         }
+        self.server_binaries.clear();
         self.documents.clear();
         self.diagnostics = DiagnosticsStore::new();
     }
@@ -1249,6 +1409,69 @@ impl LspManager {
         self.diagnostics.for_file(&normalized)
     }
 
+    /// Drop all cached diagnostics for a file across every server. Called when a
+    /// file is deleted/renamed away so its diagnostics don't linger in the warm
+    /// set (no server republishes for a vanished path), inflating the
+    /// error/warning counts in the status bar and `aft_inspect`.
+    ///
+    /// The store key is the canonical path from publish time, but a deleted file
+    /// can no longer be canonicalized directly (`canonicalize` needs the file to
+    /// exist). We therefore try several equivalent forms: the raw path, the
+    /// canonicalize-or-fallback form, and — crucially — a reconstruction that
+    /// canonicalizes the still-present parent directory and rejoins the file
+    /// name, which reproduces the publish-time key even across `/var`↔
+    /// `/private/var`-style symlink aliasing. Returns true if anything was
+    /// removed.
+    /// Forget all cached spawn FAILURES so the next file event retries them.
+    /// Called on `configure`: a configure means something changed (the user may
+    /// have just installed the missing language server, or fixed PATH / a
+    /// version pin), so a previously-failed (kind, root) pair deserves a fresh
+    /// attempt instead of being skipped until a full restart. Bounded: configure
+    /// is not a per-request hot path, so this cannot cause a spawn storm.
+    /// Returns the number of cleared entries.
+    pub fn clear_failed_spawns(&mut self) -> usize {
+        let n = self.failed_spawns.len();
+        self.failed_spawns.clear();
+        n
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_failed_spawn_for_test(&mut self) {
+        let key = ServerKey {
+            kind: crate::lsp::registry::ServerKind::Rust,
+            root: std::path::PathBuf::from("/tmp/test-root"),
+        };
+        self.failed_spawns.insert(
+            key,
+            ServerAttemptResult::SpawnFailed {
+                binary: "rust-analyzer".to_string(),
+                reason: "test".to_string(),
+            },
+        );
+    }
+
+    pub fn clear_diagnostics_for_file(&mut self, file: &Path) -> bool {
+        let mut removed = self.diagnostics.clear_for_file(file);
+
+        let normalized = normalize_lookup_path(file);
+        if normalized != file {
+            removed |= self.diagnostics.clear_for_file(&normalized);
+        }
+
+        // Reconstruct the canonical key via the parent dir (which still exists
+        // for a just-deleted file) so symlink-aliased roots still match.
+        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let reconstructed = canonical_parent.join(name);
+                if reconstructed != file && reconstructed != normalized {
+                    removed |= self.diagnostics.clear_for_file(&reconstructed);
+                }
+            }
+        }
+
+        removed
+    }
+
     pub fn get_diagnostics_for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         let normalized = normalize_lookup_path(dir);
         self.diagnostics.for_directory(&normalized)
@@ -1256,6 +1479,29 @@ impl LspManager {
 
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
         self.diagnostics.all()
+    }
+
+    /// True if any LSP server has reported diagnostics at least once, including
+    /// an empty report that proves a checked-clean file. This lets callers avoid
+    /// treating an empty flattened diagnostic list as trustworthy when no server
+    /// has actually run.
+    pub fn has_any_diagnostic_reports(&self) -> bool {
+        !self.diagnostics.is_empty()
+    }
+
+    /// True if any server has reported for this file, including an empty
+    /// checked-clean report.
+    pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics.has_any_report_for_file(&normalized)
+    }
+
+    /// True if this exact server/file pair has a diagnostic report, including
+    /// an empty checked-clean report.
+    pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics
+            .has_report_for_server_file(server, &normalized)
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
@@ -1287,6 +1533,7 @@ impl LspManager {
                     root: root.clone(),
                 };
                 self.clients.remove(&key);
+                self.server_binaries.remove(&key);
                 self.documents.remove(&key);
                 self.diagnostics.clear_for_server(&key);
                 None
@@ -1344,7 +1591,16 @@ impl LspManager {
             self.event_tx.clone(),
             self.child_registry.clone(),
         )?;
-        client.initialize(root, def.initialization_options.clone())?;
+        if let Err(err) = client.initialize(root, def.initialization_options.clone()) {
+            wait_for_stderr_tail(&mut client);
+            let stderr_tail = client.stderr_tail();
+            let reason = if client.child_exited() || !stderr_tail.is_empty() {
+                format_initialize_failure_reason(&def.binary, &stderr_tail, &err)
+            } else {
+                format!("server failed during initialize: {err}")
+            };
+            return Err(LspError::ServerNotReady(reason));
+        }
         Ok(client)
     }
 
@@ -1406,6 +1662,144 @@ impl LspManager {
 impl Default for LspManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn wait_for_stderr_tail(client: &mut LspClient) {
+    for _ in 0..10 {
+        if !client.stderr_tail().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn recoverable_pull_rejection(err: &LspError) -> bool {
+    matches!(
+        err,
+        LspError::ServerError {
+            code: -32601 | -32602,
+            ..
+        }
+    )
+}
+
+fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
+    match result {
+        ServerAttemptResult::SpawnFailed { binary, reason } => {
+            format!("spawn_failed: {binary} ({reason})")
+        }
+        ServerAttemptResult::BinaryNotInstalled { binary } => {
+            format!("binary_not_installed: {binary}")
+        }
+        ServerAttemptResult::NoRootMarker { looked_for } => {
+            format!("no_root_marker (looked for: {})", looked_for.join(", "))
+        }
+        ServerAttemptResult::Ok { .. } => "ok".to_string(),
+    }
+}
+
+fn format_stderr_tail_for_reason(stderr_tail: &str) -> String {
+    truncate_stderr_tail_for_reason(stderr_tail)
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_stderr_tail_for_reason(stderr_tail: &str) -> String {
+    if stderr_tail.len() <= STDERR_REASON_BYTES {
+        return stderr_tail.to_string();
+    }
+
+    let ellipsis = "...";
+    let target_len = STDERR_REASON_BYTES.saturating_sub(ellipsis.len());
+    let mut start = stderr_tail.len() - target_len;
+    while start < stderr_tail.len() && !stderr_tail.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{ellipsis}{}", &stderr_tail[start..])
+}
+
+fn format_initialize_failure_reason(binary: &str, stderr_tail: &str, err: &LspError) -> String {
+    let mut reason = format!("server crashed during initialize: {err}");
+    if !stderr_tail.is_empty() {
+        reason.push_str("; stderr (last 64 lines):\n");
+        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
+        reason.push_str("\n\n");
+        reason.push_str(&failure_hint(binary, stderr_tail));
+    }
+    reason
+}
+
+fn format_post_initialize_exit_reason(
+    binary: &str,
+    status: std::process::ExitStatus,
+    stderr_tail: &str,
+    err: &LspError,
+) -> String {
+    let code = status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal/unknown".to_string());
+    let mut reason = format!("server exited after initialize (code {code}): {err}");
+    if !stderr_tail.is_empty() {
+        reason.push_str("; stderr (last 64 lines):\n");
+        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
+        reason.push_str("\n\n");
+        reason.push_str(&failure_hint(binary, stderr_tail));
+    }
+    reason
+}
+
+fn failure_hint(binary: &str, stderr_tail: &str) -> String {
+    if stderr_tail.contains("MODULE_NOT_FOUND") || stderr_tail.contains("Cannot find module") {
+        let package_manager = infer_package_manager(stderr_tail);
+        format!(
+            "Your package-manager shim resolves to a missing file. Try reinstalling: {package_manager} install -g {binary} --force. Common cause: hard-link breakage from fs migration or store prune."
+        )
+    } else if let Some(component) = rustup_missing_component(stderr_tail) {
+        // The binary on PATH is rustup's proxy shim, but the toolchain
+        // component isn't installed, so rustup rejects the dispatch with
+        // "Unknown binary '<name>' in ... toolchain". The actionable fix is to
+        // add the component, not anything about the binary itself.
+        format!("'{component}' is a rustup proxy but the component is not installed. Install it: rustup component add {component}")
+    } else {
+        format!("Hint: see stderr above for '{binary}' failure details.")
+    }
+}
+
+/// Detect the rustup "proxy shim without installed component" failure and
+/// return the component name to add. rustup prints
+/// `error: Unknown binary '<name>' in official toolchain '<triple>'` when a
+/// `~/.cargo/bin/<name>` proxy is on PATH but the component was never installed
+/// (the canonical case is `rust-analyzer`, which ships as an opt-in component).
+fn rustup_missing_component(stderr_tail: &str) -> Option<String> {
+    let marker = "Unknown binary '";
+    let start = stderr_tail.find(marker)? + marker.len();
+    let rest = &stderr_tail[start..];
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    // Only treat it as a rustup-component issue when the toolchain phrasing is
+    // present, so an unrelated "Unknown binary" message doesn't mislead.
+    if name.is_empty() || !stderr_tail.contains("toolchain") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn infer_package_manager(stderr_tail: &str) -> &'static str {
+    let lower = stderr_tail.to_ascii_lowercase();
+    if lower.contains(".pnpm/") || lower.contains(".pnpm\\") || lower.contains("/pnpm/") {
+        "pnpm"
+    } else if lower.contains(".yarn/")
+        || lower.contains(".yarn\\")
+        || lower.contains("/yarn/")
+        || lower.contains("yarn")
+    {
+        "yarn"
+    } else {
+        "npm"
     }
 }
 
@@ -1492,4 +1886,191 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
         .collect();
     let key = format!("AFT_LSP_{suffix}_BINARY");
     std::env::var_os(key).map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod failure_hint_tests {
+    use super::{failure_hint, rustup_missing_component};
+
+    #[test]
+    fn detects_rustup_proxy_without_component() {
+        // The exact rustup stderr for a proxy shim whose component is missing.
+        let stderr = "error: Unknown binary 'rust-analyzer' in official toolchain 'stable-aarch64-apple-darwin'.";
+        assert_eq!(
+            rustup_missing_component(stderr).as_deref(),
+            Some("rust-analyzer")
+        );
+        let hint = failure_hint("rust-analyzer", stderr);
+        assert!(
+            hint.contains("rustup component add rust-analyzer"),
+            "expected actionable rustup hint, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_binary_without_toolchain_phrasing() {
+        // "Unknown binary" without the rustup toolchain phrasing must not be
+        // misattributed to a rustup component issue.
+        let stderr = "fatal: Unknown binary 'foo' was requested by the linker.";
+        assert_eq!(rustup_missing_component(stderr), None);
+        assert!(failure_hint("foo", stderr).starts_with("Hint: see stderr"));
+    }
+
+    #[test]
+    fn npm_module_not_found_still_wins() {
+        // The existing package-manager-shim case is unaffected.
+        let stderr = "Error: Cannot find module '/x/typescript-language-server/lib/cli.mjs'";
+        let hint = failure_hint("typescript-language-server", stderr);
+        assert!(hint.contains("install -g"), "got: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_capacity_tests {
+    use super::LspManager;
+
+    // The lsp.diagnostic_cache_size config knob must actually take effect:
+    // set_diagnostic_capacity (called at AppContext construction with the config
+    // value) propagates the cap to the underlying DiagnosticsStore. Before this
+    // wiring the field was parsed but never applied (always the hardcoded 5000).
+    #[test]
+    fn set_diagnostic_capacity_propagates_to_store() {
+        let mut manager = LspManager::new();
+        manager.set_diagnostic_capacity(7);
+        assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 7);
+        manager.set_diagnostic_capacity(0); // 0 = unbounded
+        assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 0);
+    }
+
+    // configure clears cached spawn failures so a just-installed server retries
+    // without a full restart.
+    #[test]
+    fn clear_failed_spawns_empties_the_cache() {
+        let mut manager = LspManager::new();
+        assert_eq!(manager.clear_failed_spawns(), 0);
+        manager.insert_failed_spawn_for_test();
+        assert_eq!(manager.clear_failed_spawns(), 1);
+        assert_eq!(manager.clear_failed_spawns(), 0);
+    }
+}
+
+#[cfg(test)]
+mod clear_diagnostics_tests {
+    use std::path::PathBuf;
+
+    use super::LspManager;
+    use crate::lsp::client::LspEvent;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::lsp::position::uri_for_path;
+    use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
+
+    fn err_diag(file: &PathBuf) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "boom".into(),
+            code: None,
+            source: None,
+        }
+    }
+
+    // A just-deleted file can no longer be canonicalized directly, but its
+    // store key was the canonical path from publish time. The manager must
+    // reconstruct that key via the still-present parent dir so symlink-aliased
+    // roots (macOS /var -> /private/var) still match and the diagnostic clears.
+    #[test]
+    fn clear_diagnostics_for_deleted_file_matches_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize the parent the way publish time would have.
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical_file = canonical_dir.join("gone.ts");
+        // Write then remove the file so its parent exists but the file does not,
+        // mirroring the post-delete state the watcher observes.
+        std::fs::write(&canonical_file, "x").unwrap();
+
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: canonical_dir.clone(),
+        };
+        manager.diagnostics_store_mut_for_test().publish(
+            key,
+            canonical_file.clone(),
+            vec![err_diag(&canonical_file)],
+        );
+        assert_eq!(manager.warm_error_warning_counts(), (1, 0));
+
+        std::fs::remove_file(&canonical_file).unwrap();
+
+        // Clear by the NON-canonical path the watcher might hand us (the raw
+        // tempdir path, which on macOS differs from the canonical /private form).
+        let watcher_path = dir.path().join("gone.ts");
+        let removed = manager.clear_diagnostics_for_file(&watcher_path);
+
+        assert!(removed, "expected the deleted file's diagnostic to clear");
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
+
+    #[test]
+    fn clear_diagnostics_for_unknown_file_is_noop() {
+        let mut manager = LspManager::new();
+        assert!(!manager.clear_diagnostics_for_file(&PathBuf::from("/nope/missing.ts")));
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
+
+    #[test]
+    fn drain_events_reports_publish_diagnostics_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("main.ts");
+        std::fs::write(&file, "const x: number = 'nope';").unwrap();
+
+        let mut manager = LspManager::new();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: Some("test".into()),
+            message: "boom".into(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        let params = serde_json::to_value(lsp_types::PublishDiagnosticsParams {
+            uri: uri_for_path(&file).unwrap(),
+            diagnostics: vec![diagnostic],
+            version: Some(1),
+        })
+        .unwrap();
+        manager
+            .event_tx
+            .send(LspEvent::Notification {
+                server_kind: ServerKind::TypeScript,
+                root,
+                method: "textDocument/publishDiagnostics".into(),
+                params: Some(params),
+            })
+            .unwrap();
+
+        let drained = manager.drain_events();
+
+        assert!(drained.diagnostics_changed);
+        assert_eq!(drained.events.len(), 1);
+        assert_eq!(manager.warm_error_warning_counts(), (1, 0));
+    }
 }

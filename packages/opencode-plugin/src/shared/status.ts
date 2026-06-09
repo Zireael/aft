@@ -10,6 +10,24 @@ export interface StatusCompression {
   session: StatusCompressionAggregate;
 }
 
+/**
+ * The agent status-bar glance — `[AFT E· W· | D· U· C· | T·]`. `errors`/
+ * `warnings` are live LSP diagnostics for files touched this session; the
+ * Tier-2 trio (`dead_code`/`unused_exports`/`duplicates`) plus `todos` come
+ * from the last completed background scan. `tier2_stale` marks those Tier-2
+ * counts as predating the latest edit. Null in the snapshot until the Tier-2
+ * cache is populated at least once (no fabricated zeros).
+ */
+export interface StatusBar {
+  errors: number;
+  warnings: number;
+  dead_code: number;
+  unused_exports: number;
+  duplicates: number;
+  todos: number;
+  tier2_stale: boolean;
+}
+
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
@@ -19,7 +37,7 @@ export interface AftStatusSnapshot {
    * True when at least one heavy AFT subsystem has been auto-disabled for
    * the current project root. `degraded_reasons` enumerates why (e.g.
    * `["home_root"]`, `["search_too_many_files:20000"]`). The sidebar / TUI
-   * dialog surface this so users know `aft_search`, `aft_navigate` etc.
+   * dialog surface this so users know `aft_search`, `aft_callgraph` etc.
    * won't return results from this session and can choose to open a
    * project subdirectory instead.
    */
@@ -46,6 +64,7 @@ export interface AftStatusSnapshot {
     files?: number | null;
     entries_done?: number | null;
     entries_total?: number | null;
+    refreshing_count: number;
     entries: number | null;
     dimension: number | null;
     error?: string | null;
@@ -71,6 +90,12 @@ export interface AftStatusSnapshot {
   };
   /** Compression aggregate passthrough; rendering is added separately. */
   compression?: StatusCompression;
+  /**
+   * Agent status-bar counts (E/W/D/U/C/T). Undefined until the Tier-2 cache
+   * is populated at least once — the sidebar hides the Code Health section
+   * until then so it never shows fabricated zeros.
+   */
+  status_bar?: StatusBar;
   /**
    * Human-readable explanation for a synthetic snapshot (e.g.
    * `cache_role === "not_initialized"`). When the plugin returns a placeholder
@@ -124,12 +149,42 @@ function readCompression(value: unknown): StatusCompression | undefined {
   };
 }
 
+function readStatusBar(value: unknown): StatusBar | undefined {
+  // Null until Tier-2 is populated — the Rust snapshot emits JSON null, which
+  // is not an object, so this returns undefined and the sidebar hides the
+  // Code Health section (no fabricated zeros).
+  if (typeof value !== "object" || value === null) return undefined;
+  const bar = asRecord(value);
+  return {
+    errors: readNumber(bar.errors),
+    warnings: readNumber(bar.warnings),
+    dead_code: readNumber(bar.dead_code),
+    unused_exports: readNumber(bar.unused_exports),
+    duplicates: readNumber(bar.duplicates),
+    todos: readNumber(bar.todos),
+    tier2_stale: readBoolean(bar.tier2_stale),
+  };
+}
+
 function formatFlag(enabled: boolean): string {
   return enabled ? "enabled" : "disabled";
 }
 
 function formatCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
+  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
+    return "Rebuilding (model changed)";
+  }
+  return status;
+}
+
+export function formatSemanticRefreshing(refreshingCount: number): string | null {
+  if (!Number.isFinite(refreshingCount) || refreshingCount <= 0) return null;
+  if (refreshingCount > 20) return "Ready (many files refreshing)";
+  return `Ready (${refreshingCount} file(s) refreshing)`;
 }
 
 export function formatBytes(bytes: number): string {
@@ -190,6 +245,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       files: readOptionalNumber(semanticIndex.files),
       entries_done: readOptionalNumber(semanticIndex.entries_done),
       entries_total: readOptionalNumber(semanticIndex.entries_total),
+      refreshing_count: readNumber(semanticIndex.refreshing_count),
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
@@ -212,6 +268,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       checkpoints: readNumber(session.checkpoints),
     },
     compression: readCompression(response.compression),
+    status_bar: readStatusBar(response.status_bar),
     message: readString(response.message, ""),
   };
 }
@@ -241,9 +298,13 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${status.semantic_index.status}`,
-    `- entries: ${formatCount(status.semantic_index.entries)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- ${refreshing}`);
+  }
+  lines.push(`- entries: ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- backend: ${status.semantic_index.backend}`);
   }
@@ -267,6 +328,21 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
 
   if (status.storage_dir ?? status.disk.storage_dir) {
     lines.push(`- storage dir: ${status.storage_dir ?? status.disk.storage_dir}`);
+  }
+
+  if (status.status_bar) {
+    const sb = status.status_bar;
+    lines.push(
+      "",
+      `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
+      `- errors: ${formatCount(sb.errors)}`,
+      `- warnings: ${formatCount(sb.warnings)}`,
+      // dead code / unused exports hidden until oxc resolver lands (restore both)
+      // `- dead code: ${formatCount(sb.dead_code)}`,
+      // `- unused exports: ${formatCount(sb.unused_exports)}`,
+      `- duplicates: ${formatCount(sb.duplicates)}`,
+      `- todos: ${formatCount(sb.todos)}`,
+    );
   }
 
   lines.push(
@@ -316,9 +392,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${status.semantic_index.status}\``,
-    `- **Entries:** ${formatCount(status.semantic_index.entries)}`,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- **Refresh:** ${refreshing}`);
+  }
+  lines.push(`- **Entries:** ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- **Backend:** ${status.semantic_index.backend}`);
   }
@@ -358,6 +438,21 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.storage_dir ?? status.disk.storage_dir) {
     lines.push(`- **Storage dir:** \`${status.storage_dir ?? status.disk.storage_dir}\``);
+  }
+
+  if (status.status_bar) {
+    const sb = status.status_bar;
+    lines.push(
+      "",
+      `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
+      `- **Errors:** ${formatCount(sb.errors)}`,
+      `- **Warnings:** ${formatCount(sb.warnings)}`,
+      // dead code / unused exports hidden until oxc resolver lands (restore both)
+      // `- **Dead code:** ${formatCount(sb.dead_code)}`,
+      // `- **Unused exports:** ${formatCount(sb.unused_exports)}`,
+      `- **Duplicates:** ${formatCount(sb.duplicates)}`,
+      `- **TODOs:** ${formatCount(sb.todos)}`,
+    );
   }
 
   lines.push(

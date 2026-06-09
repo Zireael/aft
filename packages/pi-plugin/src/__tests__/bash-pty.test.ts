@@ -71,15 +71,24 @@ function text(result: unknown): string {
 }
 
 describe("Pi bash PTY layer", () => {
-  test("pty true requires background true", async () => {
+  test("pty true implies background true (no explicit flag needed)", async () => {
     const tools = new Map<string, MockToolDef>();
-    const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+    const { calls, ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-implied-bg",
+    }));
     registerBashTool(api(tools), pluginCtx);
-    await expect(
-      tools.get("bash")!.execute("call", { command: "python", pty: true }, undefined, undefined, {
+    // Caller omits background: true — plugin must auto-promote because pty:true
+    // requires the polling background lifecycle.
+    const result = await tools
+      .get("bash")!
+      .execute("call", { command: "python", pty: true }, undefined, undefined, {
         cwd: process.cwd(),
-      }),
-    ).rejects.toThrow("PTY mode requires background: true");
+      });
+    expect(text(result)).toContain("bash-pty-implied-bg");
+    // Rust spawn payload sees background:true and pty:true.
+    expect(calls.at(-1)?.[1]).toMatchObject({ pty: true, background: true });
   });
 
   test("bash pty true forwards pty to bridge", async () => {
@@ -98,6 +107,36 @@ describe("Pi bash PTY layer", () => {
     expect(text(result)).toContain("bash-pty");
     expect(calls[0][0]).toBe("bash");
     expect(calls[0][1]).toMatchObject({ pty: true, background: true });
+  });
+
+  test("bash pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { calls, ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-dims",
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    // pty:false + ptyRows passed defensively: should NOT throw, dims silently ignored
+    const nonPtyResult = await tools
+      .get("bash")!
+      .execute("call", { command: "top", background: true, ptyRows: 50 }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+    expect(text(nonPtyResult)).toContain("bash-pty-dims");
+
+    const result = await tools
+      .get("bash")!
+      .execute(
+        "call",
+        { command: "top", pty: true, background: true, ptyRows: 50, ptyCols: 120 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+    expect(text(result)).toContain("bash-pty-dims");
+    expect(calls.at(-1)?.[1]).toMatchObject({ pty_rows: 50, pty_cols: 120 });
   });
 
   test("bash_write schema accepts task_id/input and returns bridge response", async () => {
@@ -157,6 +196,81 @@ describe("Pi bash PTY layer", () => {
     expect(text(result)).toContain("there");
   });
 
+  test("bash_status output_mode screen uses custom dimensions", async () => {
+    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+      pty_rows: 50,
+      pty_cols: 120,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+    const result = await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-wide-screen", output_mode: "screen" },
+        undefined,
+        undefined,
+        {
+          cwd: process.cwd(),
+        },
+      );
+    expect(text(result)).toContain("left");
+    expect(text(result)).toContain("wide");
+  });
+
+  test("bash_status preserves full coordinated non-PTY preview", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const preview = `BEGIN-${"x".repeat(2500)}-END`;
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pipes",
+      output_preview: preview,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-long-preview" }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+
+    expect(text(result)).toContain(preview);
+    expect(text(result)).toContain("-END");
+  });
+
+  test("bash_status PTY path ignores compressed output_preview", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const outputPath = await spill("raw pty bytes");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      mode: "pty",
+      output_path: outputPath,
+      output_preview: "COMPRESSED PIPE PREVIEW SHOULD NOT RENDER",
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-raw-guard", output_mode: "raw" },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain("raw pty bytes");
+    expect(text(result)).not.toContain("COMPRESSED PIPE PREVIEW");
+  });
+
   test("bash_status cache reuses terminal across calls", async () => {
     const outputPath = await spill("first");
     const tools = new Map<string, MockToolDef>();
@@ -188,6 +302,89 @@ describe("Pi bash PTY layer", () => {
     expect(text(second)).toContain("second");
     expect(text(second)).not.toContain("firstsecond");
     expect(__ptyCacheSizeForTests()).toBe(1);
+  });
+
+  test("bash_watch PTY scan is independent from bash_status cursor", async () => {
+    const outputPath = await spill("rea");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+    await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-pty-shared", output_mode: "raw" }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+    await appendFile(outputPath, "dy\n");
+
+    const result = await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-shared", pattern: "ready", timeout_ms: 1 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain('matched "ready" at offset 0');
+    expect(__ptyCacheSizeForTests()).toBe(1);
+  });
+
+  test("bash_watch PTY scan cache disposes on timeout", async () => {
+    const outputPath = await spill("not yet\n");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-timeout", pattern: "ready", timeout_ms: 1 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    // One cache entry remains for the rendered bash_watch result. The
+    // independent ::watch scan terminal must not leak as a second entry.
+    expect(__ptyCacheSizeForTests()).toBe(1);
+  });
+
+  test("bash_watch PTY scan cache disposes on terminal status", async () => {
+    const outputPath = await spill("done\n");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-exited", pattern: "missing", timeout_ms: 50 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain("done");
+    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 
   test("bash_status cache disposes on terminal status", async () => {

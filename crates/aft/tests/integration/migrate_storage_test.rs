@@ -6,6 +6,12 @@ use std::time::Duration;
 use aft::harness::Harness;
 use aft::migrate_storage::{Args, ExitStatus, Options};
 
+fn aft_binary() -> PathBuf {
+    std::env::var_os("AFT_TEST_AFT_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+}
+
 fn args(from: PathBuf, to: PathBuf, log: PathBuf) -> Args {
     Args {
         from: Some(from),
@@ -178,7 +184,6 @@ fn migrate_lock_contention_returns_code_3() {
 #[cfg(unix)]
 #[test]
 fn migrate_partial_failure_leaves_staging_dirs() {
-    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -225,7 +230,6 @@ fn migrate_partial_failure_leaves_staging_dirs() {
 #[cfg(unix)]
 #[test]
 fn migrate_writes_markers_only_on_full_success() {
-    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -260,7 +264,7 @@ fn migrate_logs_to_file_not_stderr() {
     let log = temp.path().join("logs/migration.jsonl");
     populate_legacy(&from);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let output = Command::new(aft_binary())
         .arg("migrate-storage")
         .arg("--from")
         .arg(&from)
@@ -295,7 +299,7 @@ fn status_mode_reports_migrated_when_marker_present() {
         r#"{"timestamp":"2026-05-19T15:00:00.123Z","source_path":"/legacy/aft","target_path":"/new/aft","harness":"opencode","aft_version":"0.27.0"}"#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let output = Command::new(aft_binary())
         .arg("migrate-storage")
         .arg("--status")
         .arg("--to")
@@ -314,7 +318,10 @@ fn status_mode_reports_migrated_when_marker_present() {
     assert_eq!(value["harness"], "opencode");
     assert_eq!(value["target_root"], to.display().to_string());
     assert_eq!(value["migrated"], true);
-    assert_eq!(value["marker_path"], marker.display().to_string());
+    assert_eq!(
+        value["marker_path"].as_str().unwrap().replace('\\', "/"),
+        marker.display().to_string().replace('\\', "/")
+    );
     assert_eq!(value["migrated_at"], "2026-05-19T15:00:00.123Z");
     assert_eq!(value["source_path"], "/legacy/aft");
     assert_eq!(value["aft_version"], "0.27.0");
@@ -325,7 +332,7 @@ fn status_mode_reports_not_migrated_when_marker_absent() {
     let temp = tempfile::tempdir().unwrap();
     let to = temp.path().join("new");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let output = Command::new(aft_binary())
         .arg("migrate-storage")
         .arg("--status")
         .arg("--to")
@@ -348,13 +355,50 @@ fn status_mode_reports_not_migrated_when_marker_absent() {
 }
 
 #[test]
+fn status_mode_reports_source_marker_only_partial_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let from = temp.path().join("legacy");
+    let to = temp.path().join("new");
+    let source_marker = from.join(".migrated_to_cortexkit");
+    write(&source_marker, "{}\n");
+
+    let output = Command::new(aft_binary())
+        .arg("migrate-storage")
+        .arg("--status")
+        .arg("--from")
+        .arg(&from)
+        .arg("--to")
+        .arg(&to)
+        .arg("--harness")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["harness"], "opencode");
+    assert_eq!(value["target_root"], to.display().to_string());
+    assert_eq!(value["migrated"], false);
+    assert_eq!(
+        value["source_marker_path"],
+        source_marker.display().to_string()
+    );
+    assert_eq!(value["source_marker_present"], true);
+    assert_eq!(value["partial_state"], true);
+}
+
+#[test]
 fn status_mode_does_not_acquire_lock() {
     let temp = tempfile::tempdir().unwrap();
     let to = temp.path().join("new");
     fs::create_dir_all(to.join(".aft")).unwrap();
     let _guard = aft::fs_lock::acquire(&to.join(".aft/migration.lock")).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let output = Command::new(aft_binary())
         .arg("migrate-storage")
         .arg("--status")
         .arg("--to")

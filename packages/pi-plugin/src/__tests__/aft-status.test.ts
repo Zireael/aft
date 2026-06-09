@@ -85,4 +85,49 @@ describe("aft-status command", () => {
 
     expect(notifications).toEqual([{ message: "AFT status failed: bridge down", level: "error" }]);
   });
+
+  test("fetches fresh non-UI status when cached snapshot has no session id", async () => {
+    const { api, commands } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      version: "fresh",
+      session: { id: params.session_id },
+    }));
+    bridge.cacheStatusSnapshot({ version: "cached" });
+    const notifications: Array<{ message: string; level: string }> = [];
+    registerStatusCommand(api, makePluginContext(bridge));
+
+    await commands.get("aft-status")!.handler("", {
+      cwd: "/repo",
+      hasUI: false,
+      sessionManager: { getSessionId: () => "session-new" },
+      ui: {
+        notify: (message: string, level: string) => notifications.push({ message, level }),
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].params).toEqual({ session_id: "session-new" });
+    expect(notifications[0].message).toContain("AFT version: fresh");
+  });
+
+  test("reuses non-UI cached status only when session id matches", async () => {
+    const { api, commands } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, version: "fresh" }));
+    bridge.cacheStatusSnapshot({ version: "cached", session: { id: "session-1" } });
+    const notifications: Array<{ message: string; level: string }> = [];
+    registerStatusCommand(api, makePluginContext(bridge));
+
+    await commands.get("aft-status")!.handler("", {
+      cwd: "/repo",
+      hasUI: false,
+      sessionManager: { getSessionId: () => "session-1" },
+      ui: {
+        notify: (message: string, level: string) => notifications.push({ message, level }),
+      },
+    });
+
+    expect(calls).toHaveLength(0);
+    expect(notifications[0].message).toContain("AFT version: cached");
+  });
 });

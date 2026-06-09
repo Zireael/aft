@@ -75,7 +75,8 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
         afterTool: async (env, event) => {
           expect(existsSync(join(env.workdir, "created.txt"))).toBe(true);
           expect(await readFile(join(env.workdir, "created.txt"), "utf8")).toBe("hello\n");
-          expect(resultText(event)).toContain("Wrote created.txt");
+          // Compact agent-facing summary (no path echo); diff body lives in details.
+          expect(resultText(event)).toContain("Created file");
           expect(resultText(event)).toContain("diff");
         },
       },

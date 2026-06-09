@@ -1,57 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
 
+use aft::cache_freshness::{self, FreshnessVerdict};
 use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
-use log::{Level, LevelFilter, Log, Metadata, Record};
 
-static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static LOGGER_INIT: Once = Once::new();
-
-struct TestLogger;
-
-impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Warn
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            TEST_LOGS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .expect("lock test logs")
-                .push(format!("{}", record.args()));
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_test_logger() {
-    LOGGER_INIT.call_once(|| {
-        log::set_boxed_logger(Box::new(TestLogger)).expect("install test logger");
-        log::set_max_level(LevelFilter::Warn);
-    });
-    clear_logs();
-}
-
-fn clear_logs() {
-    TEST_LOGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("lock test logs")
-        .clear();
-}
-
-fn take_logs() -> Vec<String> {
-    std::mem::take(
-        &mut *TEST_LOGS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("lock test logs"),
-    )
-}
+// Warn-level log capture is shared across all integration test modules via a
+// single process-global, thread-local-capturing logger. See test_helpers.
+// `init_test_logger()` also clears the current thread's buffer, so the old
+// local `clear_logs()` is no longer needed.
+use crate::test_helpers::{init_test_logger, take_logs};
 
 fn build_test_index(project_root: &Path) -> (SemanticIndex, PathBuf) {
     let source_file = project_root.join("src/lib.rs");
@@ -244,6 +201,78 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
 }
 
 #[test]
+fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let old_file = project.path().join("src/old.rs");
+    let new_file = project.path().join("src/new.rs");
+    fs::create_dir_all(old_file.parent().expect("source parent")).expect("create src dir");
+    fs::write(&old_file, "pub fn old_anchor() -> usize { 1 }\n").expect("write old file");
+    fs::write(&new_file, "pub fn new_anchor() -> usize { 2 }\n").expect("write new file");
+
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(
+            texts
+                .into_iter()
+                .map(|text| {
+                    if text.contains("new_anchor") {
+                        vec![0.0, 1.0, 0.0, 0.0]
+                    } else {
+                        vec![1.0, 0.0, 0.0, 0.0]
+                    }
+                })
+                .collect(),
+        )
+    };
+    let mut index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&old_file),
+        &mut embed,
+        16,
+    )
+    .expect("build initial semantic index");
+    assert_eq!(index.indexed_file_count(), 1);
+
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&new_file),
+            &mut embed,
+            16,
+            1,
+            &mut progress,
+        )
+        .expect("defer new file at cap");
+    let deferred_results = index.search(&[0.0, 1.0, 0.0, 0.0], 5);
+    assert!(
+        deferred_results
+            .iter()
+            .all(|result| result.name != "new_anchor"),
+        "new file should be deferred while the cap is full: {deferred_results:?}"
+    );
+
+    fs::remove_file(&old_file).expect("delete old file");
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&old_file),
+            &mut embed,
+            16,
+            1,
+            &mut progress,
+        )
+        .expect("retry deferred file after deletion");
+
+    let results = index.search(&[0.0, 1.0, 0.0, 0.0], 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].file, new_file);
+    assert!(
+        results[0].snippet.contains("new_anchor"),
+        "deferred file should be indexed after capacity frees: {results:?}"
+    );
+}
+
+#[test]
 fn stale_file_detected_after_deletion() {
     let project = tempfile::tempdir().expect("create project dir");
     let storage = tempfile::tempdir().expect("create storage dir");
@@ -260,6 +289,104 @@ fn stale_file_detected_after_deletion() {
     assert!(
         restored.is_file_stale(&source_file),
         "deleted file should be detected as stale"
+    );
+}
+
+#[test]
+fn semantic_stale_check_detects_same_mtime_same_size_content_change() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let source_file = project.path().join("src/lib.rs");
+    fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
+    fs::write(
+        &source_file,
+        "pub fn handle_request(token: &str) -> bool {
+    !token.is_empty()
+}
+",
+    )
+    .expect("write source file");
+    let fixed_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 123_000_000);
+    filetime::set_file_mtime(&source_file, fixed_mtime).expect("set fixed mtime");
+
+    let files = vec![source_file.clone()];
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(
+            texts
+                .into_iter()
+                .map(|_| vec![1.0, 0.0, 0.0, 0.0])
+                .collect(),
+        )
+    };
+    let index =
+        SemanticIndex::build(project.path(), &files, &mut embed, 16).expect("build semantic index");
+    let freshness = cache_freshness::collect(&source_file).expect("collect source freshness");
+    index.write_to_disk(storage.path(), "same-metadata-project");
+
+    let mut restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        "same-metadata-project",
+        project.path(),
+        false,
+        None,
+    )
+    .expect("restore semantic index from disk");
+    assert!(
+        !restored.is_file_stale(&source_file),
+        "freshly restored file should start hot"
+    );
+
+    let mut bytes = fs::read(&source_file).expect("read source bytes");
+    let bang = bytes
+        .iter()
+        .position(|byte| *byte == b'!')
+        .expect("fixture contains negation byte");
+    bytes[bang] = b' ';
+    fs::write(&source_file, &bytes).expect("rewrite source with same size");
+    filetime::set_file_mtime(
+        &source_file,
+        filetime::FileTime::from_system_time(freshness.mtime),
+    )
+    .expect("restore original mtime");
+
+    assert_eq!(
+        cache_freshness::verify_file(&source_file, &freshness),
+        FreshnessVerdict::HotFresh,
+        "non-strict freshness misses same-size/same-mtime content edits"
+    );
+    assert!(
+        restored.is_file_stale(&source_file),
+        "semantic staleness must hash-check same-size/same-mtime edits"
+    );
+
+    let mut refreshed_chunks = 0usize;
+    let mut refresh_embed = |texts: Vec<String>| {
+        refreshed_chunks += texts.len();
+        Ok::<Vec<Vec<f32>>, String>(
+            texts
+                .into_iter()
+                .map(|_| vec![1.0, 0.0, 0.0, 0.0])
+                .collect(),
+        )
+    };
+    let mut progress = |_done: usize, _total: usize| {};
+    let summary = restored
+        .refresh_stale_files(
+            project.path(),
+            &files,
+            &mut refresh_embed,
+            16,
+            &mut progress,
+        )
+        .expect("strict refresh should re-embed stale file");
+
+    assert_eq!(summary.changed, 1);
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.deleted, 0);
+    assert!(refreshed_chunks > 0, "changed file should be re-embedded");
+    assert!(
+        !restored.is_file_stale(&source_file),
+        "refreshed file should become fresh again"
     );
 }
 
@@ -492,7 +619,8 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
 
     // Case 1: nanos >= 1e9 → reject with a specific message.
     let bad_nanos = build_v3_with_mtime(0, 2_000_000_000);
-    let err = SemanticIndex::from_bytes(&bad_nanos, Path::new("/"))
+    let root = tempfile::tempdir().expect("semantic cache root");
+    let err = SemanticIndex::from_bytes(&bad_nanos, root.path())
         .expect_err("V3 with nanos >= 1e9 must be rejected");
     assert!(
         err.contains("nanos") && err.contains("1_000_000_000"),
@@ -503,7 +631,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // panicking. We pick secs = u64::MAX so adding any Duration carries past
     // the platform's representable range on every target.
     let overflow = build_v3_with_mtime(u64::MAX, 0);
-    let err = SemanticIndex::from_bytes(&overflow, Path::new("/"))
+    let err = SemanticIndex::from_bytes(&overflow, root.path())
         .expect_err("V3 with secs=u64::MAX must be rejected");
     assert!(
         err.contains("overflows SystemTime"),
@@ -513,6 +641,6 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // Case 3: valid V3 payload with nanos = 999_999_999 (max valid) loads
     // cleanly — proves the boundary is strictly < 1e9, not <=.
     let boundary = build_v3_with_mtime(1_700_000_000, 999_999_999);
-    let _ = SemanticIndex::from_bytes(&boundary, Path::new("/"))
+    let _ = SemanticIndex::from_bytes(&boundary, root.path())
         .expect("V3 with nanos=999_999_999 must load cleanly");
 }

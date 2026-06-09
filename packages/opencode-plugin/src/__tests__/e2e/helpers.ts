@@ -13,8 +13,35 @@ import { bridgeLogger } from "../../logger.js";
 // pollutes the bash background-completion output preview.
 setActiveLogger(bridgeLogger);
 
-const TARGET_DEBUG_BINARY = resolve(import.meta.dir, "../../../../../target/debug/aft");
-const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin/aft");
+// Remove a temp dir, tolerating the Windows `EBUSY: resource busy or locked`
+// race: a detached background-bash child (or the bridge's own handles) can keep
+// the temp directory open for a brief window after shutdown, so a single `rm`
+// in a test's teardown throws and fails an otherwise-passing test. Cleanup
+// failures must never fail a test — retry a few times, then give up silently
+// (the OS reaps the temp dir, and a leaked temp dir is harmless in CI).
+async function safeRemoveDir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      // Most commonly EBUSY on Windows while a detached child still holds a
+      // handle. Back off briefly and retry; ignore if it never frees up.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
+// Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
+// platform-correct name so CI's fail-loud "binary must be present" guard does
+// not trip on a name mismatch (Windows previously silent-skipped into a false
+// green before the guard landed).
+const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
+const TARGET_DEBUG_BINARY = resolve(
+  import.meta.dir,
+  `../../../../../target/debug/${AFT_BINARY_NAME}`,
+);
+const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -117,26 +144,30 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
-  const previousCacheDir = process.env.AFT_CACHE_DIR;
-  // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
   let bridge: BinaryBridge | undefined;
   try {
     await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
+    // Redirect the search index cache to a temp dir so tests don't pollute the
+    // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child
+    // env instead of mutating process.env: the child spawns lazily on the first
+    // send(), so a process.env mutation scoped to construction would be restored
+    // before the child ever inherits it — and process.env is process-global, so
+    // concurrent harnesses would race. childEnv is applied at spawn time, scoped
+    // to this child only.
     bridge = new BinaryBridge(
       preparedBinary.binaryPath,
       tempDir,
       {
         timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
         ...(options?.bridgeOptions ?? {}),
       },
       { harness: "opencode" },
     );
   } catch (err) {
-    restoreAftCacheDir(previousCacheDir);
-    await rm(tempDir, { recursive: true, force: true });
+    await safeRemoveDir(tempDir);
     throw err;
   }
 
@@ -152,22 +183,10 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        try {
-          await rm(tempDir, { recursive: true, force: true });
-        } finally {
-          restoreAftCacheDir(previousCacheDir);
-        }
+        await safeRemoveDir(tempDir);
       }
     },
   };
-}
-
-function restoreAftCacheDir(previous: string | undefined): void {
-  if (previous === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = previous;
-  }
 }
 
 export async function cleanupHarnesses(harnesses: E2EHarness[]): Promise<void> {
@@ -311,45 +330,85 @@ export function fileResultBySuffix(
   return match;
 }
 
+async function resolveAftBinaryPath(candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    if (await isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function debugBinaryCandidates(): string[] {
+  return [TARGET_DEBUG_BINARY];
+}
+
+function fallbackBinaryCandidates(): string[] {
+  return [FALLBACK_BINARY];
+}
+
 async function prepareBinaryOnce(): Promise<PreparedBinary> {
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const existing = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (existing) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: existing,
       source: "target",
       buildAttempted: false,
     };
   }
 
   const build = await runCargoBuild();
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const built = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (built) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: built,
       source: "target",
       buildAttempted: true,
     };
   }
 
-  if (await isExecutable(FALLBACK_BINARY)) {
+  const fallback = await resolveAftBinaryPath(fallbackBinaryCandidates());
+  if (fallback) {
     return {
-      binaryPath: FALLBACK_BINARY,
+      binaryPath: fallback,
       source: "fallback",
       buildAttempted: true,
     };
+  }
+
+  const searched = [...debugBinaryCandidates(), ...fallbackBinaryCandidates()]
+    .map((path) => relative(PROJECT_ROOT, path))
+    .join(" or ");
+  const skipReason = build.ok
+    ? `aft binary not found at ${searched}`
+    : `cargo build failed and no fallback aft binary was found\n${build.output}`;
+
+  // In CI the aft binary is always built before the Bun suites run, so a missing
+  // binary there means the build/setup broke — fail loud instead of letting 25+
+  // e2e files silently `describe.skipIf(!binaryPath)` into a false green. Locally
+  // (CI unset) keep the quiet-skip behavior so contributors without a built
+  // binary can still run the non-e2e suites.
+  if (process.env.CI === "true") {
+    throw new Error(
+      `e2e setup failed: ${skipReason}\n` +
+        "The aft binary must be present in CI (built before Bun tests run). " +
+        "Refusing to silently skip e2e coverage.",
+    );
   }
 
   return {
     binaryPath: null,
     source: null,
     buildAttempted: true,
-    skipReason: build.ok
-      ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
-      : `cargo build failed and no fallback aft binary was found\n${build.output}`,
+    skipReason,
   };
 }
 
 async function isExecutable(filePath: string): Promise<boolean> {
   try {
-    await access(filePath, constants.X_OK);
+    // Windows has no Unix execute bit; existence is enough for .exe discovery.
+    const mode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
+    await access(filePath, mode);
     return true;
   } catch {
     return false;

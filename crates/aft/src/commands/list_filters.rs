@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::compress::toml_filter::{parse_filter, FilterSource, TomlFilter};
 use crate::context::AppContext;
+use crate::harness::Harness;
 use crate::protocol::{RawRequest, Response};
 
 #[derive(Debug, Serialize)]
@@ -30,9 +31,11 @@ pub fn handle_list_filters(req: &RawRequest, ctx: &AppContext) -> Response {
         .as_ref()
         .map(|dir| crate::compress::trust::list_trusted(dir))
         .unwrap_or_default();
-    let user_dir = storage_dir
-        .as_ref()
-        .map(|dir| crate::compress::user_filter_dir(dir));
+    let harness = ctx.harness.borrow().unwrap_or(Harness::Opencode);
+    let user_dir = storage_dir.as_ref().map(|dir| {
+        crate::compress::repair_legacy_user_filter_dir(dir, harness);
+        crate::compress::user_filter_dir(dir, harness)
+    });
     let project_dir = project_root
         .as_ref()
         .map(|root| crate::compress::project_filter_dir(root));

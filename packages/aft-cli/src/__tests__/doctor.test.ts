@@ -3,12 +3,15 @@
 import { describe, expect, test } from "bun:test";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import {
+  buildDoctorFixPlan,
   clearDoctorCaches,
   DOCTOR_CLEAR_TARGET_OPTIONS,
   DOCTOR_FORCE_CLEAR_TARGETS,
   type DoctorClearTarget,
+  deriveIssueTitleFromBody,
   fixPluginEntries,
   hasDoctorProblems,
+  runDoctor,
 } from "../commands/doctor.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
 
@@ -69,7 +72,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     configPaths,
     aftConfig: { exists: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
-    storageDir: { path: "/tmp/aft-test/storage", exists: false, sizesByKey: {} },
+    storageDir: { path: "/tmp/aft-test/storage", exists: false, accessible: false, sizesByKey: {} },
     onnxRuntime: {
       required: false,
       systemPath: null,
@@ -104,6 +107,54 @@ function makeReport(harness: HarnessDiagnostic): DiagnosticReport {
     },
   };
 }
+
+describe("buildDoctorFixPlan plugin-update", () => {
+  test("plans a plugin update when cached plugin is older than latest", () => {
+    const adapter = makeAdapter();
+    const report = makeReport(
+      makeHarness({
+        pluginCache: {
+          path: "/tmp/aft-test/plugin-cache",
+          exists: true,
+          cached: "0.34.0",
+          latest: "0.35.0",
+        },
+      }),
+    );
+    const plan = buildDoctorFixPlan([adapter], report);
+    const updateItem = plan.find((p) => p.kind === "plugin-update");
+    expect(updateItem).toBeDefined();
+    expect(updateItem?.message).toContain("0.34.0");
+    expect(updateItem?.message).toContain("0.35.0");
+  });
+
+  test("does NOT plan a plugin update when cached === latest", () => {
+    const adapter = makeAdapter();
+    const report = makeReport(
+      makeHarness({
+        pluginCache: {
+          path: "/tmp/aft-test/plugin-cache",
+          exists: true,
+          cached: "0.35.0",
+          latest: "0.35.0",
+        },
+      }),
+    );
+    const plan = buildDoctorFixPlan([adapter], report);
+    expect(plan.some((p) => p.kind === "plugin-update")).toBe(false);
+  });
+
+  test("does NOT plan a plugin update when cache does not exist", () => {
+    const adapter = makeAdapter();
+    const report = makeReport(
+      makeHarness({
+        pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
+      }),
+    );
+    const plan = buildDoctorFixPlan([adapter], report);
+    expect(plan.some((p) => p.kind === "plugin-update")).toBe(false);
+  });
+});
 
 describe("doctor cache clear targets", () => {
   test("lists the interactive clear categories in prompt order", () => {
@@ -272,10 +323,122 @@ describe("doctor problem assessment", () => {
     expect(hasDoctorProblems(report)).toBe(true);
   });
 
+  test("plugin older than the CLI is treated as a high-priority problem", () => {
+    const report = makeReport(
+      makeHarness({
+        pluginCache: {
+          path: "/tmp/aft-test/plugin-cache",
+          exists: true,
+          cached: "0.29.1",
+          latest: "0.30.3",
+        },
+      }),
+    );
+    report.cliVersion = "0.30.3";
+    report.binaryVersion = "0.30.3";
+
+    expect(hasDoctorProblems(report)).toBe(true);
+  });
+
   test("present binary alongside a clean harness is not a problem", () => {
     const report = makeReport(makeHarness({ pluginRegistered: true }));
     // baseline: binaryVersion is "0.0.0-test", everything else green
     expect(report.binaryVersion).toBe("0.0.0-test");
     expect(hasDoctorProblems(report)).toBe(false);
+  });
+});
+
+async function withTTY<T>(stdinTTY: boolean, stdoutTTY: boolean, fn: () => Promise<T>): Promise<T> {
+  const stdinDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: stdinTTY });
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: stdoutTTY });
+  try {
+    return await fn();
+  } finally {
+    if (stdinDescriptor) Object.defineProperty(process.stdin, "isTTY", stdinDescriptor);
+    else delete (process.stdin as typeof process.stdin & { isTTY?: boolean }).isTTY;
+    if (stdoutDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutDescriptor);
+    else delete (process.stdout as typeof process.stdout & { isTTY?: boolean }).isTTY;
+  }
+}
+
+describe("doctor --issue safety", () => {
+  test("derives the filed title from the reviewed body", () => {
+    const rawDescription = "crash with sk-live-abcdefghijklmnopqrstuvwxyz123456";
+    const reviewedBody = [
+      "## Description",
+      "Crash after login after I removed the token from the report",
+      "",
+      "## Diagnostics",
+      `Original prompt was ${rawDescription}`,
+    ].join("\n");
+
+    const title = deriveIssueTitleFromBody(reviewedBody.replace(rawDescription, ""));
+
+    expect(title).toBe("AFT issue: Crash after login after I removed the token from the report");
+    expect(title).not.toContain("sk-live-");
+  });
+
+  test("redacts secrets from descriptions before deriving issue titles", () => {
+    const cases = [
+      {
+        line: "OPENCODE_SERVER_PASSWORD=swordfish",
+        redacted: "OPENCODE_SERVER_PASSWORD=<REDACTED_SECRET>",
+        secret: "swordfish",
+      },
+      {
+        line: '{"password":"hunter2"}',
+        redacted: '{"password":"<REDACTED_SECRET>"}',
+        secret: "hunter2",
+      },
+      {
+        line: "github_pat_11AA22BB33CC_44dd55ee66",
+        redacted: "<REDACTED_SECRET>",
+        secret: "github_pat_11AA22BB33CC_44dd55ee66",
+      },
+      {
+        line: "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        redacted: "Authorization: Basic <REDACTED_SECRET>",
+        secret: "QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+      },
+      {
+        line: "Proxy-Authorization: Basic cHJveHk6c2VjcmV0",
+        redacted: "Proxy-Authorization: Basic <REDACTED_SECRET>",
+        secret: "cHJveHk6c2VjcmV0",
+      },
+      {
+        line: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig",
+        redacted: "<REDACTED_SECRET>",
+        secret: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig",
+      },
+      {
+        line: "AKIAIOSFODNN7EXAMPLE",
+        redacted: "<REDACTED_SECRET>",
+        secret: "AKIAIOSFODNN7EXAMPLE",
+      },
+    ];
+
+    for (const { line, redacted, secret } of cases) {
+      const body = ["## Description", line].join("\n");
+      const title = deriveIssueTitleFromBody(body);
+
+      expect(title).toBe(`AFT issue: ${redacted}`);
+      expect(title).not.toContain(secret);
+    }
+  });
+
+  test("exits cleanly before prompts in non-interactive terminals", async () => {
+    await withTTY(false, false, async () => {
+      const code = await runDoctor({
+        clear: false,
+        fix: false,
+        force: false,
+        issue: true,
+        argv: ["--issue"],
+      });
+
+      expect(code).toBe(0);
+    });
   });
 });

@@ -1,16 +1,14 @@
-import * as fs from "node:fs/promises";
-import type { BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import {
+  type BridgeRequestOptions,
+  maybeAppendGrepSearchHint,
+  maybeStripCompressorPipe,
+  resolveBashKillTimeout,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import {
-  consumeBgCompletion,
-  markTaskWaiting,
-  trackBgTask,
-  unmarkTaskWaiting,
-} from "../bg-notifications.js";
+import { trackBgTask } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
 import { sessionLog } from "../logger.js";
-import { storeToolMetadata } from "../metadata-store.js";
 import {
   disposePtyTerminal,
   getOrCreatePtyTerminal,
@@ -19,7 +17,7 @@ import {
 } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, projectRootFor } from "./_shared.js";
+import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -28,26 +26,30 @@ const METADATA_PREVIEW_LIMIT = 30 * 1024;
 // promoting the task to background and returning. INTENTIONALLY decoupled
 // from the task's own kill cap (`args.timeout`). Council decision:
 // .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-const FOREGROUND_WAIT_WINDOW_MS = 5_000;
+// The value is resolved per-call from bash config (default 8000ms, floored at
+// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
 const FOREGROUND_POLL_INTERVAL_MS = 100;
-const BASH_WAIT_POLL_INTERVAL_MS = 100;
-const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
-const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
-// Bridge transport timeout for `bash` calls. The Rust handler returns a
-// `running` status immediately and the plugin polls separately, so transport
-// only needs to cover spawn + protocol round-trip. 30s is conservative for
-// Rust-side spawn (project_root resolution, bash_background registry write,
-// LSP integration overhead). NOT a function of args.timeout — explicit short
-// timeouts kill the task in Rust, not via transport. See council audit
-// `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.
-const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 // Default hard-kill cap when caller doesn't pass `args.timeout`. Mirrors the
 // Rust-side `DEFAULT_BG_TIMEOUT` (30 minutes). Used as the subagent foreground
 // poll-window when no explicit timeout was provided — subagents cannot survive
 // background promotion, so we poll until the task is terminal or this cap fires.
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
-const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a task_id for bash_status/bash_kill. Pass pty: true with background: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write. bash_status also supports explicit waits with exit: true and/or waitFor.`;
+// Test-only override for the foreground wait window. Production resolves the
+// window from config (floored at 5000ms), but bun caps each test at 5000ms, so
+// promotion tests need a sub-floor window to exercise the promote path
+// deterministically. Mirrors the Rust `AFT_CALLGRAPH_BUILD_WAIT_MS` test seam.
+// Never set outside tests.
+function resolveForegroundWaitMs(configured: number): number {
+  const override = process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return configured;
+}
+
+const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to block on or register for pattern matches and exit events.`;
 
 interface PermissionAsk {
   kind: "external_directory" | "bash";
@@ -55,7 +57,7 @@ interface PermissionAsk {
   always: string[];
 }
 
-type BridgeCaller = typeof callBridge;
+type BridgeCaller = typeof callBashBridge;
 
 async function withPermissionLoop(
   ctx: PluginContext,
@@ -95,7 +97,10 @@ async function withPermissionLoop(
   return second;
 }
 
-export function createBashTool(ctx: PluginContext): ToolDefinition {
+export function createBashTool(
+  ctx: PluginContext,
+  aftSearchRegisteredOverride?: boolean,
+): ToolDefinition {
   return {
     description: BASH_DESCRIPTION,
     args: {
@@ -104,14 +109,9 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "Shell command to execute through AFT's unified bash schema. Supports normal shell syntax, pipes, redirection, and command rewriting to dedicated AFT tools when available.",
         ),
-      timeout: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe(
-          "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~5s; otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
-        ),
+      timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
+      ),
       workdir: z
         .string()
         .optional()
@@ -128,7 +128,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .boolean()
         .optional()
         .describe(
-          "When true, spawn the command in the background and return a task_id for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+          "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
         ),
       compressed: z
         .boolean()
@@ -140,19 +140,32 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .boolean()
         .optional()
         .describe(
-          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
+          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
         ),
+      ptyRows: optionalInt(1, 60).describe(
+        "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+      ),
+      ptyCols: optionalInt(1, 140).describe(
+        "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+      ),
     },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
+      const ctxAftSearchRegistered =
+        (ctx as { aftSearchRegistered?: boolean }).aftSearchRegistered === true;
+      const aftSearchRegistered = aftSearchRegisteredOverride ?? ctxAftSearchRegistered;
       let accumulatedOutput = "";
       const description = args.description as string | undefined;
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      const command = args.command as string;
+      const rawCommand = args.command as string;
+      const compressionEnabled = bashCfg.compress && args.compressed !== false;
+      const pipeStrip = maybeStripCompressorPipe(rawCommand, compressionEnabled);
+      const command = pipeStrip.command;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty
-      // parentID). AFT bash auto-promotes anything >~5s to background, but a
+      // parentID). AFT bash auto-promotes long foreground tasks to background
+      // (default ~8s, configurable via bash.foreground_wait_window_ms), but a
       // subagent terminates after its single response and cannot survive
       // backgrounding: any task_id we returned would be unreachable because
       // the subagent has no chance to call bash_status. So for subagents we
@@ -160,11 +173,14 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       // foreground poll window to the task's full hard-kill timeout — the
       // command still runs to completion, just inline.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
-      const requestedBackground = args.background === true;
       const requestedPty = args.pty === true;
-      if (requestedPty && !requestedBackground) {
-        throw new Error("PTY mode requires background: true");
-      }
+      // pty:true silently implies background:true (Rust bash.rs handles the
+      // auto-promote). Agents don't need to set both flags.
+      const requestedBackground = args.background === true || requestedPty;
+      // ptyRows/ptyCols are silently ignored when pty is false so agents
+      // that defensively pass them on normal bash calls don't get stuck in
+      // a retry loop. pty: true silently implies background: true (Rust
+      // bash.rs handles the auto-promote); no explicit check needed.
       if (requestedPty && isSubagent) {
         throw new Error(
           "PTY mode is not available in subagent sessions; subagents cannot drive interactive terminals.",
@@ -173,6 +189,18 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       const allowSubagentBg = bashCfg.subagent_background;
       const subagentForcedForeground = isSubagent && !allowSubagentBg;
       const effectiveBackground = subagentForcedForeground ? false : requestedBackground;
+
+      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
+      // small `timeout` is a legitimate kill cap (kill after N ms), so honor it
+      // verbatim. For the FOREGROUND path a `timeout` below the foreground wait
+      // window is incoherent (the task would be killed before we promote it to
+      // background), so treat it as unset and let the bridge apply its
+      // 30-minute default — this is the #102 fix. Used for the bridge payload,
+      // the wait calc, and the promotion message so all three agree.
+      const rawTimeout = args.timeout as number | undefined;
+      const effectiveTimeout = effectiveBackground
+        ? rawTimeout
+        : resolveBashKillTimeout(rawTimeout, bashCfg.foreground_wait_window_ms);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
       // majority of calls and produces no useful log signal.
@@ -193,7 +221,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         context,
         {
           command,
-          timeout: args.timeout,
+          timeout: effectiveTimeout,
           workdir: args.workdir,
           env: shellEnv?.env ?? {},
           description,
@@ -201,17 +229,12 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           notify_on_completion: effectiveBackground,
           compressed: args.compressed,
           pty: requestedPty,
+          pty_rows: args.ptyRows,
+          pty_cols: args.ptyCols,
           permissions_requested: true,
         },
-        callBridge,
+        callBashBridge,
         {
-          transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
-          // Rust bash has its own watchdog that kills the child shell on the
-          // bash-level timeout (`args.timeout`) and returns a normal timed_out
-          // response well before our transport timeout fires. If we hit the
-          // transport deadline anyway it means the response is just late —
-          // don't sacrifice the bridge (and all its warm state) for that.
-          keepBridgeOnTimeout: true,
           onProgress: ({ text }) => {
             accumulatedOutput = preview(accumulatedOutput + text);
             metadata?.({ output: accumulatedOutput, description });
@@ -224,26 +247,24 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       }
 
       if (data.status === "running" && typeof data.task_id === "string") {
-        const callID = getCallID(context);
         const taskId = data.task_id;
+        const uiTitle = description ?? shortenCommand(command);
         if (effectiveBackground) {
           trackBgTask(context.sessionID, taskId);
           let startedLine = formatBackgroundLaunch(taskId, requestedPty);
           if (isSubagent && allowSubagentBg) startedLine += subagentGuidance(taskId);
+          // Tell the agent the pipe was stripped even on the background path, so
+          // when they later read the task output they know why it isn't filtered
+          // and can re-run with compressed:false to keep their pipeline.
+          startedLine = appendPipeStripNote(startedLine, pipeStrip.note);
           const metadataPayload = { description, output: startedLine, status: "running", taskId };
           metadata?.(metadataPayload);
-          if (callID) {
-            storeToolMetadata(context.sessionID, callID, {
-              title: description ?? shortenCommand(command),
-              metadata: metadataPayload,
-            });
-          }
-          return startedLine;
+          return { output: startedLine, title: uiTitle, metadata: metadataPayload };
         }
 
         // Wait-window is decoupled from `args.timeout`. For primary sessions
         // we always cap the foreground polling window at
-        // FOREGROUND_WAIT_WINDOW_MS so agents get a fast "promoted" response
+        // foregroundWaitMs so agents get a fast "promoted" response
         // for unexpectedly long commands. If the agent passed a shorter
         // explicit `timeout`, honor that — there's no point polling longer
         // than the task can possibly survive.
@@ -258,47 +279,50 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         //
         // Schema validation guarantees `args.timeout` is a positive
         // integer or undefined, so these expressions are well-defined.
-        const argTimeout = args.timeout as number | undefined;
+        // effectiveTimeout already folded the sub-window guard (#102): it is
+        // either >= foregroundWaitMs or undefined, so the primary-session
+        // Math.min can no longer collapse the wait window below the configured
+        // value.
+        const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
         const waitTimeoutMs = subagentForcedForeground
-          ? (argTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
-          : argTimeout !== undefined
-            ? Math.min(argTimeout, FOREGROUND_WAIT_WINDOW_MS)
-            : FOREGROUND_WAIT_WINDOW_MS;
+          ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
+          : effectiveTimeout !== undefined
+            ? Math.min(effectiveTimeout, foregroundWaitMs)
+            : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
-          const status = await callBridge(ctx, context, "bash_status", { task_id: taskId });
+          const status = await callBashBridge(ctx, context, "bash_status", { task_id: taskId });
           if (status.success === false) {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            const rendered = formatForegroundResult(status);
+            const rendered = maybeAppendGrepSearchHint(
+              appendPipeStripNote(formatForegroundResult(status), pipeStrip.note),
+              command,
+              aftSearchRegistered,
+            );
             const metadataPayload = foregroundMetadata(description, status, rendered);
             metadata?.(metadataPayload);
-            if (callID) {
-              storeToolMetadata(context.sessionID, callID, {
-                title: description ?? shortenCommand(command),
-                metadata: metadataPayload,
-              });
-            }
-            return rendered;
+            return { output: rendered, title: uiTitle, metadata: metadataPayload };
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
-            const promoted = await callBridge(ctx, context, "bash_promote", { task_id: taskId });
+            if (subagentForcedForeground) {
+              await sleep(FOREGROUND_POLL_INTERVAL_MS);
+              continue;
+            }
+            const promoted = await callBashBridge(ctx, context, "bash_promote", {
+              task_id: taskId,
+            });
             if (promoted.success === false) {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(context.sessionID, taskId);
-            let message = formatPromotionMessage(taskId, args.timeout as number | undefined);
+            let message = formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs);
             if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
+            message = appendPipeStripNote(message, pipeStrip.note);
             const metadataPayload = { description, output: message, status: "running", taskId };
             metadata?.(metadataPayload);
-            if (callID) {
-              storeToolMetadata(context.sessionID, callID, {
-                title: description ?? shortenCommand(command),
-                metadata: metadataPayload,
-              });
-            }
-            return message;
+            return { output: message, title: uiTitle, metadata: metadataPayload };
           }
           await sleep(FOREGROUND_POLL_INTERVAL_MS);
         }
@@ -310,7 +334,6 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       const truncated = data.truncated as boolean | undefined;
       const outputPath = data.output_path as string | undefined;
       const timedOut = data.timed_out === true;
-      const callID = getCallID(context);
       const metadataPayload = {
         description,
         output: metadataOutput,
@@ -320,12 +343,6 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       };
 
       metadata?.(metadataPayload);
-      if (callID) {
-        storeToolMetadata(context.sessionID, callID, {
-          title: description ?? shortenCommand(command),
-          metadata: metadataPayload,
-        });
-      }
 
       // Agent-visible output is the raw bash output (matches OpenCode's native
       // bash contract). Exit code, truncation, output path are UI metadata —
@@ -344,15 +361,24 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       if (typeof exit === "number" && exit !== 0) {
         rendered += `\n[exit code: ${exit}]`;
       }
-      return rendered;
+      rendered = appendPipeStripNote(rendered, pipeStrip.note);
+      return {
+        output: rendered,
+        title: description ?? shortenCommand(command),
+        metadata: metadataPayload,
+      };
     },
   };
+}
+
+function appendPipeStripNote(output: string, note: string | undefined): string {
+  return note ? `${output}\n\n${note}` : output;
 }
 
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      'Check the status and captured output of a background bash task spawned with bash({ background: true }). For PTY tasks, pass outputMode: "screen" (default) to render the visible terminal, "raw" for bytes since the previous read, or "both". Pass exit: true and/or waitFor to block until the task exits, the text/regex appears, or timeoutMs elapses.',
+      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
     args: {
       taskId: z
         .string()
@@ -363,52 +389,15 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
         ),
-      waitFor: z
-        .union([z.string(), z.object({ regex: z.string() })])
-        .optional()
-        .describe(
-          "Wait until this text pattern appears in the task's output. String form: substring match. Object form: regex match (JavaScript regex syntax). The call returns as soon as the pattern is found OR the task reaches terminal status OR timeoutMs elapses.",
-        ),
-      exit: z
-        .boolean()
-        .optional()
-        .describe(
-          "Wait until the task reaches a terminal status (completed/failed/killed/timed_out). Useful for explicitly awaiting a background bash task before returning. Can be combined with waitFor — the call returns on whichever condition fires first.",
-        ),
-      timeoutMs: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe(
-          "Maximum wait time in milliseconds. Default: 30000 (30s). Hard-capped at 300000 (5min). Ignored when neither waitFor nor exit is specified.",
-        ),
     },
     execute: async (args, context) => {
       const taskId = args.taskId as string;
       const outputMode = args.outputMode as string | undefined;
-      const waitFor = parseWaitPattern(args.waitFor);
-      const waitForExit = args.exit === true;
-      const effectiveWaitMs = Math.min(
-        (args.timeoutMs as number | undefined) ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-        MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
-      );
-      const shouldWait = waitFor !== undefined || waitForExit;
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      const data = shouldWait
-        ? await waitForBashStatus(
-            ctx,
-            context,
-            taskId,
-            outputMode,
-            waitFor,
-            waitForExit,
-            effectiveWaitMs,
-          )
-        : await bashStatusSnapshot(ctx, context, taskId, outputMode);
-      const waited = data.waited as BashStatusWaited | undefined;
-      if (waited) metadata?.({ taskId, status: data.status, waited });
-      return await formatBashStatusText(context, taskId, data, outputMode, waited);
+      // bash_status is snapshot-only as of bash_watch landing. waitFor/exit/
+      // timeoutMs moved to bash_watch — if the agent passes them here, they're
+      // silently ignored at the Zod schema layer (extra keys stripped).
+      const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      return await formatBashStatusText(context, taskId, data, outputMode);
     },
   };
 }
@@ -423,7 +412,7 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
         .describe("Background task ID returned by bash({ background: true }), e.g. bash-6b454047."),
     },
     execute: async (args, context) => {
-      const data = await callBridge(ctx, context, "bash_kill", {
+      const data = await callBashBridge(ctx, context, "bash_kill", {
         task_id: args.taskId as string,
       });
       if (data.success === false) {
@@ -438,17 +427,6 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
   };
 }
 
-type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; value: RegExp };
-
-type BashStatusWaited = {
-  reason: "matched" | "exited" | "timeout";
-  elapsed_ms: number;
-  match?: string;
-  match_offset?: number;
-};
-
-type BashStatusWithWait = Record<string, unknown> & { waited?: BashStatusWaited };
-
 async function bashStatusSnapshot(
   ctx: PluginContext,
   runtime: ToolContext,
@@ -456,7 +434,7 @@ async function bashStatusSnapshot(
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const data = await callBridge(
+  const data = await callBashBridge(
     ctx,
     runtime,
     "bash_status",
@@ -469,176 +447,31 @@ async function bashStatusSnapshot(
   return data;
 }
 
-async function waitForBashStatus(
-  ctx: PluginContext,
-  runtime: ToolContext,
-  taskId: string,
-  outputMode: string | undefined,
-  waitFor: BashWaitPattern | undefined,
-  waitForExit: boolean,
-  effectiveWaitMs: number,
-): Promise<BashStatusWithWait> {
-  const startedAt = Date.now();
-  const deadline = startedAt + effectiveWaitMs;
-  let spillCursor = 0;
-  let scanText = "";
-  let scanBaseOffset = 0;
-  const bridgeOptions: BridgeRequestOptions = {
-    keepBridgeOnTimeout: true,
-    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
-  };
-
-  while (true) {
-    const data = await bashStatusSnapshot(ctx, runtime, taskId, outputMode, bridgeOptions);
-    if (waitForExit && isTerminalStatus(data.status)) {
-      consumeBgCompletion(runtime.sessionID, taskId);
-      return withWaited(data, {
-        reason: "exited",
-        elapsed_ms: Date.now() - startedAt,
-      });
-    }
-
-    if (waitFor) {
-      const scan = await readNewTaskOutput(runtime, taskId, data, spillCursor);
-      if (scan) {
-        spillCursor = scan.nextCursor;
-        if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
-        scanText += scan.text;
-        const match = findWaitMatch(scanText, waitFor);
-        if (match) {
-          return withWaited(data, {
-            reason: "matched",
-            elapsed_ms: Date.now() - startedAt,
-            match: match.text,
-            match_offset:
-              scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
-          });
-        }
-      }
-      if (isTerminalStatus(data.status)) {
-        return withWaited(data, {
-          reason: "exited",
-          elapsed_ms: Date.now() - startedAt,
-        });
-      }
-    }
-
-    if (Date.now() >= deadline) {
-      return withWaited(data, {
-        reason: "timeout",
-        elapsed_ms: Date.now() - startedAt,
-      });
-    }
-    await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
-  }
-}
-
-async function readNewTaskOutput(
-  runtime: ToolContext,
-  taskId: string,
-  data: Record<string, unknown>,
-  cursor: number,
-): Promise<{ text: string; baseOffset: number; nextCursor: number } | undefined> {
-  const outputPath = data.output_path as string | undefined;
-  if (!outputPath) return undefined;
-  if (data.mode === "pty") {
-    const state = await getOrCreatePtyTerminal(ptyCacheKey(runtime, taskId), outputPath);
-    const baseOffset = state.offset;
-    const bytes = await readPtyBytes(state);
-    return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
-  }
-
-  const bytes = await readFileBytesFrom(outputPath, cursor);
-  return { text: bytes.toString("utf8"), baseOffset: cursor, nextCursor: cursor + bytes.length };
-}
-
-async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
-  const handle = await fs.open(outputPath, "r");
-  try {
-    const chunks: Buffer[] = [];
-    let offset = cursor;
-    while (true) {
-      const buffer = Buffer.allocUnsafe(64 * 1024);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-      if (bytesRead === 0) break;
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-      offset += bytesRead;
-    }
-    return Buffer.concat(chunks);
-  } finally {
-    await handle.close().catch(() => undefined);
-  }
-}
-
-function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
-  if (typeof value === "string") return { kind: "substring", value };
-  if (isRegexWaitObject(value)) return { kind: "regex", value: new RegExp(value.regex) };
-  return undefined;
-}
-
-function isRegexWaitObject(value: unknown): value is { regex: string } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "regex" in value &&
-    typeof (value as { regex?: unknown }).regex === "string"
-  );
-}
-
-function findWaitMatch(
-  text: string,
-  pattern: BashWaitPattern,
-): { text: string; index: number } | undefined {
-  if (pattern.kind === "substring") {
-    const index = text.indexOf(pattern.value);
-    return index >= 0 ? { text: pattern.value, index } : undefined;
-  }
-  pattern.value.lastIndex = 0;
-  const match = pattern.value.exec(text);
-  return match ? { text: match[0], index: match.index } : undefined;
-}
-
-function withWaited(data: Record<string, unknown>, waited: BashStatusWaited): BashStatusWithWait {
-  return { ...data, waited };
-}
-
 async function formatBashStatusText(
   runtime: ToolContext,
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
-  waited: BashStatusWaited | undefined,
 ): Promise<string> {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
   const dur =
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
-  if (waited) text += `\n${formatWaitSummary(waited, data)}`;
   if (data.mode === "pty") {
+    // PTY output is rendered from the raw terminal spill file; never feed it
+    // through the piped-output compression/line renderer.
     text += await formatPtyStatus(runtime, taskId, data, requestedOutputMode);
   } else {
     const preview = data.output_preview as string | undefined;
     if (preview && status !== "running") {
-      text += `\n${preview.slice(0, 2000)}`;
+      text += `\n${preview}`;
     }
     if (status === "running") {
       text += `\nA completion reminder will be delivered automatically; don't poll.`;
     }
   }
   return text;
-}
-
-function formatWaitSummary(waited: BashStatusWaited, data: Record<string, unknown>): string {
-  if (waited.reason === "matched") {
-    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
-  }
-  if (waited.reason === "timeout") {
-    return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;
-  }
-  const status = String(data.status ?? "unknown");
-  const exit = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
-  return `Waited ${waited.elapsed_ms}ms; task exited (${status}${exit}).`;
 }
 
 async function formatPtyStatus(
@@ -650,16 +483,17 @@ async function formatPtyStatus(
   const outputPath = data.output_path as string | undefined;
   if (!outputPath) return "\n[PTY output path unavailable]";
   const key = ptyCacheKey(runtime, taskId);
-  const state = await getOrCreatePtyTerminal(key, outputPath);
+  const { rows, cols } = ptyDimensions(data);
+  const state = await getOrCreatePtyTerminal(key, outputPath, rows, cols);
   const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
   let suffix = "";
   if (outputMode === "raw") {
     suffix = raw.length > 0 ? `\n${raw.toString("utf8")}` : "";
   } else if (outputMode === "both") {
-    suffix = `\n${JSON.stringify({ screen: renderScreen(state, 24, 80), raw: raw.toString("utf8") }, null, 2)}`;
+    suffix = `\n${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, 24, 80);
+    const screen = renderScreen(state, rows, cols);
     suffix = screen ? `\n${screen}` : "";
   }
   if (data.status === "running") {
@@ -668,6 +502,12 @@ async function formatPtyStatus(
     await disposePtyTerminal(key);
   }
   return suffix;
+}
+
+function ptyDimensions(data: Record<string, unknown>): { rows: number; cols: number } {
+  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
+  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
+  return { rows, cols };
 }
 
 function ptyCacheKey(runtime: ToolContext, taskId: string): string {
@@ -687,7 +527,7 @@ function isTerminalStatus(status: unknown): boolean {
 function subagentGuidance(taskId: string): string {
   return `
 
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_status({ taskId: "${taskId}", exit: true, timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
+NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}", timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
 }
 
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
@@ -700,17 +540,22 @@ function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
-function formatPromotionMessage(taskId: string, timeout: number | undefined): string {
-  // We waited up to FOREGROUND_WAIT_WINDOW_MS, or shorter if the agent's
-  // explicit timeout capped us first. Report the actual elapsed wait so the
-  // message is accurate. We do NOT echo the original command back — the
-  // agent already has it in its own tool-call args, and bash_status returns
-  // it on demand.
-  const waited =
-    timeout !== undefined
-      ? Math.min(timeout, FOREGROUND_WAIT_WINDOW_MS)
-      : FOREGROUND_WAIT_WINDOW_MS;
-  return `Foreground bash didn't finish within ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
+function formatPromotionMessage(
+  taskId: string,
+  timeout: number | undefined,
+  waitWindowMs: number,
+): string {
+  // We waited up to waitWindowMs, or shorter if the agent's explicit timeout
+  // capped us first. Report the actual elapsed wait so the message is
+  // accurate. We do NOT echo the original command back — the agent already
+  // has it in its own tool-call args, and bash_status returns it on demand.
+  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
+  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
+}
+
+/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
+function formatSeconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(1))}s`;
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {

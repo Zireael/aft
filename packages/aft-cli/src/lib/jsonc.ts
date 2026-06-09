@@ -61,7 +61,7 @@ export function writeJsoncFile(
 
 /** Canonical URL of the published AFT config schema. */
 export const AFT_SCHEMA_URL =
-  "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json";
+  "https://raw.githubusercontent.com/cortexkit/aft/main/assets/aft.schema.json";
 
 export type AftSchemaAction = "added" | "updated" | "unchanged";
 

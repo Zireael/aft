@@ -46,6 +46,39 @@ describe("shared status helpers", () => {
     expect(status.compression?.session.savings_tokens).toBe(30);
   });
 
+  test("pi_status_snapshot_parses_status_bar_and_renders_code_health", () => {
+    const status = coerceAftStatus({
+      status_bar: {
+        errors: 7,
+        warnings: 13,
+        dead_code: 334,
+        unused_exports: 222,
+        duplicates: 1167,
+        todos: 5,
+        tier2_stale: true,
+      },
+    });
+
+    expect(status.status_bar?.errors).toBe(7);
+    expect(status.status_bar?.duplicates).toBe(1167);
+    expect(status.status_bar?.tier2_stale).toBe(true);
+
+    const dialog = formatStatusDialogMessage(status);
+    expect(dialog).toContain("Code Health (~ stale)");
+    expect(dialog).toContain("duplicates: 1,167");
+    // dead_code / unused_exports are parsed from the snapshot but intentionally
+    // NOT rendered until the oxc resolver lands (over-reporting on real TS/JS).
+    expect(status.status_bar?.dead_code).toBe(334);
+    expect(dialog).not.toContain("dead code: 334");
+    expect(dialog).not.toContain("unused exports: 222");
+  });
+
+  test("pi_status_snapshot_status_bar_undefined_when_null", () => {
+    const status = coerceAftStatus({ status_bar: null });
+    expect(status.status_bar).toBeUndefined();
+    expect(formatStatusDialogMessage(status)).not.toContain("Code Health");
+  });
+
   test("formatBytes handles zero, fractions, and large units", () => {
     expect(formatBytes(0)).toBe("0 B");
     expect(formatBytes(512)).toBe("512 B");

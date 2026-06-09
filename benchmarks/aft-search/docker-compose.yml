@@ -1,0 +1,14 @@
+services:
+  aft-search:
+    build:
+      context: ../..
+      dockerfile: benchmarks/aft-search/Dockerfile
+    environment:
+      AFT_SEARCH_MODE: ${AFT_SEARCH_MODE:-in-tree}
+      AFT_SEARCH_OUT: ${AFT_SEARCH_OUT:-results/aft-search-docker.json}
+      AFT_READY_TIMEOUT: ${AFT_READY_TIMEOUT:-300}
+      AFT_SEARCH_SETUP_CORPUS: ${AFT_SEARCH_SETUP_CORPUS:-1}
+      AFT_SEARCH_ALLOW_PARTIAL: ${AFT_SEARCH_ALLOW_PARTIAL:-}
+    volumes:
+      - ./results:/workspace/benchmarks/aft-search/results
+      - ./.bench:/workspace/benchmarks/aft-search/.bench

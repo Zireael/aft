@@ -32,13 +32,13 @@ fn configure_path(aft: &mut AftProcess, root: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {
-    std::os::unix::fs::symlink(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {
-    std::os::windows::fs::symlink_dir(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
 }
 
 fn bash(aft: &mut AftProcess, id: &str, command: &str) -> serde_json::Value {
@@ -141,6 +141,67 @@ fn bash_permission_scan_collects_redirect_target() {
 }
 
 #[test]
+fn dynamic_file_args_require_external_directory_wildcard() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(&mut aft, "dynamic-file-arg", r#"rm "$DEST/file""#);
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "permission_required");
+    assert!(response["asks"].as_array().unwrap().iter().any(|ask| {
+        ask["kind"] == "external_directory"
+            && ask["patterns"].as_array().unwrap().iter().any(|p| p == "*")
+    }));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let external_dir = std::fs::canonicalize(outside.path()).unwrap();
+    let external_grant = format!("{}/*", external_dir.display());
+    let response = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "relative-redirect-grant",
+            "method": "bash",
+            "params": {
+                "command": "echo hi > ./file.log",
+                "workdir": outside.path(),
+                "permissions_requested": true,
+                "permissions_granted": [external_grant, "echo hi > ./file.log"],
+            },
+        }))
+        .unwrap(),
+    );
+
+    assert_ne!(
+        response["code"], "permission_required",
+        "relative redirect should be canonicalized against workdir: {response:?}"
+    );
+    // Foreground bash spawns through bash_background::spawn and returns
+    // immediately on slower CI runners — wait for the file with a deadline
+    // rather than asserting synchronously.
+    let target = outside.path().join("file.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && !target.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        target.exists(),
+        "expected redirect target to exist at {}",
+        target.display()
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn bash_permission_scan_handles_source() {
     let root = TempDir::new().unwrap();
     let mut aft = AftProcess::spawn();
@@ -179,7 +240,15 @@ fn symlink_path_resolving_outside_project_requires_permission() {
     let outside = dir.path().join("outside");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    create_dir_symlink(&outside, &root.join("link"));
+    if let Err(error) = create_dir_symlink(&outside, &root.join("link")) {
+        if cfg!(windows) {
+            eprintln!(
+                "skipping symlink_path_resolving_outside_project_requires_permission: Windows symlink privilege unavailable: {error}"
+            );
+            return;
+        }
+        panic!("create symlink: {error}");
+    }
     std::fs::write(outside.join("secret.txt"), "secret").unwrap();
 
     let mut aft = AftProcess::spawn();

@@ -62,6 +62,16 @@ jobs:
           docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
           docker rm "$CID"
 
+      # The E2E Dockerfile installs the local package artifacts (npm pack
+      # tarballs) instead of the published @latest plugin, so the image
+      # exercises the code under test (real package.json + dist + deps), not
+      # a published/local hybrid. Produce the tarballs on the runner first.
+      - name: Pack local plugin artifacts
+        run: |
+          mkdir -p tests/docker/fixtures/npm-packs
+          npm pack ./packages/aft-bridge --pack-destination tests/docker/fixtures/npm-packs
+          npm pack ./packages/opencode-plugin --pack-destination tests/docker/fixtures/npm-packs
+
       - name: Build E2E test image
         run: |
           docker build --platform linux/amd64 \

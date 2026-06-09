@@ -1,0 +1,9 @@
+<?php
+
+namespace Demo;
+
+use App\Alpha;
+// keep use section note
+use App\Zulu;
+
+class C {}

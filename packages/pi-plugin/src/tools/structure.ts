@@ -7,7 +7,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -24,7 +25,9 @@ const TransformParams = Type.Object({
     ["add_member", "add_derive", "wrap_try_catch", "add_decorator", "add_struct_tags"] as const,
     { description: "Transformation operation" },
   ),
-  filePath: Type.String({ description: "Path to the source file" }),
+  filePath: Type.String({
+    description: "Path to the source file (absolute or relative to project root)",
+  }),
   container: Type.Optional(Type.String({ description: "Class/struct/impl name for add_member" })),
   code: Type.Optional(Type.String({ description: "Member code to insert (add_member)" })),
   target: Type.Optional(Type.String({ description: "Target symbol name" })),
@@ -124,9 +127,14 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
     ) {
       validateTransformParams(params);
 
+      const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+      await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+        restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+      });
+
       const bridge = bridgeFor(ctx, extCtx.cwd);
       // Rust dispatch accepts the op name directly (add_member, add_derive, etc.)
-      const req: Record<string, unknown> = { file: params.filePath };
+      const req: Record<string, unknown> = { file: filePath };
       if (params.container !== undefined) req.scope = params.container;
       if (params.code !== undefined) req.code = params.code;
       if (params.target !== undefined) req.target = params.target;
@@ -154,10 +162,10 @@ function validateTransformParams(params: Static<typeof TransformParams>): void {
   const op = params.op;
 
   if (op === "add_member") {
-    if (typeof params.container !== "string") {
+    if (isEmptyParam(params.container)) {
       throw new Error("'container' is required for 'add_member' op");
     }
-    if (typeof params.code !== "string") {
+    if (isEmptyParam(params.code)) {
       throw new Error("'code' is required for 'add_member' op");
     }
   }
@@ -167,24 +175,24 @@ function validateTransformParams(params: Static<typeof TransformParams>): void {
     op === "add_decorator" ||
     op === "add_struct_tags"
   ) {
-    if (typeof params.target !== "string") {
+    if (isEmptyParam(params.target)) {
       throw new Error(`'target' is required for '${op}' op`);
     }
   }
-  if (op === "add_derive" && !Array.isArray(params.derives)) {
+  if (op === "add_derive" && isEmptyParam(params.derives)) {
     throw new Error("'derives' array is required for 'add_derive' op");
   }
-  if (op === "add_decorator" && typeof params.decorator !== "string") {
+  if (op === "add_decorator" && isEmptyParam(params.decorator)) {
     throw new Error("'decorator' is required for 'add_decorator' op");
   }
   if (op === "add_struct_tags") {
-    if (typeof params.field !== "string") {
+    if (isEmptyParam(params.field)) {
       throw new Error("'field' is required for 'add_struct_tags' op");
     }
-    if (typeof params.tag !== "string") {
+    if (isEmptyParam(params.tag)) {
       throw new Error("'tag' is required for 'add_struct_tags' op");
     }
-    if (typeof params.value !== "string") {
+    if (isEmptyParam(params.value)) {
       throw new Error("'value' is required for 'add_struct_tags' op");
     }
   }

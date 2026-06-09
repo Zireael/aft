@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{self, BufReader, BufWriter};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -23,9 +23,18 @@ use crate::lsp::{transport, LspError};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STDERR_TAIL_LINES: usize = 64;
+const STDERR_LINE_BYTES: usize = 4 * 1024;
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
+
+#[cfg(windows)]
+fn is_windows_batch_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
 
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,9 +113,9 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
-    /// Whether the server advertised `workspace.didChangeWatchedFiles` support
-    /// during `initialize`. When `false` (or `None` pre-init), we skip sending
-    /// `workspace/didChangeWatchedFiles` notifications to avoid spec violations.
+    /// Whether the server advertised static `workspace.didChangeWatchedFiles`
+    /// support during `initialize`. Dynamic registration is tracked separately
+    /// in `watched_file_registrations`; either path permits notifications.
     /// Intentional default: `false` (conservative — requires server opt-in).
     supports_watched_files: bool,
     /// Dynamic `workspace/didChangeWatchedFiles` registrations requested by
@@ -118,6 +127,7 @@ pub struct LspClient {
     /// so the signal handler can SIGKILL them on SIGTERM/SIGINT before
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
     child_registry: LspChildRegistry,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl LspClient {
@@ -135,15 +145,24 @@ impl LspClient {
         event_tx: Sender<LspEvent>,
         child_registry: LspChildRegistry,
     ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mut command = if is_windows_batch_file(binary) {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/C").arg(binary.as_os_str());
+            command
+        } else {
+            Command::new(binary)
+        };
+        #[cfg(not(windows))]
         let mut command = Command::new(binary);
         command
             .args(args)
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Use null() instead of piped() to prevent deadlock when the server
-            // writes more than ~64KB to stderr (piped buffer fills, server blocks)
-            .stderr(Stdio::null());
+            // Drain stderr on a background thread so failed shims/crashes have
+            // actionable diagnostics without risking pipe-buffer deadlock.
+            .stderr(Stdio::piped());
         for (key, value) in env {
             command.env(key, value);
         }
@@ -189,6 +208,12 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("language server missing stdin pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("language server missing stderr pipe"))?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
@@ -296,6 +321,7 @@ impl LspClient {
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
+            stderr_tail,
         })
     }
 
@@ -393,9 +419,11 @@ impl LspClient {
             .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
 
-        // Capture whether the server supports workspace/didChangeWatchedFiles.
-        // Missing capability is unsupported by default; callers must not send
-        // notifications unless the server explicitly opted in.
+        // Capture initialize-time (static) workspace/didChangeWatchedFiles
+        // support. Runtime client/registerCapability subscriptions are recorded
+        // separately by the reader thread. Missing capability is unsupported by
+        // default; callers must not send notifications unless one of those two
+        // server opt-in paths is present.
         self.supports_watched_files = caps_value
             .pointer("/workspace/didChangeWatchedFiles/dynamicRegistration")
             .and_then(|v| v.as_bool())
@@ -419,8 +447,9 @@ impl LspClient {
         self.diagnostic_caps.as_ref()
     }
 
-    /// Whether the server supports `workspace/didChangeWatchedFiles`.
-    /// Captured from the `initialize` response. Default `false` (conservative).
+    /// Whether the server advertised initialize-time
+    /// `workspace/didChangeWatchedFiles` support. Dynamic registrations are
+    /// reported by `has_watched_file_registration()`.
     pub fn supports_watched_files(&self) -> bool {
         self.supports_watched_files
     }
@@ -602,6 +631,21 @@ impl LspClient {
         }
     }
 
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| stderr_tail_to_string(&tail))
+            .unwrap_or_default()
+    }
+
+    pub fn child_exited(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_some()
+    }
+
+    pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
     pub fn state(&self) -> ServerState {
         self.state
     }
@@ -654,6 +698,58 @@ impl Drop for LspClient {
         self.child_registry.untrack(self.child_pid);
         kill_lsp_child_group(&mut self.child);
     }
+}
+
+fn spawn_stderr_drain_thread(
+    stderr: std::process::ChildStderr,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        append_stderr_tail(&mut tail, &line);
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn append_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(trim_stderr_line(line));
+}
+
+fn trim_stderr_line(line: &str) -> String {
+    let line = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+    if line.len() <= STDERR_LINE_BYTES {
+        return line.to_string();
+    }
+
+    let mut start = line.len() - STDERR_LINE_BYTES;
+    while start < line.len() && !line.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &line[start..])
+}
+
+fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
+    tail.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Force-terminate an LSP child and its entire process group on Unix.

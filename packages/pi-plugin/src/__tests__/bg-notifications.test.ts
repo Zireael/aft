@@ -5,9 +5,14 @@ import {
   __resetBgNotificationStateForTests,
   appendToolResultBgCompletions,
   cleanupIdleSessionStates,
+  consumeBgCompletion,
   formatSystemReminder,
   handlePushedBgCompletion,
   handleTurnEndBgCompletions,
+  ingestBgCompletions,
+  markBgCompletionDelivered,
+  markExplicitControl,
+  markTaskWaiting,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -57,6 +62,122 @@ describe("Pi background notifications", () => {
         },
       ]),
     ).toContain('bash_status({ task_id: "..." })');
+  });
+
+  test("markBgCompletionDelivered persists locally consumed completions", async () => {
+    const send = mock(async () => ({ success: true, acked_task_ids: ["task-1"] }));
+    const { ctx } = harness(send);
+
+    await markBgCompletionDelivered({ ctx, directory: "/tmp/project", sessionID: "s1" }, "task-1");
+
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
+  test("pending explicit control converts completions before task tracking", () => {
+    markExplicitControl("s1", "task-1", false);
+
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+
+    expect(accepted).toEqual([]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(0);
+    expect(state?.pendingPatternMatches).toHaveLength(1);
+    expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+  });
+
+  test("emptying pending queues resets wake hard-stop retry state", () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(1);
+    if (!state) throw new Error("missing state");
+    state.retryDelayMs = 1000;
+    state.wakeRetryAttempts = 5;
+    state.wakeHardStopped = true;
+
+    consumeBgCompletion("s1", "task-1");
+
+    expect(state.pendingCompletions).toHaveLength(0);
+    expect(state.retryDelayMs).toBeNull();
+    expect(state.wakeRetryAttempts).toBe(0);
+    expect(state.wakeHardStopped).toBe(false);
+  });
+
+  test("markExplicitControl retroactively converts already-pending completion to pattern match", () => {
+    // Race: bash spawns → trackBgTask, completion push frame arrives →
+    // ingestBgCompletions queues into pendingCompletions, THEN bash_watch
+    // async runs markExplicitControl. Without retroactive conversion the
+    // in-turn-append path would emit both "[BACKGROUND BASH COMPLETED]" and
+    // "[BG BASH NOTIFY]" for the same task.
+    trackBgTask("s1", "task-1");
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    expect(accepted).toHaveLength(1);
+
+    const stateBefore = sessionBgStates.get("s1");
+    expect(stateBefore?.pendingCompletions).toHaveLength(1);
+    expect(stateBefore?.pendingPatternMatches).toHaveLength(0);
+
+    markExplicitControl("s1", "task-1", false);
+
+    const stateAfter = sessionBgStates.get("s1");
+    expect(stateAfter?.pendingCompletions).toHaveLength(0);
+    expect(stateAfter?.pendingPatternMatches).toHaveLength(1);
+    expect(stateAfter?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+    expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
+  });
+
+  test("retroactively converted task-exit notify is acked after tool-result delivery", async () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    markExplicitControl("s1", "task-1", false);
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-1"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "watch registered" }],
+    );
+
+    const reminder = content?.[1]?.type === "text" ? content[1].text : "";
+    expect(reminder).toContain("[BG BASH NOTIFY]");
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
+  test("late async watch renders one notify and suppresses default completion on drain", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "echo READY")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedBgCompletion(
+      { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
+      completion("task-1", "echo READY"),
+    );
+    markExplicitControl("s1", "task-1", false);
+    markExplicitControl("s1", "task-1");
+
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "watch registered" }],
+    );
+
+    const reminder = content?.[1]?.type === "text" ? content[1].text : "";
+    expect(reminder).toContain("[BG BASH NOTIFY]");
+    expect(reminder).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(reminder.match(/- task task-1 exited:/g)).toHaveLength(1);
   });
 
   test("tool_result mutation appends a reminder text block", async () => {
@@ -143,7 +264,7 @@ describe("Pi background notifications", () => {
     expect(sendUserMessage.mock.calls[0][1]).toEqual({ deliverAs: "steer" });
   });
 
-  test("push completion lands in pending and wakes when idle", async () => {
+  test("push completion lands in pending and wakes after the spawn turn is idle", async () => {
     trackBgTask("s1", "task-1");
     const send = mock(async () => ({
       success: true,
@@ -152,6 +273,12 @@ describe("Pi background notifications", () => {
     }));
     const { ctx } = harness(send);
     const sendUserMessage = mock(() => {});
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       {
@@ -169,6 +296,35 @@ describe("Pi background notifications", () => {
     expect(sendUserMessage.mock.calls[0][0]).not.toContain(": npm test");
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+  });
+
+  test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        runtime: { sendUserMessage },
+      },
+      completion("task-1", "npm test"),
+    );
+
+    // Same-turn completions are deferred synchronously: they remain pending,
+    // but no wake timer is scheduled until a turn-end boundary clears the
+    // deferral. No wall-clock sleep is needed to prove the negative path.
+    expect(sendUserMessage).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+
+    markTaskWaiting("s1", "task-1");
+
+    // A synchronous bash_watch wait consumes the pending completion immediately.
+    expect(sendUserMessage).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("buffers push completion received before task tracking", async () => {
@@ -203,6 +359,12 @@ describe("Pi background notifications", () => {
     const sendUserMessage = mock(() => {
       throw new Error("send failed");
     });
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
@@ -220,6 +382,12 @@ describe("Pi background notifications", () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const sendUserMessage = mock(() => {
       throw new Error("send failed");
+    });
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
     });
 
     await handlePushedBgCompletion(
@@ -257,13 +425,20 @@ describe("Pi background notifications", () => {
     expect(sessionBgStates.get("__default__")?.outstandingTaskIds.has("task-1")).toBe(false);
   });
 
-  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+  test("post-idle push completion still wakes even when bridge is busy with non-agent RPC", async () => {
     // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
     // which returned true for the TUI status poll, orphaning the completion when
-    // no other trigger fired. The wake must always be scheduled.
+    // no other trigger fired. Once the spawn turn has gone idle, the wake must
+    // still be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const sendUserMessage = mock(() => {});
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       {
@@ -292,20 +467,21 @@ describe("Pi background notifications", () => {
     const sendUserMessage = mock(() => {});
 
     for (const taskId of ["task-1", "task-2", "task-3"]) trackBgTask("s1", taskId);
+    // Each turn-end drain synchronously queues one completion and extends the
+    // same debounce timer. Driving the drains back-to-back keeps coverage of
+    // coalescing without relying on short sleeps landing inside a timer window.
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(50);
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(50);
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",

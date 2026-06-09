@@ -13,7 +13,7 @@ use crate::symbols::{Symbol, SymbolKind};
 use crate::vector_store::VectorStore;
 use crate::{slog_debug, slog_info, slog_warn};
 
-use fastembed::{EmbeddingModel as FastembedEmbeddingModel, InitOptions, TextEmbedding};
+use crate::local_embed::LocalEmbedder;
 #[cfg(feature = "semantic-model2vec")]
 use model2vec_rs::model::StaticModel as Model2VecStaticModel;
 use rayon::prelude::*;
@@ -1087,7 +1087,7 @@ impl FingerprintChange {
 }
 
 enum SemanticEmbeddingEngine {
-    Fastembed(TextEmbedding),
+    Local(LocalEmbedder),
     OpenAiCompatible {
         client: Client,
         model: String,
@@ -1335,8 +1335,62 @@ fn is_retryable_embedding_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
+fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::CONFLICT
+            | reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::LOCKED
+            | reqwest::StatusCode::TOO_EARLY
+    ) {
+        return false;
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    let normalized = lower.trim();
+
+    normalized.contains("model was unloaded while the request was still in queue")
+        || normalized == "model is loading"
+        || normalized.starts_with("model is loading,")
+        || normalized.contains(r#""error":"model is loading"#)
+        || normalized.contains(r#""message":"model is loading"#)
+        || normalized == "model not loaded"
+        || normalized.contains(r#""error":"model not loaded""#)
+        || normalized.contains(r#""message":"model not loaded""#)
+        || normalized == "loading model into memory"
+        || normalized.contains(r#""error":"loading model into memory""#)
+        || normalized.contains(r#""message":"loading model into memory""#)
+        || normalized == "model is being loaded"
+        || normalized.contains(r#""error":"model is being loaded""#)
+        || normalized.contains(r#""message":"model is being loaded""#)
+        || normalized == "model is currently loading"
+        || normalized.contains(r#""error":"model is currently loading""#)
+        || normalized.contains(r#""message":"model is currently loading""#)
+}
+
 fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
     error.is_connect()
+}
+
+fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn embedding_response_read_error_is_transient(error: &reqwest::Error) -> bool {
+    embedding_send_error_is_transient(error) || error.is_body() || error.is_decode()
+}
+
+/// Stable machine marker prefixed onto embedding error strings whose root cause
+/// is transient — the backend is down, timing out, or returning 5xx/429.
+pub const TRANSIENT_EMBEDDING_MARKER: &str = "[transient] ";
+
+pub fn embedding_failure_is_transient(error: &str) -> bool {
+    error.contains(TRANSIENT_EMBEDDING_MARKER)
+}
+
+pub fn strip_transient_embedding_marker(error: &str) -> String {
+    error.replace(TRANSIENT_EMBEDDING_MARKER, "")
 }
 
 fn sleep_before_embedding_retry(attempt_index: usize) {
@@ -1359,7 +1413,12 @@ where
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                return Err(format!("{backend_label} request failed: {error}"));
+                let marker = if embedding_send_error_is_transient(&error) {
+                    TRANSIENT_EMBEDDING_MARKER
+                } else {
+                    ""
+                };
+                return Err(format!("{marker}{backend_label} request failed: {error}"));
             }
         };
 
@@ -1367,11 +1426,18 @@ where
         let raw = match response.text() {
             Ok(raw) => raw,
             Err(error) => {
-                if !last_attempt && is_retryable_embedding_error(&error) {
+                if !last_attempt && embedding_response_read_error_is_transient(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                return Err(format!("{backend_label} response read failed: {error}"));
+                let marker = if embedding_response_read_error_is_transient(&error) {
+                    TRANSIENT_EMBEDDING_MARKER
+                } else {
+                    ""
+                };
+                return Err(format!(
+                    "{marker}{backend_label} response read failed: {error}"
+                ));
             }
         };
 
@@ -1379,13 +1445,19 @@ where
             return Ok(raw);
         }
 
-        if !last_attempt && is_retryable_embedding_status(status) {
+        let body_transient = embedding_response_body_is_transient(status, &raw);
+        if !last_attempt && (is_retryable_embedding_status(status) || body_transient) {
             sleep_before_embedding_retry(attempt_index);
             continue;
         }
 
+        let marker = if is_retryable_embedding_status(status) || body_transient {
+            TRANSIENT_EMBEDDING_MARKER
+        } else {
+            ""
+        };
         return Err(format!(
-            "{backend_label} request failed (HTTP {}): {}",
+            "{marker}{backend_label} request failed (HTTP {}): {}",
             status, raw
         ));
     }
@@ -1459,7 +1531,7 @@ impl SemanticEmbeddingModel {
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
-                SemanticEmbeddingEngine::Fastembed(initialize_text_embedding(&model)?)
+                SemanticEmbeddingEngine::Local(LocalEmbedder::new(&model)?)
             }
             SemanticBackend::OpenAiCompatible => {
                 let raw = config.base_url.as_ref().ok_or_else(|| {
@@ -1621,10 +1693,10 @@ impl SemanticEmbeddingModel {
         }
 
         let dimension = match &mut self.engine {
-            SemanticEmbeddingEngine::Fastembed(model) => {
+            SemanticEmbeddingEngine::Local(model) => {
                 let vectors = model
-                    .embed(vec!["semantic index fingerprint probe".to_string()], None)
-                    .map_err(|error| format_embedding_init_error(error.to_string()))?;
+                    .embed(&["semantic index fingerprint probe".to_string()])
+                    .map_err(format_embedding_init_error)?;
                 vectors
                     .first()
                     .map(|v| v.len())
@@ -1720,9 +1792,8 @@ impl SemanticEmbeddingModel {
 
     fn embed_texts(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         match &mut self.engine {
-            SemanticEmbeddingEngine::Fastembed(model) => model
-                .embed(texts, None::<usize>)
-                .map_err(|error| format_embedding_init_error(error.to_string()))
+            SemanticEmbeddingEngine::Local(model) => model
+                .embed(&texts)
                 .map_err(|error| format!("failed to embed batch: {error}")),
             SemanticEmbeddingEngine::OpenAiCompatible {
                 client,
@@ -2281,21 +2352,8 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
     )
 }
 
-pub fn initialize_text_embedding(model: &str) -> Result<TextEmbedding, String> {
-    // Pre-validate before ort can panic on a bad library
-    pre_validate_onnx_runtime()?;
-
-    let selected_model = match model {
-        "all-MiniLM-L6-v2" | "all-minilm-l6-v2" => FastembedEmbeddingModel::AllMiniLML6V2,
-        _ => {
-            return Err(format!(
-                "unsupported fastembed model '{}'. Supported: all-MiniLM-L6-v2",
-                model
-            ))
-        }
-    };
-
-    TextEmbedding::try_new(InitOptions::new(selected_model)).map_err(format_embedding_init_error)
+pub fn initialize_text_embedding(model: &str) -> Result<LocalEmbedder, String> {
+    LocalEmbedder::new(model)
 }
 
 pub fn is_onnx_runtime_unavailable(message: &str) -> bool {

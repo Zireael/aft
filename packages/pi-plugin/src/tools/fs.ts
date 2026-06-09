@@ -3,10 +3,12 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
+import { coerceStringArray } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   type RenderContextLike,
@@ -30,8 +32,12 @@ const DeleteParams = Type.Object({
 });
 
 const MoveParams = Type.Object({
-  filePath: Type.String({ description: "Source file path to move" }),
-  destination: Type.String({ description: "Destination file path" }),
+  filePath: Type.String({
+    description: "Source file path to move (absolute or relative to project root)",
+  }),
+  destination: Type.String({
+    description: "Destination file path (absolute or relative to project root)",
+  }),
 });
 
 export interface FsSurface {
@@ -127,6 +133,23 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
+        // Coerce at the boundary: some hosts deliver `files` as a bare string
+        // or a JSON-stringified array despite the schema, which would crash the
+        // unchecked `.map` below before any validation runs.
+        const inputs = coerceStringArray(params.files);
+        if (inputs.length === 0) {
+          throw new Error("delete: `files` must be a non-empty array of paths");
+        }
+        const files = await Promise.all(inputs.map((file) => resolvePathArg(extCtx.cwd, file)));
+        const checked = new Set<string>();
+        for (const file of files) {
+          if (checked.has(file)) continue;
+          checked.add(file);
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+          });
+        }
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         // Single batched call so every file shares one op_id; one
         // `aft_safety undo` then restores the whole delete atomically.
@@ -134,7 +157,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           bridge,
           "delete_file",
           {
-            files: params.files,
+            files,
             recursive: params.recursive === true,
           },
           extCtx,
@@ -154,7 +177,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         const summary =
           deleted.length === 1 && skipped.length === 0
             ? `Deleted ${deleted[0]}`
-            : `Deleted ${deleted.length}/${params.files.length} file(s)`;
+            : `Deleted ${deleted.length}/${inputs.length} file(s)`;
         return textResult(summary, {
           success: true,
           complete: skipped.length === 0,
@@ -185,13 +208,22 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
+        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        const destination = await resolvePathArg(extCtx.cwd, params.destination);
+        const checked = new Set([filePath, destination]);
+        for (const file of checked) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+          });
+        }
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callBridge(
           bridge,
           "move_file",
           {
-            file: params.filePath,
-            destination: params.destination,
+            file: filePath,
+            destination,
           },
           extCtx,
         );

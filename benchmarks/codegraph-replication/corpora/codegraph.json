@@ -1,0 +1,171 @@
+{
+  "name": "codegraph",
+  "description": "AFT-side translation of CodeGraph's 12 structured retrieval-quality eval cases. Preserves searchNodes vs findRelevantContext shapes while substituting opencode-aft symbols for Elasticsearch symbols.",
+  "source": "Translated from /Users/ufukaltinok/Work/OSS/codegraph/__tests__/evaluation/test-cases.ts",
+  "attribution": "Methodology and source case shapes from CodeGraph; symbol substitutions are AFT-specific for running against opencode-aft.",
+  "cases": [
+    {
+      "id": "search-class-exact",
+      "sourceCaseId": "search-class-exact",
+      "query": "BinaryBridge",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["BinaryBridge"],
+      "expectedFiles": ["packages/aft-bridge/src/bridge.ts"],
+      "kinds": ["class"],
+      "category": "symbol_lookup",
+      "notes": "CodeGraph exact class lookup translated from TransportService to AFT's BinaryBridge class."
+    },
+    {
+      "id": "search-method-qualified",
+      "sourceCaseId": "search-method-qualified",
+      "query": "BinaryBridge send",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["send"],
+      "expectedFiles": ["packages/aft-bridge/src/bridge.ts"],
+      "kinds": ["method"],
+      "category": "symbol_lookup",
+      "notes": "Qualified method lookup translated from TransportService sendRequest to BinaryBridge send."
+    },
+    {
+      "id": "search-interface",
+      "sourceCaseId": "search-interface",
+      "query": "BridgeOptions",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["BridgeOptions"],
+      "expectedFiles": ["packages/aft-bridge/src/bridge.ts"],
+      "kinds": ["interface"],
+      "category": "symbol_lookup",
+      "notes": "Interface lookup translated from ActionListener to BridgeOptions."
+    },
+    {
+      "id": "search-enum",
+      "sourceCaseId": "search-enum",
+      "query": "SemanticIndexStatus",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["SemanticIndexStatus"],
+      "expectedFiles": ["crates/aft/src/context.rs"],
+      "kinds": ["enum"],
+      "category": "symbol_lookup",
+      "notes": "Enum lookup translated from RestStatus to SemanticIndexStatus."
+    },
+    {
+      "id": "search-exception",
+      "sourceCaseId": "search-exception",
+      "query": "HomeProjectRootError",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["HomeProjectRootError"],
+      "expectedFiles": ["packages/aft-bridge/src/pool.ts"],
+      "kinds": ["class"],
+      "category": "symbol_lookup",
+      "notes": "Exception/error-class lookup translated from SearchPhaseExecutionException to HomeProjectRootError."
+    },
+    {
+      "id": "search-nested-class",
+      "sourceCaseId": "search-nested-class",
+      "query": "BinaryBridge BridgeReplacedDuringVersionCheck",
+      "api": "searchNodes",
+      "tool": "aft_search",
+      "expectedSymbols": ["BridgeReplacedDuringVersionCheck"],
+      "expectedFiles": ["packages/aft-bridge/src/bridge.ts"],
+      "kinds": ["class"],
+      "category": "symbol_lookup",
+      "notes": "A scoped/private class lookup standing in for CodeGraph's nested Engine Index case; AFT's parser exposes the private class as a top-level symbol."
+    },
+    {
+      "id": "explore-plugin-bridge",
+      "sourceCaseId": "explore-rest-layer",
+      "query": "How do OpenCode plugin tools call into the AFT bridge?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["callBridge", "bridgeFor", "BinaryBridge", "BridgePool"],
+      "expectedFiles": [
+        "packages/opencode-plugin/src/tools/_shared.ts",
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "Context exploration translated from REST-layer request handling to AFT plugin-to-bridge dispatch."
+    },
+    {
+      "id": "explore-semantic-search",
+      "sourceCaseId": "explore-search-execution",
+      "query": "How does AFT semantic search execute from tool request to indexed results?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["semanticTools", "handle_semantic_search", "SemanticIndex", "SearchIndex"],
+      "expectedFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs",
+        "crates/aft/src/semantic_index.rs",
+        "crates/aft/src/search_index.rs"
+      ],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "Search execution exploration translated to AFT's semantic_search path."
+    },
+    {
+      "id": "explore-background-bash",
+      "sourceCaseId": "explore-bulk-indexing",
+      "query": "How are background bash tasks persisted and restored after restart?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["BgTaskRegistry", "PersistedTask", "replay_session", "write_task"],
+      "expectedFiles": [
+        "crates/aft/src/bash_background/registry.rs",
+        "crates/aft/src/bash_background/persistence.rs"
+      ],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "Bulk indexing flow shape translated to a multi-file persistence/replay flow in AFT."
+    },
+    {
+      "id": "explore-lsp-diagnostics",
+      "sourceCaseId": "explore-shard-allocation",
+      "query": "How does AFT wait for LSP diagnostics and pull server responses?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["LspManager", "wait_for_diagnostics", "pull_file_diagnostics", "PostEditWaitOutcome"],
+      "expectedFiles": ["crates/aft/src/lsp/manager.rs"],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "Shard allocation context case translated to AFT's LSP diagnostics orchestration."
+    },
+    {
+      "id": "explore-bridge-search",
+      "sourceCaseId": "explore-transport-search",
+      "query": "How does BinaryBridge connect plugin tool calls to semantic search?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["BinaryBridge", "send", "semanticTools", "handle_semantic_search"],
+      "expectedFiles": [
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs"
+      ],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "TransportService-to-SearchTransportService connectivity translated to BinaryBridge-to-semantic_search dispatch."
+    },
+    {
+      "id": "explore-import-organization",
+      "sourceCaseId": "explore-engine-implementations",
+      "query": "What are the import organization components for parsing, grouping, and generating imports?",
+      "api": "findRelevantContext",
+      "tool": "aft_search",
+      "expectedSymbols": ["handle_organize_imports", "parse_imports", "classify_group", "generate_import_line"],
+      "expectedFiles": [
+        "crates/aft/src/commands/organize_imports.rs",
+        "crates/aft/src/imports.rs"
+      ],
+      "category": "context_exploration",
+      "options": { "searchLimit": 10, "traversalDepth": 3, "maxNodes": 80, "minScore": 0.2 },
+      "notes": "Engine implementations exploration translated to AFT import parsing/grouping/generation components."
+    }
+  ]
+}

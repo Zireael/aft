@@ -26,6 +26,12 @@ struct LockConfig {
     poll_interval_ms: u64,
 }
 
+impl LockConfig {
+    fn cross_host_stale_heartbeat_ms(self) -> u64 {
+        self.stale_heartbeat_ms.saturating_mul(5)
+    }
+}
+
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +150,7 @@ fn acquire_with_config(
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let hostname = current_hostname();
     let mut warned_live_owner = false;
+    let mut warned_stale_live_owner = false;
 
     loop {
         if let Some(deadline) = deadline {
@@ -185,7 +192,24 @@ fn acquire_with_config(
             }
         };
 
+        let now = now_ms();
+        let since_heartbeat = now.saturating_sub(metadata.heartbeat_at_ms);
+
         if metadata.hostname != hostname {
+            let cross_host_stale_ms = config.cross_host_stale_heartbeat_ms();
+            if since_heartbeat > cross_host_stale_ms {
+                slog_warn!(
+                    "reclaiming cross-host filesystem lock at {} from host {} after stale heartbeat ({}ms > {}ms)",
+                    path.display(),
+                    metadata.hostname,
+                    since_heartbeat,
+                    cross_host_stale_ms
+                );
+                // Compare-and-delete: only remove if it's still the SAME stale
+                // owner (a fresh owner may have acquired it in the gap).
+                reclaim_lock_file(path, &metadata)?;
+                continue;
+            }
             sleep_until_retry(deadline, config.poll_interval_ms)?;
             continue;
         }
@@ -196,21 +220,26 @@ fn acquire_with_config(
                 path.display(),
                 metadata.pid
             );
-            remove_lock_file(path)?;
+            // Compare-and-delete: only remove if it's still this dead owner's
+            // lock. A fresh owner could have written a new lock (with a recycled
+            // or different PID) between our liveness check and the unlink.
+            reclaim_lock_file(path, &metadata)?;
             continue;
         }
 
-        let now = now_ms();
-        let since_heartbeat = now.saturating_sub(metadata.heartbeat_at_ms);
-        if since_heartbeat > config.stale_heartbeat_ms {
+        if since_heartbeat > config.stale_heartbeat_ms && !warned_stale_live_owner {
+            // Same-host PID liveness is authoritative. A SIGSTOP'd process,
+            // suspended VM, or sleeping laptop can miss heartbeats and later
+            // resume inside the critical section. Breaking that lock would allow
+            // split-brain writers, so a paused live owner blocks acquirers until
+            // it resumes and releases the lock or the PID dies.
             slog_warn!(
-                "reclaiming filesystem lock at {}: PID {} is alive but heartbeat is stale ({}ms)",
+                "filesystem lock at {} held by live PID {} has stale heartbeat ({}ms); NOT breaking",
                 path.display(),
                 metadata.pid,
                 since_heartbeat
             );
-            remove_lock_file(path)?;
-            continue;
+            warned_stale_live_owner = true;
         }
 
         let held_for = now.saturating_sub(metadata.created_at_ms);
@@ -272,6 +301,17 @@ fn run_heartbeat(
     shutdown: Arc<AtomicBool>,
     config: LockConfig,
 ) {
+    // Number of consecutive heartbeat intervals that can be missed before the
+    // same-host stale window elapses and another process may reclaim the lock.
+    // Beyond this point a sustained failure is genuinely dangerous, so we
+    // escalate the log from warn to error — but we still keep retrying.
+    let stale_intervals = config
+        .stale_heartbeat_ms
+        .checked_div(config.heartbeat_interval_ms.max(1))
+        .unwrap_or(3)
+        .max(1);
+    let mut consecutive_transient_failures: u64 = 0;
+
     loop {
         thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
         if shutdown.load(Ordering::Acquire) {
@@ -279,38 +319,114 @@ fn run_heartbeat(
         }
 
         match heartbeat_once(&path, &owner) {
-            Ok(()) => {}
-            Err(HeartbeatError::LockGone) => {
+            Ok(()) => {
+                if consecutive_transient_failures > 0 {
+                    slog_info!(
+                        "filesystem lock at {} heartbeat recovered after {} transient failure(s)",
+                        path.display(),
+                        consecutive_transient_failures
+                    );
+                    consecutive_transient_failures = 0;
+                }
+            }
+            Err(error) if heartbeat_error_is_terminal(&error) => {
+                // Terminal states: the lock is provably gone or owned by
+                // someone else. Continuing to write would clobber a new owner's
+                // metadata (the exact race documented in LockGuard::drop), so
+                // stop heartbeating.
                 slog_error!(
-                    "filesystem lock at {} disappeared; stopping heartbeat",
-                    path.display()
+                    "{}; stopping heartbeat",
+                    terminal_heartbeat_message(&path, &error)
                 );
                 return;
             }
-            Err(HeartbeatError::NotOwner) => {
-                slog_error!(
-                    "filesystem lock at {} is no longer owned by this guard; stopping heartbeat",
-                    path.display()
+            Err(error) => {
+                // Transient states: a temporary I/O hiccup (disk/NFS blip,
+                // quota) or a read that raced a concurrent writer mid-write
+                // (momentarily unparseable file). A single such error must NOT
+                // permanently kill the heartbeat — that would silently stop
+                // refreshing heartbeat_at_ms while the guard holder keeps
+                // running its critical section, letting another process reclaim
+                // the lock after the stale window and produce concurrent
+                // writers. Log and retry on the next interval; a later success
+                // resumes heartbeating automatically.
+                consecutive_transient_failures += 1;
+                log_transient_heartbeat_failure(
+                    &path,
+                    &transient_heartbeat_reason(&error),
+                    consecutive_transient_failures,
+                    stale_intervals,
                 );
-                return;
-            }
-            Err(HeartbeatError::Malformed(error)) => {
-                slog_error!(
-                    "filesystem lock at {} became malformed: {}; stopping heartbeat",
-                    path.display(),
-                    error
-                );
-                return;
-            }
-            Err(HeartbeatError::Io(error)) => {
-                slog_error!(
-                    "failed to heartbeat filesystem lock at {}: {}; stopping heartbeat",
-                    path.display(),
-                    error
-                );
-                return;
             }
         }
+    }
+}
+
+/// A heartbeat failure is terminal when the lock is provably no longer ours to
+/// refresh: it was removed (`LockGone`) or a different owner now holds it
+/// (`NotOwner`). I/O and malformed-read failures are treated as transient —
+/// they are typically temporary disk/NFS hiccups or a read that raced a
+/// concurrent writer — so the heartbeat retries rather than dying.
+fn heartbeat_error_is_terminal(error: &HeartbeatError) -> bool {
+    matches!(error, HeartbeatError::LockGone | HeartbeatError::NotOwner)
+}
+
+fn terminal_heartbeat_message(path: &Path, error: &HeartbeatError) -> String {
+    match error {
+        HeartbeatError::LockGone => {
+            format!("filesystem lock at {} disappeared", path.display())
+        }
+        HeartbeatError::NotOwner => format!(
+            "filesystem lock at {} is no longer owned by this guard",
+            path.display()
+        ),
+        // Not reachable for non-terminal errors, but keep a sensible string.
+        HeartbeatError::Io(error) => {
+            format!("filesystem lock at {} I/O error: {error}", path.display())
+        }
+        HeartbeatError::Malformed(error) => {
+            format!(
+                "filesystem lock at {} became malformed: {error}",
+                path.display()
+            )
+        }
+    }
+}
+
+fn transient_heartbeat_reason(error: &HeartbeatError) -> String {
+    match error {
+        HeartbeatError::Io(error) => format!("I/O error: {error}"),
+        HeartbeatError::Malformed(error) => format!("became malformed: {error}"),
+        HeartbeatError::LockGone => "lock disappeared".to_string(),
+        HeartbeatError::NotOwner => "lock no longer owned".to_string(),
+    }
+}
+
+/// Log a transient heartbeat failure, escalating to error exactly once when the
+/// failures have lasted long enough that the lock is now reclaimable by another
+/// owner. Beyond that point we stay quiet to avoid log spam while still
+/// retrying — the holder has already been warned the lock is at risk.
+fn log_transient_heartbeat_failure(
+    path: &Path,
+    reason: &str,
+    consecutive_failures: u64,
+    stale_intervals: u64,
+) {
+    if consecutive_failures < stale_intervals {
+        slog_warn!(
+            "transient failure to heartbeat filesystem lock at {}: {}; retrying (attempt {})",
+            path.display(),
+            reason,
+            consecutive_failures
+        );
+    } else if consecutive_failures == stale_intervals {
+        slog_error!(
+            "filesystem lock at {} has failed {} consecutive heartbeats: {}; \
+             the lock may now be reclaimed by another owner — continuing to retry",
+            path.display(),
+            consecutive_failures,
+            reason
+        );
     }
 }
 
@@ -416,8 +532,37 @@ fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Resul
 
 #[cfg(windows)]
 fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(to);
-    fs::rename(from, to)
+    // std::fs::rename on Windows maps to MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING, which atomically replaces an existing
+    // destination. Try that FIRST: an unconditional `remove_file(to)` before
+    // the rename opens a window where `to` does not exist, and a concurrent
+    // reader (e.g. the heartbeat poll) landing in that gap reads NotFound ->
+    // LockGone (terminal) and kills the heartbeat thread. That race made
+    // heartbeat_survives_transient_malformed_and_recovers flaky on Windows CI.
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        // Fall back to a copy-over (NOT remove-then-rename) when the atomic
+        // replace is refused (e.g. the destination is briefly open by another
+        // handle, or AV/indexer holds the temp source). `fs::copy` opens `to`
+        // with create+truncate and overwrites its bytes in place — the
+        // destination path never stops existing, so a concurrent heartbeat
+        // poll can never read NotFound -> LockGone (terminal). The earlier
+        // remove-then-rename fallback left a window where, if the second
+        // rename also failed, `to` was permanently deleted; copy-over closes
+        // that race class entirely. Worst case a reader observes a partially
+        // written file and gets Malformed, which is transient and retried —
+        // never fatal. Best-effort cleanup of the temp source afterward.
+        Err(original) => match fs::copy(from, to) {
+            Ok(_) => {
+                let _ = fs::remove_file(from);
+                Ok(())
+            }
+            // Both the atomic replace and the copy-over failed. Leave `to`
+            // untouched (copy create+truncate only proceeds once it can open
+            // the destination) and surface the original rename error.
+            Err(_) => Err(original),
+        },
+    }
 }
 
 #[cfg(not(windows))]
@@ -479,6 +624,37 @@ fn remove_lock_file(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// Reclaim (delete) a lock file we judged stale/dead, but ONLY if it still holds
+/// the SAME owner identity we evaluated. Between reading the metadata and
+/// deleting, the stale owner could release and a FRESH owner acquire — blindly
+/// `remove_file` would then delete the fresh owner's lock, allowing split-brain
+/// writers. Re-read immediately before the unlink and bail if the identity
+/// (pid, hostname, created_at_ms) changed or the file vanished. POSIX has no
+/// atomic compare-and-unlink, so a microscopic residual race remains, but this
+/// shrinks the window from the whole judgment/poll duration to a couple of
+/// syscalls — the standard mitigation. Returns true if we removed it.
+fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
+    match read_lock_metadata(path) {
+        Ok(current) => {
+            if current.pid == judged.pid
+                && current.hostname == judged.hostname
+                && current.created_at_ms == judged.created_at_ms
+            {
+                remove_lock_file(path)?;
+                Ok(true)
+            } else {
+                // A different owner acquired it in the gap — do NOT delete.
+                Ok(false)
+            }
+        }
+        // Already gone (released/reclaimed by someone else) — nothing to do.
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        // Malformed now (mid-write by a new owner) — don't delete; retry next poll.
+        Err(ReadLockError::Malformed(_)) => Ok(false),
+        Err(ReadLockError::Io(error)) => Err(error),
     }
 }
 
@@ -655,6 +831,39 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_refuses_to_delete_a_different_owners_lock() {
+        let (_dir, path) = test_lock_path();
+
+        // A lock currently owned by "owner B".
+        let owner_b = synthetic_metadata(4242, "host-b".to_string(), now_ms());
+        create_lock_file_atomically(&path, &owner_b).expect("write owner B lock");
+
+        // We judged a DIFFERENT (older) owner A as stale. Reclaiming must NOT
+        // delete B's lock (the TOCTOU split-brain guard).
+        let judged_a = synthetic_metadata(1111, "host-a".to_string(), now_ms() - 1_000_000);
+        let removed = reclaim_lock_file(&path, &judged_a).expect("reclaim");
+        assert!(!removed, "must not remove a different owner's lock");
+        assert!(path.exists(), "owner B's lock must survive");
+        let still = read_lock_metadata(&path).expect("still readable");
+        assert_eq!(still.pid, 4242, "owner B's lock intact");
+    }
+
+    #[test]
+    fn reclaim_deletes_when_identity_still_matches() {
+        let (_dir, path) = test_lock_path();
+        let owner = synthetic_metadata(1111, "host-a".to_string(), 5_000);
+        create_lock_file_atomically(&path, &owner).expect("write lock");
+
+        // Same identity we judged → safe to remove.
+        let removed = reclaim_lock_file(&path, &owner).expect("reclaim");
+        assert!(removed, "matching-identity stale lock should be removed");
+        assert!(!path.exists());
+
+        // Reclaiming a now-absent lock is a no-op, not an error.
+        assert!(!reclaim_lock_file(&path, &owner).expect("reclaim missing"));
+    }
+
+    #[test]
     fn acquire_serializes_concurrent_callers() {
         let (_dir, path) = test_lock_path();
         let path = Arc::new(path);
@@ -710,15 +919,31 @@ mod tests {
         // heartbeat_interval_ms=25. The contract being asserted is "the
         // heartbeat advances eventually", not "it advances within N
         // heartbeat intervals".
+        //
+        // On Windows, `rename_over` does `remove_file(to)` then
+        // `fs::rename(from, to)` because Windows can't atomically replace
+        // an open file. There's a brief window where the lockfile doesn't
+        // exist. If the poller hits that window, `read_lock_metadata`
+        // returns `Io(NotFound)`. Production callers already handle this
+        // (see `remove_lock_if_owned`), so the test treats `NotFound` the
+        // same as "no update yet" and keeps polling.
         let deadline = std::time::Instant::now() + Duration::from_millis(2_000);
         let mut updated = initial;
         while std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
-            updated = read_lock_metadata(&path)
-                .expect("read updated metadata")
-                .heartbeat_at_ms;
-            if updated > initial {
-                break;
+            match read_lock_metadata(&path) {
+                Ok(meta) => {
+                    updated = meta.heartbeat_at_ms;
+                    if updated > initial {
+                        break;
+                    }
+                }
+                Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    // Heartbeat thread is mid-rewrite (Windows
+                    // remove-then-rename window). Retry next iteration.
+                    continue;
+                }
+                Err(other) => panic!("read updated metadata: {other:?}"),
             }
         }
         assert!(
@@ -742,18 +967,18 @@ mod tests {
     }
 
     #[test]
-    fn stale_heartbeat_lock_is_reclaimed() {
+    fn stale_heartbeat_from_live_pid_blocks() {
         let (_dir, path) = test_lock_path();
         let mut metadata = current_process_metadata();
         metadata.created_at_ms = now_ms().saturating_sub(60_000);
         metadata.heartbeat_at_ms = now_ms().saturating_sub(60_000);
         write_synthetic_lock(&path, &metadata);
 
-        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
-            .expect("reclaim stale heartbeat lock");
-        let reclaimed = read_lock_metadata(&path).expect("read reclaimed lock");
-        assert_ne!(reclaimed.created_at_ms, metadata.created_at_ms);
-        drop(guard);
+        let result = acquire_with_config(&path, Some(Duration::from_millis(80)), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
+
+        remove_lock_file(&path).expect("cleanup synthetic lock");
     }
 
     #[test]
@@ -781,9 +1006,9 @@ mod tests {
     }
 
     #[test]
-    fn cross_host_lock_is_not_stolen() {
+    fn cross_host_lock_is_not_stolen_before_extended_stale_threshold() {
         let (_dir, path) = test_lock_path();
-        let now = now_ms().saturating_sub(60_000);
+        let now = now_ms();
         let metadata = LockMetadata {
             pid: std::process::id(),
             hostname: format!("{}-other", current_hostname()),
@@ -797,6 +1022,27 @@ mod tests {
         assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[test]
+    fn stale_cross_host_lock_is_reclaimed_after_extended_threshold() {
+        let (_dir, path) = test_lock_path();
+        let stale_at =
+            now_ms().saturating_sub(test_config().cross_host_stale_heartbeat_ms() + 1_000);
+        let metadata = LockMetadata {
+            pid: std::process::id(),
+            hostname: format!("{}-other", current_hostname()),
+            created_at_ms: stale_at,
+            heartbeat_at_ms: stale_at,
+        };
+        write_synthetic_lock(&path, &metadata);
+
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
+            .expect("reclaim stale cross-host lock");
+        let reclaimed = read_lock_metadata(&path).expect("read reclaimed lock");
+        assert_eq!(reclaimed.hostname, current_hostname());
+        assert_ne!(reclaimed.created_at_ms, metadata.created_at_ms);
+        drop(guard);
     }
 
     #[test]
@@ -827,5 +1073,86 @@ mod tests {
             !path.exists(),
             "heartbeat recreated or kept updating lockfile"
         );
+    }
+
+    #[test]
+    fn heartbeat_error_classification_terminal_vs_transient() {
+        // Terminal: the lock is provably no longer ours to refresh.
+        assert!(heartbeat_error_is_terminal(&HeartbeatError::LockGone));
+        assert!(heartbeat_error_is_terminal(&HeartbeatError::NotOwner));
+        // Transient: a temporary I/O hiccup or a read that raced a concurrent
+        // writer. These must NOT kill the heartbeat — it retries instead.
+        assert!(!heartbeat_error_is_terminal(&HeartbeatError::Io(
+            io::Error::other("disk blip")
+        )));
+        let malformed: serde_json::Error =
+            serde_json::from_str::<LockMetadata>("not json").unwrap_err();
+        assert!(!heartbeat_error_is_terminal(&HeartbeatError::Malformed(
+            malformed
+        )));
+    }
+
+    #[test]
+    fn heartbeat_survives_transient_malformed_and_recovers() {
+        // Regression: a single transient failure (e.g. a read that races a
+        // concurrent writer and sees a momentarily-unparseable file) used to
+        // permanently kill the heartbeat thread. The guard holder would then
+        // run its critical section with a stale heartbeat_at_ms, letting
+        // another process reclaim the lock after the stale window — concurrent
+        // writers / split-brain. The heartbeat must instead retry and resume
+        // refreshing once the file is readable again.
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        let owner = guard.metadata.clone();
+
+        // Corrupt the lockfile out from under the heartbeat (simulates a
+        // concurrent-writer race producing a momentarily-unparseable read).
+        // The heartbeat reads-then-writes, so it observes Malformed and, with
+        // the fix, retries instead of dying.
+        fs::write(&path, b"{ not valid json").expect("corrupt lockfile");
+
+        // Give the heartbeat several intervals to observe the malformed file.
+        // Pre-fix, the thread is dead by now.
+        thread::sleep(Duration::from_millis(
+            test_config().heartbeat_interval_ms * 4,
+        ));
+
+        // Restore valid owner metadata with a clearly-stale heartbeat sentinel.
+        // Ownership fields must match `owner` exactly so heartbeat_once passes
+        // its ownership check and writes a fresh timestamp.
+        //
+        // Use the atomic temp-write+rename path rather than remove-then-recreate:
+        // a remove followed by a separate create leaves a window where the file
+        // does not exist, and a heartbeat poll landing in that window reads
+        // NotFound -> LockGone (terminal) and kills the thread, failing this test
+        // spuriously under runner load (observed on macOS CI). The atomic replace
+        // overwrites the corrupt file in place with no no-file window on Unix.
+        let sentinel = now_ms().saturating_sub(1_000_000);
+        let mut restored = owner.clone();
+        restored.heartbeat_at_ms = sentinel;
+        atomic_write_lock_metadata(&path, &restored).expect("atomically restore lock metadata");
+
+        // If the heartbeat thread is still alive (the fix), it will overwrite
+        // heartbeat_at_ms with a current value. Poll for that recovery.
+        let deadline = std::time::Instant::now() + Duration::from_millis(3_000);
+        let mut recovered = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            match read_lock_metadata(&path) {
+                Ok(meta)
+                    if meta.created_at_ms == owner.created_at_ms
+                        && meta.heartbeat_at_ms > sentinel =>
+                {
+                    recovered = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            recovered,
+            "heartbeat did not recover after a transient malformed read — thread likely died"
+        );
+        drop(guard);
     }
 }

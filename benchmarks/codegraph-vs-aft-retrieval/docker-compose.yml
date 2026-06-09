@@ -1,0 +1,25 @@
+services:
+  aft:
+    build:
+      context: ../..
+      dockerfile: benchmarks/codegraph-vs-aft-retrieval/Dockerfile.aft
+    environment:
+      RETRIEVAL_CORPUS: ${RETRIEVAL_CORPUS:-opencode-aft}
+      TOP_K: ${TOP_K:-10}
+      RETRIEVAL_TIMEOUT_MS: ${RETRIEVAL_TIMEOUT_MS:-600000}
+      PREPARE_TARGET: ${PREPARE_TARGET:-}
+    volumes:
+      - ./results:/workspace/benchmarks/codegraph-vs-aft-retrieval/results
+      - ./.bench:/workspace/benchmarks/codegraph-vs-aft-retrieval/.bench
+  codegraph:
+    build:
+      context: ../..
+      dockerfile: benchmarks/codegraph-vs-aft-retrieval/Dockerfile.codegraph
+    environment:
+      RETRIEVAL_CORPUS: ${RETRIEVAL_CORPUS:-opencode-aft}
+      TOP_K: ${TOP_K:-10}
+      RETRIEVAL_TIMEOUT_MS: ${RETRIEVAL_TIMEOUT_MS:-600000}
+      PREPARE_TARGET: ${PREPARE_TARGET:-}
+    volumes:
+      - ./results:/workspace/benchmarks/codegraph-vs-aft-retrieval/results
+      - ./.bench:/workspace/benchmarks/codegraph-vs-aft-retrieval/.bench

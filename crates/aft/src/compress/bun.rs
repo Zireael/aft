@@ -1,12 +1,8 @@
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct BunCompressor;
-
-/// Maximum number of failure blocks to preserve in a `bun test` run.
-/// Beyond this, additional failures are dropped with a "+N more failures"
-/// trailer so a catastrophic 1000-failure run still fits in the inline cap.
-const MAX_FAILURES: usize = 25;
 
 impl Compressor for BunCompressor {
     fn specificity(&self) -> Specificity {
@@ -20,23 +16,75 @@ impl Compressor for BunCompressor {
             .is_some_and(|head| head == "bun")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match bun_subcommand(command).as_deref() {
-            Some("install" | "add" | "remove") => compress_package(output),
+            Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
             Some("test") => compress_test(output),
-            Some("run") => GenericCompressor::compress_output(output),
             Some("build") => compress_build(output),
-            _ => GenericCompressor::compress_output(output),
+            _ => GenericCompressor::compress_output(output).into(),
         }
+    }
+
+    fn matches_output(&self, output: &str) -> bool {
+        let mut saw_ran_summary = false;
+        let mut saw_result_marker = false;
+
+        for line in output.lines() {
+            saw_ran_summary |= is_ran_summary_line(line);
+            saw_result_marker |= is_bun_test_result_marker(line);
+
+            if saw_ran_summary && saw_result_marker {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
+        compress_test(output)
     }
 }
 
+/// Known bun subcommands we want to match on. Used by `bun_subcommand`
+/// to safely skip over flag values like `--cwd <dir>` that would
+/// otherwise be misread as the subcommand. Listing only the
+/// subcommands the compressor actually dispatches on plus the most
+/// common bun verbs keeps the set small without missing real cases.
+///
+/// Full bun verb set (per `bun --help`): install, add, remove, update,
+/// outdated, link, unlink, why, audit, patch, pm, publish, pack, run,
+/// test, x, exec, create, init, build, repl, upgrade.
+const BUN_SUBCOMMANDS: &[&str] = &[
+    "install", "i", "add", "remove", "update", "outdated", "link", "unlink", "why", "audit",
+    "patch", "pm", "publish", "pack", "run", "test", "x", "exec", "create", "init", "build",
+    "repl", "upgrade", "help", "info",
+];
+
+/// Detect the bun subcommand from a command line.
+///
+/// Important: previous implementations used `find(!starts_with('-'))`
+/// which broke for `bun --cwd packages/opencode-plugin test` — the
+/// flag's value (`packages/opencode-plugin`) was returned as the
+/// subcommand, causing the bun-test compressor to silently fall
+/// through to the generic compressor and drop per-test failure
+/// blocks. We now match against a whitelist of known bun verbs so
+/// flag values are skipped safely.
 fn bun_subcommand(command: &str) -> Option<String> {
     command
         .split_whitespace()
         .skip_while(|token| *token != "bun")
         .skip(1)
-        .find(|token| !token.starts_with('-'))
+        .find(|token| BUN_SUBCOMMANDS.contains(token))
         .map(ToString::to_string)
 }
 
@@ -59,24 +107,17 @@ fn compress_package(output: &str) -> String {
     trim_trailing_lines(&result.join("\n"))
 }
 
-fn compress_build(output: &str) -> String {
-    let mut result = Vec::new();
-    let mut timing_seen = 0usize;
-    let mut timing_omitted = 0usize;
+fn compress_build(output: &str) -> CompressionResult {
+    let mut blocks = Vec::new();
     for line in output.lines() {
         if is_timing_line(line) {
-            timing_seen += 1;
-            if timing_seen > 10 {
-                timing_omitted += 1;
-                continue;
-            }
+            blocks.push(ClassifiedBlock::new(DropClass::Timing, line.to_string()));
+        } else {
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
-        result.push(line.to_string());
     }
-    if timing_omitted > 0 {
-        result.push(format!("... and {timing_omitted} more timing lines"));
-    }
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 /// Compress `bun test` output. Preserves:
@@ -92,17 +133,17 @@ fn compress_build(output: &str) -> String {
 ///     already conveys count) — but if no failures exist, returns the
 ///     full original output via the generic compressor for safety
 ///
-/// Cap: `MAX_FAILURES` failure blocks preserved; further blocks dropped
-/// with a `+N more failures` trailer.
+/// Failure blocks are class-capped by the shared semantic cap helper; the
+/// registry emits the single visible omission marker.
 ///
 /// Why this matters: bun test writes failure blocks INLINE between the
 /// header and the final summary. With the 30KB inline cap, large test
 /// runs middle-truncate and lose the failure block entirely — agents
 /// see only the header + summary count and have no debugging context.
-fn compress_test(output: &str) -> String {
+fn compress_test(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     if lines.is_empty() {
-        return output.to_string();
+        return CompressionResult::new(output.to_string());
     }
 
     // Quick pre-scan: if no failures, defer to generic. This keeps the
@@ -110,14 +151,13 @@ fn compress_test(output: &str) -> String {
     // the truncation problem (small all-pass runs are already short).
     let has_failures = lines.iter().any(|line| is_bun_test_fail_marker(line));
     if !has_failures {
-        return compress_test_pass_only(&lines);
+        return CompressionResult::new(compress_test_pass_only(&lines));
     }
 
-    let mut result: Vec<String> = Vec::new();
-    let mut failures_kept = 0usize;
-    let mut failures_dropped = 0usize;
+    let mut blocks: Vec<ClassifiedBlock> = Vec::new();
     let mut index = 0usize;
     let mut saw_ran_summary = false;
+    let mut pending_section: Option<String> = None;
 
     while index < lines.len() {
         let line = lines[index];
@@ -128,14 +168,14 @@ fn compress_test(output: &str) -> String {
             // so chains don't silently lose the next command's output.
             // (Note: `&&` short-circuits on test failure so this is mainly
             // relevant for `;` separators or `|| fallback_cmd`.)
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
 
-        // Bun version header — always keep.
+        // Bun version header — keep, minus the noisy version + commit hash.
         if is_bun_test_header(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(render_bun_header(line)));
             index += 1;
             continue;
         }
@@ -154,15 +194,15 @@ fn compress_test(output: &str) -> String {
                 (None, _) => false,
             };
             if keep_section {
-                result.push(line.to_string());
+                pending_section = Some(line.to_string());
             }
             index += 1;
             continue;
         }
 
-        // Summary tail — always keep.
+        // Summary tail — always keep (Ran line minus its [Xms] duration).
         if is_summary_line(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(render_summary_line(line)));
             // The `Ran N tests across M files. [Xms]` line marks the
             // boundary between bun-test output and any chained-command
             // output that follows. (Bun uses `file. [` singular when
@@ -197,14 +237,19 @@ fn compress_test(output: &str) -> String {
                 block_end += 1;
             }
 
-            failures_kept += 1;
-            if failures_kept <= MAX_FAILURES {
-                for line in &lines[block_start..block_end] {
-                    result.push((*line).to_string());
-                }
-            } else {
-                failures_dropped += 1;
+            let mut block_lines = Vec::new();
+            if let Some(section) = pending_section.take() {
+                block_lines.push(section);
             }
+            block_lines.extend(
+                lines[block_start..block_end]
+                    .iter()
+                    .map(|line| (*line).to_string()),
+            );
+            blocks.push(ClassifiedBlock::new(
+                DropClass::Failure,
+                block_lines.join("\n"),
+            ));
             index = block_end;
             continue;
         }
@@ -213,16 +258,13 @@ fn compress_test(output: &str) -> String {
         index += 1;
     }
 
-    if failures_dropped > 0 {
-        result.push(format!("+{failures_dropped} more failures"));
-    }
-
     // Safety net: if we somehow stripped everything, fall back so the
     // agent at least sees the raw bytes truncated by the generic path.
-    if result.is_empty() {
-        return GenericCompressor::compress_output(output);
+    if blocks.is_empty() {
+        return GenericCompressor::compress_output(output).into();
     }
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 /// All-pass `bun test` output: keep version header + summary + drop the
@@ -247,8 +289,10 @@ fn compress_test_pass_only(lines: &[&str]) -> String {
             result.push((*line).to_string());
             continue;
         }
-        if is_bun_test_header(line) || is_summary_line(line) {
-            result.push((*line).to_string());
+        if is_bun_test_header(line) {
+            result.push(render_bun_header(line));
+        } else if is_summary_line(line) {
+            result.push(render_summary_line(line));
             // The `Ran N tests across M files. [Xms]` line is the LAST line
             // bun emits for the test run itself. Everything after must be
             // from a chained command (`&& other_cmd`).
@@ -280,6 +324,29 @@ fn is_bun_test_header(line: &str) -> bool {
     line.starts_with("bun test v")
 }
 
+/// Render the bun banner without the noisy version + commit hash:
+/// `bun test v1.3.14 (0d9b296a)` -> `bun test`. The version/hash is pure
+/// per-call token tax with no agent value.
+fn render_bun_header(line: &str) -> String {
+    match line.find(" v") {
+        Some(idx) => line[..idx].to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// Strip the trailing ` [Xms]` wall-clock duration from the
+/// `Ran N tests across M files. [Xms]` line — noise for the common case and
+/// recoverable via `compressed:false`. Other summary lines (`N pass` etc.) and
+/// non-Ran lines pass through unchanged.
+fn render_summary_line(line: &str) -> String {
+    if is_ran_summary_line(line.trim_start()) {
+        if let Some(idx) = line.rfind(" [") {
+            return line[..idx].to_string();
+        }
+    }
+    line.to_string()
+}
+
 fn is_file_section_header(line: &str) -> bool {
     // File-section headers from bun look like `path/to/foo.test.ts:`
     // (no leading whitespace, no spaces in the path part, trailing
@@ -299,8 +366,60 @@ fn is_file_section_header(line: &str) -> bool {
         || path.contains("_spec.")
 }
 
+fn is_bun_test_result_marker(line: &str) -> bool {
+    is_bun_test_pass_marker(line) || is_bun_test_fail_marker(line)
+}
+
+fn is_bun_test_pass_marker(line: &str) -> bool {
+    is_bun_test_marker(line, "(pass)")
+}
+
 fn is_bun_test_fail_marker(line: &str) -> bool {
-    line.trim_start().starts_with("(fail)")
+    is_bun_test_marker(line, "(fail)")
+}
+
+fn is_bun_test_marker(line: &str, marker: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix(marker) else {
+        return false;
+    };
+    if !rest.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+        return false;
+    }
+
+    let name_and_timing = rest.trim_start();
+    let Some((name, timing)) = name_and_timing.rsplit_once(" [") else {
+        return false;
+    };
+    if name.trim().is_empty() {
+        return false;
+    }
+
+    let Some(duration) = timing.strip_suffix(']') else {
+        return false;
+    };
+    is_bun_test_duration(duration)
+}
+
+fn is_bun_test_duration(duration: &str) -> bool {
+    ["ms", "µs", "μs", "us", "ns", "s"]
+        .iter()
+        .any(|unit| duration.strip_suffix(*unit).is_some_and(is_decimal_number))
+}
+
+fn is_decimal_number(value: &str) -> bool {
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+
+    for ch in value.chars() {
+        match ch {
+            '0'..='9' => saw_digit = true,
+            '.' if !saw_dot => saw_dot = true,
+            _ => return false,
+        }
+    }
+
+    saw_digit
 }
 
 fn is_bun_test_error_start(line: &str) -> bool {
@@ -330,10 +449,22 @@ fn is_bun_test_code_pointer(line: &str) -> bool {
 /// emits to mark the end of its own output. Accepts both the singular
 /// (`file. [`) and plural (`files. [`) forms.
 fn is_ran_summary_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("Ran ")
-        && trimmed.contains(" tests")
-        && (trimmed.contains(" files. [") || trimmed.contains(" file. ["))
+    let Some(rest) = line.strip_prefix("Ran ") else {
+        return false;
+    };
+    let Some((test_count, rest)) = rest.split_once(" tests across ") else {
+        return false;
+    };
+    if test_count.is_empty() || !test_count.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some((file_count, rest)) = rest.split_once(" file") else {
+        return false;
+    };
+    if file_count.is_empty() || !file_count.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    rest.starts_with(". [") || rest.starts_with("s. [")
 }
 
 fn is_summary_line(line: &str) -> bool {
@@ -341,7 +472,7 @@ fn is_summary_line(line: &str) -> bool {
     // Summary lines come after `[N]ms` markers in counts. Catch:
     //   " N pass", " N fail", " N expect() calls"
     //   "Ran N tests across N files. [Xms]"
-    if trimmed.starts_with("Ran ") && trimmed.contains(" tests") {
+    if is_ran_summary_line(trimmed) {
         return true;
     }
     if let Some(first_token) = trimmed.split_whitespace().next() {

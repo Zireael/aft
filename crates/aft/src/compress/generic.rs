@@ -1,8 +1,4 @@
-use crate::compress::Compressor;
-
-const DEFAULT_THRESHOLD_BYTES: usize = 5 * 1024;
-const DEFAULT_KEEP_HEAD_BYTES: usize = 2 * 1024;
-const DEFAULT_KEEP_TAIL_BYTES: usize = 2 * 1024;
+use crate::compress::{CompressionResult, Compressor};
 
 pub fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -119,14 +115,14 @@ pub fn middle_truncate(
     output
 }
 
-fn floor_char_boundary(input: &str, mut index: usize) -> usize {
+pub(crate) fn floor_char_boundary(input: &str, mut index: usize) -> usize {
     while index > 0 && !input.is_char_boundary(index) {
         index -= 1;
     }
     index
 }
 
-fn ceil_char_boundary(input: &str, mut index: usize) -> usize {
+pub(crate) fn ceil_char_boundary(input: &str, mut index: usize) -> usize {
     while index < input.len() && !input.is_char_boundary(index) {
         index += 1;
     }
@@ -138,13 +134,7 @@ pub struct GenericCompressor;
 impl GenericCompressor {
     pub fn compress_output(output: &str) -> String {
         let stripped = strip_ansi(output);
-        let deduped = dedup_consecutive(&stripped);
-        middle_truncate(
-            &deduped,
-            DEFAULT_THRESHOLD_BYTES,
-            DEFAULT_KEEP_HEAD_BYTES,
-            DEFAULT_KEEP_TAIL_BYTES,
-        )
+        dedup_consecutive(&stripped)
     }
 }
 
@@ -153,7 +143,33 @@ impl Compressor for GenericCompressor {
         true
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        Self::compress_output(output)
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
+        Self::compress_output(output).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_does_not_pretruncate_above_old_five_kib_threshold() {
+        let input = (0..900)
+            .map(|idx| format!("unique-line-{idx:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(input.len() > 5 * 1024);
+
+        let compressed = GenericCompressor::compress_output(&input);
+
+        assert!(!compressed.contains("...<truncated "));
+        assert!(compressed.len() > 5 * 1024);
+        assert!(compressed.contains("unique-line-0000"));
+        assert!(compressed.contains("unique-line-0899"));
     }
 }

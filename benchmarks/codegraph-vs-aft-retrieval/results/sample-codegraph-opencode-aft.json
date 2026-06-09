@@ -1,0 +1,410 @@
+{
+  "benchmark": "codegraph-vs-aft-retrieval",
+  "driver": "codegraph",
+  "timestamp": "2026-05-27T05:09:27.778Z",
+  "corpus": "opencode-aft",
+  "corpusPath": "/workspace/benchmarks/codegraph-vs-aft-retrieval/corpora/opencode-aft.json",
+  "codebasePath": "/workspace",
+  "targetSha": "unknown",
+  "topK": 10,
+  "summary": {
+    "cases": 6,
+    "passed": 3,
+    "failed": 3,
+    "meanRecall": 0.5,
+    "meanMRR": 0.5,
+    "meanPrecisionAt1": 0.5,
+    "meanPrecisionAt5": 0.1,
+    "meanPrecisionAt10": 0.05,
+    "latencyMsP50": 72.933,
+    "latencyMsP95": 137.587
+  },
+  "results": [
+    {
+      "caseId": "symbol-binary-bridge",
+      "query": "BinaryBridge",
+      "mode": "search",
+      "driver": "codegraph",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.1,
+      "found": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "startLine": 272
+        }
+      ],
+      "missed": [],
+      "latencyMs": 70.769,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "kind": "class",
+          "startLine": 272,
+          "endLine": 1224,
+          "score": 113.230924146782,
+          "text": "BinaryBridge"
+        }
+      ]
+    },
+    {
+      "caseId": "symbol-bridge-options",
+      "query": "BridgeOptions",
+      "mode": "search",
+      "driver": "codegraph",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.1,
+      "found": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BridgeOptions",
+          "startLine": 156
+        }
+      ],
+      "missed": [],
+      "latencyMs": 72.933,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BridgeOptions",
+          "kind": "interface",
+          "startLine": 156,
+          "endLine": 196,
+          "score": 120.44303194983546,
+          "text": "BridgeOptions"
+        }
+      ]
+    },
+    {
+      "caseId": "symbol-semantic-index-status",
+      "query": "SemanticIndexStatus",
+      "mode": "search",
+      "driver": "codegraph",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.1,
+      "found": [
+        {
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexStatus",
+          "startLine": 88
+        }
+      ],
+      "missed": [],
+      "latencyMs": 69.84,
+      "resultCount": 1,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexStatus",
+          "kind": "enum",
+          "startLine": 88,
+          "endLine": 103,
+          "score": 99.4359676408549,
+          "text": "SemanticIndexStatus"
+        }
+      ]
+    },
+    {
+      "caseId": "context-plugin-bridge-dispatch",
+      "query": "How do OpenCode plugin tools call into the AFT bridge?",
+      "mode": "context",
+      "driver": "codegraph",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAt1": 0,
+      "precisionAt5": 0,
+      "precisionAt10": 0,
+      "found": [],
+      "missed": [
+        {
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "callBridge",
+          "startLine": 331
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "bridgeFor",
+          "startLine": 312
+        },
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "startLine": 272
+        }
+      ],
+      "latencyMs": 97.125,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/migrate_storage/log.rs",
+          "startLine": 15,
+          "text": "- **open** (method) - crates/aft/src/migrate_storage/log.rs:15"
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/db/mod.rs",
+          "startLine": 152,
+          "text": "- **open** (function) - crates/aft/src/db/mod.rs:152"
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/lsp/document.rs",
+          "startLine": 66,
+          "text": "- **open** (method) - crates/aft/src/lsp/document.rs:66"
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/migrate_storage/log.rs",
+          "text": "- crates/aft/src/migrate_storage/log.rs: JsonLogger:8"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/migrate_storage.rs",
+          "text": "- crates/aft/src/migrate_storage.rs: run_with_options:78"
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/harness.rs",
+          "text": "- crates/aft/src/harness.rs: Harness:5"
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/db/mod.rs",
+          "text": "- crates/aft/src/db/mod.rs: apply_pragmas:166, run_migrations:178, open_fresh_db_creates_all_tables:265, open_fresh_db_creates_all_indexes:276"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/lsp/pull_params.rs",
+          "text": "- crates/aft/src/lsp/pull_params.rs: Result:34"
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/migrate_storage.rs",
+          "startLine": 78,
+          "text": "#### run_with_options (crates/aft/src/migrate_storage.rs:78)"
+        },
+        {
+          "rank": 10,
+          "file": "args.h",
+          "text": "write_status(&args.to, args.harness, args.from.as_deref());"
+        }
+      ]
+    },
+    {
+      "caseId": "context-semantic-search-path",
+      "query": "How does AFT semantic search execute from tool request to indexed results?",
+      "mode": "context",
+      "driver": "codegraph",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAt1": 0,
+      "precisionAt5": 0,
+      "precisionAt10": 0,
+      "found": [],
+      "missed": [
+        {
+          "file": "packages/opencode-plugin/src/tools/semantic.ts",
+          "symbol": "semanticTools",
+          "startLine": 15
+        },
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndex",
+          "startLine": 965
+        },
+        {
+          "file": "crates/aft/src/search_index.rs",
+          "symbol": "SearchIndex",
+          "startLine": 58
+        }
+      ],
+      "latencyMs": 114.692,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/lsp/pull_params.rs",
+          "startLine": 34,
+          "text": "- **Result** (type_alias) - crates/aft/src/lsp/pull_params.rs:34"
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/lsp/pull_params.rs",
+          "startLine": 65,
+          "text": "- **Result** (type_alias) - crates/aft/src/lsp/pull_params.rs:65"
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/grep_executor.rs",
+          "startLine": 135,
+          "text": "- **execute** (function) - crates/aft/src/grep_executor.rs:135"
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft-tokenizer/examples/count_stdin.rs",
+          "text": "- crates/aft-tokenizer/examples/count_stdin.rs: main:9, from_str:88, expect:113"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/ast_grep_lang.rs",
+          "text": "- crates/aft/src/ast_grep_lang.rs: build_pattern:64, compile_pattern:147, php_snippet_selector:199, build_pattern:249"
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/backup.rs",
+          "text": "- crates/aft/src/backup.rs: try_from:80, snapshot:273, snapshot_with_op:285"
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft-tokenizer/examples/count_stdin.rs",
+          "startLine": 9,
+          "text": "#### main (crates/aft-tokenizer/examples/count_stdin.rs:9)"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft-tokenizer/examples/count_stdin.rs",
+          "startLine": 88,
+          "text": "#### from_str (crates/aft-tokenizer/examples/count_stdin.rs:88)"
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft-tokenizer/examples/count_stdin.rs",
+          "startLine": 113,
+          "text": "#### expect (crates/aft-tokenizer/examples/count_stdin.rs:113)"
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/ast_grep_lang.rs",
+          "startLine": 64,
+          "text": "#### build_pattern (crates/aft/src/ast_grep_lang.rs:64)"
+        }
+      ]
+    },
+    {
+      "caseId": "context-import-organization",
+      "query": "What are the import organization components for parsing, grouping, and generating imports?",
+      "mode": "context",
+      "driver": "codegraph",
+      "pass": false,
+      "recall": 0,
+      "mrr": 0,
+      "precisionAt1": 0,
+      "precisionAt5": 0,
+      "precisionAt10": 0,
+      "found": [],
+      "missed": [
+        {
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "handle_organize_imports",
+          "startLine": 27
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "parse_imports",
+          "startLine": 171
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "classify_group",
+          "startLine": 473
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "generate_import_line",
+          "startLine": 399
+        }
+      ],
+      "latencyMs": 137.587,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/bash_rewrite/parser.rs",
+          "startLine": 8,
+          "text": "- **parse** (function) - crates/aft/src/bash_rewrite/parser.rs:8"
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/parser.rs",
+          "startLine": 1105,
+          "text": "- **parse** (method) - crates/aft/src/parser.rs:1105"
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/compress/toml_filter.rs",
+          "startLine": 511,
+          "text": "- **parse** (function) - crates/aft/src/compress/toml_filter.rs:511"
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/bash_rewrite/parser.rs",
+          "text": "- crates/aft/src/bash_rewrite/parser.rs: split_heredoc:24, tokenize:105, ParsedCommand:2"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/bash_rewrite/rules.rs",
+          "text": "- crates/aft/src/bash_rewrite/rules.rs: grep_request:254, find_request:310, cat_read_request:350, append_request:361, sed_request:385"
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/parser.rs",
+          "text": "- crates/aft/src/parser.rs: FileParser:1040, detect_language:592"
+        },
+        {
+          "rank": 7,
+          "file": "self.c",
+          "text": "let needs_reparse = match self.cache.get(&canon) {"
+        },
+        {
+          "rank": 8,
+          "file": "cached.c",
+          "text": "cached.content_hash,"
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/bash_rewrite/parser.rs",
+          "startLine": 24,
+          "text": "#### split_heredoc (crates/aft/src/bash_rewrite/parser.rs:24)"
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/bash_rewrite/parser.rs",
+          "startLine": 105,
+          "text": "#### tokenize (crates/aft/src/bash_rewrite/parser.rs:105)"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "aftBinary": "/workspace/target/release/aft",
+    "target": {
+      "name": "opencode-aft",
+      "kind": "local",
+      "path": "/workspace",
+      "url": "https://github.com/cortexkit/aft.git",
+      "commit": "local-worktree"
+    },
+    "methodology": "Identical retrieval cases scored by ground-truth symbol/file matches with Recall, MRR, and Precision@k. No LLM is used."
+  }
+}

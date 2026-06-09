@@ -5,9 +5,14 @@ use aft::compress::builtin_filters::ALL;
 use aft::compress::toml_filter::{apply_filter, build_registry, parse_filter, FilterSource};
 
 fn fixture_dir(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    crate::helpers::cargo_manifest_dir()
         .join("tests/integration/fixtures/compress_filters")
         .join(name)
+}
+
+/// Normalize `\r\n` from Windows bind mounts so fixture comparisons are portable.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
 }
 
 fn load_filter(name: &str) -> aft::compress::toml_filter::TomlFilter {
@@ -21,12 +26,18 @@ fn load_filter(name: &str) -> aft::compress::toml_filter::TomlFilter {
 fn run_fixture(name: &str) {
     let dir = fixture_dir(name);
     let input = fs::read_to_string(dir.join("input.txt")).expect("input.txt");
-    let expected = fs::read_to_string(dir.join("expected.txt")).expect("expected.txt");
     let filter = load_filter(name);
-    let actual = apply_filter(&filter, &input);
+    let actual = apply_filter(&filter, &input).text;
+    // Golden bless: `AFT_BLESS_FIXTURES=1 cargo test ...` rewrites the expected
+    // files from current output. Off by default; the assert path is the gate.
+    if std::env::var("AFT_BLESS_FIXTURES").is_ok() {
+        fs::write(dir.join("expected.txt"), &actual).expect("write expected.txt");
+        return;
+    }
+    let expected = fs::read_to_string(dir.join("expected.txt")).expect("expected.txt");
     assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
+        normalize_newlines(actual.trim_end()),
+        normalize_newlines(expected.trim_end()),
         "fixture mismatch for {name}",
     );
 }
@@ -112,6 +123,25 @@ fn make_shortcircuit_only_matches_empty_body() {
 }
 
 #[test]
+fn make_strip_tail_cap_is_not_offset_eligible() {
+    let filter = load_filter("make");
+    let output = format!(
+        "make[1]: Entering directory `/tmp`\n{}",
+        (0..100)
+            .map(|index| format!("compile line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let result = apply_filter(&filter, &output);
+
+    assert!(result.had_inner_drop);
+    assert!(!result.offset_hint_eligible);
+    assert_eq!(result.offset_start_line, None);
+    assert!(result.text.contains("compile line 99"));
+}
+
+#[test]
 fn toml_filter_strip_ansi_false_sees_raw_ansi() {
     let registry = build_registry(
         &[(
@@ -143,7 +173,7 @@ strip = false
 
 fn compress_builtin(command: &str, output: &str) -> String {
     let registry = build_registry(ALL, None, None);
-    aft::compress::compress_with_registry(command, output, &registry)
+    aft::compress::compress_with_registry(command, output, &registry).text
 }
 
 #[test]

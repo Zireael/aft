@@ -154,28 +154,6 @@ maybeDescribe("e2e edit commands", () => {
     expect(await readTextFile(filePath)).toContain("updated:");
   });
 
-  test("transaction updates multiple files", async () => {
-    const h = await harness();
-    const fileA = h.path("sample.ts");
-    const fileB = h.path("with-errors.ts");
-
-    const response = await h.bridge.send("transaction", {
-      operations: [
-        { file: fileA, command: "edit_match", match: "funcA", replacement: "funcATransaction" },
-        {
-          file: fileB,
-          command: "write",
-          content: 'export const transactionState = "ok";\n',
-        },
-      ],
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.files_modified).toBe(2);
-    expect(await readTextFile(fileA)).toContain("funcATransaction");
-    expect(await readTextFile(fileB)).toBe('export const transactionState = "ok";\n');
-  });
-
   test("edit_match supports glob patterns across files", async () => {
     const h = await harness();
 
@@ -191,28 +169,6 @@ maybeDescribe("e2e edit commands", () => {
     expect(await readTextFile(h.path("directory", "alpha.ts"))).toContain("NEW_VALUE");
     expect(await readTextFile(h.path("directory", "beta.ts"))).toContain("NEW_VALUE");
     expect(await readTextFile(h.path("directory", "gamma.ts"))).toContain("NEW_VALUE");
-  });
-
-  test("transaction rolls back on failure", async () => {
-    const h = await harness();
-    const fileA = h.path("sample.ts");
-    const original = await readTextFile(fileA);
-
-    const response = await h.bridge.send("transaction", {
-      operations: [
-        { file: fileA, command: "edit_match", match: "funcA", replacement: "rolledChange" },
-        {
-          file: h.path("with-errors.ts"),
-          command: "edit_match",
-          match: "missing-pattern",
-          replacement: "x",
-        },
-      ],
-    });
-
-    expect(response.success).toBe(false);
-    expect(response.code).toBe("transaction_failed");
-    expect(await readTextFile(fileA)).toBe(original);
   });
 
   test("batch line range edits work through the binary", async () => {

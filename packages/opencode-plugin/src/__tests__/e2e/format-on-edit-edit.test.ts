@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
-import { noopAsk } from "../test-helpers";
+import { noopAsk, toolResultText } from "../test-helpers";
 import {
   BIOME_TS_EXCLUDED_PRESET,
   BIOME_TS_PRESET,
@@ -75,21 +75,6 @@ exit 0
   };
 }
 
-function rustFormatShim(name = "rustfmt"): FakeFormatterShim {
-  return {
-    name,
-    script: `#!/bin/sh
-file="$1"
-cat > "$file" <<'EOF'
-fn main() {
-    let x = 42;
-}
-EOF
-exit 0
-`,
-  };
-}
-
 maybeDescribe("e2e format_on_edit edit tool", () => {
   let preparedBinary: PreparedBinary = initialBinary;
   const harnesses: E2EHarness[] = [];
@@ -129,7 +114,7 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
     return {
       execute: async (args: Record<string, unknown>) => {
-        const output = await tools.edit.execute(args, createSdkContext(h.tempDir));
+        const output = toolResultText(await tools.edit.execute(args, createSdkContext(h.tempDir)));
         if (!data) throw new Error("edit response was not captured");
         return { output, data };
       },
@@ -145,7 +130,7 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     expect(data.formatted).toBe(formatted);
     if (reason) expect(data.format_skipped_reason).toBe(reason);
     else expect(data.format_skipped_reason).toBeUndefined();
-    if (formatted) expect(output).toContain('"formatted":true');
+    if (formatted) expect(output).toContain("Auto-formatted.");
     else expect(output).not.toContain("Auto-formatted.");
   }
 
@@ -221,7 +206,7 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     // Hoisted `edit` tool returns JSON-stringified Rust response, so the
     // `formatted: true` signal is in the JSON output (the human-readable
     // "Auto-formatted." string is only used by hoisted `write`).
-    expect(output).toContain('"formatted":true');
+    expect(output).toContain("Auto-formatted.");
   });
 
   test("edit symbol replace triggers formatter", async () => {
@@ -239,7 +224,7 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     expectEditOutcome(output, data, true);
   });
 
-  test("edit operations[] (batch) — single file", async () => {
+  test("edit edits[] (batch) — single file", async () => {
     const h = await formatHarness(formatterPreset("biome"), [countingTsShim()]);
     const filePath = h.path("src", "batch.ts");
     await seedFile(filePath);
@@ -257,54 +242,6 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
       (await readFile(h.path("src", "formatter-count.log"), "utf8")).trim().split("\n"),
     ).toHaveLength(1);
     expect(data.formatted).toBe(true);
-  });
-
-  test("edit operations[] — multi-file (TS + Rust)", async () => {
-    const h = await formatHarness(formatterPreset("biome"), [countingTsShim(), rustFormatShim()]);
-    await h.bridge.send("configure", {
-      project_root: h.tempDir,
-      harness: "opencode",
-      format_on_edit: true,
-      formatter: { typescript: "biome", rust: "rustfmt" },
-    });
-    const tsFile = h.path("src", "multi.ts");
-    const rsFile = h.path("src", "main.rs");
-    await seedFile(tsFile);
-    await seedFile(rsFile, "fn main(){let x=42;}\n");
-
-    const { output, data } = await editTool(h).execute({
-      operations: [
-        { file: tsFile, command: "edit_match", match: "alpha = 1", replacement: "alpha=  2" },
-        { file: rsFile, command: "edit_match", match: "let x=42;", replacement: "let x=42;" },
-      ],
-    });
-
-    expect(await readFile(tsFile, "utf8")).toContain("export const alpha = 2;");
-    expect(await readFile(rsFile, "utf8")).toBe("fn main() {\n    let x = 42;\n}\n");
-    expect(output).toContain('"files_modified":2');
-    expect(data.results).toBeArray();
-  });
-
-  test("edit operations[] — one file fails", async () => {
-    const h = await formatHarness(formatterPreset("biome"), [countingTsShim()]);
-    const okFile = h.path("src", "ok.ts");
-    const failFile = h.path("src", "fail.ts");
-    await seedFile(okFile);
-    await seedFile(failFile);
-
-    await expect(
-      editTool(h).execute({
-        operations: [
-          { file: okFile, command: "edit_match", match: "alpha = 1", replacement: "alpha=  2" },
-          { file: failFile, command: "edit_match", match: "does not exist", replacement: "x" },
-        ],
-      }),
-    ).rejects.toThrow("does not exist");
-
-    expect(await readFile(okFile, "utf8")).toContain("export const alpha = 1;");
-    expect(
-      (await readFile(h.path("src", "formatter-count.log"), "utf8")).trim().split("\n"),
-    ).toHaveLength(1);
   });
 
   test("edit on file outside formatter scope", async () => {

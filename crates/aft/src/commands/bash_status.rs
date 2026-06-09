@@ -1,9 +1,10 @@
+use crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde::Deserialize;
 use serde_json::json;
 
-const PREVIEW_BYTES: usize = 5 * 1024;
+const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
 #[derive(Debug, Deserialize)]
 struct BashStatusParams {

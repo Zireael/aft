@@ -1,0 +1,813 @@
+{
+  "benchmark": "codegraph-vs-aft-retrieval",
+  "driver": "aft",
+  "timestamp": "2026-05-27T07:06:14.960Z",
+  "corpus": "opencode-aft",
+  "corpusPath": "/workspace/benchmarks/codegraph-vs-aft-retrieval/corpora/opencode-aft.json",
+  "codebasePath": "/workspace",
+  "targetSha": "unknown",
+  "topK": 10,
+  "summary": {
+    "cases": 6,
+    "passed": 5,
+    "failed": 1,
+    "meanRecall": 0.791667,
+    "meanMRR": 0.783333,
+    "meanPrecisionAt1": 0.666667,
+    "meanPrecisionAt5": 0.3,
+    "meanPrecisionAt10": 0.233333,
+    "latencyMsP50": 4.141,
+    "latencyMsP95": 65.48
+  },
+  "results": [
+    {
+      "caseId": "symbol-binary-bridge",
+      "query": "BinaryBridge",
+      "mode": "search",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.2,
+      "found": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "startLine": 272
+        }
+      ],
+      "missed": [],
+      "latencyMs": 65.48,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "kind": "class",
+          "startLine": 267,
+          "endLine": 1224,
+          "score": 0.6050058007240295,
+          "text": "/**\n * Manages a persistent `aft` child process, communicating via NDJSON over\n * stdin/stdout. Lazy-spawns on first `send()` call. Handles crash detection\n * with exponential backoff auto-restart.\n */\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/aft-bridge/src/__tests__/status-cache.test.ts",
+          "symbol": "makeBridge",
+          "kind": "function",
+          "startLine": 4,
+          "endLine": 6,
+          "score": 0.5203638672828674,
+          "text": "function makeBridge(): BinaryBridge {\n  return new BinaryBridge(\"/bin/false\", process.cwd());\n}"
+        },
+        {
+          "rank": 3,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "symbol": "BridgePool",
+          "kind": "class",
+          "startLine": 102,
+          "endLine": 371,
+          "score": 0.5102612972259521,
+          "text": "/**\n * Manages a pool of BinaryBridge instances, keyed by **canonical project root**.\n *\n * Prior to issue #14, the pool spawned one binary process per OpenCode session,\n * which duplicated every heavy in-memory structure (ONNX runtime, trigram and\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "bridgeFor",
+          "kind": "function",
+          "startLine": 302,
+          "endLine": 314,
+          "score": 0.47434255480766296,
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "callBridge",
+          "kind": "function",
+          "startLine": 316,
+          "endLine": 363,
+          "score": 0.4462156593799591,
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/pi-plugin/src/__tests__/bash.test.ts",
+          "symbol": "makeMockBridge",
+          "kind": "function",
+          "startLine": 59,
+          "endLine": 64,
+          "score": 0.4424373209476471,
+          "text": "function makeMockBridge(response: Record<string, unknown> = {}): BinaryBridge {\n  const sendFn = async () => ({ success: true, ...response });\n  return {\n    send: sendFn,\n  } as unknown as BinaryBridge;\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "symbol": "replaceBinary",
+          "kind": "method",
+          "startLine": 284,
+          "endLine": 306,
+          "score": 0.4384719729423523,
+          "text": "  /**\n   * Replace the binary path and restart all bridges.\n   * Used after downloading a newer binary version.\n   */\n  async replaceBinary(newPath: string): Promise<string> {\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/pi-plugin/src/__tests__/tool-test-utils.ts",
+          "symbol": "makeMockBridge",
+          "kind": "function",
+          "startLine": 46,
+          "endLine": 83,
+          "score": 0.43487805128097534,
+          "text": "export function makeMockBridge(\n  handler: (\n    command: string,\n    params: Record<string, unknown>,\n    options?: Record<string, unknown>,\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "pushStderrLine",
+          "kind": "method",
+          "startLine": 991,
+          "endLine": 996,
+          "score": 0.4314064085483551,
+          "text": "  private pushStderrLine(line: string): void {\n    this.stderrTail.push(line);\n    if (this.stderrTail.length > BinaryBridge.STDERR_TAIL_MAX) {\n      this.stderrTail.shift();\n    }\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/opencode-plugin/src/__tests__/tools.test.ts",
+          "symbol": "createBridge",
+          "kind": "function",
+          "startLine": 60,
+          "endLine": 69,
+          "score": 0.4135917127132416,
+          "text": "  const createBridge = () => {\n    pool = new BridgePool(\n      BINARY_PATH,\n      {\n        timeoutMs: TEST_TIMEOUT_MS,\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "symbol-bridge-options",
+      "query": "BridgeOptions",
+      "mode": "search",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.4,
+      "precisionAt10": 0.3,
+      "found": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BridgeOptions",
+          "startLine": 156
+        }
+      ],
+      "missed": [],
+      "latencyMs": 4.121,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BridgeOptions",
+          "kind": "interface",
+          "startLine": 156,
+          "endLine": 196,
+          "score": 0.5759782791137695,
+          "text": "export interface BridgeOptions {\n  /** Request timeout in milliseconds. Default: 30000 */\n  timeoutMs?: number;\n  /** Maximum restart attempts before giving up. Default: 3 */\n  maxRestarts?: number;\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BridgeRequestOptions",
+          "kind": "interface",
+          "startLine": 238,
+          "endLine": 259,
+          "score": 0.5625020861625671,
+          "text": "export interface BridgeRequestOptions {\n  onProgress?: (chunk: { kind: \"stdout\" | \"stderr\"; text: string }) => void;\n  /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */\n  transportTimeoutMs?: number;\n  /**\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "symbol": "PoolOptions",
+          "kind": "interface",
+          "startLine": 71,
+          "endLine": 100,
+          "score": 0.5521911978721619,
+          "text": "export interface PoolOptions extends BridgeOptions {\n  maxPoolSize?: number;\n  idleTimeoutMs?: number;\n  logger?: Logger;\n  /**\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "symbol": "bridgeFor",
+          "kind": "function",
+          "startLine": 182,
+          "endLine": 185,
+          "score": 0.5397778749465942,
+          "text": "/** Get the session bridge for the current working directory. */\nexport function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {\n  return ctx.pool.getBridge(cwd);\n}"
+        },
+        {
+          "rank": 5,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "ConfigureWarningsContext",
+          "kind": "interface",
+          "startLine": 134,
+          "endLine": 140,
+          "score": 0.5320998430252075,
+          "text": "/** Context passed to {@link BridgeOptions.onConfigureWarnings} after the first successful configure. */\nexport interface ConfigureWarningsContext {\n  projectRoot: string;\n  sessionId?: string | null;\n  client?: unknown;\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "constructor",
+          "kind": "method",
+          "startLine": 315,
+          "endLine": 334,
+          "score": 0.5294551253318787,
+          "text": "  constructor(\n    binaryPath: string,\n    cwd: string,\n    options?: BridgeOptions,\n    configOverrides?: Record<string, unknown>,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "SendOptions",
+          "kind": "interface",
+          "startLine": 261,
+          "endLine": 265,
+          "score": 0.5289841890335083,
+          "text": "interface SendOptions extends BridgeRequestOptions {\n  timeoutMs?: number;\n  configureWarningClient?: unknown;\n  markConfiguredOnSuccess?: boolean;\n}"
+        },
+        {
+          "rank": 8,
+          "file": "packages/pi-plugin/src/index.ts",
+          "symbol": "bridgeDirectoryFromCallback",
+          "kind": "function",
+          "startLine": 243,
+          "endLine": 246,
+          "score": 0.5207655429840088,
+          "text": "function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string {\n  const cwd = (bridge as { cwd?: unknown } | undefined)?.cwd;\n  return typeof cwd === \"string\" && cwd.length > 0 ? cwd : fallback;\n}"
+        },
+        {
+          "rank": 9,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "symbol": "setConfigureOverride",
+          "kind": "method",
+          "startLine": 336,
+          "endLine": 352,
+          "score": 0.511711835861206,
+          "text": "  /**\n   * Update or set a single configure override that will be applied to every\n   * **future** bridge spawn. Existing bridges keep their original configure\n   * payload — this method intentionally does NOT restart them, because that\n   * would discard their warm trigram/semantic/LSP/symbol-cac..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "symbol": "HomeProjectRootError",
+          "kind": "class",
+          "startLine": 11,
+          "endLine": 38,
+          "score": 0.5044558048248291,
+          "text": "/**\n * Historical error class — kept for backwards-compatible imports.\n *\n * **No longer thrown by `BridgePool.getBridge()`.** Prior versions refused\n * to spawn a bridge when `project_root` resolved to `$HOME`, but that was\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "symbol-semantic-index-status",
+      "query": "SemanticIndexStatus",
+      "mode": "search",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.4,
+      "precisionAt10": 0.2,
+      "found": [
+        {
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexStatus",
+          "startLine": 88
+        }
+      ],
+      "missed": [],
+      "latencyMs": 4.14,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexStatus",
+          "kind": "enum",
+          "startLine": 87,
+          "endLine": 103,
+          "score": 0.7194417715072632,
+          "text": "#[derive(Debug, Clone)]\npub enum SemanticIndexStatus {\n    Disabled,\n    Building {\n        /// Cold-build only — index is not queryable.\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndex",
+          "kind": "struct",
+          "startLine": 963,
+          "endLine": 976,
+          "score": 0.6882301568984985,
+          "text": "/// The semantic index — stores embeddings for all symbols in a project\n#[derive(Debug)]\npub struct SemanticIndex {\n    entries: Vec<EmbeddingEntry>,\n    /// Track which files are indexed and their mtime for staleness detection\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "semantic_index_status",
+          "kind": "method",
+          "startLine": 874,
+          "endLine": 876,
+          "score": 0.682311475276947,
+          "text": "    pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {\n        &self.semantic_index_status\n    }"
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "semantic_index",
+          "kind": "method",
+          "startLine": 862,
+          "endLine": 865,
+          "score": 0.6577033400535583,
+          "text": "    /// Access the semantic search index.\n    pub fn semantic_index(&self) -> &RefCell<Option<SemanticIndex>> {\n        &self.semantic_index\n    }"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexEvent",
+          "kind": "enum",
+          "startLine": 135,
+          "endLine": 144,
+          "score": 0.6320781111717224,
+          "text": "pub enum SemanticIndexEvent {\n    Progress {\n        stage: String,\n        files: Option<usize>,\n        entries_done: Option<usize>,\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "is_semantic_indexed_extension",
+          "kind": "function",
+          "startLine": 2243,
+          "endLine": 2269,
+          "score": 0.6268857717514038,
+          "text": "pub fn is_semantic_indexed_extension(path: &Path) -> bool {\n    matches!(\n        path.extension().and_then(|extension| extension.to_str()),\n        Some(\n            \"ts\" | \"tsx\"\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndexLock",
+          "kind": "struct",
+          "startLine": 61,
+          "endLine": 63,
+          "score": 0.6238979697227478,
+          "text": "pub struct SemanticIndexLock {\n    _guard: fs_lock::LockGuard,\n}"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndexFingerprint",
+          "kind": "struct",
+          "startLine": 84,
+          "endLine": 93,
+          "score": 0.6035162210464478,
+          "text": "#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct SemanticIndexFingerprint {\n    pub backend: String,\n    pub model: String,\n    #[serde(default)]\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "search",
+          "kind": "method",
+          "startLine": 1483,
+          "endLine": 1526,
+          "score": 0.5711869597434998,
+          "text": "    /// Search the index with a query embedding, returning top-K results sorted by relevance\n    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {\n        if self.entries.is_empty() || query_vector.len() != self.dimension {\n            return Vec::new();\n        }\n  ...."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "semantic_index_rx",
+          "kind": "method",
+          "startLine": 867,
+          "endLine": 872,
+          "score": 0.5526522994041443,
+          "text": "    /// Access the semantic-index build receiver.\n    pub fn semantic_index_rx(\n        &self,\n    ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>> {\n        &self.semantic_index_rx\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "context-plugin-bridge-dispatch",
+      "query": "How do OpenCode plugin tools call into the AFT bridge?",
+      "mode": "context",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.666667,
+      "mrr": 1,
+      "precisionAt1": 1,
+      "precisionAt5": 0.4,
+      "precisionAt10": 0.2,
+      "found": [
+        {
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "callBridge",
+          "startLine": 331
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "bridgeFor",
+          "startLine": 312
+        }
+      ],
+      "missed": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "symbol": "BinaryBridge",
+          "startLine": 272
+        }
+      ],
+      "latencyMs": 4.882,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "callBridge",
+          "kind": "function",
+          "startLine": 316,
+          "endLine": 363,
+          "score": 0.77620530128479,
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "bridgeFor",
+          "kind": "function",
+          "startLine": 302,
+          "endLine": 314,
+          "score": 0.7664450407028198,
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/opencode-plugin/src/types.ts",
+          "symbol": "PluginContext",
+          "kind": "interface",
+          "startLine": 13,
+          "endLine": 24,
+          "score": 0.7025715112686157,
+          "text": "/**\n * Shared context passed to all tool factory functions.\n * Bundles the binary bridge, the OpenCode SDK client, and plugin config.\n */\nexport interface PluginContext {\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/config.ts",
+          "symbol": "resolveProjectOverridesForConfigure",
+          "kind": "function",
+          "startLine": 332,
+          "endLine": 378,
+          "score": 0.6727011799812317,
+          "text": "/**\n * Build the per-project subset of configure overrides that come from\n * `aft.jsonc` (user config merged with project config). Used by the OpenCode\n * plugin's per-bridge `projectConfigLoader` so each project's `aft.jsonc` wins\n * over the user-level config for that project's bridge, instead of ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/index.ts",
+          "symbol": "initializePluginForDirectory",
+          "kind": "function",
+          "startLine": 243,
+          "endLine": 1055,
+          "score": 0.6336002349853516,
+          "text": "async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {\n  const binaryPath = await findBinary(PLUGIN_VERSION);\n\n  await ensureStorageMigrated({ harness: \"opencode\", binaryPath, logger: bridgeLogger });\n\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "symbol": "ToolRuntime",
+          "kind": "interface",
+          "startLine": 242,
+          "endLine": 256,
+          "score": 0.6304269433021545,
+          "text": "/**\n * Minimum shape of the per-tool-call context provided by the OpenCode SDK.\n *\n * We only depend on a few fields so any similar context (including the Pi\n * plugin's `ExtensionContext`) can be passed through the same helpers once\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/opencode-plugin/src/tools/hoisted.ts",
+          "symbol": "aftPrefixedTools",
+          "kind": "function",
+          "startLine": 1722,
+          "endLine": 1819,
+          "score": 0.6226973533630371,
+          "text": "/**\n * Returns the same tools with aft_ prefix (for when hoisting is disabled).\n */\nexport function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  const aftEditTool = createEditTool(ctx, \"aft_write\");\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/opencode-plugin/src/index.ts",
+          "symbol": "BridgePendingState",
+          "kind": "type_alias",
+          "startLine": 89,
+          "endLine": 91,
+          "score": 0.615834653377533,
+          "text": "type BridgePendingState = {\n  hasPendingRequests(): boolean;\n};"
+        },
+        {
+          "rank": 9,
+          "file": "packages/opencode-plugin/src/__tests__/tools.test.ts",
+          "symbol": "createBridge",
+          "kind": "function",
+          "startLine": 60,
+          "endLine": 69,
+          "score": 0.6151157021522522,
+          "text": "  const createBridge = () => {\n    pool = new BridgePool(\n      BINARY_PATH,\n      {\n        timeoutMs: TEST_TIMEOUT_MS,\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/opencode-plugin/src/notifications.ts",
+          "symbol": "ConfigureWarningOptions",
+          "kind": "interface",
+          "startLine": 385,
+          "endLine": 392,
+          "score": 0.6127973198890686,
+          "text": "export interface ConfigureWarningOptions {\n  client: unknown;\n  sessionId: string;\n  bridge: Pick<BinaryBridge, \"send\">;\n  storageDir: string;\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "context-semantic-search-path",
+      "query": "How does AFT semantic search execute from tool request to indexed results?",
+      "mode": "context",
+      "driver": "aft",
+      "pass": false,
+      "recall": 0.333333,
+      "mrr": 0.2,
+      "precisionAt1": 0,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.1,
+      "found": [
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndex",
+          "startLine": 965
+        }
+      ],
+      "missed": [
+        {
+          "file": "packages/opencode-plugin/src/tools/semantic.ts",
+          "symbol": "semanticTools",
+          "startLine": 15
+        },
+        {
+          "file": "crates/aft/src/search_index.rs",
+          "symbol": "SearchIndex",
+          "startLine": 58
+        }
+      ],
+      "latencyMs": 4.141,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "symbol": "handle_semantic_search",
+          "kind": "function",
+          "startLine": 72,
+          "endLine": 125,
+          "score": 0.6038039326667786,
+          "text": "pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {\n    let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {\n        Ok(params) => params,\n        Err(error) => {\n            return Response::error(\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/tests/integration/semantic_test.rs",
+          "symbol": "semantic_search_returns_not_ready_without_an_index",
+          "kind": "function",
+          "startLine": 281,
+          "endLine": 303,
+          "score": 0.5885433554649353,
+          "text": "#[test]\nfn semantic_search_returns_not_ready_without_an_index() {\n    let mut aft = AftProcess::spawn();\n\n    let response = send(\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "search",
+          "kind": "method",
+          "startLine": 1483,
+          "endLine": 1526,
+          "score": 0.5737839937210083,
+          "text": "    /// Search the index with a query embedding, returning top-K results sorted by relevance\n    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {\n        if self.entries.is_empty() || query_vector.len() != self.dimension {\n            return Vec::new();\n        }\n  ...."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "semantic_index",
+          "kind": "method",
+          "startLine": 862,
+          "endLine": 865,
+          "score": 0.5732992887496948,
+          "text": "    /// Access the semantic search index.\n    pub fn semantic_index(&self) -> &RefCell<Option<SemanticIndex>> {\n        &self.semantic_index\n    }"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticIndex",
+          "kind": "struct",
+          "startLine": 963,
+          "endLine": 976,
+          "score": 0.5576665997505188,
+          "text": "/// The semantic index — stores embeddings for all symbols in a project\n#[derive(Debug)]\npub struct SemanticIndex {\n    entries: Vec<EmbeddingEntry>,\n    /// Track which files are indexed and their mtime for staleness detection\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/semantic_index.rs",
+          "symbol": "SemanticResult",
+          "kind": "struct",
+          "startLine": 1002,
+          "endLine": 1014,
+          "score": 0.5521960258483887,
+          "text": "/// Search result from a semantic query\n#[derive(Debug, Clone)]\npub struct SemanticResult {\n    pub file: PathBuf,\n    pub name: String,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "semantic_index_status",
+          "kind": "method",
+          "startLine": 874,
+          "endLine": 876,
+          "score": 0.5517644882202148,
+          "text": "    pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {\n        &self.semantic_index_status\n    }"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "symbol": "fuse_hybrid_results",
+          "kind": "function",
+          "startLine": 588,
+          "endLine": 651,
+          "score": 0.5471777319908142,
+          "text": "pub fn fuse_hybrid_results(\n    semantic: Vec<SemanticResult>,\n    lexical_files: Vec<(PathBuf, f32)>,\n    shape: &QueryShape,\n    top_k: usize,\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "symbol": "handle_semantic_or_hybrid_search",
+          "kind": "function",
+          "startLine": 269,
+          "endLine": 451,
+          "score": 0.5446579456329346,
+          "text": "fn handle_semantic_or_hybrid_search(\n    req: &RawRequest,\n    ctx: &AppContext,\n    params: SemanticSearchParams,\n    top_k: usize,\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/context.rs",
+          "symbol": "SemanticIndexStatus",
+          "kind": "enum",
+          "startLine": 87,
+          "endLine": 103,
+          "score": 0.5424224734306335,
+          "text": "#[derive(Debug, Clone)]\npub enum SemanticIndexStatus {\n    Disabled,\n    Building {\n        /// Cold-build only — index is not queryable.\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "context-import-organization",
+      "query": "What are the import organization components for parsing, grouping, and generating imports?",
+      "mode": "context",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.75,
+      "mrr": 0.5,
+      "precisionAt1": 0,
+      "precisionAt5": 0.2,
+      "precisionAt10": 0.4,
+      "found": [
+        {
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "handle_organize_imports",
+          "startLine": 27
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "parse_imports",
+          "startLine": 171
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "classify_group",
+          "startLine": 473
+        }
+      ],
+      "missed": [
+        {
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "generate_import_line",
+          "startLine": 399
+        }
+      ],
+      "latencyMs": 7.155,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "ImportGroup",
+          "kind": "enum",
+          "startLine": 30,
+          "endLine": 49,
+          "score": 0.6036604642868042,
+          "text": "/// Which logical group an import belongs to (language-specific).\n///\n/// Ordering matches conventional import group sorting:\n///   Stdlib (first) < External < Internal (last)\n///\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "organize_imports",
+          "kind": "file_summary",
+          "score": 0.5870503187179565,
+          "text": "//! Handler for the `organize_imports` command: re-group, sort, deduplicate, and\n//! optionally merge imports in a file.\n//!\n//! For all languages: extracts imports, groups by convention, sorts alphab"
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "OrganizedImport",
+          "kind": "struct",
+          "startLine": 240,
+          "endLine": 248,
+          "score": 0.5501118898391724,
+          "text": "/// An organized import ready for code generation.\n#[derive(Debug, Clone)]\nstruct OrganizedImport {\n    module_path: String,\n    names: Vec<String>,\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/commands/add_import.rs",
+          "symbol": "add_import",
+          "kind": "file_summary",
+          "score": 0.5294052362442017,
+          "text": "//! Handler for the `add_import` command: add an import statement to a file.\n//!\n//! Analyzes existing imports, checks for duplicates, finds the correct\n//! insertion point based on group and alphabet"
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/tools/imports.ts",
+          "symbol": "importTools",
+          "kind": "function",
+          "startLine": 15,
+          "endLine": 95,
+          "score": 0.5275976061820984,
+          "text": "/**\n * Tool definitions for import management commands: add_import, remove_import, organize_imports.\n */\nexport function importTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  return {\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "organize",
+          "kind": "function",
+          "startLine": 210,
+          "endLine": 238,
+          "score": 0.5168617963790894,
+          "text": "/// Organize imports: group by convention, sort within groups, deduplicate.\n/// Returns (grouped imports in order, count of removed duplicates).\nfn organize(\n    imports: &[ImportStatement],\n    lang: LangId,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "symbol": "handle_organize_imports",
+          "kind": "function",
+          "startLine": 21,
+          "endLine": 208,
+          "score": 0.5157124996185303,
+          "text": "/// Handle an `organize_imports` request.\n///\n/// Params:\n///   - `file` (string, required) — target file path\n///\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "generate_go_import_line",
+          "kind": "function",
+          "startLine": 1525,
+          "endLine": 1543,
+          "score": 0.49895501136779785,
+          "text": "/// Generate a Go import line (public API for command handler).\n///\n/// `in_group` controls whether to generate a spec for insertion into an\n/// existing grouped import (`\\t\"path\"`) or a standalone import (`import \"path\"`).\nfn generate_go_import_line(module_path: &str, alias: Option<&str>, in_group:..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "classify_group_ts",
+          "kind": "function",
+          "startLine": 463,
+          "endLine": 470,
+          "score": 0.49513673782348633,
+          "text": "/// Classify a module path into a group for TS/JS/TSX.\npub fn classify_group_ts(module_path: &str) -> ImportGroup {\n    if module_path.starts_with('.') {\n        ImportGroup::Internal\n    } else {\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/imports.rs",
+          "symbol": "parse_imports",
+          "kind": "function",
+          "startLine": 170,
+          "endLine": 195,
+          "score": 0.4939717948436737,
+          "text": "/// Parse imports from source using the provided tree-sitter tree.\npub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {\n    match lang {\n        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => parse_ts_imports(source, tree),\n        LangId::Python => parse_py_impor..."
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "aftBinary": "/workspace/target/release/aft",
+    "target": {
+      "name": "opencode-aft",
+      "kind": "local",
+      "path": "/workspace",
+      "url": "https://github.com/cortexkit/aft.git",
+      "commit": "local-worktree"
+    },
+    "methodology": "Identical retrieval cases scored by ground-truth symbol/file matches with Recall, MRR, and Precision@k. No LLM is used."
+  }
+}

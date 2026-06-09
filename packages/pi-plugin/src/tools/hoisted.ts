@@ -19,7 +19,8 @@
 
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { formatEditSummary } from "@cortexkit/aft-bridge";
 import {
   type AgentToolResult,
   type ExtensionAPI,
@@ -29,8 +30,15 @@ import {
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
+
+const DIAGNOSTICS_PARAM_DESCRIPTION =
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
@@ -47,66 +55,144 @@ function containsPath(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-async function assertExternalDirectoryPermission(
-  extCtx: { cwd: string; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } },
+/**
+ * Expand a leading `~` to the user's home directory. Returns the path
+ * unchanged if it does not start with `~`. Mirrors shell-style expansion so
+ * agent calls like `grep ... in ~/Work/...` resolve before any filesystem
+ * stat or permission check sees the literal tilde.
+ */
+function expandTilde(path: string): string {
+  if (!path || !path.startsWith("~")) return path;
+  if (path === "~") return homedir();
+  if (path.startsWith(`~${sep}`) || path.startsWith("~/")) {
+    return resolve(homedir(), path.slice(2));
+  }
+  return path;
+}
+
+/**
+ * Hard upper bound on how long we'll wait for `ui.confirm` before treating
+ * the prompt as denied. Without this, an agent-driven tool call from a
+ * non-UI Pi context (or any path where the host can't surface the prompt)
+ * blocks the bridge round-trip indefinitely — observed as "grep hangs
+ * forever". Denial after 30s preserves the security model while letting
+ * the agent recover. Overridable for tests via
+ * `AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS`.
+ */
+function externalDirectoryPromptTimeoutMs(): number {
+  const raw = process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
+  if (raw === undefined) return 30_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+}
+
+export async function assertExternalDirectoryPermission(
+  extCtx: {
+    cwd: string;
+    hasUI?: boolean;
+    ui?: { confirm?: (title: string, message: string) => Promise<boolean> };
+  },
   target: string,
   action = "modify",
+  options: { restrictToProjectRoot?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
-  const absoluteTarget = isAbsolute(target) ? target : resolve(extCtx.cwd, target);
+  const expanded = expandTilde(target);
+  const absoluteTarget = isAbsolute(expanded) ? expanded : resolve(extCtx.cwd, expanded);
   if (containsPath(extCtx.cwd, absoluteTarget)) return;
 
-  const confirmed = await extCtx.ui?.confirm?.(
-    "Allow external directory access?",
-    `AFT wants to ${action} outside the project: ${absoluteTarget}`,
-  );
-  if (confirmed === true) return;
-  throw new Error("Permission denied: external directory access was cancelled.");
+  // User has explicitly opted out of path restriction (the Pi default).
+  // Pi has no host-level external_directory allow-list to consult, so a
+  // ui.confirm prompt has no policy behind it — it would just nag the
+  // user on every external path. Defer to Rust, which will accept the
+  // path because `restrict_to_project_root` is false.
+  if (options.restrictToProjectRoot === false) return;
+
+  // No UI available — deny immediately so the agent gets a clear refusal
+  // instead of an unanswerable prompt. This branch is only reachable when
+  // `restrict_to_project_root: true` AND no UI is available, which is
+  // unusual; the right path is to either run Pi interactively or relax
+  // the restriction.
+  const confirmFn = extCtx.ui?.confirm;
+  if (extCtx.hasUI === false || !confirmFn) {
+    throw new Error(
+      `Permission denied: cannot prompt for ${action} outside the project (${absoluteTarget}).`,
+    );
+  }
+
+  // Race the confirm against a hard timeout so a stuck prompt cannot wedge
+  // the bridge dispatch loop.
+  const timeoutMs = externalDirectoryPromptTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    const result = await Promise.race([
+      confirmFn(
+        "Allow external directory access?",
+        `AFT wants to ${action} outside the project: ${absoluteTarget}`,
+      ),
+      timeoutPromise,
+    ]);
+    if (result === true) return;
+    if (result === "timeout") {
+      throw new Error(
+        `Permission denied: external directory prompt timed out after ${timeoutMs}ms.`,
+      );
+    }
+    throw new Error("Permission denied: external directory access was cancelled.");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 const ReadParams = Type.Object({
-  path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
-  offset: Type.Optional(
-    Type.Number({ description: "Line number to start reading from (1-indexed)" }),
-  ),
-  limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+  path: Type.String({
+    description: "Path to the file to read (absolute or relative to project root)",
+  }),
+  offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
 });
 
 const WriteParams = Type.Object({
   filePath: Type.String({
-    description: "Path to the file to write (absolute or project-relative)",
+    description: "Path to the file to write (absolute or relative to project root)",
   }),
   content: Type.String({ description: "Full file contents to write" }),
+  diagnostics: Type.Optional(Type.Boolean({ description: DIAGNOSTICS_PARAM_DESCRIPTION })),
 });
 
 const EditParams = Type.Object({
-  filePath: Type.String({ description: "Path to the file to edit" }),
+  filePath: Type.String({
+    description: "Path to the file to edit (absolute or relative to project root)",
+  }),
   oldString: Type.Optional(
     Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
   ),
   newString: Type.Optional(Type.String({ description: "Replacement text (omit to delete match)" })),
   replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
-  occurrence: Type.Optional(
-    Type.Number({ description: "0-indexed occurrence when multiple matches exist" }),
-  ),
+  occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
   appendContent: Type.Optional(
     Type.String({
       description:
         "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
     }),
   ),
+  diagnostics: Type.Optional(Type.Boolean({ description: DIAGNOSTICS_PARAM_DESCRIPTION })),
 });
 
 const GrepParams = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for" }),
-  path: Type.Optional(Type.String({ description: "Path scope (file or directory)" })),
+  path: Type.Optional(
+    Type.String({
+      description: "Path scope (file or directory; absolute or relative to project root)",
+    }),
+  ),
   include: Type.Optional(
     Type.String({ description: "Glob filter for included files (e.g. '*.ts,*.tsx')" }),
   ),
   caseSensitive: Type.Optional(Type.Boolean({ description: "Case-sensitive matching" })),
-  contextLines: Type.Optional(
-    Type.Number({ description: "Lines of context before/after each match" }),
-  ),
 });
 
 export interface ToolSurfaceFlags {
@@ -114,6 +200,19 @@ export interface ToolSurfaceFlags {
   hoistWrite: boolean;
   hoistEdit: boolean;
   hoistGrep: boolean;
+  /**
+   * Mirrors the user's `restrict_to_project_root` AFT config (Pi default
+   * `false`). When false, the user has explicitly opted into "no
+   * restriction" — Pi has no host-level external_directory allow-list, so
+   * a `ui.confirm` prompt has no policy to consult and would only annoy
+   * the user. When true, Rust hard-rejects out-of-root paths before the
+   * plugin layer sees them anyway, so the prompt is also unreachable. We
+   * pass this through so `assertExternalDirectoryPermission` can skip the
+   * prompt in the false case (the common one) and the helper stays in
+   * place as a safety net for unusual contexts that opt into restriction
+   * but still want a chance to allow a one-off external write.
+   */
+  restrictToProjectRoot: boolean;
 }
 
 /** Details surfaced to both renderer and agent message stream. */
@@ -178,14 +277,19 @@ export function registerHoistedTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const req: Record<string, unknown> = { file: params.path };
-        if (params.offset !== undefined) {
-          req.start_line = params.offset;
-          if (params.limit !== undefined) {
-            req.end_line = params.offset + params.limit - 1;
+        const offset = coerceOptionalInt(params.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
+        const limit = coerceOptionalInt(params.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
+        // Resolve ~ / relative so Rust gets a real path, not a literal `~/...`.
+        const req: Record<string, unknown> = {
+          file: await resolvePathArg(extCtx.cwd, params.path),
+        };
+        if (offset !== undefined) {
+          req.start_line = offset;
+          if (limit !== undefined) {
+            req.end_line = offset + limit - 1;
           }
-        } else if (params.limit !== undefined) {
-          req.end_line = params.limit;
+        } else if (limit !== undefined) {
+          req.end_line = limit;
         }
         const response = await callBridge(bridge, "read", req, extCtx);
         if (Array.isArray(response.entries)) {
@@ -201,7 +305,7 @@ export function registerHoistedTools(
         // existed. This restores Case A (hint when agent didn't choose)
         // while avoiding the patronizing hint when the agent already
         // chose a range (Case B → no footer).
-        const agentSpecifiedRange = params.offset !== undefined || params.limit !== undefined;
+        const agentSpecifiedRange = offset !== undefined || limit !== undefined;
         const footer = formatReadFooter(agentSpecifiedRange, response);
         if (footer) text += footer;
         return textResult(text);
@@ -214,9 +318,9 @@ export function registerHoistedTools(
       name: "write",
       label: "write",
       description:
-        "Write a file atomically with per-file backup, optional auto-format, and inline LSP diagnostics. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`).",
+        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Create or overwrite files (uses filePath; auto-formats; returns LSP diagnostics inline)",
+        "Create or overwrite files (uses filePath; auto-formats; diagnostics follow lsp.diagnostics_on_edit unless overridden)",
       promptGuidelines: ["Use write only for new files or complete rewrites."],
       parameters: WriteParams,
       async execute(
@@ -226,20 +330,27 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify");
+        // Resolve ~ / relative ONCE and use the same value for the permission
+        // check and the bridge. Previously the check expanded ~ but the bridge
+        // got the raw `~/...`, which Rust treats literally — creating a literal
+        // `~` directory under the project root instead of writing to home.
+        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+          restrictToProjectRoot: surface.restrictToProjectRoot,
+        });
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callBridge(
           bridge,
           "write",
           {
-            file: params.filePath,
+            file: filePath,
             content: params.content,
-            diagnostics: true,
-            include_diff: true,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            include_diff_content: true,
           },
           extCtx,
         );
-        return buildMutationResult(params.filePath, response);
+        return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
         return renderMutationCall("write", args?.filePath, theme, context);
@@ -255,9 +366,9 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Always returns LSP diagnostics inline.",
+        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing).",
+        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics follow lsp.diagnostics_on_edit unless overridden.",
       promptGuidelines: [
         "Prefer edit over write when changing part of an existing file.",
         "Include enough surrounding context in oldString to make the match unique, or set replaceAll/occurrence explicitly.",
@@ -271,7 +382,13 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify");
+        // Resolve ~ / relative ONCE (see the write handler) and use it for the
+        // permission check and the bridge, so Rust receives the real target
+        // instead of a literal `~/...`.
+        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+          restrictToProjectRoot: surface.restrictToProjectRoot,
+        });
         const bridge = bridgeFor(ctx, extCtx.cwd);
 
         // Append mode: explicitly route through the Rust `append` op, which
@@ -281,27 +398,33 @@ export function registerHoistedTools(
         if (typeof params.appendContent === "string") {
           const req: Record<string, unknown> = {
             op: "append",
-            file: params.filePath,
+            file: filePath,
             append_content: params.appendContent,
-            diagnostics: true,
-            include_diff: true,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            include_diff_content: true,
           };
           const response = await callBridge(bridge, "edit_match", req, extCtx);
-          return buildMutationResult(params.filePath, response);
+          return buildMutationResult(response);
         }
 
         const req: Record<string, unknown> = {
-          file: params.filePath,
+          file: filePath,
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
-          diagnostics: true,
-          include_diff: true,
+          diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+          include_diff_content: true,
         };
         if (params.replaceAll === true) req.replace_all = true;
-        if (params.occurrence !== undefined) req.occurrence = params.occurrence;
+        const occurrence = coerceOptionalInt(
+          params.occurrence,
+          "occurrence",
+          0,
+          Number.MAX_SAFE_INTEGER,
+        );
+        if (occurrence !== undefined) req.occurrence = occurrence;
 
         const response = await callBridge(bridge, "edit_match", req, extCtx);
-        return buildMutationResult(params.filePath, response);
+        return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
         return renderMutationCall("edit", args?.filePath, theme, context);
@@ -331,12 +454,13 @@ export function registerHoistedTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { pattern: params.pattern };
         if (params.path) {
-          await assertExternalDirectoryPermission(extCtx, params.path, "search");
+          await assertExternalDirectoryPermission(extCtx, params.path, "search", {
+            restrictToProjectRoot: surface.restrictToProjectRoot,
+          });
           req.path = await resolvePathArg(extCtx.cwd, params.path);
         }
         if (params.include) req.include = splitIncludeGlobs(params.include);
         if (params.caseSensitive !== undefined) req.case_sensitive = params.caseSensitive;
-        if (params.contextLines !== undefined) req.context_lines = params.contextLines;
 
         const response = await callBridge(bridge, "grep", req, extCtx);
         const text = (response.text as string | undefined) ?? "";
@@ -356,7 +480,6 @@ export function registerHoistedTools(
  * behavior without spinning up a real bridge.
  */
 export function buildMutationResult(
-  filePath: string,
   response: Record<string, unknown>,
 ): AgentToolResult<FileMutationDetails> {
   const diffObj = response.diff as
@@ -406,18 +529,14 @@ export function buildMutationResult(
     firstChangedLine = piDiff.firstChangedLine;
   }
 
-  // Agent-facing text: summary header + diff (if present) + truncation
-  // notice + no-op notice + format-skip notice (non-benign reasons only)
-  // + diagnostics.
-  const summaryHeader =
-    replacements !== undefined
-      ? `Edited ${filePath} (+${additions}/-${deletions}, ${replacements} replacement${replacements === 1 ? "" : "s"})`
-      : `Wrote ${filePath} (+${additions}/-${deletions})`;
-  let text = summaryHeader;
-  if (diffText) text += `\n\n${diffText}`;
-  if (truncated) {
-    text += "\n\n(diff truncated \u2014 file too large to include before/after content)";
-  }
+  // Agent-facing text: compact summary header (shared with OpenCode via
+  // formatEditSummary) + conditional notices below. The header deliberately
+  // omits the file path and the diff body: the agent supplied both the path
+  // and the content, so echoing them back wastes tokens proportional to file
+  // size. The line-numbered diff stays in `details.diff` for the TUI renderer
+  // (which sources the path from the call args, not this text). This keeps the
+  // OpenCode and Pi agent-facing edit output byte-identical in shape.
+  let text = formatEditSummary(response as Record<string, unknown>);
   if (noOp) {
     // Surface the no-op signal explicitly so the agent can distinguish "the
     // tool failed silently" from "the edit matched but produced no net change".
@@ -597,14 +716,15 @@ function shortenPath(path: string): string {
   return path;
 }
 
-/** Resolve a path argument to an absolute path if it exists. */
-async function resolvePathArg(cwd: string, path: string): Promise<string> {
-  const abs = resolve(cwd, path);
+/** Resolve a path argument to an absolute path if it exists, expanding `~`. */
+export async function resolvePathArg(cwd: string, path: string): Promise<string> {
+  const expanded = expandTilde(path);
+  const abs = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
   try {
     await stat(abs);
     return abs;
   } catch {
-    return path;
+    return expanded;
   }
 }
 

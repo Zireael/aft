@@ -59,6 +59,8 @@ describe("storage migration status", () => {
       [
         "migrate-storage",
         "--status",
+        "--from",
+        join(tempDir, "opencode", "storage", "plugin", "aft"),
         "--to",
         join(tempDir, "cortexkit", "aft"),
         "--harness",
@@ -73,6 +75,35 @@ describe("storage migration status", () => {
       harness: "opencode",
       target_root: join(tempDir, "cortexkit", "aft"),
       migrated: false,
+    };
+    setSpawnResult({
+      status: 0,
+      signal: null,
+      error: undefined,
+      stdout: `${JSON.stringify(payload)}\n`,
+      stderr: "",
+    });
+
+    await expect(
+      getMigrationStatus({ harness: "opencode", binaryPath: "/bin/aft" }),
+    ).resolves.toEqual(payload);
+  });
+
+  test("getMigrationStatus_exposes_partial_state_fields", async () => {
+    const payload = {
+      harness: "opencode",
+      target_root: join(tempDir, "cortexkit", "aft"),
+      migrated: false,
+      source_marker_path: join(
+        tempDir,
+        "opencode",
+        "storage",
+        "plugin",
+        "aft",
+        ".migrated_to_cortexkit",
+      ),
+      source_marker_present: true,
+      partial_state: true,
     };
     setSpawnResult({
       status: 0,

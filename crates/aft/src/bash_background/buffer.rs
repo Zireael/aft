@@ -10,6 +10,13 @@ pub enum StreamKind {
     Stderr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedRead {
+    pub text: String,
+    pub truncated: bool,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum BgBuffer {
     Pipes {
@@ -94,6 +101,55 @@ impl BgBuffer {
                 Err(_) => (String::new(), false),
             },
         }
+    }
+
+    pub fn read_combined_head_tail(
+        &self,
+        max_bytes: usize,
+        head_bytes: usize,
+        tail_bytes: usize,
+    ) -> BoundedRead {
+        match self {
+            Self::Pipes {
+                stdout_path,
+                stderr_path,
+            } => {
+                read_two_file_head_tail(stdout_path, stderr_path, max_bytes, head_bytes, tail_bytes)
+            }
+            Self::Pty { combined_path } => {
+                read_single_file_head_tail(combined_path, max_bytes, head_bytes, tail_bytes)
+                    .unwrap_or_else(|_| BoundedRead {
+                        text: String::new(),
+                        truncated: false,
+                        total_bytes: 0,
+                    })
+            }
+        }
+    }
+
+    pub fn read_stream_bounded(&self, stream: StreamKind, max_bytes: usize) -> BoundedRead {
+        let path = match (self, stream) {
+            (Self::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
+            (Self::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
+            (Self::Pty { combined_path }, _) => Some(combined_path),
+        };
+        path.and_then(|path| read_file_bounded(path, max_bytes).ok())
+            .unwrap_or_else(|| BoundedRead {
+                text: String::new(),
+                truncated: false,
+                total_bytes: 0,
+            })
+    }
+
+    pub fn stream_len(&self, stream: StreamKind) -> u64 {
+        let path = match (self, stream) {
+            (Self::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
+            (Self::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
+            (Self::Pty { combined_path }, _) => Some(combined_path),
+        };
+        path.and_then(|path| path.metadata().ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
     }
 
     pub fn read_for_token_count(&self, max_bytes_per_stream: usize) -> TokenCountInput {
@@ -214,6 +270,154 @@ pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u
     let mut bytes = Vec::with_capacity(read_len as usize);
     file.read_to_end(&mut bytes)?;
     Ok((bytes, len > max_bytes as u64))
+}
+
+fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
+    let metadata = path.metadata()?;
+    let total_bytes = metadata.len();
+    if total_bytes > max_bytes as u64 {
+        return Ok(BoundedRead {
+            text: String::new(),
+            truncated: true,
+            total_bytes,
+        });
+    }
+    let bytes = fs::read(path)?;
+    Ok(BoundedRead {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated: false,
+        total_bytes,
+    })
+}
+
+fn read_single_file_head_tail(
+    path: &Path,
+    max_bytes: usize,
+    head_bytes: usize,
+    tail_bytes: usize,
+) -> io::Result<BoundedRead> {
+    let total_bytes = path.metadata()?.len();
+    if total_bytes <= max_bytes as u64 {
+        let bytes = fs::read(path)?;
+        return Ok(BoundedRead {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated: false,
+            total_bytes,
+        });
+    }
+
+    let head_len = head_bytes.min(max_bytes) as u64;
+    let tail_len = tail_bytes.min(max_bytes.saturating_sub(head_len as usize)) as u64;
+    let head = read_file_range(path, 0, head_len)?;
+    let tail_start = total_bytes.saturating_sub(tail_len);
+    let tail = read_file_range(path, tail_start, tail_len)?;
+    Ok(BoundedRead {
+        text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
+        truncated: true,
+        total_bytes,
+    })
+}
+
+fn read_two_file_head_tail(
+    first: &Path,
+    second: &Path,
+    max_bytes: usize,
+    head_bytes: usize,
+    tail_bytes: usize,
+) -> BoundedRead {
+    let first_len = first.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let second_len = second
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let total_bytes = first_len.saturating_add(second_len);
+
+    if total_bytes <= max_bytes as u64 {
+        let mut bytes = Vec::with_capacity(total_bytes as usize);
+        if let Ok(first_bytes) = fs::read(first) {
+            bytes.extend_from_slice(&first_bytes);
+        }
+        if let Ok(second_bytes) = fs::read(second) {
+            bytes.extend_from_slice(&second_bytes);
+        }
+        return BoundedRead {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated: false,
+            total_bytes,
+        };
+    }
+
+    let head_len = head_bytes.min(max_bytes) as u64;
+    let tail_len = tail_bytes.min(max_bytes.saturating_sub(head_len as usize)) as u64;
+    let head = read_virtual_range(first, first_len, second, 0, head_len).unwrap_or_default();
+    let tail_start = total_bytes.saturating_sub(tail_len);
+    let tail =
+        read_virtual_range(first, first_len, second, tail_start, tail_len).unwrap_or_default();
+    BoundedRead {
+        text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
+        truncated: true,
+        total_bytes,
+    }
+}
+
+fn read_virtual_range(
+    first: &Path,
+    first_len: u64,
+    second: &Path,
+    start: u64,
+    len: u64,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(len as usize);
+    if len == 0 {
+        return Ok(output);
+    }
+    let end = start.saturating_add(len);
+
+    if start < first_len {
+        let first_read_start = start;
+        let first_read_end = end.min(first_len);
+        output.extend(read_file_range(
+            first,
+            first_read_start,
+            first_read_end.saturating_sub(first_read_start),
+        )?);
+    }
+
+    if end > first_len {
+        let second_read_start = start.saturating_sub(first_len);
+        let second_read_end = end.saturating_sub(first_len);
+        output.extend(read_file_range(
+            second,
+            second_read_start,
+            second_read_end.saturating_sub(second_read_start),
+        )?);
+    }
+
+    Ok(output)
+}
+
+fn read_file_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut limited = file.take(len);
+    let mut bytes = Vec::with_capacity(len as usize);
+    limited.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_head_tail_bytes(head: Vec<u8>, tail: Vec<u8>, truncated_bytes: u64) -> String {
+    let mut output = String::from_utf8_lossy(&head).into_owned();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("...<truncated ");
+    output.push_str(&truncated_bytes.to_string());
+    output.push_str(" bytes>...\n");
+    output.push_str(&String::from_utf8_lossy(&tail));
+    output
 }
 
 fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {

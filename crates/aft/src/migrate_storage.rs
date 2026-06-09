@@ -77,7 +77,7 @@ pub fn run(args: Args) -> ExitCode {
 
 pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     if args.status {
-        write_status(&args.to, args.harness);
+        write_status(&args.to, args.harness, args.from.as_deref());
         return ExitStatus::Success;
     }
 
@@ -305,9 +305,13 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     ExitStatus::Success
 }
 
-fn write_status(target_root: &Path, harness: Harness) {
+fn write_status(target_root: &Path, harness: Harness, source_root: Option<&Path>) {
     let marker_path = target_marker_path_from(target_root, harness);
-    let value = match fs::read(&marker_path) {
+    let source_marker_path = source_root.map(|root| root.join(SOURCE_MARKER));
+    let source_marker_present = source_marker_path
+        .as_ref()
+        .is_some_and(|path| path.exists());
+    let mut value = match fs::read(&marker_path) {
         Ok(bytes) => match serde_json::from_slice::<Marker>(&bytes) {
             Ok(marker) => serde_json::json!({
                 "harness": harness.as_str(),
@@ -337,34 +341,68 @@ fn write_status(target_root: &Path, harness: Harness) {
         }),
     };
 
+    if let Some(source_marker_path) = source_marker_path {
+        value["source_marker_path"] = serde_json::json!(source_marker_path.display().to_string());
+        value["source_marker_present"] = serde_json::json!(source_marker_present);
+        value["partial_state"] = serde_json::json!(source_marker_present && !marker_path.exists());
+    }
+
     let mut stdout = io::stdout().lock();
     let _ = serde_json::to_writer(&mut stdout, &value);
     let _ = stdout.write_all(b"\n");
 }
 
-/// Sweep `staging-*` directories from prior failed migrations in the harness root.
-/// Idempotent. Returns the number of staging dirs removed.
+/// Sweep `staging-*` files and directories from target parents used by migration.
+/// Idempotent. Returns the number of staging entries removed.
 pub fn cleanup_staging_dirs(target_root: &Path, harness: Harness) -> io::Result<usize> {
-    let harness_dir = target_root.join(harness.as_str());
-    if !harness_dir.exists() {
-        return Ok(0);
+    let mut parents = BTreeSet::new();
+    for &item in migration_items() {
+        parents.insert(staging_parent_from_root(target_root, harness, item));
     }
 
     let mut removed = 0;
-    for entry in fs::read_dir(&harness_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(s) = name.to_str() else { continue };
-        if !s.starts_with("staging-") {
-            continue;
-        }
-        let path = entry.path();
-        if fs::remove_dir_all(&path).is_ok() {
+    for parent in parents {
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(s) = name.to_str() else { continue };
+            if !s.starts_with("staging-") {
+                continue;
+            }
+
+            remove_staging_path(&entry.path())?;
             removed += 1;
         }
     }
 
     Ok(removed)
+}
+
+fn staging_parent_from_root(target_root: &Path, harness: Harness, item: MigrationItem) -> PathBuf {
+    let final_path = target_path_from_root(target_root, harness, item);
+    if item.merge == MergeKind::ChildUnion {
+        final_path
+    } else {
+        final_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| target_root.to_path_buf())
+    }
+}
+
+fn remove_staging_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn log_complete(log: &mut JsonLogger, started: SystemTime) {
@@ -656,9 +694,13 @@ fn read_json_string_array(path: &Path) -> io::Result<Vec<String>> {
 }
 
 fn target_path(args: &MigrationArgs, item: MigrationItem) -> PathBuf {
+    target_path_from_root(&args.to, args.harness, item)
+}
+
+fn target_path_from_root(target_root: &Path, harness: Harness, item: MigrationItem) -> PathBuf {
     match item.target {
-        TargetKind::Harness => args.to.join(args.harness.as_str()).join(item.name),
-        TargetKind::Root => args.to.join(item.name),
+        TargetKind::Harness => target_root.join(harness.as_str()).join(item.name),
+        TargetKind::Root => target_root.join(item.name),
     }
 }
 
@@ -744,6 +786,7 @@ fn free_bytes_at(_path: &Path) -> io::Result<u64> {
     Ok(u64::MAX)
 }
 
+#[cfg(unix)]
 fn existing_ancestor(path: &Path) -> &Path {
     let mut current = path;
     while !current.exists() {

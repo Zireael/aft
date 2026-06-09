@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 400;
 const MAX_JSON_FAILURES: usize = 20;
@@ -22,9 +22,68 @@ impl Compressor for PlaywrightCompressor {
         command_tokens(command).any(|token| token == "playwright")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_playwright(output)
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = compress_playwright(output);
+        if matches!(exit_code, Some(code) if code != 0) && is_success_summary(&compressed) {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed.into()
+        }
     }
+
+    fn matches_output(&self, output: &str) -> bool {
+        output
+            .lines()
+            .any(|line| is_playwright_running_signature(line.trim_start()))
+            || looks_like_playwright_json_output(output)
+    }
+}
+
+fn is_success_summary(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("playwright:")
+        || (lower.contains(" tests: ") && lower.contains(" passed") && lower.contains("0 failed"))
+}
+
+fn looks_like_playwright_json_output(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .is_some_and(|value| value.get("stats").is_some() && value.get("suites").is_some())
+}
+
+fn is_playwright_running_signature(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("Running ") else {
+        return false;
+    };
+    let mut parts = rest.split_whitespace();
+    let Some(test_count) = parts.next() else {
+        return false;
+    };
+    if test_count.parse::<usize>().is_err() {
+        return false;
+    }
+    if !matches!(parts.next(), Some("test" | "tests")) {
+        return false;
+    }
+    if parts.next() != Some("using") {
+        return false;
+    }
+    let Some(worker_count) = parts.next() else {
+        return false;
+    };
+    if worker_count.parse::<usize>().is_err() {
+        return false;
+    }
+    matches!(parts.next(), Some("worker" | "workers"))
 }
 
 fn compress_playwright(output: &str) -> String {
@@ -294,7 +353,7 @@ fn is_summary_line(trimmed: &str) -> bool {
 }
 
 fn parse_running_line(trimmed: &str) -> Option<(usize, Option<String>)> {
-    if !trimmed.starts_with("Running ") || !trimmed.contains(" tests") {
+    if !is_playwright_running_signature(trimmed) {
         return None;
     }
     let count = trimmed

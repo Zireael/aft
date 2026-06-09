@@ -1,9 +1,71 @@
-use serde_json::json;
+use std::fs;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 
 use super::helpers::AftProcess;
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
+}
+
+fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, storage: &Path) {
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-search-index-storage",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "search_index": true,
+            "semantic_search": false,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+}
+
+fn grep_marker(aft: &mut AftProcess, pattern: &str) -> Value {
+    aft.send(
+        &json!({
+            "id": "grep-marker",
+            "command": "grep",
+            "pattern": pattern,
+        })
+        .to_string(),
+    )
+}
+
+fn wait_for_ready_grep<F>(
+    aft: &mut AftProcess,
+    label: &str,
+    pattern: &str,
+    mut predicate: F,
+) -> Value
+where
+    F: FnMut(&Value) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_response = None;
+    while Instant::now() < deadline {
+        let response = grep_marker(aft, pattern);
+        assert_eq!(
+            response["success"], true,
+            "grep should succeed while waiting for {label}: {response:?}"
+        );
+        if response["index_status"] == "Ready" && predicate(&response) {
+            return response;
+        }
+        last_response = Some(response);
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!("timed out waiting for {label}; last response: {last_response:?}");
 }
 
 fn warning_with_kind<'a>(
@@ -55,6 +117,84 @@ fn configure_accepts_boolean_validate_on_edit() {
 }
 
 #[test]
+fn configure_rejects_nonpositive_semantic_max_files() {
+    for (id, max_files) in [
+        ("cfg-semantic-max-files-zero", json!(0)),
+        ("cfg-semantic-max-files-negative", json!(-1)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut aft = AftProcess::spawn();
+
+        let configure = aft.send(
+            &json!({
+                "id": id,
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": dir.path(),
+                "semantic": {
+                    "max_files": max_files,
+                },
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            configure["success"], false,
+            "configure should fail: {configure:?}"
+        );
+        assert_eq!(configure["code"], "invalid_request");
+        assert!(
+            configure["message"]
+                .as_str()
+                .unwrap()
+                .contains("semantic.max_files must be a positive integer"),
+            "unexpected error message: {configure:?}"
+        );
+
+        let shutdown = aft.shutdown();
+        assert!(shutdown.success());
+    }
+}
+
+#[test]
+fn configure_cold_reuse_rebuilds_search_index_when_ignore_rules_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/secret.rs"),
+        r#"fn secret() { println!("cold_ignore_marker"); }
+"#,
+    )
+    .unwrap();
+
+    let mut first = AftProcess::spawn();
+    configure_with_search_index_and_storage(&mut first, dir.path(), storage.path());
+    wait_for_ready_grep(
+        &mut first,
+        "initial cold indexed secret",
+        "cold_ignore_marker",
+        |response| response["total_matches"] == 1,
+    );
+    let shutdown = first.shutdown();
+    assert!(shutdown.success());
+
+    fs::write(dir.path().join(".aftignore"), "src/secret.rs\n").unwrap();
+
+    let mut second = AftProcess::spawn();
+    configure_with_search_index_and_storage(&mut second, dir.path(), storage.path());
+    wait_for_ready_grep(
+        &mut second,
+        "ignored secret after cold cache reuse",
+        "cold_ignore_marker",
+        |response| response["total_matches"] == 0,
+    );
+
+    let shutdown = second.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn configure_warnings_frame_after_main_response() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
@@ -88,14 +228,18 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
     std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
 
     let path = empty_path();
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
 
     let configure = aft.send(
         &json!({
             "id": "cfg-missing-format-check",
             "command": "configure",
             "harness": "opencode",
-            "project_root": dir.path()
+            "project_root": dir.path(),
+            "validate_on_edit": "syntax"
         })
         .to_string(),
     );
@@ -117,6 +261,45 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
     let checker = warning_with_kind(&configure, "checker_not_installed", "tool", "biome")
         .expect("missing checker warning");
     assert_eq!(checker["language"], "typescript");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
+fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
+    std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-no-format-warnings",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "format_on_edit": false,
+            "validate_on_edit": "off"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+    let configure = aft.merge_configure_warnings(configure);
+    assert!(
+        warning_with_kind(&configure, "formatter_not_installed", "tool", "biome").is_none(),
+        "format_on_edit:false should suppress formatter warnings: {configure:?}"
+    );
+    assert!(
+        warning_with_kind(&configure, "checker_not_installed", "tool", "biome").is_none(),
+        "validate_on_edit:off should suppress checker warnings: {configure:?}"
+    );
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
@@ -575,6 +758,8 @@ fn configure_rejects_malformed_lsp_servers() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
 
+    // A present-but-blank binary is a typo, not an intentional inherit
+    // (which is expressed by omitting the field), so it is still rejected.
     let configure = aft.send(
         &json!({
             "id": "cfg-lsp-bad",
@@ -583,8 +768,8 @@ fn configure_rejects_malformed_lsp_servers() {
             "project_root": dir.path(),
             "lsp_servers": [{
                 "id": "tinymist",
-                "extensions": [],
-                "binary": "tinymist"
+                "extensions": [".typ"],
+                "binary": "   "
             }]
         })
         .to_string(),
@@ -595,7 +780,38 @@ fn configure_rejects_malformed_lsp_servers() {
     assert!(configure["message"]
         .as_str()
         .unwrap()
-        .contains("extensions must not be empty"));
+        .contains("binary must not be empty"));
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+/// A partial override of a built-in server (omitting extensions/binary to
+/// inherit them) must be accepted — previously the whole `lsp` config section
+/// was silently dropped when these were required.
+#[test]
+fn configure_accepts_partial_builtin_lsp_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-lsp-partial",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "lsp_servers": [{
+                "id": "rust",
+                "args": ["--extra-flag"]
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "partial override should configure: {configure:#}"
+    );
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());

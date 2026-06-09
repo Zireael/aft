@@ -10,12 +10,11 @@ const z = tool.schema;
 
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePatterns,
   workspacePattern,
 } from "./permissions.js";
@@ -42,14 +41,26 @@ function extractHint(response: Record<string, unknown>): string | null {
   return typeof hint === "string" && hint.length > 0 ? hint : null;
 }
 
-async function checkAstPathsPermission(
+async function resolveAstPaths(
+  ctx: PluginContext,
   context: Parameters<ToolDefinition["execute"]>[1],
   paths: unknown,
-): Promise<string | undefined> {
-  if (!Array.isArray(paths)) return undefined;
-  const uniquePaths = Array.from(
-    new Set(paths.filter((p): p is string => typeof p === "string" && p.length > 0)),
+): Promise<string[] | undefined> {
+  if (isEmptyParam(paths) || !Array.isArray(paths)) return undefined;
+  const resolved = await Promise.all(
+    paths
+      .filter((p): p is string => typeof p === "string" && p.length > 0)
+      .map((p) => resolvePathArg(ctx, context, p)),
   );
+  return resolved.length > 0 ? resolved : undefined;
+}
+
+async function checkAstPathsPermission(
+  context: Parameters<ToolDefinition["execute"]>[1],
+  paths: string[] | undefined,
+): Promise<string | undefined> {
+  if (paths === undefined) return undefined;
+  const uniquePaths = Array.from(new Set(paths));
   for (const p of uniquePaths) {
     const denial = await assertExternalDirectoryPermission(context, p, { kind: "directory" });
     if (denial) return denial;
@@ -66,8 +77,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'\n\n" +
-      "Returns: Text summary — 'Found N match(es) across M file(s)' followed by file:line blocks with matched text and captured meta-variables.",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'",
     args: {
       pattern: z
         .string()
@@ -75,21 +85,24 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),
-      contextLines: z
-        .number()
-        .optional()
-        .describe("Number of context lines to show around each match"),
+      contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "Number of context lines to show around each match",
+      ),
     },
     execute: async (args, context): Promise<string> => {
-      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      const paths = await resolveAstPaths(ctx, context, args.paths);
+      const externalDenied = await checkAstPathsPermission(context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       const params: Record<string, unknown> = {
         pattern: args.pattern,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam so empty arrays ([]) sent by GPT-family models don't
+      // get forwarded to Rust as "scope present" — let Rust default to whole
+      // project_root instead of round-tripping a useless empty scope.
+      if (!isEmptyParam(paths)) params.paths = paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       if (args.contextLines !== undefined) params.context = Number(args.contextLines);
       const response = await callBridge(ctx, context, "ast_search", params);
 
@@ -172,8 +185,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
-      "**Warning: This tool modifies files directly.** Use dryRun=true to preview. Consider creating an aft_safety checkpoint before bulk replacements.\n\n" +
-      "Returns: Text summary — 'Replaced N match(es) across M file(s)' (or '[DRY RUN] Would replace...') followed by per-file output. In dry-run mode, each file is shown with its unified diff so you can verify the rewrite before applying (e.g. catch literal $$$ from anonymous-variadic typos). Diff preview is capped at 8KB total; remaining files are summarized.",
+      "**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
     args: {
       pattern: z
         .string()
@@ -186,36 +198,29 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
     execute: async (args, context): Promise<string> => {
       const isDryRun = args.dryRun === true;
+      const paths = await resolveAstPaths(ctx, context, args.paths);
 
-      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      const externalDenied = await checkAstPathsPermission(context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       if (!isDryRun) {
-        const paths = Array.isArray(args.paths) ? (args.paths as string[]) : ["."];
         // External-directory check first (mirrors opencode-native grep/glob directory checks).
         if (!Array.isArray(args.paths)) {
-          const asked = new Set<string>();
-          for (const targetPath of paths) {
-            const absPath = resolveAbsolutePath(context, targetPath);
-            if (asked.has(absPath)) continue;
-            asked.add(absPath);
-            const denial = await assertExternalDirectoryPermission(context, absPath, {
-              kind: "directory",
-            });
-            if (denial) return permissionDeniedResponse(denial);
-          }
+          const targetPath = await resolvePathArg(ctx, context, ".");
+          const denial = await assertExternalDirectoryPermission(context, targetPath, {
+            kind: "directory",
+          });
+          if (denial) return permissionDeniedResponse(denial);
         }
 
-        const explicitPaths = Array.isArray(args.paths)
-          ? resolveRelativePatterns(context, args.paths as string[])
-          : [];
+        const explicitPaths = paths !== undefined ? resolveRelativePatterns(context, paths) : [];
         const positiveGlobs = Array.isArray(args.globs)
           ? (args.globs as string[]).filter((glob) => !glob.startsWith("!"))
           : [];
         const patterns = [...explicitPaths, ...positiveGlobs];
         const metadata =
-          explicitPaths.length === 1 && positiveGlobs.length === 0 && Array.isArray(args.paths)
-            ? { filepath: resolveAbsolutePath(context, (args.paths as string[])[0] as string) }
+          explicitPaths.length === 1 && positiveGlobs.length === 0 && paths !== undefined
+            ? { filepath: paths[0] }
             : {};
         const permissionError = await askEditPermission(
           context,
@@ -232,8 +237,9 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         rewrite: args.rewrite,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam — see ast_search above for rationale.
+      if (!isEmptyParam(paths)) params.paths = paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       params.dry_run = args.dryRun === true;
       const response = await callBridge(ctx, context, "ast_replace", params);
 

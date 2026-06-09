@@ -1,0 +1,63 @@
+{
+  "name": "aft",
+  "description": "Supplemental AFT-native cases for tool-surface coverage beyond CodeGraph's searchNodes/findRelevantContext corpus.",
+  "source": "opencode-aft local symbols",
+  "cases": [
+    {
+      "id": "aft-outline-bridge-file",
+      "query": "Outline BinaryBridge file",
+      "api": "findRelevantContext",
+      "tool": "aft_outline",
+      "expectedSymbols": [
+        "tagStderrLine",
+        "compareSemver",
+        "BridgeOptions"
+      ],
+      "expectedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "category": "outline",
+      "options": {
+        "file": "packages/aft-bridge/src/bridge.ts"
+      },
+      "notes": "AFT-specific outline coverage for top-level symbols in a single TypeScript file."
+    },
+    {
+      "id": "aft-zoom-semantic-tool",
+      "query": "Zoom semanticTools implementation",
+      "api": "findRelevantContext",
+      "tool": "aft_zoom",
+      "expectedSymbols": [
+        "semanticTools"
+      ],
+      "expectedFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts"
+      ],
+      "category": "zoom",
+      "options": {
+        "file": "packages/opencode-plugin/src/tools/semantic.ts",
+        "symbol": "semanticTools",
+        "contextLines": 2
+      },
+      "notes": "AFT-specific source-inspection coverage."
+    },
+    {
+      "id": "aft-navigate-callers",
+      "query": "Who calls handle_semantic_search",
+      "api": "findRelevantContext",
+      "tool": "aft_navigate",
+      "expectedSymbols": [],
+      "expectedFiles": [
+        "crates/aft/src/commands/semantic_search.rs"
+      ],
+      "category": "navigate",
+      "options": {
+        "op": "callers",
+        "file": "crates/aft/src/commands/semantic_search.rs",
+        "symbol": "handle_semantic_search",
+        "depth": 1
+      },
+      "notes": "AFT-specific navigation coverage; scored by expected file because callers output is relationship text rather than the anchor symbol itself."
+    }
+  ]
+}

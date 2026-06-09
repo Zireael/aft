@@ -9,7 +9,7 @@ import { registerAstTools } from "../tools/ast.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 describe("AST tool adapters", () => {
-  test("ast_grep_search maps contextLines to context_lines and preserves globs", async () => {
+  test("ast_grep_search maps contextLines to the `context` key Rust reads, and preserves globs", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "Found 0 matches" }));
     registerAstTools(api, makePluginContext(bridge), { astSearch: true, astReplace: true });
@@ -23,12 +23,14 @@ describe("AST tool adapters", () => {
     });
 
     expect(calls[0].command).toBe("ast_search");
+    // Rust ast_search reads `context`, not `context_lines`; sending the wrong
+    // key silently dropped the requested context.
     expect(calls[0].params).toEqual({
       pattern: "console.log($MSG)",
       lang: "typescript",
       paths: ["src"],
       globs: ["**/*.ts", "!dist/**"],
-      context_lines: 3,
+      context: 3,
     });
   });
 

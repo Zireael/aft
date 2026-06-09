@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import {
+  type BinaryBridge,
+  markAnnouncementSeen,
+  shouldShowAnnouncement,
+} from "@cortexkit/aft-bridge";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
@@ -46,16 +48,34 @@ function sendIgnoredMessage(client: unknown, sessionId: string, text: string): b
   }
 }
 
+/**
+ * Reads the persisted `warned_tools` dedup map.
+ *
+ * Returns `null` when the state could NOT be read (bridge not configured yet /
+ * RPC error) — distinct from `{}` which means "read succeeded, nothing recorded
+ * yet". The caller must treat `null` as "unknown" and NOT as "never warned":
+ * conflating the two re-fired the same `lsp_binary_missing` warning on every
+ * session, because a read that raced the not-configured window returned `{}`,
+ * the gate read "never warned", and the warning was delivered again.
+ *
+ * A read that SUCCEEDS but returns a malformed/corrupt value is treated as a
+ * recoverable empty `{}` (deliver once, then recordWarning overwrites the bad
+ * value) — only a genuine read failure is `null`.
+ */
 async function readWarnedTools(
   bridge: Pick<BinaryBridge, "send">,
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
+  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
   try {
-    const resp = await bridge.send("db_get_state", { key: "warned_tools" });
-    if (resp.success === false) return {};
+    resp = await bridge.send("db_get_state", { key: "warned_tools" });
+  } catch {
+    return null;
+  }
+  if (resp.success === false) return null;
 
-    const value = (resp.data as { value?: unknown } | undefined)?.value;
-    if (typeof value !== "string") return {};
-
+  const value = (resp.data as { value?: unknown } | undefined)?.value;
+  if (typeof value !== "string") return {};
+  try {
     const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
@@ -64,13 +84,25 @@ async function readWarnedTools(
   }
 }
 
-async function hasWarnedFor(bridge: Pick<BinaryBridge, "send">, key: string): Promise<boolean> {
+/**
+ * Tri-state dedup check:
+ *   - "warned": key recorded — skip.
+ *   - "fresh": state read OK, key absent — deliver + record.
+ *   - "unknown": state unreadable — do NOT deliver (can't dedup); a later
+ *     configured call delivers once.
+ */
+async function warnedStatus(
+  bridge: Pick<BinaryBridge, "send">,
+  key: string,
+): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
-  return warned[key] === true || typeof warned[key] === "string";
+  if (warned === null) return "unknown";
+  return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
 async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
   const warned = await readWarnedTools(bridge);
+  if (warned === null) return;
   warned[key] = true;
 
   try {
@@ -133,7 +165,10 @@ export async function deliverConfigureWarnings(
   // add a bridge-side atomic update command rather than reviving file locks.
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
-    if (await hasWarnedFor(opts.bridge, key)) continue;
+    // "warned" → already shown once; "unknown" → dedup state unreadable
+    // (bridge not configured yet), so do NOT deliver — delivering on unknown
+    // is what re-fired the warning every session. Only "fresh" delivers.
+    if ((await warnedStatus(opts.bridge, key)) !== "fresh") continue;
 
     if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
 
@@ -147,21 +182,11 @@ export function sendFeatureAnnouncement(
   footer: string,
   storageDir: string,
 ): void {
-  // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-  // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-  // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-  // spawn at every plugin init. Deferred to a future version that decides whether
-  // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-  // other writer; this file stays in sync via direct legacy-file writes.
-  const versionFile = join(storageDir, "last_announced_version");
-  try {
-    if (existsSync(versionFile)) {
-      const lastVersion = readFileSync(versionFile, "utf-8").trim();
-      if (lastVersion === version) return;
-    }
-  } catch {
-    // ignore read errors — proceed with announcement
-  }
+  // shouldShowAnnouncement silently seeds the marker on first-install /
+  // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't get
+  // changelog bullets spammed on every boot (per magic-context#99). Real
+  // upgrades from a persisted older version still surface here.
+  if (!shouldShowAnnouncement(storageDir, "pi", version)) return;
 
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
@@ -175,10 +200,5 @@ export function sendFeatureAnnouncement(
   }
   log(sections.join("\n"));
 
-  try {
-    mkdirSync(storageDir, { recursive: true });
-    writeFileSync(versionFile, version);
-  } catch {
-    // best-effort
-  }
+  markAnnouncementSeen(storageDir, "pi", version);
 }

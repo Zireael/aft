@@ -2,12 +2,11 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePattern,
   resolveRelativePatterns,
   workspacePattern,
@@ -29,8 +28,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, both inclusive). Supports TS/JS/TSX and Python.\n" +
         "- 'inline': Replace a function call with the function's body, substituting args for params. Requires 'symbol', 'callSiteLine' (1-based). Validates single-return constraint.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
-        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.\n\n" +
-        "Returns: move { ok, files_modified, consumers_updated, checkpoint_name, results }. extract returns { file, name, parameters, return_type, syntax_valid, formatted, ... }. inline returns { file, symbol, call_context, substitutions, conflicts, syntax_valid, formatted, ... }.",
+        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
@@ -55,30 +53,33 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           ),
         // extract
         name: z.string().optional().describe("New function name — required for 'extract' op"),
-        startLine: z.number().optional().describe("1-based start line — required for 'extract' op"),
+        startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+          "1-based start line — required for 'extract' op",
+        ),
         // endLine is inclusive from the agent's perspective; the execute function adds +1
         // because the Rust backend expects exclusive end. This is intentional — do not document.
-        endLine: z
-          .number()
-          .optional()
-          .describe("1-based end line (inclusive) — required for 'extract' op"),
+        endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+          "1-based end line (inclusive) — required for 'extract' op",
+        ),
         // inline
-        callSiteLine: z
-          .number()
-          .optional()
-          .describe("1-based call site line — required for 'inline' op"),
+        callSiteLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+          "1-based call site line — required for 'inline' op",
+        ),
       },
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
 
-        if ((op === "move" || op === "inline") && typeof args.symbol !== "string") {
+        // Use isEmptyParam so empty strings (GPT-family models send "" for omitted
+        // required string params) trigger the proper "required" error instead of
+        // being silently accepted as a string and crashing downstream.
+        if ((op === "move" || op === "inline") && isEmptyParam(args.symbol)) {
           throw new Error(`'symbol' is required for '${op}' op`);
         }
-        if (op === "move" && typeof args.destination !== "string") {
+        if (op === "move" && isEmptyParam(args.destination)) {
           throw new Error("'destination' is required for 'move' op");
         }
         if (op === "extract") {
-          if (typeof args.name !== "string") throw new Error("'name' is required for 'extract' op");
+          if (isEmptyParam(args.name)) throw new Error("'name' is required for 'extract' op");
           if (args.startLine === undefined)
             throw new Error("'startLine' is required for 'extract' op");
           if (args.endLine === undefined) throw new Error("'endLine' is required for 'extract' op");
@@ -87,23 +88,25 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           throw new Error("'callSiteLine' is required for 'inline' op");
         }
 
-        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
+        const destination =
+          op === "move"
+            ? await resolvePathArg(ctx, context, args.destination as string)
+            : undefined;
         const patterns =
           op === "move"
             ? resolveRelativePatterns(context, [
                 workspacePattern(context),
-                args.filePath as string,
-                ...(typeof args.destination === "string" ? [args.destination] : []),
+                filePath,
+                ...(destination !== undefined ? [destination] : []),
               ])
-            : [resolveRelativePattern(context, args.filePath as string)];
+            : [resolveRelativePattern(context, filePath)];
         const metadata = patterns.length === 1 ? { filepath: filePath } : {};
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
           const affectedPaths =
-            op === "move" && typeof args.destination === "string"
-              ? [filePath, resolveAbsolutePath(context, args.destination)]
-              : [filePath];
+            op === "move" && destination !== undefined ? [filePath, destination] : [filePath];
           const asked = new Set<string>();
           for (const affectedPath of affectedPaths) {
             if (asked.has(affectedPath)) continue;
@@ -121,12 +124,12 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           extract: "extract_function",
           inline: "inline_symbol",
         };
-        const params: Record<string, unknown> = { file: args.filePath };
+        const params: Record<string, unknown> = { file: filePath };
 
         switch (op) {
           case "move":
             params.symbol = args.symbol;
-            params.destination = args.destination;
+            params.destination = destination;
             if (args.scope !== undefined) params.scope = args.scope;
             break;
           case "extract":

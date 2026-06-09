@@ -34,20 +34,11 @@ pub fn insert_compression_event(
 ) -> rusqlite::Result<()> {
     conn.execute(
         r#"
-        INSERT INTO compression_events (
+        INSERT OR IGNORE INTO compression_events (
             harness, session_id, project_key, tool, task_id, command, compressor,
             original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
         )
-        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM compression_events
-            WHERE harness = ?1
-              AND session_id IS ?2
-              AND task_id IS ?5
-              AND tool = ?4
-            LIMIT 1
-        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
         params![
             row.harness,
@@ -116,4 +107,53 @@ pub fn aggregate_for_session(
             })
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn duplicate_identity_is_ignored_without_cross_project_suppression() {
+        let dir = tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("aft.db")).expect("open db");
+
+        insert_compression_event(&conn, &row("project-a", 100, 40, 1)).expect("insert first");
+        insert_compression_event(&conn, &row("project-a", 900, 10, 2)).expect("ignore duplicate");
+        insert_compression_event(&conn, &row("project-b", 200, 80, 3))
+            .expect("insert same task id for other project");
+
+        let project_a = aggregate_for_project(&conn, "opencode", "project-a").unwrap();
+        assert_eq!(project_a.events, 1);
+        assert_eq!(project_a.original_tokens, 100);
+        assert_eq!(project_a.compressed_tokens, 40);
+
+        let project_b = aggregate_for_project(&conn, "opencode", "project-b").unwrap();
+        assert_eq!(project_b.events, 1);
+        assert_eq!(project_b.original_tokens, 200);
+        assert_eq!(project_b.compressed_tokens, 80);
+    }
+
+    fn row(
+        project_key: &'static str,
+        original_tokens: u32,
+        compressed_tokens: u32,
+        created_at: i64,
+    ) -> CompressionEventRow<'static> {
+        CompressionEventRow {
+            harness: "opencode",
+            session_id: Some("session-1"),
+            project_key,
+            tool: "bash",
+            task_id: Some("task-1"),
+            command: Some("echo ok"),
+            compressor: "zstd",
+            original_bytes: original_tokens as i64 * 4,
+            compressed_bytes: compressed_tokens as i64 * 4,
+            original_tokens,
+            compressed_tokens,
+            created_at,
+        }
+    }
 }

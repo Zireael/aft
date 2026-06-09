@@ -19,6 +19,8 @@ export interface WorkflowHintsOpts {
   semanticEnabled: boolean;
   /** `experimental.bash.background` — gates background-bash paragraph. */
   bashBackgroundEnabled: boolean;
+  /** Resolved bash compression flag. */
+  bashCompressionEnabled: boolean;
   /** Set of disabled tool names (after surface filtering). */
   disabledTools: Set<string>;
 }
@@ -47,37 +49,68 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasGrep = opts.toolSurface !== "minimal" && !opts.disabledTools.has(grepName);
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.disabledTools.has("aft_search");
-  // aft_navigate is "all"-tier only.
-  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_navigate");
+  // aft_callgraph is "all"-tier only.
+  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_callgraph");
+  const hasInspect = opts.toolSurface !== "minimal" && !opts.disabledTools.has("aft_inspect");
   const hasBash = !opts.disabledTools.has(bashName);
   const hasBgBash =
     hasBash && opts.bashBackgroundEnabled && !opts.disabledTools.has(bashStatusName);
 
+  if (hasBash && opts.bashCompressionEnabled) {
+    sections.push(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail (e.g. `bun test | grep fail`) to summarize. The compressor already keeps failures and the summary; piping hides failures. Run the command bare.",
+    );
+  }
+
   // Web/URL access — needs aft_outline + aft_zoom.
   if (hasOutline && hasZoom) {
     sections.push(
-      `**Web/URL access**: \`aft_outline({ url })\` first for structure, then \`aft_zoom({ url, symbol: "<heading>" })\` for the specific section.`,
+      `**Web/URL access**: \`aft_outline({ target: url })\` first for structure, then \`aft_zoom({ url, symbols: "<heading>" })\` for the specific section.`,
     );
   }
 
   // Code exploration — needs at least aft_outline + aft_zoom + (grep or aft_search).
+  // Lead with the two behaviors agents reliably get wrong: serializing
+  // independent lookups, and shelling out to grep for code search. Both are
+  // stated imperatively (DO NOT) because soft "prefer" wording does not change
+  // the reflex. When aft_search is available it is named alone — it auto-routes
+  // literals too, so naming the grep tool would only dilute the redirect; only
+  // when aft_search is absent do we point at the grep TOOL as the indexed,
+  // ranked alternative to raw bash grep.
   if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
-    const locator = hasGrep ? `\`${grepName}\`` : "`aft_search`";
+    const locate = hasSearch
+      ? '`aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals (pass `hint: "regex"`/`"literal"`/`"semantic"` to force a lane).'
+      : `\`${grepName}\` (the tool — indexed and ranked) locates code.`;
     sections.push(
-      hasGrep && hasSearch
-        ? `**Code exploration**: For exact identifiers (\`useState\`, function names, env vars), error messages, or path-shaped queries → \`${grepName}\` first. For broad concepts ('where is X handled', 'how does Y work') → \`aft_search\`. Then use \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`
-        : `**Code exploration**: ${locator} to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
+      `**Code exploration**: fire independent lookups in ONE parallel tool-call wave — do NOT serialize them. ${locate} Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\` through \`bash\` to locate code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes).`,
     );
   }
 
-  // Relationship questions — needs aft_navigate ("all" surface).
+  // Codebase health & diagnostics — needs aft_inspect (recommended+).
+  // Lead with the behavioral change: AFT no longer auto-surfaces compile/type
+  // errors on edit, so the agent MUST pull them. Anchor to the edit→test/commit
+  // moment, and be explicit that aft_inspect diagnostics are a checkpoint, not
+  // the authority (the project checker is).
+  if (hasInspect) {
+    sections.push(
+      "**Codebase health & diagnostics**: AFT does not surface compile/type errors automatically after edits — pull them with `aft_inspect`. Run it after a batch of edits and before you run tests or commit, when starting in unfamiliar code, or before a refactor/review. One call summarizes diagnostics (compile/type errors), TODOs, metrics, dead code, unused exports, and duplicates; pass `sections` for focused drill-down and `scope` to actively pull diagnostics for a specific file or directory. Its diagnostics are a fast checkpoint, not the authority — a clean `tsc` / `cargo check` / `pyright` run is the real gate. Treat `stale_categories` as a genuine stale-cache signal while an async Tier 2 refresh catches up.",
+    );
+    // Status-bar legend — taught once here so the per-call bar is just compact
+    // values (~18 tokens). The bar is appended to tool results on change.
+    sections.push(
+      "**AFT status bar**: tool results may end with a one-line health bar `[AFT E<errors> W<warnings> | D<dead-code> U<unused-exports> C<clone/dup-groups> | T<todos>]` — an IDE-style glance that appears when a count changes. `E`/`W` are live LSP diagnostics for files touched this session (your universal compile-error signal across every language with an LSP). A `~` before `D` means the dead-code/unused/dup counts predate your latest edit — run `aft_inspect` for current numbers and detail. When `E>0`, you likely just introduced errors; investigate before moving on.",
+    );
+  }
+
+  // Relationship questions — needs aft_callgraph ("all" surface).
   if (hasNavigate) {
     sections.push(
       [
-        "Use `aft_navigate` instead of grep + read chains for relationship questions:",
+        "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
         "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",
+        "- `trace_to_symbol` — shortest call path from one symbol to another",
         "- `trace_data` — follow a value through assignments and parameters across files",
       ].join("\n"),
     );
@@ -89,7 +122,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // there's no "30s default" to warn about anymore.
   if (hasBash && hasBgBash) {
     sections.push(
-      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`taskId\`. A completion reminder is delivered automatically — do not poll \`${bashStatusName}({ taskId })\`. Use \`${bashStatusName}\` only after the reminder arrives, or to inspect a task you already know is complete.`,
+      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`taskId\`, then **end your turn** — a completion reminder arrives automatically when it finishes. Do not poll \`${bashStatusName}({ taskId })\`, and do not sync-wait with \`bash_watch\` for a long task: blocking freezes your turn and locks the user out until it ends. For an early non-blocking ping on a specific output line, register an async watch \`bash_watch({ taskId, pattern, background: true })\`. \`bash_watch\` synchronous mode is only for short bounded waits (seconds, e.g. a dev server printing a readiness line), never for multi-minute jobs.`,
     );
     sections.push(
       `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`${bashStatusName}({ taskId, outputMode: "screen" })\`, and send input with \`${bashWriteName}({ taskId, input: "..." })\`.`,
@@ -99,6 +132,14 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   if (sections.length === 0) {
     return null;
   }
+
+  // Parallel-tool-call discipline frames the whole block: the single biggest
+  // efficiency win is firing independent read-only calls together rather than
+  // one-at-a-time. Prepended so it leads, and only when there's real content
+  // below it (never emitted alone).
+  sections.unshift(
+    "**Parallel tool calls**: when several read-only operations are independent, emit them in ONE response instead of serializing — file reads, structure and symbol lookups, code search, diagnostics, and git status/diff/log. Sequence only when a call depends on a prior result or when a command mutates state.",
+  );
 
   return `${HEADING}\n\n${sections.join("\n\n")}`;
 }
@@ -117,6 +158,7 @@ export function buildHintsFromConfig(config: AftConfig, disabledTools: Set<strin
     hoistBuiltins: config.hoist_builtin_tools !== false,
     semanticEnabled: config.semantic_search === true,
     bashBackgroundEnabled: resolveBashConfig(config).background,
+    bashCompressionEnabled: resolveBashConfig(config).compress,
     disabledTools,
   });
 }

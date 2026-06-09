@@ -1,7 +1,7 @@
 //! Integration tests for the `move_file` command, focused on error-message
 //! quality (BUG-7 from the dogfooding triage).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,18 @@ fn fake_server_path() -> PathBuf {
         .expect("fake-lsp-server binary path not set")
 }
 
-fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_json::Value> {
+fn watched_file_change_count(events: &[serde_json::Value]) -> usize {
+    events
+        .iter()
+        .filter_map(|event| event["changes"].as_array())
+        .map(Vec::len)
+        .sum()
+}
+
+fn collect_watched_file_events(
+    ctx: &AppContext,
+    expected_changes: usize,
+) -> Vec<serde_json::Value> {
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -50,7 +61,7 @@ fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_j
             if let LspEvent::Notification { method, params, .. } = event {
                 if method == "custom/watchedFilesChanged" {
                     collected.push(params.expect("watched event params"));
-                    if collected.len() == expected {
+                    if watched_file_change_count(&collected) >= expected_changes {
                         return collected;
                     }
                 }
@@ -58,27 +69,20 @@ fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_j
         }
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(
-        !collected.is_empty(),
-        "timed out waiting for watched-file notification"
+
+    let actual_changes = watched_file_change_count(&collected);
+    panic!(
+        "timed out waiting for {expected_changes} watched-file changes; saw {actual_changes}: {collected:?}"
     );
-    collected
 }
 
-fn wait_for_publish(ctx: &AppContext) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        for event in ctx.lsp().drain_events() {
-            if matches!(
-                event,
-                LspEvent::Notification { method, .. } if method == "textDocument/publishDiagnostics"
-            ) {
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for publishDiagnostics");
+fn notify_and_wait_for_publish(ctx: &AppContext, file_path: &Path, content: &str) {
+    let outcome =
+        ctx.lsp_notify_and_collect_diagnostics(file_path, content, Duration::from_secs(2));
+    assert!(
+        outcome.complete(),
+        "timed out waiting for publishDiagnostics: {outcome:?}"
+    );
 }
 
 #[test]
@@ -101,8 +105,7 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
     );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(&source, "export const open = 2;\n");
-    wait_for_publish(&ctx);
+    notify_and_wait_for_publish(&ctx, &source, "export const open = 2;\n");
 
     let req: RawRequest = serde_json::from_value(json!({
         "id": "move-tsconfig",
@@ -174,10 +177,71 @@ fn undo_after_move_file_restores_source_and_removes_destination() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn undo_after_move_file_restores_symlink_source_and_removes_destination() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    let target = root.join("target.txt");
+    let source = root.join("before-link.txt");
+    let destination = root.join("nested").join("after-link.txt");
+    std::fs::write(&target, "target contents\n").expect("write target");
+    std::os::unix::fs::symlink(&target, &source).expect("create source symlink");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, root);
+
+    let move_resp = send(
+        &mut aft,
+        json!({
+            "id": "move-symlink-before-undo",
+            "command": "move_file",
+            "file": source.display().to_string(),
+            "destination": destination.display().to_string(),
+        }),
+    );
+    assert_eq!(move_resp["success"], true, "move failed: {move_resp:?}");
+    assert!(!source.exists(), "source symlink should be moved away");
+    assert!(
+        std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "destination should be the moved symlink"
+    );
+
+    let undo = send(
+        &mut aft,
+        json!({
+            "id": "undo-symlink-move-operation",
+            "command": "undo",
+        }),
+    );
+    assert_eq!(undo["success"], true, "undo failed: {undo:?}");
+    assert!(
+        std::fs::symlink_metadata(&source)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "source should be restored as a symlink"
+    );
+    assert_eq!(std::fs::read_link(&source).unwrap(), target);
+    assert!(
+        !destination.exists(),
+        "destination symlink should be removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "target contents\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
-    super::helpers::skip_if_root();
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -200,16 +264,17 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
         .expect("make source parent undeletable");
 
     let mut aft = AftProcess::spawn();
-    configure(&mut aft, Path::new("/"));
+    configure(&mut aft, src_tmp.path());
 
-    let resp = send(
-        &mut aft,
-        json!({
+    let resp = aft.send_with_timeout(
+        &json!({
             "id": "move-partial-delete",
             "command": "move_file",
             "file": src_path.display().to_string(),
             "destination": dst_path.display().to_string(),
-        }),
+        })
+        .to_string(),
+        std::time::Duration::from_secs(120),
     );
 
     std::fs::set_permissions(src_parent, std::fs::Permissions::from_mode(original_mode))

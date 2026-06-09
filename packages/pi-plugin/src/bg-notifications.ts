@@ -22,6 +22,19 @@ export interface BgCompletion {
   output_path?: string;
 }
 
+export interface PatternMatchEntry {
+  task_id: string;
+  session_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+  reason?: "pattern_match" | "task_exit";
+  /** Ack the underlying bash completion after this task-exit reminder is delivered. */
+  ackCompletionOnDelivery?: boolean;
+}
+
 export interface BgLongRunningReminder {
   task_id: string;
   session_id: string;
@@ -34,6 +47,8 @@ type SessionBgState = {
   outstandingTaskIds: Set<string>;
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
+  pendingPatternMatches: PatternMatchEntry[];
+  explicitControlTasks: Set<string>;
   debounceTimer: NodeJS.Timeout | null;
   firstCompletionAt: number | null;
   scheduledFireAt: number | null;
@@ -43,6 +58,12 @@ type SessionBgState = {
   wakeHardStopped: boolean;
   forcedDrainCompleted: boolean;
   unknownCompletions: Array<{ completion: BgCompletion; receivedAt: number }>;
+  /**
+   * Task IDs spawned since the last session idle boundary. Push completions
+   * for these tasks stay pending but do not send an immediate follow-up;
+   * sync bash_watch may still consume them inline in the same turn.
+   */
+  wakeDeferredTaskIds: Set<string>;
   /**
    * Task IDs whose completions were consumed inline by an explicit
    * `bash_status({ exit: true, ... })` wait. The bash_completed push
@@ -96,6 +117,7 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // to drop it. Mirrors the OpenCode fix.
   const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  state.wakeDeferredTaskIds.delete(taskId);
   if (!state.consumedTaskIds.has(taskId)) {
     state.consumedTaskIds.add(taskId);
     state.consumedTaskOrder.push(taskId);
@@ -105,17 +127,16 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
     }
   }
   // Cancel any pending debounced wake when nothing's left to deliver.
-  if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.debounceTimer
-  ) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
+}
+
+export async function markBgCompletionDelivered(
+  drainContext: DrainContext,
+  taskId: string,
+): Promise<void> {
+  await ackCompletions(drainContext, [
+    { task_id: taskId, status: "unknown", exit_code: null, command: "" },
+  ]);
 }
 
 /**
@@ -124,25 +145,19 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
  */
 export function markTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
-  if (state.consumedTaskIds.has(taskId)) return;
+  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  state.wakeDeferredTaskIds.delete(taskId);
+  if (state.consumedTaskIds.has(taskId)) {
+    clearWakeTimerIfNoPending(state);
+    return;
+  }
   state.consumedTaskIds.add(taskId);
   state.consumedTaskOrder.push(taskId);
   while (state.consumedTaskOrder.length > CONSUMED_TASKIDS_CAP) {
     const evicted = state.consumedTaskOrder.shift();
     if (evicted !== undefined) state.consumedTaskIds.delete(evicted);
   }
-  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
-  if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.debounceTimer
-  ) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
 }
 
 /**
@@ -152,6 +167,7 @@ export function markTaskWaiting(sessionID: string | undefined, taskId: string): 
  */
 export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
+  state.wakeDeferredTaskIds.delete(taskId);
   if (!state.consumedTaskIds.has(taskId)) return;
   state.consumedTaskIds.delete(taskId);
   const idx = state.consumedTaskOrder.indexOf(taskId);
@@ -160,6 +176,7 @@ export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string)
 
 export function trackBgTask(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
+  state.wakeDeferredTaskIds.add(taskId);
   pruneUnknownCompletions(state, Date.now());
   const buffered = state.unknownCompletions.filter((entry) => entry.completion.task_id === taskId);
   state.unknownCompletions = state.unknownCompletions.filter(
@@ -174,6 +191,78 @@ export function trackBgTask(sessionID: string | undefined, taskId: string): void
     return;
   }
   state.outstandingTaskIds.add(taskId);
+}
+
+export function markExplicitControl(
+  sessionID: string | undefined,
+  taskId: string,
+  trackOutstanding = true,
+): void {
+  const state = stateFor(sessionID);
+  state.explicitControlTasks.add(taskId);
+  if (trackOutstanding) state.outstandingTaskIds.add(taskId);
+  // If a push completion already landed for this task before bash_watch
+  // could register the explicit control marker, move it from the default
+  // pendingCompletions queue (which renders as "[BACKGROUND BASH COMPLETED]")
+  // to pendingPatternMatches (which renders as "[BG BASH NOTIFY] task_exit").
+  // Without this, both reminders fire because the in-turn-append path drains
+  // pendingCompletions regardless of wakeDeferredTaskIds filtering.
+  const idx = state.pendingCompletions.findIndex((c) => c.task_id === taskId);
+  if (idx >= 0) {
+    const completion = state.pendingCompletions[idx];
+    state.pendingCompletions.splice(idx, 1);
+    queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+    state.wakeDeferredTaskIds.delete(taskId);
+  }
+}
+
+export function unmarkExplicitControl(sessionID: string | undefined, taskId: string): void {
+  stateFor(sessionID).explicitControlTasks.delete(taskId);
+}
+
+function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntry): void {
+  const normalized: PatternMatchEntry = entry.reason
+    ? entry
+    : { ...entry, reason: "pattern_match" };
+  const existingIdx = state.pendingPatternMatches.findIndex(
+    (match) => match.task_id === normalized.task_id,
+  );
+  if (existingIdx >= 0) {
+    const existing = state.pendingPatternMatches[existingIdx];
+    if (existing.reason !== "pattern_match" && normalized.reason === "pattern_match") {
+      state.pendingPatternMatches[existingIdx] = normalized;
+    }
+    return;
+  }
+  state.pendingPatternMatches.push(normalized);
+}
+
+function routeExplicitControlCompletions(state: SessionBgState): void {
+  if (state.pendingCompletions.length === 0) return;
+  const remaining: BgCompletion[] = [];
+  for (const completion of state.pendingCompletions) {
+    if (
+      state.explicitControlTasks.has(completion.task_id) ||
+      state.pendingPatternMatches.some((match) => match.task_id === completion.task_id)
+    ) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      state.explicitControlTasks.delete(completion.task_id);
+      state.wakeDeferredTaskIds.delete(completion.task_id);
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+    } else {
+      remaining.push(completion);
+    }
+  }
+  state.pendingCompletions = remaining;
+}
+
+export async function handlePushedPatternMatch(
+  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+  frame: PatternMatchEntry,
+): Promise<void> {
+  const state = stateFor(drainContext.sessionID);
+  queuePendingPatternMatch(state, frame);
+  await triggerWakeIfPending(drainContext, true);
 }
 
 export function ingestBgCompletions(
@@ -191,6 +280,12 @@ export function ingestBgCompletions(
     // tracking stays accurate. See `consumeBgCompletion` for context.
     if (state.consumedTaskIds.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
+      continue;
+    }
+    if (state.explicitControlTasks.has(completion.task_id)) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      state.explicitControlTasks.delete(completion.task_id);
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
       continue;
     }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
@@ -214,7 +309,7 @@ export async function handlePushedBgCompletion(
   completion: unknown,
 ): Promise<void> {
   ingestBgCompletions(drainContext.sessionID, [completion]);
-  await triggerWakeIfPending(drainContext, true);
+  await triggerWakeIfPending(drainContext, true, false);
 }
 
 export async function handlePushedBgLongRunning(
@@ -233,65 +328,82 @@ export async function appendToolResultBgCompletions(
   if (
     state.outstandingTaskIds.size === 0 &&
     state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
   )
     await drainCompletions(drainContext);
   if (
     state.outstandingTaskIds.size === 0 &&
     state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
   )
     return undefined;
 
   if (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0)
+  routeExplicitControlCompletions(state);
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
+  )
     return undefined;
 
   const deliveredCompletions = [...state.pendingCompletions];
-  const reminder = formatCombinedSystemReminder(state.pendingCompletions, state.pendingLongRunning);
+  const deliveredPatternMatches = [...state.pendingPatternMatches];
+  const completionAcks = completionAcksForDelivery(deliveredCompletions, deliveredPatternMatches);
+  const reminder = formatCombinedSystemReminder(
+    state.pendingCompletions,
+    state.pendingLongRunning,
+    state.pendingPatternMatches,
+  );
   state.pendingCompletions = [];
+  for (const completion of deliveredCompletions) {
+    state.wakeDeferredTaskIds.delete(completion.task_id);
+  }
   state.pendingLongRunning = [];
+  state.pendingPatternMatches = [];
+  state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
-  await ackCompletions(drainContext, deliveredCompletions);
+  await ackCompletions(drainContext, completionAcks);
   // Cancel any pending debounced wake — its captured pendingCompletions /
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body "[BACKGROUND BASH STILL RUNNING]" reminder.
-  if (state.debounceTimer) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
   return [...content, { type: "text", text: reminder }];
 }
 
 export async function handleTurnEndBgCompletions(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
-  await triggerWakeIfPending(drainContext, false);
+  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  await triggerWakeIfPending(drainContext, false, true);
 }
 
 async function triggerWakeIfPending(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   skipDrain: boolean,
+  includeDeferredCompletions = true,
 ): Promise<void> {
   // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
   // to defer wakes until the bridge was idle. That was wrong: the bridge
   // is busy for any non-agent traffic (status polls, configure work),
   // which orphaned completions when no other trigger fired. Pi's
-  // `sendUserMessage` with `deliverAs: "steer"` already handles mid-turn
-  // delivery cleanly, so suppressing the wake provides no benefit and
-  // creates a hang. Mirrors the OpenCode fix.
+  // `sendUserMessage` with `deliverAs: "steer"` handles ordinary mid-turn
+  // delivery cleanly. For tasks spawned in the current assistant turn,
+  // wakeDeferredTaskIds still suppresses immediate push wakes until an
+  // in-turn append consumes the completion or turn end clears the deferral.
+  // Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
 
   if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0) return;
+  routeExplicitControlCompletions(state);
+  if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
 
   scheduleWake(
     state,
@@ -326,6 +438,7 @@ async function triggerWakeIfPending(
           : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     },
+    includeDeferredCompletions,
   );
 }
 
@@ -350,13 +463,29 @@ export function formatLongRunningReminder(reminders: readonly BgLongRunningRemin
   return `<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n${bullets}\nUse bash_status({ task_id: "..." }) to inspect output or bash_kill({ task_id: "..." }) to terminate.\n</system-reminder>`;
 }
 
+export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]): string {
+  const bullets = matches
+    .map((match) => {
+      const context = (match.context || match.match_text).replace(/\n/g, "\n      > ");
+      if (match.reason === "task_exit") {
+        return `- task ${match.task_id} exited:\n      > ${context}`;
+      }
+      return `- task ${match.task_id} matched ${JSON.stringify(match.match_text)} (offset ${match.match_offset}):\n      > ${context}`;
+    })
+    .join("\n");
+  return `<system-reminder>\n[BG BASH NOTIFY]\n${bullets}\n</system-reminder>`;
+}
+
 function formatCombinedSystemReminder(
   completions: readonly BgCompletion[],
   longRunning: readonly BgLongRunningReminder[],
+  patternMatches: readonly PatternMatchEntry[] = [],
 ): string {
-  if (completions.length === 0) return formatLongRunningReminder(longRunning);
-  if (longRunning.length === 0) return formatSystemReminder(completions);
-  return `${formatSystemReminder(completions)}\n${formatLongRunningReminder(longRunning)}`;
+  const parts: string[] = [];
+  if (completions.length > 0) parts.push(formatSystemReminder(completions));
+  if (longRunning.length > 0) parts.push(formatLongRunningReminder(longRunning));
+  if (patternMatches.length > 0) parts.push(formatPatternMatchReminder(patternMatches));
+  return parts.join("\n");
 }
 
 export function __resetBgNotificationStateForTests(): void {
@@ -413,17 +542,62 @@ async function ackCompletions(
   }
 }
 
+function hasWakeEligiblePending(
+  state: SessionBgState,
+  includeDeferredCompletions: boolean,
+): boolean {
+  return (
+    wakeEligibleCompletions(state, includeDeferredCompletions).length > 0 ||
+    state.pendingLongRunning.length > 0 ||
+    state.pendingPatternMatches.length > 0
+  );
+}
+
+function wakeEligibleCompletions(
+  state: SessionBgState,
+  includeDeferredCompletions: boolean,
+): BgCompletion[] {
+  if (includeDeferredCompletions || state.wakeDeferredTaskIds.size === 0) {
+    return state.pendingCompletions;
+  }
+  return state.pendingCompletions.filter(
+    (completion) => !state.wakeDeferredTaskIds.has(completion.task_id),
+  );
+}
+
+function clearWakeTimerIfNoPending(state: SessionBgState): void {
+  if (
+    state.pendingCompletions.length > 0 ||
+    state.pendingLongRunning.length > 0 ||
+    state.pendingPatternMatches.length > 0
+  ) {
+    return;
+  }
+  if (state.debounceTimer) clearTimeout(state.debounceTimer);
+  state.debounceTimer = null;
+  state.firstCompletionAt = null;
+  state.scheduledFireAt = null;
+  state.scheduledCompletionCount = 0;
+  state.retryDelayMs = null;
+  state.wakeRetryAttempts = 0;
+  state.wakeHardStopped = false;
+}
+
 function scheduleWake(
   state: SessionBgState,
   sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
+  includeDeferredCompletions = true,
 ): void {
   if (state.wakeHardStopped) return;
   // Race model: JS state changes are synchronous; awaits only happen before scheduling
   // drains and during final user-message delivery. Multiple hook invocations can
   // interleave only at those awaits, so we gate timer extension on completion count.
   const now = Date.now();
-  const pendingCount = state.pendingCompletions.length + state.pendingLongRunning.length;
+  const pendingCount =
+    wakeEligibleCompletions(state, includeDeferredCompletions).length +
+    state.pendingLongRunning.length +
+    state.pendingPatternMatches.length;
   if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
     return;
   }
@@ -442,8 +616,9 @@ function scheduleWake(
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
   state.debounceTimer = setTimeout(() => {
-    const pending = state.pendingCompletions;
+    const pending = wakeEligibleCompletions(state, includeDeferredCompletions);
     const pendingLongRunning = state.pendingLongRunning;
+    const pendingPatternMatches = state.pendingPatternMatches;
     state.debounceTimer = null;
     state.firstCompletionAt = null;
     state.scheduledFireAt = null;
@@ -452,11 +627,26 @@ function scheduleWake(
     // drained the pending arrays between schedule and fire and didn't
     // cancel us, just skip — don't ship an empty
     // "[BACKGROUND BASH STILL RUNNING]" shell.
-    if (pending.length === 0 && pendingLongRunning.length === 0) return;
-    const reminder = formatCombinedSystemReminder(pending, pendingLongRunning);
-    state.pendingCompletions = [];
+    if (
+      pending.length === 0 &&
+      pendingLongRunning.length === 0 &&
+      pendingPatternMatches.length === 0
+    )
+      return;
+    const reminder = formatCombinedSystemReminder(
+      pending,
+      pendingLongRunning,
+      pendingPatternMatches,
+    );
+    const deliveredTaskIds = new Set(pending.map((completion) => completion.task_id));
+    state.pendingCompletions = state.pendingCompletions.filter(
+      (completion) => !deliveredTaskIds.has(completion.task_id),
+    );
+    for (const taskId of deliveredTaskIds) state.wakeDeferredTaskIds.delete(taskId);
     state.pendingLongRunning = [];
-    void sendWake(reminder, pending)
+    state.pendingPatternMatches = [];
+    const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
+    void sendWake(reminder, completionAcks)
       .then(() => {
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
@@ -465,6 +655,7 @@ function scheduleWake(
       .catch((err) => {
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
         state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
+        state.pendingPatternMatches = [...pendingPatternMatches, ...state.pendingPatternMatches];
         state.wakeRetryAttempts += 1;
         if (state.wakeRetryAttempts >= MAX_WAKE_SEND_ATTEMPTS) {
           state.retryDelayMs = null;
@@ -474,7 +665,7 @@ function scheduleWake(
         }
         state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
         onSendFailure(err, false);
-        scheduleWake(state, sendWake, onSendFailure);
+        scheduleWake(state, sendWake, onSendFailure, includeDeferredCompletions);
       });
   }, delay);
   state.debounceTimer.unref?.();
@@ -490,6 +681,8 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       outstandingTaskIds: new Set(),
       pendingCompletions: [],
       pendingLongRunning: [],
+      pendingPatternMatches: [],
+      explicitControlTasks: new Set(),
       debounceTimer: null,
       firstCompletionAt: null,
       scheduledFireAt: null,
@@ -499,6 +692,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       wakeHardStopped: false,
       forcedDrainCompleted: false,
       unknownCompletions: [],
+      wakeDeferredTaskIds: new Set(),
       consumedTaskIds: new Set(),
       consumedTaskOrder: [],
       lastSeenAt: now,
@@ -520,6 +714,11 @@ function ingestDrainedBgCompletions(
   for (const completion of completions) {
     if (!isBgCompletion(completion)) continue;
     state.outstandingTaskIds.delete(completion.task_id);
+    if (state.explicitControlTasks.has(completion.task_id)) {
+      state.explicitControlTasks.delete(completion.task_id);
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      continue;
+    }
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
@@ -560,6 +759,42 @@ function pruneUnknownCompletions(state: SessionBgState, now: number): void {
   state.unknownCompletions = state.unknownCompletions.filter(
     (entry) => now - entry.receivedAt <= UNKNOWN_COMPLETION_TTL_MS,
   );
+}
+
+function completionToExitPattern(
+  completion: BgCompletion,
+  ackCompletionOnDelivery = false,
+): PatternMatchEntry {
+  const status = formatStatus(completion);
+  const preview = formatOutputPreview(completion).replace(/^ {4}/gm, "").slice(-300);
+  const entry: PatternMatchEntry = {
+    task_id: completion.task_id,
+    session_id: "",
+    watch_id: "exit",
+    match_text: "",
+    match_offset: 0,
+    context: preview
+      ? `task ${completion.task_id} exited (${status})\n${preview}`
+      : `task ${completion.task_id} exited (${status})`,
+    once: true,
+    reason: "task_exit",
+  };
+  if (ackCompletionOnDelivery) entry.ackCompletionOnDelivery = true;
+  return entry;
+}
+
+function completionAcksForDelivery(
+  completions: readonly BgCompletion[],
+  patternMatches: readonly PatternMatchEntry[],
+): BgCompletion[] {
+  const acks = [...completions];
+  const ackedTaskIds = new Set(acks.map((completion) => completion.task_id));
+  for (const match of patternMatches) {
+    if (!match.ackCompletionOnDelivery || ackedTaskIds.has(match.task_id)) continue;
+    acks.push({ task_id: match.task_id, status: "unknown", exit_code: null, command: "" });
+    ackedTaskIds.add(match.task_id);
+  }
+  return acks;
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {

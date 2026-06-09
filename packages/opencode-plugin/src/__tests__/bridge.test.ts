@@ -76,6 +76,36 @@ describe("BinaryBridge lifecycle", () => {
     ]);
   });
 
+  test("parses final stdout frame without trailing newline when stream ends", async () => {
+    const completions: unknown[] = [];
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onBashCompletion: (completion) => {
+          completions.push(completion);
+        },
+      },
+      { harness: "opencode" },
+    );
+
+    (bridge as any).onStdoutData(
+      JSON.stringify({
+        type: "bash_completed",
+        task_id: "task-final",
+        session_id: "s1",
+        status: "completed",
+        exit_code: 0,
+        command: "echo done",
+      }),
+    );
+    (bridge as any).flushStdoutBuffer();
+
+    expect(completions).toHaveLength(1);
+    expect((completions[0] as { task_id?: string }).task_id).toBe("task-final");
+  });
+
   test("routes pushed configure_warnings frames with session_id to the warning handler", async () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(
@@ -324,7 +354,7 @@ describe("BinaryBridge lifecycle", () => {
     proc.kill("SIGKILL");
 
     // Wait for crash detection
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForBridgeProcessExit(bridge, proc.pid);
 
     // Next send should spawn a fresh process (ensureSpawned) — but then kill it again
     // Actually with maxRestarts=0, handleCrash won't restart, but ensureSpawned
@@ -396,7 +426,7 @@ describe("BinaryBridge lifecycle", () => {
       if (proc) {
         proc.kill("SIGKILL");
         // Wait for the exit event to fire and handleCrash to run
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await waitForBridgeProcessExit(this, proc.pid);
       }
       // Return normally — simulates checkVersion swallowing the error
     };
@@ -409,8 +439,8 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("crash error stays clean for the agent and points to the log", async () => {
-    // Fake binary: writes recognizable stderr lines, briefly sleeps so the
-    // bridge has time to queue `configure`, then exits non-zero.
+    // Fake binary: writes recognizable stderr lines, waits until the bridge
+    // queues `configure`, then exits non-zero.
     //
     // Agent-facing rejection contract: the rejection error must NOT carry
     // stderr tail noise (loaded N backups, invalidated K files, or — as in
@@ -424,10 +454,11 @@ describe("BinaryBridge lifecycle", () => {
         "#!/bin/sh",
         'echo "fatal: semantic index corrupted" >&2',
         'echo "caused by: bad cache magic" >&2',
-        // Sleep long enough for the bridge to write `configure` to stdin
+        // Wait for the bridge to write the first request (`configure`) to stdin
         // before the process dies, so the request is in `pending` when the
-        // exit handler runs.
-        "sleep 0.3",
+        // exit handler runs. This is the real synchronization point; a fixed
+        // sleep made the test flaky under CPU contention.
+        "IFS= read -r _ || true",
         "exit 1",
         "",
       ].join("\n"),
@@ -539,14 +570,27 @@ describe("BinaryBridge lifecycle", () => {
       expect(child).not.toBeNull();
       expect(child?.killed).toBe(false);
 
-      // Compare with default (no keep flag): same hung binary, but now the
-      // bridge will tear it down on timeout.
+      // Compare with default (no keep flag): same hung binary. Per the
+      // starvation-timeout mitigation, a SINGLE non-keep timeout no longer
+      // kills the bridge — a transient/slow response keeps the warm bridge
+      // alive (consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD). The child
+      // is only torn down once repeated silent timeouts indicate a genuine
+      // hang. This hung binary emits no output, so each timeout counts toward
+      // the hang threshold (2); the second consecutive non-keep timeout
+      // triggers handleTimeout and clears the process.
       const err2 = await bridge.send("version", {}, { timeoutMs: 50 }).catch((e) => e);
       expect(err2).toBeInstanceOf(Error);
       expect((err2 as Error).message).toContain("timed out");
-      // After handleTimeout fires, the previous child is killed (process is
-      // cleared). New send() would spawn fresh, but we set maxRestarts=0 so
-      // no respawn happens — process should now be null.
+      // First non-keep timeout: bridge kept warm (child still alive).
+      const childMid = (bridge as unknown as { process: { killed: boolean } | null }).process;
+      expect(childMid).not.toBeNull();
+
+      const err3 = await bridge.send("version", {}, { timeoutMs: 50 }).catch((e) => e);
+      expect(err3).toBeInstanceOf(Error);
+      expect((err3 as Error).message).toContain("timed out");
+      // Second consecutive silent timeout crosses the hang threshold →
+      // handleTimeout kills the child. maxRestarts=0 means no respawn, so the
+      // process is now null.
       const childAfter = (bridge as unknown as { process: { killed: boolean } | null }).process;
       expect(childAfter).toBeNull();
     } finally {

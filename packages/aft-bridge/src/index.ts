@@ -9,6 +9,13 @@
 
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
+// --- bash output hints (shared by both plugin hosts) ---
+export {
+  commandLeadsWithCodeSearch,
+  maybeAppendConflictsHint,
+  maybeAppendGrepSearchHint,
+} from "./bash-hints.js";
+export { resolveBashKillTimeout } from "./bash-timeout.js";
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
@@ -20,6 +27,7 @@ export type {
 } from "./bridge.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
+export { coerceStringArray } from "./coerce.js";
 // --- binary resolution ---
 export {
   downloadBinary,
@@ -28,8 +36,12 @@ export {
   getCacheDir,
   getCachedBinaryPath,
 } from "./downloader.js";
+export type { EditSummaryInput } from "./edit-summary.js";
+export { formatEditSummary } from "./edit-summary.js";
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
+// --- jsonc helpers ---
+export { stripJsoncSymbols } from "./jsonc.js";
 export type { Logger, LogMeta } from "./logger.js";
 export type { MigrationHarness, MigrationOptions, MigrationStatus } from "./migration.js";
 // --- storage migration ---
@@ -39,6 +51,14 @@ export {
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "./migration.js";
+// --- npm resolution (PATH-stripped GUI launch fallback) ---
+export type { ResolvedNpm } from "./npm-resolver.js";
+export {
+  isNpmAvailable,
+  npmSpawnEnv,
+  probeNpmVersion,
+  resolveNpm,
+} from "./npm-resolver.js";
 // --- ONNX runtime ---
 export {
   __test__ as __onnxTest__,
@@ -47,6 +67,14 @@ export {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
+export {
+  markAnnouncementSeen,
+  repairRootScopedStorageFile,
+  resolveHarnessStoragePath,
+  shouldShowAnnouncement,
+} from "./paths.js";
+export type { PipeStripResult } from "./pipe-strip.js";
+export { maybeStripCompressorPipe } from "./pipe-strip.js";
 // --- platform helpers ---
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 export type { PoolOptions } from "./pool.js";
@@ -67,9 +95,22 @@ export type {
   StatusCompressionAggregate,
   StatusResponse,
 } from "./protocol.js";
-export { findBinary, findBinarySync, platformKey } from "./resolver.js";
-// --- URL fetch (shared by aft_outline / aft_zoom URL targets) ---
-export { _isPrivateIpv4, cleanupUrlCache, fetchUrlToTempFile } from "./url-fetch.js";
+export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
+// --- agent status bar (shared by both plugin hosts) ---
+export type { StatusBarCounts, StatusBarEmitState } from "./status-bar.js";
+export {
+  createStatusBarEmitState,
+  formatStatusBar,
+  parseStatusBarCounts,
+  STATUS_BAR_HEARTBEAT_CALLS,
+  shouldEmitStatusBar,
+  statusBarLine,
+} from "./status-bar.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
-export type { ZoomResponseLike } from "./zoom-format.js";
-export { formatZoomText } from "./zoom-format.js";
+export type {
+  ZoomMultiTargetEntry,
+  ZoomMultiTargetResult,
+  ZoomMultiTargetSymbolResult,
+  ZoomResponseLike,
+} from "./zoom-format.js";
+export { formatZoomMultiTargetResult, formatZoomText } from "./zoom-format.js";

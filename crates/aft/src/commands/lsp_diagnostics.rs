@@ -247,7 +247,7 @@ fn handle_file_mode(
     for entry in &server_status {
         match entry.status.as_str() {
             "pull_ok" | "pull_unchanged" => {}
-            "push_only" => {
+            "push_only" | "pull_rejected_push_fallback" | "pull_no_cache_for_unchanged" => {
                 let fresh = outcomes.successful.iter().any(|key| {
                     key.kind.id_str() == entry.server_id && proven_push_servers.contains(key)
                 });
@@ -429,10 +429,25 @@ fn wait_for_push(ctx: &AppContext, wait_ms: u64) {
 }
 
 fn needs_push_wait(pull_results: &[PullFileResult]) -> bool {
-    pull_results
-        .iter()
-        .any(|r| matches!(r.outcome, PullFileOutcome::PullNotSupported))
-        || pull_results.is_empty()
+    pull_results.iter().any(|r| match &r.outcome {
+        PullFileOutcome::PullNotSupported => true,
+        PullFileOutcome::RequestFailed { reason } => request_failure_needs_push(reason),
+        _ => false,
+    }) || pull_results.is_empty()
+}
+
+fn request_failure_needs_push(reason: &str) -> bool {
+    reason == "no_cache_for_unchanged" || reason.starts_with("pull_rejected_push_fallback:")
+}
+
+fn request_failure_status(reason: &str) -> String {
+    if reason == "no_cache_for_unchanged" {
+        "pull_no_cache_for_unchanged".to_string()
+    } else if reason.starts_with("pull_rejected_push_fallback:") {
+        "pull_rejected_push_fallback".to_string()
+    } else {
+        format!("pull_failed: {reason}")
+    }
 }
 
 fn update_status_with_pull(
@@ -456,7 +471,7 @@ fn update_status_with_pull(
             PullFileOutcome::Unchanged => "pull_unchanged".to_string(),
             PullFileOutcome::PullNotSupported => "push_only".to_string(),
             PullFileOutcome::PartialNotSupported => "pull_partial_skipped".to_string(),
-            PullFileOutcome::RequestFailed { reason } => format!("pull_failed: {reason}"),
+            PullFileOutcome::RequestFailed { reason } => request_failure_status(reason),
         };
     }
 }
@@ -467,6 +482,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
 
     let walker = ignore::WalkBuilder::new(dir)
         .standard_filters(true) // honors .gitignore + hidden-file rules
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|e| {
             // Skip noisy directories that explode walk time on real repos.
             let name = e.file_name().to_string_lossy();
@@ -477,6 +493,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         })
         .build();
 
+    let mut walk_truncated = false;
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -494,14 +511,14 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         }
 
         resolvable_files.push(path.to_path_buf());
+        if resolvable_files.len() > DIRECTORY_FILE_CAP {
+            walk_truncated = true;
+            break;
+        }
     }
 
-    if resolvable_files.len() > DIRECTORY_FILE_CAP {
-        let unchecked = resolvable_files[DIRECTORY_FILE_CAP..]
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
-        return (unchecked, true);
+    if walk_truncated {
+        resolvable_files.truncate(DIRECTORY_FILE_CAP);
     }
 
     let mut unchecked = Vec::new();
@@ -527,7 +544,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         }
     }
 
-    (unchecked, false)
+    (unchecked, walk_truncated)
 }
 
 fn build_response(
@@ -672,4 +689,35 @@ fn parse_severity_filter(value: Option<&str>) -> Result<SeverityFilter, String> 
 
 fn normalize_query_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::parser::TreeSitterProvider;
+    use std::fs;
+
+    #[test]
+    fn compute_unchecked_files_caps_resolvable_walk() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("workspace");
+        let src = root.join("src");
+        fs::create_dir_all(&src).expect("create src");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("cargo toml");
+        for index in 0..250 {
+            fs::write(src.join(format!("file_{index:03}.rs")), "fn main() {}\n").expect("write rs");
+        }
+
+        let config = Config {
+            project_root: Some(root),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+
+        let (unchecked, truncated) = compute_unchecked_files(&ctx, &src);
+
+        assert!(truncated);
+        assert_eq!(unchecked.len(), DIRECTORY_FILE_CAP);
+    }
 }

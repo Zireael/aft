@@ -76,6 +76,39 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(text).toContain("sample.go");
   });
 
+  test("outline files mode lists directory file metadata", async () => {
+    const result = await harness.callTool("aft_outline", { target: "directory", files: true });
+    const text = harness.text(result);
+
+    expect(text).toMatch(/alpha\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/beta\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/gamma\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+  });
+
+  test("outline files mode accepts array target of directories", async () => {
+    await mkdir(harness.path("outline-files-a"), { recursive: true });
+    await mkdir(harness.path("outline-files-b"), { recursive: true });
+    await writeFile(
+      harness.path("outline-files-a", "one.ts"),
+      "export function one() { return 1; }\n",
+      "utf8",
+    );
+    await writeFile(
+      harness.path("outline-files-b", "two.py"),
+      "def two():\n    return 2\n",
+      "utf8",
+    );
+
+    const result = await harness.callTool("aft_outline", {
+      target: [harness.path("outline-files-a"), harness.path("outline-files-b")],
+      files: true,
+    });
+    const text = harness.text(result);
+
+    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ bytes/);
+  });
+
   test("outline rejects empty string target", async () => {
     await expect(harness.callTool("aft_outline", { target: "" })).rejects.toThrow(/non-empty/);
   });
@@ -128,10 +161,10 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(harness.text(result)).toContain("file-000.ts");
   });
 
-  test("zoom into single symbol returns source", async () => {
+  test("zoom into single symbol returns source (symbols as string)", async () => {
     const result = await harness.callTool("aft_zoom", {
       filePath: "sample.ts",
-      symbol: "funcB",
+      symbols: "funcB",
     });
     const text = harness.text(result);
     expect(text).toContain("funcB");
@@ -152,7 +185,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
   test("zoom with contextLines expands range", async () => {
     const result = await harness.callTool("aft_zoom", {
       filePath: "sample.ts",
-      symbol: "funcA",
+      symbols: "funcA",
       contextLines: 10,
     });
     const text = harness.text(result);
@@ -161,15 +194,9 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
 });
 
 /**
- * URL-mode coverage. These are critical because they exercise undici's
- * `connect.lookup` callback under the actual Node runtime — exactly the path
- * that surfaced as `ERR_INVALID_IP_ADDRESS: Invalid IP address: undefined`
- * when the dispatcher's pinned-DNS callback was called with the legacy
- * 3-arg `(err, address, family)` shape against a Node 18+ connector that
- * passes `opts.all: true` and expects `(err, [{address, family}])`.
- *
- * The mock server binds to 127.0.0.1, so we need `url_fetch_allow_private`
- * to bypass the SSRF guard.
+ * URL-mode coverage. These exercise the plugin → Rust pass-through path: Rust
+ * owns SSRF validation, fetching, and disk cache lookup. The mock server binds
+ * to 127.0.0.1, so we need `url_fetch_allow_private` to bypass the SSRF guard.
  */
 const urlMaybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
 
@@ -243,10 +270,7 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
     });
     const text = harness.text(result);
 
-    // This is the test that locks in the Node-runtime fetch fix. Before the
-    // dual-shape lookup callback was added, this call surfaced as
-    // `ERR_INVALID_IP_ADDRESS: Invalid IP address: undefined` from
-    // net:emitLookup under Node 18+.
+    // Locks in URL pass-through to Rust fetch/cache.
     expect(text).toContain("Test Document");
     expect(text).toContain("Section A");
     expect(text).toContain("Section B");
@@ -265,7 +289,7 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
   test("zoom URL — fetches and zooms into a section", async () => {
     const result = await harness.callTool("aft_zoom", {
       url: `${serverUrl}/doc.md`,
-      symbol: "Section A",
+      symbols: "Section A",
     });
     const text = harness.text(result);
     expect(text).toContain("Section A");
@@ -298,8 +322,19 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
       harness.callTool("aft_zoom", {
         filePath: "sample.ts",
         url: `${serverUrl}/doc.md`,
-        symbol: "anything",
+        symbols: "anything",
       }),
     ).rejects.toThrow(/exactly ONE of 'filePath' or 'url'/);
+  });
+
+  test("zoom URL — multi-section via symbols array", async () => {
+    const result = await harness.callTool("aft_zoom", {
+      url: `${serverUrl}/doc.md`,
+      symbols: ["Section A", "Section B"],
+    });
+    const text = harness.text(result);
+    expect(text).toContain("Section A");
+    expect(text).toContain("Body of section A.");
+    expect(text).toContain("Section B");
   });
 });

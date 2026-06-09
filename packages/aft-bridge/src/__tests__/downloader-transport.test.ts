@@ -2,11 +2,29 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
+
+const shellFixtureSkipReason =
+  process.platform === "win32" ? "POSIX shell fixture is unavailable on Windows" : "";
+
+function shellFixtureAvailable(): boolean {
+  if (!shellFixtureSkipReason) return true;
+  if (process.env.CI === "true") throw new Error(shellFixtureSkipReason);
+  return false;
+}
 
 describe("downloadBinary hardened transport", () => {
   let tmpDir: string;
@@ -15,7 +33,11 @@ describe("downloadBinary hardened transport", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-download-test-"));
-    releaseEnv = await acquireEnv({ XDG_CACHE_HOME: tmpDir });
+    // getCacheDir() reads different env vars per platform:
+    // Windows → LOCALAPPDATA, POSIX → XDG_CACHE_HOME
+    const cacheEnv =
+      process.platform === "win32" ? { LOCALAPPDATA: tmpDir } : { XDG_CACHE_HOME: tmpDir };
+    releaseEnv = await acquireEnv(cacheEnv);
     originalFetch = globalThis.fetch;
   });
 
@@ -35,6 +57,7 @@ describe("downloadBinary hardened transport", () => {
   }
 
   test("dedupes concurrent same-version downloads and writes one final binary", async () => {
+    if (!shellFixtureAvailable()) return;
     const { downloadBinary, getBinaryName } = await import(
       `../downloader.js?transport-dedupe-${Date.now()}`
     );
@@ -65,6 +88,54 @@ describe("downloadBinary hardened transport", () => {
     expect(
       readdirSync(join(tmpDir, "aft", "bin", "v1.2.3")).filter((name) => name.includes(".tmp")),
     ).toEqual([]);
+  });
+
+  test("ensureBinary redownloads mismatched versioned cache entries", async () => {
+    if (!shellFixtureAvailable()) return;
+
+    const { ensureBinary, getBinaryName, readBinaryVersion } = await import(
+      `../downloader.js?ensure-cache-validate-${Date.now()}`
+    );
+    const assetName = currentAssetName();
+    const payload = Buffer.from("#!/bin/sh\necho aft 1.2.3\n");
+    const sha256 = createHash("sha256").update(payload).digest("hex");
+    const versionedDir = join(tmpDir, "aft", "bin", "v1.2.3");
+    const cachedPath = join(versionedDir, getBinaryName());
+    let binaryFetches = 0;
+
+    mkdirSync(versionedDir, { recursive: true });
+    writeFileSync(cachedPath, '#!/bin/sh\necho "aft 9.9.9"\n');
+    chmodSync(cachedPath, 0o755);
+    expect(readBinaryVersion(cachedPath)).toBe("9.9.9");
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const rawUrl = String(url);
+      if (rawUrl.endsWith("checksums.sha256")) {
+        return new Response(`${sha256}  ${assetName}\n`, { status: 200 });
+      }
+      binaryFetches += 1;
+      return new Response(payload, {
+        status: 200,
+        headers: { "content-length": String(payload.byteLength) },
+      });
+    }) as typeof fetch;
+
+    await expect(ensureBinary("v1.2.3")).resolves.toBe(cachedPath);
+    expect(binaryFetches).toBe(1);
+    expect(readFileSync(cachedPath, "utf8")).toContain("1.2.3");
+  });
+
+  test("download lock release preserves a reclaimed lock owned by another process", async () => {
+    const { __test__ } = await import(`../downloader.js?download-lock-${Date.now()}`);
+    const lockDir = join(tmpDir, "lock-owner");
+    const lockPath = join(lockDir, ".download.lock");
+    mkdirSync(lockDir, { recursive: true });
+
+    const release = await __test__.acquireDownloadLock(lockPath);
+    writeFileSync(lockPath, "other-owner");
+    release();
+
+    expect(readFileSync(lockPath, "utf8")).toBe("other-owner");
   });
 
   test("rejects oversized advertised downloads before buffering", async () => {

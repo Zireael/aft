@@ -31,6 +31,7 @@ fn weights(kind: QueryKind) -> ShapeWeights {
         QueryKind::Mixed => "how does useState work",
         QueryKind::ErrorCode => "ERR_TIMEOUT",
         QueryKind::Path => "src/lib.rs",
+        QueryKind::Regex => "^export",
         QueryKind::NaturalLanguage => "how does auth work",
     })
     .weights
@@ -43,7 +44,6 @@ fn classifies_identifier_queries() {
         "useState",
         "aft_safety_history",
         "LSPManager",
-        "foo.bar",
         "subagent_type",
         "getCurrentWorkingDirectory",
         "SearchIndex",
@@ -51,7 +51,6 @@ fn classifies_identifier_queries() {
         "x",
         "API",
         "FOO_BAR",
-        "two words",
         "  useEffect  ",
     ] {
         assert_shape(query, QueryKind::Identifier, expected);
@@ -68,6 +67,10 @@ fn classifies_path_queries_before_error_or_identifier_patterns() {
         "src/ERR_TIMEOUT.rs",
         "/tmp/E1234.log",
         "./foo/bar.json",
+        "foo.bar",
+        "a.b.c",
+        "https://example.com",
+        "react?.js",
     ] {
         assert_shape(query, QueryKind::Path, expected);
     }
@@ -79,9 +82,12 @@ fn classifies_error_code_queries_before_identifier_patterns() {
     for query in [
         "ERR_TIMEOUT",
         "E1234",
+        "E0502",
         "0xCAFE",
         "404",
+        "HTTP 404",
         "HTTP 500",
+        "error TS2304",
         "ERR_CONNECTION_RESET",
         "0xdeadbeef panic",
         "E10000 failed",
@@ -97,7 +103,9 @@ fn classifies_natural_language_queries() {
         "",
         "   ",
         "how does auth work",
+        "how does auth work?",
         "what handles background task completion",
+        "what handles background task completion?",
         "where is rate limiting handled",
         "why does indexing rebuild repeatedly",
         "when should semantic search run",
@@ -121,8 +129,32 @@ fn classifies_mixed_queries() {
         "does SearchIndex refresh stale files",
         "useState hook examples",
         "useState hook examples for cleanup",
+        "why do I get E0502 when borrowing",
+        "why do I get error TS2304 when compiling",
+        "why do I get HTTP 404 when fetching",
     ] {
         assert_shape(query, QueryKind::Mixed, expected);
+    }
+}
+
+#[test]
+fn classifies_regex_queries() {
+    let expected = weights(QueryKind::Regex);
+    for query in [
+        "^export",
+        "foo$",
+        r"foo\.bar",
+        "[a-z]+",
+        "foo|bar",
+        "(?:foo)",
+        "foo*",
+        "foo+",
+        "foo.*bar",
+        "get.+",
+        "colou?r",
+        "foo*bar",
+    ] {
+        assert_shape(query, QueryKind::Regex, expected);
     }
 }
 
@@ -168,5 +200,14 @@ fn weights_are_stable_by_shape() {
             should_use_lexical: true,
         },
         "mixed",
+    );
+    assert_weights(
+        weights(QueryKind::Regex),
+        ShapeWeights {
+            semantic: 0.0,
+            lexical: 1.0,
+            should_use_lexical: false,
+        },
+        "regex",
     );
 }

@@ -1,0 +1,18 @@
+FROM node:24-bookworm-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+ENV IN_DOCKER=1
+
+RUN npm install -g @colbymchenry/codegraph@0.9.6
+
+WORKDIR /workspace
+COPY . /workspace
+RUN bun install --frozen-lockfile
+
+WORKDIR /workspace/benchmarks/codegraph-vs-aft-retrieval
+ENTRYPOINT ["bash", "scripts/run-codegraph.sh"]

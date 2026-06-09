@@ -1,5 +1,6 @@
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 pub struct CargoCompressor;
 
@@ -11,13 +12,36 @@ impl Compressor for CargoCompressor {
             .is_some_and(|head| head == "cargo")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
         match cargo_subcommand(command).as_deref() {
             Some("build" | "check" | "clippy") => compress_build_like(output),
-            Some("test") => compress_test(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("test") => compress_test(output, exit_code),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
+
+    fn matches_output(&self, output: &str) -> bool {
+        output.lines().any(is_cargo_test_signature_line)
+    }
+
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        compress_test(output, exit_code)
+    }
+}
+
+fn is_cargo_test_signature_line(line: &str) -> bool {
+    line.starts_with("test result:")
+        || line.starts_with("failures:")
+        || (line.starts_with("---- ") && line.ends_with(" stdout ----"))
 }
 
 fn cargo_subcommand(command: &str) -> Option<String> {
@@ -37,17 +61,17 @@ fn cargo_subcommand(command: &str) -> Option<String> {
     None
 }
 
-fn compress_build_like(output: &str) -> String {
+fn compress_build_like(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_diagnostic = lines
         .iter()
         .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["));
 
     if !has_diagnostic {
-        return output.trim_end().to_string();
+        return CompressionResult::new(output.trim_end().to_string());
     }
 
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -58,22 +82,28 @@ fn compress_build_like(output: &str) -> String {
         }
 
         if is_warning_or_error(line) || line.trim_start().starts_with("error[") {
+            let class = if line.trim_start().starts_with("warning:") {
+                DropClass::Warning
+            } else {
+                DropClass::Error
+            };
             let start = index;
             index += 1;
             while index < lines.len() && !starts_next_build_message(lines[index]) {
                 index += 1;
             }
-            result.extend(lines[start..index].iter().map(|line| (*line).to_string()));
+            blocks.push(ClassifiedBlock::new(class, lines[start..index].join("\n")));
             continue;
         }
 
         if is_final_cargo_summary(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
         index += 1;
     }
 
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 fn starts_next_build_message(line: &str) -> bool {
@@ -115,10 +145,18 @@ fn is_final_cargo_summary(line: &str) -> bool {
         || trimmed.starts_with("test result:")
 }
 
-fn compress_test(output: &str) -> String {
+fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     if !has_failures {
+        if matches!(exit_code, Some(code) if code != 0)
+            && lines
+                .iter()
+                .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["))
+        {
+            return compress_build_like(output);
+        }
+
         let result: Vec<String> = lines
             .iter()
             .filter(|line| {
@@ -129,43 +167,66 @@ fn compress_test(output: &str) -> String {
             })
             .map(|line| (*line).to_string())
             .collect();
-        return trim_trailing_lines(&result.join("\n"));
+        return CompressionResult::new(trim_trailing_lines(&result.join("\n")));
     }
 
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
         if trimmed.starts_with("running ") || trimmed.starts_with("test result:") {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
 
         if trimmed == "failures:" {
-            result.extend(lines[index..].iter().map(|line| (*line).to_string()));
-            break;
+            let start = index;
+            let mut next = index + 1;
+            while next < lines.len() && lines[next].trim().is_empty() {
+                next += 1;
+            }
+            if next < lines.len() && lines[next].starts_with("---- ") {
+                blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+                index += 1;
+                continue;
+            }
+
+            index += 1;
+            while index < lines.len() && !lines[index].trim_start().starts_with("test result:") {
+                index += 1;
+            }
+            blocks.push(ClassifiedBlock::unclassified(
+                lines[start..index].join("\n"),
+            ));
+            continue;
         }
 
         if line.starts_with("---- ") {
+            let start = index;
             while index < lines.len() {
-                result.push(lines[index].to_string());
                 index += 1;
                 if index < lines.len()
-                    && (lines[index].trim_start().starts_with("test result:")
+                    && (lines[index].starts_with("---- ")
+                        || lines[index].trim_start().starts_with("test result:")
                         || lines[index].trim() == "failures:")
                 {
                     break;
                 }
             }
+            blocks.push(ClassifiedBlock::new(
+                DropClass::Failure,
+                lines[start..index].join("\n"),
+            ));
             continue;
         }
 
         index += 1;
     }
 
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 fn trim_trailing_lines(input: &str) -> String {
@@ -174,4 +235,39 @@ fn trim_trailing_lines(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::caps::{DropClass, CAP_ERRORS};
+
+    #[test]
+    fn cargo_test_caps_failure_blocks_after_failures_header() {
+        let mut output = String::from("running 40 tests\n\nfailures:\n\n");
+        for index in 0..40 {
+            output.push_str(&format!(
+                "---- case_{index} stdout ----\nthread 'case_{index}' panicked at src/lib.rs:{index}:1\nstack line {index}\n\n"
+            ));
+        }
+        output.push_str("failures:\n");
+        for index in 0..40 {
+            output.push_str(&format!("    case_{index}\n"));
+        }
+        output.push_str(
+            "\ntest result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+
+        let result = compress_test(&output, None);
+
+        assert_eq!(
+            result.dropped_by_class.get(&DropClass::Failure),
+            Some(&(40 - CAP_ERRORS))
+        );
+        assert_eq!(result.text.matches(" stdout ----").count(), CAP_ERRORS);
+        assert!(result.text.contains("---- case_19 stdout ----"));
+        assert!(!result.text.contains("---- case_20 stdout ----"));
+        assert!(result.had_inner_drop);
+        assert!(!result.offset_hint_eligible);
+    }
 }

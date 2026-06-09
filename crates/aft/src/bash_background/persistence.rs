@@ -10,7 +10,7 @@ use crate::db::bash_tasks::BashTaskRow;
 
 use super::BgTaskStatus;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -58,6 +58,10 @@ pub struct PersistedTask {
     /// for a single bash call without flipping the global flag.
     #[serde(default = "default_compressed")]
     pub compressed: bool,
+    #[serde(default)]
+    pub pty_rows: Option<u16>,
+    #[serde(default)]
+    pub pty_cols: Option<u16>,
     pub status_reason: Option<String>,
 }
 
@@ -105,6 +109,8 @@ impl PersistedTask {
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
+            pty_rows: None,
+            pty_cols: None,
             status_reason: None,
         }
     }
@@ -214,6 +220,8 @@ impl From<BashTaskRow> for PersistedTask {
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
+            pty_rows: None,
+            pty_cols: None,
             status_reason: None,
         }
     }
@@ -253,9 +261,27 @@ fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
 }
 
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
-    storage_dir
-        .join("bash-tasks")
-        .join(hash_session(session_id))
+    let session_hash = hash_session(session_id);
+    let direct = storage_dir.join("bash-tasks").join(&session_hash);
+    if direct.exists() {
+        return direct;
+    }
+
+    let mut harness_matches = ["opencode", "pi"]
+        .into_iter()
+        .map(|harness| {
+            storage_dir
+                .join(harness)
+                .join("bash-tasks")
+                .join(&session_hash)
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if harness_matches.len() == 1 {
+        return harness_matches.remove(0);
+    }
+
+    direct
 }
 
 pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPaths {
@@ -273,11 +299,11 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let content = fs::read_to_string(path)?;
     let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
-    if !matches!(task.schema_version, 2 | SCHEMA_VERSION) {
+    if !matches!(task.schema_version, 2 | 3 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported background task schema_version {} (expected 2 or {SCHEMA_VERSION})",
+                "unsupported background task schema_version {} (expected 2, 3, or {SCHEMA_VERSION})",
                 task.schema_version
             ),
         ));

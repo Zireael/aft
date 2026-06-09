@@ -1,0 +1,1742 @@
+{
+  "timestamp": "2026-05-26T09:41:23.339Z",
+  "benchmark": "codegraph-replication",
+  "codebasePath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588",
+  "codegraphSha": "1be8e7830f7ca37e42a378186b0274e684b1d4d8",
+  "aftSha": "c6dac3b6d1c6be88271924f3ea4a666445313e8e",
+  "driver": "aft",
+  "corpus": "codegraph",
+  "corpusPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication/corpora/codegraph.json",
+  "topK": 10,
+  "runs": 1,
+  "summary": {
+    "total": 12,
+    "passed": 12,
+    "failed": 0,
+    "skipped": 0,
+    "meanRecall": 0.833333,
+    "meanMRR": 0.958333,
+    "meanPrecisionAt1": 0.916667,
+    "meanPrecisionAt5": 0.65,
+    "meanPrecisionAt10": 0.5,
+    "latencyMsMedian": 3.302,
+    "latencyMsP95": 52.698
+  },
+  "results": [
+    {
+      "caseId": "search-class-exact",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.8,
+        "p10": 0.7
+      },
+      "foundSymbols": [
+        "BinaryBridge"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 52.698,
+      "latencySamplesMs": [
+        52.698
+      ],
+      "latencyMsMedian": 52.698,
+      "latencyMsP95": 52.698,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "BinaryBridge",
+          "kind": "class",
+          "line": 267,
+          "endLine": 1224,
+          "score": 0.6050059199333191,
+          "source": "semantic",
+          "text": "/**\n * Manages a persistent `aft` child process, communicating via NDJSON over\n * stdin/stdout. Lazy-spawns on first `send()` call. Handles crash detection\n * with exponential backoff auto-restart.\n */\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.5217767953872681,
+          "source": "hybrid",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/aft-bridge/src/__tests__/status-cache.test.ts",
+          "name": "makeBridge",
+          "kind": "function",
+          "line": 4,
+          "endLine": 6,
+          "score": 0.5203639268875122,
+          "source": "semantic",
+          "text": "function makeBridge(): BinaryBridge {\n  return new BinaryBridge(\"/bin/false\", process.cwd());\n}"
+        },
+        {
+          "rank": 4,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "BridgePool",
+          "kind": "class",
+          "line": 102,
+          "endLine": 371,
+          "score": 0.5102611184120178,
+          "source": "semantic",
+          "text": "/**\n * Manages a pool of BinaryBridge instances, keyed by **canonical project root**.\n *\n * Prior to issue #14, the pool spawned one binary process per OpenCode session,\n * which duplicated every heavy in-memory structure (ONNX runtime, trigram and\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "callBridge",
+          "kind": "function",
+          "line": 296,
+          "endLine": 343,
+          "score": 0.4908371567726135,
+          "source": "hybrid",
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/pi-plugin/src/__tests__/bash.test.ts",
+          "name": "makeMockBridge",
+          "kind": "function",
+          "line": 59,
+          "endLine": 64,
+          "score": 0.4866812527179718,
+          "source": "hybrid",
+          "text": "function makeMockBridge(response: Record<string, unknown> = {}): BinaryBridge {\n  const sendFn = async () => ({ success: true, ...response });\n  return {\n    send: sendFn,\n  } as unknown as BinaryBridge;\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/pi-plugin/src/__tests__/tool-test-utils.ts",
+          "name": "makeMockBridge",
+          "kind": "function",
+          "line": 46,
+          "endLine": 83,
+          "score": 0.47836577892303467,
+          "source": "hybrid",
+          "text": "export function makeMockBridge(\n  handler: (\n    command: string,\n    params: Record<string, unknown>,\n    options?: Record<string, unknown>,\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/opencode-plugin/src/__tests__/notifications.test.ts",
+          "name": "createFailingBridge",
+          "kind": "function",
+          "line": 60,
+          "endLine": 65,
+          "score": 0.4545402526855469,
+          "source": "hybrid",
+          "text": "function createFailingBridge() {\n  const send = mock(async () => {\n    throw new Error(\"bridge unavailable\");\n  });\n  return { bridge: { send } as unknown as Pick<BinaryBridge, \"send\">, send };\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 162,
+          "endLine": 165,
+          "score": 0.4528086483478546,
+          "source": "hybrid",
+          "text": "/** Get the session bridge for the current working directory. */\nexport function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {\n  return ctx.pool.getBridge(cwd);\n}"
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "replaceBinary",
+          "kind": "method",
+          "line": 284,
+          "endLine": 306,
+          "score": 0.4384719729423523,
+          "source": "semantic",
+          "text": "  /**\n   * Replace the binary path and restart all bridges.\n   * Used after downloading a newer binary version.\n   */\n  async replaceBinary(newPath: string): Promise<string> {\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "search-method-qualified",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 0.7
+      },
+      "foundSymbols": [
+        "send"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.302,
+      "latencySamplesMs": [
+        3.302
+      ],
+      "latencyMsMedian": 3.302,
+      "latencyMsP95": 3.302,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "BinaryBridge",
+          "kind": "class",
+          "line": 267,
+          "endLine": 1224,
+          "score": 0.5867044925689697,
+          "source": "semantic",
+          "text": "/**\n * Manages a persistent `aft` child process, communicating via NDJSON over\n * stdin/stdout. Lazy-spawns on first `send()` call. Handles crash detection\n * with exponential backoff auto-restart.\n */\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/pi-plugin/src/__tests__/bash.test.ts",
+          "name": "makeMockBridge",
+          "kind": "function",
+          "line": 59,
+          "endLine": 64,
+          "score": 0.5191243290901184,
+          "source": "hybrid",
+          "text": "function makeMockBridge(response: Record<string, unknown> = {}): BinaryBridge {\n  const sendFn = async () => ({ success: true, ...response });\n  return {\n    send: sendFn,\n  } as unknown as BinaryBridge;\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "callBridge",
+          "kind": "function",
+          "line": 296,
+          "endLine": 343,
+          "score": 0.5169790983200073,
+          "source": "hybrid",
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/__tests__/notifications.test.ts",
+          "name": "createFailingBridge",
+          "kind": "function",
+          "line": 60,
+          "endLine": 65,
+          "score": 0.4929700791835785,
+          "source": "hybrid",
+          "text": "function createFailingBridge() {\n  const send = mock(async () => {\n    throw new Error(\"bridge unavailable\");\n  });\n  return { bridge: { send } as unknown as Pick<BinaryBridge, \"send\">, send };\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.47999751567840576,
+          "source": "hybrid",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "send",
+          "kind": "method",
+          "line": 449,
+          "endLine": 459,
+          "score": 0.4634478986263275,
+          "source": "semantic",
+          "text": "  /**\n   * Send a command to the binary and return the parsed response.\n   * Lazy-spawns the binary on first call.\n   */\n  async send(\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/__tests__/status-cache.test.ts",
+          "name": "makeBridge",
+          "kind": "function",
+          "line": 4,
+          "endLine": 6,
+          "score": 0.4562252461910248,
+          "source": "semantic",
+          "text": "function makeBridge(): BinaryBridge {\n  return new BinaryBridge(\"/bin/false\", process.cwd());\n}"
+        },
+        {
+          "rank": 8,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "name": "callBridge",
+          "kind": "function",
+          "line": 183,
+          "endLine": 219,
+          "score": 0.4516844153404236,
+          "source": "hybrid",
+          "text": "/**\n * Call a bridge command and throw a plain Error on failure.\n * Every tool handler should guard with `if (response.success === false)`\n * before accessing success-only fields — this helper does it uniformly.\n *\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "packages/pi-plugin/src/__tests__/notifications.test.ts",
+          "name": "createFailingBridge",
+          "kind": "function",
+          "line": 55,
+          "endLine": 60,
+          "score": 0.4499189555644989,
+          "source": "hybrid",
+          "text": "function createFailingBridge() {\n  const send = mock(async () => {\n    throw new Error(\"bridge unavailable\");\n  });\n  return { bridge: { send } as unknown as Pick<BinaryBridge, \"send\">, send };\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "replaceBinary",
+          "kind": "method",
+          "line": 284,
+          "endLine": 306,
+          "score": 0.4234525263309479,
+          "source": "semantic",
+          "text": "  /**\n   * Replace the binary path and restart all bridges.\n   * Used after downloading a newer binary version.\n   */\n  async replaceBinary(newPath: string): Promise<string> {\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "search-interface",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 0.5,
+      "precisionAtK": {
+        "p1": 0,
+        "p5": 0.6,
+        "p10": 0.3
+      },
+      "foundSymbols": [
+        "BridgeOptions"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.6,
+      "latencySamplesMs": [
+        3.6
+      ],
+      "latencyMsMedian": 3.6,
+      "latencyMsP95": 3.6,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 162,
+          "endLine": 165,
+          "score": 0.5937557220458984,
+          "source": "hybrid",
+          "text": "/** Get the session bridge for the current working directory. */\nexport function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {\n  return ctx.pool.getBridge(cwd);\n}"
+        },
+        {
+          "rank": 2,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "BridgeOptions",
+          "kind": "interface",
+          "line": 156,
+          "endLine": 196,
+          "score": 0.5759784579277039,
+          "source": "semantic",
+          "text": "export interface BridgeOptions {\n  /** Request timeout in milliseconds. Default: 30000 */\n  timeoutMs?: number;\n  /** Maximum restart attempts before giving up. Default: 3 */\n  maxRestarts?: number;\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "BridgeRequestOptions",
+          "kind": "interface",
+          "line": 238,
+          "endLine": 259,
+          "score": 0.5625021457672119,
+          "source": "semantic",
+          "text": "export interface BridgeRequestOptions {\n  onProgress?: (chunk: { kind: \"stdout\" | \"stderr\"; text: string }) => void;\n  /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */\n  transportTimeoutMs?: number;\n  /**\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.5537136793136597,
+          "source": "hybrid",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "PoolOptions",
+          "kind": "interface",
+          "line": 71,
+          "endLine": 100,
+          "score": 0.5521911382675171,
+          "source": "semantic",
+          "text": "export interface PoolOptions extends BridgeOptions {\n  maxPoolSize?: number;\n  idleTimeoutMs?: number;\n  logger?: Logger;\n  /**\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/pi-plugin/src/index.ts",
+          "name": "bridgeDirectoryFromCallback",
+          "kind": "function",
+          "line": 243,
+          "endLine": 246,
+          "score": 0.5207653641700745,
+          "source": "semantic",
+          "text": "function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string {\n  const cwd = (bridge as { cwd?: unknown } | undefined)?.cwd;\n  return typeof cwd === \"string\" && cwd.length > 0 ? cwd : fallback;\n}"
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "setConfigureOverride",
+          "kind": "method",
+          "line": 336,
+          "endLine": 352,
+          "score": 0.5117117762565613,
+          "source": "semantic",
+          "text": "  /**\n   * Update or set a single configure override that will be applied to every\n   * **future** bridge spawn. Existing bridges keep their original configure\n   * payload — this method intentionally does NOT restart them, because that\n   * would discard their warm trigram/semantic/LSP/symbol-cac..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/pi-plugin/src/__tests__/bridge.test.ts",
+          "name": "bridge.test",
+          "kind": "file_summary",
+          "score": 0.45712974667549133,
+          "source": "semantic",
+          "text": "/**\n * Bridge-level tests for Pi.\n *\n * Mirrors packages/opencode-plugin/src/__tests__/bridge.test.ts. Both plugins\n * share the same bridge design (per-op timeout, SIGKILL recovery, etc) so we\n * kee"
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/context.rs",
+          "name": "is_worktree_bridge",
+          "kind": "method",
+          "line": 766,
+          "endLine": 768,
+          "score": 0.4489808976650238,
+          "source": "semantic",
+          "text": "    pub fn is_worktree_bridge(&self) -> bool {\n        *self.is_worktree_bridge.borrow()\n    }"
+        },
+        {
+          "rank": 10,
+          "file": "packages/pi-plugin/src/__tests__/tool-test-utils.ts",
+          "name": "makeMockBridge",
+          "kind": "function",
+          "line": 46,
+          "endLine": 83,
+          "score": 0.44769415259361267,
+          "source": "hybrid",
+          "text": "export function makeMockBridge(\n  handler: (\n    command: string,\n    params: Record<string, unknown>,\n    options?: Record<string, unknown>,\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "search-enum",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.4,
+        "p10": 0.2
+      },
+      "foundSymbols": [
+        "SemanticIndexStatus"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "crates/aft/src/context.rs"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.138,
+      "latencySamplesMs": [
+        3.138
+      ],
+      "latencyMsMedian": 3.138,
+      "latencyMsP95": 3.138,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/context.rs",
+          "name": "semantic_index_status",
+          "kind": "method",
+          "line": 839,
+          "endLine": 841,
+          "score": 0.7505428791046143,
+          "source": "hybrid",
+          "text": "    pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {\n        &self.semantic_index_status\n    }"
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/context.rs",
+          "name": "SemanticIndexStatus",
+          "kind": "enum",
+          "line": 87,
+          "endLine": 98,
+          "score": 0.7403652667999268,
+          "source": "hybrid",
+          "text": "#[derive(Debug, Clone)]\npub enum SemanticIndexStatus {\n    Disabled,\n    Building {\n        stage: String,\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "SemanticIndex",
+          "kind": "struct",
+          "line": 963,
+          "endLine": 976,
+          "score": 0.6882304549217224,
+          "source": "semantic",
+          "text": "/// The semantic index — stores embeddings for all symbols in a project\n#[derive(Debug)]\npub struct SemanticIndex {\n    entries: Vec<EmbeddingEntry>,\n    /// Track which files are indexed and their mtime for staleness detection\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "is_semantic_indexed_extension",
+          "kind": "function",
+          "line": 2243,
+          "endLine": 2269,
+          "score": 0.6268858313560486,
+          "source": "semantic",
+          "text": "pub fn is_semantic_indexed_extension(path: &Path) -> bool {\n    matches!(\n        path.extension().and_then(|extension| extension.to_str()),\n        Some(\n            \"ts\" | \"tsx\"\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "fuse_hybrid_results",
+          "kind": "function",
+          "line": 218,
+          "endLine": 281,
+          "score": 0.5975385904312134,
+          "source": "hybrid",
+          "text": "pub fn fuse_hybrid_results(\n    semantic: Vec<SemanticResult>,\n    lexical_files: Vec<(PathBuf, f32)>,\n    shape: &QueryShape,\n    top_k: usize,\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "building_lexical_note",
+          "kind": "function",
+          "line": 367,
+          "endLine": 373,
+          "score": 0.5815536379814148,
+          "source": "hybrid",
+          "text": "fn building_lexical_note(lexical_index_ready: bool) -> &'static str {\n    if lexical_index_ready {\n        \"Semantic index is rebuilding; results are lexical-only fallback results from the trigram index.\"\n    } else {\n        \"Semantic index is rebuilding; lexical fallback is unavailable because the..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/pi-plugin/src/tools/semantic.ts",
+          "name": "registerSemanticTool",
+          "kind": "function",
+          "line": 121,
+          "endLine": 163,
+          "score": 0.5083542466163635,
+          "source": "semantic",
+          "text": "export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void {\n  pi.registerTool({\n    name: \"aft_search\",\n    label: \"semantic search\",\n    description: [\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/search_index.rs",
+          "name": "IndexStatus",
+          "kind": "enum",
+          "line": 178,
+          "endLine": 183,
+          "score": 0.5079876780509949,
+          "source": "hybrid",
+          "text": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum IndexStatus {\n    Ready,\n    Building,\n    Fallback,\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/search_index.rs",
+          "name": "lexical_score",
+          "kind": "function",
+          "line": 1382,
+          "endLine": 1408,
+          "score": 0.49778515100479126,
+          "source": "hybrid",
+          "text": "pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {\n    if query_trigrams.is_empty() {\n        return 0.0;\n    }\n\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/tests/integration/semantic_test.rs",
+          "name": "semantic_search_returns_not_ready_without_an_index",
+          "kind": "function",
+          "line": 93,
+          "endLine": 115,
+          "score": 0.4744795858860016,
+          "source": "semantic",
+          "text": "#[test]\nfn semantic_search_returns_not_ready_without_an_index() {\n    let mut aft = AftProcess::spawn();\n\n    let response = send(\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "search-exception",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.4,
+        "p10": 0.2
+      },
+      "foundSymbols": [
+        "HomeProjectRootError"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.201,
+      "latencySamplesMs": [
+        3.201
+      ],
+      "latencyMsMedian": 3.201,
+      "latencyMsP95": 3.201,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "HomeProjectRootError",
+          "kind": "class",
+          "line": 11,
+          "endLine": 38,
+          "score": 0.6543737053871155,
+          "source": "hybrid",
+          "text": "/**\n * Historical error class — kept for backwards-compatible imports.\n *\n * **No longer thrown by `BridgePool.getBridge()`.** Prior versions refused\n * to spawn a bridge when `project_root` resolved to `$HOME`, but that was\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "isHomeDirectoryRoot",
+          "kind": "function",
+          "line": 55,
+          "endLine": 64,
+          "score": 0.5091710686683655,
+          "source": "hybrid",
+          "text": "/**\n * Test whether the given normalized project root matches the user's home\n * directory exactly. Subdirectories of `$HOME` are valid project roots and\n * pass through.\n */\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/aft-bridge/src/resolver.ts",
+          "name": "homeDirFromEnv",
+          "kind": "function",
+          "line": 71,
+          "endLine": 73,
+          "score": 0.4830576479434967,
+          "source": "semantic",
+          "text": "function homeDirFromEnv(env: ResolverEnv): string {\n  return (process.platform === \"win32\" ? env.USERPROFILE || env.HOME : env.HOME) || homedir();\n}"
+        },
+        {
+          "rank": 4,
+          "file": "packages/aft-bridge/src/migration.ts",
+          "name": "homeDir",
+          "kind": "function",
+          "line": 60,
+          "endLine": 63,
+          "score": 0.4576593339443207,
+          "source": "semantic",
+          "text": "function homeDir(): string {\n  if (process.platform === \"win32\") return process.env.USERPROFILE || process.env.HOME || homedir();\n  return process.env.HOME || homedir();\n}"
+        },
+        {
+          "rank": 5,
+          "file": "packages/aft-cli/src/lib/paths.ts",
+          "name": "homeDir",
+          "kind": "function",
+          "line": 60,
+          "endLine": 63,
+          "score": 0.44869768619537354,
+          "source": "semantic",
+          "text": "function homeDir(): string {\n  if (process.platform === \"win32\") return process.env.USERPROFILE || process.env.HOME || homedir();\n  return process.env.HOME || homedir();\n}"
+        },
+        {
+          "rank": 6,
+          "file": "packages/opencode-plugin/src/config.ts",
+          "name": "resolveLspConfigForConfigure",
+          "kind": "function",
+          "line": 279,
+          "endLine": 330,
+          "score": 0.4156401753425598,
+          "source": "hybrid",
+          "text": "export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOverrides {\n  const overrides: ConfigureLspOverrides = {};\n  const disabled = new Set(config.lsp?.disabled ?? []);\n  let experimentalTy = config.experimental?.lsp_ty;\n\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/pi-plugin/src/config.ts",
+          "name": "resolveLspConfigForConfigure",
+          "kind": "function",
+          "line": 402,
+          "endLine": 453,
+          "score": 0.3990648090839386,
+          "source": "hybrid",
+          "text": "export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOverrides {\n  const overrides: ConfigureLspOverrides = {};\n  const disabled = new Set(config.lsp?.disabled ?? []);\n  let experimentalTy = config.experimental?.lsp_ty;\n\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/aft-cli/src/adapters/pi.ts",
+          "name": "getPiAgentDir",
+          "kind": "function",
+          "line": 18,
+          "endLine": 26,
+          "score": 0.3958652913570404,
+          "source": "semantic",
+          "text": "function getPiAgentDir(): string {\n  // Prefer $HOME / %USERPROFILE% so tests can override. Falls back to\n  // os.homedir() which reads from getpwuid()/SHGetKnownFolderPath. Matches\n  // the convention OpenCode and Pi themselves use (settings-manager.js\n  // reads $HOME via getAgentDir()).\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "packages/opencode-plugin/src/shared/storage-paths.ts",
+          "name": "homeDir",
+          "kind": "function",
+          "line": 4,
+          "endLine": 7,
+          "score": 0.3856149911880493,
+          "source": "semantic",
+          "text": "function homeDir(): string {\n  if (process.platform === \"win32\") return process.env.USERPROFILE || process.env.HOME || homedir();\n  return process.env.HOME || homedir();\n}"
+        },
+        {
+          "rank": 10,
+          "file": "packages/opencode-plugin/src/configure-warnings.ts",
+          "name": "drainPendingEagerWarnings",
+          "kind": "function",
+          "line": 44,
+          "endLine": 48,
+          "score": 0.38340041041374207,
+          "source": "semantic",
+          "text": "export function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning[] {\n  const pending = pendingEagerWarnings.get(projectRoot) ?? [];\n  pendingEagerWarnings.delete(projectRoot);\n  return pending;\n}"
+        }
+      ]
+    },
+    {
+      "caseId": "search-nested-class",
+      "api": "searchNodes",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.4,
+        "p10": 0.2
+      },
+      "foundSymbols": [
+        "BridgeReplacedDuringVersionCheck"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.062,
+      "latencySamplesMs": [
+        3.062
+      ],
+      "latencyMsMedian": 3.062,
+      "latencyMsP95": 3.062,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "BridgeReplacedDuringVersionCheck",
+          "kind": "class",
+          "line": 149,
+          "endLine": 154,
+          "score": 0.7731016278266907,
+          "source": "hybrid",
+          "text": "class BridgeReplacedDuringVersionCheck extends Error {\n  constructor(public readonly newBinaryPath: string) {\n    super(`Bridge binary replaced during version check: ${newBinaryPath}`);\n    this.name = \"BridgeReplacedDuringVersionCheck\";\n  }\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "name": "constructor",
+          "kind": "method",
+          "line": 150,
+          "endLine": 153,
+          "score": 0.7385764122009277,
+          "source": "hybrid",
+          "text": "  constructor(public readonly newBinaryPath: string) {\n    super(`Bridge binary replaced during version check: ${newBinaryPath}`);\n    this.name = \"BridgeReplacedDuringVersionCheck\";\n  }"
+        },
+        {
+          "rank": 3,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.5976138114929199,
+          "source": "semantic",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 162,
+          "endLine": 165,
+          "score": 0.5679470300674438,
+          "source": "semantic",
+          "text": "/** Get the session bridge for the current working directory. */\nexport function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {\n  return ctx.pool.getBridge(cwd);\n}"
+        },
+        {
+          "rank": 5,
+          "file": "packages/aft-bridge/src/downloader.ts",
+          "name": "readBinaryVersion",
+          "kind": "function",
+          "line": 44,
+          "endLine": 68,
+          "score": 0.5650995373725891,
+          "source": "semantic",
+          "text": "/**\n * Read the version string from an `aft` binary by invoking it with\n * `--version`. Returns the bare version (e.g. `\"0.22.1\"`) without the\n * leading `v` or the `aft` prefix, or `null` if the invocation fails.\n *\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "getActiveBridgeForRoot",
+          "kind": "method",
+          "line": 163,
+          "endLine": 179,
+          "score": 0.5554708242416382,
+          "source": "semantic",
+          "text": "  /**\n   * Get an alive bridge only when it belongs to the requested project root.\n   *\n   * Used by read-only paths (e.g. `/aft-status`, background-bash drains) that\n   * want to reuse a warm bridge with loaded indexes/LSP state. Returns `null`\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/aft-bridge/src/__tests__/status-cache.test.ts",
+          "name": "makeBridge",
+          "kind": "function",
+          "line": 4,
+          "endLine": 6,
+          "score": 0.5489222407341003,
+          "source": "semantic",
+          "text": "function makeBridge(): BinaryBridge {\n  return new BinaryBridge(\"/bin/false\", process.cwd());\n}"
+        },
+        {
+          "rank": 8,
+          "file": "packages/aft-bridge/src/pool.ts",
+          "name": "replaceBinary",
+          "kind": "method",
+          "line": 284,
+          "endLine": 306,
+          "score": 0.5415365099906921,
+          "source": "semantic",
+          "text": "  /**\n   * Replace the binary path and restart all bridges.\n   * Used after downloading a newer binary version.\n   */\n  async replaceBinary(newPath: string): Promise<string> {\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "packages/aft-bridge/src/downloader.ts",
+          "name": "getCachedBinaryPath",
+          "kind": "function",
+          "line": 101,
+          "endLine": 109,
+          "score": 0.5342585444450378,
+          "source": "semantic",
+          "text": "/** Return the cached binary path if it exists, otherwise null.\n *  Checks the version-specific cache directory only.\n *  The legacy flat cache (~/.cache/aft/bin/aft) is intentionally NOT checked\n *  because it can be overwritten by other instances, corrupting running processes. */\nexport function g..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/aft-cli/src/lib/binary-probe.ts",
+          "name": "loadPluginVersion",
+          "kind": "function",
+          "line": 8,
+          "endLine": 34,
+          "score": 0.5161893367767334,
+          "source": "semantic",
+          "text": "async function loadPluginVersion(): Promise<string> {\n  try {\n    const bridgePackageName: string = \"@cortexkit/aft-bridge\";\n    const bridge = (await import(bridgePackageName)) as Record<string, unknown>;\n    if (typeof bridge.PLUGIN_VERSION === \"string\" && bridge.PLUGIN_VERSION.length > 0) {\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-plugin-bridge",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 1,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.4,
+        "p10": 0.4
+      },
+      "foundSymbols": [
+        "callBridge",
+        "bridgeFor",
+        "BinaryBridge",
+        "BridgePool"
+      ],
+      "missedSymbols": [],
+      "foundFiles": [
+        "packages/opencode-plugin/src/tools/_shared.ts"
+      ],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/aft-bridge/src/pool.ts"
+      ],
+      "latencyMs": 3.563,
+      "latencySamplesMs": [
+        3.563
+      ],
+      "latencyMsMedian": 3.563,
+      "latencyMsP95": 3.563,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "callBridge",
+          "kind": "function",
+          "line": 296,
+          "endLine": 343,
+          "score": 0.7762052416801453,
+          "source": "semantic",
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/opencode-plugin/src/types.ts",
+          "name": "PluginContext",
+          "kind": "interface",
+          "line": 13,
+          "endLine": 24,
+          "score": 0.7728283405303955,
+          "source": "hybrid",
+          "text": "/**\n * Shared context passed to all tool factory functions.\n * Bundles the binary bridge, the OpenCode SDK client, and plugin config.\n */\nexport interface PluginContext {\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.7664448618888855,
+          "source": "semantic",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "packages/opencode-plugin/src/config.ts",
+          "name": "resolveProjectOverridesForConfigure",
+          "kind": "function",
+          "line": 332,
+          "endLine": 378,
+          "score": 0.672701358795166,
+          "source": "semantic",
+          "text": "/**\n * Build the per-project subset of configure overrides that come from\n * `aft.jsonc` (user config merged with project config). Used by the OpenCode\n * plugin's per-bridge `projectConfigLoader` so each project's `aft.jsonc` wins\n * over the user-level config for that project's bridge, instead of ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/shared/opencode-config-dir.ts",
+          "name": "getOpenCodeConfigDir",
+          "kind": "function",
+          "line": 33,
+          "endLine": 35,
+          "score": 0.6358022093772888,
+          "source": "hybrid",
+          "text": "export function getOpenCodeConfigDir(_options: OpenCodeConfigDirOptions): string {\n  return getCliConfigDir();\n}"
+        },
+        {
+          "rank": 6,
+          "file": "packages/opencode-plugin/src/index.ts",
+          "name": "initializePluginForDirectory",
+          "kind": "function",
+          "line": 243,
+          "endLine": 1055,
+          "score": 0.6336000561714172,
+          "source": "semantic",
+          "text": "async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {\n  const binaryPath = await findBinary(PLUGIN_VERSION);\n\n  await ensureStorageMigrated({ harness: \"opencode\", binaryPath, logger: bridgeLogger });\n\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/opencode-plugin/src/tools/hoisted.ts",
+          "name": "aftPrefixedTools",
+          "kind": "function",
+          "line": 1713,
+          "endLine": 1810,
+          "score": 0.6226972341537476,
+          "source": "semantic",
+          "text": "/**\n * Returns the same tools with aft_ prefix (for when hoisting is disabled).\n */\nexport function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  const aftEditTool = createEditTool(ctx, \"aft_write\");\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "packages/opencode-plugin/src/index.ts",
+          "name": "BridgePendingState",
+          "kind": "type_alias",
+          "line": 89,
+          "endLine": 91,
+          "score": 0.6158344149589539,
+          "source": "semantic",
+          "text": "type BridgePendingState = {\n  hasPendingRequests(): boolean;\n};"
+        },
+        {
+          "rank": 9,
+          "file": "packages/opencode-plugin/src/__tests__/tools.test.ts",
+          "name": "createBridge",
+          "kind": "function",
+          "line": 60,
+          "endLine": 69,
+          "score": 0.6151156425476074,
+          "source": "semantic",
+          "text": "  const createBridge = () => {\n    pool = new BridgePool(\n      BINARY_PATH,\n      {\n        timeoutMs: TEST_TIMEOUT_MS,\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/opencode-plugin/src/notifications.ts",
+          "name": "ConfigureWarningOptions",
+          "kind": "interface",
+          "line": 385,
+          "endLine": 392,
+          "score": 0.612797200679779,
+          "source": "semantic",
+          "text": "export interface ConfigureWarningOptions {\n  client: unknown;\n  sessionId: string;\n  bridge: Pick<BinaryBridge, \"send\">;\n  storageDir: string;\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-semantic-search",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.5,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.8,
+        "p10": 0.8
+      },
+      "foundSymbols": [
+        "handle_semantic_search",
+        "SemanticIndex"
+      ],
+      "missedSymbols": [
+        "semanticTools",
+        "SearchIndex"
+      ],
+      "foundFiles": [
+        "crates/aft/src/commands/semantic_search.rs",
+        "crates/aft/src/semantic_index.rs"
+      ],
+      "missedFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/search_index.rs"
+      ],
+      "latencyMs": 3.23,
+      "latencySamplesMs": [
+        3.23
+      ],
+      "latencyMsMedian": 3.23,
+      "latencyMsP95": 3.23,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "handle_semantic_search",
+          "kind": "function",
+          "line": 43,
+          "endLine": 161,
+          "score": 0.6038042306900024,
+          "source": "semantic",
+          "text": "pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {\n    let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {\n        Ok(params) => params,\n        Err(error) => {\n            return Response::error(\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/tests/integration/semantic_test.rs",
+          "name": "semantic_search_returns_not_ready_without_an_index",
+          "kind": "function",
+          "line": 93,
+          "endLine": 115,
+          "score": 0.5885433554649353,
+          "source": "semantic",
+          "text": "#[test]\nfn semantic_search_returns_not_ready_without_an_index() {\n    let mut aft = AftProcess::spawn();\n\n    let response = send(\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "search",
+          "kind": "method",
+          "line": 1483,
+          "endLine": 1526,
+          "score": 0.5737842917442322,
+          "source": "semantic",
+          "text": "    /// Search the index with a query embedding, returning top-K results sorted by relevance\n    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {\n        if self.entries.is_empty() || query_vector.len() != self.dimension {\n            return Vec::new();\n        }\n  ...."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/context.rs",
+          "name": "semantic_index",
+          "kind": "method",
+          "line": 827,
+          "endLine": 830,
+          "score": 0.5732993483543396,
+          "source": "semantic",
+          "text": "    /// Access the semantic search index.\n    pub fn semantic_index(&self) -> &RefCell<Option<SemanticIndex>> {\n        &self.semantic_index\n    }"
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "SemanticIndex",
+          "kind": "struct",
+          "line": 963,
+          "endLine": 976,
+          "score": 0.5576668977737427,
+          "source": "semantic",
+          "text": "/// The semantic index — stores embeddings for all symbols in a project\n#[derive(Debug)]\npub struct SemanticIndex {\n    entries: Vec<EmbeddingEntry>,\n    /// Track which files are indexed and their mtime for staleness detection\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "SemanticResult",
+          "kind": "struct",
+          "line": 1002,
+          "endLine": 1014,
+          "score": 0.5521960258483887,
+          "source": "semantic",
+          "text": "/// Search result from a semantic query\n#[derive(Debug, Clone)]\npub struct SemanticResult {\n    pub file: PathBuf,\n    pub name: String,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/context.rs",
+          "name": "semantic_index_status",
+          "kind": "method",
+          "line": 839,
+          "endLine": 841,
+          "score": 0.551764965057373,
+          "source": "semantic",
+          "text": "    pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {\n        &self.semantic_index_status\n    }"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "fuse_hybrid_results",
+          "kind": "function",
+          "line": 218,
+          "endLine": 281,
+          "score": 0.5471777319908142,
+          "source": "semantic",
+          "text": "pub fn fuse_hybrid_results(\n    semantic: Vec<SemanticResult>,\n    lexical_files: Vec<(PathBuf, f32)>,\n    shape: &QueryShape,\n    top_k: usize,\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/tests/integration/semantic_test.rs",
+          "name": "wait_for_ready_search",
+          "kind": "function",
+          "line": 66,
+          "endLine": 91,
+          "score": 0.5411497354507446,
+          "source": "semantic",
+          "text": "fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {\n    for _ in 0..180 {\n        let response = send(\n            aft,\n            json!({\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "is_semantic_indexed_extension",
+          "kind": "function",
+          "line": 2243,
+          "endLine": 2269,
+          "score": 0.5393858551979065,
+          "source": "semantic",
+          "text": "pub fn is_semantic_indexed_extension(path: &Path) -> bool {\n    matches!(\n        path.extension().and_then(|extension| extension.to_str()),\n        Some(\n            \"ts\" | \"tsx\"\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-background-bash",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.5,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 1,
+        "p10": 0.6
+      },
+      "foundSymbols": [
+        "PersistedTask",
+        "write_task"
+      ],
+      "missedSymbols": [
+        "BgTaskRegistry",
+        "replay_session"
+      ],
+      "foundFiles": [
+        "crates/aft/src/bash_background/registry.rs",
+        "crates/aft/src/bash_background/persistence.rs"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.075,
+      "latencySamplesMs": [
+        3.075
+      ],
+      "latencyMsMedian": 3.075,
+      "latencyMsP95": 3.075,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "name": "persist_task",
+          "kind": "method",
+          "line": 249,
+          "endLine": 253,
+          "score": 0.6172124147415161,
+          "source": "semantic",
+          "text": "    fn persist_task(&self, paths: &TaskPaths, metadata: &PersistedTask) -> std::io::Result<()> {\n        write_task(&paths.json, metadata)?;\n        self.dual_write_task(paths, metadata);\n        Ok(())\n    }"
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "name": "maybe_gc_persisted",
+          "kind": "method",
+          "line": 1316,
+          "endLine": 1398,
+          "score": 0.598507285118103,
+          "source": "semantic",
+          "text": "    pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {\n        #[cfg(test)]\n        self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);\n\n        let mut deleted = 0usize;\n  ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "name": "running_tasks",
+          "kind": "method",
+          "line": 1761,
+          "endLine": 1773,
+          "score": 0.5867871046066284,
+          "source": "semantic",
+          "text": "    pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {\n        self.inner\n            .tasks\n            .lock()\n            .map(|tasks| {\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/bash_background/persistence.rs",
+          "name": "update_task",
+          "kind": "function",
+          "line": 373,
+          "endLine": 390,
+          "score": 0.5749790072441101,
+          "source": "semantic",
+          "text": "pub fn update_task<F>(path: &Path, update: F) -> io::Result<PersistedTask>\nwhere\n    F: FnOnce(&mut PersistedTask),\n{\n    let mut task = read_task(path)?;\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/bash_background/persistence.rs",
+          "name": "starting",
+          "kind": "method",
+          "line": 83,
+          "endLine": 116,
+          "score": 0.5566791296005249,
+          "source": "semantic",
+          "text": "    pub fn starting(\n        task_id: String,\n        session_id: String,\n        command: String,\n        workdir: PathBuf,\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/tests/integration/bash_background_persistence_test.rs",
+          "name": "fake_task",
+          "kind": "function",
+          "line": 184,
+          "endLine": 214,
+          "score": 0.5562663078308105,
+          "source": "semantic",
+          "text": "fn fake_task(\n    storage: &Path,\n    project: &Path,\n    session: &str,\n    task_id: &str,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "name": "task_exit_path",
+          "kind": "method",
+          "line": 2469,
+          "endLine": 2473,
+          "score": 0.5485702753067017,
+          "source": "semantic",
+          "text": "    #[cfg(test)]\n    pub fn task_exit_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {\n        self.task_for_session(task_id, session_id)\n            .map(|task| task.paths.exit.clone())\n    }"
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/tests/integration/bash_background_persistence_test.rs",
+          "name": "spawn_detached_survives_parent_restart",
+          "kind": "function",
+          "line": 917,
+          "endLine": 942,
+          "score": 0.5465955138206482,
+          "source": "semantic",
+          "text": "#[test]\nfn spawn_detached_survives_parent_restart() {\n    let project = tempfile::tempdir().unwrap();\n    let storage = spawn_storage_dir(\"storage\");\n\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/tests/integration/bash_background_persistence_test.rs",
+          "name": "cleanup_finished_retains_undelivered_terminals",
+          "kind": "function",
+          "line": 840,
+          "endLine": 866,
+          "score": 0.5435733199119568,
+          "source": "semantic",
+          "text": "#[test]\nfn cleanup_finished_retains_undelivered_terminals() {\n    let project = tempfile::tempdir().unwrap();\n    let storage = tempfile::tempdir().unwrap();\n    let registry = registry();\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/tests/integration/bash_background_persistence_test.rs",
+          "name": "persistence_restore_does_not_push_completion_frame",
+          "kind": "function",
+          "line": 1114,
+          "endLine": 1163,
+          "score": 0.5312802195549011,
+          "source": "semantic",
+          "text": "#[test]\nfn persistence_restore_does_not_push_completion_frame() {\n    let project = tempfile::tempdir().unwrap();\n    let storage = spawn_storage_dir(\"storage\");\n    let task_id = {\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-lsp-diagnostics",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.5,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.6,
+        "p10": 0.5
+      },
+      "foundSymbols": [
+        "wait_for_diagnostics",
+        "PostEditWaitOutcome"
+      ],
+      "missedSymbols": [
+        "LspManager",
+        "pull_file_diagnostics"
+      ],
+      "foundFiles": [
+        "crates/aft/src/lsp/manager.rs"
+      ],
+      "missedFiles": [],
+      "latencyMs": 3.493,
+      "latencySamplesMs": [
+        3.493
+      ],
+      "latencyMsMedian": 3.493,
+      "latencyMsP95": 3.493,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/lsp/manager.rs",
+          "name": "PostEditWaitOutcome",
+          "kind": "struct",
+          "line": 82,
+          "endLine": 105,
+          "score": 0.7469871044158936,
+          "source": "semantic",
+          "text": "/// Outcome of a post-edit diagnostics wait. Reports the per-server status\n/// alongside the fresh diagnostics, so the response layer can build an\n/// honest tri-state payload (`success: true` + `complete: bool` + named\n/// gap fields per `crates/aft/src/protocol.rs`).\n///\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/lsp/client.rs",
+          "name": "ServerDiagnosticCapabilities",
+          "kind": "struct",
+          "line": 67,
+          "endLine": 87,
+          "score": 0.6983404159545898,
+          "source": "semantic",
+          "text": "/// What this server told us it can do during the LSP `initialize` handshake.\n///\n/// We capture this once and use it to route diagnostic requests:\n/// - `pull_diagnostics` → use `textDocument/diagnostic` instead of waiting for push\n/// - `workspace_diagnostics` → use `workspace/diagnostic` for ..."
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/lsp/manager.rs",
+          "name": "wait_for_diagnostics",
+          "kind": "method",
+          "line": 709,
+          "endLine": 718,
+          "score": 0.6543569564819336,
+          "source": "semantic",
+          "text": "    /// Wait for diagnostics to arrive for a specific file until a timeout expires.\n    pub fn wait_for_diagnostics(\n        &mut self,\n        file_path: &Path,\n        config: &Config,\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/lsp/manager.rs",
+          "name": "wait_for_diagnostics_default",
+          "kind": "method",
+          "line": 720,
+          "endLine": 726,
+          "score": 0.6359536051750183,
+          "source": "semantic",
+          "text": "    pub fn wait_for_diagnostics_default(\n        &mut self,\n        file_path: &Path,\n        timeout: std::time::Duration,\n    ) -> Vec<StoredDiagnostic> {\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "crates/aft/src/context.rs",
+          "name": "lsp_notify_and_collect_diagnostics",
+          "kind": "method",
+          "line": 876,
+          "endLine": 929,
+          "score": 0.6330790519714355,
+          "source": "semantic",
+          "text": "    /// Notify LSP and optionally wait for diagnostics.\n    ///\n    /// Call this after `write_format_validate` when the request has `\"diagnostics\": true`.\n    /// Sends didChange to the server, waits briefly for publishDiagnostics, and returns\n    /// any diagnostics for the file. If no server is r..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/lsp/manager.rs",
+          "name": "pull_workspace_diagnostics",
+          "kind": "method",
+          "line": 1100,
+          "endLine": 1207,
+          "score": 0.6300912499427795,
+          "source": "semantic",
+          "text": "    /// Issue a `workspace/diagnostic` request to a specific server. Cancels\n    /// internally if `timeout` elapses before the server responds. Cached\n    /// entries from the response are stored so directory-mode queries pick\n    /// them up.\n    pub fn pull_workspace_diagnostics(\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/lsp/manager.rs",
+          "name": "wait_for_file_diagnostics",
+          "kind": "method",
+          "line": 936,
+          "endLine": 981,
+          "score": 0.6243245601654053,
+          "source": "semantic",
+          "text": "    /// Wait for diagnostics to arrive for a specific file until a deadline.\n    ///\n    /// Drains already-queued events first, then blocks on the shared event\n    /// channel only until either `publishDiagnostics` arrives for this file or\n    /// the deadline is reached.\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/lsp/pull_params.rs",
+          "name": "AftDocumentDiagnosticParams",
+          "kind": "struct",
+          "line": 3,
+          "endLine": 27,
+          "score": 0.6179157495498657,
+          "source": "semantic",
+          "text": "/// Parameters for `textDocument/diagnostic` pull requests.\n///\n/// This mirrors `lsp_types::DocumentDiagnosticParams`, but omits absent\n/// optional fields from the JSON payload. The LSP 3.17 schema allows\n/// `identifier` and `previousResultId` to be strings or absent, not `null`.\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/tests/integration/lsp_commands_test.rs",
+          "name": "wait_for_server",
+          "kind": "function",
+          "line": 54,
+          "endLine": 57,
+          "score": 0.6099213361740112,
+          "source": "semantic",
+          "text": "fn wait_for_server(ctx: &AppContext) {\n    thread::sleep(Duration::from_millis(200));\n    ctx.lsp().drain_events();\n}"
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/tests/integration/lsp_diagnostics_test.rs",
+          "name": "test_pull_diagnostics_returns_full_report",
+          "kind": "function",
+          "line": 1236,
+          "endLine": 1284,
+          "score": 0.5976461172103882,
+          "source": "semantic",
+          "text": "/// When the server declares pull-diagnostic capability AND the LSP client\n/// requests `textDocument/diagnostic`, the response should populate cache\n/// entries and be reachable via `get_diagnostics_for_file`.\n///\n/// We exercise this via env vars on the fake server: `AFT_FAKE_LSP_PULL=1`\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-bridge-search",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.75,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.8,
+        "p10": 0.6
+      },
+      "foundSymbols": [
+        "BinaryBridge",
+        "send",
+        "semanticTools"
+      ],
+      "missedSymbols": [
+        "handle_semantic_search"
+      ],
+      "foundFiles": [
+        "packages/opencode-plugin/src/tools/semantic.ts",
+        "crates/aft/src/commands/semantic_search.rs"
+      ],
+      "missedFiles": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "latencyMs": 3.831,
+      "latencySamplesMs": [
+        3.831
+      ],
+      "latencyMsMedian": 3.831,
+      "latencyMsP95": 3.831,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 282,
+          "endLine": 294,
+          "score": 0.5824099183082581,
+          "source": "hybrid",
+          "text": "/**\n * Get the BinaryBridge for the runtime's project root.\n *\n * Prefer `callBridge()` unless you need to send multiple requests yourself.\n *\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "packages/opencode-plugin/src/tools/semantic.ts",
+          "name": "semanticTools",
+          "kind": "function",
+          "line": 14,
+          "endLine": 71,
+          "score": 0.5791865587234497,
+          "source": "semantic",
+          "text": "export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  const searchTool: ToolDefinition = {\n    description: [\n      \"Find symbols by concept using hybrid semantic + lexical search. Returns ranked code matches with similarity scores and provenance tags.\",\n      \"\",\n  ...."
+        },
+        {
+          "rank": 3,
+          "file": "packages/opencode-plugin/src/tools/_shared.ts",
+          "name": "callBridge",
+          "kind": "function",
+          "line": 296,
+          "endLine": 343,
+          "score": 0.5761176943778992,
+          "source": "hybrid",
+          "text": "/**\n * Send a single command to the Rust binary with `session_id` injected.\n *\n * This is the canonical way for a tool handler to call AFT: the helper picks\n * the right bridge (project-keyed), attaches the session namespace from\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "fuse_hybrid_results",
+          "kind": "function",
+          "line": 218,
+          "endLine": 281,
+          "score": 0.5182677507400513,
+          "source": "semantic",
+          "text": "pub fn fuse_hybrid_results(\n    semantic: Vec<SemanticResult>,\n    lexical_files: Vec<(PathBuf, f32)>,\n    shape: &QueryShape,\n    top_k: usize,\n  ..."
+        },
+        {
+          "rank": 5,
+          "file": "packages/pi-plugin/src/tools/semantic.ts",
+          "name": "registerSemanticTool",
+          "kind": "function",
+          "line": 121,
+          "endLine": 163,
+          "score": 0.5181058645248413,
+          "source": "semantic",
+          "text": "export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void {\n  pi.registerTool({\n    name: \"aft_search\",\n    label: \"semantic search\",\n    description: [\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/semantic_index.rs",
+          "name": "SemanticResult",
+          "kind": "struct",
+          "line": 1002,
+          "endLine": 1014,
+          "score": 0.5151490569114685,
+          "source": "semantic",
+          "text": "/// Search result from a semantic query\n#[derive(Debug, Clone)]\npub struct SemanticResult {\n    pub file: PathBuf,\n    pub name: String,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "packages/pi-plugin/src/tools/_shared.ts",
+          "name": "bridgeFor",
+          "kind": "function",
+          "line": 162,
+          "endLine": 165,
+          "score": 0.5094743371009827,
+          "source": "hybrid",
+          "text": "/** Get the session bridge for the current working directory. */\nexport function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {\n  return ctx.pool.getBridge(cwd);\n}"
+        },
+        {
+          "rank": 8,
+          "file": "packages/opencode-plugin/src/__tests__/e2e/semantic-search.test.ts",
+          "name": "createToolHarness",
+          "kind": "function",
+          "line": 69,
+          "endLine": 96,
+          "score": 0.5016852021217346,
+          "source": "semantic",
+          "text": "  async function createToolHarness(options?: { experimentalSemanticSearch?: boolean }) {\n    const harness = await createHarness(preparedBinary, {\n      fixtureNames: [],\n      timeoutMs: 20_000,\n      tempPrefix: \"aft-plugin-semantic-search-\",\n  ..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "name": "HybridResult",
+          "kind": "struct",
+          "line": 21,
+          "endLine": 34,
+          "score": 0.49713853001594543,
+          "source": "semantic",
+          "text": "#[derive(Debug, Clone)]\npub struct HybridResult {\n    pub file: PathBuf,\n    pub name: String,\n    pub kind: SymbolKind,\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "packages/pi-plugin/src/__tests__/tool-test-utils.ts",
+          "name": "makeMockBridge",
+          "kind": "function",
+          "line": 46,
+          "endLine": 83,
+          "score": 0.4948219358921051,
+          "source": "hybrid",
+          "text": "export function makeMockBridge(\n  handler: (\n    command: string,\n    params: Record<string, unknown>,\n    options?: Record<string, unknown>,\n  ..."
+        }
+      ]
+    },
+    {
+      "caseId": "explore-import-organization",
+      "api": "findRelevantContext",
+      "driver": "aft",
+      "pass": true,
+      "recall": 0.75,
+      "mrr": 1,
+      "precisionAtK": {
+        "p1": 1,
+        "p5": 0.6,
+        "p10": 0.8
+      },
+      "foundSymbols": [
+        "handle_organize_imports",
+        "parse_imports",
+        "classify_group"
+      ],
+      "missedSymbols": [
+        "generate_import_line"
+      ],
+      "foundFiles": [
+        "crates/aft/src/commands/organize_imports.rs",
+        "crates/aft/src/imports.rs"
+      ],
+      "missedFiles": [],
+      "latencyMs": 5.455,
+      "latencySamplesMs": [
+        5.455
+      ],
+      "latencyMsMedian": 5.455,
+      "latencyMsP95": 5.455,
+      "resultCount": 10,
+      "results": [
+        {
+          "rank": 1,
+          "file": "crates/aft/src/imports.rs",
+          "name": "ImportGroup",
+          "kind": "enum",
+          "line": 30,
+          "endLine": 49,
+          "score": 0.6036604642868042,
+          "source": "semantic",
+          "text": "/// Which logical group an import belongs to (language-specific).\n///\n/// Ordering matches conventional import group sorting:\n///   Stdlib (first) < External < Internal (last)\n///\n  ..."
+        },
+        {
+          "rank": 2,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "name": "organize_imports",
+          "kind": "file_summary",
+          "score": 0.5870503187179565,
+          "source": "semantic",
+          "text": "//! Handler for the `organize_imports` command: re-group, sort, deduplicate, and\n//! optionally merge imports in a file.\n//!\n//! For all languages: extracts imports, groups by convention, sorts alphab"
+        },
+        {
+          "rank": 3,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "name": "OrganizedImport",
+          "kind": "struct",
+          "line": 240,
+          "endLine": 248,
+          "score": 0.5501118302345276,
+          "source": "semantic",
+          "text": "/// An organized import ready for code generation.\n#[derive(Debug, Clone)]\nstruct OrganizedImport {\n    module_path: String,\n    names: Vec<String>,\n  ..."
+        },
+        {
+          "rank": 4,
+          "file": "crates/aft/src/commands/add_import.rs",
+          "name": "add_import",
+          "kind": "file_summary",
+          "score": 0.5294051766395569,
+          "source": "semantic",
+          "text": "//! Handler for the `add_import` command: add an import statement to a file.\n//!\n//! Analyzes existing imports, checks for duplicates, finds the correct\n//! insertion point based on group and alphabet"
+        },
+        {
+          "rank": 5,
+          "file": "packages/opencode-plugin/src/tools/imports.ts",
+          "name": "importTools",
+          "kind": "function",
+          "line": 15,
+          "endLine": 95,
+          "score": 0.5275975465774536,
+          "source": "semantic",
+          "text": "/**\n * Tool definitions for import management commands: add_import, remove_import, organize_imports.\n */\nexport function importTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  return {\n  ..."
+        },
+        {
+          "rank": 6,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "name": "organize",
+          "kind": "function",
+          "line": 210,
+          "endLine": 238,
+          "score": 0.5168620347976685,
+          "source": "semantic",
+          "text": "/// Organize imports: group by convention, sort within groups, deduplicate.\n/// Returns (grouped imports in order, count of removed duplicates).\nfn organize(\n    imports: &[ImportStatement],\n    lang: LangId,\n  ..."
+        },
+        {
+          "rank": 7,
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "name": "handle_organize_imports",
+          "kind": "function",
+          "line": 21,
+          "endLine": 208,
+          "score": 0.5157127380371094,
+          "source": "semantic",
+          "text": "/// Handle an `organize_imports` request.\n///\n/// Params:\n///   - `file` (string, required) — target file path\n///\n  ..."
+        },
+        {
+          "rank": 8,
+          "file": "crates/aft/src/imports.rs",
+          "name": "generate_go_import_line",
+          "kind": "function",
+          "line": 1525,
+          "endLine": 1543,
+          "score": 0.4989551603794098,
+          "source": "semantic",
+          "text": "/// Generate a Go import line (public API for command handler).\n///\n/// `in_group` controls whether to generate a spec for insertion into an\n/// existing grouped import (`\\t\"path\"`) or a standalone import (`import \"path\"`).\nfn generate_go_import_line(module_path: &str, alias: Option<&str>, in_group:..."
+        },
+        {
+          "rank": 9,
+          "file": "crates/aft/src/imports.rs",
+          "name": "classify_group_ts",
+          "kind": "function",
+          "line": 463,
+          "endLine": 470,
+          "score": 0.49513670802116394,
+          "source": "semantic",
+          "text": "/// Classify a module path into a group for TS/JS/TSX.\npub fn classify_group_ts(module_path: &str) -> ImportGroup {\n    if module_path.starts_with('.') {\n        ImportGroup::Internal\n    } else {\n  ..."
+        },
+        {
+          "rank": 10,
+          "file": "crates/aft/src/imports.rs",
+          "name": "parse_imports",
+          "kind": "function",
+          "line": 170,
+          "endLine": 195,
+          "score": 0.49397188425064087,
+          "source": "semantic",
+          "text": "/// Parse imports from source using the provided tree-sitter tree.\npub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {\n    match lang {\n        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => parse_ts_imports(source, tree),\n        LangId::Python => parse_py_impor..."
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "binaryPath": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/target/release/aft",
+    "latencyNote": "latencySamplesMs are wall-clock measurements around each actual driver dispatch",
+    "harnessDir": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_1e2cc588/benchmarks/codegraph-replication",
+    "methodology": "AFT replication of codegraph/__tests__/evaluation structured retrieval-quality eval"
+  }
+}

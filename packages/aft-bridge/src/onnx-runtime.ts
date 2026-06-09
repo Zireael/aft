@@ -53,7 +53,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
@@ -181,8 +181,14 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   const info = getPlatformInfo();
 
   // 1. Cached location with TOFU.
-  const ortDir = join(storageDir, "onnxruntime", ORT_VERSION);
-  const libPath = join(ortDir, info?.libName ?? "libonnxruntime.dylib");
+  const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
+  const libName = info?.libName ?? "libonnxruntime.dylib";
+  // Keep the version root separate from the resolved library directory. The
+  // root owns cleanup, downloads, and TOFU metadata; the resolved dir only
+  // feeds the return value / ORT_DYLIB_PATH and may be `<version>/lib` for
+  // manual Microsoft-archive installs (#71).
+  const resolvedOrtDir = resolveCachedOnnxRuntimeDir(ortVersionDir, libName);
+  const libPath = join(resolvedOrtDir, libName);
 
   if (existsSync(libPath)) {
     // Audit-3 v0.17 #1 (TOFU): if we recorded a hash for this version,
@@ -190,30 +196,32 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
     // partial install corruption. Refuse to use it and let the caller
     // either retry the download (after the user clears the cache) or
     // fall back to system install.
-    const meta = readOnnxInstalledMeta(ortDir);
+    // Our installer writes the TOFU meta file to the version root, never the
+    // lib/ subdir, so always read it from there.
+    const meta = readOnnxInstalledMeta(ortVersionDir);
     if (meta?.sha256) {
       try {
         const currentHash = sha256File(libPath);
         if (currentHash !== meta.sha256) {
           error(
-            `ONNX Runtime at ${ortDir}: TOFU sha256 mismatch — refusing to use ` +
+            `ONNX Runtime at ${resolvedOrtDir}: TOFU sha256 mismatch — refusing to use ` +
               `tampered binary. Recorded ${meta.sha256}, current ${currentHash}. ` +
               `Run \`aft doctor --clear\` to re-download from scratch.`,
           );
           // Fall through to system path / re-download attempt below.
         } else {
-          log(`ONNX Runtime found at ${ortDir} (TOFU verified)`);
-          return ortDir;
+          log(`ONNX Runtime found at ${resolvedOrtDir} (TOFU verified)`);
+          return resolvedOrtDir;
         }
       } catch (err) {
-        warn(`Could not verify ONNX Runtime hash at ${ortDir}: ${err}`);
+        warn(`Could not verify ONNX Runtime hash at ${resolvedOrtDir}: ${err}`);
         // Treat unreadable hash as "trust on existence" since we already
         // owned this install — better than blocking semantic search.
-        return ortDir;
+        return resolvedOrtDir;
       }
     } else {
-      log(`ONNX Runtime found at ${ortDir} (no recorded hash, accepting)`);
-      return ortDir;
+      log(`ONNX Runtime found at ${resolvedOrtDir} (no recorded hash, accepting)`);
+      return resolvedOrtDir;
     }
   }
 
@@ -245,8 +253,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
 
   // Recover from SIGKILL'd previous attempts before acquiring the lock.
   // When the host process is killed mid-download (user closes OpenCode while
-  // ONNX is still downloading), the staging dir at `${ortDir}.tmp.<pid>.<ts>`
-  // and a half-populated `ortDir` can survive without a meta file. The
+  // ONNX is still downloading), the staging dir at `${ortVersionDir}.tmp.<pid>.<ts>`
+  // and a half-populated `ortVersionDir` can survive without a meta file. The
   // existing TOFU branch above already handles a tampered-but-complete
   // install, but this branch covers the "abandoned, incomplete" case where
   // the lib file isn't present (we wouldn't be here otherwise). Sweep them
@@ -261,8 +269,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   }
 
   try {
-    cleanupIncompleteTargetIfUnowned(ortDir);
-    return await downloadOnnxRuntime(info, ortDir);
+    cleanupIncompleteTargetIfUnowned(ortVersionDir);
+    return await downloadOnnxRuntime(info, ortVersionDir);
   } finally {
     releaseLock(lockPath);
   }
@@ -272,9 +280,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
  * Sweep abandoned `*.tmp.<pid>.<ts>` staging directories left behind by
  * killed download attempts, and remove an empty/half-populated target dir
  * so the next download retries cleanly. Safe to call before lock acquisition
- * because we only delete dirs whose owning PID is dead (or when the parent
- * dir's mtime exceeds STALE_LOCK_MS — covers Windows where we can't check
- * process liveness reliably).
+ * because we only delete dirs whose owning PID is dead (or, on Windows,
+ * very old while the owner is still reported alive).
  */
 function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
   // Sweep .tmp.* staging dirs whose pid is dead or are sufficiently old.
@@ -290,13 +297,19 @@ function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
       let abandoned = false;
       if (Number.isFinite(pid) && pid > 0) {
         if (process.platform === "win32") {
-          // No reliable cross-process liveness check on Windows; fall back
-          // to mtime-based age comparison.
-          try {
-            const ageMs = Date.now() - statSync(stagingDir).mtimeMs;
-            abandoned = ageMs > STALE_LOCK_MS;
-          } catch {
+          const ownerAlive = isProcessAlive(pid);
+          if (!ownerAlive) {
             abandoned = true;
+          } else {
+            // Keep the existing stale-age escape hatch for very old Windows
+            // attempts, but no longer impose a blind 5-minute wait when the
+            // owning process has already exited.
+            try {
+              const ageMs = Date.now() - statSync(stagingDir).mtimeMs;
+              abandoned = ageMs > STALE_LOCK_MS;
+            } catch {
+              abandoned = true;
+            }
           }
         } else {
           abandoned = !isProcessAlive(pid);
@@ -349,14 +362,49 @@ function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void
  */
 const REQUIRED_ORT_MAJOR = 1;
 const REQUIRED_ORT_MIN_MINOR = 20;
+const INVALID_ORT_VERSION = "<invalid>";
+
+function parseOnnxVersionFromPath(value: string): string | null {
+  const name = basename(value);
+  const semverish = name.match(
+    /(?:^|[._-])(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\.(?:dylib|dll))?$/,
+  );
+  if (semverish) return semverish[1].split(/[-+]/, 1)[0];
+  return /\d+\.\d+\.\d+/.test(name) ? INVALID_ORT_VERSION : null;
+}
+
+function parseOnnxVersionFromDirectoryPath(value: string): string | null {
+  const parts = value
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .reverse();
+  for (const part of parts) {
+    const version = parseOnnxVersionFromPath(part);
+    if (version) return version;
+  }
+  return null;
+}
+
+function isPathInsideRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return (
+    rel === "" ||
+    (!rel.startsWith("../") &&
+      !rel.startsWith("..\\") &&
+      rel !== ".." &&
+      !isAbsolute(rel) &&
+      !win32.isAbsolute(rel))
+  );
+}
 
 /**
  * Detect the version of an ONNX Runtime install by walking the directory's
  * library-file suffixes. Microsoft ships `libonnxruntime.so.1.24.4` and
  * symlinks the bare `libonnxruntime.so` at it; on macOS the pattern is
- * `libonnxruntime.1.24.4.dylib`. Returns null when the version cannot be
- * inferred (treat as compatible to avoid false negatives on unconventional
- * installs).
+ * `libonnxruntime.1.24.4.dylib`. Returns null only when no version-shaped
+ * suffix is present (treat as compatible to avoid false negatives on
+ * unconventional installs). Malformed version-shaped suffixes return an invalid
+ * sentinel so the system install is rejected instead of silently accepted.
  */
 function detectOnnxVersion(libDir: string, libName: string): string | null {
   try {
@@ -369,29 +417,32 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
     // `libonnxruntime.so.1.24.4` and macOS's `libonnxruntime.1.24.4.dylib`
     // are picked up.
     const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
+    const expectedPrefix = process.platform === "win32" ? barePrefix.toLowerCase() : barePrefix;
     for (const entry of entries) {
-      if (!entry.startsWith(barePrefix)) continue;
-      const match = entry.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-      if (match) return match[1];
+      const comparable = process.platform === "win32" ? entry.toLowerCase() : entry;
+      if (!comparable.startsWith(expectedPrefix)) continue;
+      const version = parseOnnxVersionFromPath(entry);
+      if (version) return version;
     }
     // Symlink fallback: bare libonnxruntime.so -> libonnxruntime.so.1.24.4
     const base = join(libDir, libName);
     if (existsSync(base)) {
       try {
         const real = realpathSync(base);
-        const m = real.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-        if (m) return m[1];
+        const version = parseOnnxVersionFromPath(real) ?? parseOnnxVersionFromDirectoryPath(real);
+        if (version) return version;
       } catch {
         // ignore
       }
       try {
         const target = readlinkSync(base);
-        const m = target.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-        if (m) return m[1];
+        const version = parseOnnxVersionFromPath(target);
+        if (version) return version;
       } catch {
         // not a symlink
       }
     }
+    return parseOnnxVersionFromDirectoryPath(libDir);
   } catch {
     // unreadable dir
   }
@@ -404,6 +455,44 @@ function isOnnxVersionCompatible(version: string): boolean {
   if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
   if (major !== REQUIRED_ORT_MAJOR) return false;
   return minor >= REQUIRED_ORT_MIN_MINOR;
+}
+
+function pathEnvValue(): string {
+  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+}
+
+function pathEntriesForPlatform(): string[] {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathEnvValue()
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter((entry) => {
+      if (!entry || entry === "." || entry.includes("\0")) return false;
+      return isAbsolute(entry) || win32.isAbsolute(entry);
+    });
+}
+
+function directoryContainsLibrary(dir: string, libName: string): boolean {
+  try {
+    const entries = readdirSync(dir);
+    if (process.platform === "win32") {
+      const expected = libName.toLowerCase();
+      return entries.some((entry) => entry.toLowerCase() === expected);
+    }
+    return entries.includes(libName);
+  } catch {
+    return false;
+  }
+}
+
+function resolveCachedOnnxRuntimeDir(ortVersionDir: string, libName: string): string {
+  // AFT's own installer flattens the runtime libraries into the version root.
+  // Microsoft's archives keep them under lib/. Prefer the root when both exist
+  // because downloads and metadata are anchored there.
+  if (existsSync(join(ortVersionDir, libName))) return ortVersionDir;
+  const libSubdir = join(ortVersionDir, "lib");
+  if (existsSync(join(libSubdir, libName))) return libSubdir;
+  return ortVersionDir;
 }
 
 function findSystemOnnxRuntime(libName?: string): string | null {
@@ -421,17 +510,85 @@ function findSystemOnnxRuntime(libName?: string): string | null {
       "/usr/lib/aarch64-linux-gnu",
       "/usr/local/lib",
     );
+  } else if (process.platform === "win32") {
+    // Common Windows install locations for ONNX Runtime
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    searchPaths.push(
+      join(programFiles, "onnxruntime", "lib"),
+      join(programFiles, "Microsoft ONNX Runtime", "lib"),
+      join(programFiles, "Microsoft Machine Learning", "lib"),
+      join(programFilesX86, "onnxruntime", "lib"),
+      // Windows NuGet package layout:
+      //   <user>\.nuget\packages\microsoft.ml.onnxruntime\<version>\runtimes\win-{x64,arm64}\native\
+      // Scan all installed versions since we don't know which one is present.
+      ...(() => {
+        const nugetPaths: string[] = [];
+        const userProfile = process.env.USERPROFILE ?? "";
+        if (!userProfile) return nugetPaths;
+        const nugetPackageDir = join(userProfile, ".nuget", "packages", "microsoft.ml.onnxruntime");
+        if (!existsSync(nugetPackageDir)) return nugetPaths;
+        try {
+          for (const entry of readdirSync(nugetPackageDir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            // Skip well-known non-version entries
+            if (entry.name === "__globalPackagesFolder" || entry.name.startsWith(".")) continue;
+            nugetPaths.push(
+              join(nugetPackageDir, entry.name, "runtimes", "win-x64", "native"),
+              join(nugetPackageDir, entry.name, "runtimes", "win-arm64", "native"),
+            );
+          }
+        } catch (err) {
+          warn(
+            `Failed to scan NuGet ONNX Runtime cache ${nugetPackageDir}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        return nugetPaths;
+      })(),
+    );
+    // Also include absolute PATH entries (reuses the existing helper that
+    // validates absolute paths, rejects null bytes, strips quotes, excludes ".").
+    searchPaths.push(...pathEntriesForPlatform());
   }
 
-  for (const dir of searchPaths) {
-    if (!existsSync(join(dir, libName))) continue;
+  // Deduplicate paths while preserving order.
+  // On case-insensitive filesystems (Windows, macOS) normalize casing for
+  // comparison; on Linux the raw path casing is the authority.
+  const normalizeCase = process.platform === "win32" || process.platform === "darwin";
+  const seen = new Set<string>();
+  const uniquePaths = searchPaths.filter((p) => {
+    let key = resolve(p).replace(/[/\\]+$/, "");
+    if (normalizeCase) key = key.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const unknownVersionPaths: string[] = [];
+
+  for (const dir of uniquePaths) {
+    const libPath = join(dir, libName);
+    if (process.platform === "win32") {
+      if (!directoryContainsLibrary(dir, libName)) continue;
+    } else if (!existsSync(libPath)) {
+      continue;
+    }
 
     // Reject system installs that the Rust pre-validator will refuse. Without
     // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
     // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
     // stays "failed" until the user hand-deletes the system library.
+    //
+    // Windows PATH/NuGet installs often expose only `onnxruntime.dll`, so we
+    // also mine version-bearing parent directories and symlink targets. When a
+    // version is unknown, keep it as a last-choice fallback rather than letting
+    // it shadow a later candidate with a known compatible version.
     const version = detectOnnxVersion(dir, libName);
-    if (version && !isOnnxVersionCompatible(version)) {
+    if (!version) {
+      unknownVersionPaths.push(dir);
+      continue;
+    }
+    if (!isOnnxVersionCompatible(version)) {
       warn(
         `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
           `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
@@ -442,7 +599,7 @@ function findSystemOnnxRuntime(libName?: string): string | null {
     return dir;
   }
 
-  return null;
+  return unknownVersionPaths[0] ?? null;
 }
 
 /**
@@ -535,7 +692,10 @@ function validateExtractedTree(stagingRoot: string): void {
         const linkTarget = readlinkSync(fullPath);
         const resolvedTarget = resolve(dirname(fullPath), linkTarget);
         const rel = relative(realRoot, resolvedTarget);
-        if (rel.startsWith("..") || (process.platform !== "win32" && rel.startsWith("/"))) {
+        // A target inside realRoot yields a relative path. If `relative()`
+        // returns an absolute path it escaped the root — on POSIX (`/...`) or
+        // across Windows drives (`D:\...`, where the win32 check is essential).
+        if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
           throw new Error(
             `extracted symlink ${fullPath} points outside staging root: ${linkTarget}`,
           );
@@ -544,7 +704,7 @@ function validateExtractedTree(stagingRoot: string): void {
       }
 
       const rel = relative(realRoot, fullPath);
-      if (rel.startsWith("..") || (process.platform !== "win32" && rel.startsWith("/"))) {
+      if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
         throw new Error(`extracted entry ${fullPath} escapes staging root`);
       }
 
@@ -721,6 +881,7 @@ function copyOnnxLibraries(
 
   // Recreate symlinks in target directory. If the required library is a
   // symlink, failures must be fatal for the same reason as required copies.
+  const targetRoot = realpathSync(targetDir);
   for (const link of symlinks) {
     const dst = join(targetDir, link.name);
     try {
@@ -728,6 +889,19 @@ function copyOnnxLibraries(
     } catch {
       // ignore
     }
+
+    const dstForContainment = join(targetRoot, link.name);
+    const resolvedTarget = resolve(dirname(dstForContainment), link.target);
+    if (!isPathInsideRoot(targetRoot, resolvedTarget)) {
+      const message = `ONNX Runtime symlink ${link.name} points outside install dir: ${link.target}`;
+      if (requiredLibs.has(link.name)) {
+        rmSync(targetDir, { recursive: true, force: true });
+        throw new Error(message);
+      }
+      log(`ORT extract: skipping optional symlink ${link.name}: ${message}`);
+      continue;
+    }
+
     try {
       symlinkSync(link.target, dst);
     } catch (symlinkErr) {
@@ -872,9 +1046,8 @@ function acquireLock(lockPath: string): boolean {
 
   const age = Date.now() - lockMtimeMs;
   const ageWithinFresh = Math.abs(age) < STALE_LOCK_MS;
-  const skipLiveness = process.platform === "win32";
-  const ownerAlive = !skipLiveness && owningPid !== null && isProcessAlive(owningPid);
-  if (skipLiveness ? ageWithinFresh : ownerAlive && ageWithinFresh) {
+  const ownerAlive = owningPid !== null && isProcessAlive(owningPid);
+  if (ownerAlive && ageWithinFresh) {
     return false;
   }
 
@@ -923,7 +1096,30 @@ function releaseLock(lockPath: string): void {
   }
 }
 
+function tasklistPidFromCsvLine(line: string): string | null {
+  const quoted = line.match(/"([^"]*)"/g);
+  if (quoted && quoted.length >= 2) return quoted[1].slice(1, -1);
+  const cells = line.split(",").map((cell) => cell.trim().replace(/^"|"$/g, ""));
+  return cells[1] ?? null;
+}
+
+function isWindowsProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const output = execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      windowsHide: true,
+    });
+    const expected = String(pid);
+    return output.split(/\r?\n/).some((line) => tasklistPidFromCsvLine(line) === expected);
+  } catch {
+    return false;
+  }
+}
+
 function isProcessAlive(pid: number): boolean {
+  if (process.platform === "win32") return isWindowsProcessAlive(pid);
   try {
     process.kill(pid, 0);
     return true;
@@ -958,11 +1154,15 @@ export const __test__ = {
   cleanupAbandonedStagingDirs,
   cleanupIncompleteTargetIfUnowned,
   copyOnnxLibraries,
+  resolveCachedOnnxRuntimeDir,
   ORT_VERSION,
   ONNX_INSTALLED_META_FILE,
   detectOnnxVersion,
+  parseOnnxVersionFromPath,
   isOnnxVersionCompatible,
   findSystemOnnxRuntime,
+  acquireLock,
+  releaseLock,
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
 };

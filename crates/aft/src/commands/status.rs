@@ -71,21 +71,31 @@ impl AppContext {
         };
 
         // Semantic index status
-        let mut semantic_index_info = {
+        let semantic_index_info = {
+            let status = self.semantic_index_status().borrow().clone();
+            let refreshing_count = status.refreshing_count();
             let index = self.semantic_index().borrow();
             match index.as_ref() {
                 Some(idx) => {
+                    let status_label = match status {
+                        SemanticIndexStatus::Ready { .. } => "ready",
+                        _ => idx.status_label(),
+                    };
                     serde_json::json!({
-                        "status": idx.status_label(),
+                        "status": status_label,
+                        "state": status_label,
+                        "refreshing_count": refreshing_count,
                         "entries": idx.entry_count(),
                         "dimension": idx.dimension(),
                         "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
                         "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                     })
                 }
-                None => match &*self.semantic_index_status().borrow() {
+                None => match status {
                     SemanticIndexStatus::Disabled => serde_json::json!({
                         "status": "disabled",
+                        "state": "disabled",
+                        "refreshing_count": 0,
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
@@ -96,15 +106,12 @@ impl AppContext {
                         entries_total,
                     } => serde_json::json!({
                         "status": "loading",
+                        "state": "loading",
+                        "refreshing_count": 0,
                         "stage": stage,
                         "files": files,
                         "entries_done": entries_done,
                         "entries_total": entries_total,
-                        "backend": config.semantic_backend_label(),
-                        "model": config.semantic.model.as_str(),
-                    }),
-                    SemanticIndexStatus::Ready => serde_json::json!({
-                        "status": "ready",
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
@@ -115,6 +122,8 @@ impl AppContext {
                         completeness,
                     } => serde_json::json!({
                         "status": "partial",
+                        "state": "partial",
+                        "refreshing_count": 0,
                         "stage": stage,
                         "entries_done": entries_done,
                         "entries_total": entries_total,
@@ -122,8 +131,17 @@ impl AppContext {
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
+                    SemanticIndexStatus::Ready { refreshing } => serde_json::json!({
+                        "status": "ready",
+                        "state": "ready",
+                        "refreshing_count": refreshing.len(),
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
                     SemanticIndexStatus::Failed(error) => serde_json::json!({
                         "status": "failed",
+                        "state": "failed",
+                        "refreshing_count": 0,
                         "error": error,
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
@@ -131,59 +149,6 @@ impl AppContext {
                 },
             }
         };
-
-        // Extend semantic_index_info with metrics, rerank, and warnings
-        // so TUI/status surfaces can show pipeline health without a separate call.
-        let metrics_agg = self.semantic_search_metrics().borrow().aggregate();
-        if let Some(obj) = semantic_index_info.as_object_mut() {
-            // Search quality metrics
-            obj.insert(
-                "total_queries".into(),
-                serde_json::json!(metrics_agg.total_queries),
-            );
-            obj.insert(
-                "p50_latency_ms".into(),
-                serde_json::json!(metrics_agg.p50_latency_ms),
-            );
-            obj.insert(
-                "p95_latency_ms".into(),
-                serde_json::json!(metrics_agg.p95_latency_ms),
-            );
-            obj.insert(
-                "zero_result_rate".into(),
-                serde_json::json!(metrics_agg.zero_result_rate),
-            );
-            obj.insert(
-                "low_confidence_rate".into(),
-                serde_json::json!(metrics_agg.low_confidence_rate),
-            );
-            obj.insert(
-                "embedding_failure_rate".into(),
-                serde_json::json!(metrics_agg.embedding_failure_rate),
-            );
-            obj.insert(
-                "lexical_failure_rate".into(),
-                serde_json::json!(metrics_agg.lexical_failure_rate),
-            );
-            // Rerank status
-            obj.insert(
-                "rerank_enabled".into(),
-                serde_json::json!(config.semantic.rerank_enabled),
-            );
-            obj.insert(
-                "rerank_model".into(),
-                serde_json::json!(config.semantic.rerank_model),
-            );
-            // Diagnostics
-            obj.insert(
-                "diagnostics_enabled".into(),
-                serde_json::json!(config.semantic.diagnostics_enabled),
-            );
-            obj.insert(
-                "prompt_active".into(),
-                serde_json::json!(config.semantic.query_prompt_template.is_some()),
-            );
-        }
 
         // Disk cache sizes — scoped to the **current project** only.
         //
@@ -251,6 +216,24 @@ impl AppContext {
         let degraded_reasons = self.degraded_reasons();
         let degraded = !degraded_reasons.is_empty();
 
+        // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
+        // Surfaced for the TUI sidebar so users see the same code-health view
+        // agents get. `None` until the Tier-2 cache is populated at least once
+        // (so we never render fabricated zeros) — emitted as JSON null then,
+        // and the sidebar hides the section.
+        let status_bar = match self.status_bar_counts() {
+            Some(counts) => serde_json::json!({
+                "errors": counts.errors,
+                "warnings": counts.warnings,
+                "dead_code": counts.dead_code,
+                "unused_exports": counts.unused_exports,
+                "duplicates": counts.duplicates,
+                "todos": counts.todos,
+                "tier2_stale": counts.tier2_stale,
+            }),
+            None => serde_json::Value::Null,
+        };
+
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
@@ -264,10 +247,11 @@ impl AppContext {
                 "restrict_to_project_root": config.restrict_to_project_root,
                 "search_index": config.search_index,
                 "semantic_search": config.semantic_search,
-                "semantic_model2vec": cfg!(feature = "semantic-model2vec"),
+                "callgraph_store": config.callgraph_store,
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
+            "status_bar": status_bar,
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
@@ -381,5 +365,24 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[test]
+    fn status_status_bar_is_null_until_tier2_populated() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let response = handle_status(&request(), &ctx);
+        // No Tier-2 scan has run yet, so the status-bar glance must be null
+        // (never fabricated zeros). The key is always present so the TS
+        // coercion can distinguish "field absent" from "not populated".
+        assert!(response.data.get("status_bar").is_some());
+        assert!(response.data["status_bar"].is_null());
+
+        // Once Tier-2 counts are populated, the snapshot carries the glance.
+        ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
+        let response = handle_status(&request(), &ctx);
+        assert_eq!(response.data["status_bar"]["dead_code"], 3);
+        assert_eq!(response.data["status_bar"]["unused_exports"], 2);
+        assert_eq!(response.data["status_bar"]["duplicates"], 1);
+        assert_eq!(response.data["status_bar"]["tier2_stale"], false);
     }
 }

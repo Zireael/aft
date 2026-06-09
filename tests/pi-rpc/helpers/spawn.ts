@@ -29,7 +29,7 @@ function resolvePiPackageJson(): string {
     return require_.resolve("@earendil-works/pi-coding-agent/package.json");
   } catch {
     const bunModules = join(REPO_ROOT, "node_modules/.bun");
-    const prefix = "@mariozechner+pi-coding-agent@";
+    const prefix = "@earendil-works+pi-coding-agent@";
     const candidates = readdirSync(bunModules, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
       .map((entry) => {
@@ -59,6 +59,13 @@ export interface PiSpawnOptions {
   configDir: string;
   workdir: string;
   extraArgs?: string[];
+  /**
+   * Force `restrict_to_project_root: true` in the generated AFT config so
+   * tests that exercise the `ui.confirm` external-directory prompt actually
+   * trigger it. Pi defaults this to false ("no restriction"), in which case
+   * the plugin defers to Rust without ever showing the prompt.
+   */
+  restrictToProjectRoot?: boolean;
 }
 
 function childEnv(configDir: string): Record<string, string> {
@@ -91,6 +98,12 @@ function childEnv(configDir: string): Record<string, string> {
     join(REPO_ROOT, "target", "debug"),
     result.PATH ?? "",
   ].join(sep);
+  // Store-backed callgraph ops (e.g. trace_to_symbol) build the persisted store
+  // in the background and return `callgraph_building` until it lands. Tests
+  // assert the real JSON result, so block the op until the store is ready
+  // instead of racing the background build. Matches the determinism knob the
+  // other e2e harnesses use; see AppContext::callgraph_build_wait_window.
+  result.AFT_CALLGRAPH_BUILD_WAIT_MS = "15000";
   return result;
 }
 
@@ -132,10 +145,14 @@ function writeConfigs(opts: PiSpawnOptions): string {
       2,
     ),
   );
-  writeFileSync(
-    join(agentDir, "aft.jsonc"),
-    readFileSync(join(import.meta.dir, "../fixtures/aft-pi-config.jsonc"), "utf8"),
-  );
+  const baseConfig = readFileSync(join(import.meta.dir, "../fixtures/aft-pi-config.jsonc"), "utf8");
+  // Tests that exercise the `ui.confirm` external-directory prompt opt into
+  // strict mode by passing `restrictToProjectRoot: true`. Without this, the
+  // plugin defers to Rust (Pi default behavior) and the prompt never fires.
+  const aftConfig = opts.restrictToProjectRoot
+    ? baseConfig.replace(/\}\s*$/, ',\n  "restrict_to_project_root": true\n}\n')
+    : baseConfig;
+  writeFileSync(join(agentDir, "aft.jsonc"), aftConfig);
   return agentDir;
 }
 

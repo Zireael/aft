@@ -1,12 +1,14 @@
 //! Background bash task management. Phase 0 stub; Phase 1 Track D fills in.
 
 pub mod buffer;
+pub mod output;
 pub mod persistence;
 pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
 pub mod watchdog;
+pub mod watches;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
@@ -67,6 +69,8 @@ pub fn spawn(
     notify_on_completion: bool,
     compressed: bool,
     pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -81,7 +85,14 @@ pub fn spawn(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         })
     });
-    let storage_dir = storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = {
+        let config = ctx.config();
+        let root = storage_dir(config.storage_dir.as_deref());
+        config
+            .harness
+            .map(|harness| root.join(harness.as_str()))
+            .unwrap_or(root)
+    };
     let max_running = ctx.config().max_background_bash_tasks;
     let timeout = timeout_ms.map(Duration::from_millis);
     let project_root = ctx
@@ -104,8 +115,8 @@ pub fn spawn(
             notify_on_completion,
             compressed,
             project_root,
-            24,
-            80,
+            pty_rows,
+            pty_cols,
         )
     } else {
         ctx.bash_background().spawn(
@@ -158,4 +169,62 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     home.join(".cache").join("aft")
+}
+
+pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::harness::Harness) {
+    let root_tasks = storage_root.join("bash-tasks");
+    if !dir_has_entries(&root_tasks) {
+        return;
+    }
+
+    let harness_tasks = storage_root.join(harness.as_str()).join("bash-tasks");
+    if dir_has_entries(&harness_tasks) {
+        return;
+    }
+    if let Some(parent) = harness_tasks.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            crate::slog_warn!(
+                "failed to create harness bash task dir {}: {}",
+                parent.display(),
+                error
+            );
+            return;
+        }
+    }
+    if harness_tasks.exists() {
+        let _ = std::fs::remove_dir(&harness_tasks);
+    }
+
+    match std::fs::rename(&root_tasks, &harness_tasks) {
+        Ok(()) => crate::slog_info!(
+            "moved legacy root bash tasks into harness namespace: {}",
+            harness_tasks.display()
+        ),
+        Err(error) => {
+            crate::slog_warn!(
+                "failed to move legacy root bash tasks into {}: {}; trying child merge",
+                harness_tasks.display(),
+                error
+            );
+            if std::fs::create_dir_all(&harness_tasks).is_err() {
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(&root_tasks) {
+                for entry in entries.flatten() {
+                    let source = entry.path();
+                    let target = harness_tasks.join(entry.file_name());
+                    if !target.exists() {
+                        let _ = std::fs::rename(source, target);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&root_tasks);
+        }
+    }
+}
+
+fn dir_has_entries(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }

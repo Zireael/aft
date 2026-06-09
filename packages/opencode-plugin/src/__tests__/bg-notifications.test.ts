@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names, wake_client_path metadata,
@@ -13,10 +13,15 @@ const sessionLogSpy = mock(
 const sessionWarnSpy = mock(
   (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
 );
+const sessionDebugSpy = mock(
+  (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
+);
 mock.module("../logger.js", () => ({
   sessionLog: sessionLogSpy,
+  sessionDebug: sessionDebugSpy,
   sessionWarn: sessionWarnSpy,
   log: () => {},
+  debug: () => {},
   warn: () => {},
   error: () => {},
   sessionError: () => {},
@@ -45,6 +50,18 @@ mock.module("../logger.js", () => ({
 let liveServerClient: unknown = null;
 let lastLiveServerArgs: { serverUrl: string; directory: string } | null = null;
 let liveServerAvailable = true;
+// Per-URL availability map — must behave like the real
+// live-server-client implementation so the live-server-client unit
+// tests still pass when Bun's process-global `mock.module()` leaks
+// this stub across test files.
+const perUrlAvailability = new Map<string, boolean>();
+function normalizeServerUrl(serverUrl: string): string {
+  try {
+    return new URL(serverUrl).toString();
+  } catch {
+    return serverUrl;
+  }
+}
 function setTestLiveServerClient(client: unknown): void {
   liveServerClient = client;
 }
@@ -62,26 +79,90 @@ mock.module("../shared/live-server-client.js", () => ({
     }
     return liveServerClient;
   },
-  useLiveServerWake: () => liveServerAvailable,
-  setLiveServerWakeAvailable: (available: boolean) => {
-    liveServerAvailable = available;
+  useLiveServerWake: (serverUrl?: string) => {
+    if (!serverUrl) return liveServerAvailable;
+    const keyed = perUrlAvailability.get(normalizeServerUrl(serverUrl));
+    if (keyed !== undefined) return keyed;
+    // bg-notifications tests use setTestLiveServerAvailable(true) (single
+    // bool) to enable the live-server path for all URLs in one shot,
+    // while live-server-client unit tests use setLiveServerWakeAvailable(url, ...)
+    // to set per-URL state. When per-URL state is unset, fall back to the
+    // single-bool toggle so bg-notifications tests keep working, but only
+    // when it has been set explicitly via setTestLiveServerAvailable() —
+    // the unit tests reset liveServerAvailable to its initial state via
+    // __resetLiveServerWakeForTests(), so any URL they didn't set should
+    // remain false.
+    return liveServerAvailable;
+  },
+  setLiveServerWakeAvailable: (
+    serverUrlOrAvailable: string | boolean | undefined,
+    available?: boolean,
+  ) => {
+    if (typeof serverUrlOrAvailable === "boolean") {
+      liveServerAvailable = serverUrlOrAvailable;
+      return;
+    }
+    if (!serverUrlOrAvailable) {
+      liveServerAvailable = available ?? false;
+      return;
+    }
+    perUrlAvailability.set(normalizeServerUrl(serverUrlOrAvailable), available ?? false);
+  },
+  // Bun's `mock.module()` is process-global and partial mocks leak across
+  // test files. The probe-related exports MUST be included even though this
+  // test file does not exercise them, because the live-server-client unit
+  // tests import from the same module path and would otherwise see
+  // `undefined` for these symbols when the mock is already installed.
+  probeServerReachable: async (serverUrl?: string, _timeoutMs?: number) => {
+    if (!serverUrl) {
+      perUrlAvailability.clear();
+      return false;
+    }
+    // Mirror the real implementation enough that the unit-test fetch stubs
+    // drive this code path correctly: hit the URL, accept 2xx/401/403,
+    // reject 404/5xx and network errors.
+    let reachable = false;
+    try {
+      const probeUrl = new URL("/session", serverUrl).toString();
+      const res = await globalThis.fetch(probeUrl, { method: "GET" });
+      reachable = res.ok || res.status === 401 || res.status === 403;
+    } catch {
+      reachable = false;
+    }
+    perUrlAvailability.set(normalizeServerUrl(serverUrl), reachable);
+    return reachable;
   },
   __resetLiveServerClientCacheForTests: () => {
     liveServerClient = null;
     lastLiveServerArgs = null;
   },
   __resetLiveServerWakeForTests: () => {
-    liveServerAvailable = true;
+    // Match the real implementation: legacyLiveServerWakeAvailable resets
+    // to false, not true. The bg-notifications tests that need
+    // liveServerAvailable=true explicitly call setTestLiveServerAvailable(true)
+    // in their setup, so this default of false is what the live-server-client
+    // unit tests need without breaking bg-notifications.
+    liveServerAvailable = false;
+    perUrlAvailability.clear();
   },
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
+  consumeBgCompletion,
+  formatPatternMatchReminder,
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
   ingestBgCompletions,
+  markBgCompletionDelivered,
+  markExplicitControl,
+  markTaskWaiting,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -94,6 +175,7 @@ const TEST_SERVER_URL = "http://127.0.0.1:0/";
 
 beforeEach(() => {
   sessionLogSpy.mockClear();
+  sessionDebugSpy.mockClear();
   sessionWarnSpy.mockClear();
   liveServerClient = null;
   lastLiveServerArgs = null;
@@ -142,6 +224,10 @@ function makeClient(
 /** Helper: extract the structured data argument from the first matching trace event. */
 function findTraceEvent(eventName: string): Record<string, unknown> | undefined {
   for (const call of sessionLogSpy.mock.calls) {
+    const data = call[2] as { event?: string } | undefined;
+    if (data?.event === eventName) return data as Record<string, unknown>;
+  }
+  for (const call of sessionDebugSpy.mock.calls) {
     const data = call[2] as { event?: string } | undefined;
     if (data?.event === eventName) return data as Record<string, unknown>;
   }
@@ -243,6 +329,46 @@ describe("OpenCode background notifications", () => {
     expect(reminder).toBe(
       "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task empty1 (exit 0)\n</system-reminder>",
     );
+  });
+
+  test("formats pushed pattern matches with matched framing", () => {
+    expect(
+      formatPatternMatchReminder([
+        {
+          task_id: "bash-1",
+          session_id: "s1",
+          watch_id: "watch-1",
+          match_text: "vite-ready-on-port-3000",
+          match_offset: 42,
+          context: "vite-ready-on-port-3000",
+          once: true,
+          reason: "pattern_match",
+        },
+      ]),
+    ).toBe(
+      '<system-reminder>\n[BG BASH NOTIFY]\n- task bash-1 matched "vite-ready-on-port-3000" (offset 42):\n      > vite-ready-on-port-3000\n</system-reminder>',
+    );
+  });
+
+  test("formats exit safety-net notifications without matched framing", () => {
+    const reminder = formatPatternMatchReminder([
+      {
+        task_id: "bash-2",
+        session_id: "s1",
+        watch_id: "exit",
+        match_text: "",
+        match_offset: 0,
+        context: "task bash-2 exited (exit 0)\nvite-ready-on-port-3000",
+        once: true,
+        reason: "task_exit",
+      },
+    ]);
+
+    expect(reminder).toContain("- task bash-2 exited:");
+    expect(reminder).toContain("task bash-2 exited (exit 0)");
+    expect(reminder).toContain("vite-ready-on-port-3000");
+    expect(reminder).not.toContain("matched");
+    expect(reminder).not.toContain("offset 0");
   });
 
   test("in-turn delivery drains and appends reminder to tool output", async () => {
@@ -407,7 +533,122 @@ describe("OpenCode background notifications", () => {
     expect(payload.body.variant).toBeUndefined();
   });
 
-  test("push completion lands in pending and wakes when idle", async () => {
+  test("markBgCompletionDelivered persists locally consumed completions", async () => {
+    const send = mock(async () => ({ success: true, acked_task_ids: ["task-1"] }));
+    const { ctx } = harness(send);
+
+    await markBgCompletionDelivered({ ctx, directory: "/tmp/project", sessionID: "s1" }, "task-1");
+
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
+  test("pending explicit control converts completions before task tracking", () => {
+    markExplicitControl("s1", "task-1", false);
+
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+
+    expect(accepted).toEqual([]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(0);
+    expect(state?.pendingPatternMatches).toHaveLength(1);
+    expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+  });
+
+  test("emptying pending queues resets wake hard-stop retry state", () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(1);
+    if (!state) throw new Error("missing state");
+    state.retryDelayMs = 1000;
+    state.wakeRetryAttempts = 5;
+    state.wakeHardStopped = true;
+
+    consumeBgCompletion("s1", "task-1");
+
+    expect(state.pendingCompletions).toHaveLength(0);
+    expect(state.retryDelayMs).toBeNull();
+    expect(state.wakeRetryAttempts).toBe(0);
+    expect(state.wakeHardStopped).toBe(false);
+  });
+
+  test("markExplicitControl retroactively converts already-pending completion to pattern match", () => {
+    // Race: bash spawns → trackBgTask, completion push frame arrives →
+    // ingestBgCompletions queues into pendingCompletions, THEN bash_watch
+    // async runs markExplicitControl. Without retroactive conversion the
+    // in-turn-append path would emit both "[BACKGROUND BASH COMPLETED]" and
+    // "[BG BASH NOTIFY]" for the same task.
+    trackBgTask("s1", "task-1");
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    expect(accepted).toHaveLength(1);
+
+    const stateBefore = sessionBgStates.get("s1");
+    expect(stateBefore?.pendingCompletions).toHaveLength(1);
+    expect(stateBefore?.pendingPatternMatches).toHaveLength(0);
+
+    markExplicitControl("s1", "task-1", false);
+
+    const stateAfter = sessionBgStates.get("s1");
+    expect(stateAfter?.pendingCompletions).toHaveLength(0);
+    expect(stateAfter?.pendingPatternMatches).toHaveLength(1);
+    expect(stateAfter?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+    expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
+  });
+
+  test("retroactively converted task-exit notify is acked after in-turn delivery", async () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    markExplicitControl("s1", "task-1", false);
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-1"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const output = { output: "watch registered" };
+
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+
+    expect(output.output).toContain("[BG BASH NOTIFY]");
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
+  test("late async watch renders one notify and suppresses default completion on drain", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "echo READY")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "echo READY"),
+    );
+    markExplicitControl("s1", "task-1", false);
+    markExplicitControl("s1", "task-1");
+
+    const output = { output: "watch registered" };
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+
+    expect(output.output).toContain("[BG BASH NOTIFY]");
+    expect(output.output).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(output.output?.match(/- task task-1 exited:/g)).toHaveLength(1);
+  });
+
+  test("push completion lands in pending and wakes after the spawn turn is idle", async () => {
     trackBgTask("s1", "task-1");
     const send = mock(async () => ({
       success: true,
@@ -417,6 +658,13 @@ describe("OpenCode background notifications", () => {
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -437,6 +685,35 @@ describe("OpenCode background notifications", () => {
     expect(text).not.toContain(": npm test");
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+  });
+
+  test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+
+    markTaskWaiting("s1", "task-1");
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("buffers push completion received before task tracking", async () => {
@@ -471,19 +748,27 @@ describe("OpenCode background notifications", () => {
   });
 
   test("failed wake keeps pending completions and retries", async () => {
+    setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    installLiveServerClient(promptAsync);
+    const fallbackClient = makeClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: {},
+        client: fallbackClient,
         serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
@@ -496,19 +781,27 @@ describe("OpenCode background notifications", () => {
   });
 
   test("failed wake hard-stops after capped retries", async () => {
+    setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    installLiveServerClient(promptAsync);
+    const fallbackClient = makeClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: {},
+        client: fallbackClient,
         serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
@@ -523,14 +816,22 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
   });
 
-  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+  test("post-idle push completion still wakes even when bridge is busy with non-agent RPC", async () => {
     // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
     // which returned true for the TUI status poll, orphaning the completion when
-    // no other trigger fired. The wake must always be scheduled.
+    // no other trigger fired. Once the spawn turn has gone idle, the wake must
+    // still be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -798,6 +1099,67 @@ describe("OpenCode background notifications", () => {
     });
   });
 
+  test("live-server failure falls back in-process and demotes subsequent wakes", async () => {
+    setTestLiveServerAvailable(true);
+    const responses: BridgeResponse[] = [
+      { success: true, bg_completions: [completion("task-1", "npm test")] },
+      { success: true, bg_completions: [completion("task-2", "npm test again")] },
+    ];
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? (responses.shift() ?? { success: true, bg_completions: [] })
+        : { success: true, acked_task_ids: [] },
+    );
+    const { ctx } = harness(send);
+    const livePromptAsync = mock(async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1");
+    });
+    installLiveServerClient(livePromptAsync);
+    const fallbackClient = makeClient(mock(async () => {}));
+
+    trackBgTask("s1", "task-1");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.promptAsync, 1);
+
+    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
+    // Production code calls setLiveServerWakeAvailable(serverUrl, false)
+    // (per-URL form), so check the per-URL availability map directly.
+    expect(perUrlAvailability.get(normalizeServerUrl(TEST_SERVER_URL))).toBe(false);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+
+    const warnEvents = sessionWarnSpy.mock.calls.map(
+      (call) => (call[2] as { event?: string } | undefined)?.event,
+    );
+    const debugEvents = sessionDebugSpy.mock.calls.map(
+      (call) => (call[2] as { event?: string } | undefined)?.event,
+    );
+    expect(debugEvents).toContain("bash_completion_wake_prompt_async_error");
+    expect(debugEvents).toContain("bash_completion_wake_live_server_fallback");
+    expect(warnEvents).not.toContain("bash_completion_wake_prompt_async_error");
+    expect(warnEvents).not.toContain("bash_completion_wake_live_server_fallback");
+
+    trackBgTask("s1", "task-2");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.promptAsync, 2);
+
+    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
   test("in-process fallback wake uses drainContext.client and tags trace accordingly", async () => {
     // When the live HTTP listener was unreachable at startup,
     // bg-notifications must use the plugin-provided in-process client so
@@ -847,6 +1209,13 @@ describe("OpenCode background notifications", () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const livePromptAsync = mock(async () => {});
     installLiveServerClient(livePromptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {

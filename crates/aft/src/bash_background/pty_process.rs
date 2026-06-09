@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,7 +29,8 @@ pub(crate) fn spawn_pty_for_command(
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
-        let mut command = CommandBuilder::new("/bin/sh");
+        let shell = resolve_posix_shell();
+        let mut command = CommandBuilder::new(shell.as_os_str());
         command.arg("-c");
         command.arg(user_command);
         command.cwd(workdir.as_os_str());
@@ -42,7 +47,7 @@ pub(crate) fn spawn_pty_for_command(
         let mut last_err = String::from("no Windows shell candidates available");
 
         for shell in candidates {
-            let wrapper_body = shell.wrapper_script(user_command, &paths.exit);
+            let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
             let wrapper_path = windows_wrapper_path(paths, &shell);
             if let Err(error) = fs::write(&wrapper_path, wrapper_body) {
                 last_err = format!("write wrapper {wrapper_path:?}: {error}");
@@ -81,6 +86,43 @@ pub(crate) fn spawn_pty_for_command(
 
         Err(last_err)
     }
+}
+
+#[cfg(unix)]
+fn resolve_posix_shell() -> PathBuf {
+    resolve_posix_shell_with(
+        || std::env::var_os("SHELL").map(PathBuf::from),
+        is_executable_file,
+    )
+}
+
+#[cfg(unix)]
+fn resolve_posix_shell_with<S, X>(shell_env: S, is_executable: X) -> PathBuf
+where
+    S: FnOnce() -> Option<PathBuf>,
+    X: Fn(&Path) -> bool,
+{
+    if let Some(shell) =
+        shell_env().filter(|path| !path.as_os_str().is_empty() && is_executable(path.as_path()))
+    {
+        return shell;
+    }
+
+    for fallback in ["/bin/bash", "/bin/sh", "/bin/zsh"] {
+        let path = PathBuf::from(fallback);
+        if is_executable(&path) {
+            return path;
+        }
+    }
+
+    PathBuf::from("/bin/sh")
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -145,11 +187,13 @@ fn try_spawn_pty(
         wake_tx,
     ));
 
+    let writer = Arc::new(Mutex::new(writer));
     spawn_reader(
         reader,
         paths.pty.clone(),
         Arc::clone(&reader_done),
         Arc::clone(&coordinator),
+        Some(Arc::clone(&writer)),
     );
     spawn_waiter(
         child,
@@ -161,7 +205,7 @@ fn try_spawn_pty(
 
     Ok(PtyRuntime {
         master: Some(pair.master),
-        writer: Arc::new(Mutex::new(writer)),
+        writer,
         killer,
         child_pid,
         reader_done,
@@ -176,6 +220,7 @@ pub(crate) fn spawn_reader(
     spill_path: std::path::PathBuf,
     reader_done: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 ) {
     thread::spawn(move || {
         let result = (|| -> io::Result<()> {
@@ -193,6 +238,21 @@ pub(crate) fn spawn_reader(
                     Ok(n) => {
                         file.write_all(&buf[..n])?;
                         file.flush()?;
+                        if buf[..n].windows(4).any(|window| window == b"\x1b[6n") {
+                            // Some Windows console hosts/apps query the
+                            // terminal cursor position with DSR (ESC[6n)
+                            // before accepting input. A real terminal answers
+                            // with ESC[row;colR; without that response the
+                            // process can sit forever after emitting only the
+                            // query. We own both ends of the PTY, so provide a
+                            // conservative 1;1 response.
+                            if let Some(writer) = writer.as_ref() {
+                                if let Ok(mut writer) = writer.lock() {
+                                    let _ = writer.write_all(b"\x1b[1;1R");
+                                    let _ = writer.flush();
+                                }
+                            }
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
@@ -261,7 +321,10 @@ fn write_exit_marker(path: &Path, marker: &ExitMarker, task_id: &str) -> io::Res
     atomic_write(path, content.as_bytes(), task_id)
 }
 
-#[cfg(test)]
+// Every test in this module exercises Unix-only PTY paths (`#[cfg(unix)]`
+// shell resolution + the spawn_waiter), so gate the whole module on `unix` to
+// avoid unused-import / dead-code warnings when cross-compiling for Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -322,6 +385,38 @@ mod tests {
         fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
             None
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_shell_prefers_executable_shell_env() {
+        let shell = PathBuf::from("/custom/zsh");
+        let resolved =
+            resolve_posix_shell_with(|| Some(shell.clone()), |path| path == shell.as_path());
+
+        assert_eq!(resolved, shell);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_shell_ignores_unusable_shell_env_and_uses_fallback_order() {
+        let resolved = resolve_posix_shell_with(
+            || Some(PathBuf::from("/missing/fish")),
+            |path| path == Path::new("/bin/sh") || path == Path::new("/bin/zsh"),
+        );
+
+        assert_eq!(resolved, PathBuf::from("/bin/sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_shell_uses_bin_bash_before_later_fallbacks() {
+        let resolved = resolve_posix_shell_with(
+            || None,
+            |path| path == Path::new("/bin/bash") || path == Path::new("/bin/sh"),
+        );
+
+        assert_eq!(resolved, PathBuf::from("/bin/bash"));
     }
 
     #[cfg(unix)]

@@ -9,7 +9,6 @@ use super::helpers::AftProcess;
 
 #[test]
 fn edit_match_glob_rolls_back_prior_files_when_later_write_fails() {
-    super::helpers::skip_if_root();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let a = root.join("a.ts");
@@ -93,6 +92,13 @@ fn edit_match_glob_rolls_back_when_any_file_becomes_syntax_invalid() {
     assert_eq!(fs::read_to_string(&b).unwrap(), original_b);
     assert_eq!(fs::read_to_string(&c).unwrap(), original_c);
 
+    let undo = aft.send(&json!({"id": "undo-after-glob-rollback", "command": "undo"}).to_string());
+    assert_eq!(
+        undo["success"], false,
+        "glob rollback should discard operation undo entries: {undo:?}"
+    );
+    assert_eq!(undo["code"], "no_undo_history");
+
     let status = aft.shutdown();
     assert!(status.success());
 }
@@ -158,6 +164,92 @@ fn edit_match_omits_syntax_valid_when_language_unsupported() {
     assert_eq!(
         fs::read_to_string(dir.path().join("notes.unusual_extension")).unwrap(),
         "hello new world\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// Regression for #83: a fuzzy (rstrip) match must not drop the trailing
+// newline of the matched range. The fuzzy line matcher includes the newline
+// after the last matched line in its byte range; applying the replacement
+// verbatim used to merge the last replaced line with the following line.
+#[test]
+fn edit_match_fuzzy_preserves_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("greet.js");
+    // Trailing spaces after two lines force the rstrip fuzzy pass (pass 2),
+    // since the clean `match` below won't match byte-for-byte.
+    fs::write(
+        &file,
+        "function greet(name) {\n  const message = \"Hello, \" + name;   \n  console.log(message);   \n  return message;\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "fuzzy-trailing-newline",
+        "command": "edit_match",
+        "file": file,
+        // No trailing spaces in the match (forces fuzzy) and no trailing newline
+        // in the replacement (the bug condition).
+        "match": "  const message = \"Hello, \" + name;\n  console.log(message);\n  return message;",
+        "replacement": "  const msg = \"Hello, \" + name;\n  console.log(msg);\n  return msg;"
+    });
+    let resp = aft.send(&req.to_string());
+    assert_eq!(resp["success"], true, "expected edit success: {resp:?}");
+
+    let after = fs::read_to_string(&file).unwrap();
+    // The newline before `}` must survive — `return msg;` and `}` stay on
+    // separate lines instead of merging into `  return msg;}`.
+    assert!(
+        after.contains("  return msg;\n}"),
+        "trailing newline before closing brace was dropped: {after:?}"
+    );
+    assert!(
+        !after.contains("return msg;}"),
+        "last replaced line merged with the next line: {after:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_replace_all_rejects_overlapping_fuzzy_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("over.js");
+    // Trailing spaces defeat the exact (pass 1) matcher and force the fuzzy
+    // line pass, which steps line-by-line. A 2-line needle over three identical
+    // lines yields two OVERLAPPING matches (lines 0-1 and lines 1-2). Applying
+    // them in reverse would silently corrupt the file, so replace_all must
+    // reject with `overlapping_edits` instead.
+    let original = "row \nrow \nrow \n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "replace-all-overlap",
+        "command": "edit_match",
+        "file": file,
+        "match": "row\nrow",
+        "replacement": "X\nX",
+        "replace_all": true
+    });
+    let resp = aft.send(&req.to_string());
+    assert_eq!(
+        resp["success"], false,
+        "overlapping replace_all must fail cleanly: {resp:?}"
+    );
+    assert_eq!(
+        resp["code"], "overlapping_edits",
+        "wrong error code: {resp:?}"
+    );
+    // File must be untouched — no partial/corrupt write.
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "file was modified despite the overlap rejection"
     );
 
     let status = aft.shutdown();

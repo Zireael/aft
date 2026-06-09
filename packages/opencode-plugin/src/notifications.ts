@@ -14,11 +14,17 @@
  * when no longer relevant (Desktop only — TUI toasts are inherently transient).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
-import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import { sessionLog } from "./logger.js";
+import {
+  type BinaryBridge,
+  markAnnouncementSeen,
+  shouldShowAnnouncement,
+} from "@cortexkit/aft-bridge";
+import type { ConfigureWarningsDelivery } from "./config.js";
+import { sessionLog, warn } from "./logger.js";
+import { resolvePromptContext } from "./shared/last-assistant-model.js";
 
 // --- TUI toast helper ---
 
@@ -98,21 +104,25 @@ function getDesktopStatePath(): string | null {
 }
 
 interface DesktopState {
-  sessionId: string | null;
   serverUrl: string | null;
 }
 
-function readDesktopState(directory: string): DesktopState {
+function readDesktopState(): DesktopState {
   const statePath = getDesktopStatePath();
   if (!statePath || !existsSync(statePath)) {
-    return { sessionId: null, serverUrl: null };
+    return { serverUrl: null };
   }
 
   try {
     const raw = readFileSync(statePath, "utf-8");
     const state = JSON.parse(raw) as Record<string, unknown>;
 
-    // Extract sidecar URL from server state
+    // Extract sidecar URL from server state. We intentionally do NOT read
+    // layout.page.lastProjectSession here: that value is global per directory,
+    // not per Desktop window, and can route startup notifications to the wrong
+    // window when two windows have the same repo open. Desktop notifications
+    // require an explicit sessionId; session-less startup notices are queued
+    // until a caller has concrete session/window context.
     let serverUrl: string | null = null;
     const serverStr = state.server;
     if (typeof serverStr === "string") {
@@ -126,24 +136,65 @@ function readDesktopState(directory: string): DesktopState {
       }
     }
 
-    // Extract last session for directory
-    let sessionId: string | null = null;
-    const layoutPage = state["layout.page"];
-    if (typeof layoutPage === "string") {
-      const parsed = JSON.parse(layoutPage) as Record<string, unknown>;
-      const lastProjectSession = parsed.lastProjectSession as
-        | Record<string, { id?: string }>
-        | undefined;
-      if (lastProjectSession) {
-        const entry = lastProjectSession[directory];
-        sessionId = entry?.id ?? null;
-      }
-    }
-
-    return { sessionId, serverUrl };
+    return { serverUrl };
   } catch {
-    return { sessionId: null, serverUrl: null };
+    return { serverUrl: null };
   }
+}
+
+// --- Desktop notification queue ---
+
+type PendingDesktopNotification = {
+  key: string;
+  text: string;
+  shouldSkip?: () => boolean;
+  onDelivered?: () => void;
+};
+
+const MAX_PENDING_DESKTOP_NOTIFICATIONS = 20;
+const pendingDesktopNotifications = new Map<string, PendingDesktopNotification[]>();
+
+function getExplicitSessionId(opts: Pick<NotificationOptions, "sessionId">): string | null {
+  const sessionId = opts.sessionId?.trim();
+  return sessionId ? sessionId : null;
+}
+
+function enqueuePendingDesktopNotification(
+  directory: string,
+  notification: PendingDesktopNotification,
+): void {
+  if (!directory) return;
+  const pending = pendingDesktopNotifications.get(directory) ?? [];
+  if (pending.some((item) => item.key === notification.key)) return;
+
+  pending.push(notification);
+  if (pending.length > MAX_PENDING_DESKTOP_NOTIFICATIONS) {
+    pending.splice(0, pending.length - MAX_PENDING_DESKTOP_NOTIFICATIONS);
+  }
+  pendingDesktopNotifications.set(directory, pending);
+}
+
+async function flushPendingDesktopNotifications(
+  opts: Pick<NotificationOptions, "client" | "directory">,
+  sessionId: string,
+): Promise<void> {
+  const pending = pendingDesktopNotifications.get(opts.directory);
+  if (!pending?.length) return;
+
+  pendingDesktopNotifications.delete(opts.directory);
+  for (const notification of pending) {
+    if (notification.shouldSkip?.()) continue;
+    const delivered = await sendIgnoredMessage(opts.client, sessionId, notification.text);
+    if (delivered) {
+      notification.onDelivered?.();
+    } else {
+      enqueuePendingDesktopNotification(opts.directory, notification);
+    }
+  }
+}
+
+export function __resetNotificationStateForTests(): void {
+  pendingDesktopNotifications.clear();
 }
 
 // --- SDK message helpers ---
@@ -213,6 +264,7 @@ async function sendIgnoredMessage(
   client: unknown,
   sessionId: string,
   text: string,
+  options?: { includeAgent?: boolean },
 ): Promise<boolean> {
   try {
     const c = client as {
@@ -223,18 +275,37 @@ async function sendIgnoredMessage(
     };
 
     // `noReply: true` means OpenCode appends this as a synthetic user
-    // message and does NOT trigger an assistant turn. No LLM call
-    // happens, so model/variant/agent passthrough is unnecessary here.
-    // Keeping the body minimal also avoids OpenCode-side crashes that
-    // surfaced when we passed model/agent on this path. Cache-preserving
-    // model/variant forwarding belongs ONLY on wake-style calls
-    // (noReply: false), which live in bg-notifications.ts.
+    // message and does NOT trigger an assistant turn — no LLM call happens
+    // now. But OpenCode's `createUserMessage` still RECORDS prompt context
+    // on the appended message, and that recorded context becomes the
+    // session's active model/agent for the NEXT real turn.
+    //
+    // Pin agent AND model/variant from the previous assistant turn for
+    // announcements/status (issue #62). Configure warnings pass
+    // `{ includeAgent: false }` to skip all context pinning and avoid
+    // ModelSwitched / AgentSwitched on the first tool turn.
+    const body: Record<string, unknown> = {
+      noReply: true,
+      parts: [{ type: "text", text, ignored: true }],
+    };
+    if (options?.includeAgent !== false) {
+      const promptContext = await resolvePromptContext(
+        c as Parameters<typeof resolvePromptContext>[0],
+        sessionId,
+      );
+      if (promptContext?.agent) body.agent = promptContext.agent;
+      if (promptContext?.model) {
+        body.model = {
+          providerID: promptContext.model.providerID,
+          modelID: promptContext.model.modelID,
+        };
+      }
+      if (promptContext?.variant) body.variant = promptContext.variant;
+    }
+
     const promptInput = {
       path: { id: sessionId },
-      body: {
-        noReply: true,
-        parts: [{ type: "text", text, ignored: true }],
-      },
+      body,
     };
 
     if (typeof c.session?.prompt === "function") {
@@ -252,6 +323,31 @@ async function sendIgnoredMessage(
     );
   }
   return false;
+}
+
+async function showToastViaHttp(
+  serverUrl: string,
+  title: string,
+  message: string,
+  variant: "info" | "warning" | "error" | "success",
+  duration: number,
+): Promise<boolean> {
+  const auth = getServerAuth();
+  const url = `${serverUrl.replace(/\/$/, "")}/tui/show-toast`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+      },
+      body: JSON.stringify({ title, message, variant, duration }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function deleteMessage(
@@ -279,8 +375,10 @@ async function deleteMessage(
 export interface NotificationOptions {
   /** The OpenCode SDK client */
   client: unknown;
-  /** Project directory for Desktop state lookup */
+  /** Project directory used as the queue key for delayed Desktop notices. */
   directory: string;
+  /** Concrete OpenCode session/window to receive Desktop notifications. */
+  sessionId?: string;
   /** Server URL for message deletion (optional — from ctx.serverUrl) */
   serverUrl?: string;
 }
@@ -301,11 +399,13 @@ export interface ConfigureWarningOptions {
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
+  serverUrl?: string;
+  delivery?: ConfigureWarningsDelivery;
 }
 
 /**
  * Send a persistent warning notification.
- * Desktop: ignored message, cleaned up on next startup when resolved.
+ * Desktop: ignored message when sessionId is explicit; otherwise queued.
  * TUI: toast with warning variant (inherently transient).
  */
 export async function sendWarning(opts: NotificationOptions, message: string): Promise<void> {
@@ -313,17 +413,21 @@ export async function sendWarning(opts: NotificationOptions, message: string): P
   const toastSent = await showTuiToast(opts.client, "AFT Warning", message, "warning", 10000);
   if (toastSent) return;
 
-  const { sessionId } = readDesktopState(opts.directory);
-  if (!sessionId) return;
-
   const text = `${WARNING_MARKER} ${message}`;
+  const sessionId = getExplicitSessionId(opts);
+  if (!sessionId) {
+    enqueuePendingDesktopNotification(opts.directory, { key: `warning:${message}`, text });
+    return;
+  }
+
+  await flushPendingDesktopNotifications(opts, sessionId);
   sessionLog(sessionId, `[aft-plugin] sending warning to session ${sessionId}`);
   await sendIgnoredMessage(opts.client, sessionId, text);
 }
 
 /**
  * Send a transient status notification.
- * Desktop: ignored message, auto-deletes after 3 seconds.
+ * Desktop: ignored message when sessionId is explicit, auto-deletes after 3 seconds.
  * TUI: toast with success variant, auto-dismissed by the TUI.
  */
 export async function sendStatus(opts: NotificationOptions, message: string): Promise<void> {
@@ -332,14 +436,15 @@ export async function sendStatus(opts: NotificationOptions, message: string): Pr
     return;
   }
 
-  const { sessionId, serverUrl: desktopServerUrl } = readDesktopState(opts.directory);
+  const sessionId = getExplicitSessionId(opts);
   if (!sessionId) return;
 
+  await flushPendingDesktopNotifications(opts, sessionId);
   const text = `${STATUS_MARKER} ${message}`;
   await sendIgnoredMessage(opts.client, sessionId, text);
 
   // Auto-delete after 3 seconds
-  const effectiveServerUrl = opts.serverUrl || desktopServerUrl;
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
   if (!effectiveServerUrl) return;
 
   setTimeout(async () => {
@@ -373,7 +478,7 @@ export async function sendStatus(opts: NotificationOptions, message: string): Pr
 /**
  * Send a feature announcement for a new version.
  * Tracked via a version file in storageDir — only fires once per version across all sessions.
- * Desktop: ignored message in the active session.
+ * Desktop: ignored message when sessionId is explicit; otherwise queued.
  * TUI: toast with info variant.
  */
 export async function sendFeatureAnnouncement(
@@ -383,24 +488,8 @@ export async function sendFeatureAnnouncement(
   footer: string,
   storageDir?: string,
 ): Promise<void> {
-  // Check if we already announced this version (persisted across sessions)
-  if (storageDir) {
-    // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-    // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-    // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-    // spawn at every plugin init. Deferred to a future version that decides whether
-    // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-    // other writer; this file stays in sync via direct legacy-file writes.
-    const versionFile = join(storageDir, "last_announced_version");
-    try {
-      if (existsSync(versionFile)) {
-        const lastVersion = readFileSync(versionFile, "utf-8").trim();
-        if (lastVersion === version) return;
-      }
-    } catch {
-      // ignore read errors — proceed with announcement
-    }
-  }
+  // Check if we already announced this version (persisted across sessions).
+  if (hasAnnouncedVersion(storageDir, version)) return;
 
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
@@ -413,56 +502,124 @@ export async function sendFeatureAnnouncement(
   // Try TUI toast first (works when client exposes tui.showToast),
   // fall back to Desktop ignored message
   const toastSent = await showTuiToast(opts.client, `AFT v${version}`, featureText, "info", 12000);
-  if (!toastSent) {
-    const { sessionId } = readDesktopState(opts.directory);
-    if (!sessionId) return;
-
-    const sections: string[] = [
-      `${FEATURE_MARKER} v${version}:`,
-      ...features.map((f) => `  • ${f}`),
-    ];
-    if (hasFooter) sections.push("", footer);
-    const text = sections.join("\n");
-    sessionLog(sessionId, `[aft-plugin] sending feature announcement for v${version}`);
-    await sendIgnoredMessage(opts.client, sessionId, text);
+  if (toastSent) {
+    persistAnnouncedVersion(storageDir, version);
+    return;
   }
 
-  // Persist the announced version
-  if (storageDir) {
-    try {
-      mkdirSync(storageDir, { recursive: true });
-      writeFileSync(join(storageDir, "last_announced_version"), version);
-    } catch {
-      // best-effort
-    }
+  const sections: string[] = [`${FEATURE_MARKER} v${version}:`, ...features.map((f) => `  • ${f}`)];
+  if (hasFooter) sections.push("", footer);
+  const text = sections.join("\n");
+  const pending = {
+    key: `feature:${version}`,
+    text,
+    shouldSkip: () => hasAnnouncedVersion(storageDir, version),
+    onDelivered: () => persistAnnouncedVersion(storageDir, version),
+  };
+
+  const sessionId = getExplicitSessionId(opts);
+  if (!sessionId) {
+    enqueuePendingDesktopNotification(opts.directory, pending);
+    return;
+  }
+
+  await flushPendingDesktopNotifications(opts, sessionId);
+  if (hasAnnouncedVersion(storageDir, version)) return;
+
+  sessionLog(sessionId, `[aft-plugin] sending feature announcement for v${version}`);
+  if (await sendIgnoredMessage(opts.client, sessionId, text)) {
+    persistAnnouncedVersion(storageDir, version);
   }
 }
 
+/**
+ * Returns true when the announcement should be suppressed for any reason:
+ *   - storageDir isn't configured (can't persist seen state),
+ *   - the marker file already records this version, or
+ *   - this is a fresh install / ephemeral sandbox (no marker file yet),
+ *     in which case shouldShowAnnouncement silently seeds the marker so the
+ *     next launch stays quiet (per magic-context#99).
+ *
+ * Note the name is retained from the pre-shared-helper version of this
+ * module to minimize call-site churn; semantically it's now "should suppress
+ * announcement" (fresh-install case included).
+ */
+function hasAnnouncedVersion(storageDir: string | undefined, version: string): boolean {
+  if (!storageDir) return true;
+  return !shouldShowAnnouncement(storageDir, "opencode", version);
+}
+
+function persistAnnouncedVersion(storageDir: string | undefined, version: string): void {
+  if (!storageDir) return;
+  markAnnouncementSeen(storageDir, "opencode", version);
+}
+
+/**
+ * Reads the persisted `warned_tools` dedup map.
+ *
+ * Returns `null` when the state could NOT be read (bridge not configured yet,
+ * RPC error, or a throw) — distinct from `{}` which means "read succeeded, no
+ * warnings recorded yet". The caller MUST treat `null` as "unknown" and NOT as
+ * "never warned": conflating the two is what caused the same `lsp_binary_missing`
+ * warning to re-fire on every session. The dedup row persists fine (record runs
+ * once the bridge is configured), but a read that raced the not-configured
+ * window returned `{}`, the gate read "never warned", and the warning was
+ * re-delivered every time.
+ */
 async function readWarnedTools(
   bridge: Pick<BinaryBridge, "send">,
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
+  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
   try {
-    const resp = await bridge.send("db_get_state", { key: "warned_tools" });
-    if (resp.success === false) return {};
+    resp = await bridge.send("db_get_state", { key: "warned_tools" });
+  } catch {
+    // The RPC itself failed (bridge not ready / transport error). State is
+    // UNKNOWN — caller must not treat this as "never warned".
+    return null;
+  }
+  // success:false means the bridge couldn't serve the read (e.g. not
+  // configured yet). UNKNOWN — same as a throw.
+  if (resp.success === false) return null;
 
-    const value = (resp.data as { value?: unknown } | undefined)?.value;
-    if (typeof value !== "string") return {};
-
+  // From here the read SUCCEEDED. Any malformed/absent/corrupt value is a
+  // genuine empty `{}` (recoverable): we deliver once and recordWarning then
+  // overwrites the bad value with a fresh valid map. Returning null here would
+  // suppress the warning forever AND never repair the corruption.
+  const value = (resp.data as { value?: unknown } | undefined)?.value;
+  if (typeof value !== "string") return {};
+  try {
     const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
   } catch {
+    // Corrupt JSON, but the read succeeded — treat as empty/recoverable.
     return {};
   }
 }
 
-async function hasWarnedFor(bridge: Pick<BinaryBridge, "send">, key: string): Promise<boolean> {
+/**
+ * Tri-state dedup check:
+ *   - "warned": the key is recorded — skip delivery.
+ *   - "fresh": state read OK, key absent — deliver + record.
+ *   - "unknown": state could not be read — do NOT deliver (can't dedup, so
+ *     delivering would risk spamming). The next configured call retries.
+ */
+async function warnedStatus(
+  bridge: Pick<BinaryBridge, "send">,
+  key: string,
+): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
-  return warned[key] === true || typeof warned[key] === "string";
+  if (warned === null) return "unknown";
+  return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
 async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
+  // Read-modify-write. If the read failed (null), do NOT write — a blind
+  // `{}` write would clobber previously-recorded keys and re-open the
+  // re-fire window. We only reach here after a "fresh" status, which means
+  // the read succeeded, so null is not expected; guard anyway.
   const warned = await readWarnedTools(bridge);
+  if (warned === null) return;
   warned[key] = true;
 
   try {
@@ -499,7 +656,7 @@ function warningTitle(warning: ConfigureWarning): string {
   }
 }
 
-function formatConfigureWarning(warning: ConfigureWarning): string {
+function formatConfigureWarningLine(warning: ConfigureWarning): string {
   const details: string[] = [];
   if (warning.language) details.push(`language: ${warning.language}`);
   if (warning.server) details.push(`server: ${warning.server}`);
@@ -509,32 +666,92 @@ function formatConfigureWarning(warning: ConfigureWarning): string {
   }
 
   const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-  return `${WARNING_MARKER} ${warningTitle(warning)}${suffix}\n${warning.hint}`;
+  return `• ${warningTitle(warning)}${suffix}\n  ${warning.hint}`;
+}
+
+function formatConfigureWarningChat(warning: ConfigureWarning): string {
+  return `${WARNING_MARKER} ${formatConfigureWarningLine(warning).replace(/^• /, "")}`;
+}
+
+function formatConfigureWarningsBatch(warnings: ConfigureWarning[]): string {
+  return warnings.map(formatConfigureWarningLine).join("\n\n");
+}
+
+async function deliverConfigureWarningBatch(
+  opts: ConfigureWarningOptions,
+  warnings: ConfigureWarning[],
+): Promise<boolean> {
+  if (warnings.length === 0) return false;
+  const delivery = opts.delivery ?? "toast";
+  const message = formatConfigureWarningsBatch(warnings);
+  const title = warnings.length === 1 ? `AFT: ${warningTitle(warnings[0])}` : "AFT: Missing tools";
+  if (delivery === "log") {
+    warn(`[aft-plugin] configure warnings:\n${message}`);
+    sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+    return true;
+  }
+
+  const toastSent = await showTuiToast(opts.client, title, message, "warning", 10_000);
+  if (toastSent) return true;
+
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
+  if (effectiveServerUrl) {
+    const httpToast = await showToastViaHttp(effectiveServerUrl, title, message, "warning", 10_000);
+    if (httpToast) return true;
+  }
+
+  warn(`[aft-plugin] configure warnings (toast unavailable):\n${message}`);
+  sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+  return true;
 }
 
 export async function deliverConfigureWarnings(
   opts: ConfigureWarningOptions,
   warnings: ConfigureWarning[],
 ): Promise<void> {
+  if (opts.projectRoot) {
+    await flushPendingDesktopNotifications(
+      { client: opts.client, directory: opts.projectRoot },
+      opts.sessionId,
+    );
+  }
   if (warnings.length === 0) return;
 
-  // `warned_tools` now persists through the bridge DB state API. This loses the
-  // old file-lock read-modify-write mutex, so two same-process concurrent
-  // recordWarning calls could race and drop one key. Configure warnings are
-  // delivered sequentially in normal plugin flow; if this becomes observable,
-  // add a bridge-side atomic update command rather than reviving file locks.
+  const pending: ConfigureWarning[] = [];
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
-    if (await hasWarnedFor(opts.bridge, key)) continue;
+    const status = await warnedStatus(opts.bridge, key);
+    // "warned": already delivered once — skip.
+    // "unknown": dedup state couldn't be read (bridge not configured yet /
+    //   RPC error). Do NOT deliver — delivering here is exactly what caused
+    //   the warning to re-fire on every session. The next configured call
+    //   reads real state and delivers once.
+    if (status !== "fresh") continue;
+    pending.push(warning);
+  }
+  if (pending.length === 0) return;
 
-    const delivered = await sendIgnoredMessage(
-      opts.client,
-      opts.sessionId,
-      formatConfigureWarning(warning),
-    );
-    if (!delivered) continue;
+  const delivery = opts.delivery ?? "toast";
+  if (delivery === "chat") {
+    for (const warning of pending) {
+      const ok = await sendIgnoredMessage(
+        opts.client,
+        opts.sessionId,
+        formatConfigureWarningChat(warning),
+        { includeAgent: false },
+      );
+      if (ok) {
+        await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
+      }
+    }
+    return;
+  }
 
-    await recordWarning(opts.bridge, key);
+  const delivered = await deliverConfigureWarningBatch(opts, pending);
+  if (!delivered) return;
+
+  for (const warning of pending) {
+    await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
   }
 }
 
@@ -545,10 +762,10 @@ export async function deliverConfigureWarnings(
 export async function cleanupWarnings(opts: NotificationOptions): Promise<void> {
   if (isTuiMode()) return; // TUI toasts don't persist
 
-  const { sessionId, serverUrl: desktopServerUrl } = readDesktopState(opts.directory);
+  const sessionId = getExplicitSessionId(opts);
   if (!sessionId) return;
 
-  const effectiveServerUrl = opts.serverUrl || desktopServerUrl;
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
   if (!effectiveServerUrl) return;
 
   const messages = await getSessionMessages(opts.client, sessionId);

@@ -264,6 +264,9 @@ pub struct SemanticBackendConfig {
     /// Prevents a single dense module from dominating search results.
     #[serde(default = "default_max_results_per_file")]
     pub max_results_per_file: usize,
+    /// Maximum number of project files to semantically index. Guards local
+    /// embedding memory on huge project roots; remote backends can raise it.
+    pub max_files: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -523,9 +526,23 @@ impl Default for SemanticBackendConfig {
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InspectConfig {
+    pub enabled: bool,
+}
+
+impl Default for InspectConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {
@@ -567,6 +584,10 @@ pub struct Config {
     pub search_index: bool,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
+    /// Whether the plugin registered the `aft_search` tool for this surface.
+    pub aft_search_registered: bool,
+    /// Enable the persisted callgraph store substrate (default: false).
+    pub callgraph_store: bool,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
     /// Enable experimental bash command compression (default: false).
@@ -594,6 +615,7 @@ pub struct Config {
     pub semantic: SemanticBackendConfig,
     /// File inclusion/exclusion policy for semantic indexing.
     pub semantic_files: SemanticFilePolicy,
+    pub inspect: InspectConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -623,6 +645,8 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// Allow URL-fetch commands to access private network hosts.
+    pub url_fetch_allow_private: bool,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
     pub harness: Option<Harness>,
@@ -651,6 +675,8 @@ impl Default for Config {
             restrict_to_project_root: false,
             search_index: false,
             semantic_search: false,
+            aft_search_registered: false,
+            callgraph_store: false,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,
@@ -680,6 +706,7 @@ impl Default for Config {
             max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
             semantic_files: SemanticFilePolicy::default(),
+            inspect: InspectConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),
@@ -687,6 +714,7 @@ impl Default for Config {
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
+            url_fetch_allow_private: false,
             harness: None,
             diagnostic_cache_size: 5000,
         }

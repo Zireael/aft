@@ -15,6 +15,7 @@ import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notifications.js";
 import { registerBashTool } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
 
@@ -96,6 +97,18 @@ async function spill(contents: string): Promise<string> {
   return file;
 }
 
+async function spillPair(
+  stdout: string,
+  stderr: string,
+): Promise<{ dir: string; stdoutPath: string; stderrPath: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "aft-pi-bash-status-test-"));
+  const stdoutPath = join(dir, "task.out");
+  const stderrPath = join(dir, "task.err");
+  await writeFile(stdoutPath, stdout);
+  await writeFile(stderrPath, stderr);
+  return { dir, stdoutPath, stderrPath };
+}
+
 function toolText(result: unknown): string {
   return (result as { content: Array<{ type: string; text: string }> }).content[0].text;
 }
@@ -155,6 +168,55 @@ describe("bash tool adapter", () => {
     expect(result.details.duration_ms).toBe(100);
   });
 
+  test("strips compressor-handled filter pipes before bridge and appends note", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({
+      output: "failure details",
+      exit_code: 1,
+      duration_ms: 100,
+    });
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    const bashTool = tools.get("bash")!;
+    const result = (await bashTool.execute(
+      "test-call",
+      { command: "bun test | grep fail" },
+      undefined,
+      undefined,
+      { cwd: "/test" },
+    )) as { content: Array<{ type: string; text: string }> };
+
+    const callArgs = calls[0] as [string, Record<string, unknown>];
+    expect(callArgs[1].command).toBe("bun test");
+    expect(result.content[0].text).toContain("failure details");
+    expect(result.content[0].text).toContain("[AFT dropped `| grep fail`");
+  });
+
+  test("keeps filter pipes when compressed:false", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({ output: "raw", exit_code: 0 });
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    const bashTool = tools.get("bash")!;
+    const result = (await bashTool.execute(
+      "test-call",
+      { command: "bun test | grep fail", compressed: false },
+      undefined,
+      undefined,
+      { cwd: "/test" },
+    )) as { content: Array<{ type: string; text: string }> };
+
+    const callArgs = calls[0] as [string, Record<string, unknown>];
+    expect(callArgs[1].command).toBe("bun test | grep fail");
+    expect(result.content[0].text).not.toContain("AFT dropped");
+  });
+
   test("background bash forwards user kill cap and uses 30s baseline transport budget", async () => {
     // Post-v0.20+ the Rust `bash` call returns `running` immediately, so
     // transport timeout is bounded by spawn + protocol round-trip, not the
@@ -201,8 +263,12 @@ describe("bash tool adapter", () => {
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
     const bridge = {
-      send: async (command: string, params: Record<string, unknown>) => {
-        calls.push([command, params]);
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
         if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
         return {
           success: true,
@@ -229,7 +295,72 @@ describe("bash tool adapter", () => {
 
     expect(result.content[0].text).toBe("done");
     expect(calls.map((call) => (call as [string])[0])).toEqual(["bash", "bash_status"]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
     expect((calls[0] as [string, Record<string, unknown>])[1].notify_on_completion).toBe(false);
+  });
+
+  test("foreground leading grep appends aft_search hint", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "src/file.ts:1:x",
+          output_truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx, true);
+
+    const result = (await tools
+      .get("bash")!
+      .execute("test-call", { command: 'grep -nE "x" src/' }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("src/file.ts:1:x");
+    expect(result.content[0].text).toContain("DO NOT search code by running grep/rg in bash");
+    expect(result.content[0].text).toContain("Use the `aft_search` tool instead");
+  });
+
+  test("foreground filtering grep does not append code-search hint", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "failure details",
+          output_truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx, true);
+
+    const result = (await tools
+      .get("bash")!
+      .execute("test-call", { command: "bun test | grep fail" }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("failure details");
+    expect(result.content[0].text).not.toContain("DO NOT search code by running grep/rg in bash");
   });
 
   test("foreground running command promotes to background after timeout", async () => {
@@ -237,8 +368,12 @@ describe("bash tool adapter", () => {
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
     const bridge = {
-      send: async (command: string, params: Record<string, unknown>) => {
-        calls.push([command, params]);
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
         if (command === "bash")
           return { success: true, status: "running", task_id: "task-promote" };
         if (command === "bash_status") return { success: true, status: "running" };
@@ -250,20 +385,56 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const result = (await bashTool.execute(
-      "test-call",
-      { command: "sleep 2", timeout: 0 },
-      undefined,
-      undefined,
-      { cwd: "/test" },
-    )) as { content: Array<{ text: string }> };
+    // 50ms foreground wait: first status poll (~0ms elapsed) keeps polling, the
+    // second (~100ms after a poll-interval sleep) crosses the window and
+    // promotes — exactly two status calls. Production floors the window at 5s;
+    // bun caps tests at 5s, so this seam exercises the promote path fast.
+    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "50";
+    let result: { content: Array<{ text: string }> };
+    try {
+      result = (await bashTool.execute("test-call", { command: "sleep 2" }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+    } finally {
+      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+    }
 
     expect(result.content[0].text).toContain("promoted to background: task-promote");
     expect(calls.map((call) => (call as [string])[0])).toEqual([
       "bash",
       "bash_status",
+      "bash_status",
       "bash_promote",
     ]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
+  });
+
+  test("async bash_watch registration does not add synthetic outstanding task", async () => {
+    __resetBgNotificationStateForTests();
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) =>
+        command === "bash_notify"
+          ? { success: true, watch_id: "watch-1" }
+          : { success: true, status: "completed", exit_code: 0 },
+    } as unknown as BinaryBridge;
+    registerBashTool(api, makeMockContext(bridge));
+
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-finished", pattern: "READY", background: true },
+        undefined,
+        undefined,
+        { cwd: "/test", sessionManager: { getSessionId: () => "s-watch" } },
+      );
+
+    expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
   });
 
   test("BashSpawnHook modifies command before bridge call", async () => {
@@ -467,7 +638,55 @@ describe("bash tool adapter", () => {
     ).rejects.toThrow("Permission ask reached Pi adapter");
   });
 
-  test("bash_status wait_for substring returns waited details", async () => {
+  test("bash-family control RPCs keep the bridge on transport timeout", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    const bridge = {
+      send: async (...args: unknown[]) => {
+        calls.push(args);
+        const command = args[0];
+        if (command === "bash_notify") return { success: true, watch_id: "watch-1" };
+        if (command === "bash_write") return { success: true, bytes_written: 3 };
+        if (command === "bash_kill") return { success: true, status: "killed" };
+        return { success: true, status: "running", duration_ms: 0 };
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(api, makeMockContext(bridge));
+    const extCtx = { cwd: "/test" };
+
+    await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-control" }, undefined, undefined, extCtx);
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-control", pattern: "ready", background: true },
+        undefined,
+        undefined,
+        extCtx,
+      );
+    await tools
+      .get("bash_write")!
+      .execute("call", { task_id: "bash-control", input: "abc" }, undefined, undefined, extCtx);
+    await tools
+      .get("bash_kill")!
+      .execute("call", { task_id: "bash-control" }, undefined, undefined, extCtx);
+
+    expect(calls.map((call) => (call as [string])[0])).toEqual([
+      "bash_status",
+      "bash_notify",
+      "bash_write",
+      "bash_kill",
+    ]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
+  });
+
+  test("bash_watch pattern substring returns waited matched details", async () => {
     const outputPath = await spill("alpha ready beta\n");
     try {
       const tools = new Map<string, MockToolDef>();
@@ -480,8 +699,8 @@ describe("bash tool adapter", () => {
       const ctx = makeMockContext(bridge);
       registerBashTool(api, ctx);
       const result = (await tools
-        .get("bash_status")!
-        .execute("call", { task_id: "bash-pi-wait", wait_for: "ready" }, undefined, undefined, {
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-pi-wait", pattern: "ready" }, undefined, undefined, {
           cwd: "/test",
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
       expect(toolText(result)).toContain('matched "ready" at offset 6');
@@ -498,7 +717,62 @@ describe("bash tool adapter", () => {
     }
   });
 
-  test("bash_status exit true returns waited exited details", async () => {
+  test("bash_watch scans stderr_path as well as output_path", async () => {
+    const spill = await spillPair("stdout\n", "warning: READY on stderr\n");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const { bridge } = makeTrackableMockBridge({
+        status: "running",
+        mode: "pipes",
+        output_path: spill.stdoutPath,
+        stderr_path: spill.stderrPath,
+      });
+      const ctx = makeMockContext(bridge);
+      registerBashTool(api, ctx);
+      const result = (await tools
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-pi-stderr", pattern: "READY" }, undefined, undefined, {
+          cwd: "/test",
+        })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
+      expect(toolText(result)).toContain('matched "READY" at offset 16');
+      expect(result.details.waited).toMatchObject({
+        reason: "matched",
+        match: "READY",
+        match_offset: 16,
+      });
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch scans terminal output before returning exited", async () => {
+    const outputPath = await spill("pattern exists and match wins\n");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const { bridge } = makeTrackableMockBridge({
+        status: "completed",
+        exit_code: 0,
+        mode: "pipes",
+        output_path: outputPath,
+      });
+      const ctx = makeMockContext(bridge);
+      registerBashTool(api, ctx);
+      const result = (await tools
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-pi-race", pattern: "pattern" }, undefined, undefined, {
+          cwd: "/test",
+        })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
+      expect(toolText(result)).toContain('matched "pattern" at offset 0');
+      expect(toolText(result)).not.toContain("task exited");
+      expect(result.details.waited).toMatchObject({ reason: "matched", match_offset: 0 });
+    } finally {
+      await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch exit-only returns waited exited details", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge } = makeTrackableMockBridge({
@@ -508,9 +782,10 @@ describe("bash tool adapter", () => {
     });
     const ctx = makeMockContext(bridge);
     registerBashTool(api, ctx);
+    // bash_watch with no pattern in sync mode waits for exit
     const result = (await tools
-      .get("bash_status")!
-      .execute("call", { task_id: "bash-pi-exit", exit: true }, undefined, undefined, {
+      .get("bash_watch")!
+      .execute("call", { task_id: "bash-pi-exit" }, undefined, undefined, {
         cwd: "/test",
       })) as { details: { waited?: { reason: string } } };
     expect(toolText(result)).toContain("task exited (completed, exit 0)");

@@ -117,3 +117,21 @@ The external task definitions in `external-fixtures.json` are vendored from
 Vera's `eval/tasks/*.json` corpus. The metric formulas in `metrics.py` mirror
 Vera's `eval/src/metrics.rs` and are reimplemented independently here rather
 than copied wholesale.
+
+## Docker
+
+Run the existing in-tree benchmark without host AFT/Bun/Rust installs:
+
+```bash
+bun run bench:aft-search
+# or
+make run-aft-search
+```
+
+The Docker image builds AFT from this checkout and writes `results/aft-search-docker.json` by default. For the external Vera-compatible corpus:
+
+```bash
+AFT_SEARCH_MODE=external AFT_SEARCH_OUT=results/aft-vera-docker.json bun run bench:aft-search
+```
+
+The compose file mounts `results/` and `.bench/` so reports and cloned corpora persist outside the container.

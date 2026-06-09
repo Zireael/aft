@@ -1,10 +1,11 @@
+use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
@@ -13,22 +14,29 @@ use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, SemanticFilePolicy, UserServerDef};
-use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+};
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
-    CacheLock, SearchIndex,
+    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir,
+    walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
-use crate::semantic_index::{EmbeddingModelProfile, SemanticIndex, SemanticIndexLock};
-use crate::{slog_info, slog_warn};
+use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
+use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 const MAX_SEARCH_INDEX_FILES: usize = 20_000;
+const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
+const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
+const MAX_SEMANTIC_TIMEOUT_MS: u64 = 120_000;
+const MAX_SEMANTIC_BATCH_SIZE: usize = 1_024;
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -39,22 +47,49 @@ fn resolve_home_dir() -> Option<PathBuf> {
 
 fn create_project_watcher(
     root_path: PathBuf,
+    extra_watch_paths: Vec<PathBuf>,
     tx: mpsc::Sender<notify::Result<notify::Event>>,
 ) -> notify::Result<notify::RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(&root_path, RecursiveMode::Recursive)?;
+    for path in extra_watch_paths {
+        if path.exists() {
+            watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        }
+    }
     Ok(watcher)
+}
+
+fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+        if global_ignore.is_file() {
+            paths.push(global_ignore);
+        }
+    }
+    let info_exclude = ctx
+        .git_common_dir()
+        .unwrap_or_else(|| root_path.join(".git"))
+        .join("info")
+        .join("exclude");
+    if info_exclude.is_file() {
+        paths.push(info_exclude);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn install_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
     attach: F,
 ) -> thread::JoinHandle<()>
 where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -71,29 +106,255 @@ where
     let root_path = root_path.to_path_buf();
     let session_id_for_bg = log_ctx::current_session();
     thread::spawn(move || {
-        log_ctx::with_session(session_id_for_bg, || match attach(root_path.clone(), tx) {
-            Ok(_watcher) => {
-                if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    slog_info!("watcher started: {}", root_path.display());
+        log_ctx::with_session(session_id_for_bg, || {
+            match attach(root_path.clone(), extra_watch_paths, tx.clone()) {
+                Ok(_watcher) => {
+                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        slog_info!("watcher started: {}", root_path.display());
+                    }
+                    while WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                while WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    thread::sleep(Duration::from_millis(50));
-                }
-            }
-            Err(error) => {
-                if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    log::debug!(
-                        "watcher init failed: {} — callers will work with stale data",
-                        error
-                    );
+                Err(error) => {
+                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        log::debug!(
+                            "watcher init failed: {} — callers will work with stale data",
+                            error
+                        );
+                        let _ = tx.send(Err(notify::Error::generic(&format!(
+                            "watcher init failed: {error}"
+                        ))));
+                    }
                 }
             }
         });
     })
 }
 
+/// Harness-only seam: when `AFT_TEST_DISABLE_FILE_WATCHER=1`, `configure` skips
+/// installing the OS file watcher entirely. The integration suite spawns ~600
+/// `aft` processes; under that concurrent load the macOS FSEvents `watch()` call
+/// probabilistically hangs (it never returns and never delivers events for a
+/// fraction of processes), which flaked any test waiting on watcher-driven
+/// invalidation. The vast majority of tests mutate files through AFT's own tools
+/// (which invalidate caches directly, not via the watcher), so they need no
+/// watcher at all. The test helper disables it by default; the dedicated
+/// `watcher_integration` test binary (which runs alone, with no concurrent load)
+/// opts back in. Never set in production.
+fn file_watcher_disabled_for_test() -> bool {
+    std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1")
+}
+
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
-    let _ = install_project_watcher_with(ctx, root_path, create_project_watcher);
+    if file_watcher_disabled_for_test() {
+        return;
+    }
+    let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
+    let _ = install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
+}
+
+/// Backoff for build-level retries when the embedding backend is unreachable.
+/// Ramps 15s -> 30s -> 60s then holds at 60s. Keeps the retry cadence cheap
+/// (the build re-walks files each attempt) while recovering within a minute of
+/// the backend returning.
+fn semantic_build_retry_backoff(attempt: usize) -> Duration {
+    // Test seam: shrink the schedule to a fixed small interval so recovery
+    // integration tests don't wait real 15s+ windows. Not a user-facing knob.
+    if let Ok(raw) = std::env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    const SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
+    let secs = SCHEDULE_SECS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*SCHEDULE_SECS.last().unwrap());
+    Duration::from_secs(secs)
+}
+
+fn spawn_semantic_refresh_worker(
+    project_root: PathBuf,
+    mut index: SemanticIndex,
+    mut model: crate::semantic_index::EmbeddingModel,
+    max_batch_size: usize,
+    max_files: usize,
+    request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
+    event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
+    session_id: Option<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            while let Ok(first_request) = request_rx.recv() {
+                let mut paths = Vec::new();
+                let mut corpus_files = None;
+                match first_request {
+                    SemanticRefreshRequest::Files {
+                        paths: request_paths,
+                    } => {
+                        paths.extend(request_paths);
+                    }
+                    SemanticRefreshRequest::Corpus { current_files } => {
+                        corpus_files = Some(current_files);
+                    }
+                }
+
+                let mut disconnected = false;
+                let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
+                let mut deadline = Instant::now() + quiet_window;
+
+                while corpus_files.is_none() && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match request_rx.recv_timeout(remaining) {
+                        Ok(SemanticRefreshRequest::Files {
+                            paths: request_paths,
+                        }) => {
+                            paths.extend(request_paths);
+                            if paths.len() >= SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                                break;
+                            }
+                            deadline = Instant::now() + quiet_window;
+                        }
+                        Ok(SemanticRefreshRequest::Corpus { current_files }) => {
+                            paths.clear();
+                            corpus_files = Some(current_files);
+                            break;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if disconnected {
+                    break;
+                }
+
+                if let Some(mut current_files) = corpus_files {
+                    current_files.sort();
+                    current_files.dedup();
+                    if current_files.len() > max_files {
+                        let error = format!(
+                            "too many files (>{}) for semantic indexing (max {})",
+                            max_files, max_files
+                        );
+                        let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed { error });
+                        continue;
+                    }
+
+                    let mut embed = |texts: Vec<String>| model.embed(texts);
+                    let mut progress = |_done: usize, _total: usize| {};
+                    match index.refresh_stale_files(
+                        &project_root,
+                        &current_files,
+                        &mut embed,
+                        max_batch_size,
+                        &mut progress,
+                    ) {
+                        Ok(summary) => {
+                            if !summary.is_noop() {
+                                slog_info!(
+                                    "semantic corpus refresh: {} changed, {} new, {} deleted, {} total processed",
+                                    summary.changed,
+                                    summary.added,
+                                    summary.deleted,
+                                    summary.total_processed,
+                                );
+                            }
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusCompleted {
+                                    index: index.clone(),
+                                    changed: summary.changed,
+                                    added: summary.added,
+                                    deleted: summary.deleted,
+                                    total_processed: summary.total_processed,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            slog_warn!("semantic corpus refresh failed: {}", error);
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                paths.sort();
+                paths.dedup();
+                if paths.is_empty() {
+                    continue;
+                }
+
+                if event_tx
+                    .send(SemanticRefreshEvent::Started {
+                        paths: paths.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+
+                let mut embed = |texts: Vec<String>| model.embed(texts);
+                let mut progress = |_done: usize, _total: usize| {};
+                match index.refresh_invalidated_files(
+                    &project_root,
+                    &paths,
+                    &mut embed,
+                    max_batch_size,
+                    max_files,
+                    &mut progress,
+                ) {
+                    Ok(update) => {
+                        if !update.summary.is_noop() {
+                            slog_info!(
+                                "semantic refresh: {} changed, {} new, {} deleted, {} total processed",
+                                update.summary.changed,
+                                update.summary.added,
+                                update.summary.deleted,
+                                update.summary.total_processed,
+                            );
+                        }
+                        if event_tx
+                            .send(SemanticRefreshEvent::Completed {
+                                added_entries: update.added_entries,
+                                updated_metadata: update.updated_metadata,
+                                completed_paths: update.completed_paths,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        slog_warn!(
+                            "semantic refresh failed for {} file(s): {}",
+                            paths.len(),
+                            error
+                        );
+                        if event_tx
+                            .send(SemanticRefreshEvent::Failed { paths, error })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    })
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
@@ -137,6 +398,9 @@ fn has_parent_component(path: &Path) -> bool {
 }
 
 fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
+    if std::env::var_os("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD").is_some() {
+        return (false, None);
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -164,6 +428,35 @@ fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
     let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
     let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
     (git_dir != common_dir, Some(common_dir))
+}
+
+fn semantic_fingerprint_config_changed(
+    previous: &SemanticBackendConfig,
+    next: &SemanticBackendConfig,
+) -> bool {
+    previous.backend != next.backend
+        || previous.model != next.model
+        || previous.base_url != next.base_url
+}
+
+fn parse_inspect_config(
+    value: &serde_json::Value,
+    current: &crate::config::InspectConfig,
+) -> Result<crate::config::InspectConfig, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: inspect must be an object".to_string());
+    };
+
+    let mut inspect = current.clone();
+
+    if let Some(raw) = obj.get("enabled") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: inspect.enabled must be a boolean".to_string());
+        };
+        inspect.enabled = value;
+    }
+
+    Ok(inspect)
 }
 
 fn parse_semantic_config(
@@ -221,14 +514,15 @@ fn parse_semantic_config(
         let timeout_ms = raw.as_u64().ok_or_else(|| {
             "configure: semantic.timeout_ms must be an unsigned integer".to_string()
         })?;
-        semantic.timeout_ms = timeout_ms;
+        semantic.timeout_ms = timeout_ms.min(MAX_SEMANTIC_TIMEOUT_MS);
     }
     if let Some(raw) = obj.get("max_batch_size") {
         let max_batch_size = raw.as_u64().ok_or_else(|| {
             "configure: semantic.max_batch_size must be an unsigned integer".to_string()
         })?;
         semantic.max_batch_size = usize::try_from(max_batch_size)
-            .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?;
+            .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?
+            .min(MAX_SEMANTIC_BATCH_SIZE);
     }
     if let Some(raw) = obj.get("dimensions") {
         semantic.dimensions = if raw.is_null() {
@@ -302,22 +596,12 @@ fn parse_semantic_config(
             })?
             .trim()
             .to_string();
-        // Normalize empty/whitespace-only templates to None so fingerprint
-        // hashes match the no-template case and avoid unnecessary rebuilds.
         semantic.query_prompt_template = if trimmed.is_empty() {
             None
         } else {
-            // Warn if the template does not contain the expected placeholder.
-            // Truncate the template in the log to avoid exposing sensitive content.
             if !trimmed.contains("{query}") {
-                let preview = if trimmed.len() > 80 {
-                    format!("{}…", &trimmed[..80])
-                } else {
-                    trimmed.clone()
-                };
                 crate::slog_warn!(
-                    "semantic.query_prompt_template does not contain {{query}} placeholder; template will be ignored at query time: {}",
-                    &preview,
+                    "semantic.query_prompt_template does not contain {{query}} placeholder"
                 );
             }
             Some(trimmed)
@@ -331,19 +615,12 @@ fn parse_semantic_config(
             })?
             .trim()
             .to_string();
-        // Normalize empty/whitespace-only templates to None.
         semantic.document_prompt_template = if trimmed.is_empty() {
             None
         } else {
             if !trimmed.contains("{text}") {
-                let preview = if trimmed.len() > 80 {
-                    format!("{}…", &trimmed[..80])
-                } else {
-                    trimmed.clone()
-                };
                 crate::slog_warn!(
-                    "semantic.document_prompt_template does not contain {{text}} placeholder; template will be ignored at document time: {}",
-                    &preview,
+                    "semantic.document_prompt_template does not contain {{text}} placeholder"
                 );
             }
             Some(trimmed)
@@ -478,6 +755,23 @@ fn parse_semantic_config(
         semantic.metrics_window_size = usize::try_from(v)
             .map_err(|_| "configure: semantic.metrics_window_size is too large".to_string())?;
     }
+    if let Some(raw) = obj.get("max_results_per_file") {
+        let v = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.max_results_per_file must be an unsigned integer".to_string()
+        })?;
+        semantic.max_results_per_file = usize::try_from(v)
+            .map_err(|_| "configure: semantic.max_results_per_file is too large".to_string())?;
+    }
+    if let Some(raw) = obj.get("max_files") {
+        let max_files = raw.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
+            format!(
+                "configure: semantic.max_files must be a positive integer (>= 1); got {}",
+                raw
+            )
+        })?;
+        semantic.max_files = usize::try_from(max_files)
+            .map_err(|_| "configure: semantic.max_files is too large".to_string())?;
+    }
 
     Ok(semantic)
 }
@@ -580,8 +874,12 @@ fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String
     };
 
     let id = required_string(obj.get("id"), index, "id")?;
-    let extensions = required_extension_array(obj.get("extensions"), index)?;
-    let binary = required_string(obj.get("binary"), index, "binary")?;
+    // extensions/binary are optional: when a user overrides a *built-in* server
+    // (e.g. `rust`) to tweak one field, the built-in's extensions/binary are
+    // inherited downstream in `resolved_servers`. Requiring them here silently
+    // dropped the entire `lsp` section on a partial override (issue from #84).
+    let extensions = optional_extension_array(obj.get("extensions"), index)?;
+    let binary = optional_lsp_binary(obj.get("binary"), index)?;
     let args = optional_string_array(obj.get("args"), index, "args")?;
     let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
     let env = parse_lsp_server_env(obj.get("env"), index)?;
@@ -646,26 +944,25 @@ fn required_string(value: Option<&Value>, index: usize, field: &str) -> Result<S
     Ok(raw.to_string())
 }
 
-fn required_string_array(
-    value: Option<&Value>,
-    index: usize,
-    field: &str,
-) -> Result<Vec<String>, String> {
-    let values = optional_string_array(value, index, field)?;
-    if values.is_empty() {
-        return Err(format!(
-            "configure: lsp_servers[{index}].{field} must not be empty"
-        ));
-    }
-    Ok(values)
-}
-
-fn required_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
-    let values = required_string_array(value, index, "extensions")?;
+/// Parse the `extensions` array for an LSP server override. An absent value is
+/// an empty list (no validation error) so a partial override of a built-in
+/// server can omit `extensions` and inherit the built-in's set downstream.
+fn optional_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
+    let values = optional_string_array(value, index, "extensions")?;
     Ok(values
         .into_iter()
         .map(|value| value.trim_start_matches('.').to_string())
         .collect())
+}
+
+/// Like `required_string` for `binary` but treats an absent value as empty
+/// (inherited from the built-in downstream). A present-but-blank value is still
+/// rejected so typos like `"binary": ""` surface instead of silently inheriting.
+fn optional_lsp_binary(value: Option<&Value>, index: usize) -> Result<String, String> {
+    match value {
+        None => Ok(String::new()),
+        Some(value) => required_string(Some(value), index, "binary"),
+    }
 }
 
 fn optional_string_array(
@@ -816,6 +1113,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
         LangId::Solidity => "solidity",
+        LangId::Scss => "scss",
         LangId::Vue => "vue",
         LangId::Json => "json",
         LangId::Scala => "scala",
@@ -828,6 +1126,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
     }
 }
 
@@ -966,6 +1265,7 @@ fn formatter_candidates(
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -976,7 +1276,7 @@ fn formatter_candidates(
         | LangId::Php
         | LangId::Lua
         | LangId::Perl => Vec::new(),
-        LangId::Html | LangId::Markdown => Vec::new(),
+        LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
 
@@ -1032,6 +1332,7 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -1042,7 +1343,7 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::Php
         | LangId::Lua
         | LangId::Perl => Vec::new(),
-        LangId::Html | LangId::Markdown => Vec::new(),
+        LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
 
@@ -1055,85 +1356,18 @@ fn resolve_tool_cached(
         return *is_available;
     }
 
-    let is_available = resolve_tool_uncached(tool, project_root);
+    let is_available = crate::format::tool_available_for_missing_warning(tool, project_root);
     cache.insert(tool.to_string(), is_available);
     is_available
 }
 
-fn resolve_tool_uncached(tool: &str, project_root: Option<&Path>) -> bool {
-    if tool == "ruff" {
-        return ruff_format_available(project_root);
-    }
-
-    if let Some(root) = project_root {
-        if root.join("node_modules").join(".bin").join(tool).exists() {
-            return true;
-        }
-    }
-
-    let mut child = match std::process::Command::new(tool)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => return false,
-        }
-    }
+fn should_warn_missing_formatters(config: &crate::config::Config, lang: LangId) -> bool {
+    config.format_on_edit || config.formatter.contains_key(lang_key(lang))
 }
 
-fn ruff_format_available(project_root: Option<&Path>) -> bool {
-    let command = if let Some(root) = project_root {
-        let local = root.join("node_modules").join(".bin").join("ruff");
-        if local.exists() {
-            local
-        } else {
-            PathBuf::from("ruff")
-        }
-    } else {
-        PathBuf::from("ruff")
-    };
-
-    let output = match std::process::Command::new(command)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-
-    let version = String::from_utf8_lossy(&output.stdout);
-    let version = version
-        .trim()
-        .strip_prefix("ruff ")
-        .unwrap_or(version.trim());
-    let parts = version
-        .split('.')
-        .take(3)
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>();
-    match parts.as_deref() {
-        Ok([major, minor, patch]) => (*major, *minor, *patch) >= (0, 1, 2),
-        _ => false,
-    }
+fn should_warn_missing_checkers(config: &crate::config::Config, lang: LangId) -> bool {
+    let mode = config.validate_on_edit.as_deref().unwrap_or("off");
+    (mode == "syntax" || mode == "full") || config.checker.contains_key(lang_key(lang))
 }
 
 fn missing_tool_warning(
@@ -1175,38 +1409,42 @@ fn detect_missing_tools_for_languages(
     for &lang in languages {
         let language = lang_key(lang);
 
-        for candidate in formatter_candidates(lang, config) {
-            if let Some(warning) = missing_tool_warning(
-                "formatter_not_installed",
-                language,
-                &candidate,
-                config.project_root.as_deref(),
-                &mut tool_cache,
-            ) {
-                if seen.insert((
-                    warning.kind.clone(),
-                    warning.language.clone(),
-                    warning.tool.clone(),
-                )) {
-                    warnings.push(warning);
+        if should_warn_missing_formatters(config, lang) {
+            for candidate in formatter_candidates(lang, config) {
+                if let Some(warning) = missing_tool_warning(
+                    "formatter_not_installed",
+                    language,
+                    &candidate,
+                    config.project_root.as_deref(),
+                    &mut tool_cache,
+                ) {
+                    if seen.insert((
+                        warning.kind.clone(),
+                        warning.language.clone(),
+                        warning.tool.clone(),
+                    )) {
+                        warnings.push(warning);
+                    }
                 }
             }
         }
 
-        for candidate in checker_candidates(lang, config) {
-            if let Some(warning) = missing_tool_warning(
-                "checker_not_installed",
-                language,
-                &candidate,
-                config.project_root.as_deref(),
-                &mut tool_cache,
-            ) {
-                if seen.insert((
-                    warning.kind.clone(),
-                    warning.language.clone(),
-                    warning.tool.clone(),
-                )) {
-                    warnings.push(warning);
+        if should_warn_missing_checkers(config, lang) {
+            for candidate in checker_candidates(lang, config) {
+                if let Some(warning) = missing_tool_warning(
+                    "checker_not_installed",
+                    language,
+                    &candidate,
+                    config.project_root.as_deref(),
+                    &mut tool_cache,
+                ) {
+                    if seen.insert((
+                        warning.kind.clone(),
+                        warning.language.clone(),
+                        warning.tool.clone(),
+                    )) {
+                        warnings.push(warning);
+                    }
                 }
             }
         }
@@ -1216,6 +1454,47 @@ fn detect_missing_tools_for_languages(
         (&left.kind, &left.language, &left.tool).cmp(&(&right.kind, &right.language, &right.tool))
     });
     warnings
+}
+
+fn parse_validate_on_edit(raw: &Value) -> Result<String, String> {
+    if let Some(value) = raw.as_bool() {
+        return Ok(if value { "syntax" } else { "off" }.to_string());
+    }
+
+    let Some(value) = raw.as_str() else {
+        return Err(
+            "configure: validate_on_edit must be a boolean or one of 'off', 'syntax', 'full'"
+                .to_string(),
+        );
+    };
+
+    match value {
+        "off" | "syntax" | "full" => Ok(value.to_string()),
+        "true" | "false" => Err(
+            "configure: validate_on_edit string booleans are not accepted; use a JSON boolean or one of 'off', 'syntax', 'full'"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "configure: validate_on_edit must be one of 'off', 'syntax', 'full'; got '{other}'"
+        )),
+    }
+}
+
+fn parse_string_map(value: &Value, field: &str) -> Result<HashMap<String, String>, String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "configure: {field} must be an object of string values"
+        ));
+    };
+
+    let mut parsed = HashMap::with_capacity(object.len());
+    for (key, raw_value) in object {
+        let Some(value) = raw_value.as_str() else {
+            return Err(format!("configure: {field}.{key} must be a string"));
+        };
+        parsed.insert(key.clone(), value.to_string());
+    }
+    Ok(parsed)
 }
 
 fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
@@ -1263,6 +1542,14 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     }
 
     for server in &config.lsp_servers {
+        // A blank binary means "partial built-in override, inherit the built-in
+        // binary" — the resolvable binary is already covered by the built-in
+        // pass above, so skip the missing-binary probe here (probing "" never
+        // resolves and would emit a bogus warning).
+        if server.binary.is_empty() {
+            continue;
+        }
+
         if server.disabled || !seen.insert((server.id.clone(), server.binary.clone())) {
             continue;
         }
@@ -1291,6 +1578,168 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 
     warnings.sort_by_key(|warning| warning.to_string());
     warnings
+}
+
+type SearchIndexSymbolFile = (PathBuf, SystemTime);
+
+fn search_index_symbol_files(index: &SearchIndex) -> Vec<SearchIndexSymbolFile> {
+    index
+        .files
+        .iter()
+        .filter(|entry| !entry.path.as_os_str().is_empty())
+        .map(|entry| (entry.path.clone(), entry.modified))
+        .collect()
+}
+
+fn spawn_symbol_cache_prewarm(
+    root: PathBuf,
+    symbol_cache: SharedSymbolCache,
+    symbol_storage: Option<PathBuf>,
+    symbol_project_key: String,
+    symbol_cache_generation: u64,
+    symbol_files: Vec<SearchIndexSymbolFile>,
+    is_worktree_bridge: bool,
+    session_id: Option<String>,
+) {
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            prewarm_symbol_cache_from_search_files(
+                root,
+                symbol_cache,
+                symbol_storage,
+                symbol_project_key,
+                symbol_cache_generation,
+                symbol_files,
+                is_worktree_bridge,
+            );
+        });
+    });
+}
+
+fn prewarm_symbol_cache_from_search_files(
+    root: PathBuf,
+    symbol_cache: SharedSymbolCache,
+    symbol_storage: Option<PathBuf>,
+    symbol_project_key: String,
+    symbol_cache_generation: u64,
+    symbol_files: Vec<SearchIndexSymbolFile>,
+    is_worktree_bridge: bool,
+) {
+    #[cfg(debug_assertions)]
+    delay_symbol_prewarm_for_debug();
+
+    let mut warmed_files = 0usize;
+    let mut skipped_files = 0usize;
+    if let Ok(mut cache) = symbol_cache.write() {
+        if !cache.set_project_root_for_generation(symbol_cache_generation, root.clone()) {
+            slog_info!("skipping stale symbol cache prewarm after reconfigure");
+            return;
+        }
+        if let Some(storage_dir) = symbol_storage.as_deref() {
+            let loaded_count = cache.load_from_disk_for_generation(
+                symbol_cache_generation,
+                storage_dir,
+                &symbol_project_key,
+                &root,
+            );
+            slog_info!("loaded symbol cache from disk: {} files", loaded_count);
+        }
+    } else {
+        return;
+    }
+
+    let mut parser = crate::parser::FileParser::with_symbol_cache_generation(
+        symbol_cache.clone(),
+        Some(symbol_cache_generation),
+    );
+    for (path, modified) in &symbol_files {
+        let cached = symbol_cache
+            .read()
+            .map(|cache| cache.contains_path_with_mtime(path, *modified))
+            .unwrap_or(false);
+        if cached {
+            skipped_files += 1;
+            continue;
+        }
+        if parser.extract_symbols(path).is_ok() {
+            warmed_files += 1;
+        }
+    }
+
+    let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
+    if !is_worktree_bridge {
+        if let Some(storage_dir) = symbol_storage.as_deref() {
+            if let Ok(cache) = symbol_cache.read() {
+                if cache.generation() != symbol_cache_generation {
+                    slog_info!("skipping stale symbol cache persistence after reconfigure");
+                    return;
+                }
+                match crate::symbol_cache_disk::write_to_disk(
+                    &cache,
+                    storage_dir,
+                    &symbol_project_key,
+                ) {
+                    Ok(()) => {
+                        slog_info!("persisted symbol cache: {} files", cache.len());
+                    }
+                    Err(error) => {
+                        slog_warn!("failed to persist symbol cache: {}", error);
+                    }
+                }
+            }
+        }
+    }
+    slog_info!(
+        "pre-warmed symbol cache: {} new, {} cached, {} files total",
+        warmed_files,
+        skipped_files,
+        total_files
+    );
+}
+
+#[cfg(debug_assertions)]
+fn delay_symbol_prewarm_for_debug() {
+    let Some(delay_ms) = std::env::var("AFT_TEST_SYMBOL_PREWARM_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay_ms));
+}
+
+fn walk_semantic_project_files_bounded(
+    root: &Path,
+    max_files: usize,
+) -> Result<Vec<PathBuf>, usize> {
+    let filters = build_path_filters(&[], &[]).unwrap_or_default();
+    walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
+}
+
+#[cfg(debug_assertions)]
+fn delay_search_rebuild_publish_for_debug() {
+    let Some(delay_ms) = std::env::var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay_ms));
+}
+
+#[cfg(not(debug_assertions))]
+fn delay_search_rebuild_publish_for_debug() {}
+
+#[cfg(debug_assertions)]
+fn mark_search_rebuild_spawn_for_debug() {
+    let Some(path) = std::env::var_os("AFT_TEST_SEARCH_REBUILD_THREAD_MARKER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"spawned");
 }
 
 /// Handle a `configure` request.
@@ -1354,121 +1803,48 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     debug_assert!(canonical_cache_root.is_absolute());
     let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(&canonical_cache_root);
 
-    let previous_project_root = ctx.config().project_root.clone();
-    if previous_project_root.as_ref() != Some(&root_path) {
-        crate::format::clear_tool_cache();
-    }
+    let previous_config = ctx.config().clone();
+    let previous_project_root = previous_config.project_root.clone();
+    let mut next_config = previous_config.clone();
+    next_config.project_root = Some(root_path.clone());
+    next_config.harness = Some(harness);
 
-    // Set project root on config
-    ctx.config_mut().project_root = Some(root_path.clone());
-    ctx.config_mut().harness = Some(harness);
-    ctx.set_harness(harness);
-    ctx.backup().borrow().set_db_harness(harness);
-    ctx.set_canonical_cache_root(canonical_cache_root.clone());
-    ctx.set_cache_role(is_worktree_bridge, git_common_dir);
-    ctx.backup()
-        .borrow()
-        .set_db_project_key(crate::search_index::project_cache_key(
-            &canonical_cache_root,
-        ));
-
-    // Detect "this is not really a project root" scenarios FIRST, before any
-    // walks that traverse `project_root` — `rebuild_gitignore()` below walks
-    // up to depth 8 to discover nested `.gitignore` files, and on `$HOME`
-    // that means walking through millions of files under `~/Library/Caches`,
-    // `~/Library/Application Support`, etc., which blows past configure's
-    // 30s budget. When we already know the root is degraded we skip the
-    // gitignore walk entirely; the matcher is only used by the watcher
-    // event filter, and watcher noise doesn't matter at `$HOME` because
-    // the heavy indexes that consume watcher events are disabled.
-    //
-    // The decision is recorded on `AppContext` as a list of `degraded_reasons`
-    // strings; status / sidebar surfaces it, and we override
-    // `config.search_index` and `config.semantic_search` below before they're
-    // read by the subsystem builders.
-    //
-    // Two checks here:
-    //   1. Canonical path == `$HOME` — the original "Desktop launched from
-    //      `~` and SDK fell back to home" case. Subdirs of `$HOME` do NOT
-    //      match (a real project that lives under `~/Work/...` is fine).
-    //      Note we use the canonical path, so a symlink chain that resolves
-    //      to `$HOME` (e.g. weird stow setups, container chroots where
-    //      `~/.dotfiles -> /home/user`) also trips this — exactly what the
-    //      user reported for the `~/.dotfiles` case.
-    //   2. File-count threshold checks (search >20k, semantic >10k) happen
-    //      LATER inside the build threads with their respective caps; those
-    //      are skip-with-status rather than configure-time decisions.
-    let mut degraded_reasons: Vec<String> = Vec::new();
-    let home_match = resolve_home_dir().is_some_and(|home| home == canonical_cache_root);
-    if home_match {
-        degraded_reasons.push("home_root".to_string());
-    }
-
-    // Rebuild gitignore matcher used by the watcher event filter to honor the
-    // user's `.gitignore` files instead of a hardcoded directory list.
-    // Cheap (~ms for typical projects) and bounded for huge monorepos via the
-    // walker's depth/filter_entry settings in `rebuild_gitignore`.
-    //
-    // Skipped entirely when `home_match` is true — the walk would traverse
-    // `~/Library/*` to depth 8, easily eating the full 30s configure budget.
-    // The watcher event filter falls back to the hardcoded infra-dir skip
-    // list, which is the v0.25.x behavior and fine for degraded mode.
-    if !home_match {
-        ctx.rebuild_gitignore();
-    } else {
-        // Clear any stale matcher from a previous non-home configure.
-        ctx.clear_gitignore();
-    }
-
-    // Optional feature flags from plugin config
-    // Optional feature flags from plugin config
+    // Parse and validate every configure field into a temporary config first.
+    // AppContext is mutated only after this phase succeeds, so an invalid late
+    // field cannot leave the bridge half-configured.
     if let Some(v) = params.get("format_on_edit").and_then(|v| v.as_bool()) {
-        ctx.config_mut().format_on_edit = v;
+        next_config.format_on_edit = v;
     }
     if let Some(raw) = params.get("validate_on_edit") {
-        if let Some(v) = raw.as_bool() {
-            ctx.config_mut().validate_on_edit = Some(if v { "syntax" } else { "off" }.to_string());
-        } else if let Some(v) = raw.as_str() {
-            let value = match v {
-                "true" => "syntax",
-                "false" => "off",
-                other => other,
-            };
-            ctx.config_mut().validate_on_edit = Some(value.to_string());
-        }
+        let value = match parse_validate_on_edit(raw) {
+            Ok(value) => value,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+        next_config.validate_on_edit = Some(value);
     }
-    // Per-language formatter overrides: { "typescript": "biome", "python": "ruff" }
-    if let Some(v) = params.get("formatter").and_then(|v| v.as_object()) {
-        for (lang, tool) in v {
-            if let Some(tool_str) = tool.as_str() {
-                ctx.config_mut()
-                    .formatter
-                    .insert(lang.clone(), tool_str.to_string());
-            }
-        }
+    if let Some(v) = params.get("formatter") {
+        next_config.formatter = match parse_string_map(v, "formatter") {
+            Ok(formatter) => formatter,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     }
-    // Restrict file operations to project root (default: false)
     if let Some(v) = params
         .get("restrict_to_project_root")
         .and_then(|v| v.as_bool())
     {
-        ctx.config_mut().restrict_to_project_root = v;
+        next_config.restrict_to_project_root = v;
     }
-    // Formatter timeout in seconds (default: 10). Used by `auto_format()`
-    // to bound external formatter subprocesses. Surfacing this through
-    // configure() lets tests deterministically trigger the `"timeout"`
-    // skip reason without a 10-second test wallclock, and lets users
-    // raise the budget for slow formatters in larger projects.
-    //
-    // Validation: must be a positive integer ≤ 600 (10 minutes). Larger
-    // values are clamped down — they almost certainly indicate a config
-    // typo, and we don't want a stuck formatter to hold the bridge for
-    // an hour. Zero is rejected because Command::wait_with_timeout(0)
-    // races on most platforms.
-    if let Some(v) = params
-        .get("formatter_timeout_secs")
-        .and_then(|v| v.as_u64())
-    {
+    if let Some(raw) = params.get("formatter_timeout_secs") {
+        let Some(v) = raw.as_u64() else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!(
+                    "configure: formatter_timeout_secs must be in 1..=600, got {}",
+                    raw
+                ),
+            );
+        };
         if v == 0 || v > 600 {
             return Response::error(
                 &req.id,
@@ -1479,104 +1855,332 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 ),
             );
         }
-        ctx.config_mut().formatter_timeout_secs = v as u32;
+        next_config.formatter_timeout_secs = v as u32;
     }
-    // Per-language checker overrides: { "typescript": "tsc", "python": "pyright" }
-    if let Some(v) = params.get("checker").and_then(|v| v.as_object()) {
-        for (lang, tool) in v {
-            if let Some(tool_str) = tool.as_str() {
-                ctx.config_mut()
-                    .checker
-                    .insert(lang.clone(), tool_str.to_string());
-            }
-        }
+    if let Some(v) = params.get("checker") {
+        next_config.checker = match parse_string_map(v, "checker") {
+            Ok(checker) => checker,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     }
 
     if let Some(v) = params.get("search_index").and_then(|v| v.as_bool()) {
-        ctx.config_mut().search_index = v;
+        next_config.search_index = v;
     }
     if let Some(v) = params.get("semantic_search").and_then(|v| v.as_bool()) {
-        ctx.config_mut().semantic_search = v;
+        next_config.semantic_search = v;
+    }
+    if let Some(v) = params
+        .get("aft_search_registered")
+        .and_then(|v| v.as_bool())
+    {
+        next_config.aft_search_registered = v;
+    }
+    if let Some(v) = params
+        .get(crate::callgraph_store::CALLGRAPH_STORE_FLAG)
+        .and_then(|v| v.as_bool())
+    {
+        next_config.callgraph_store = v;
     }
     if let Some(v) = params
         .get("experimental_bash_rewrite")
         .and_then(|v| v.as_bool())
     {
-        ctx.config_mut().experimental_bash_rewrite = v;
+        next_config.experimental_bash_rewrite = v;
     }
     if let Some(v) = params
         .get("experimental_bash_compress")
         .and_then(|v| v.as_bool())
     {
-        ctx.set_bash_compress_enabled(v);
+        next_config.experimental_bash_compress = v;
     }
     if let Some(v) = params
         .get("experimental_bash_background")
         .and_then(|v| v.as_bool())
     {
-        ctx.config_mut().experimental_bash_background = v;
+        next_config.experimental_bash_background = v;
     }
     if let Some(v) = params.get("experimental_lsp_ty").and_then(|v| v.as_bool()) {
-        ctx.config_mut().experimental_lsp_ty = v;
+        next_config.experimental_lsp_ty = v;
     }
     if let Some(v) = params.get("lsp_servers") {
-        let servers = match parse_lsp_servers(v) {
+        next_config.lsp_servers = match parse_lsp_servers(v) {
             Ok(servers) => servers,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
-        ctx.config_mut().lsp_servers = servers;
     }
     if let Some(v) = params.get("bash_permissions").and_then(|v| v.as_bool()) {
-        ctx.config_mut().bash_permissions = v;
+        next_config.bash_permissions = v;
     }
     if let Some(v) = params.get("disabled_lsp") {
-        let disabled_lsp = match parse_disabled_lsp(v) {
+        next_config.disabled_lsp = match parse_disabled_lsp(v) {
             Ok(disabled_lsp) => disabled_lsp,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
-        ctx.config_mut().disabled_lsp = disabled_lsp;
     }
     if let Some(v) = params.get("lsp_paths_extra") {
-        let paths = match parse_lsp_paths_extra(v) {
+        next_config.lsp_paths_extra = match parse_lsp_paths_extra(v) {
             Ok(paths) => paths,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
-        ctx.config_mut().lsp_paths_extra = paths;
     }
     if let Some(v) = params.get("lsp_auto_install_binaries") {
-        let binaries = match parse_string_set(v, "lsp_auto_install_binaries") {
-            Ok(binaries) => binaries,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-        ctx.config_mut().lsp_auto_install_binaries = binaries;
+        next_config.lsp_auto_install_binaries =
+            match parse_string_set(v, "lsp_auto_install_binaries") {
+                Ok(binaries) => binaries,
+                Err(error) => return Response::error(&req.id, "invalid_request", error),
+            };
     }
     if let Some(v) = params.get("lsp_inflight_installs") {
-        let binaries = match parse_string_set(v, "lsp_inflight_installs") {
+        next_config.lsp_inflight_installs = match parse_string_set(v, "lsp_inflight_installs") {
             Ok(binaries) => binaries,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
-        ctx.config_mut().lsp_inflight_installs = binaries;
     }
     if let Some(v) = params
         .get("search_index_max_file_size")
         .and_then(|v| v.as_u64())
     {
-        ctx.config_mut().search_index_max_file_size = v;
+        next_config.search_index_max_file_size = v;
     }
-    if let Some(v) = params.get("storage_dir").and_then(|v| v.as_str()) {
-        let storage_dir = match validate_storage_dir(v) {
-            Ok(path) => path,
-            Err(error) => {
-                return Response::error(&req.id, "invalid_request", error);
-            }
+    if let Some(raw) = params.get("storage_dir") {
+        let Some(value) = raw.as_str() else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "configure: storage_dir must be a string",
+            );
         };
-        ctx.config_mut().storage_dir = Some(storage_dir.clone());
-        let ttl_hours = ctx.config().checkpoint_ttl_hours;
-        ctx.backup()
-            .borrow_mut()
-            .set_storage_dir(storage_dir, ttl_hours);
+        next_config.storage_dir = match validate_storage_dir(value) {
+            Ok(path) => Some(path),
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     }
-    let db_path = ctx.storage_dir().join("aft.db");
+    if let Some(raw) = params.get("url_fetch_allow_private") {
+        let Some(value) = raw.as_bool() else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "configure: url_fetch_allow_private must be a boolean",
+            );
+        };
+        next_config.url_fetch_allow_private = value;
+    }
+    if let Some(v) = params.get("semantic") {
+        next_config.semantic = match parse_semantic_config(v, &next_config.semantic) {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
+    if let Some(v) = params.get("semantic_files") {
+        next_config.semantic_files = match parse_semantic_files_config(v, &next_config.semantic_files)
+        {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
+    if let Some(v) = params.get("inspect") {
+        next_config.inspect = match parse_inspect_config(v, &next_config.inspect) {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
+    if let Some(raw) = params.get("max_callgraph_files") {
+        // Reject invalid values explicitly so user typos surface instead of
+        // being silently swallowed (Oracle v0.15.1 review blocker).
+        // Accepts: positive integers (u64).
+        // Rejects: 0, negatives, non-integers, non-numbers.
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed {
+            Some(v) => next_config.max_callgraph_files = v as usize,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "max_callgraph_files must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(raw) = params.get("max_background_bash_tasks") {
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed.and_then(|v| usize::try_from(v).ok()) {
+            Some(v) => next_config.max_background_bash_tasks = v,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "max_background_bash_tasks must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(v) = params
+        .get("bash_long_running_reminder_enabled")
+        .and_then(|v| v.as_bool())
+    {
+        next_config.bash_long_running_reminder_enabled = v;
+    }
+    if let Some(raw) = params.get("bash_long_running_reminder_interval_ms") {
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed {
+            Some(v) => next_config.bash_long_running_reminder_interval_ms = v,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "bash_long_running_reminder_interval_ms must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
+
+    // Detect "this is not really a project root" scenarios before any walks
+    // that traverse `project_root`.
+    let mut degraded_reasons: Vec<String> = Vec::new();
+    let home_match = resolve_home_dir().is_some_and(|home| home == canonical_cache_root);
+    if home_match {
+        degraded_reasons.push("home_root".to_string());
+    }
+
+    // `_bypass_size_limits` (set by `aft warmup --force`) lifts all three
+    // file-count caps so a very large repo is fully indexed for measurement:
+    // callgraph (`max_callgraph_files`), search index (`MAX_SEARCH_INDEX_FILES`),
+    // and semantic (`semantic.max_files`). Not a user-facing config knob — it is
+    // an internal benchmarking escape hatch. We raise to a large-but-safe value
+    // (not usize::MAX) so the `+ 1` below cannot overflow.
+    let bypass_size_limits = params
+        .get("_bypass_size_limits")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if bypass_size_limits {
+        const UNCAPPED: usize = 1_000_000_000;
+        next_config.max_callgraph_files = next_config.max_callgraph_files.max(UNCAPPED);
+        next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
+    }
+
+    // The cap-bounded count below uses `take(max + 1)` so it costs O(cap),
+    // not O(project), and feeds both call-graph viability and search-index
+    // auto-disable decisions.
+    let max_callgraph_files = next_config.max_callgraph_files;
+    // `--force`/bypass also lifts the hardcoded search-index file limit.
+    let search_index_limit = if bypass_size_limits {
+        usize::MAX - 1
+    } else {
+        MAX_SEARCH_INDEX_FILES
+    };
+    let (source_file_count, exceeds, exceeds_search_threshold) = if home_match {
+        (max_callgraph_files + 1, true, true)
+    } else {
+        let walk_limit = max_callgraph_files
+            .max(search_index_limit)
+            .saturating_add(1);
+        let count = crate::callgraph::walk_project_files(&root_path)
+            .take(walk_limit)
+            .count();
+        let exceeds_cg = count > max_callgraph_files;
+        let exceeds_search = count > search_index_limit;
+        (count, exceeds_cg, exceeds_search)
+    };
+    if exceeds {
+        slog_warn!(
+            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, symbol move analysis) will be disabled. Store-backed callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
+            max_callgraph_files
+        );
+    }
+    if exceeds_search_threshold && next_config.search_index {
+        slog_warn!(
+            "project has >{} source files. Search index auto-disabled — open a project subdirectory for grep/aft_search.",
+            MAX_SEARCH_INDEX_FILES
+        );
+        next_config.search_index = false;
+        degraded_reasons.push(format!("search_too_many_files:{}", MAX_SEARCH_INDEX_FILES));
+    }
+
+    if home_match {
+        if next_config.search_index {
+            next_config.search_index = false;
+            slog_warn!(
+                "search_index auto-disabled: project root is the user home directory \
+                 ({}). Open a project subdirectory for full features.",
+                canonical_cache_root.display()
+            );
+        }
+        if next_config.semantic_search {
+            next_config.semantic_search = false;
+            slog_warn!(
+                "semantic_search auto-disabled: project root is the user home directory \
+                 ({}). Open a project subdirectory for full features.",
+                canonical_cache_root.display()
+            );
+        }
+    }
+
+    if previous_project_root.as_ref() != Some(&root_path) {
+        crate::format::clear_tool_cache();
+    }
+
+    // Commit phase: no validation returns after this point.
+    *ctx.config_mut() = next_config.clone();
+    ctx.set_harness(harness);
+    ctx.backup().borrow().set_db_harness(harness);
+    ctx.set_canonical_cache_root(canonical_cache_root.clone());
+    ctx.set_cache_role(is_worktree_bridge, git_common_dir);
+    ctx.reset_tier2_refresh_scheduler();
+    // Project root (and thus tsconfig resolution) may have changed; drop the
+    // status-bar membership cache so the next bar count re-resolves from disk.
+    ctx.clear_tsconfig_membership_cache();
+    ctx.backup()
+        .borrow()
+        .set_db_project_key(crate::search_index::project_cache_key(
+            &canonical_cache_root,
+        ));
+    if let Some(storage_dir) = next_config.storage_dir.clone() {
+        // Ensure the storage root directory exists so subsystems (trust,
+        // backups, checkpoints, DB, persistence) can create their sub-trees
+        // without a separate create_dir_all per subsystem. On fresh installs
+        // this directory hasn't been created yet, and every subsystem
+        // currently creates its own subdirectory lazily — but the root must
+        // exist for status/diagnostics to report a valid path.
+        if let Err(err) = fs::create_dir_all(&storage_dir) {
+            slog_warn!(
+                "failed to create storage directory {}: {}",
+                storage_dir.display(),
+                err
+            );
+        }
+        ctx.backup().borrow_mut().set_storage_dir_for_harness(
+            storage_dir,
+            harness,
+            next_config.checkpoint_ttl_hours,
+        );
+    }
+
+    // Rebuild gitignore matcher used by the watcher event filter to honor the
+    // user's `.gitignore` files instead of a hardcoded directory list. Skipped
+    // entirely when `home_match` is true — the walk would traverse `$HOME`.
+    if !home_match {
+        ctx.rebuild_gitignore();
+    } else {
+        ctx.clear_gitignore();
+    }
+
+    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    match crate::url_fetch::cleanup_url_cache(&storage_root) {
+        Ok(0) => {}
+        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+    }
+    let db_path = storage_root.join("aft.db");
     match crate::db::open(&db_path) {
         Ok(conn) => {
             let shared = Arc::new(Mutex::new(conn));
@@ -1595,7 +2199,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
-    match crate::migrate_storage::cleanup_staging_dirs(&ctx.storage_dir(), harness) {
+    match crate::migrate_storage::cleanup_staging_dirs(&storage_root, harness) {
         Ok(0) => {}
         Ok(n) => slog_info!(
             "swept {} staging directory orphans from prior migrations",
@@ -1606,171 +2210,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             err
         ),
     }
-    if let Some(v) = params.get("semantic") {
-        let current = ctx.config().semantic.clone();
-        let semantic = match parse_semantic_config(v, &current) {
-            Ok(config) => config,
-            Err(error) => {
-                return Response::error(&req.id, "invalid_request", error);
-            }
-        };
-        ctx.config_mut().semantic = semantic;
-    }
-    if let Some(v) = params.get("semantic_files") {
-        let current = ctx.config().semantic_files.clone();
-        let semantic_files = match parse_semantic_files_config(v, &current) {
-            Ok(config) => config,
-            Err(error) => {
-                return Response::error(&req.id, "invalid_request", error);
-            }
-        };
-        ctx.config_mut().semantic_files = semantic_files;
-    }
-    if let Some(raw) = params.get("max_callgraph_files") {
-        // Reject invalid values explicitly so user typos surface instead of
-        // being silently swallowed (Oracle v0.15.1 review blocker).
-        // Accepts: positive integers (u64).
-        // Rejects: 0, negatives, non-integers, non-numbers.
-        let parsed = raw.as_u64().filter(|v| *v >= 1);
-        match parsed {
-            Some(v) => ctx.config_mut().max_callgraph_files = v as usize,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "max_callgraph_files must be a positive integer (>= 1); got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
-    if let Some(raw) = params.get("max_background_bash_tasks") {
-        let parsed = raw.as_u64().filter(|v| *v >= 1);
-        match parsed.and_then(|v| usize::try_from(v).ok()) {
-            Some(v) => ctx.config_mut().max_background_bash_tasks = v,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "max_background_bash_tasks must be a positive integer (>= 1); got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
-    if let Some(v) = params
-        .get("bash_long_running_reminder_enabled")
-        .and_then(|v| v.as_bool())
-    {
-        ctx.config_mut().bash_long_running_reminder_enabled = v;
-    }
-    if let Some(raw) = params.get("bash_long_running_reminder_interval_ms") {
-        let parsed = raw.as_u64().filter(|v| *v >= 1);
-        match parsed {
-            Some(v) => ctx.config_mut().bash_long_running_reminder_interval_ms = v,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "bash_long_running_reminder_interval_ms must be a positive integer (>= 1); got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
     ctx.bash_background().configure_long_running_reminders(
-        ctx.config().bash_long_running_reminder_enabled,
-        ctx.config().bash_long_running_reminder_interval_ms,
+        next_config.bash_long_running_reminder_enabled,
+        next_config.bash_long_running_reminder_interval_ms,
     );
-
-    // The full source-file walk (used to detect languages and warn about
-    // missing formatter/checker/LSP binaries) used to run synchronously here
-    // and could block configure for 30+ seconds on huge directories like the
-    // user's $HOME (2.4M files). We defer it to a background thread that
-    // pushes a `ConfigureWarningsFrame` once it's done, keeping configure
-    // itself fast on every project — including ones the user accidentally
-    // opened in.
-    //
-    // The cap-bounded count below uses `take(max + 1)` so it costs O(cap),
-    // not O(project) — fast enough to compute synchronously even on huge
-    // trees, and used for two distinct decisions:
-    //   1. Call-graph viability (cap = `max_callgraph_files`, default 5_000)
-    //   2. Search index auto-disable (cap = `MAX_SEARCH_INDEX_FILES`, 20_000)
-    //
-    // We use the larger of the two as the walk bound so one O(cap) walk
-    // answers both checks. Counting up to 20_001 takes a few hundred ms even
-    // on a 2M-file `$HOME` (limited by directory traversal latency, not by
-    // the cap itself); still well under configure's budget.
-    let max_callgraph_files = ctx.config().max_callgraph_files;
-    // Skip the synchronous source-file walk entirely when we already KNOW
-    // the answer: a `$HOME` root has hundreds of thousands of files spread
-    // across `~/Library`, `~/Documents`, `~/Downloads` etc. Even bounded by
-    // `take(20_001)`, `ignore::WalkBuilder` has to traverse directories to
-    // discover that many source files, and on macOS `$HOME` this routinely
-    // exceeds configure's 30s budget — exactly the failure mode degraded
-    // mode is meant to prevent. When `home_match` is true we already know
-    // the project is "too large" for callgraph and search, so we record the
-    // limits directly and skip the walk.
-    let (source_file_count, exceeds, exceeds_search_threshold) = if home_match {
-        (max_callgraph_files + 1, true, true)
-    } else {
-        let walk_limit = max_callgraph_files.max(MAX_SEARCH_INDEX_FILES) + 1;
-        let count = crate::callgraph::walk_project_files(&root_path)
-            .take(walk_limit)
-            .count();
-        let exceeds_cg = count > max_callgraph_files;
-        let exceeds_search = count > MAX_SEARCH_INDEX_FILES;
-        (count, exceeds_cg, exceeds_search)
-    };
-    if exceeds {
-        slog_warn!(
-            "project has >{} source files. Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
-            max_callgraph_files
-        );
-    }
-    if exceeds_search_threshold && ctx.config().search_index {
-        slog_warn!(
-            "project has >{} source files. Search index auto-disabled — open a project subdirectory for grep/aft_search.",
-            MAX_SEARCH_INDEX_FILES
-        );
-        ctx.config_mut().search_index = false;
-        degraded_reasons.push(format!("search_too_many_files:{}", MAX_SEARCH_INDEX_FILES));
-    }
-
-    // Apply degraded-mode overrides BEFORE snapshotting the flags below.
-    // Heavy subsystems disabled when the resolved project root is `$HOME`:
-    //   - `search_index`: would otherwise trigram-index everything under
-    //     `~/Documents`, `~/Downloads`, `~/Library`, etc. Useless for any
-    //     real agent task and burns memory + disk + time.
-    //   - `semantic_search`: same logic; the model walk also has memory
-    //     cost via 200MB-ish embedding state.
-    // Callgraph naturally degrades through the existing `max_callgraph_files`
-    // refusal when source-file count exceeds the cap, so no manual override
-    // is needed there.
-    if home_match {
-        if ctx.config().search_index {
-            ctx.config_mut().search_index = false;
-            slog_warn!(
-                "search_index auto-disabled: project root is the user home directory \
-                 ({}). Open a project subdirectory for full features.",
-                canonical_cache_root.display()
-            );
-        }
-        if ctx.config().semantic_search {
-            ctx.config_mut().semantic_search = false;
-            slog_warn!(
-                "semantic_search auto-disabled: project root is the user home directory \
-                 ({}). Open a project subdirectory for full features.",
-                canonical_cache_root.display()
-            );
-        }
-    }
 
     let search_index = ctx.config().search_index;
     let semantic_search = ctx.config().semantic_search;
@@ -1792,14 +2235,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "configure called while search index build is still in progress; previous build will continue detached"
         );
     }
-    // Cancel any in-flight semantic build by advancing the generation counter.
-    // The old thread will detect the mismatch and exit early on its next
-    // cooperative cancellation check (before the next embedding batch).
     if semantic_build_in_progress {
-        let new_gen = ctx.semantic_cancel_token().cancel_and_advance();
-        slog_info!(
-            "configure: cancelling in-flight semantic build (advancing generation to {})",
-            new_gen
+        slog_warn!(
+            "configure called while semantic index build is still in progress; previous build will continue detached"
         );
     }
 
@@ -1808,8 +2246,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let symbol_cache_generation = ctx.reset_symbol_cache();
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
+    *ctx.callgraph_store().borrow_mut() = None;
+    if previous_project_root.as_ref() == Some(&root_path) {
+        ctx.mark_callgraph_store_force_rebuild();
+    }
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;
+    ctx.clear_pending_index_updates();
 
     // Snapshot accumulated degraded reasons on the context so status /
     // sidebar / future tool calls all see the same state. Reasons emitted
@@ -1828,137 +2272,108 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if search_index {
         let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
         let current_head = current_git_head(&canonical_cache_root);
-        let mut baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
+        let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
         search_index_cache_reused = baseline.is_some();
 
-        if let Some(index) = baseline.as_mut() {
-            if index.stored_git_head() == current_head.as_deref() {
-                index.verify_against_disk(current_head.clone());
-                *ctx.search_index().borrow_mut() = Some(index.clone());
-            } else {
-                index.set_ready(false);
-                *ctx.search_index().borrow_mut() = Some(index.clone());
-            }
-        }
-
-        let (tx, rx): (
-            crossbeam_channel::Sender<SearchIndex>,
-            crossbeam_channel::Receiver<SearchIndex>,
-        ) = unbounded();
-        *ctx.search_index_rx().borrow_mut() = Some(rx);
-
-        let root_clone = canonical_cache_root.clone();
+        let root_for_prewarm = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
         let symbol_project_key = project_cache_key(&canonical_cache_root);
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let session_id_for_bg = log_ctx::current_session();
-        thread::spawn(move || {
-            log_ctx::with_session(session_id_for_bg, || {
-                let _cache_lock = if is_worktree_bridge_for_search {
-                    None
-                } else {
-                    match CacheLock::acquire(&cache_dir) {
-                        Ok(lock) => Some(lock),
-                        Err(error) => {
-                            slog_warn!("failed to acquire search cache lock: {}", error);
-                            None
-                        }
-                    }
-                };
-                let index = SearchIndex::rebuild_or_refresh(
-                    &root_clone,
-                    search_index_max_file_size,
-                    current_head,
-                    baseline,
+
+        match baseline {
+            Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                index.verify_against_disk(current_head.clone());
+                let symbol_files = search_index_symbol_files(&index);
+                *ctx.search_index().borrow_mut() = Some(index);
+                spawn_symbol_cache_prewarm(
+                    root_for_prewarm,
+                    symbol_cache,
+                    symbol_storage,
+                    symbol_project_key,
+                    symbol_cache_generation,
+                    symbol_files,
+                    is_worktree_bridge_for_search,
+                    session_id_for_bg,
                 );
-                if !is_worktree_bridge_for_search {
-                    index.write_to_disk(&cache_dir, index.stored_git_head());
+            }
+            mut baseline => {
+                if let Some(index) = baseline.as_mut() {
+                    index.set_ready(false);
+                    *ctx.search_index().borrow_mut() = Some(index.clone());
                 }
 
-                // Pre-warm symbol cache from indexed files
-                let mut warmed_files = 0usize;
-                let mut skipped_files = 0usize;
-                if let Ok(mut cache) = symbol_cache.write() {
-                    if !cache.set_project_root_for_generation(
-                        symbol_cache_generation,
-                        root_clone.clone(),
-                    ) {
-                        slog_info!("skipping stale symbol cache prewarm after reconfigure");
-                        return;
-                    }
-                    if let Some(storage_dir) = symbol_storage.as_deref() {
-                        let loaded_count = cache.load_from_disk_for_generation(
+                let (tx, rx): (
+                    crossbeam_channel::Sender<SearchIndex>,
+                    crossbeam_channel::Receiver<SearchIndex>,
+                ) = unbounded();
+                *ctx.search_index_rx().borrow_mut() = Some(rx);
+
+                #[cfg(debug_assertions)]
+                mark_search_rebuild_spawn_for_debug();
+
+                let root_clone = canonical_cache_root.clone();
+                thread::spawn(move || {
+                    let session_id_for_prewarm = session_id_for_bg.clone();
+                    log_ctx::with_session(session_id_for_bg, || {
+                        let index = {
+                            let _cache_lock = if is_worktree_bridge_for_search {
+                                None
+                            } else {
+                                match CacheLock::acquire(&cache_dir) {
+                                    Ok(lock) => Some(lock),
+                                    Err(error) => {
+                                        slog_warn!(
+                                            "failed to acquire search cache lock: {}",
+                                            error
+                                        );
+                                        None
+                                    }
+                                }
+                            };
+                            let index = SearchIndex::rebuild_or_refresh(
+                                &root_clone,
+                                search_index_max_file_size,
+                                current_head,
+                                baseline,
+                            );
+                            delay_search_rebuild_publish_for_debug();
+                            if !is_worktree_bridge_for_search {
+                                index.write_to_disk(&cache_dir, index.stored_git_head());
+                            }
+                            index
+                        };
+
+                        let symbol_files = search_index_symbol_files(&index);
+                        let _ = tx.send(index);
+                        spawn_symbol_cache_prewarm(
+                            root_clone,
+                            symbol_cache,
+                            symbol_storage,
+                            symbol_project_key,
                             symbol_cache_generation,
-                            storage_dir,
-                            &symbol_project_key,
-                            &root_clone,
+                            symbol_files,
+                            is_worktree_bridge_for_search,
+                            session_id_for_prewarm,
                         );
-                        slog_info!("loaded symbol cache from disk: {} files", loaded_count);
-                    }
-                } else {
-                    return;
-                }
-                let mut parser = crate::parser::FileParser::with_symbol_cache_generation(
-                    symbol_cache.clone(),
-                    Some(symbol_cache_generation),
-                );
-                for file_entry in &index.files {
-                    let cached = symbol_cache
-                        .read()
-                        .map(|cache| {
-                            cache.contains_path_with_mtime(&file_entry.path, file_entry.modified)
-                        })
-                        .unwrap_or(false);
-                    if cached {
-                        skipped_files += 1;
-                        continue;
-                    }
-                    if parser.extract_symbols(&file_entry.path).is_ok() {
-                        warmed_files += 1;
-                    }
-                }
-
-                let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
-                if !is_worktree_bridge_for_search {
-                    if let Some(storage_dir) = symbol_storage.as_deref() {
-                        if let Ok(cache) = symbol_cache.read() {
-                            if cache.generation() != symbol_cache_generation {
-                                slog_info!(
-                                    "skipping stale symbol cache persistence after reconfigure"
-                                );
-                                return;
-                            }
-                            match crate::symbol_cache_disk::write_to_disk(
-                                &cache,
-                                storage_dir,
-                                &symbol_project_key,
-                            ) {
-                                Ok(()) => {
-                                    slog_info!("persisted symbol cache: {} files", cache.len());
-                                }
-                                Err(error) => {
-                                    slog_warn!("failed to persist symbol cache: {}", error);
-                                }
-                            }
-                        }
-                    }
-                }
-                slog_info!(
-                    "pre-warmed symbol cache: {} new, {} cached, {} files total",
-                    warmed_files,
-                    skipped_files,
-                    total_files
-                );
-
-                let _ = tx.send(index);
-            });
-        });
+                    });
+                });
+            }
+        }
     }
 
     if semantic_search {
+        let semantic_initial_stage = if previous_config.semantic_search
+            && previous_project_root.as_deref() == Some(root_path.as_path())
+            && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
+        {
+            "fingerprint_change"
+        } else {
+            "initial"
+        };
         *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-            stage: "queued".to_string(),
+            stage: semantic_initial_stage.to_string(),
             files: None,
             entries_done: None,
             entries_total: None,
@@ -1969,29 +2384,35 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ) = unbounded();
         *ctx.semantic_index_rx().borrow_mut() = Some(rx);
 
+        let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
+        let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
+        let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker(
+            refresh_tx,
+            refresh_event_rx,
+            Arc::clone(&refresh_worker_slot),
+        );
+
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
         let semantic_config = semantic_config.clone();
-        let semantic_files_config = ctx.config().semantic_files.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let session_id_for_bg2 = log_ctx::current_session();
-        let cancel_token = ctx.semantic_cancel_token().clone();
-        let captured_generation = cancel_token.capture_generation();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
-                // Cap file count to prevent OOM on huge project roots (e.g., /home/user).
-                // fastembed model (~200MB) + embeddings + batch buffers can exceed memory
-                // on constrained systems when indexing tens of thousands of files.
-                const MAX_SEMANTIC_FILES: usize = 10_000;
+                // Cap file count to bound memory on huge project roots (e.g.,
+                // /home/user). The local fastembed model (~200MB) + embeddings +
+                // batch buffers can exceed memory on constrained systems when
+                // indexing tens of thousands of files. Configurable via
+                // `semantic.max_files` (default 20k); remote backends that embed
+                // server-side can raise it freely.
+                let max_semantic_files = semantic_config.max_files;
+                let mut semantic_retry_attempt: usize = 0;
 
-                let build_result = catch_unwind(AssertUnwindSafe(
-                    || -> Result<SemanticIndex, String> {
-                        // Helper: check if this build has been superseded by a reconfigure.
-                        let cancelled =
-                            || -> bool { cancel_token.is_cancelled(captured_generation) };
-
+                let build_once =
+                    || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
                             files: None,
@@ -2000,25 +2421,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         });
                         let mut model =
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                        let profile = EmbeddingModelProfile::from_config(&semantic_config);
-                        let fingerprint = model.fingerprint(
-                            &semantic_config,
-                            profile.as_ref(),
-                            &semantic_files_config,
-                        )?;
+                        let fingerprint = model.fingerprint(&semantic_config)?;
                         let fingerprint_key = fingerprint.as_string();
-
-                        if cancelled() {
-                            return Err("semantic build cancelled (reconfigured)".to_string());
-                        }
-
-                        // Keep doc_template for inline closures at each call site;
-                        // model stays borrowable for contextualized branching at full-build time.
-                        let doc_template = semantic_config.document_prompt_template.clone();
-                        let use_contextualized = semantic_config.input_mode
-                            == Some(crate::config::InputMode::DocumentChunks)
-                            && model.input_mode() == crate::config::InputMode::DocumentChunks;
-
                         let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                             .then(|| ())
                             .and_then(|_| semantic_storage.as_ref())
@@ -2048,25 +2452,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 // This is the hot path for restart on a project with a
                                 // handful of edits — avoids re-embedding 4000+ unchanged
                                 // files just to pick up 10 changes.
-                                let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                                let current_files = walk_project_files(&root_clone, &filters);
-
-                                // Cap before incremental too — same reason as full rebuild.
-                                if current_files.len() > MAX_SEMANTIC_FILES {
-                                    slog_warn!(
-                                        "skipping semantic index: {} files exceeds limit of {}. \
-                                         Open a specific project directory instead of a large root.",
-                                        current_files.len(),
-                                        MAX_SEMANTIC_FILES
-                                    );
-                                    return Err(format!(
-                                        "too many files ({}) for semantic indexing (max {})",
-                                        current_files.len(),
-                                        MAX_SEMANTIC_FILES
-                                    ));
-                                }
+                                let current_files = match walk_semantic_project_files_bounded(
+                                    &root_clone,
+                                    max_semantic_files,
+                                ) {
+                                    Ok(files) => files,
+                                    Err(observed) => {
+                                        slog_warn!(
+                                            "skipping semantic index: more than {} files exceeds limit of {}. \
+                                             Raise semantic.max_files or open a specific project directory.",
+                                            observed.saturating_sub(1),
+                                            max_semantic_files
+                                        );
+                                        return Err(format!(
+                                            "too many files (>{}) for semantic indexing (max {})",
+                                            max_semantic_files, max_semantic_files
+                                        ));
+                                    }
+                                };
 
                                 let mut cached = cached;
+                                let mut embed = |texts: Vec<String>| model.embed(texts);
                                 let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                     stage: "refreshing_stale_files".to_string(),
                                     files: None,
@@ -2082,30 +2488,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     });
                                 };
 
-                                let mut embed = |texts: Vec<String>| {
-                                    let texts = if let Some(ref tpl) = doc_template {
-                                        texts
-                                            .iter()
-                                            .map(|t| {
-                                                crate::semantic_index::apply_document_template(
-                                                    t,
-                                                    Some(tpl),
-                                                )
-                                            })
-                                            .collect()
-                                    } else {
-                                        texts
-                                    };
-                                    model.embed(texts)
-                                };
-
                                 match cached.refresh_stale_files(
                                     &root_clone,
                                     &current_files,
                                     &mut embed,
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
-                                    &semantic_files_config,
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2136,11 +2524,36 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             entries_done: Some(cached.entry_count()),
                                             entries_total: Some(cached.entry_count()),
                                         });
-                                        return Ok(cached);
+                                        return Ok((cached, model));
                                     }
                                     Err(error) => {
-                                        // Hard failure (dimension mismatch, embed backend
-                                        // error). Drop the cache and do a full rebuild.
+                                        if crate::semantic_index::embedding_failure_is_transient(
+                                            &error,
+                                        ) {
+                                            // TRANSIENT backend error (e.g. the embedding
+                                            // server is overloaded by concurrent bridges, or
+                                            // briefly unreachable). Do NOT drop the cache and
+                                            // full-rebuild: a full corpus re-embed against an
+                                            // already-overloaded backend amplifies the overload
+                                            // and cascades to other bridges AND the main
+                                            // session (every bridge's incremental refresh then
+                                            // fails transiently and full-rebuilds too). Keep
+                                            // serving the valid cached index; the handful of
+                                            // changed files re-embed on a later refresh once the
+                                            // backend recovers. Mirrors the watcher-refresh
+                                            // self-heal in main.rs.
+                                            let clean =
+                                                crate::semantic_index::strip_transient_embedding_marker(
+                                                    &error,
+                                                );
+                                            slog_warn!(
+                                                "incremental refresh hit a transient backend error ({}); keeping the cached index instead of full-rebuilding",
+                                                clean
+                                            );
+                                            return Ok((cached, model));
+                                        }
+                                        // Permanent failure (dimension mismatch, etc.): the
+                                        // cache is genuinely unusable, drop it and full-rebuild.
                                         slog_warn!(
                                             "incremental refresh failed ({}), falling back to full rebuild",
                                             error
@@ -2150,32 +2563,40 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
-                        if cancelled() {
-                            return Err("semantic build cancelled (reconfigured)".to_string());
-                        }
+                        let files = match walk_semantic_project_files_bounded(
+                            &root_clone,
+                            max_semantic_files,
+                        ) {
+                            Ok(files) => {
+                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                    stage: "scanned_project_files".to_string(),
+                                    files: Some(files.len()),
+                                    entries_done: None,
+                                    entries_total: None,
+                                });
+                                files
+                            }
+                            Err(observed) => {
+                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                    stage: "scanned_project_files".to_string(),
+                                    files: Some(observed),
+                                    entries_done: None,
+                                    entries_total: None,
+                                });
+                                slog_warn!(
+                                    "skipping semantic index: more than {} files exceeds limit of {}. \
+                                     Raise semantic.max_files or open a specific project directory.",
+                                    observed.saturating_sub(1),
+                                    max_semantic_files
+                                );
+                                return Err(format!(
+                                    "too many files (>{}) for semantic indexing (max {})",
+                                    max_semantic_files, max_semantic_files
+                                ));
+                            }
+                        };
 
-                        let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                        let files = walk_project_files(&root_clone, &filters);
-                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                            stage: "scanned_project_files".to_string(),
-                            files: Some(files.len()),
-                            entries_done: None,
-                            entries_total: None,
-                        });
-
-                        if files.len() > MAX_SEMANTIC_FILES {
-                            slog_warn!(
-                                "skipping semantic index: {} files exceeds limit of {}. \
-                             Open a specific project directory instead of a large root.",
-                                files.len(),
-                                MAX_SEMANTIC_FILES
-                            );
-                            return Err(format!(
-                                "too many files ({}) for semantic indexing (max {})",
-                                files.len(),
-                                MAX_SEMANTIC_FILES
-                            ));
-                        }
+                        let mut embed = |texts: Vec<String>| model.embed(texts);
 
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "extracting_symbols".to_string(),
@@ -2183,11 +2604,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             entries_done: None,
                             entries_total: None,
                         });
-
-                        if cancelled() {
-                            return Err("semantic build cancelled (reconfigured)".to_string());
-                        }
-
                         let mut progress = |done: usize, total: usize| {
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                 stage: "embedding_symbols".to_string(),
@@ -2196,43 +2612,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 entries_total: Some(total),
                             });
                         };
-                        let index = if use_contextualized {
-                            let mut ctx_embed = |docs: crate::semantic_index::DocumentChunks| {
-                                model.embed_document_chunks(docs)
-                            };
-                            SemanticIndex::build_with_progress_contextualized(
-                                &root_clone,
-                                &files,
-                                &mut ctx_embed,
-                                &mut progress,
-                                &semantic_files_config,
-                            )?
-                        } else {
-                            let mut embed = |texts: Vec<String>| {
-                                let texts = if let Some(ref tpl) = doc_template {
-                                    texts
-                                        .iter()
-                                        .map(|t| {
-                                            crate::semantic_index::apply_document_template(
-                                                t,
-                                                Some(tpl),
-                                            )
-                                        })
-                                        .collect()
-                                } else {
-                                    texts
-                                };
-                                model.embed(texts)
-                            };
-                            SemanticIndex::build_with_progress(
-                                &root_clone,
-                                &files,
-                                &mut embed,
-                                semantic_config.max_batch_size.max(1),
-                                &mut progress,
-                                &semantic_files_config,
-                            )?
-                        };
+                        let index = SemanticIndex::build_with_progress(
+                            &root_clone,
+                            &files,
+                            &mut embed,
+                            semantic_config.max_batch_size.max(1),
+                            &mut progress,
+                        )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
                         slog_info!(
@@ -2253,12 +2639,79 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
-                        Ok(index)
-                    },
-                ));
+                        Ok((index, model))
+                    };
+
+                // Build-level retry: if the embedding backend is unreachable or
+                // briefly failing (connection refused, timeout, 5xx/429), riding
+                // it out beats parking the index in `Failed` forever — a state
+                // nothing re-triggers short of a bridge restart. We keep retrying
+                // with capped backoff, surfacing an honest "waiting for backend"
+                // building-state so the sidebar shows recovery-in-progress, not a
+                // red failure. The moment the backend returns, the build
+                // succeeds and the index goes Ready.
+                //
+                // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
+                // are NOT marked transient and fail fast with the real message.
+                //
+                // Supersession is automatic: a reconfigure replaces the bridge's
+                // semantic receiver, so the next `tx`/`tx_progress.send` returns
+                // Err (receiver dropped) and this thread exits without competing
+                // with the fresh build.
+                let build_result = loop {
+                    let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
+                    match attempt_result {
+                        Ok(Err(ref error))
+                            if crate::semantic_index::embedding_failure_is_transient(error) =>
+                        {
+                            let clean =
+                                crate::semantic_index::strip_transient_embedding_marker(error);
+                            let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
+                            semantic_retry_attempt += 1;
+                            slog_warn!(
+                                "semantic index build: embedding backend unavailable ({}); retrying in {}s",
+                                clean,
+                                backoff.as_secs(),
+                            );
+                            // Surface "waiting for backend" as a building stage so
+                            // the sidebar shows recovery-in-progress. If the
+                            // receiver is gone (reconfigure superseded us), bail.
+                            if tx_progress
+                                .send(SemanticIndexEvent::Progress {
+                                    stage: format!("waiting_for_embedding_backend: {clean}"),
+                                    files: None,
+                                    entries_done: None,
+                                    entries_total: None,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            thread::sleep(backoff);
+                            continue;
+                        }
+                        other => break other,
+                    }
+                };
 
                 let event = match build_result {
-                    Ok(Ok(index)) => SemanticIndexEvent::Ready(index),
+                    Ok(Ok((index, model))) => {
+                        let worker_index = index.clone();
+                        let worker_handle = spawn_semantic_refresh_worker(
+                            root_clone.clone(),
+                            worker_index,
+                            model,
+                            semantic_config.max_batch_size.max(1),
+                            semantic_config.max_files,
+                            refresh_rx,
+                            refresh_event_tx,
+                            log_ctx::current_session(),
+                        );
+                        if let Ok(mut slot) = refresh_worker_slot.lock() {
+                            *slot = Some(worker_handle);
+                        }
+                        SemanticIndexEvent::Ready(index)
+                    }
                     Ok(Err(error)) => {
                         slog_warn!("failed to build semantic index: {}", error);
                         SemanticIndexEvent::Failed(error)
@@ -2279,7 +2732,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);
 
-    let bg_storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);
+    let bg_storage_dir = ctx.harness_dir();
     if let Err(error) =
         ctx.bash_background()
             .replay_session_for_project(&bg_storage_dir, req.session(), &root_path)
@@ -2290,17 +2745,30 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Spawn file watcher for live invalidation off the configure foreground.
     // FSEvents startup can synchronously wait for seconds on very large roots;
     // configure should return while the watcher attaches in the background.
-    install_project_watcher(ctx, &root_path);
+    if !home_match {
+        install_project_watcher(ctx, &canonical_cache_root);
+    }
 
     slog_info!("project root set: {}", root_path.display());
 
-    // Sync compression state before spawning the async configure-warnings
-    // worker. If this work happens after spawn, very small projects can emit
-    // their push frame before the configure response is written, and clients
-    // that wait for the response first may discard that early frame.
+    // Sync compression/filter state before snapshotting the async warning worker.
     ctx.sync_bash_compress_flag();
     ctx.reset_filter_registry();
 
+    // Forget cached LSP spawn FAILURES on every configure. A configure means
+    // something changed (the user may have just installed the missing server,
+    // fixed PATH, or changed a version pin), so a previously-failed server
+    // should be retried on the next file event instead of staying skipped until
+    // a full restart. Bounded — configure is not a per-request hot path.
+    let cleared = ctx.lsp().clear_failed_spawns();
+    if cleared > 0 {
+        slog_debug!(
+            "configure: cleared {} cached LSP spawn failure(s) for retry",
+            cleared
+        );
+    }
+
+    let configure_generation = ctx.advance_configure_generation();
     let config_snapshot = ctx.config().clone();
 
     // Defer the full source-file walk + language detection +
@@ -2308,7 +2776,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    if let Some(progress_sender) = ctx.progress_sender_handle() {
+    let warnings_pending = !home_match && ctx.progress_sender_handle().is_some();
+    if warnings_pending {
+        let warning_tx = ctx.configure_warnings_sender();
+        let warning_generation = configure_generation;
         let walk_root = root_path.clone();
         let max_files = config_snapshot.max_callgraph_files;
         let project_root_display = root_path.display().to_string();
@@ -2317,11 +2788,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_id_for_frame = session_id_for_bg.clone();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg, || {
-                // The main configure response must be observable before this
-                // push frame. AFT's foreground loop writes responses
-                // immediately after `handle_configure` returns; yield briefly
-                // so tiny projects cannot race the response writer.
-                std::thread::sleep(std::time::Duration::from_millis(25));
                 let source_files: Vec<PathBuf> =
                     crate::callgraph::walk_project_files(&walk_root).collect();
                 let detected_languages: HashSet<LangId> = source_files
@@ -2346,7 +2812,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     max_files,
                     warnings,
                 );
-                progress_sender(crate::protocol::PushFrame::ConfigureWarnings(frame));
+                let _ = warning_tx.send((warning_generation, frame));
             });
         });
     }
@@ -2365,7 +2831,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "max_callgraph_files": config_snapshot.max_callgraph_files,
             "source_file_count_bounded": true,
             "warnings": [],
-            "warnings_pending": true,
+            "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
         }),
     );
@@ -2382,16 +2848,27 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        install_project_watcher_with, parse_lsp_paths_extra, validate_storage_dir,
+        external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
+        parse_semantic_config, semantic_build_retry_backoff, validate_storage_dir,
         WATCHER_GENERATION,
     };
-    use crate::config::Config;
+    use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn semantic_build_retry_backoff_ramps_then_holds() {
+        assert_eq!(semantic_build_retry_backoff(0), Duration::from_secs(15));
+        assert_eq!(semantic_build_retry_backoff(1), Duration::from_secs(30));
+        assert_eq!(semantic_build_retry_backoff(2), Duration::from_secs(60));
+        // Holds at the cap for all later attempts.
+        assert_eq!(semantic_build_retry_backoff(3), Duration::from_secs(60));
+        assert_eq!(semantic_build_retry_backoff(99), Duration::from_secs(60));
     }
 
     fn configure_request(project_root: serde_json::Value) -> RawRequest {
@@ -2489,6 +2966,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_semantic_config_clamps_expensive_limits() {
+        let parsed = super::parse_semantic_config(
+            &json!({
+                "timeout_ms": 999_999_999_u64,
+                "max_batch_size": 999_999_999_u64,
+            }),
+            &SemanticBackendConfig::default(),
+        )
+        .expect("parse semantic config");
+
+        assert_eq!(parsed.timeout_ms, super::MAX_SEMANTIC_TIMEOUT_MS);
+        assert_eq!(parsed.max_batch_size, super::MAX_SEMANTIC_BATCH_SIZE);
+    }
+
+    #[test]
+    fn semantic_file_cap_counts_only_semantic_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn one() {}\n").unwrap();
+        for index in 0..5 {
+            std::fs::write(
+                temp.path().join(format!("asset-{index}.bin")),
+                format!("asset {index}"),
+            )
+            .unwrap();
+        }
+
+        let files = super::walk_semantic_project_files_bounded(temp.path(), 1)
+            .expect("one semantic file should be within cap");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("src/lib.rs"));
+
+        std::fs::write(temp.path().join("src/second.rs"), "pub fn two() {}\n").unwrap();
+        assert!(super::walk_semantic_project_files_bounded(temp.path(), 1).is_err());
+    }
+
+    #[test]
     fn configure_missing_tools_warns_for_explicit_oxfmt_formatter() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config {
@@ -2513,6 +3027,40 @@ mod tests {
         assert_eq!(warning.kind, "formatter_not_installed");
         assert_eq!(warning.language, "typescript");
         assert_eq!(warning.tool, "oxfmt");
+    }
+
+    #[test]
+    fn detect_missing_tools_skips_formatters_when_format_on_edit_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("biome.json"), "{}\n").unwrap();
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            format_on_edit: false,
+            ..Config::default()
+        };
+        let languages = std::collections::HashSet::from([crate::parser::LangId::TypeScript]);
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+        assert!(
+            warnings.is_empty(),
+            "format_on_edit:false should suppress derived formatter warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missing_tools_still_warns_explicit_formatter_when_format_on_edit_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            format_on_edit: false,
+            ..Config::default()
+        };
+        config
+            .formatter
+            .insert("typescript".to_string(), "biome".to_string());
+        let languages = std::collections::HashSet::from([crate::parser::LangId::TypeScript]);
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].tool, "biome");
     }
 
     #[test]
@@ -2541,12 +3089,63 @@ mod tests {
         assert_eq!(warning.tool, "oxfmt");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn configure_missing_tools_uses_shared_go_tool_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("go.mod"), "module example.test\ngo 1.21\n").unwrap();
+        let bin_dir = temp.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let go = bin_dir.join("go");
+        std::fs::write(
+            &go,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then exit 0; fi\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let gofmt = bin_dir.join("gofmt");
+        std::fs::write(
+            &gofmt,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\ncat >/dev/null\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gofmt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut languages = std::collections::HashSet::new();
+        languages.insert(crate::parser::LangId::Go);
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+
+        assert!(
+            warnings.is_empty(),
+            "expected shared Go resolver to avoid false missing-tool warnings, got {warnings:?}"
+        );
+    }
+
     /// Shared mutex serializing the home-root tests below. Both tests
     /// mutate process-global `HOME` / `USERPROFILE` env vars, and `cargo
     /// test` runs unit tests concurrently within the same process — without
     /// serialization a parallel `set_var("HOME", X)` in test A can race
     /// `resolve_home_dir()` in test B and produce flaky failures.
     fn home_env_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Shared mutex serializing the watcher tests below. They share the
+    /// process-global `WATCHER_GENERATION` atomic: each test bumps it to tear
+    /// down its spawned thread, and the install path gates its event/error send
+    /// on a generation match. Run in parallel, one test's bump invalidates
+    /// another's in-flight generation check, so a legitimate error send is
+    /// skipped and the receiver observes `Disconnected` instead. Serializing
+    /// them keeps the global stable for the duration of each test.
+    fn watcher_test_mutex() -> &'static std::sync::Mutex<()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
@@ -2680,6 +3279,33 @@ mod tests {
         assert_eq!(servers[0].root_markers, vec![".oxlintrc.json", ".oxlintrc"]);
     }
 
+    // A partial override of a built-in server (only `args`/`binary`) must parse
+    // successfully with empty extensions/binary inherited downstream — requiring
+    // them used to drop the entire `lsp` config section silently.
+    #[test]
+    fn parse_lsp_server_allows_partial_builtin_override() {
+        let value = json!([
+            {
+                "id": "rust",
+                "args": ["--extra-flag"]
+            }
+        ]);
+
+        let servers = super::parse_lsp_servers(&value).expect("partial override should parse");
+        assert_eq!(servers[0].id, "rust");
+        assert!(servers[0].extensions.is_empty());
+        assert!(servers[0].binary.is_empty());
+        assert_eq!(servers[0].args, vec!["--extra-flag"]);
+    }
+
+    // A present-but-blank binary is still rejected — that's a typo, not an
+    // intentional inherit (which is expressed by omitting the field entirely).
+    #[test]
+    fn parse_lsp_server_rejects_blank_binary() {
+        let value = json!([{ "id": "rust", "binary": "  " }]);
+        assert!(super::parse_lsp_servers(&value).is_err());
+    }
+
     #[cfg(unix)]
     fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {
         std::os::unix::fs::symlink(src, dst).unwrap();
@@ -2807,17 +3433,23 @@ mod tests {
 
     #[test]
     fn watcher_attach_runs_off_configure_foreground_when_slow() {
+        let _guard = watcher_test_mutex().lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let attach_started = Arc::new(Barrier::new(2));
         let attach_started_for_thread = Arc::clone(&attach_started);
 
         let started = Instant::now();
-        let handle = install_project_watcher_with(&ctx, root.path(), move |_root, _tx| {
-            attach_started_for_thread.wait();
-            std::thread::sleep(Duration::from_millis(250));
-            Ok::<(), &'static str>(())
-        });
+        let handle = install_project_watcher_with(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            move |_root, _extra_watch_paths, _tx| {
+                attach_started_for_thread.wait();
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<(), &'static str>(())
+            },
+        );
 
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -2829,5 +3461,184 @@ mod tests {
         attach_started.wait();
         WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_attach_failure_reports_error_on_receiver() {
+        let _guard = watcher_test_mutex().lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+
+        let handle = install_project_watcher_with(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            |_root, _extra_watch_paths, _tx| Err::<(), _>("no watcher backend"),
+        );
+
+        let event = ctx
+            .watcher_rx()
+            .borrow()
+            .as_ref()
+            .expect("watcher receiver installed")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher error event");
+        assert!(event
+            .unwrap_err()
+            .to_string()
+            .contains("no watcher backend"));
+        WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn external_ignore_watch_paths_includes_git_common_info_exclude() {
+        let root = tempfile::tempdir().unwrap();
+        let common = tempfile::tempdir().unwrap();
+        let info = common.path().join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        std::fs::write(
+            &exclude,
+            "ignored/
+",
+        )
+        .unwrap();
+
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.set_cache_role(false, Some(common.path().to_path_buf()));
+
+        let paths = external_ignore_watch_paths(&ctx, root.path());
+
+        assert!(paths.contains(&exclude));
+    }
+
+    #[test]
+    fn invalid_late_configure_field_does_not_mutate_existing_context() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let first_req = configure_request_with_params(json!({
+            "project_root": first.path(),
+            "harness": "opencode",
+            "max_callgraph_files": 1000
+        }));
+        let first_response = super::handle_configure(&first_req, &ctx);
+        assert!(first_response.success);
+        let canonical_before = ctx.canonical_cache_root();
+
+        let invalid_req = configure_request_with_params(json!({
+            "project_root": second.path(),
+            "harness": "pi",
+            "formatter_timeout_secs": 0
+        }));
+        let invalid_response = super::handle_configure(&invalid_req, &ctx);
+
+        assert!(!invalid_response.success);
+        assert_eq!(invalid_response.data["code"], "invalid_request");
+        assert_eq!(ctx.harness_opt(), Some(crate::harness::Harness::Opencode));
+        assert_eq!(ctx.canonical_cache_root(), canonical_before);
+        let config = ctx.config();
+        assert_eq!(config.project_root.as_deref(), Some(first.path()));
+        assert_eq!(config.harness, Some(crate::harness::Harness::Opencode));
+        assert_eq!(config.max_callgraph_files, 1000);
+    }
+
+    #[test]
+    fn configure_replaces_formatter_and_checker_maps_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let first_req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "formatter": { "typescript": "biome", "python": "ruff" },
+            "checker": { "typescript": "tsc" }
+        }));
+        assert!(super::handle_configure(&first_req, &ctx).success);
+
+        let second_req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "formatter": { "rust": "rustfmt" },
+            "checker": { "go": "go" }
+        }));
+        assert!(super::handle_configure(&second_req, &ctx).success);
+
+        let config = ctx.config();
+        assert_eq!(
+            config.formatter.get("rust").map(String::as_str),
+            Some("rustfmt")
+        );
+        assert!(!config.formatter.contains_key("typescript"));
+        assert!(!config.formatter.contains_key("python"));
+        assert_eq!(config.checker.get("go").map(String::as_str), Some("go"));
+        assert!(!config.checker.contains_key("typescript"));
+    }
+
+    #[test]
+    fn configure_rejects_validate_on_edit_string_booleans_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "validate_on_edit": "true"
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "invalid_request");
+        assert!(ctx.config().project_root.is_none());
+        assert!(ctx.harness_opt().is_none());
+    }
+
+    #[test]
+    fn configure_generation_advances_only_after_successful_configure() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let invalid_req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "max_callgraph_files": 0
+        }));
+        assert!(!super::handle_configure(&invalid_req, &ctx).success);
+        assert_eq!(ctx.configure_generation(), 0);
+
+        let valid_req = configure_request(json!(root.path()));
+        assert!(super::handle_configure(&valid_req, &ctx).success);
+        assert_eq!(ctx.configure_generation(), 1);
+    }
+
+    #[test]
+    fn semantic_max_files_defaults_to_20k() {
+        assert_eq!(SemanticBackendConfig::default().max_files, 20_000);
+    }
+
+    #[test]
+    fn parse_semantic_config_reads_max_files() {
+        let cfg = parse_semantic_config(
+            &json!({ "max_files": 50_000 }),
+            &SemanticBackendConfig::default(),
+        )
+        .expect("valid max_files");
+        assert_eq!(cfg.max_files, 50_000);
+    }
+
+    #[test]
+    fn parse_semantic_config_max_files_omitted_keeps_existing() {
+        let existing = SemanticBackendConfig {
+            max_files: 7_500,
+            ..SemanticBackendConfig::default()
+        };
+        let cfg = parse_semantic_config(&json!({ "model": "x" }), &existing).expect("valid config");
+        assert_eq!(cfg.max_files, 7_500);
+    }
+
+    #[test]
+    fn parse_semantic_config_rejects_non_integer_max_files() {
+        let base = SemanticBackendConfig::default();
+        assert!(parse_semantic_config(&json!({ "max_files": "lots" }), &base).is_err());
+        assert!(parse_semantic_config(&json!({ "max_files": 1.5 }), &base).is_err());
     }
 }

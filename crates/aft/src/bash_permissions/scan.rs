@@ -113,10 +113,13 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
 
         if FILE_COMMANDS.contains(&head) {
             for arg in path_args(&parts) {
-                let Some(path) = arg_path(arg, &scan_cwd) else {
-                    continue;
-                };
-                push_external_path(&mut asks, &mut seen, &project_root, &path);
+                match path_arg_target(arg, &scan_cwd) {
+                    PathArgTarget::Path(path) => {
+                        push_external_path(&mut asks, &mut seen, &project_root, &path);
+                    }
+                    PathArgTarget::Dynamic => push_external_wildcard(&mut asks, &mut seen),
+                    PathArgTarget::None => {}
+                }
             }
         }
 
@@ -217,6 +220,12 @@ enum RedirectTarget {
     Dynamic,
 }
 
+enum PathArgTarget {
+    Path(PathBuf),
+    Dynamic,
+    None,
+}
+
 fn collect_redirection_targets(
     source: &str,
     command: Node<'_>,
@@ -269,10 +278,10 @@ fn collect_redirection_targets_from_node(
                 "word" | "file" | "raw_string" | "string" | "concatenation"
             ) {
                 let text = node_text(source, child);
-                if dynamic(text) {
-                    on_target(RedirectTarget::Dynamic);
-                } else if let Some(path) = arg_path(text, cwd) {
-                    on_target(RedirectTarget::Path(path));
+                match path_arg_target(text, cwd) {
+                    PathArgTarget::Path(path) => on_target(RedirectTarget::Path(path)),
+                    PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
+                    PathArgTarget::None => {}
                 }
             }
         }
@@ -304,11 +313,21 @@ fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
 }
 
 fn arg_path(arg: &str, cwd: &Path) -> Option<PathBuf> {
-    let text = home(&unquote(arg));
-    let text = glob_prefix(&text)?;
-    if dynamic(text) {
-        return None;
+    match path_arg_target(arg, cwd) {
+        PathArgTarget::Path(path) => Some(path),
+        PathArgTarget::Dynamic | PathArgTarget::None => None,
     }
+}
+
+fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
+    let text = home(&unquote(arg), cwd);
+    if dynamic(&text) {
+        return PathArgTarget::Dynamic;
+    }
+
+    let Some(text) = glob_prefix(&text) else {
+        return PathArgTarget::None;
+    };
 
     let path = PathBuf::from(text);
     let resolved = if path.is_absolute() {
@@ -316,7 +335,7 @@ fn arg_path(arg: &str, cwd: &Path) -> Option<PathBuf> {
     } else {
         cwd.join(path)
     };
-    Some(resolve_existing(&resolved))
+    PathArgTarget::Path(resolve_existing(&resolved))
 }
 
 fn unquote(text: &str) -> String {
@@ -333,7 +352,7 @@ fn unquote(text: &str) -> String {
     }
 }
 
-fn home(text: &str) -> String {
+fn home(text: &str, cwd: &Path) -> String {
     if text == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| text.to_string());
     }
@@ -342,20 +361,12 @@ fn home(text: &str) -> String {
             return Path::new(&home).join(rest).to_string_lossy().into_owned();
         }
     }
-    text.replace("$HOME", &std::env::var("HOME").unwrap_or_default())
-        .replace("${HOME}", &std::env::var("HOME").unwrap_or_default())
-        .replace(
-            "$PWD",
-            &std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy(),
-        )
-        .replace(
-            "${PWD}",
-            &std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy(),
-        )
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pwd = cwd.to_string_lossy();
+    text.replace("$HOME", &home)
+        .replace("${HOME}", &home)
+        .replace("$PWD", pwd.as_ref())
+        .replace("${PWD}", pwd.as_ref())
 }
 
 fn glob_prefix(text: &str) -> Option<&str> {
@@ -476,5 +487,39 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
         asks.push(ask);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pwd_expands_against_scan_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan_cwd = temp.path().join("project").join("subdir");
+        std::fs::create_dir_all(&scan_cwd).unwrap();
+
+        let path = arg_path("$PWD/output.log", &scan_cwd).unwrap();
+
+        assert_eq!(path, normalize_path(&scan_cwd.join("output.log")));
+    }
+
+    #[test]
+    fn dynamic_file_arg_is_reported_as_dynamic_target() {
+        let target = path_arg_target(r#""$DEST/file""#, Path::new("/tmp"));
+
+        assert!(matches!(target, PathArgTarget::Dynamic));
+    }
+
+    #[test]
+    fn relative_redirect_target_resolves_against_scan_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan_cwd = temp.path().join("outside");
+        std::fs::create_dir_all(&scan_cwd).unwrap();
+
+        let path = arg_path("./file.log", &scan_cwd).unwrap();
+
+        assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
     }
 }

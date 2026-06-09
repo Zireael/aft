@@ -181,152 +181,102 @@ mod tests {
     // Killing just the wrapper PID via `kill(2)` leaves the real server
     // orphaned to PID 1. `killpg(2)` kills the whole group.
     //
-    // We fork a wrapper that does setsid() then forks a grandchild that
-    // exec's sleep 120. The grandchild inherits the wrapper's session and
-    // PG — matching the real npm-wrapper pattern. Raw fork() avoids
-    // Rust's Command::spawn() exec-sync-pipe hang.
-    //
-    // After killpg(), the grandchild may linger as a zombie (state 'Z' in
-    // /proc) because Docker containers often lack a proper init to reap
-    // orphans. We verify killpg() reached the grandchild by checking that
-    // it is NOT in state 'S' (sleeping/running) — 'Z' or absent both
-    // confirm the SIGKILL was delivered.
+    // This test simulates that two-process structure with a shell pipeline:
+    // a parent shell that forks a child `sleep`. The parent stays attached
+    // (via wait), so both die when the group is killed.
     #[cfg(unix)]
     #[test]
     fn kill_all_kills_process_group_not_just_wrapper_pid() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
         use std::thread;
         use std::time::{Duration, Instant};
 
-        let test_timeout = Duration::from_secs(10);
-        let start = Instant::now();
-
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let sync_path = temp.path().join("gc_pid");
-
-        let wrapper_pid_i32: i32 = unsafe { libc::fork() };
-        assert_ne!(wrapper_pid_i32, -1, "fork failed for wrapper");
-
-        if wrapper_pid_i32 == 0 {
-            unsafe {
-                libc::setsid();
-                let gc_pid = libc::fork();
-                assert_ne!(gc_pid, -1, "fork failed for grandchild");
-
-                if gc_pid == 0 {
-                    let cmd = c"sleep";
-                    let args: [*const libc::c_char; 3] =
-                        [cmd.as_ptr(), c"120".as_ptr(), std::ptr::null()];
-                    libc::execvp(cmd.as_ptr(), args.as_ptr());
-                    libc::_exit(127);
-                }
-
-                let pid_str = format!("{}", gc_pid);
-                let path_cstr =
-                    std::ffi::CString::new(sync_path.to_str().unwrap().as_bytes()).unwrap();
-                let fd = libc::open(
-                    path_cstr.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                    0o644,
-                );
-                assert!(fd >= 0, "open sync file failed");
-                libc::write(fd, pid_str.as_ptr() as *const libc::c_void, pid_str.len());
-                libc::close(fd);
-
-                let mut status = 0i32;
-                libc::waitpid(gc_pid, &mut status, 0);
-                libc::_exit(0);
+        /// Running process (excludes zombies: kill(0) still succeeds on zombies).
+        fn process_running(pid: u32) -> bool {
+            let Ok(pid_i) = i32::try_from(pid) else {
+                return false;
+            };
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid_i.to_string()])
+                .output()
+                .expect("ps");
+            if !output.status.success() {
+                return false;
             }
+            let stat = String::from_utf8_lossy(&output.stdout);
+            !stat.is_empty() && !stat.contains('Z')
         }
 
-        // Wait for sync file with timeout.
-        let grandchild_pid: u32 = loop {
-            if start.elapsed() > test_timeout {
-                panic!("timeout waiting for grandchild PID sync file");
-            }
-            if let Ok(s) = std::fs::read_to_string(&sync_path) {
-                if let Ok(pid) = s.trim().parse::<u32>() {
-                    if pid > 0 {
-                        break pid;
-                    }
+        fn wait_until_not_running(pid: u32, timeout: Duration) -> bool {
+            let started = Instant::now();
+            while started.elapsed() < timeout {
+                if !process_running(pid) {
+                    return true;
                 }
+                thread::sleep(Duration::from_millis(50));
             }
-            thread::sleep(Duration::from_millis(10));
+            false
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        // Pass the path via env so the shell never interpolates TMPDIR characters
+        // (e.g. embedded single quotes) into the script literal.
+        const PID_FILE_ENV: &str = "AFT_LSP_KILLALL_TEST_PID_FILE";
+
+        let mut child = unsafe {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("sleep 60 & echo $! > \"$AFT_LSP_KILLALL_TEST_PID_FILE\"; wait")
+                .env(PID_FILE_ENV, &pid_file);
+            // setsid() so wrapper becomes its own process-group leader,
+            // matching what LspClient::spawn does.
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+            cmd.spawn().expect("spawn wrapper")
         };
 
-        thread::sleep(Duration::from_millis(200));
+        let wrapper_pid = child.id();
+        let started = Instant::now();
+        while !pid_file.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "timed out waiting for grandchild pid file"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("read grandchild pid")
+            .trim()
+            .parse()
+            .expect("parse grandchild PID");
 
+        assert!(process_running(wrapper_pid), "wrapper should be running");
         assert!(
-            crate::bash_background::process::is_process_alive(wrapper_pid_i32 as u32),
-            "wrapper should be alive before kill"
-        );
-        assert!(
-            crate::bash_background::process::is_process_alive(grandchild_pid),
-            "grandchild should be alive before kill"
+            process_running(grandchild_pid),
+            "grandchild should be running"
         );
 
-        // Kill the process group via killpg().
         let reg = LspChildRegistry::new();
-        reg.track(wrapper_pid_i32 as u32);
+        reg.track(wrapper_pid);
         let killed = reg.kill_all();
         assert_eq!(killed, 1, "should report 1 group killed");
 
-        // Reap the wrapper.
-        let mut reap_status = 0i32;
-        unsafe {
-            libc::waitpid(wrapper_pid_i32, &mut reap_status, 0);
-        }
+        let _ = child.wait();
 
-        // The wrapper must be dead — that's the core regression.
-        thread::sleep(Duration::from_millis(100));
         assert!(
-            !crate::bash_background::process::is_process_alive(wrapper_pid_i32 as u32),
-            "wrapper must be dead after killpg"
+            wait_until_not_running(wrapper_pid, Duration::from_secs(5)),
+            "wrapper must stop after killpg"
         );
-
-        // For the grandchild: poll up to 3 seconds. After killpg, the
-        // grandchild is either:
-        //   - Gone (reaped by init) → not alive → PASS
-        //   - Zombie (state 'Z' in /proc) → alive but killed → PASS
-        //   - Still sleeping (state 'S') → killpg missed it → FAIL
-        //
-        // is_process_alive() returns true for both running AND zombie
-        // processes (kill(pid,0) succeeds for zombies). We disambiguate
-        // by reading /proc/<pid>/stat when available.
-        let gc_i32 = grandchild_pid as i32;
-        let grandchild_dead_or_zombie = loop {
-            if start.elapsed() > test_timeout {
-                break false;
-            }
-            if !crate::bash_background::process::is_process_alive(grandchild_pid) {
-                break true; // Fully reaped — definitely dead.
-            }
-            match std::fs::read_to_string(format!("/proc/{}/stat", gc_i32)) {
-                Ok(stat) => {
-                    // Format: "pid (comm) state ..."
-                    // After splitting on ')', the remainder starts with a
-                    // space before the state character (e.g. " S ...").
-                    if let Some(rest) = stat.split(')').nth(1) {
-                        // Skip the leading space to reach the state byte.
-                        let state = rest.as_bytes().get(1);
-                        if state != Some(&b'S') && state != Some(&b'R') {
-                            // Z (zombie), T (stopped), X (dead) — all
-                            // mean killpg reached it.
-                            break true;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // /proc entry gone — process fully reaped.
-                    break true;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-
+        // without killpg() the grandchild would survive as an orphan.
         assert!(
-            grandchild_dead_or_zombie,
-            "grandchild must be dead or zombie after killpg — \
-             still running means killpg missed it (npm-wrapper orphan bug)"
+            wait_until_not_running(grandchild_pid, Duration::from_secs(5)),
+            "grandchild must stop after killpg (this was the npm-wrapper orphan bug)"
         );
     }
 }

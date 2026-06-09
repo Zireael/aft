@@ -10,7 +10,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { showAftStatusDialog } from "../dialogs/status-dialog.js";
 import { coerceAftStatus, formatStatusDialogMessage } from "../shared/status.js";
-import { bridgeFor, callBridge } from "../tools/_shared.js";
+import { bridgeFor, callBridge, resolveSessionId } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 export function registerStatusCommand(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -24,11 +24,18 @@ export function registerStatusCommand(pi: ExtensionAPI, ctx: PluginContext): voi
         }
         // Non-UI mode — return a one-shot plain-text snapshot via notify.
         const bridge = bridgeFor(ctx, extCtx.cwd);
+        const sessionId = resolveSessionId(extCtx);
         const cached = bridge.getCachedStatus();
-        const response = cached
+        const cachedSession = (cached as Record<string, unknown> | null)?.session as
+          | Record<string, unknown>
+          | undefined;
+        const cachedSessionId = cachedSession?.id as string | undefined;
+        const cacheUsable =
+          cached !== null && cachedSessionId !== undefined && cachedSessionId === sessionId;
+        const response = cacheUsable
           ? { success: true, ...cached }
           : await callBridge(bridge, "status", {}, extCtx);
-        if (!cached) {
+        if (!cacheUsable) {
           bridge.cacheStatusSnapshot(response);
         }
         const snapshot = coerceAftStatus(response);

@@ -11,7 +11,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::sync::{Mutex, Once, OnceLock};
 
 use aft::bash_rewrite::{parser, try_rewrite};
 use aft::commands::edit_match::handle_edit_match;
@@ -19,53 +18,12 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
-use log::{Level, LevelFilter, Log, Metadata, Record};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static LOGGER_INIT: Once = Once::new();
-
-struct TestLogger;
-
-impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Warn
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            TEST_LOGS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .expect("lock test logs")
-                .push(format!("{}", record.args()));
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_test_logger() {
-    LOGGER_INIT.call_once(|| {
-        log::set_boxed_logger(Box::new(TestLogger)).expect("install test logger");
-        log::set_max_level(LevelFilter::Warn);
-    });
-    TEST_LOGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("lock test logs")
-        .clear();
-}
-
-fn take_logs() -> Vec<String> {
-    std::mem::take(
-        &mut *TEST_LOGS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("lock test logs"),
-    )
-}
+// Warn-level log capture is shared across all integration test modules via a
+// single process-global, thread-local-capturing logger. See test_helpers.
+use crate::test_helpers::{init_test_logger, take_logs};
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(
@@ -74,6 +32,19 @@ fn context(root: &std::path::Path, enabled: bool) -> AppContext {
             project_root: Some(root.to_path_buf()),
             experimental_bash_rewrite: enabled,
             restrict_to_project_root: true,
+            ..Config::default()
+        },
+    )
+}
+
+fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> AppContext {
+    AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.to_path_buf()),
+            experimental_bash_rewrite: true,
+            restrict_to_project_root: true,
+            aft_search_registered,
             ..Config::default()
         },
     )
@@ -127,15 +98,42 @@ fn rewrites_grep_and_rejects_pipes() {
     fs::write(dir.path().join("src/lib.rs"), "fn Needle() {}\n").unwrap();
     let ctx = context(dir.path(), true);
 
-    let data = assert_rewritten(
+    let data = rewrite(
         &format!("grep -ni needle {}", dir.path().join("src").display()),
         &ctx,
-        "grep",
+    )
+    .expect("grep should rewrite");
+    // grep/rg use the enforced code-search footer, not the generic "Prefer" one.
+    assert!(
+        output(&data).contains("DO NOT search code by running grep/rg in bash"),
+        "missing enforced grep footer: {data:?}"
     );
     assert_eq!(data["success"], Value::Null);
     assert!(output(&data).contains("Needle"));
     assert!(rewrite("grep needle src | wc -l", &ctx).is_none());
     assert!(rewrite("grep -x needle src", &ctx).is_none());
+}
+
+#[test]
+fn grep_footer_steers_to_aft_search_when_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn needle() {}\n").unwrap();
+    let target = format!("grep -ni needle {}", dir.path().join("src").display());
+
+    // Registered → footer names `aft_search`, not the grep tool.
+    let registered = context_with_search(dir.path(), true);
+    let data = rewrite(&target, &registered).expect("grep should rewrite");
+    let out = output(&data);
+    assert!(out.contains("Use the `aft_search` tool instead"), "{out}");
+    assert!(!out.contains("Use the `grep` tool instead"), "{out}");
+
+    // Not registered → footer falls back to the indexed grep tool.
+    let not_registered = context_with_search(dir.path(), false);
+    let data = rewrite(&target, &not_registered).expect("grep should rewrite");
+    let out = output(&data);
+    assert!(out.contains("Use the `grep` tool instead"), "{out}");
+    assert!(!out.contains("Use the `aft_search` tool instead"), "{out}");
 }
 
 #[test]
@@ -154,7 +152,12 @@ fn rewrites_rg_and_rejects_chains() {
     fs::write(dir.path().join("notes.txt"), "alpha beta\n").unwrap();
     let ctx = context(dir.path(), true);
 
-    let data = assert_rewritten(&format!("rg alpha {}", dir.path().display()), &ctx, "grep");
+    let data =
+        rewrite(&format!("rg alpha {}", dir.path().display()), &ctx).expect("rg should rewrite");
+    assert!(
+        output(&data).contains("DO NOT search code by running grep/rg in bash"),
+        "missing enforced rg footer: {data:?}"
+    );
     assert!(output(&data).contains("alpha beta"));
     assert!(rewrite("rg alpha . && echo done", &ctx).is_none());
 }

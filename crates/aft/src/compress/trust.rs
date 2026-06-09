@@ -14,10 +14,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fs_lock;
+
 const TRUST_FILE: &str = "trusted-filter-projects.json";
+static TRUST_SAVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TrustState {
@@ -50,11 +55,13 @@ pub fn trust_project(storage_dir: &Path, project_root: &Path) -> Result<(), Stri
     let canonical = project_root
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", project_root.display()))?;
-    let mut state = load(storage_dir).unwrap_or_default();
-    state
-        .trusted_projects
-        .insert(canonical.display().to_string());
-    save(storage_dir, &state)
+    with_trust_lock(storage_dir, || {
+        let mut state = load(storage_dir).unwrap_or_default();
+        state
+            .trusted_projects
+            .insert(canonical.display().to_string());
+        save(storage_dir, &state)
+    })
 }
 
 /// Remove a project from the trusted set. No-op if the project wasn't trusted.
@@ -62,11 +69,13 @@ pub fn untrust_project(storage_dir: &Path, project_root: &Path) -> Result<(), St
     let canonical = project_root
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", project_root.display()))?;
-    let mut state = load(storage_dir).unwrap_or_default();
-    state
-        .trusted_projects
-        .remove(&canonical.display().to_string());
-    save(storage_dir, &state)
+    with_trust_lock(storage_dir, || {
+        let mut state = load(storage_dir).unwrap_or_default();
+        state
+            .trusted_projects
+            .remove(&canonical.display().to_string());
+        save(storage_dir, &state)
+    })
 }
 
 /// List all trusted project paths (for `aft doctor filters trust --list`).
@@ -78,6 +87,22 @@ pub fn list_trusted(storage_dir: &Path) -> Vec<String> {
 
 fn trust_path(storage_dir: &Path) -> PathBuf {
     storage_dir.join(TRUST_FILE)
+}
+
+fn trust_lock_path(storage_dir: &Path) -> PathBuf {
+    trust_path(storage_dir).with_extension("json.lock")
+}
+
+fn with_trust_lock<T>(
+    storage_dir: &Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    fs::create_dir_all(storage_dir)
+        .map_err(|e| format!("create_dir_all {}: {e}", storage_dir.display()))?;
+    let lock_path = trust_lock_path(storage_dir);
+    let _guard = fs_lock::acquire(&lock_path)
+        .map_err(|e| format!("acquire trust lock {}: {e}", lock_path.display()))?;
+    action()
 }
 
 fn load(storage_dir: &Path) -> Result<TrustState, String> {
@@ -96,18 +121,35 @@ fn save(storage_dir: &Path, state: &TrustState) -> Result<(), String> {
     fs::create_dir_all(storage_dir)
         .map_err(|e| format!("create_dir_all {}: {e}", storage_dir.display()))?;
     let path = trust_path(storage_dir);
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = save_temp_path(&path);
     let bytes =
         serde_json::to_vec_pretty(state).map_err(|e| format!("serialize trust state: {e}"))?;
     fs::write(&tmp_path, &bytes).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("rename {} → {}: {e}", tmp_path.display(), path.display()))?;
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "rename {} → {}: {e}",
+            tmp_path.display(),
+            path.display()
+        ));
+    }
     Ok(())
+}
+
+fn save_temp_path(path: &Path) -> PathBuf {
+    let seq = TRUST_SAVE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("json.tmp.{}.{}.{}", std::process::id(), nanos, seq))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -143,6 +185,41 @@ mod tests {
         trust_project(storage.path(), p2.path()).unwrap();
         let listed = list_trusted(storage.path());
         assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_trust_project_writes_preserve_both_projects() {
+        let storage = tempdir().unwrap();
+        let p1 = tempdir().unwrap();
+        let p2 = tempdir().unwrap();
+        let p1_canonical = p1.path().canonicalize().unwrap().display().to_string();
+        let p2_canonical = p2.path().canonicalize().unwrap().display().to_string();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let storage_for_t1 = storage.path().to_path_buf();
+        let storage_for_t2 = storage.path().to_path_buf();
+        let p1_for_thread = p1.path().to_path_buf();
+        let p2_for_thread = p2.path().to_path_buf();
+
+        let t1_barrier = Arc::clone(&barrier);
+        let t1 = thread::spawn(move || {
+            t1_barrier.wait();
+            trust_project(&storage_for_t1, &p1_for_thread).unwrap();
+        });
+
+        let t2_barrier = Arc::clone(&barrier);
+        let t2 = thread::spawn(move || {
+            t2_barrier.wait();
+            trust_project(&storage_for_t2, &p2_for_thread).unwrap();
+        });
+
+        barrier.wait();
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let listed = list_trusted(storage.path());
+        assert!(listed.contains(&p1_canonical), "listed: {listed:?}");
+        assert!(listed.contains(&p2_canonical), "listed: {listed:?}");
     }
 
     #[test]

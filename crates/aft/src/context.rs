@@ -1,7 +1,9 @@
 use std::cell::{Ref, RefCell, RefMut};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lsp_types::FileChangeType;
@@ -12,19 +14,60 @@ use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskRegistry};
 use crate::callgraph::CallGraph;
+use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
+use crate::inspect::{
+    InspectCategory, InspectManager, InspectSnapshot, Tier2RefreshScheduler, Tier2TriggerReason,
+};
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
 use crate::parser::{SharedSymbolCache, SymbolCache};
-use crate::protocol::{ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload};
+use crate::protocol::{
+    ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
+};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
+
+/// Agent status-bar counts — the IDE-style "status bar" surfaced to the agent
+/// on every tool result (emit-on-change). `errors`/`warnings` are read LIVE
+/// from the continuously-drained LSP diagnostics store; the Tier-2 counts
+/// (`dead_code`/`unused_exports`/`duplicates`) and `todos` are last-known,
+/// refreshed when `aft_inspect` runs or a background Tier-2 scan completes.
+/// `tier2_stale` marks the Tier-2 counts as not-yet-reconciled with the latest
+/// edits (rendered with a `~` marker so the agent never reads them as live).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusBarCounts {
+    pub errors: usize,
+    pub warnings: usize,
+    pub dead_code: usize,
+    pub unused_exports: usize,
+    pub duplicates: usize,
+    pub todos: usize,
+    pub tier2_stale: bool,
+}
+
+/// Last-known Tier-2 + todos counts, refreshed off the hot path. `errors` and
+/// `warnings` are intentionally NOT cached here — they're read live per attach.
+///
+/// Each Tier-2 category is `Option`: `None` means "no scan has ever produced a
+/// count for this category", so we never fabricate a `0`. The bar is only
+/// surfaced once all three Tier-2 categories hold a real value — a partially
+/// completed cold scan (e.g. dead_code done, unused_exports/duplicates still
+/// running) must not render `D<real> U0 C0` and lie about project health (#1).
+#[derive(Debug, Clone, Default)]
+struct StatusBarTier2 {
+    dead_code: Option<usize>,
+    unused_exports: Option<usize>,
+    duplicates: Option<usize>,
+    todos: Option<usize>,
+    stale: bool,
+}
 
 pub struct StatusEmitter {
     latest: Arc<Mutex<Option<StatusPayload>>>,
@@ -78,28 +121,152 @@ fn status_debounce_loop(
         }
     }
 }
+use crate::cache_freshness::FileFreshness;
 use crate::search_index::SearchIndex;
-use crate::semantic_index::SemanticIndex;
+use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
+
+// `SemanticIndexStatus::Ready` exposes a unique `refreshing` path list. Keep
+// per-path queue accounting separately so repeated edits to the same file do not
+// let an older refresh completion remove the path while newer work is pending.
+#[derive(Debug, Default)]
+struct SemanticRefreshAccounting {
+    pending: usize,
+    in_flight: usize,
+}
+
+static SEMANTIC_REFRESH_ACCOUNTING: OnceLock<Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>>> =
+    OnceLock::new();
+
+fn semantic_refresh_accounting() -> &'static Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>> {
+    SEMANTIC_REFRESH_ACCOUNTING.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn clear_semantic_refresh_accounting() {
+    if let Some(accounting) = SEMANTIC_REFRESH_ACCOUNTING.get() {
+        if let Ok(mut accounting) = accounting.lock() {
+            accounting.clear();
+        }
+    }
+}
+
+fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
+    if !refreshing.iter().any(|existing| existing == &path) {
+        refreshing.push(path);
+        refreshing.sort();
+    }
+}
+
+fn remove_refreshing_path(refreshing: &mut Vec<PathBuf>, path: &Path) {
+    refreshing.retain(|existing| existing != path);
+}
 
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
     Disabled,
     Building {
+        /// Cold-build only — index is not queryable.
         stage: String,
         files: Option<usize>,
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
     /// Index is partially built — semantic search works but results may be incomplete.
-    /// `completeness` is 0.0–1.0 representing the fraction of chunks indexed.
     Partial {
         stage: String,
         entries_done: usize,
         entries_total: usize,
         completeness: f64,
     },
-    Ready,
+    Ready {
+        /// Files currently being re-embedded after recent edits. The index is
+        /// still queryable; results for these files may be temporarily missing.
+        refreshing: Vec<PathBuf>,
+    },
     Failed(String),
+}
+
+impl SemanticIndexStatus {
+    pub fn ready() -> Self {
+        clear_semantic_refresh_accounting();
+        Self::Ready {
+            refreshing: Vec::new(),
+        }
+    }
+
+    pub fn add_refreshing_file(&mut self, path: PathBuf) {
+        if let Self::Ready { refreshing } = self {
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                let state = accounting.entry(path.clone()).or_default();
+                state.pending = state.pending.saturating_add(1);
+            }
+            ensure_refreshing_path(refreshing, path);
+        }
+    }
+
+    pub fn start_refreshing_file(&mut self, path: PathBuf) {
+        if let Self::Ready { refreshing } = self {
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                let state = accounting.entry(path.clone()).or_default();
+                if state.pending == 0 {
+                    state.pending = 1;
+                }
+                if state.in_flight == 0 {
+                    state.in_flight = state.pending;
+                }
+            }
+            ensure_refreshing_path(refreshing, path);
+        }
+    }
+
+    pub fn cancel_refreshing_file(&mut self, path: &Path) {
+        self.finish_refreshing_file(path, false);
+    }
+
+    pub fn complete_refreshing_file(&mut self, path: &Path) {
+        self.finish_refreshing_file(path, true);
+    }
+
+    pub fn remove_refreshing_file(&mut self, path: &Path) {
+        self.complete_refreshing_file(path);
+    }
+
+    fn finish_refreshing_file(&mut self, path: &Path, complete_in_flight: bool) {
+        if let Self::Ready { refreshing } = self {
+            let mut keep_refreshing = false;
+            let mut accounting_checked = false;
+            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
+                accounting_checked = true;
+                if let Some(state) = accounting.get_mut(path) {
+                    let finished = if complete_in_flight {
+                        state.in_flight.max(1)
+                    } else {
+                        1
+                    };
+                    state.pending = state.pending.saturating_sub(finished);
+                    if complete_in_flight {
+                        state.in_flight = 0;
+                    } else {
+                        state.in_flight = state.in_flight.min(state.pending);
+                    }
+                    keep_refreshing = state.pending > 0;
+                    if !keep_refreshing {
+                        accounting.remove(path);
+                    }
+                }
+            }
+
+            if !accounting_checked || !keep_refreshing {
+                remove_refreshing_path(refreshing, path);
+            }
+        }
+    }
+
+    pub fn refreshing_count(&self) -> usize {
+        match self {
+            Self::Ready { refreshing } => refreshing.len(),
+            _ => 0,
+        }
+    }
 }
 
 pub enum SemanticIndexEvent {
@@ -109,74 +276,43 @@ pub enum SemanticIndexEvent {
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
-    /// Intermediate event: index is usable but still building.
-    /// The receiver should make the index available for search
-    /// while the build continues in the background.
-    PartialReady(SemanticIndex),
     Ready(SemanticIndex),
     Failed(String),
 }
 
-/// Cooperative cancellation token for semantic index builds.
-/// Uses an `AtomicU64` generation counter: the build thread captures
-/// the generation at start and checks it before each embedding batch.
-/// When a reconfigure increments the generation, the old build detects
-/// the mismatch and exits early.
-#[derive(Clone)]
-pub struct SemanticCancellationToken {
-    generation: Arc<std::sync::atomic::AtomicU64>,
+#[derive(Debug, Clone)]
+pub enum SemanticRefreshRequest {
+    Files { paths: Vec<PathBuf> },
+    Corpus { current_files: Vec<PathBuf> },
 }
 
-impl SemanticCancellationToken {
-    pub fn new() -> Self {
-        Self {
-            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
-    }
-
-    /// Capture the current generation. The build thread calls this once at start
-    /// and then uses `is_cancelled(generation)` to check cooperatively.
-    pub fn capture_generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Check if the captured generation is still current. Returns `true` if
-    /// a reconfigure has superseded this build.
-    pub fn is_cancelled(&self, captured_generation: u64) -> bool {
-        self.generation.load(std::sync::atomic::Ordering::Acquire) != captured_generation
-    }
-
-    /// Increment the generation counter, cancelling any in-flight build.
-    /// Returns the new generation value.
-    pub fn cancel_and_advance(&self) -> u64 {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1
-    }
+#[derive(Debug)]
+pub enum SemanticRefreshEvent {
+    Started {
+        paths: Vec<PathBuf>,
+    },
+    Completed {
+        added_entries: Vec<EmbeddingEntry>,
+        updated_metadata: Vec<(PathBuf, FileFreshness)>,
+        completed_paths: Vec<PathBuf>,
+    },
+    CorpusCompleted {
+        index: SemanticIndex,
+        changed: usize,
+        added: usize,
+        deleted: usize,
+        total_processed: usize,
+    },
+    Failed {
+        paths: Vec<PathBuf>,
+        error: String,
+    },
+    CorpusFailed {
+        error: String,
+    },
 }
 
-/// Resolve the default path for the JSONL diagnostics log.
-/// Order: `AFT_CACHE_DIR` env var → project's `.aft/cache/` → `~/.cache/aft/`.
-fn resolve_diagnostics_log_path(project_root: Option<&Path>) -> PathBuf {
-    if let Some(cache_dir) = std::env::var_os("AFT_CACHE_DIR") {
-        return PathBuf::from(cache_dir).join("semantic_diagnostics.jsonl");
-    }
-    // Check for storage_dir config (handled by caller), but the default fallback
-    // is based on project root or home dir.
-    if let Some(root) = project_root {
-        let cache = root.join(".aft").join("cache");
-        if cache.exists() || std::fs::create_dir_all(&cache).is_ok() {
-            return cache.join("semantic_diagnostics.jsonl");
-        }
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache")
-        .join("aft")
-        .join("semantic_diagnostics.jsonl")
-}
+pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 
 /// Normalize a path by resolving `.` and `..` components lexically,
 /// without touching the filesystem. This prevents path traversal
@@ -371,24 +507,25 @@ pub struct AppContext {
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: RefCell<Vec<String>>,
     callgraph: RefCell<Option<CallGraph>>,
+    callgraph_store: RefCell<Option<CallGraphStore>>,
+    callgraph_store_force_rebuild: RefCell<bool>,
+    callgraph_store_rx: RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
+    pending_callgraph_store_paths: RefCell<BTreeSet<PathBuf>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
+    pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
+    inspect_manager: Arc<InspectManager>,
+    tier2_refresh_scheduler: RefCell<Tier2RefreshScheduler>,
     semantic_index: RefCell<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
+    pending_semantic_index_paths: RefCell<BTreeSet<PathBuf>>,
+    pending_semantic_corpus_refresh: RefCell<bool>,
+    semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
+    semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
+    semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
-    /// Cancellation token for the semantic index build. Incremented on reconfigure
-    /// to cooperatively cancel any in-flight build thread.
-    semantic_cancel_token: SemanticCancellationToken,
-    /// Rolling per-query semantic search metrics collector.
-    semantic_search_metrics: RefCell<crate::semantic_diagnostics::SearchMetricsCollector>,
-    /// Optional JSONL diagnostics logger for persistent search diagnostics.
-    semantic_diagnostics_logger:
-        RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>>,
-    /// Warning dedup state for semantic search tool output.
-    /// Deduplicates repeated warnings within a 60-second window.
-    semantic_warning_dedup: RefCell<crate::semantic_diagnostics::WarningDedup>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -398,6 +535,13 @@ pub struct AppContext {
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
+    configure_generation: AtomicU64,
+    /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
+    /// per-request inspect drain can detect watcher-driven Tier-2 scans that
+    /// finished since the previous tick and refresh the status bar (#3).
+    last_seen_reuse_completions: AtomicU64,
+    configure_warnings_tx: mpsc::Sender<(u64, ConfigureWarningsFrame)>,
+    configure_warnings_rx: mpsc::Receiver<(u64, ConfigureWarningsFrame)>,
     status_emitter: StatusEmitter,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
@@ -422,14 +566,55 @@ pub struct AppContext {
     /// root is configured or when the project has no gitignore files; in that
     /// case the watcher falls back to a small hardcoded infra-directory skip.
     gitignore: RefCell<Option<Arc<ignore::gitignore::Gitignore>>>,
+    /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
+    /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
+    /// Errors/warnings are read live and not stored here.
+    status_bar_tier2: RefCell<StatusBarTier2>,
+    /// Persistent TypeScript-project membership cache for the status-bar E/W
+    /// count. The bar reads E/W live on every tool result, so resolving the
+    /// nearest tsconfig (read + parse + glob-compile) per drain is too costly;
+    /// this memoizes per tsconfig dir. Invalidated wholesale on any
+    /// tsconfig-like watcher event and on `configure`. Owned here (not in
+    /// `DiagnosticsStore`, which stays raw policy-free) per the v0.35 council.
+    tsconfig_membership: RefCell<crate::lsp::tsconfig_membership::TsconfigMembershipCache>,
+}
+
+/// Result of requesting the persisted callgraph store for a store-backed op.
+///
+/// The five edge-query ops never block the request thread on a cold build:
+/// a genuine cold build is kicked off in the background and `Building` is
+/// returned so the agent retries, mirroring how semantic search reports a
+/// build in progress. Warm restarts open the on-disk DB synchronously, so
+/// `Building` is only ever seen during a true first cold build.
+pub enum CallgraphStoreAccess<'a> {
+    /// Store is resident and queryable.
+    Ready(RefMut<'a, CallGraphStore>),
+    /// A cold build is in flight (or was just started); retry shortly.
+    Building,
+    /// Not configured, or a read-only worktree whose store was never built.
+    Unavailable,
+    /// A store open/build check failed with a real error (DB/IO).
+    Error(CallGraphStoreError),
+}
+
+/// Inline wait window for a callgraph-store cold build before returning
+/// `Building`. Default `0` (pure-async: never block the request thread).
+/// Tests set `AFT_CALLGRAPH_BUILD_WAIT_MS` large so small fixture builds
+/// resolve to `Ready` synchronously and exercise query correctness directly.
+fn callgraph_build_wait_window() -> Duration {
+    std::env::var("AFT_CALLGRAPH_BUILD_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
 }
 
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
-        let metrics_window_size = config.semantic.metrics_window_size;
         let progress_sender = Arc::new(Mutex::new(None));
         let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+        let (configure_warnings_tx, configure_warnings_rx) = mpsc::channel();
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let symbol_cache = provider
             .as_any()
@@ -439,6 +624,9 @@ impl AppContext {
         let lsp_child_registry = crate::lsp::child_registry::LspChildRegistry::new();
         let mut lsp_manager = LspManager::new();
         lsp_manager.set_child_registry(lsp_child_registry.clone());
+        // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
+        // so the documented `lsp.diagnostic_cache_size` knob takes effect.
+        lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         AppContext {
             provider,
             backup: RefCell::new(BackupStore::new()),
@@ -451,27 +639,35 @@ impl AppContext {
             git_common_dir: RefCell::new(None),
             degraded_reasons: RefCell::new(Vec::new()),
             callgraph: RefCell::new(None),
+            callgraph_store: RefCell::new(None),
+            callgraph_store_force_rebuild: RefCell::new(false),
+            callgraph_store_rx: RefCell::new(None),
+            pending_callgraph_store_paths: RefCell::new(BTreeSet::new()),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
+            pending_search_index_paths: RefCell::new(BTreeSet::new()),
             symbol_cache,
+            inspect_manager: Arc::new(InspectManager::new()),
+            tier2_refresh_scheduler: RefCell::new(Tier2RefreshScheduler::new()),
             semantic_index: RefCell::new(None),
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
+            pending_semantic_index_paths: RefCell::new(BTreeSet::new()),
+            pending_semantic_corpus_refresh: RefCell::new(false),
+            semantic_refresh_tx: RefCell::new(None),
+            semantic_refresh_event_rx: RefCell::new(None),
+            semantic_refresh_worker: RefCell::new(None),
             semantic_embedding_model: RefCell::new(None),
-            semantic_cancel_token: SemanticCancellationToken::new(),
-            semantic_search_metrics: RefCell::new(
-                crate::semantic_diagnostics::SearchMetricsCollector::new(metrics_window_size),
-            ),
-            semantic_diagnostics_logger: RefCell::new(None),
-            semantic_warning_dedup: RefCell::new(crate::semantic_diagnostics::WarningDedup::new(
-                Duration::from_secs(60),
-            )),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
             lsp_child_registry,
             stdout_writer,
             progress_sender: Arc::clone(&progress_sender),
+            configure_generation: AtomicU64::new(0),
+            last_seen_reuse_completions: AtomicU64::new(0),
+            configure_warnings_tx,
+            configure_warnings_rx,
             status_emitter,
             bash_background: BgTaskRegistry::new(progress_sender),
             filter_registry: Arc::new(std::sync::RwLock::new(
@@ -480,7 +676,110 @@ impl AppContext {
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: RefCell::new(None),
+            status_bar_tier2: RefCell::new(StatusBarTier2::default()),
+            tsconfig_membership: RefCell::new(
+                crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
+            ),
         }
+    }
+
+    /// Current agent status-bar counts. `errors`/`warnings` are read LIVE from
+    /// the LSP diagnostics store (continuously drained, no round-trip); the
+    /// Tier-2 + todos counts are the last-known cached values. Returns `None`
+    /// until the Tier-2 cache has been populated at least once, so we never
+    /// surface a bar that misleadingly claims "0 dead code" before any scan.
+    pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
+        let tier2 = self.status_bar_tier2.borrow();
+        // All three Tier-2 categories must hold a real value before the bar is
+        // surfaced — otherwise a partially-scanned cold run would render a
+        // fabricated `0` for the not-yet-completed categories (#1).
+        let (Some(dead_code), Some(unused_exports), Some(duplicates)) =
+            (tier2.dead_code, tier2.unused_exports, tier2.duplicates)
+        else {
+            return None;
+        };
+        let (errors, warnings) = self.status_bar_error_warning_counts();
+        Some(StatusBarCounts {
+            errors,
+            warnings,
+            dead_code,
+            unused_exports,
+            duplicates,
+            todos: tier2.todos.unwrap_or(0),
+            tier2_stale: tier2.stale,
+        })
+    }
+
+    /// Error/warning counts for the agent status bar, filtered to match
+    /// `aft_inspect`/`tsc` (v0.35 council): only diagnostics under the canonical
+    /// project root, with build-excluded TS/JS files skipped via the persistent
+    /// tsconfig-membership cache, and cross-server duplicates collapsed. Falls
+    /// back to the raw warm count before configure has set a canonical root.
+    fn status_bar_error_warning_counts(&self) -> (usize, usize) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            // Pre-configure: no project root to scope against. Raw count is the
+            // best available signal (and the bar is gated on Tier-2 anyway).
+            return self.lsp_manager.borrow().warm_error_warning_counts();
+        };
+        let mut membership = self.tsconfig_membership.borrow_mut();
+        self.lsp_manager
+            .borrow()
+            .filtered_error_warning_counts(|file| {
+                file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+            })
+    }
+
+    /// Invalidate the status-bar tsconfig-membership cache. Called from the
+    /// watcher seam when a tsconfig-like file changes and from `configure`
+    /// when the project root changes, so the next bar count re-reads from disk.
+    pub fn clear_tsconfig_membership_cache(&self) {
+        self.tsconfig_membership.borrow_mut().clear();
+    }
+
+    /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
+    /// changing the numbers — called when the watcher sees a source-file change,
+    /// so the bar honestly signals the counts predate the latest edit until the
+    /// next background scan completes. Returns true only when the visible stale
+    /// bit flips. No-op before the first populate.
+    pub fn mark_status_bar_tier2_stale(&self) -> bool {
+        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        // No-op before the first full populate (nothing real to mark stale).
+        if tier2.dead_code.is_some() && tier2.unused_exports.is_some() && tier2.duplicates.is_some()
+        {
+            let changed = !tier2.stale;
+            tier2.stale = true;
+            return changed;
+        }
+        false
+    }
+
+    /// Refresh the cached Tier-2 + todos counts for the status bar. Each count
+    /// is `Option`: `None` preserves the last-known value (the category wasn't
+    /// recomputed or has no real aggregate yet) so we never overwrite a real
+    /// count with a fabricated `0`. `stale` marks the Tier-2 numbers as
+    /// not-yet-reconciled with the latest edits.
+    pub fn update_status_bar_tier2(
+        &self,
+        dead_code: Option<usize>,
+        unused_exports: Option<usize>,
+        duplicates: Option<usize>,
+        todos: Option<usize>,
+        stale: bool,
+    ) {
+        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        if let Some(dead_code) = dead_code {
+            tier2.dead_code = Some(dead_code);
+        }
+        if let Some(unused_exports) = unused_exports {
+            tier2.unused_exports = Some(unused_exports);
+        }
+        if let Some(duplicates) = duplicates {
+            tier2.duplicates = Some(duplicates);
+        }
+        if let Some(todos) = todos {
+            tier2.todos = Some(todos);
+        }
+        tier2.stale = stale;
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no
@@ -496,8 +795,9 @@ impl AppContext {
     ///
     /// The builder honors:
     /// - `<project_root>/.gitignore`
-    /// - `<project_root>/.git/info/exclude` (loaded explicitly because
-    ///   `GitignoreBuilder::new` does not auto-discover it)
+    /// - Git's global excludes file (the same source used by `ignore::WalkBuilder`)
+    /// - the repository's real `info/exclude` file, resolved through Git's
+    ///   common dir for linked worktrees
     /// - nested `.gitignore` files (each `.gitignore` discovered during
     ///   the recursive walk)
     ///
@@ -532,6 +832,21 @@ impl AppContext {
         // for watcher events on macOS) keeps them in the same prefix space.
         let root = std::fs::canonicalize(&root_raw).unwrap_or(root_raw);
         let mut builder = GitignoreBuilder::new(&root);
+        // Git's global excludes file — keep the live watcher matcher aligned
+        // with the project walkers (`WalkBuilder::git_global(true)`). The
+        // ignore crate exposes the same path discovery it uses internally, so
+        // this handles the default XDG location and configured excludesFile.
+        if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+            if global_ignore.is_file() {
+                if let Some(err) = builder.add(&global_ignore) {
+                    crate::slog_warn!(
+                        "global gitignore parse error in {}: {}",
+                        global_ignore.display(),
+                        err
+                    );
+                }
+            }
+        }
         // Add root .gitignore (the most common case)
         let root_ignore = Path::new(&root).join(".gitignore");
         if root_ignore.exists() {
@@ -543,9 +858,31 @@ impl AppContext {
                 );
             }
         }
+        // Root .aftignore — AFT-specific ignores layered on top of .gitignore.
+        // Lets users exclude paths git can't (e.g. submodules) from AFT's
+        // walks/indexes. Honored by the watcher matcher too, so edits under an
+        // aftignored path don't trigger reindexing.
+        let root_aftignore = Path::new(&root).join(".aftignore");
+        if root_aftignore.exists() {
+            if let Some(err) = builder.add(&root_aftignore) {
+                crate::slog_warn!(
+                    "aftignore parse error in {}: {}",
+                    root_aftignore.display(),
+                    err
+                );
+            }
+        }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
         // does not auto-discover it (verified against ignore-0.4.25 source).
-        let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
+        // In linked worktrees this lives under the repository common dir, not
+        // under `<worktree>/.git/info/exclude` (where `.git` is only a file).
+        let info_exclude = self
+            .git_common_dir
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Path::new(&root).join(".git"))
+            .join("info")
+            .join("exclude");
         if info_exclude.exists() {
             if let Some(err) = builder.add(&info_exclude) {
                 crate::slog_warn!(
@@ -555,17 +892,21 @@ impl AppContext {
                 );
             }
         }
-        // Walk the project to pick up nested .gitignore files. Cap the walk
-        // at the same SOURCE_WALK_LIMIT used by other configure-time walks
-        // (currently 20000 files); gitignore lookup-cost stays bounded for
-        // huge monorepos. Skip the obvious infra dirs so we don't accidentally
-        // load a vendored repo's .gitignore that doesn't apply to ours.
+        // Walk the project to pick up nested .gitignore/.aftignore files at
+        // arbitrary depth. The main project walkers honor deeply nested ignore
+        // files, so the watcher matcher must do the same or live invalidation
+        // can disagree with startup indexing. Skip obvious infra dirs so we
+        // don't accidentally load a vendored repo's ignore file as ours.
         let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(true)
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.
+            // No `max_depth`: nested `.gitignore`/`.aftignore` files are honored
+            // at arbitrary depth (see configure_watcher_honors_deep_nested_aftignore).
+            // The walk is pruned by standard gitignore filters plus the infra
+            // skip below; configure never runs this against `$HOME` (guarded by
+            // `home_match`), and tests use bounded roots rather than `/`.
             .hidden(false)
-            .max_depth(Some(8))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(
@@ -575,10 +916,13 @@ impl AppContext {
             })
             .build();
         for entry in walker.flatten() {
-            if entry.file_name() == ".gitignore" && entry.path() != root_ignore {
+            let file_name = entry.file_name();
+            let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
+            let is_nested_aftignore = file_name == ".aftignore" && entry.path() != root_aftignore;
+            if is_nested_gitignore || is_nested_aftignore {
                 if let Some(err) = builder.add(entry.path()) {
                     crate::slog_warn!(
-                        "nested gitignore parse error in {}: {}",
+                        "nested ignore parse error in {}: {}",
                         entry.path().display(),
                         err
                     );
@@ -714,6 +1058,28 @@ impl AppContext {
             .and_then(|sender| sender.clone())
     }
 
+    pub fn advance_configure_generation(&self) -> u64 {
+        self.configure_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn configure_generation(&self) -> u64 {
+        self.configure_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn configure_warnings_sender(&self) -> mpsc::Sender<(u64, ConfigureWarningsFrame)> {
+        self.configure_warnings_tx.clone()
+    }
+
+    pub fn drain_configure_warnings(&self) -> Vec<(u64, ConfigureWarningsFrame)> {
+        let mut warnings = Vec::new();
+        while let Ok(warning) = self.configure_warnings_rx.try_recv() {
+            warnings.push(warning);
+        }
+        warnings
+    }
+
     pub fn bash_background(&self) -> &BgTaskRegistry {
         &self.bash_background
     }
@@ -764,9 +1130,12 @@ impl AppContext {
         self.bash_background.set_harness(harness);
     }
 
+    pub fn harness_opt(&self) -> Option<Harness> {
+        *self.harness.borrow()
+    }
+
     pub fn harness(&self) -> Harness {
-        self.harness
-            .borrow()
+        self.harness_opt()
             .expect("harness set by configure before any tool call")
     }
 
@@ -776,6 +1145,10 @@ impl AppContext {
 
     pub fn harness_dir(&self) -> PathBuf {
         self.storage_dir().join(self.harness().as_str())
+    }
+
+    pub fn inspect_dir(&self) -> PathBuf {
+        self.harness_dir().join("inspect")
     }
 
     pub fn bash_tasks_dir(&self, session_id: &str) -> PathBuf {
@@ -825,11 +1198,25 @@ impl AppContext {
         *self.is_worktree_bridge.borrow()
     }
 
+    pub fn git_common_dir(&self) -> Option<PathBuf> {
+        self.git_common_dir.borrow().clone()
+    }
+
     /// Replace the current degraded-mode reasons. Empty vec = full-featured
     /// mode (no degradation). Called by `handle_configure` after deciding
     /// which subsystems to disable for this project root.
     pub fn set_degraded_reasons(&self, reasons: Vec<String>) {
         *self.degraded_reasons.borrow_mut() = reasons;
+    }
+
+    pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
+        let reason = reason.into();
+        let mut reasons = self.degraded_reasons.borrow_mut();
+        if reasons.iter().any(|existing| existing == &reason) {
+            return false;
+        }
+        reasons.push(reason);
+        true
     }
 
     /// Snapshot of current degraded-mode reasons. Order is stable
@@ -859,6 +1246,292 @@ impl AppContext {
         &self.callgraph
     }
 
+    /// Access the persisted call graph store.
+    pub fn callgraph_store(&self) -> &RefCell<Option<CallGraphStore>> {
+        &self.callgraph_store
+    }
+
+    pub fn mark_callgraph_store_force_rebuild(&self) {
+        *self.callgraph_store_force_rebuild.borrow_mut() = true;
+    }
+
+    fn take_callgraph_store_force_rebuild(&self) -> bool {
+        let force = *self.callgraph_store_force_rebuild.borrow();
+        *self.callgraph_store_force_rebuild.borrow_mut() = false;
+        force
+    }
+
+    pub fn callgraph_store_dir(&self) -> PathBuf {
+        match self.harness_opt() {
+            Some(harness) => self.storage_dir().join(harness.as_str()).join("callgraph"),
+            None => self.storage_dir().join("callgraph"),
+        }
+    }
+
+    pub fn ensure_callgraph_store(
+        &self,
+    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+        self.ensure_callgraph_store_with_flag(true)
+    }
+
+    fn ensure_callgraph_store_with_flag(
+        &self,
+        respect_config_flag: bool,
+    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+        if respect_config_flag && !self.config().callgraph_store {
+            return Ok(None);
+        }
+        if self.callgraph_store.borrow().is_none() {
+            let Some(project_root) = self.callgraph_project_root() else {
+                return Ok(None);
+            };
+            let callgraph_dir = self.callgraph_store_dir();
+            let force_rebuild = self.take_callgraph_store_force_rebuild();
+            let store = if self.is_worktree_bridge() {
+                CallGraphStore::open_readonly(callgraph_dir, project_root)?
+            } else if force_rebuild {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                Some(store)
+            } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)?;
+                Some(store)
+            } else {
+                Some(CallGraphStore::open(callgraph_dir, project_root)?)
+            };
+            *self.callgraph_store.borrow_mut() = store;
+        }
+        let borrow = self.callgraph_store.borrow_mut();
+        Ok(RefMut::filter_map(borrow, Option::as_mut).ok())
+    }
+
+    /// Resolve the project root used for the callgraph store: prefer the
+    /// canonical cache root, falling back to the configured project root.
+    fn callgraph_project_root(&self) -> Option<PathBuf> {
+        self.canonical_cache_root_opt().or_else(|| {
+            self.config()
+                .project_root
+                .clone()
+                .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+        })
+    }
+
+    /// Access the persisted callgraph store for the five store-backed edge-query
+    /// ops **without ever blocking the request thread on a cold build**.
+    ///
+    /// - Store resident          -> `Ready`.
+    /// - Warm on-disk DB present  -> opened synchronously (cheap) -> `Ready`.
+    /// - Genuine cold build needed -> kicked off in the background, returns
+    ///   `Building`; the watcher keeps the store fresh once it lands.
+    /// - Worktree without a built store, or not configured -> `Unavailable`.
+    ///
+    /// A build already in flight (`callgraph_store_rx` set) also returns
+    /// `Building` without starting a second build.
+    /// Drop the resident callgraph store when another process (or a local cold
+    /// rebuild) has published a newer generation, so the next access reopens via
+    /// the pointer. No-op when no store is resident, a build is in flight, or the
+    /// store is still current. Must run before serving ops AND before any
+    /// incremental write, so every process converges on the current generation
+    /// rather than writing to a stale one.
+    pub fn revalidate_callgraph_store_generation(&self) {
+        // Never disturb the store while a background build's result is pending
+        // install (the rx-install path replaces it wholesale).
+        if self.callgraph_store_rx.borrow().is_some() {
+            return;
+        }
+        let superseded = self
+            .callgraph_store
+            .borrow()
+            .as_ref()
+            .is_some_and(|store| !store.is_current());
+        if superseded {
+            *self.callgraph_store.borrow_mut() = None;
+        }
+    }
+
+    pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess<'_> {
+        // Converge to a newer generation another process (or a local cold
+        // rebuild) may have published: if our resident store is superseded, drop
+        // it so the open path below reopens via the pointer. Cheap pointer read.
+        self.revalidate_callgraph_store_generation();
+        if self.callgraph_store.borrow().is_some() {
+            let borrow = self.callgraph_store.borrow_mut();
+            return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                Some(store) => CallgraphStoreAccess::Ready(store),
+                None => CallgraphStoreAccess::Unavailable,
+            };
+        }
+
+        // A background build is already running; don't start a second one.
+        if self.callgraph_store_rx.borrow().is_some() {
+            return CallgraphStoreAccess::Building;
+        }
+
+        let Some(project_root) = self.callgraph_project_root() else {
+            return CallgraphStoreAccess::Unavailable;
+        };
+        let callgraph_dir = self.callgraph_store_dir();
+
+        // Worktree bridges are read-only: open whatever the main checkout built,
+        // never cold-build here.
+        if self.is_worktree_bridge() {
+            match CallGraphStore::open_readonly(callgraph_dir, project_root) {
+                Ok(Some(store)) => {
+                    *self.callgraph_store.borrow_mut() = Some(store);
+                    let borrow = self.callgraph_store.borrow_mut();
+                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                        Some(store) => CallgraphStoreAccess::Ready(store),
+                        None => CallgraphStoreAccess::Unavailable,
+                    };
+                }
+                Ok(None) | Err(_) => return CallgraphStoreAccess::Unavailable,
+            }
+        }
+
+        let force_rebuild = *self.callgraph_store_force_rebuild.borrow();
+        // Warm path: a fresh on-disk DB exists -> open synchronously (cheap, no
+        // "building" delay). Only a genuine cold build goes to the background.
+        if !force_rebuild {
+            match CallGraphStore::needs_cold_build(&callgraph_dir, &project_root) {
+                Ok(false) => match CallGraphStore::open(callgraph_dir, project_root) {
+                    Ok(store) => {
+                        *self.callgraph_store.borrow_mut() = Some(store);
+                        let borrow = self.callgraph_store.borrow_mut();
+                        return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                            Some(store) => CallgraphStoreAccess::Ready(store),
+                            None => CallgraphStoreAccess::Unavailable,
+                        };
+                    }
+                    Err(error) => return CallgraphStoreAccess::Error(error),
+                },
+                Ok(true) => {}
+                Err(error) => return CallgraphStoreAccess::Error(error),
+            }
+        }
+
+        // Cold build required: run it off the request thread and return
+        // `Building` so the agent retries (the watcher keeps the store fresh
+        // once it lands). By default this never blocks the request thread.
+        //
+        // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
+        // window inline for the build to land before returning `Building`; tests
+        // set it large so fixture builds resolve to `Ready` synchronously.
+        self.spawn_callgraph_store_cold_build(project_root, callgraph_dir, force_rebuild);
+
+        let wait = callgraph_build_wait_window();
+        if !wait.is_zero() {
+            let received = {
+                let rx_ref = self.callgraph_store_rx.borrow();
+                let Some(rx) = rx_ref.as_ref() else {
+                    return CallgraphStoreAccess::Building;
+                };
+                rx.recv_timeout(wait)
+            };
+            match received {
+                Ok(store) => {
+                    // Replay any source files the watcher saw during the wait so
+                    // the installed store reflects mid-build edits (mirrors the
+                    // drain install path). Empty in the common case.
+                    let pending = self.take_pending_callgraph_store_paths();
+                    if !pending.is_empty() {
+                        if let Err(error) = store.refresh_files(&pending) {
+                            crate::slog_warn!(
+                                "callgraph store inline post-build refresh failed: {}",
+                                error
+                            );
+                            let _ = store.mark_files_stale(&pending);
+                        }
+                    }
+                    *self.callgraph_store.borrow_mut() = Some(store);
+                    *self.callgraph_store_rx.borrow_mut() = None;
+                    let borrow = self.callgraph_store.borrow_mut();
+                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                        Some(store) => CallgraphStoreAccess::Ready(store),
+                        None => CallgraphStoreAccess::Unavailable,
+                    };
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // Build failed before sending; clear the receiver so a later
+                    // op restarts the build instead of waiting on a dead channel.
+                    *self.callgraph_store_rx.borrow_mut() = None;
+                }
+            }
+        }
+        CallgraphStoreAccess::Building
+    }
+
+    /// Spawn a background thread that cold-builds the callgraph store and sends
+    /// the finished store over `callgraph_store_rx`. The main loop installs it
+    /// via `drain_callgraph_store_events`. Mirrors the search-index build
+    /// lifecycle (channel + drain).
+    fn spawn_callgraph_store_cold_build(
+        &self,
+        project_root: PathBuf,
+        callgraph_dir: PathBuf,
+        force_rebuild: bool,
+    ) {
+        if force_rebuild {
+            // Consume the force flag now so a follow-up request doesn't queue a
+            // second forced build while this one is in flight.
+            self.take_callgraph_store_force_rebuild();
+        }
+        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
+        *self.callgraph_store_rx.borrow_mut() = Some(rx);
+        let session_id = crate::log_ctx::current_session();
+        std::thread::spawn(move || {
+            crate::log_ctx::with_session(session_id, || {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let built = if force_rebuild {
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)
+                        .map(|(store, _)| store)
+                } else {
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)
+                        .map(|(store, _)| store)
+                };
+                match built {
+                    Ok(store) => {
+                        let _ = tx.send(store);
+                    }
+                    Err(error) => {
+                        crate::slog_warn!("callgraph store cold build failed: {}", error);
+                        // Dropping tx disconnects the channel; the drain clears
+                        // the receiver so a later op can retry the build.
+                    }
+                }
+            });
+        });
+    }
+
+    /// Access the callgraph-store background-build receiver (drained by the
+    /// main loop once the cold build completes).
+    pub fn callgraph_store_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>> {
+        &self.callgraph_store_rx
+    }
+
+    /// Record source-file paths that changed while a cold build was in flight,
+    /// so they can be refreshed once the freshly-built store is installed.
+    pub fn add_pending_callgraph_store_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_callgraph_store_paths
+            .borrow_mut()
+            .extend(paths);
+    }
+
+    /// Take and clear the paths that changed during a background cold build.
+    pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_callgraph_store_paths.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
     /// Access the search index.
     pub fn search_index(&self) -> &RefCell<Option<SearchIndex>> {
         &self.search_index
@@ -867,6 +1540,190 @@ impl AppContext {
     /// Access the search-index build receiver.
     pub fn search_index_rx(&self) -> &RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>> {
         &self.search_index_rx
+    }
+
+    pub fn add_pending_search_index_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_search_index_paths.borrow_mut().extend(paths);
+    }
+
+    pub fn take_pending_search_index_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_search_index_paths.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    pub fn add_pending_semantic_index_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_semantic_index_paths.borrow_mut().extend(paths);
+    }
+
+    pub fn take_pending_semantic_index_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_semantic_index_paths.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    pub fn mark_pending_semantic_corpus_refresh(&self) {
+        *self.pending_semantic_corpus_refresh.borrow_mut() = true;
+    }
+
+    pub fn take_pending_semantic_corpus_refresh(&self) -> bool {
+        std::mem::take(&mut *self.pending_semantic_corpus_refresh.borrow_mut())
+    }
+
+    pub fn clear_pending_index_updates(&self) {
+        self.pending_search_index_paths.borrow_mut().clear();
+        self.pending_callgraph_store_paths.borrow_mut().clear();
+        self.pending_semantic_index_paths.borrow_mut().clear();
+        *self.pending_semantic_corpus_refresh.borrow_mut() = false;
+    }
+
+    pub fn inspect_manager(&self) -> Arc<InspectManager> {
+        Arc::clone(&self.inspect_manager)
+    }
+
+    /// Returns true when one or more watcher-driven (reuse-path) Tier-2 scans
+    /// have completed since the last call, advancing the last-seen marker. The
+    /// per-request inspect drain uses this to refresh the status bar after a
+    /// background scan — those completions bypass `drain_completions`.
+    pub fn take_new_reuse_completions(&self) -> bool {
+        let current = self.inspect_manager.reuse_completion_count();
+        let previous = self
+            .last_seen_reuse_completions
+            .swap(current, Ordering::SeqCst);
+        current != previous
+    }
+
+    pub fn reset_tier2_refresh_scheduler(&self) {
+        self.reset_tier2_refresh_scheduler_at(Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn reset_tier2_refresh_scheduler_at(&self, now: Instant) {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .reset_after_configure(now);
+    }
+
+    pub fn request_tier2_refresh_pull(&self) -> bool {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .request_pull(!self.is_worktree_bridge())
+    }
+
+    pub fn tick_tier2_refresh_scheduler(
+        &self,
+        changed_path_count: usize,
+    ) -> Option<Tier2TriggerReason> {
+        self.tick_tier2_refresh_scheduler_at(Instant::now(), changed_path_count)
+    }
+
+    #[doc(hidden)]
+    pub fn tick_tier2_refresh_scheduler_at(
+        &self,
+        now: Instant,
+        changed_path_count: usize,
+    ) -> Option<Tier2TriggerReason> {
+        let manager = self.inspect_manager();
+        let can_write = !self.is_worktree_bridge();
+        let in_flight = manager.tier2_any_in_flight();
+        let decision = self.tier2_refresh_scheduler.borrow_mut().tick(
+            now,
+            changed_path_count,
+            can_write,
+            in_flight,
+        );
+
+        if let Some(reason) = decision {
+            self.start_tier2_refresh(reason, manager);
+        }
+
+        decision
+    }
+
+    pub fn note_tier2_refresh_started(&self) {
+        self.note_tier2_refresh_started_at(Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn note_tier2_refresh_started_at(&self, now: Instant) {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .note_external_scan_started(now);
+    }
+
+    pub fn tier2_trigger_reason(&self) -> Option<&'static str> {
+        self.tier2_refresh_scheduler
+            .borrow()
+            .last_trigger_reason()
+            .map(Tier2TriggerReason::as_str)
+    }
+
+    #[doc(hidden)]
+    pub fn tier2_pull_demand_pending(&self) -> bool {
+        self.tier2_refresh_scheduler.borrow().pull_demand_pending()
+    }
+
+    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
+        if self.is_worktree_bridge()
+            || self
+                .degraded_reasons
+                .borrow()
+                .iter()
+                .any(|r| r == "home_root")
+            || !self.config().inspect.enabled
+        {
+            return;
+        }
+        let Some(snapshot) = self.tier2_refresh_snapshot() else {
+            return;
+        };
+        let categories = InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| category.is_tier2())
+            .collect::<Vec<_>>();
+        let submission =
+            manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
+        if submission.has_new_work() {
+            crate::slog_info!(
+                "tier2 refresh scheduled: reason={}, categories={:?}",
+                reason.as_str(),
+                submission
+                    .newly_queued_categories
+                    .iter()
+                    .map(|category| category.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        for error in submission.errors {
+            crate::slog_warn!(
+                "tier2 refresh schedule failed for {}: {}",
+                error.category,
+                error.message
+            );
+        }
+    }
+
+    fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {
+        self.harness_opt()?;
+        let config = self.config().clone();
+        let project_root = config
+            .project_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+        Some(InspectSnapshot::new(
+            project_root,
+            self.inspect_dir(),
+            Arc::new(config),
+            self.symbol_cache(),
+        ))
     }
 
     /// Access the shared symbol cache.
@@ -898,67 +1755,45 @@ impl AppContext {
         &self.semantic_index_status
     }
 
+    pub fn install_semantic_refresh_worker(
+        &self,
+        sender: crossbeam_channel::Sender<SemanticRefreshRequest>,
+        event_rx: crossbeam_channel::Receiver<SemanticRefreshEvent>,
+        worker_slot: SemanticRefreshWorkerSlot,
+    ) {
+        self.clear_semantic_refresh_worker();
+        *self.semantic_refresh_tx.borrow_mut() = Some(sender);
+        *self.semantic_refresh_event_rx.borrow_mut() = Some(event_rx);
+        *self.semantic_refresh_worker.borrow_mut() = Some(worker_slot);
+    }
+
+    pub fn clear_semantic_refresh_worker(&self) {
+        *self.semantic_refresh_tx.borrow_mut() = None;
+        *self.semantic_refresh_event_rx.borrow_mut() = None;
+        if let Some(worker_slot) = self.semantic_refresh_worker.borrow_mut().take() {
+            if let Ok(mut handle) = worker_slot.lock() {
+                drop(handle.take());
+            }
+        }
+    }
+
+    pub fn semantic_refresh_sender(
+        &self,
+    ) -> Option<crossbeam_channel::Sender<SemanticRefreshRequest>> {
+        self.semantic_refresh_tx.borrow().clone()
+    }
+
+    pub fn semantic_refresh_event_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>> {
+        &self.semantic_refresh_event_rx
+    }
+
     /// Access the cached semantic embedding model.
     pub fn semantic_embedding_model(
         &self,
     ) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
-    }
-
-    /// Access the cancellation token for the semantic index build.
-    pub fn semantic_cancel_token(&self) -> &SemanticCancellationToken {
-        &self.semantic_cancel_token
-    }
-
-    /// Access the rolling search metrics collector.
-    pub fn semantic_search_metrics(
-        &self,
-    ) -> &RefCell<crate::semantic_diagnostics::SearchMetricsCollector> {
-        &self.semantic_search_metrics
-    }
-
-    /// Access the optional JSONL diagnostics logger.
-    pub fn semantic_diagnostics_logger(
-        &self,
-    ) -> &RefCell<Option<crate::semantic_diagnostics::SemanticDiagnosticsLogger>> {
-        &self.semantic_diagnostics_logger
-    }
-
-    /// Access the warning dedup state for semantic search tool output.
-    pub fn semantic_warning_dedup(&self) -> &RefCell<crate::semantic_diagnostics::WarningDedup> {
-        &self.semantic_warning_dedup
-    }
-
-    /// Lazily initialize the JSONL diagnostics logger if jsonl_logging is enabled.
-    /// Safe to call every time — returns immediately if already initialized or not enabled.
-    pub fn init_diagnostics_logger(&self) {
-        let mut logger = self.semantic_diagnostics_logger.borrow_mut();
-        if logger.is_some() {
-            return;
-        }
-        let cfg = self.config();
-        if !cfg.semantic.jsonl_logging {
-            return;
-        }
-        let path = cfg
-            .semantic
-            .jsonl_path
-            .clone()
-            .unwrap_or_else(|| resolve_diagnostics_log_path(cfg.project_root.as_deref()));
-        let include_raw_queries = cfg.semantic.include_raw_queries;
-        let include_snippets = cfg.semantic.include_snippets;
-        let retention_days = cfg.semantic.retention_days;
-        let new_logger = crate::semantic_diagnostics::SemanticDiagnosticsLogger::new(
-            path,
-            include_raw_queries,
-            include_snippets,
-            retention_days,
-        );
-        if let Some(lg) = new_logger {
-            // Run retention on init.
-            lg.run_retention();
-            *logger = Some(lg);
-        }
     }
 
     /// Access the file watcher handle (kept alive to continue watching).
@@ -984,6 +1819,19 @@ impl AppContext {
             if let Err(e) = lsp.notify_file_changed(file_path, content, &config) {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
             }
+        }
+    }
+
+    /// Drop cached LSP diagnostics for a deleted/renamed-away file so its
+    /// errors/warnings don't linger in the warm set (no server republishes for
+    /// a vanished path), keeping the status bar and `aft_inspect` honest.
+    /// Returns true if any entry was removed. Best-effort: a contended borrow is
+    /// skipped silently (the watcher drain retries on subsequent events).
+    pub fn lsp_clear_diagnostics_for_file(&self, file_path: &Path) -> bool {
+        if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
+            lsp.clear_diagnostics_for_file(file_path)
+        } else {
+            false
         }
     }
 
@@ -1413,6 +2261,144 @@ mod status_emitter_tests {
 }
 
 #[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn status_bar_counts_none_until_tier2_populated() {
+        let ctx = ctx();
+        // No scan has run yet — never surface a bar claiming "0 dead code".
+        assert!(ctx.status_bar_counts().is_none());
+
+        ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 5);
+        assert_eq!(counts.unused_exports, 3);
+        assert_eq!(counts.duplicates, 7);
+        assert_eq!(counts.todos, 2);
+        assert!(!counts.tier2_stale);
+        // Errors/warnings are read live from an empty LSP store → 0.
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.warnings, 0);
+    }
+
+    #[test]
+    fn partial_tier2_does_not_fabricate_zeros() {
+        let ctx = ctx();
+        // Only dead_code has completed (the slow first serial category); the
+        // other two are still in flight. The bar must stay suppressed rather
+        // than render `D5 U0 C0` with fabricated zeros (#1).
+        ctx.update_status_bar_tier2(Some(5), None, None, None, true);
+        assert!(
+            ctx.status_bar_counts().is_none(),
+            "bar must not surface until all three Tier-2 categories are real"
+        );
+
+        // Second category completes — still incomplete, still suppressed.
+        ctx.update_status_bar_tier2(None, Some(3), None, None, true);
+        assert!(ctx.status_bar_counts().is_none());
+
+        // Final category completes → bar surfaces with all real counts, and
+        // none of them were ever fabricated.
+        ctx.update_status_bar_tier2(None, None, Some(7), None, false);
+        let counts = ctx.status_bar_counts().expect("all three real now");
+        assert_eq!(counts.dead_code, 5);
+        assert_eq!(counts.unused_exports, 3);
+        assert_eq!(counts.duplicates, 7);
+    }
+
+    #[test]
+    fn update_with_none_todos_preserves_last_known_todos() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(1), Some(1), Some(1), Some(9), false);
+        // A background-scan refresh passes todos=None → todo count preserved.
+        ctx.update_status_bar_tier2(Some(2), Some(2), Some(2), None, false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.todos, 9);
+        assert_eq!(counts.dead_code, 2);
+    }
+
+    #[test]
+    fn update_with_none_count_preserves_last_known_count() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(10), Some(20), Some(30), None, false);
+        // A refresh that only recomputed dead_code preserves the other two
+        // real counts rather than overwriting them with a fabricated 0.
+        ctx.update_status_bar_tier2(Some(11), None, None, None, false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 11);
+        assert_eq!(counts.unused_exports, 20);
+        assert_eq!(counts.duplicates, 30);
+    }
+
+    #[test]
+    fn mark_stale_sets_flag_only_after_populate() {
+        let ctx = ctx();
+        // No-op before first populate.
+        ctx.mark_status_bar_tier2_stale();
+        assert!(ctx.status_bar_counts().is_none());
+
+        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), Some(0), false);
+        ctx.mark_status_bar_tier2_stale();
+        assert!(ctx.status_bar_counts().expect("populated").tier2_stale);
+
+        // A completed scan clears stale.
+        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), None, false);
+        assert!(!ctx.status_bar_counts().expect("populated").tier2_stale);
+    }
+
+    // End-to-end wiring: a diagnostic for a file inflates the status-bar `E`
+    // count (read live from the warm LSP set); clearing that file's diagnostics
+    // (the deleted-file path) drops it back. This is the AppContext glue between
+    // the watcher-drain clear and the agent-visible bar.
+    #[test]
+    fn clearing_diagnostics_for_deleted_file_drops_status_bar_errors() {
+        use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
+
+        let file = std::path::PathBuf::from("/proj/gone.ts");
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test().publish(
+                ServerKey {
+                    kind: ServerKind::TypeScript,
+                    root: std::path::PathBuf::from("/proj"),
+                },
+                file.clone(),
+                vec![StoredDiagnostic {
+                    file: file.clone(),
+                    line: 1,
+                    column: 1,
+                    end_line: 1,
+                    end_column: 2,
+                    severity: DiagnosticSeverity::Error,
+                    message: "boom".into(),
+                    code: None,
+                    source: None,
+                }],
+            );
+        }
+
+        // Bar reflects the live warm-set error.
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+
+        // Clearing the (now-deleted) file's diagnostics drops the count.
+        let removed = ctx.lsp_clear_diagnostics_for_file(&file);
+        assert!(removed);
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+    }
+}
+
+#[cfg(test)]
 mod harness_path_tests {
     use super::*;
     use crate::harness::Harness;
@@ -1530,11 +2516,47 @@ mod gitignore_tests {
             .is_ignore()
     }
 
+    /// Run `f` with global git-ignore discovery neutralized.
+    ///
+    /// `rebuild_gitignore` loads git's global excludes (the `ignore` crate
+    /// resolves `$XDG_CONFIG_HOME/git/ignore`, falling back to
+    /// `$HOME/.config/git/ignore`). A developer machine commonly has that file,
+    /// so a "no project ignore → None" assertion is only deterministic when
+    /// global discovery is pointed at an empty directory. Pointing
+    /// `XDG_CONFIG_HOME` at a fresh tempdir does that without touching `HOME`
+    /// (so it can't race the `HOME`-mutating configure tests). Serialized by a
+    /// process-local mutex; env is restored before the closure result is used.
+    fn with_neutralized_global_gitignore<R>(f: impl FnOnce() -> R) -> R {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by LOCK above; restored immediately after `f`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
     #[test]
     fn rebuild_gitignore_returns_none_without_project_root() {
         let provider = Box::new(crate::parser::TreeSitterProvider::new());
         let ctx = AppContext::new(provider, Config::default());
-        ctx.rebuild_gitignore();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
         assert!(ctx.gitignore().is_none());
     }
 
@@ -1542,7 +2564,7 @@ mod gitignore_tests {
     fn rebuild_gitignore_returns_none_for_project_with_no_gitignore() {
         let tmp = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(tmp.path());
-        ctx.rebuild_gitignore();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
         assert!(ctx.gitignore().is_none());
     }
 

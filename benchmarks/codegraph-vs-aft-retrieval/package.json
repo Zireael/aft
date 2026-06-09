@@ -1,0 +1,13 @@
+{
+  "name": "aft-codegraph-retrieval-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun run src/cli.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

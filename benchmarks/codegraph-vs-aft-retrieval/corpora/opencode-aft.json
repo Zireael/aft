@@ -1,0 +1,77 @@
+{
+  "name": "opencode-aft",
+  "description": "AFT vs CodeGraph retrieval corpus over this opencode-aft checkout. Cases mix exact symbol lookup and natural-language context retrieval without an LLM.",
+  "target": {
+    "name": "opencode-aft",
+    "kind": "local",
+    "path": "/workspace",
+    "url": "https://github.com/cortexkit/aft.git",
+    "commit": "local-worktree"
+  },
+  "cases": [
+    {
+      "id": "symbol-binary-bridge",
+      "query": "BinaryBridge",
+      "mode": "search",
+      "hint": "semantic",
+      "kind": "class",
+      "expectedSymbols": ["BinaryBridge"],
+      "groundTruth": [{ "file": "packages/aft-bridge/src/bridge.ts", "symbol": "BinaryBridge", "startLine": 272 }]
+    },
+    {
+      "id": "symbol-bridge-options",
+      "query": "BridgeOptions",
+      "mode": "search",
+      "hint": "semantic",
+      "kind": "interface",
+      "expectedSymbols": ["BridgeOptions"],
+      "groundTruth": [{ "file": "packages/aft-bridge/src/bridge.ts", "symbol": "BridgeOptions", "startLine": 156 }]
+    },
+    {
+      "id": "symbol-semantic-index-status",
+      "query": "SemanticIndexStatus",
+      "mode": "search",
+      "hint": "semantic",
+      "kind": "enum",
+      "expectedSymbols": ["SemanticIndexStatus"],
+      "groundTruth": [{ "file": "crates/aft/src/context.rs", "symbol": "SemanticIndexStatus", "startLine": 88 }]
+    },
+    {
+      "id": "context-plugin-bridge-dispatch",
+      "query": "How do OpenCode plugin tools call into the AFT bridge?",
+      "mode": "context",
+      "hint": "semantic",
+      "expectedSymbols": ["callBridge", "bridgeFor", "BinaryBridge"],
+      "groundTruth": [
+        { "file": "packages/opencode-plugin/src/tools/_shared.ts", "symbol": "callBridge", "startLine": 331 },
+        { "file": "packages/opencode-plugin/src/tools/_shared.ts", "symbol": "bridgeFor", "startLine": 312 },
+        { "file": "packages/aft-bridge/src/bridge.ts", "symbol": "BinaryBridge", "startLine": 272 }
+      ]
+    },
+    {
+      "id": "context-semantic-search-path",
+      "query": "How does AFT semantic search execute from tool request to indexed results?",
+      "mode": "context",
+      "hint": "semantic",
+      "expectedSymbols": ["semanticTools", "SemanticIndex", "SearchIndex"],
+      "groundTruth": [
+        { "file": "packages/opencode-plugin/src/tools/semantic.ts", "symbol": "semanticTools", "startLine": 15 },
+        { "file": "crates/aft/src/semantic_index.rs", "symbol": "SemanticIndex", "startLine": 965 },
+        { "file": "crates/aft/src/search_index.rs", "symbol": "SearchIndex", "startLine": 58 }
+      ]
+    },
+    {
+      "id": "context-import-organization",
+      "query": "What are the import organization components for parsing, grouping, and generating imports?",
+      "mode": "context",
+      "hint": "semantic",
+      "expectedSymbols": ["handle_organize_imports", "parse_imports", "classify_group", "generate_import_line"],
+      "groundTruth": [
+        { "file": "crates/aft/src/commands/organize_imports.rs", "symbol": "handle_organize_imports", "startLine": 27 },
+        { "file": "crates/aft/src/imports.rs", "symbol": "parse_imports", "startLine": 171 },
+        { "file": "crates/aft/src/imports.rs", "symbol": "classify_group", "startLine": 473 },
+        { "file": "crates/aft/src/imports.rs", "symbol": "generate_import_line", "startLine": 399 }
+      ]
+    }
+  ]
+}

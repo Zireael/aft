@@ -61,6 +61,42 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("loads a config with comments inside nested objects (issue #88)", () => {
+    const fixture = createConfigFixture();
+    // comment-json attaches Symbol(before:<key>) properties for the comments.
+    // Before the fix, Zod stringified those symbols while building validation
+    // paths and threw "Cannot convert a symbol to a string", which the outer
+    // catch swallowed and silently dropped the entire config to defaults.
+    writeFileSync(
+      fixture.userConfigPath,
+      `{
+        "search_index": true,
+        "semantic_search": true,
+        "formatter": {
+          // typescript uses biome
+          "typescript": "biome"
+        },
+        "lsp": {
+          "servers": {
+            // my custom server
+            "my-server": { "extensions": [".foo"], "binary": "my-lsp" }
+          }
+        }
+      }`,
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const loaded = JSON.parse(result.stdout);
+    expect(loaded.search_index).toBe(true);
+    expect(loaded.semantic_search).toBe(true);
+    expect(loaded.formatter).toEqual({ typescript: "biome" });
+    expect(loaded.lsp?.servers?.["my-server"]?.binary).toBe("my-lsp");
+    expect(result.stderr).not.toContain("Cannot convert a symbol to a string");
+  });
+
   test("loads user object-map lsp servers with entry defaults", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -109,8 +145,12 @@ describe("loadAftConfig", () => {
           format_on_edit: false,
           lsp: {
             servers: {
+              // `extensions` as a string (not an array) is malformed under the
+              // schema. (Omitting extensions/binary entirely is now a valid
+              // partial built-in override, so the malformed case must use a
+              // genuinely wrong shape.)
               tinymist: {
-                extensions: [".typ"],
+                extensions: ".typ",
               },
             },
           },
@@ -295,6 +335,23 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(
       `Ignoring lsp.disabled from project config ${fixture.projectConfigPath}`,
     );
+  });
+
+  test("preserves project lsp.diagnostics_on_edit", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { diagnostics_on_edit: false } }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ lsp: { diagnostics_on_edit: true } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.lsp.diagnostics_on_edit).toBe(true);
+    expect(result.stderr).not.toContain("these LSP settings only honor user-level config");
   });
 
   test("preserves project lsp.python", () => {

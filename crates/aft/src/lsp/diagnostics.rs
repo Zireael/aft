@@ -126,6 +126,13 @@ impl DiagnosticsStore {
         self.entries.len()
     }
 
+    /// The current LRU cap (0 = unbounded). Test-only accessor used to verify
+    /// the `lsp.diagnostic_cache_size` config wiring.
+    #[cfg(test)]
+    pub fn capacity_for_test(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -276,6 +283,87 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// Count of errors and warnings across the entire warm set (every file any
+    /// server has published for). Allocation-free — the raw, unfiltered union.
+    /// Callers that want the agent-status-bar semantics (project-root scoped,
+    /// tsconfig-membership filtered, cross-server deduped) should use
+    /// [`filtered_error_warning_counts`](Self::filtered_error_warning_counts).
+    pub fn error_warning_counts(&self) -> (usize, usize) {
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for entry in self.entries.values() {
+            for diagnostic in &entry.diagnostics {
+                match diagnostic.severity {
+                    DiagnosticSeverity::Error => errors += 1,
+                    DiagnosticSeverity::Warning => warnings += 1,
+                    _ => {}
+                }
+            }
+        }
+        (errors, warnings)
+    }
+
+    /// Error/warning counts after applying a per-file `keep` predicate and
+    /// de-duplicating diagnostics that multiple servers reported for the same
+    /// location. This matches `aft_inspect`'s warm semantics
+    /// (`inspect/diagnostics_category.rs`: project-root filter +
+    /// tsconfig-membership skip + `sort_and_dedup`) so the agent status bar's
+    /// E/W agree with `aft_inspect`/`tsc` instead of counting build-excluded
+    /// files and double-counting multi-server overlaps.
+    ///
+    /// The store itself holds no tsconfig/project policy — the caller encodes
+    /// it in `keep` (see `LspManager::filtered_error_warning_counts`). `keep`
+    /// is `FnMut` because the membership cache resolves lazily.
+    pub fn filtered_error_warning_counts(
+        &self,
+        mut keep: impl FnMut(&Path) -> bool,
+    ) -> (usize, usize) {
+        // Dedup key mirrors `sort_and_dedup` in inspect/diagnostics_category.rs
+        // exactly (file, range, severity, message, source) so the bar and
+        // inspect collapse the same multi-server overlaps.
+        let mut seen: std::collections::HashSet<(
+            &Path,
+            u32,
+            u32,
+            u32,
+            u32,
+            &str,
+            &str,
+            Option<&str>,
+        )> = std::collections::HashSet::new();
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for ((_, file), entry) in &self.entries {
+            // All diagnostics in an entry share the entry's file, so the keep
+            // predicate (the cost center: tsconfig resolution) runs once per
+            // (server, file) entry, not once per diagnostic.
+            if !keep(file) {
+                continue;
+            }
+            for diagnostic in &entry.diagnostics {
+                let dedup_key = (
+                    diagnostic.file.as_path(),
+                    diagnostic.line,
+                    diagnostic.column,
+                    diagnostic.end_line,
+                    diagnostic.end_column,
+                    diagnostic.severity.as_str(),
+                    diagnostic.message.as_str(),
+                    diagnostic.source.as_deref(),
+                );
+                if !seen.insert(dedup_key) {
+                    continue;
+                }
+                match diagnostic.severity {
+                    DiagnosticSeverity::Error => errors += 1,
+                    DiagnosticSeverity::Warning => warnings += 1,
+                    _ => {}
+                }
+            }
+        }
+        (errors, warnings)
+    }
+
     /// Drop all entries for a server kind (e.g., on server crash/restart).
     /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
     /// same kind are not wiped.
@@ -286,6 +374,32 @@ impl DiagnosticsStore {
             .retain(|(stored_key, _)| stored_key.kind != server);
         self.last_publish_at_for_file
             .retain(|(stored_key, _), _| stored_key.kind != server);
+    }
+
+    /// Drop one cached report for a specific server/file pair.
+    pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
+        let cache_key = (key.clone(), file.to_path_buf());
+        self.entries.remove(&cache_key);
+        self.order.retain(|entry_key| entry_key != &cache_key);
+        self.last_publish_at_for_file.remove(&cache_key);
+    }
+
+    /// Drop every cached report for a file across all servers. Used when a file
+    /// is deleted/renamed away — its diagnostics would otherwise linger in the
+    /// warm set forever (no server republishes for a path that no longer
+    /// exists), inflating the error/warning counts surfaced in the status bar
+    /// and `aft_inspect`. Returns true if any entry was removed.
+    pub fn clear_for_file(&mut self, file: &Path) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|(_, stored_file), _| stored_file != file);
+        let removed = self.entries.len() != before;
+        if removed {
+            self.order.retain(|(_, stored_file)| stored_file != file);
+            self.last_publish_at_for_file
+                .retain(|(_, stored_file), _| stored_file != file);
+        }
+        removed
     }
 
     /// Drop all entries for a specific server instance.
@@ -530,6 +644,37 @@ mod tests {
     }
 
     #[test]
+    fn clear_for_server_file_removes_only_exact_entry() {
+        let file_a = PathBuf::from("/tmp/a.rs");
+        let file_b = PathBuf::from("/tmp/b.rs");
+        let mut store = DiagnosticsStore::new();
+        let rust_key = server_key(ServerKind::Rust);
+        let py_key = server_key(ServerKind::Python);
+
+        store.publish(
+            rust_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 1, "rust a", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            rust_key.clone(),
+            file_b.clone(),
+            vec![diag("/tmp/b.rs", 1, "rust b", DiagnosticSeverity::Warning)],
+        );
+        store.publish(
+            py_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 2, "py a", DiagnosticSeverity::Warning)],
+        );
+
+        store.clear_for_server_file(&rust_key, &file_a);
+
+        assert!(!store.has_report_for_server_file(&rust_key, &file_a));
+        assert!(store.has_report_for_server_file(&rust_key, &file_b));
+        assert!(store.has_report_for_server_file(&py_key, &file_a));
+    }
+
+    #[test]
     fn lru_evicts_oldest_when_capacity_exceeded() {
         let mut store = DiagnosticsStore::with_capacity(2);
         let key = server_key(ServerKind::Rust);
@@ -689,5 +834,121 @@ mod tests {
         store.clear_server(ServerKind::Python);
         assert!(!store.has_any_report_for_file(Path::new("/a.py")));
         assert!(store.has_any_report_for_file(Path::new("/b.rs")));
+    }
+
+    #[test]
+    fn clear_for_file_drops_every_server_entry_and_updates_counts() {
+        let mut store = DiagnosticsStore::new();
+        let py_key = server_key(ServerKind::Python);
+        let biome_key = server_key(ServerKind::Biome);
+
+        // Two servers both report for the SAME deleted file, plus an unrelated
+        // file that must survive.
+        store.publish(
+            py_key,
+            PathBuf::from("/gone.ts"),
+            vec![diag("/gone.ts", 4, "type error", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            biome_key,
+            PathBuf::from("/gone.ts"),
+            vec![diag(
+                "/gone.ts",
+                7,
+                "lint warning",
+                DiagnosticSeverity::Warning,
+            )],
+        );
+        store.publish(
+            server_key(ServerKind::Rust),
+            PathBuf::from("/keep.rs"),
+            vec![diag("/keep.rs", 1, "live error", DiagnosticSeverity::Error)],
+        );
+
+        assert_eq!(store.error_warning_counts(), (2, 1));
+
+        // Clearing the deleted file drops both server entries for it.
+        let removed = store.clear_for_file(Path::new("/gone.ts"));
+        assert!(removed);
+        assert!(!store.has_any_report_for_file(Path::new("/gone.ts")));
+        // The unrelated file's diagnostic is untouched.
+        assert!(store.has_any_report_for_file(Path::new("/keep.rs")));
+        assert_eq!(store.error_warning_counts(), (1, 0));
+
+        // Clearing again is a no-op (nothing left for that file).
+        assert!(!store.clear_for_file(Path::new("/gone.ts")));
+    }
+
+    #[test]
+    fn filtered_counts_apply_keep_predicate() {
+        let mut store = DiagnosticsStore::new();
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from("/repo/src/app.ts"),
+            vec![diag(
+                "/repo/src/app.ts",
+                1,
+                "in build",
+                DiagnosticSeverity::Error,
+            )],
+        );
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from("/repo/src/app.test.ts"),
+            vec![diag(
+                "/repo/src/app.test.ts",
+                1,
+                "excluded",
+                DiagnosticSeverity::Error,
+            )],
+        );
+
+        // Raw count sees both files.
+        assert_eq!(store.error_warning_counts(), (2, 0));
+        // Filtered count drops the build-excluded test file.
+        let counts = store.filtered_error_warning_counts(|file| !file.ends_with("app.test.ts"));
+        assert_eq!(counts, (1, 0));
+    }
+
+    #[test]
+    fn filtered_counts_dedup_across_servers() {
+        let mut store = DiagnosticsStore::new();
+        let file = "/repo/src/app.ts";
+        // Two different servers report the SAME diagnostic (same file/range/
+        // severity/message/source) for one file — e.g. tsserver + a linter that
+        // both surface an identical issue. Raw counting double-counts; the
+        // status-bar count must collapse to one (matching inspect sort_and_dedup).
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from(file),
+            vec![diag(file, 7, "dup", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            server_key(ServerKind::Biome),
+            PathBuf::from(file),
+            vec![diag(file, 7, "dup", DiagnosticSeverity::Error)],
+        );
+
+        assert_eq!(store.error_warning_counts(), (2, 0));
+        assert_eq!(store.filtered_error_warning_counts(|_| true), (1, 0));
+    }
+
+    #[test]
+    fn filtered_counts_keep_distinct_diagnostics_same_file() {
+        let mut store = DiagnosticsStore::new();
+        let file = "/repo/src/app.ts";
+        // Two servers, genuinely different diagnostics on the same file — both
+        // must be counted (dedup keys on location+message+source, not file).
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from(file),
+            vec![diag(file, 7, "type error", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            server_key(ServerKind::Biome),
+            PathBuf::from(file),
+            vec![diag(file, 12, "lint warn", DiagnosticSeverity::Warning)],
+        );
+        assert_eq!(store.filtered_error_warning_counts(|_| true), (1, 1));
     }
 }

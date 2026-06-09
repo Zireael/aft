@@ -4,7 +4,8 @@
 //! markers, and returns line-numbered conflict regions with surrounding context — the same format
 //! agents see from `read`, but only the conflict areas.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::context::AppContext;
@@ -21,18 +22,45 @@ struct ConflictRegion {
     end_line: usize,
 }
 
-/// Find all conflicted files using `git ls-files --unmerged`.
-/// Returns unique file paths relative to the git working directory.
-fn discover_conflicted_files(project_root: &Path) -> Result<Vec<String>, String> {
+/// Resolve the git toplevel for `base_dir`.
+fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     let output = Command::new("git")
-        .args(["ls-files", "--unmerged"])
-        .current_dir(project_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(base_dir)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Not a git repo or no git installed
+        if stderr.contains("not a git repository") {
+            return Err("not a git repository".to_string());
+        }
+        return Err(format!("git rev-parse failed: {}", stderr.trim()));
+    }
+
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if toplevel.is_empty() {
+        return Err("git rev-parse returned an empty toplevel".to_string());
+    }
+
+    Ok(PathBuf::from(toplevel))
+}
+
+/// Find all conflicted files using index-unmerged state plus tracked working-tree markers.
+/// Returns the git toplevel and unique file paths relative to that toplevel.
+fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<String>), String> {
+    let toplevel = git_toplevel(base_dir)?;
+    let mut files: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    let output = Command::new("git")
+        .args(["ls-files", "--unmerged"])
+        .current_dir(&toplevel)
+        .output()
+        .map_err(|e| format!("failed to run git: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("not a git repository") {
             return Err("not a git repository".to_string());
         }
@@ -40,9 +68,6 @@ fn discover_conflicted_files(project_root: &Path) -> Result<Vec<String>, String>
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut files: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
     for line in stdout.lines() {
         // Format: "<mode> <hash> <stage>\t<filename>"
         if let Some(tab_pos) = line.find('\t') {
@@ -53,8 +78,28 @@ fn discover_conflicted_files(project_root: &Path) -> Result<Vec<String>, String>
         }
     }
 
+    let grep_output = Command::new("git")
+        .args(["grep", "-lE", r"^(<<<<<<< |>>>>>>> )"])
+        .current_dir(&toplevel)
+        .output()
+        .map_err(|e| format!("failed to run git: {}", e))?;
+
+    if grep_output.status.success() {
+        let stdout = String::from_utf8_lossy(&grep_output.stdout);
+        for filename in stdout.lines() {
+            if seen.insert(filename.to_string()) {
+                files.push(filename.to_string());
+            }
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&grep_output.stderr);
+        if grep_output.status.code() != Some(1) || !stderr.trim().is_empty() {
+            return Err(format!("git grep failed: {}", stderr.trim()));
+        }
+    }
+
     files.sort();
-    Ok(files)
+    Ok((toplevel, files))
 }
 
 /// Parse a file's content and find all conflict regions (marker line numbers).
@@ -152,22 +197,59 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(CONTEXT_LINES);
+    let requested_path = req
+        .params
+        .get("path")
+        .or_else(|| {
+            req.params
+                .get("params")
+                .and_then(|params| params.get("path"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let discovery_base = if let Some(path) = requested_path {
+        let path = PathBuf::from(path);
+        let path = if path.is_relative() {
+            project_root.join(path)
+        } else {
+            path
+        };
+        match ctx.validate_path(&req.id, &path) {
+            Ok(path) => path,
+            Err(resp) => return resp,
+        }
+    } else {
+        project_root
+    };
 
     // Discover conflicted files
-    let files = match discover_conflicted_files(&project_root) {
-        Ok(f) => f,
+    let (git_toplevel, files) = match discover_conflicted_files(&discovery_base) {
+        Ok(result) => result,
         Err(e) => {
+            if requested_path.is_some() && e == "not a git repository" {
+                return Response::error(
+                    &req.id,
+                    "not_a_git_repository",
+                    format!(
+                        "path is not inside a git repository: {}",
+                        discovery_base.display()
+                    ),
+                );
+            }
             return Response::error(&req.id, "git_error", e);
         }
     };
+    let checked_root = git_toplevel.to_string_lossy().to_string();
 
     if files.is_empty() {
         return Response::success(
             &req.id,
             serde_json::json!({
-                "text": "No merge conflicts found.",
+                "text": format!("No merge conflicts found.\nChecked repo root: {}", checked_root),
                 "file_count": 0,
                 "conflict_count": 0,
+                "checked_root": checked_root,
             }),
         );
     }
@@ -177,7 +259,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
     let mut files_with_conflicts = 0;
 
     for file_path in &files {
-        let full_path = project_root.join(file_path);
+        let full_path = git_toplevel.join(file_path);
         let validated_path = match ctx.validate_path(&req.id, &full_path) {
             Ok(path) => path,
             Err(resp) => return resp,
@@ -215,7 +297,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
 
     // Prepend summary header
     let header = format!(
-        "{} {}, {} {}\n\n",
+        "{} {}, {} {}\nChecked repo root: {}\n\n",
         files_with_conflicts,
         if files_with_conflicts == 1 {
             "file"
@@ -228,6 +310,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         } else {
             "conflicts"
         },
+        checked_root,
     );
 
     let text = format!("{}{}", header, output.trim_end());
@@ -238,6 +321,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
             "text": text,
             "file_count": files_with_conflicts,
             "conflict_count": total_conflicts,
+            "checked_root": checked_root,
         }),
     )
 }

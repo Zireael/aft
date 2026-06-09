@@ -1,12 +1,11 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePattern,
 } from "./permissions.js";
 
@@ -28,13 +27,7 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         "- 'wrap_try_catch': Wrap a TS/JS function body in try/catch. Requires 'target' (function name). Optional 'catchBody'.\n" +
         "- 'add_decorator': Add Python decorator to function/class. Requires 'target' and 'decorator' (without @). Optional 'position'.\n" +
         "- 'add_struct_tags': Add/update Go struct field tags. Requires 'target' (struct name), 'field', 'tag', 'value'.\n\n" +
-        "Each op requires specific parameters — see parameter descriptions for requirements. Use aft_safety checkpoint/undo before risky transforms.\n\n" +
-        "Returns:\n" +
-        "- add_member: { file, scope, position, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_derive: { file, target, derives, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- wrap_try_catch: { file, target, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_decorator: { file, target, decorator, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_struct_tags: { file, target, field, tag_string, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
+        "Each op requires specific parameters — see parameter descriptions for requirements. Use aft_safety checkpoint/undo before risky transforms.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
@@ -96,10 +89,9 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         const op = args.op as string;
 
         if (op === "add_member") {
-          if (typeof args.container !== "string")
+          if (isEmptyParam(args.container))
             throw new Error("'container' is required for 'add_member' op");
-          if (typeof args.code !== "string")
-            throw new Error("'code' is required for 'add_member' op");
+          if (isEmptyParam(args.code)) throw new Error("'code' is required for 'add_member' op");
         }
         if (
           op === "add_derive" ||
@@ -107,25 +99,23 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           op === "add_decorator" ||
           op === "add_struct_tags"
         ) {
-          if (typeof args.target !== "string")
-            throw new Error(`'target' is required for '${op}' op`);
+          if (isEmptyParam(args.target)) throw new Error(`'target' is required for '${op}' op`);
         }
-        if (op === "add_derive" && !Array.isArray(args.derives)) {
+        if (op === "add_derive" && isEmptyParam(args.derives)) {
           throw new Error("'derives' array is required for 'add_derive' op");
         }
-        if (op === "add_decorator" && typeof args.decorator !== "string") {
+        if (op === "add_decorator" && isEmptyParam(args.decorator)) {
           throw new Error("'decorator' is required for 'add_decorator' op");
         }
         if (op === "add_struct_tags") {
-          if (typeof args.field !== "string")
+          if (isEmptyParam(args.field))
             throw new Error("'field' is required for 'add_struct_tags' op");
-          if (typeof args.tag !== "string")
-            throw new Error("'tag' is required for 'add_struct_tags' op");
-          if (typeof args.value !== "string")
+          if (isEmptyParam(args.tag)) throw new Error("'tag' is required for 'add_struct_tags' op");
+          if (isEmptyParam(args.value))
             throw new Error("'value' is required for 'add_struct_tags' op");
         }
 
-        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
@@ -135,12 +125,12 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
 
         const permissionError = await askEditPermission(
           context,
-          [resolveRelativePattern(context, args.filePath as string)],
+          [resolveRelativePattern(context, filePath)],
           { filepath: filePath },
         );
         if (permissionError) return permissionDeniedResponse(permissionError);
 
-        const params: Record<string, unknown> = { file: args.filePath };
+        const params: Record<string, unknown> = { file: filePath };
         if (args.validate !== undefined) params.validate = args.validate;
 
         switch (op) {

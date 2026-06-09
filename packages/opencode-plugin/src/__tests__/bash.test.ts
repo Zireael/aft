@@ -5,18 +5,30 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BridgePool, BridgeRequestOptions } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
   sessionBgStates,
   trackBgTask,
 } from "../bg-notifications.js";
-import { consumeToolMetadata } from "../metadata-store.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
+import { createBashWatchTool } from "../tools/bash_watch.js";
+import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
 import { mockAsk, noopAsk } from "./test-helpers";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
+
+/**
+ * The hoisted `bash` tool now returns `{ output, title, metadata }` (UI
+ * metadata lives on the result, not a side-channel store). Most tests only
+ * care about the agent-visible text — this unwraps it (and tolerates the
+ * legacy bare-string shape for safety).
+ */
+function bashText(r: unknown): string {
+  return typeof r === "string" ? r : ((r as { output?: string })?.output ?? "");
+}
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = {
@@ -56,6 +68,7 @@ function createHarness(
     options?: BridgeRequestOptions & { onProgress?: ProgressHandler },
   ) => Promise<BridgeResponse> | BridgeResponse,
   triggerImpl?: PluginContext["plugin"],
+  aftSearchRegistered = false,
 ) {
   const calls: SendCall[] = [];
   const bridge = {
@@ -76,7 +89,7 @@ function createHarness(
     config: {} as PluginContext["config"],
     storageDir: "/tmp/aft-test",
   };
-  return { calls, tool: createBashTool(ctx) };
+  return { calls, tool: createBashTool(ctx, aftSearchRegistered) };
 }
 
 function safeParse(schema: unknown, value: unknown): { success: boolean } {
@@ -97,16 +110,67 @@ describe("OpenCode bash adapter", () => {
     expect(safeParse(bash.args.description, "List files").success).toBe(true);
     expect(safeParse(bash.args.background, true).success).toBe(true);
     expect(safeParse(bash.args.compressed, false).success).toBe(true);
+    expect(safeParse(bash.args.ptyRows, 50).success).toBe(true);
+    expect(safeParse(bash.args.ptyCols, 120).success).toBe(true);
 
     expect(safeParse(bash.args.command, 123).success).toBe(false);
     expect(safeParse(bash.args.timeout, "slow").success).toBe(false);
     expect(safeParse(bash.args.background, "yes").success).toBe(false);
     expect(safeParse(bash.args.compressed, "no").success).toBe(false);
+    // optionalInt is a plain bounded `z.number().int().min(...).max(...).optional()`
+    // schema (deliberately NOT a transform; transforms break OpenCode's
+    // z.toJSONSchema and crash plugin load — see
+    // `tool-schemas-json-convertible.test.ts`). Out-of-range and non-integer
+    // values are rejected at Zod parse time.
+    expect(safeParse(bash.args.ptyRows, 0).success).toBe(false);
+    expect(safeParse(bash.args.ptyRows, 61).success).toBe(false);
+    expect(safeParse(bash.args.ptyRows, 1.5).success).toBe(false);
+    expect(safeParse(bash.args.ptyCols, 141).success).toBe(false);
 
+    // Verify the args convert to JSON Schema with the default options
+    // OpenCode uses (`{ io: "input" }`, no `unrepresentable: "any"` escape
+    // hatch). If any arg's schema contains a transform, this throws and
+    // plugin load fails at session start.
     for (const schema of Object.values(bash.args)) {
-      const jsonSchema = tool.schema.toJSONSchema(schema) as { description?: string };
+      expect(() => tool.schema.toJSONSchema(schema, { io: "input" })).not.toThrow();
+      const jsonSchema = tool.schema.toJSONSchema(schema, { io: "input" }) as {
+        description?: string;
+      };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);
     }
+  });
+
+  test("pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-dims",
+    }));
+
+    // pty:false + ptyRows passed defensively: should NOT throw, dims silently ignored
+    const nonPtyOutput = bashText(
+      await bash.execute(
+        { command: "echo hi", background: true, ptyRows: 50 },
+        createMockSdkContext(),
+      ),
+    );
+    expect(nonPtyOutput).toContain("bash-pty-dims");
+    // The non-pty call still forwards ptyRows in params (Rust silently ignores
+    // when pty:false). We only assert no throw + task_id propagation here.
+
+    const output = bashText(
+      await bash.execute(
+        { command: "top", background: true, pty: true, ptyRows: 50, ptyCols: 120 },
+        createMockSdkContext(),
+      ),
+    );
+
+    expect(output).toContain("bash-pty-dims");
+    expect(calls.at(-1)?.params).toMatchObject({
+      pty: true,
+      pty_rows: 50,
+      pty_cols: 120,
+    });
   });
 
   test("permission loop asks for each PermissionAsk and retries with permissions_granted", async () => {
@@ -127,7 +191,7 @@ describe("OpenCode bash adapter", () => {
       return { success: true, output: "ok", exit_code: 0, truncated: false };
     });
 
-    await bash.execute({ command: "rm -rf /tmp/demo" }, createMockSdkContext({ ask }));
+    bashText(await bash.execute({ command: "rm -rf /tmp/demo" }, createMockSdkContext({ ask })));
 
     expect(ask).toHaveBeenCalledTimes(2);
     expect(ask.mock.calls[0][0]).toEqual({
@@ -160,9 +224,11 @@ describe("OpenCode bash adapter", () => {
       { trigger },
     );
 
-    await bash.execute(
-      { command: "printenv FOO", workdir: "/tmp/project" },
-      createMockSdkContext({ sessionID: "s1", callID: "c1" } as Partial<ToolContext>),
+    bashText(
+      await bash.execute(
+        { command: "printenv FOO", workdir: "/tmp/project" },
+        createMockSdkContext({ sessionID: "s1", callID: "c1" } as Partial<ToolContext>),
+      ),
     );
 
     expect(events).toEqual(["trigger", "bridge"]);
@@ -173,6 +239,42 @@ describe("OpenCode bash adapter", () => {
       { env: {} },
     ]);
     expect(calls[0].params.env).toEqual({ FOO: "bar", TOKEN: "redacted" });
+  });
+
+  test("strips compressor-handled filter pipes before bridge and appends note", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "failure details",
+      exit_code: 1,
+      truncated: false,
+    }));
+
+    const output = bashText(
+      await bash.execute({ command: "bun test | grep fail" }, createMockSdkContext()),
+    );
+
+    expect(calls[0].params.command).toBe("bun test");
+    expect(output).toContain("failure details");
+    expect(output).toContain("[AFT dropped `| grep fail`");
+  });
+
+  test("keeps filter pipes when compressed:false", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "raw",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    const output = bashText(
+      await bash.execute(
+        { command: "bun test | grep fail", compressed: false },
+        createMockSdkContext(),
+      ),
+    );
+
+    expect(calls[0].params.command).toBe("bun test | grep fail");
+    expect(output).not.toContain("AFT dropped");
   });
 
   test("transport timeout is bounded by wait-window, not user-supplied task budget", async () => {
@@ -190,7 +292,9 @@ describe("OpenCode bash adapter", () => {
       truncated: false,
     }));
 
-    await bash.execute({ command: "cargo build", timeout: 600_000 }, createMockSdkContext());
+    bashText(
+      await bash.execute({ command: "cargo build", timeout: 600_000 }, createMockSdkContext()),
+    );
 
     expect(calls).toHaveLength(1);
     // The user's kill cap still propagates to Rust as the task timeout.
@@ -198,6 +302,45 @@ describe("OpenCode bash adapter", () => {
     // But transport timeout is the 30s baseline — wait-window (5s) plus
     // overhead (5s) is well below the floor.
     expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
+  });
+
+  test("foreground sub-window timeout is dropped so the bridge applies its default (#102)", async () => {
+    // A model passing timeout: 100 must NOT become the bridge kill cap (that
+    // killed commands at 100ms). On the foreground path, a timeout below the
+    // wait window is incoherent, so it's sent as undefined and Rust uses its
+    // 30-minute default.
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "done",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    bashText(await bash.execute({ command: "echo hi", timeout: 100 }, createMockSdkContext()));
+
+    expect(calls[0].command).toBe("bash");
+    expect(calls[0].params.timeout).toBeUndefined();
+  });
+
+  test("explicit background honors a small timeout verbatim as a real kill cap", async () => {
+    // Background is the opposite of foreground: a small timeout IS a legitimate
+    // kill cap there (kill after N ms), so it must pass through unchanged.
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      task_id: "task-bg",
+      status: "running",
+    }));
+
+    bashText(
+      await bash.execute(
+        { command: "sleep 9", background: true, timeout: 200 },
+        createMockSdkContext(),
+      ),
+    );
+
+    expect(calls[0].command).toBe("bash");
+    expect(calls[0].params.timeout).toBe(200);
   });
 
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
@@ -208,9 +351,11 @@ describe("OpenCode bash adapter", () => {
       return { success: true, output: "hello world", exit_code: 0, truncated: false };
     });
 
-    await bash.execute(
-      { command: "printf hello", description: "Print greeting" },
-      createMockSdkContext({ metadata }),
+    bashText(
+      await bash.execute(
+        { command: "printf hello", description: "Print greeting" },
+        createMockSdkContext({ metadata }),
+      ),
     );
 
     expect(metadata.mock.calls[0][0]).toEqual({ output: "hello ", description: "Print greeting" });
@@ -238,7 +383,9 @@ describe("OpenCode bash adapter", () => {
       ],
     }));
 
-    const output = await bash.execute({ command: "echo foreground" }, createMockSdkContext());
+    const output = bashText(
+      await bash.execute({ command: "echo foreground" }, createMockSdkContext()),
+    );
 
     expect(output).toBe("foreground");
   });
@@ -252,27 +399,24 @@ describe("OpenCode bash adapter", () => {
       output_path: "/tmp/bash-output.txt",
     }));
 
-    const output = await bash.execute(
+    const stored = (await bash.execute(
       { command: "echo done", description: "Echo done" },
       createMockSdkContext({
         sessionID: "meta-session",
         callID: "meta-call",
       } as Partial<ToolContext>),
-    );
-    const stored = consumeToolMetadata("meta-session", "meta-call");
+    )) as { output: string; title: string; metadata: Record<string, unknown> };
 
     // Truncation must be visible to the agent (so it knows full output is on
     // disk); metadata payload preserves the structured fields for the UI.
-    expect(output).toBe("done\n[output truncated; full output at /tmp/bash-output.txt]");
-    expect(stored).toEqual({
-      title: "Echo done",
-      metadata: {
-        description: "Echo done",
-        output: "done",
-        exit: 0,
-        truncated: true,
-        outputPath: "/tmp/bash-output.txt",
-      },
+    expect(stored.output).toBe("done\n[output truncated; full output at /tmp/bash-output.txt]");
+    expect(stored.title).toBe("Echo done");
+    expect(stored.metadata).toEqual({
+      description: "Echo done",
+      output: "done",
+      exit: 0,
+      truncated: true,
+      outputPath: "/tmp/bash-output.txt",
     });
   });
 
@@ -284,7 +428,7 @@ describe("OpenCode bash adapter", () => {
       truncated: false,
     }));
 
-    const output = await bash.execute({ command: "false" }, createMockSdkContext());
+    const output = bashText(await bash.execute({ command: "false" }, createMockSdkContext()));
 
     expect(output).toBe("command failed\n\n[exit code: 2]");
   });
@@ -296,23 +440,22 @@ describe("OpenCode bash adapter", () => {
       task_id: "task-xyz",
     }));
 
-    const output = await bash.execute(
+    const stored = (await bash.execute(
       { command: "sleep 30 && echo done", background: true },
       createMockSdkContext({
         sessionID: "bg-session",
         callID: "bg-call",
       } as Partial<ToolContext>),
-    );
-    const stored = consumeToolMetadata("bg-session", "bg-call");
+    )) as { output: string; metadata: Record<string, unknown> };
 
     // The "completion reminder" sentence is load-bearing — it tells the
     // agent the notification mechanism exists so it stops polling. Don't
     // soften this assertion; if the wording changes accidentally we want
     // the test to fail.
-    expect(output).toBe(
+    expect(stored.output).toBe(
       "Background task started: task-xyz. A completion reminder will be delivered automatically; don't poll bash_status.",
     );
-    expect(stored?.metadata).toEqual({
+    expect(stored.metadata).toEqual({
       description: undefined,
       output:
         "Background task started: task-xyz. A completion reminder will be delivered automatically; don't poll bash_status.",
@@ -334,11 +477,66 @@ describe("OpenCode bash adapter", () => {
       };
     });
 
-    const output = await bash.execute({ command: "printf done" }, createMockSdkContext());
+    const output = bashText(await bash.execute({ command: "printf done" }, createMockSdkContext()));
 
     expect(output).toBe("done");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status"]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+      expect(call.options?.transportTimeoutMs).toBe(30_000);
+    }
     expect(calls[0].params.notify_on_completion).toBe(false);
+  });
+
+  test("foreground leading grep appends aft_search hint", async () => {
+    const { tool: bash } = createHarness(
+      (command) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "src/file.ts:1:x",
+          output_truncated: false,
+        };
+      },
+      undefined,
+      true,
+    );
+
+    const output = bashText(
+      await bash.execute({ command: 'grep -nE "x" src/' }, createMockSdkContext()),
+    );
+
+    expect(output).toContain("src/file.ts:1:x");
+    expect(output).toContain("DO NOT search code by running grep/rg in bash");
+    expect(output).toContain("Use the `aft_search` tool instead");
+  });
+
+  test("foreground filtering grep does not append code-search hint", async () => {
+    const { tool: bash } = createHarness(
+      (command) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "failure details",
+          output_truncated: false,
+        };
+      },
+      undefined,
+      true,
+    );
+
+    const output = bashText(
+      await bash.execute({ command: "bun test | grep fail" }, createMockSdkContext()),
+    );
+
+    expect(output).toContain("failure details");
+    expect(output).not.toContain("DO NOT search code by running grep/rg in bash");
   });
 
   test("foreground running task promotes to background after wait timeout", async () => {
@@ -348,13 +546,23 @@ describe("OpenCode bash adapter", () => {
       return { success: true, task_id: "task-promote", promoted: true };
     });
 
-    const output = await bash.execute(
-      { command: "sleep 2", timeout: 0 },
-      createMockSdkContext({ sessionID: "promote-session" }),
+    // Force a 0ms foreground wait so the promote path fires after the first
+    // status poll (production floors the window at 5s; bun caps tests at 5s).
+    const output = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "0" }, async () =>
+      bashText(
+        await bash.execute(
+          { command: "sleep 2" },
+          createMockSdkContext({ sessionID: "promote-session" }),
+        ),
+      ),
     );
 
     expect(output).toContain("promoted to background: task-promote");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+      expect(call.options?.transportTimeoutMs).toBe(30_000);
+    }
   });
 
   test("explicit background spawn enables completion notifications", async () => {
@@ -364,9 +572,8 @@ describe("OpenCode bash adapter", () => {
       task_id: "task-notify",
     }));
 
-    const output = await bash.execute(
-      { command: "sleep 30", background: true },
-      createMockSdkContext(),
+    const output = bashText(
+      await bash.execute({ command: "sleep 30", background: true }, createMockSdkContext()),
     );
 
     expect(output).toContain("Background task started: task-notify");
@@ -405,8 +612,68 @@ describe("bash_status tool", () => {
       config: {} as PluginContext["config"],
       storageDir: "/tmp/aft-test",
     };
-    return { calls, ctx, statusTool: createBashStatusTool(ctx), killTool: createBashKillTool(ctx) };
+    return {
+      calls,
+      ctx,
+      statusTool: createBashStatusTool(ctx),
+      watchTool: createBashWatchTool(ctx),
+      killTool: createBashKillTool(ctx),
+      writeTool: createBashWriteTool(ctx),
+    };
   }
+
+  test("bash-family control RPCs keep the bridge on transport timeout", async () => {
+    const { calls, statusTool, watchTool, writeTool, killTool } = makeCtx((cmd) => {
+      if (cmd === "bash_notify") return { success: true, watch_id: "watch-1" };
+      if (cmd === "bash_write") return { success: true, bytes_written: 3 };
+      if (cmd === "bash_kill") return { success: true, status: "killed" };
+      return { success: true, status: "running", duration_ms: 0 };
+    });
+    const runtime = createMockSdkContext();
+
+    await statusTool.execute({ taskId: "bash-control" }, runtime);
+    await watchTool.execute(
+      { taskId: "bash-control", pattern: "ready", background: true },
+      runtime,
+    );
+    await writeTool.execute({ taskId: "bash-control", input: "abc" }, runtime);
+    await killTool.execute({ taskId: "bash-control" }, runtime);
+
+    expect(calls.map((call) => call.cmd)).toEqual([
+      "bash_status",
+      "bash_notify",
+      "bash_write",
+      "bash_kill",
+    ]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+    }
+    expect(calls.find((call) => call.cmd === "bash_status")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+    expect(calls.find((call) => call.cmd === "bash_notify")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+    expect(calls.find((call) => call.cmd === "bash_kill")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+  });
+
+  test("async bash_watch registration does not add synthetic outstanding task", async () => {
+    __resetBgNotificationStateForTests();
+    const { watchTool } = makeCtx((cmd) =>
+      cmd === "bash_notify"
+        ? { success: true, watch_id: "watch-1" }
+        : { success: true, status: "completed", exit_code: 0 },
+    );
+
+    await watchTool.execute(
+      { taskId: "bash-finished", pattern: "READY", background: true },
+      createMockSdkContext({ sessionID: "s-watch" }),
+    );
+
+    expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
 
   test("returns running status with anti-polling reminder, no output preview", async () => {
     const { statusTool } = makeCtx((_cmd, _params) => ({
@@ -484,18 +751,30 @@ describe("bash_status tool", () => {
     return file;
   }
 
-  test("waitFor substring match returns matched reason, text, and offset", async () => {
+  async function spillPair(
+    stdout: string,
+    stderr: string,
+  ): Promise<{ dir: string; stdoutPath: string; stderrPath: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "aft-bash-status-test-"));
+    const stdoutPath = join(dir, "task.out");
+    const stderrPath = join(dir, "task.err");
+    await writeFile(stdoutPath, stdout);
+    await writeFile(stderrPath, stderr);
+    return { dir, stdoutPath, stderrPath };
+  }
+
+  test("bash_watch pattern substring match returns matched reason, text, and offset", async () => {
     const outputPath = await spill("prefix Server listening on port 3000\n");
     try {
       const metadata = mock(() => {});
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-wait", waitFor: "Server listening" },
+      const result = await watchTool.execute(
+        { taskId: "bash-wait", pattern: "Server listening" },
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "Server listening" at offset 7');
@@ -509,17 +788,17 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("waitFor regex match returns matched reason, text, and offset", async () => {
+  test("bash_watch pattern regex match returns matched reason, text, and offset", async () => {
     const outputPath = await spill("abc ready: 4242\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-regex", waitFor: { regex: "ready: \\d+" } },
+      const result = await watchTool.execute(
+        { taskId: "bash-regex", pattern: { regex: "ready: \\d+" } },
         createMockSdkContext(),
       );
       expect(result).toContain('matched "ready: 4242" at offset 4');
@@ -528,18 +807,15 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("exit true on already-terminal task returns immediately with reason exited", async () => {
-    const { calls, statusTool } = makeCtx(() => ({
+  test("bash_watch on already-terminal task returns immediately with reason exited", async () => {
+    const { calls, watchTool } = makeCtx(() => ({
       success: true,
       status: "completed",
       exit_code: 0,
       duration_ms: 12,
       output_preview: "done",
     }));
-    const result = await statusTool.execute(
-      { taskId: "bash-done", exit: true },
-      createMockSdkContext(),
-    );
+    const result = await watchTool.execute({ taskId: "bash-done" }, createMockSdkContext());
     expect(result).toContain("task exited (completed, exit 0)");
     expect(result).toContain("done");
     expect(calls).toHaveLength(1);
@@ -547,33 +823,33 @@ describe("bash_status tool", () => {
     expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
   });
 
-  test("exit true on running task that completes mid-poll returns reason exited", async () => {
+  test("bash_watch on running task that completes mid-poll returns reason exited", async () => {
     let polls = 0;
-    const { statusTool } = makeCtx(() => {
+    const { watchTool } = makeCtx(() => {
       polls += 1;
       return polls === 1
         ? { success: true, status: "running" }
         : { success: true, status: "completed", exit_code: 0, output_preview: "finished" };
     });
-    const result = await statusTool.execute(
-      { taskId: "bash-mid", exit: true, timeoutMs: 500 },
+    const result = await watchTool.execute(
+      { taskId: "bash-mid", timeoutMs: 500 },
       createMockSdkContext(),
     );
     expect(result).toContain("task exited (completed, exit 0)");
     expect(polls).toBe(2);
   });
 
-  test("timeoutMs returns timeout when neither wait condition is met", async () => {
+  test("bash_watch timeoutMs returns timeout when pattern never matches", async () => {
     const outputPath = await spill("not yet\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-timeout", waitFor: "never", timeoutMs: 1 },
+      const result = await watchTool.execute(
+        { taskId: "bash-timeout", pattern: "never", timeoutMs: 1 },
         createMockSdkContext(),
       );
       expect(result).toContain("timeout reached without match");
@@ -582,38 +858,38 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("waitFor plus exit true race returns exited when task exits before scanning pattern", async () => {
-    const outputPath = await spill("pattern exists but exit wins\n");
+  test("bash_watch pattern + exit race scans terminal output before returning exited", async () => {
+    const outputPath = await spill("pattern exists and match wins\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "completed",
         exit_code: 0,
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-race", waitFor: "pattern", exit: true },
+      const result = await watchTool.execute(
+        { taskId: "bash-race", pattern: "pattern" },
         createMockSdkContext(),
       );
-      expect(result).toContain("task exited (completed, exit 0)");
-      expect(result).not.toContain("matched");
+      expect(result).toContain('matched "pattern" at offset 0');
+      expect(result).not.toContain("task exited");
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }
   });
 
-  test("PIPED bash with waitFor reads output_path and matches", async () => {
+  test("bash_watch on PIPED bash with pattern reads output_path and matches", async () => {
     const outputPath = await spill("one\ntwo\nthree\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-piped", waitFor: "two" },
+      const result = await watchTool.execute(
+        { taskId: "bash-piped", pattern: "two" },
         createMockSdkContext(),
       );
       expect(result).toContain('matched "two" at offset 4');
@@ -622,11 +898,31 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("exit wait consumes pending completion to suppress duplicate reminder", async () => {
+  test("bash_watch on PIPED bash scans stderr_path as well as output_path", async () => {
+    const spill = await spillPair("stdout\n", "warning: READY on stderr\n");
+    try {
+      const { watchTool } = makeCtx(() => ({
+        success: true,
+        status: "running",
+        mode: "pipes",
+        output_path: spill.stdoutPath,
+        stderr_path: spill.stderrPath,
+      }));
+      const result = await watchTool.execute(
+        { taskId: "bash-stderr", pattern: "READY" },
+        createMockSdkContext(),
+      );
+      expect(result).toContain('matched "READY" at offset 16');
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch exit wait consumes pending completion to suppress duplicate reminder", async () => {
     __resetBgNotificationStateForTests();
     try {
       trackBgTask("s-consume", "bash-consume");
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "completed",
         exit_code: 0,
@@ -634,8 +930,8 @@ describe("bash_status tool", () => {
           { task_id: "bash-consume", status: "completed", exit_code: 0, command: "echo done" },
         ],
       }));
-      await statusTool.execute(
-        { taskId: "bash-consume", exit: true },
+      await watchTool.execute(
+        { taskId: "bash-consume" },
         createMockSdkContext({ sessionID: "s-consume" }),
       );
       expect(sessionBgStates.get("s-consume")?.pendingCompletions).toEqual([]);
@@ -645,15 +941,13 @@ describe("bash_status tool", () => {
   });
 
   test("bash_kill forwards task_id and returns confirmation", async () => {
-    const calls: Array<{ cmd: string; params: Record<string, unknown> }> = [];
-    const { killTool } = makeCtx((cmd, params) => {
-      calls.push({ cmd, params });
-      return { success: true, status: "killed" };
-    });
+    const { killTool, calls } = makeCtx(() => ({ success: true, status: "killed" }));
     const result = await killTool.execute({ taskId: "bash-deadbeef" }, createMockSdkContext());
     expect(result).toBe("Task bash-deadbeef: killed");
     expect(calls[0].cmd).toBe("bash_kill");
     expect(calls[0].params.task_id).toBe("bash-deadbeef");
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
+    expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
   });
 
   test("bash_kill surfaces already-terminal status from bridge", async () => {
@@ -751,9 +1045,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       }
       return { success: true };
     });
-    const result = await bash.execute(
-      { command: "sleep 30", background: true, timeout: 30_000 },
-      createMockSdkContext({ sessionID: "ses_subagent_a" }),
+    const result = bashText(
+      await bash.execute(
+        { command: "sleep 30", background: true, timeout: 30_000 },
+        createMockSdkContext({ sessionID: "ses_subagent_a" }),
+      ),
     );
     // Result should be the actual command output, NOT a JSON refusal envelope
     // and NOT a "Background task started" launch line.
@@ -768,6 +1064,38 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(bashCall?.params.notify_on_completion).toBe(false);
     // Subagents must never call bash_promote even when caller requested
     // background:true — the conversion happens upstream of promotion.
+    expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
+  });
+
+  test("subagent forced foreground does not promote after its poll deadline", async () => {
+    _resetSubagentCacheForTest();
+    let statusCalls = 0;
+    const { calls, tool: bash } = createSubagentHarness((command) => {
+      if (command === "bash")
+        return { success: true, status: "running", task_id: "bash-no-promote" };
+      if (command === "bash_status") {
+        statusCalls += 1;
+        if (statusCalls === 1) return { success: true, status: "running" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          output_preview: "finished inline",
+          output_truncated: false,
+        };
+      }
+      return { success: true };
+    });
+
+    const result = bashText(
+      await bash.execute(
+        { command: "slow-subagent", timeout: 0 },
+        createMockSdkContext({ sessionID: "ses_subagent_deadline" }),
+      ),
+    );
+
+    expect(result as string).toContain("finished inline");
+    expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_status"]);
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
@@ -792,9 +1120,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       }
       return { success: true };
     });
-    const result = await bash.execute(
-      { command: "fast-test", timeout: 30_000 },
-      createMockSdkContext({ sessionID: "ses_subagent_b" }),
+    const result = bashText(
+      await bash.execute(
+        { command: "fast-test", timeout: 30_000 },
+        createMockSdkContext({ sessionID: "ses_subagent_b" }),
+      ),
     );
     expect(typeof result).toBe("string");
     expect(result as string).not.toContain("promoted to background");
@@ -817,9 +1147,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       }
       return { success: true };
     });
-    await bash.execute(
-      { command: "fast-test" }, // no timeout — should use DEFAULT_HARD_TIMEOUT_MS
-      createMockSdkContext({ sessionID: "ses_subagent_c" }),
+    bashText(
+      await bash.execute(
+        { command: "fast-test" }, // no timeout — should use DEFAULT_HARD_TIMEOUT_MS
+        createMockSdkContext({ sessionID: "ses_subagent_c" }),
+      ),
     );
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
@@ -831,9 +1163,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       if (command === "bash") return { success: true, status: "running", task_id: "bash-bg" };
       return { success: true };
     });
-    const result = await bash.execute(
-      { command: "sleep 30", background: true },
-      createMockSdkContext({ sessionID: "ses_primary_a" }),
+    const result = bashText(
+      await bash.execute(
+        { command: "sleep 30", background: true },
+        createMockSdkContext({ sessionID: "ses_primary_a" }),
+      ),
     );
     expect(typeof result).toBe("string");
     // Primary should NOT get the subagent error envelope
@@ -869,9 +1203,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       storageDir: "/tmp/aft-test",
     };
     const bash = createBashTool(ctx);
-    const result = await bash.execute(
-      { command: "sleep 30", background: true },
-      createMockSdkContext({ sessionID: "ses_err_a" }),
+    const result = bashText(
+      await bash.execute(
+        { command: "sleep 30", background: true },
+        createMockSdkContext({ sessionID: "ses_err_a" }),
+      ),
     );
     // SDK failed → defaulted to primary → background: true succeeded
     expect(result as string).not.toContain("not allowed for subagents");
@@ -888,14 +1224,14 @@ describe("OpenCode bash adapter — subagent gating", () => {
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
     );
-    const result = await bash.execute(
-      { command: "sleep 30", background: true },
-      createMockSdkContext({ sessionID: "ses_subagent_bg" }),
+    const result = bashText(
+      await bash.execute(
+        { command: "sleep 30", background: true },
+        createMockSdkContext({ sessionID: "ses_subagent_bg" }),
+      ),
     );
     expect(result as string).toContain("Background task started: bash-sub-bg");
-    expect(result as string).toContain(
-      'bash_status({ taskId: "bash-sub-bg", exit: true, timeoutMs: 60000 })',
-    );
+    expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg", timeoutMs: 60000 })');
     expect(calls.find((c) => c.command === "bash")?.params.background).toBe(true);
     expect(calls.find((c) => c.command === "bash")?.params.notify_on_completion).toBe(true);
   });
@@ -912,13 +1248,17 @@ describe("OpenCode bash adapter — subagent gating", () => {
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
     );
-    const result = await bash.execute(
-      { command: "sleep 30", timeout: 0 },
-      createMockSdkContext({ sessionID: "ses_subagent_promote" }),
+    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "0" }, async () =>
+      bashText(
+        await bash.execute(
+          { command: "sleep 30" },
+          createMockSdkContext({ sessionID: "ses_subagent_promote" }),
+        ),
+      ),
     );
     expect(result as string).toContain("promoted to background: bash-sub-promote");
     expect(result as string).toContain(
-      'bash_status({ taskId: "bash-sub-promote", exit: true, timeoutMs: 60000 })',
+      'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
     );
     expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_promote"]);
   });

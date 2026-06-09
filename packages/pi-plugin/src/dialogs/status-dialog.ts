@@ -29,10 +29,12 @@ import {
   type AftStatusSnapshot,
   coerceAftStatus,
   formatBytes,
+  formatSemanticIndexStatus,
+  formatSemanticRefreshing,
   type StatusCompression,
   type StatusCompressionAggregate,
 } from "../shared/status.js";
-import { bridgeFor, callBridge } from "../tools/_shared.js";
+import { bridgeFor, callBridge, resolveSessionId } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 const REFRESH_INTERVAL_MS = 1500;
@@ -94,12 +96,19 @@ class AftStatusDialogComponent implements Component {
       const bridge = bridgeFor(this.props.pluginCtx, this.props.extCtx.cwd);
       // Prefer the in-memory push-frame cache — that's the whole reason
       // the v0.24 status-push pipeline exists. Only fall through to the
-      // bridge RPC when the cache is empty (cold path on first call).
+      // bridge RPC when the cache is empty or belongs to another session.
+      const sessionId = resolveSessionId(this.props.extCtx);
       const cached = bridge.getCachedStatus();
-      const response = cached
+      const cachedSession = (cached as Record<string, unknown> | null)?.session as
+        | Record<string, unknown>
+        | undefined;
+      const cachedSessionId = cachedSession?.id as string | undefined;
+      const cacheUsable =
+        cached !== null && cachedSessionId !== undefined && cachedSessionId === sessionId;
+      const response = cacheUsable
         ? { success: true, ...cached }
         : await callBridge(bridge, "status", {}, this.props.extCtx);
-      if (!cached) {
+      if (!cacheUsable) {
         bridge.cacheStatusSnapshot(response);
       }
       if (this.closed) return;
@@ -201,7 +210,19 @@ function renderInner(
 
   // Right: semantic index
   right.push(theme.fg("muted", "Semantic index"));
-  right.push(kv("status", colorStatus(s.semantic_index.status, theme), theme));
+  right.push(
+    kv(
+      "status",
+      colorStatus(
+        s.semantic_index.status,
+        theme,
+        formatSemanticIndexStatus(s.semantic_index.status, s.semantic_index.stage),
+      ),
+      theme,
+    ),
+  );
+  const semanticRefreshing = formatSemanticRefreshing(s.semantic_index.refreshing_count);
+  if (semanticRefreshing) right.push(theme.fg("muted", `  ${semanticRefreshing}`));
   right.push(kv("entries", formatCountShort(s.semantic_index.entries), theme));
   if (s.semantic_index.backend) right.push(kv("backend", s.semantic_index.backend, theme));
   if (s.semantic_index.model) right.push(kv("model", s.semantic_index.model, theme));
@@ -322,25 +343,25 @@ export function formatCompressionStatusRows(compression: StatusCompression | und
 
 type ToneColor = "accent" | "warning" | "error" | "muted" | "success";
 
-function colorStatus(status: string, theme: Theme): string {
+function colorStatus(status: string, theme: Theme, label = status): string {
   switch (status) {
     case "ready":
       // some themes have "success", fall back to accent
       try {
-        return theme.fg("success", status);
+        return theme.fg("success", label);
       } catch {
-        return theme.fg("accent", status);
+        return theme.fg("accent", label);
       }
     case "loading":
     case "building":
-      return theme.fg("warning", status);
+      return theme.fg("warning", label);
     case "failed":
     case "error":
-      return theme.fg("error", status);
+      return theme.fg("error", label);
     case "disabled":
-      return theme.fg("muted", status);
+      return theme.fg("muted", label);
     default:
-      return status;
+      return label;
   }
 }
 

@@ -31,11 +31,35 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?
 fi
 
 TAG="v$VERSION"
+CURRENT_HEAD=$(git rev-parse HEAD)
+RESUME_RELEASE=0
 
-# Check if tag already exists
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-  echo "Error: tag '$TAG' already exists"
+# Check if tag already exists. If it points at HEAD, this is a resumable
+# release: commit/tag creation already succeeded and only the push/CI handoff
+# needs another attempt.
+check_existing_tag_for_resume() {
+  local source="$1"
+  local tag_commit
+
+  tag_commit=$(git rev-list -n 1 "$TAG")
+  if [[ "$tag_commit" == "$CURRENT_HEAD" ]]; then
+    echo "→ Tag '$TAG' already exists on $source at HEAD; resuming release push."
+    RESUME_RELEASE=1
+    return
+  fi
+
+  echo "Error: tag '$TAG' already exists on $source but points at $tag_commit"
+  echo "       current HEAD is $CURRENT_HEAD"
+  echo "       Refusing to reuse a release tag from a different commit."
   exit 1
+}
+
+if git show-ref --verify --quiet "refs/tags/$TAG"; then
+  check_existing_tag_for_resume "local"
+elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "→ Tag '$TAG' exists on origin; fetching to check resume state..."
+  git fetch --quiet origin "refs/tags/$TAG:refs/tags/$TAG"
+  check_existing_tag_for_resume "origin"
 fi
 
 # Check for clean working tree
@@ -60,6 +84,28 @@ echo ""
 echo "  Releasing AFT $TAG"
 echo "  ─────────────────────"
 echo ""
+
+push_release() {
+  echo "→ Pushing to origin..."
+  git push origin "$BRANCH"
+  git push origin "$TAG"
+  echo ""
+
+  echo "  ✓ Released $TAG"
+  echo "  → GitHub Actions will now: test → build → publish"
+  echo "  → Watch: https://github.com/cortexkit/aft/actions"
+}
+
+if [[ "$RESUME_RELEASE" == "1" ]]; then
+  echo "→ Resume mode: skipping local checks, version sync, commit, and tag creation."
+  if [[ "$DRY" == "--dry" ]]; then
+    echo "[DRY RUN] Would push branch '$BRANCH' and tag '$TAG' to origin."
+    exit 0
+  fi
+  echo ""
+  push_release
+  exit 0
+fi
 
 # ─── Static release-content checks ───
 #
@@ -164,25 +210,44 @@ bun run lint 2>&1 || { echo "Error: Lint failed"; exit 1; }
 echo "  bun typecheck..."
 bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
 
-echo "  bun test..."
-bun run test 2>&1 || { echo "Error: Plugin tests failed"; exit 1; }
+if [ "${SKIP_JS_TESTS:-}" = "1" ]; then
+  echo "  (skipping plugin tests — SKIP_JS_TESTS=1)"
+else
+  echo "  bun test..."
+  bun run test 2>&1 || { echo "Error: Plugin tests failed"; exit 1; }
+fi
 
 if [ "${SKIP_DOCKER_E2E:-}" = "1" ]; then
   echo "  (skipping docker e2e — SKIP_DOCKER_E2E=1)"
 elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
   echo "  docker e2e (Linux x64)..."
+  cleanup_fixture() {
+    rm -f tests/docker/fixtures/aft-linux-x64
+    rm -rf tests/docker/fixtures/npm-packs
+  }
+  trap cleanup_fixture EXIT
   # Build Linux x64 binary in Docker
   docker build --platform linux/amd64 -t aft-build-linux -f tests/docker/Dockerfile.build-linux . --quiet 2>&1 || { echo "Error: Docker Linux build failed"; exit 1; }
   # Extract binary to fixtures
   CID=$(docker create --platform linux/amd64 aft-build-linux true)
   docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
   docker rm "$CID" > /dev/null
+  # Pack local plugin artifacts so the E2E image installs the code under test
+  # (real package.json + dist + deps) instead of the published @latest plugin.
+  # The Dockerfile COPYs tests/docker/fixtures/npm-packs/*.tgz; CI does the same
+  # in _e2e-suite.yml. Without this the E2E image build fails on a missing dir.
+  rm -rf tests/docker/fixtures/npm-packs
+  mkdir -p tests/docker/fixtures/npm-packs
+  npm pack ./packages/aft-bridge --pack-destination tests/docker/fixtures/npm-packs >/dev/null 2>&1 || { echo "Error: npm pack aft-bridge failed"; exit 1; }
+  npm pack ./packages/opencode-plugin --pack-destination tests/docker/fixtures/npm-packs >/dev/null 2>&1 || { echo "Error: npm pack opencode-plugin failed"; exit 1; }
   # Build E2E test image
   docker build --platform linux/amd64 -t aft-e2e-linux-x64 -f tests/docker/Dockerfile.linux-x64 . --quiet 2>&1 || { echo "Error: Docker E2E image build failed"; exit 1; }
   # Run E2E test
   docker run --rm --platform linux/amd64 aft-e2e-linux-x64 2>&1 || { echo "Error: Docker E2E tests failed"; exit 1; }
-  # Clean up extracted binary (don't commit it)
+  # Clean up extracted binary + packed tarballs (don't commit them)
   rm -f tests/docker/fixtures/aft-linux-x64
+  rm -rf tests/docker/fixtures/npm-packs
+  trap - EXIT
   echo "  ✓ Docker E2E passed"
 else
   echo "  (skipping docker e2e — Docker not available)"
@@ -231,11 +296,4 @@ git tag -a "$TAG" -m "Release $TAG"
 echo ""
 
 # Step 4: Push
-echo "→ Pushing to origin..."
-git push origin "$BRANCH"
-git push origin "$TAG"
-echo ""
-
-echo "  ✓ Released $TAG"
-echo "  → GitHub Actions will now: test → build → publish"
-echo "  → Watch: https://github.com/cortexkit/aft/actions"
+push_release

@@ -56,6 +56,15 @@ impl StubEmbedder {
     fn batch_count(&self) -> usize {
         self.calls.lock().expect("lock embed calls").len()
     }
+
+    fn embedded_texts(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("lock embed calls")
+            .iter()
+            .flat_map(|batch| batch.iter().cloned())
+            .collect()
+    }
 }
 
 /// Build an initial index over a small two-file project. Returns the index +
@@ -322,6 +331,438 @@ fn refresh_handles_changed_plus_deleted_plus_new_in_one_call() {
     // Embedded calls should match changed + new files only — not file_b
     // (deleted) and not the original file_a/file_b cached embeddings.
     assert!(stub.batch_count() >= 1, "at least one embed batch");
+}
+
+#[test]
+fn refresh_reuses_line_shifted_file_chunks_without_embedding() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut index, file_a, file_b) = build_two_file_index(project.path());
+    let count_for_a_before = count_entries_for_file(&index, &file_a);
+
+    let shifted = "\npub fn alpha() -> i32 {\n    let x = 1;\n    x\n}\n\npub fn alpha_helper() -> i32 {\n    let y = 2;\n    y\n}\n";
+    rewrite_with_new_mtime(&file_a, shifted);
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let summary = index
+        .refresh_stale_files(
+            project.path(),
+            &[file_a.clone(), file_b],
+            &mut embed,
+            16,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(summary.changed, 1);
+    assert_eq!(stub.total_embedded_texts(), 0);
+    assert_eq!(count_entries_for_file(&index, &file_a), count_for_a_before);
+}
+
+#[test]
+fn refresh_reembeds_only_edited_symbol_in_changed_file() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut index, file_a, file_b) = build_two_file_index(project.path());
+    let count_for_a_before = count_entries_for_file(&index, &file_a);
+    assert!(
+        count_for_a_before >= 2,
+        "file_a starts with multiple symbols"
+    );
+
+    rewrite_with_new_mtime(
+        &file_a,
+        "pub fn alpha() -> i32 {\n    let x = 99;\n    x\n}\n\npub fn alpha_helper() -> i32 {\n    let y = 2;\n    y\n}\n",
+    );
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let summary = index
+        .refresh_stale_files(
+            project.path(),
+            &[file_a.clone(), file_b],
+            &mut embed,
+            16,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(summary.changed, 1);
+    assert_eq!(stub.total_embedded_texts(), 1);
+    assert!(stub.embedded_texts()[0].contains("name:alpha"));
+    // Duplication guard: the unchanged siblings are reused (embed-count==1 above
+    // proves only the edited symbol was embedded), and the post-refresh entry
+    // count for the file is unchanged — no chunk dropped, none duplicated.
+    assert_eq!(
+        count_entries_for_file(&index, &file_a),
+        count_for_a_before,
+        "entry count unchanged after partial-reuse refresh"
+    );
+}
+
+#[test]
+fn refresh_stale_files_collect_failure_keeps_stale_entries() {
+    // The corpus-refresh path (refresh_stale_files) must KEEP stale-but-valid
+    // entries when a changed file fails to re-collect (transient/parse error) —
+    // the deliberate opposite of the watcher path, which drops them up front.
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut index, file_a, file_b) = build_two_file_index(project.path());
+    let count_for_a_before = count_entries_for_file(&index, &file_a);
+    assert!(count_for_a_before > 0, "file_a starts with entries");
+
+    // Corrupt file_a (invalid UTF-8 → collect yields nothing) and advance its
+    // mtime so it is bucketed as "changed" rather than fresh.
+    fs::write(&file_a, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+    let advanced = fs::metadata(&file_a)
+        .expect("stat after corrupt")
+        .modified()
+        .expect("mtime after corrupt")
+        .checked_add(Duration::from_secs(2))
+        .expect("advance mtime");
+    filetime::set_file_mtime(&file_a, filetime::FileTime::from_system_time(advanced))
+        .expect("set advanced mtime");
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_stale_files(
+            project.path(),
+            &[file_a.clone(), file_b],
+            &mut embed,
+            16,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(
+        stub.total_embedded_texts(),
+        0,
+        "nothing embeds when the changed file fails to collect"
+    );
+    assert_eq!(
+        count_entries_for_file(&index, &file_a),
+        count_for_a_before,
+        "stale entries kept (not dropped, not duplicated) on collect failure"
+    );
+}
+
+#[test]
+fn invalidated_refresh_mixed_reuse_and_miss_retains_all_after_apply() {
+    // Editing one symbol's body in a multi-symbol file: that symbol's chunk is a
+    // cache miss (re-embedded) while siblings + file-summary are reused. The
+    // applied delta must carry the FULL replacement set so the serving index
+    // neither drops the reused chunks nor duplicates them.
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut worker_index, file_a, _file_b) = build_two_file_index(project.path());
+    let mut serving_index = worker_index.clone();
+    let count_for_a_before = count_entries_for_file(&serving_index, &file_a);
+    assert!(count_for_a_before >= 2, "file_a has multiple symbols");
+
+    // Edit only alpha's body; alpha_helper is byte-identical and reused.
+    rewrite_with_new_mtime(
+        &file_a,
+        "pub fn alpha() -> i32 {\n    let x = 99;\n    x\n}\n\npub fn alpha_helper() -> i32 {\n    let y = 2;\n    y\n}\n",
+    );
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = worker_index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_a),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    // Mixed path: exactly the edited symbol re-embeds; the full set is still
+    // delivered as the delta (reused + newly embedded).
+    assert_eq!(
+        stub.total_embedded_texts(),
+        1,
+        "only the edited symbol re-embeds; siblings reused"
+    );
+    assert_eq!(
+        update.added_entries.len(),
+        count_for_a_before,
+        "delta is the full replacement set, not just the miss"
+    );
+
+    serving_index.apply_refresh_update(
+        update.added_entries,
+        update.updated_metadata,
+        &update.completed_paths,
+    );
+
+    assert_eq!(
+        count_entries_for_file(&serving_index, &file_a),
+        count_for_a_before,
+        "no chunk dropped, none duplicated after applying the mixed delta"
+    );
+}
+
+#[test]
+fn invalidated_refresh_delta_retains_reused_chunks_after_apply() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut worker_index, file_a, _file_b) = build_two_file_index(project.path());
+    let mut serving_index = worker_index.clone();
+    let count_for_a_before = count_entries_for_file(&serving_index, &file_a);
+
+    rewrite_with_new_mtime(
+        &file_a,
+        "\npub fn alpha() -> i32 {\n    let x = 1;\n    x\n}\n\npub fn alpha_helper() -> i32 {\n    let y = 2;\n    y\n}\n",
+    );
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = worker_index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_a),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(stub.total_embedded_texts(), 0);
+    assert_eq!(update.added_entries.len(), count_for_a_before);
+
+    serving_index.apply_refresh_update(
+        update.added_entries,
+        update.updated_metadata,
+        &update.completed_paths,
+    );
+
+    assert_eq!(
+        count_entries_for_file(&serving_index, &file_a),
+        count_for_a_before
+    );
+}
+
+#[test]
+fn invalidated_refresh_reuses_duplicate_embed_text_for_new_identical_symbol() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let file = project.path().join("src/dupe.js");
+    fs::create_dir_all(file.parent().expect("parent")).expect("create src");
+    let duplicate = "function duplicate() {\n  return 1;\n}\n";
+    fs::write(&file, duplicate).expect("write duplicate");
+
+    let initial_stub = StubEmbedder::new();
+    let mut initial_embed = |texts: Vec<String>| initial_stub.embed(texts);
+    let mut index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&file),
+        &mut initial_embed,
+        16,
+    )
+    .expect("build initial index");
+
+    rewrite_with_new_mtime(&file, &format!("{duplicate}\n{duplicate}"));
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    let duplicate_results = index
+        .search(&[1.0, 0.0, 0.0, 0.0], 16)
+        .into_iter()
+        .filter(|result| result.file == file && result.name == "duplicate")
+        .count();
+    assert_eq!(stub.total_embedded_texts(), 0);
+    assert_eq!(duplicate_results, 2);
+}
+
+#[test]
+fn invalidated_refresh_file_summary_reuse_and_miss_are_text_based() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let file = project.path().join("src/lib.rs");
+    fs::create_dir_all(file.parent().expect("parent")).expect("create src");
+    fs::write(
+        &file,
+        "//! module docs v1\n\npub fn alpha() -> i32 {\n    1\n}\n",
+    )
+    .expect("write source");
+
+    let initial_stub = StubEmbedder::new();
+    let mut initial_embed = |texts: Vec<String>| initial_stub.embed(texts);
+    let mut index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&file),
+        &mut initial_embed,
+        16,
+    )
+    .expect("build initial index");
+
+    rewrite_with_new_mtime(
+        &file,
+        "//! module docs v1\n\npub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    let body_stub = StubEmbedder::new();
+    let mut body_embed = |texts: Vec<String>| body_stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file),
+            &mut body_embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("body refresh succeeds");
+    assert_eq!(body_stub.total_embedded_texts(), 1);
+    assert!(body_stub.embedded_texts()[0].contains("name:alpha"));
+
+    rewrite_with_new_mtime(
+        &file,
+        "//! module docs v2\n\npub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    let doc_stub = StubEmbedder::new();
+    let mut doc_embed = |texts: Vec<String>| doc_stub.embed(texts);
+    index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file),
+            &mut doc_embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("doc refresh succeeds");
+    assert_eq!(doc_stub.total_embedded_texts(), 1);
+    assert!(doc_stub.embedded_texts()[0].contains("kind:file-summary"));
+}
+
+#[test]
+fn invalidated_refresh_deleted_file_drops_entries_after_apply() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut worker_index, file_a, _file_b) = build_two_file_index(project.path());
+    let mut serving_index = worker_index.clone();
+
+    fs::remove_file(&file_a).expect("delete file");
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = worker_index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_a),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(update.summary.deleted, 1);
+    assert_eq!(stub.total_embedded_texts(), 0);
+    serving_index.apply_refresh_update(
+        update.added_entries,
+        update.updated_metadata,
+        &update.completed_paths,
+    );
+    assert_eq!(count_entries_for_file(&serving_index, &file_a), 0);
+}
+
+#[test]
+fn invalidated_refresh_collect_failure_does_not_resurrect_stale_entries() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut worker_index, file_a, _file_b) = build_two_file_index(project.path());
+    let mut serving_index = worker_index.clone();
+
+    fs::write(&file_a, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = worker_index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_a),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(stub.total_embedded_texts(), 0);
+    assert!(update.added_entries.is_empty());
+    serving_index.apply_refresh_update(
+        update.added_entries,
+        update.updated_metadata,
+        &update.completed_paths,
+    );
+    assert_eq!(count_entries_for_file(&serving_index, &file_a), 0);
+}
+
+#[test]
+fn invalidated_refresh_cap_deferral_stays_file_count_based() {
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let file_a = project.path().join("src/a.rs");
+    let file_b = project.path().join("src/b.rs");
+    fs::create_dir_all(file_a.parent().expect("parent")).expect("create src");
+    fs::write(&file_a, "pub fn alpha() -> i32 {\n    1\n}\n").expect("write a");
+    fs::write(&file_b, "pub fn beta() -> i32 {\n    2\n}\n").expect("write b");
+
+    let initial_stub = StubEmbedder::new();
+    let mut initial_embed = |texts: Vec<String>| initial_stub.embed(texts);
+    let mut index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&file_a),
+        &mut initial_embed,
+        16,
+    )
+    .expect("build initial index");
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_b),
+            &mut embed,
+            16,
+            1,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(update.summary.total_processed, 1);
+    assert_eq!(update.summary.added, 0);
+    assert_eq!(stub.total_embedded_texts(), 0);
+    assert_eq!(index.indexed_file_count(), 1);
+    assert_eq!(count_entries_for_file(&index, &file_b), 0);
 }
 
 /// Helper: count entries in the index that belong to `file`. We only have

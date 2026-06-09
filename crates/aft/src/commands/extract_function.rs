@@ -333,6 +333,23 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         };
 
+    // Honesty: write_format_validate reverts the file when the extraction
+    // produced invalid syntax (e.g. extracting a class method emits a bare
+    // `function helper` into a class body). The file is unchanged, so returning
+    // a success response with the new symbol metadata would be a lie. Fail with
+    // the validation errors so the agent retries. (edit_match/batch surface this
+    // via rolled_back already; the refactor handlers did not.)
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "extract_function produced invalid syntax; the file was left unchanged. {}",
+                edit::format_validation_errors(&write_result.validation_errors)
+            ),
+        );
+    }
+
     if let Ok(final_content) = std::fs::read_to_string(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }

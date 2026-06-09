@@ -289,7 +289,8 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         // For new files, before-content is empty; compute_diff_info handles
         // that correctly (additions = number of lines in append_content).
         // Diff reflects post-format content because we re-read after format.
-        result["diff"] = edit::compute_diff_info(&before_content, &final_content);
+        result["diff"] =
+            edit::compute_diff_for_response(&req.params, &before_content, &final_content);
     }
 
     // Reuse the standard WriteResult formatter so append's response carries
@@ -336,11 +337,13 @@ fn handle_glob_edit_match(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     drop(config);
-    let full_pattern = if pattern.starts_with('/') {
+    let full_pattern = if is_absolute_glob_pattern(pattern) {
         pattern.to_string()
     } else {
-        format!("{}/{}", root.display(), pattern)
+        root.join(pattern).display().to_string()
     };
+    #[cfg(windows)]
+    let full_pattern = full_pattern.replace('\\', "/");
 
     let mut paths: Vec<std::path::PathBuf> = match glob::glob(&full_pattern) {
         Ok(entries) => entries
@@ -355,6 +358,10 @@ fn handle_glob_edit_match(
             );
         }
     };
+    #[cfg(windows)]
+    if paths.is_empty() {
+        paths = expand_windows_glob(&full_pattern);
+    }
     paths.sort();
 
     if paths.is_empty() {
@@ -524,7 +531,11 @@ fn handle_glob_edit_match(
                         .iter()
                         .map(|edit| edit.path.clone())
                         .collect::<Vec<_>>();
-                    let _ = restore_glob_checkpoint(ctx, req.session(), name, &paths);
+                    if restore_glob_checkpoint(ctx, req.session(), name, &paths).is_ok() {
+                        ctx.backup()
+                            .borrow_mut()
+                            .discard_operation_entries(req.session(), op_id);
+                    }
                     delete_glob_checkpoint(ctx, req.session(), name);
                 }
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -580,6 +591,11 @@ fn handle_glob_edit_match(
                 syntax_failures.len() - 5
             )
         };
+        if rollback.as_ref().map_or(true, |result| result.is_ok()) {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), op_id);
+        }
         return match rollback {
             Some(Err(reason)) => Response::error_with_data(
                 &req.id,
@@ -632,6 +648,60 @@ fn handle_glob_edit_match(
             "format_skip_reasons": format_skip_reasons,
         }),
     )
+}
+
+#[cfg(windows)]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
+}
+
+#[cfg(not(windows))]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    Path::new(path).is_absolute()
+}
+
+#[cfg(windows)]
+fn expand_windows_glob(full_pattern: &str) -> Vec<PathBuf> {
+    let normalized = full_pattern.replace('\\', "/");
+    let Some(first_glob) = normalized.find(['*', '?', '[', '{']) else {
+        return Vec::new();
+    };
+    let Some(base_end) = normalized[..first_glob].rfind('/') else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(&normalized[..base_end]);
+    let rel_pattern = &normalized[base_end + 1..];
+    let Ok(pattern) = glob::Pattern::new(rel_pattern) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+
+    ignore::WalkBuilder::new(&base)
+        .hidden(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".aftignore")
+        .build()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.strip_prefix(&base)
+                .ok()
+                .map(|relative| relative.display().to_string().replace('\\', "/"))
+                .is_some_and(|relative| pattern.matches_with(&relative, options))
+        })
+        .collect()
 }
 
 fn unique_glob_checkpoint_name(request_id: &str) -> String {
@@ -716,6 +786,20 @@ mod tests {
 
     #[test]
     fn restore_glob_checkpoint_reports_failures() {
+        // Isolate the checkpoint store's lock-file dir per test by giving each
+        // run its own `AFT_CACHE_DIR`. The default storage_dir lives under
+        // `$HOME/.cache/aft` (or `$AFT_CACHE_DIR`), and under parallel
+        // `cargo test` with a shared HOME (CI containers, sandboxed runners),
+        // two tests can race on the same `checkpoints/<project>/checkpoint.lock`
+        // path and fail with `No such file or directory` during the
+        // `create_dir_all` + `try_acquire` sequence.
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: tests run single-threaded inside this function and the env
+        // var is restored on drop; we only mutate process env briefly here.
+        unsafe {
+            std::env::set_var("AFT_CACHE_DIR", cache.path());
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let a = root.join("a.ts");
@@ -739,6 +823,11 @@ mod tests {
         ctx.checkpoint()
             .borrow_mut()
             .delete("default", &checkpoint_name);
+
+        // SAFETY: only one test in this module mutates this env var.
+        unsafe {
+            std::env::remove_var("AFT_CACHE_DIR");
+        }
 
         assert!(result.unwrap_err().contains("file not found"));
     }
@@ -884,8 +973,50 @@ fn handle_single_file_edit_match(
         }
     };
 
+    // Fuzzy passes (rstrip/trim/unicode) are line-based: `find_line_matches`
+    // sets the byte range to include the trailing newline after the last
+    // matched line, even when the user's `oldString` had no trailing newline.
+    // Applying the replacement verbatim over that range drops the newline, so
+    // the last replaced line merges with the following line (#83). Re-append
+    // a newline when the matched range ended in one and the replacement does
+    // not — mirroring batch.rs line-range mode. Gated to fuzzy passes (pass >=
+    // 2); the exact pass (1) matches the needle byte-for-byte, so its trailing
+    // newline behavior reflects exactly what the caller typed.
+    let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
+        let byte_end = m.byte_start + m.byte_len;
+        let range_has_trailing_nl = m.pass >= 2
+            && byte_end > 0
+            && byte_end <= source.len()
+            && source.as_bytes()[byte_end - 1] == b'\n';
+        if range_has_trailing_nl && !replacement.is_empty() && !replacement.ends_with('\n') {
+            format!("{replacement}\n")
+        } else {
+            replacement.to_string()
+        }
+    };
+
     // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len())
     let (new_source, count) = if replace_all {
+        // Guard against overlapping matches before applying. The fuzzy line
+        // passes (2-4) step line-by-line, so a multi-line needle can match
+        // overlapping regions (e.g. needle "a\na" over "a\na\na" when whitespace
+        // variants defeat the exact pass). Applying overlapping ranges in
+        // reverse would let a later replacement overwrite part of an earlier
+        // one, silently corrupting the file. Fail cleanly instead — mirrors the
+        // `batch` command's overlap guard. (matches are ascending by byte_start.)
+        for pair in fuzzy_matches.windows(2) {
+            let cur_end = pair[0].byte_start + pair[0].byte_len;
+            if cur_end > pair[1].byte_start {
+                return Response::error(
+                    &req.id,
+                    "overlapping_edits",
+                    format!(
+                        "edit: replace_all matches overlap — match at bytes [{}..{}) overlaps with match at bytes [{}..{}). Use a more specific 'match' or edit occurrences individually.",
+                        pair[0].byte_start, cur_end, pair[1].byte_start, pair[1].byte_start + pair[1].byte_len
+                    ),
+                );
+            }
+        }
         let count = fuzzy_matches.len();
         // Apply replacements in reverse order to preserve byte offsets
         let mut result = source.clone();
@@ -894,7 +1025,7 @@ fn handle_single_file_edit_match(
                 &result,
                 m.byte_start,
                 m.byte_start + m.byte_len,
-                replacement,
+                &effective_replacement(m),
             ) {
                 Ok(updated) => updated,
                 Err(e) => {
@@ -911,7 +1042,7 @@ fn handle_single_file_edit_match(
                 &source,
                 m.byte_start,
                 m.byte_start + m.byte_len,
-                replacement,
+                &effective_replacement(m),
             ) {
                 Ok(updated) => updated,
                 Err(e) => {
@@ -934,6 +1065,12 @@ fn handle_single_file_edit_match(
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
+
+    if write_result.rolled_back {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), op_id);
+    }
 
     if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
         write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
@@ -983,7 +1120,7 @@ fn handle_single_file_edit_match(
     }
 
     if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_info(&source, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     Response::success(&req.id, result)

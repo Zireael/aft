@@ -4,10 +4,21 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
-import packageJson from "../../package.json";
+import { version as packageVersion } from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
-import { createAftSidebarSlot, formatCompressionSidebarRows } from "./sidebar";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatBytes,
+  formatSemanticIndexStatus,
+  formatSemanticRefreshing,
+} from "../shared/status";
+import {
+  createAftSidebarSlot,
+  formatCompressionSidebarRows,
+  resolveTuiStorageDir,
+  shouldSuppressUninitializedDowngrade,
+} from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
 // JSON port file written by AftRpcServer ({ port, token }) and includes that
@@ -23,16 +34,7 @@ function getRpcClient(directory: string): AftRpcClient {
   let client = rpcClients.get(directory);
   if (client) return client;
 
-  // v0.27 moved AFT storage to the CortexKit root. The TUI plugin must use
-  // the same path as the server plugin (`resolveCortexKitStorageRoot()`),
-  // otherwise it polls stale legacy port files written by older versions
-  // and never picks up the live RPC server, leaving the sidebar/dialog
-  // stuck on the "AFT is starting up" placeholder forever.
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const dataHome = process.env.XDG_DATA_HOME || `${home}/.local/share`;
-  const storageDir = `${dataHome}/cortexkit/aft`;
-
-  client = new AftRpcClient(storageDir, directory);
+  client = new AftRpcClient(resolveTuiStorageDir(), directory);
   rpcClients.set(directory, client);
   return client;
 }
@@ -142,18 +144,58 @@ const StatusDialog = (props: StatusDialogProps) => {
   const [status, setStatus] = createSignal<AftStatusSnapshot | null>(props.initial);
   const [error, setError] = createSignal<string | null>(props.initialError);
 
-  const timer = setInterval(async () => {
+  let pollGeneration = 0;
+  let pollController: AbortController | null = null;
+  const pollStatus = async () => {
+    if (pollController) return;
+
+    const controller = new AbortController();
+    const requestGeneration = ++pollGeneration;
+    pollController = controller;
+
     try {
-      const response = await props.client.call("status", { sessionID: props.sessionID });
+      const response = await props.client.call(
+        "status",
+        { sessionID: props.sessionID },
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       if ((response as Record<string, unknown>).success !== false) {
-        setStatus(coerceAftStatus(response as Record<string, unknown>));
+        const snapshot = coerceAftStatus(response as Record<string, unknown>);
+        // Stale-while-revalidate: don't downgrade a good snapshot to a transient
+        // `not_initialized` (bridge mid-respawn / session-dir key miss) — it
+        // arrives as success:true and would blank the dialog until the next poll.
+        const current = status();
+        if (
+          shouldSuppressUninitializedDowngrade(
+            snapshot.cache_role,
+            current !== null && current.cache_role !== "not_initialized",
+          )
+        ) {
+          return;
+        }
+        setStatus(snapshot);
         setError(null);
       }
     } catch {
+      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       // transient — keep showing last good snapshot
+    } finally {
+      if (pollController === controller) pollController = null;
     }
+  };
+
+  const timer = setInterval(() => {
+    void pollStatus();
   }, POLL_INTERVAL_MS);
-  onCleanup(() => clearInterval(timer));
+  onCleanup(() => {
+    clearInterval(timer);
+    pollGeneration++;
+    if (pollController) {
+      pollController.abort();
+      pollController = null;
+    }
+  });
 
   // Visual cache-role badge: main is accent, worktree is warning,
   // not_initialized is muted. Matches the sidebar convention.
@@ -182,7 +224,7 @@ const StatusDialog = (props: StatusDialogProps) => {
           <b>⚡ AFT Status</b>
         </text>
         {status()?.cache_role !== "not_initialized" && (
-          <text fg={t().textMuted}>v{status()?.version ?? packageJson.version}</text>
+          <text fg={t().textMuted}>v{status()?.version ?? packageVersion}</text>
         )}
       </box>
 
@@ -309,9 +351,19 @@ const StatusDialog = (props: StatusDialogProps) => {
             <R
               theme={t()}
               label="Status"
-              value={status()!.semantic_index.status}
+              value={formatSemanticIndexStatus(
+                status()!.semantic_index.status,
+                status()!.semantic_index.stage,
+              )}
               tone={statusTone(status()!.semantic_index.status)}
             />
+            {formatSemanticRefreshing(status()!.semantic_index.refreshing_count) ? (
+              <box width="100%">
+                <text fg={t().textMuted}>
+                  {formatSemanticRefreshing(status()!.semantic_index.refreshing_count)}
+                </text>
+              </box>
+            ) : null}
             <R
               theme={t()}
               label="Entries"
@@ -411,6 +463,57 @@ const StatusDialog = (props: StatusDialogProps) => {
               <R theme={t()} label={row.label} value={row.value} tone="muted" />
             ),
           )}
+        </box>
+      ) : null}
+
+      {/* Code Health — the agent status-bar glance (E/W/D/U/C/T), surfaced so
+          users see the same view agents get. Hidden until the Tier-2 cache is
+          populated (status_bar undefined) so it never shows fabricated zeros.
+          A `~` on the header flags the Tier-2 counts as predating the latest
+          edit. */}
+      {status()?.status_bar ? (
+        <box flexDirection="column" width="100%" marginTop={1}>
+          <text fg={t().text}>
+            <b>{status()!.status_bar!.tier2_stale ? "Code Health ~" : "Code Health"}</b>
+          </text>
+          <R
+            theme={t()}
+            label="Errors"
+            value={formatCountShort(status()!.status_bar!.errors)}
+            tone={status()!.status_bar!.errors > 0 ? "err" : "muted"}
+          />
+          <R
+            theme={t()}
+            label="Warnings"
+            value={formatCountShort(status()!.status_bar!.warnings)}
+            tone={status()!.status_bar!.warnings > 0 ? "warn" : "muted"}
+          />
+          {/* Dead Code / Unused Exports hidden until the oxc resolver lands
+          (current scanner over-reports on barrel re-exports). Restore both. */}
+          {/* <R
+            theme={t()}
+            label="Dead Code"
+            value={formatCountShort(status()!.status_bar!.dead_code)}
+            tone="muted"
+          />
+          <R
+            theme={t()}
+            label="Unused Exports"
+            value={formatCountShort(status()!.status_bar!.unused_exports)}
+            tone="muted"
+          /> */}
+          <R
+            theme={t()}
+            label="Duplicates"
+            value={formatCountShort(status()!.status_bar!.duplicates)}
+            tone="muted"
+          />
+          <R
+            theme={t()}
+            label="TODOs"
+            value={formatCountShort(status()!.status_bar!.todos)}
+            tone="muted"
+          />
         </box>
       ) : null}
 
@@ -602,7 +705,7 @@ const tui: TuiPlugin = async (api) => {
   // command palette entry so the sidebar is available immediately when the
   // user opens their first session.
   try {
-    api.slots.register(createAftSidebarSlot(api, packageJson.version));
+    api.slots.register(createAftSidebarSlot(api, packageVersion));
   } catch {
     // Older OpenCode TUI hosts may not implement api.slots; fall through
     // and keep the slash command working.

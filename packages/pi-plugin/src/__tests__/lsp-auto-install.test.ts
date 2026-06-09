@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
-import { type AutoInstallConfig, runAutoInstall } from "../lsp-auto-install";
+import { type AutoInstallConfig, ensureInstallAnchor, runAutoInstall } from "../lsp-auto-install";
 import { lspBinaryPath, writeInstalledMeta } from "../lsp-cache";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -200,6 +200,7 @@ describe("runAutoInstall", () => {
     // and then read again to see the final post-decrement count for skipped servers.
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("typescript-language-server");
     const tsSkip = result.skipped.find((s) => s.id === "typescript");
     expect(tsSkip).toBeDefined();
     expect(tsSkip?.reason).toContain("grace");
@@ -247,21 +248,56 @@ describe("runAutoInstall", () => {
     await result.installsComplete;
     expect(result.cachedBinDirs).toHaveLength(1);
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("yaml-language-server");
   });
 
-  test("runInstall uses npm for Pi and unreferences spawned children", () => {
+  test("runInstall uses resolved npm for Pi and unreferences spawned children", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
-    // Node's child_process.spawn on Windows does not auto-resolve `.cmd`
-    // shims, and npm ships as `npm.cmd` there. Assert the platform branch
-    // + the spawn invocation separately so the test survives formatter
-    // reflows of the source.
+    // npm must be resolved via the shared resolver (handles npm.cmd on win32
+    // AND finds npm beyond a GUI-stripped PATH), then spawned by its resolved
+    // command with the spawn-env that makes its node sibling reachable.
+    expect(source).toMatch(/resolveNpm\(\)/);
+    expect(source).toMatch(/spawn\(\s*npm\.command\s*,/);
+    expect(source).toMatch(/env:\s*npmSpawnEnv\(npm\)/);
     expect(source).toMatch(
-      /process\.platform\s*===\s*["']win32["']\s*\?\s*["']npm\.cmd["']\s*:\s*["']npm["']/,
-    );
-    expect(source).toMatch(
-      /spawn\(\s*\w+\s*,\s*\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*\]/,
+      /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*\]/,
     );
     expect(source).not.toContain('spawn("bun"');
     expect(source).toContain("child.unref()");
+  });
+
+  // GitHub #92: `npm install --no-save` with no package.json in the cache dir
+  // walks UP the tree and, if an ancestor has a package.json, installs into
+  // THAT package's node_modules instead — leaving our cache dir empty while
+  // exiting 0 (silent failure). ensureInstallAnchor writes the anchoring stub.
+  describe("ensureInstallAnchor (GitHub #92)", () => {
+    test("writes a private package.json when none exists", () => {
+      const dir = mkdtempSync(join(tmpdir(), "aft-anchor-"));
+      try {
+        expect(existsSync(join(dir, "package.json"))).toBe(false);
+        ensureInstallAnchor(dir);
+        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+        expect(pkg).toMatchObject({ name: "aft-lsp-cache", private: true });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("is idempotent and does not clobber an existing package.json", () => {
+      const dir = mkdtempSync(join(tmpdir(), "aft-anchor-"));
+      try {
+        const existing = `${JSON.stringify({ name: "user-project", version: "9.9.9" })}\n`;
+        writeFileSync(join(dir, "package.json"), existing);
+        ensureInstallAnchor(dir);
+        expect(readFileSync(join(dir, "package.json"), "utf8")).toBe(existing);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("does not throw when the directory is missing", () => {
+      const missing = join(tmpdir(), `aft-anchor-missing-${Date.now()}`, "nope");
+      expect(() => ensureInstallAnchor(missing)).not.toThrow();
+    });
   });
 });

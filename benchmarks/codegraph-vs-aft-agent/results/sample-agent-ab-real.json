@@ -1,0 +1,106 @@
+{
+  "benchmark": "codegraph-vs-aft-agent",
+  "timestamp": "2026-05-27T06:56:04.694Z",
+  "model": "opencode-go/deepseek-v4-flash-free",
+  "fallbackModel": "opencode-go/deepseek-v4-pro",
+  "corpus": "agent-fixture",
+  "arms": [
+    "aft",
+    "codegraph"
+  ],
+  "taskCount": 1,
+  "summary": {
+    "aft": {
+      "runs": 1,
+      "successRate": 1,
+      "successes": 1,
+      "tokensTotal": 13512,
+      "tokensMedian": 13512,
+      "wallTimeMsMedian": 11469.115,
+      "wallTimeMsP95": 11469.115,
+      "toolCallsMedian": 1
+    },
+    "codegraph": {
+      "runs": 1,
+      "successRate": 1,
+      "successes": 1,
+      "tokensTotal": 10504,
+      "tokensMedian": 10504,
+      "wallTimeMsMedian": 7118.596,
+      "wallTimeMsP95": 7118.596,
+      "toolCallsMedian": 2
+    }
+  },
+  "results": [
+    {
+      "arm": "aft",
+      "taskId": "answer-loyalty-discount",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 11469.115,
+      "exitCode": 0,
+      "tokens": {
+        "input": 12696,
+        "output": 64,
+        "total": 13512
+      },
+      "toolCalls": 1,
+      "answerText": "```json\n{\"file\": \"src/pricing.ts\", \"symbol\": \"applyLoyaltyDiscount\"}\n```",
+      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/opencode.stdout.jsonl",
+      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/opencode.stderr.log",
+      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/pricing.ts",
+              "applyLoyaltyDiscount"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    },
+    {
+      "arm": "codegraph",
+      "taskId": "answer-loyalty-discount",
+      "kind": "answer",
+      "success": true,
+      "model": "opencode-go/deepseek-v4-flash-free",
+      "attemptedModel": "opencode-go/deepseek-v4-flash-free",
+      "wallTimeMs": 7118.596,
+      "exitCode": 0,
+      "tokens": {
+        "input": 10274,
+        "output": 98,
+        "total": 10504
+      },
+      "toolCalls": 2,
+      "answerText": "```json\n{\"file\": \"src/pricing.ts\", \"symbol\": \"applyLoyaltyDiscount\"}\n```",
+      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/opencode.stdout.jsonl",
+      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/opencode.stderr.log",
+      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/repo",
+      "checks": [
+        {
+          "check": {
+            "type": "answer_contains",
+            "values": [
+              "src/pricing.ts",
+              "applyLoyaltyDiscount"
+            ]
+          },
+          "pass": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "dryRun": false,
+    "fixturePath": "corpora/agent-fixture",
+    "methodology": "OpenCode CLI runs the same deterministic tasks with either AFT plugin tools or CodeGraph MCP tools. Scoring checks final answers, file contents, and optional commands.",
+    "auth": "API keys are read from OPENCODE_API_KEY/OPENAI_API_KEY or mounted ~/.local/share/opencode/auth.json; keys are never written to reports."
+  }
+}

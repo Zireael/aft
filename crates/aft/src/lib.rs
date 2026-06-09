@@ -54,6 +54,7 @@ pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod cache_freshness;
 pub mod callgraph;
+pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;
 pub mod commands;
@@ -67,15 +68,19 @@ pub mod extract;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
+pub mod grep_executor;
 pub mod harness;
 pub mod imports;
 pub mod indent;
+pub mod inspect;
 pub mod language;
+pub mod local_embed;
 pub mod log_ctx;
 pub mod lsp;
 pub mod lsp_hints;
 pub mod migrate_storage;
 pub mod parser;
+pub mod pattern_compile;
 pub mod protocol;
 pub mod query_shape;
 pub mod search_index;
@@ -86,6 +91,8 @@ pub mod semantic_index;
 pub mod semantic_rerank;
 pub mod symbol_cache_disk;
 pub mod symbols;
+pub mod tool_path;
+pub mod url_fetch;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only
@@ -248,7 +255,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+            "project has 20001 source files, exceeding max_callgraph_files=20000. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, and symbol move analysis) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
         );
         assert_eq!(err.code(), "project_too_large");
     }

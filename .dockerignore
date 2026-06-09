@@ -10,7 +10,9 @@ dist/
 
 # Development artifacts
 .fastembed_cache/
-benchmarks/
+benchmarks/**/results/
+benchmarks/**/.bench/
+benchmarks/**/cache/
 *.bench/
 .sisyphus/
 .opencode/dumps/

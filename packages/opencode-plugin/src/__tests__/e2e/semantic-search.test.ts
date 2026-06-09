@@ -17,6 +17,7 @@ import {
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
+const isCI = process.env.CI === "true";
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
 function createMockClient(): any {
@@ -95,7 +96,7 @@ maybeDescribe("e2e semantic search tool", () => {
     };
   }
 
-  test("aft_search returns not_ready text when the semantic index is unavailable", async () => {
+  test("aft_search degrades to a lexical fallback when semantic is disabled", async () => {
     const { tools, sdkCtx } = await createToolHarness({ experimentalSemanticSearch: false });
 
     const output = await tools.aft_search.execute(
@@ -103,7 +104,13 @@ maybeDescribe("e2e semantic search tool", () => {
       sdkCtx,
     );
 
-    expect(output).toBe("Semantic search is not enabled.");
+    // With semantic disabled, a natural-language query degrades to a lexical
+    // (literal grep) fallback rather than stranding the agent with zero
+    // results. The response stays honest — it still names that semantic is
+    // unavailable — but returns usable lexical matches. (Matches the v0.32
+    // degraded-fallback contract; see aft_search_contract_test.)
+    expect(typeof output).toBe("string");
+    expect(output).toContain("Semantic search is not enabled.");
   });
 
   test("aft_search handles a missing query parameter gracefully", async () => {
@@ -125,8 +132,6 @@ maybeDescribe("e2e semantic search tool", () => {
     expect(typeof output).toBe("string");
     expect(output.length).toBeGreaterThan(0);
 
-    // In CI without ONNX Runtime, various non-ready responses are valid.
-    // Only assert structure when the index is actually ready.
     const isBuilding =
       output.includes("building") || output.includes("not ready") || output.includes("not_ready");
     const isUnavailable =
@@ -135,14 +140,25 @@ maybeDescribe("e2e semantic search tool", () => {
       output.includes("not found") ||
       output.includes("not enabled");
     const isDisabled = output.includes("disabled") || output.includes("not enabled");
-    if (isBuilding || isUnavailable || isDisabled) {
-      // Any non-ready state is acceptable in test environments
-      expect(output.length).toBeGreaterThan(0);
-    } else {
+
+    if (isCI) {
+      expect(isBuilding || isUnavailable || isDisabled).toBe(false);
       expect(output).toContain("Found ");
-      expect(output).toContain("[index: ready]");
+      // The ready path no longer carries an [index: ready] tag (absence == ready,
+      // for both the semantic and lexical lanes) — it was per-call token tax.
+      expect(output).not.toContain("[index: ready]");
       expect(output).toContain("src/");
+      return;
     }
+
+    if (isBuilding || isUnavailable || isDisabled) {
+      expect(output.length).toBeGreaterThan(0);
+      return;
+    }
+
+    expect(output).toContain("Found ");
+    expect(output).not.toContain("[index: ready]");
+    expect(output).toContain("src/");
   });
 });
 

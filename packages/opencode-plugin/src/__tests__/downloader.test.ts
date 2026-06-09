@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -226,7 +226,8 @@ describe("downloadBinary tag normalization (regression for v0.25.1 404 bug)", ()
     const cachedPath = join(cachedDir, binaryName);
     mkdtempSync; // keep import used
     spawnSync("mkdir", ["-p", cachedDir]);
-    spawnSync("touch", [cachedPath]);
+    writeFileSync(cachedPath, '#!/bin/sh\necho "aft 0.7.7"\n', "utf8");
+    chmodSync(cachedPath, 0o755);
 
     const result = runDownloaderScript(
       `

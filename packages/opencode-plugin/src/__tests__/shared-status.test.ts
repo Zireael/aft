@@ -57,6 +57,34 @@ describe("coerceAftStatus", () => {
     expect(status.compression?.project.events).toBe(3);
     expect(status.compression?.session.savings_tokens).toBe(30);
   });
+
+  test("parses status_bar when present", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      status_bar: {
+        errors: 7,
+        warnings: 13,
+        dead_code: 334,
+        unused_exports: 222,
+        duplicates: 1167,
+        todos: 5,
+        tier2_stale: true,
+      },
+    } as unknown as Record<string, unknown>);
+
+    expect(status.status_bar?.errors).toBe(7);
+    expect(status.status_bar?.duplicates).toBe(1167);
+    expect(status.status_bar?.tier2_stale).toBe(true);
+  });
+
+  test("status_bar is undefined when null (Tier-2 not populated)", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      status_bar: null,
+    } as unknown as Record<string, unknown>);
+
+    expect(status.status_bar).toBeUndefined();
+  });
 });
 
 describe("formatStatus* output", () => {

@@ -30,8 +30,18 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
+import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   isInstalled,
@@ -239,6 +249,32 @@ async function resolveTargetVersion(
  * normal CLI distribution path, matches Pi's auto-install behavior, and is
  * what OpenCode itself uses for its built-in LSP auto-install.
  */
+/**
+ * Anchor an `npm install --no-save` to `cwd` by writing a minimal package.json.
+ *
+ * Without a package.json in `cwd`, npm walks UP the directory tree; if any
+ * ancestor (e.g. ~/package.json) has one, npm installs into THAT package's
+ * node_modules instead, leaving our cache dir's node_modules/<server> missing
+ * while still exiting 0. The result is a silent install failure and a recurring
+ * lsp_binary_missing warning. The old `bun add` flow created this package.json
+ * implicitly; npm needs it written explicitly. GitHub #92.
+ *
+ * Idempotent: only writes when absent. Failures are non-fatal (logged).
+ */
+export function ensureInstallAnchor(cwd: string): void {
+  try {
+    const stub = join(cwd, "package.json");
+    if (!existsSync(stub)) {
+      writeFileSync(
+        stub,
+        `${JSON.stringify({ name: "aft-lsp-cache", version: "0.0.0", private: true })}\n`,
+      );
+    }
+  } catch (err) {
+    warn(`[lsp] could not write package.json stub in ${cwd}: ${err}`);
+  }
+}
+
 function runInstall(
   spec: NpmServerSpec,
   version: string,
@@ -255,17 +291,30 @@ function runInstall(
       return;
     }
 
-    // Windows: Node's child_process.spawn does NOT auto-resolve `.cmd` for
-    // `npm`. The installed npm shim on Windows GitHub runners (and most user
-    // machines) is `npm.cmd`, so spawning `"npm"` directly fails with
-    // ENOENT: no such file or directory, uv_spawn 'npm'. Use `npm.cmd` on
-    // win32. shell: true would also work but enables shell parsing on a
-    // user-supplied `target` semver string — avoid that surface.
-    const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
-    const child = spawn(npmBin, ["install", "--no-save", "--ignore-scripts", "--silent", target], {
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd,
-    });
+    // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
+    // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
+    // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
+    // resolveNpm() handles both, and npmSpawnEnv() makes npm's node sibling
+    // reachable. shell:true is avoided so a user-supplied `target` semver is
+    // never shell-parsed.
+    const npm = resolveNpm();
+    if (!npm) {
+      warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
+      resolve(false);
+      return;
+    }
+
+    ensureInstallAnchor(cwd);
+
+    const child = spawn(
+      npm.command,
+      ["install", "--no-save", "--ignore-scripts", "--silent", target],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        cwd,
+        env: npmSpawnEnv(npm),
+      },
+    );
     child.unref();
 
     let stderrBuf = "";

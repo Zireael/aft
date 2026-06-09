@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct PnpmCompressor;
 
@@ -15,21 +15,91 @@ impl Compressor for PnpmCompressor {
             .is_some_and(|head| head == "pnpm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match pnpm_subcommand(command).as_deref() {
-            Some("install" | "i" | "add" | "remove") => compress_package(output),
-            Some("run" | "test" | "build") => GenericCompressor::compress_output(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
+            Some("run" | "test" | "build") => GenericCompressor::compress_output(output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 }
+
+/// Known pnpm subcommands. Same rationale as bun.rs::BUN_SUBCOMMANDS —
+/// using a whitelist instead of "first non-flag" avoids returning flag
+/// values like `--filter <pattern>` as the subcommand for command lines
+/// such as `pnpm --filter ./packages/foo test`.
+const PNPM_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "uninstall",
+    "un",
+    "update",
+    "up",
+    "upgrade",
+    "outdated",
+    "audit",
+    "outdated-of",
+    "publish",
+    "pack",
+    "run",
+    "test",
+    "t",
+    "exec",
+    "x",
+    "dlx",
+    "create",
+    "init",
+    "build",
+    "start",
+    "link",
+    "unlink",
+    "view",
+    "info",
+    "show",
+    "config",
+    "help",
+    "version",
+    "ls",
+    "list",
+    "list-modules",
+    "list-bin",
+    "ping",
+    "whoami",
+    "login",
+    "logout",
+    "deploy",
+    "dedupe",
+    "fetch",
+    "import",
+    "patch",
+    "patch-commit",
+    "patch-remove",
+    "prune",
+    "rebuild",
+    "recursive",
+    "root",
+    "store",
+    "why",
+    "doctor",
+    "env",
+    "server",
+    "setup",
+];
 
 fn pnpm_subcommand(command: &str) -> Option<String> {
     command
         .split_whitespace()
         .skip_while(|token| *token != "pnpm")
         .skip(1)
-        .find(|token| !token.starts_with('-'))
+        .find(|token| PNPM_SUBCOMMANDS.contains(token))
         .map(ToString::to_string)
 }
 
