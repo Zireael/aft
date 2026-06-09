@@ -302,9 +302,10 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             RerankOutcome::Failed(e) => {
                 rerank_latency_ms = rerank_timer.stop();
-                if diagnostics_enabled {
-                    warnings.push(SearchWarning::RerankerFailure { reason: e });
-                }
+                // Always surface reranker failures — the agent needs to know
+                // when reranking was attempted but fell back to original order,
+                // regardless of diagnostics_enabled.
+                warnings.push(SearchWarning::RerankerFailure { reason: e });
                 (results.clone(), true)
             }
         };

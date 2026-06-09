@@ -561,7 +561,7 @@ install_cargo_tool_cmd() {
 
 cargo_features_flag() {
   if [[ -n "$CARGO_FEATURES" ]]; then
-    printf '%s' "--features $CARGO_FEATURES"
+    printf '%s' "--features '$CARGO_FEATURES'"
   fi
 }
 

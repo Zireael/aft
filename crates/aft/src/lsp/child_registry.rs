@@ -302,10 +302,12 @@ mod tests {
             }
             match std::fs::read_to_string(format!("/proc/{}/stat", gc_i32)) {
                 Ok(stat) => {
-                    // Field 3 (after pid and comm) is the state character.
                     // Format: "pid (comm) state ..."
+                    // After splitting on ')', the remainder starts with a
+                    // space before the state character (e.g. " S ...").
                     if let Some(rest) = stat.split(')').nth(1) {
-                        let state = rest.as_bytes().first();
+                        // Skip the leading space to reach the state byte.
+                        let state = rest.as_bytes().get(1);
                         if state != Some(&b'S') && state != Some(&b'R') {
                             // Z (zombie), T (stopped), X (dead) — all
                             // mean killpg reached it.
