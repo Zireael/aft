@@ -9,7 +9,7 @@
 - Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` as the shared transport layer, isolating one `aft` process per project root.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/compress/`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -58,22 +58,22 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests and route each command to a focused handler.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
-- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
-- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
+- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/bash_notify/bash_watch/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/callgraph_store/semantic_doctor/semantic_eval/state
+- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/compress/`, `crates/aft/src/inspect/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
-- Purpose: Parse code, compute call graphs, apply edits, format files, manage imports, index code semantically, and search with trigram indexes.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index, trigram search index, disk-backed symbol cache, AST-grep integration
-- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
+- Purpose: Parse code, compute call graphs, persist callgraph state, apply edits, format files, manage imports, index code semantically and with trigrams, rerank search results, generate embeddings locally, and provide AST-grep integration.
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_eval.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, callgraph computation and persistence (SQLite-backed with generational snapshots), semantic embedding index, trigram search index, LLM-based search reranker, local ONNX embedding (ort-driven, replacing fastembed), pluggable vector storage (flat f32 / binary Hamming), search diagnostics and health reports, disk-backed symbol cache, AST-grep integration, grep scope resolution and execution pipeline
+- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (via `ort`), OpenAI-compatible chat endpoints (reranker), SQLite (callgraph store), the `tokenizers` crate (local embed)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
-- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`
-- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool
-- Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/`), `serde`
+- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, callgraph persistence, codebase-health scanning, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/inspect/`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`
+- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, `CallGraph` (in-memory), `CallGraphStore` (SQLite-backed, generational), `InspectManager` (Tier 1/2 background scanner workers), `Tier2RefreshScheduler` (debounced background refresh), `InspectCache` (persistent inspection results), `WorkerCtx` (per-scanner state), LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, bash output watch patterns
+- Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `callgraph_store/` and `db/`), `serde`, `rayon` (inspect parallel scanning)
 - Used by: All command handlers through `AppContext`
 
 ## Data Flow
@@ -99,8 +99,10 @@
 **Search and retrieval flow:**
 
 1. Index project files with trigram-based search index -- `crates/aft/src/search_index.rs`
-2. Optionally index with dense embeddings (fastembed, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`
-3. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`
+2. Optionally index with dense embeddings (local ONNX ort-driven, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`
+3. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/commands/semantic_search.rs`
+4. Optionally rerank search results via LLM for improved relevance -- `crates/aft/src/semantic_rerank.rs`
+5. Track search pipeline decisions for diagnostics -- `crates/aft/src/semantic_diagnostics.rs`
 
 **Bash execution flow:**
 
@@ -144,24 +146,44 @@
 - Contains: `CallGraph`, `SearchIndex`, `SemanticIndex`, `BgTaskRegistry`, `FilterRegistry`, database connections, LSP manager, undo history
 
 **CallGraph:**
-- Purpose: Cache per-file call data and answer callers, call-tree, impact, and trace queries.
+- Purpose: Cache per-file call data in memory and answer callers, call-tree, impact, and trace queries.
 - Location: `crates/aft/src/callgraph.rs`
-- Pattern: Lazy workspace index with invalidation on watcher events
+- Pattern: Lazy workspace index with invalidation on watcher events; backed by `CallGraphStore` for persistence
+
+**CallGraphStore:**
+- Purpose: Persist callgraph data to SQLite with generational snapshots for concurrent process safety.
+- Location: `crates/aft/src/callgraph_store/mod.rs`
+- Pattern: Opens `<project_key>.g<nanos>.<pid>.sqlite` generations; detects newer generations published by other processes and reopens transparently. Provides `StoreAdapter` for bridging the in-memory `CallGraph` to persisted `StoreNode`/`StoreCallSite` records.
+
+**GrepExecutor:**
+- Purpose: Resolve grep scope (path/glob/root) and execute trigram-indexed or fallback grep searches.
+- Location: `crates/aft/src/grep_executor.rs`
+- Pattern: Extracted pipeline — scope resolution (`resolve_grep_scope`), index-aware dispatch (`execute`), and fallback literal search (`fallback_search_file`)
+
+**InspectManager:**
+- Purpose: Orchestrate codebase-health scanning (dead code, unused exports, duplicates, metrics, todos, diagnostics) across Tier 1 (inline) and Tier 2 (background) inspectors.
+- Location: `crates/aft/src/inspect/manager.rs`
+- Pattern: Rayon-backed parallel scanner with persistent cache (`InspectCache`), job dispatch (`InspectWorker`), and a debounced `Tier2RefreshScheduler` (45s debounce, 10min staleness ceiling, 120s storm protection)
 
 **SearchIndex:**
 - Purpose: Provide fast trigram-based full-text search across the project.
 - Location: `crates/aft/src/search_index.rs`
-- Pattern: On-disk trigram index rebuilt on watcher events, served from a background thread
+- Pattern: On-disk trigram index rebuilt on watcher events, served from a background thread. The extracted `GrepExecutor` module (`crates/aft/src/grep_executor.rs`) handles scope resolution and fallback dispatch.
 
 **SemanticIndex:**
 - Purpose: Provide dense-embedding semantic search across the project.
 - Location: `crates/aft/src/semantic_index.rs`
-- Pattern: Optional index backed by fastembed (local), OpenAI-compatible, or Ollama; configurable `max_files` cap
+- Pattern: Optional index backed by local ONNX (`crates/aft/src/local_embed.rs` — orth-driven, replacing fastembed), OpenAI-compatible, or Ollama embeddings. Vector storage is pluggable via `VectorStore` trait (`crates/aft/src/vector_store.rs` — flat f32 cosine and binary Hamming backends). Configurable `max_files` cap.
+
+**SemanticReranker:**
+- Purpose: Re-rank semantic search results using an OpenAI-compatible chat endpoint for improved relevance.
+- Location: `crates/aft/src/semantic_rerank.rs`
+- Pattern: Sends candidate chunks with a ranking prompt; falls back to original order on any error. The `SearchPipeline` diagnostic module (`crates/aft/src/semantic_diagnostics.rs`) tracks which pipeline path (lexical, semantic, hybrid, rerank, lexical-fallback) served each query.
 
 **BgTaskRegistry:**
-- Purpose: Manage background bash tasks and PTY sessions.
+- Purpose: Manage background bash tasks, PTY sessions, and output watch patterns.
 - Location: `crates/aft/src/bash_background/registry.rs`
-- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup
+- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, output buffer management (`buffer.rs`), structured output (`output.rs`), and watch-pattern matching (`watches.rs`) for `bash_notify` notifications
 
 **Compressor:**
 - Purpose: Reduce hoisted-bash output to relevant tokens.
@@ -209,6 +231,16 @@
 - Location: `.github/workflows/release.yml`
 - Triggers: Git tag pushes matching `v*`
 - Responsibilities: Test the workspace, build platform binaries, publish crates and npm packages, and create a GitHub release
+
+**Manual build entry point:**
+- Location: `.github/workflows/build-aft.yml`
+- Triggers: `workflow_dispatch` with branch and platform-target inputs
+- Responsibilities: Build the AFT binary with all feature flags on selected platforms (windows/linux/darwin/all) from any branch or tag
+
+**E2E iteration entry point:**
+- Location: `.github/workflows/e2e-iter.yml`
+- Triggers: Push to `iter/**` branches or `workflow_dispatch`
+- Responsibilities: Run macOS + Linux E2E tests only (no unit tests, Windows, Pi RPC, or publish) for fast 5-10 minute iteration cycles
 
 ## Error Handling
 
@@ -280,6 +312,6 @@
 
 **Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` or `packages/pi-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.
 
-**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
+**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, persist callgraph data to SQLite (generational snapshots) via `crates/aft/src/callgraph_store/`, cache inspection results persistently via `crates/aft/src/inspect/cache.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
 
 **Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.

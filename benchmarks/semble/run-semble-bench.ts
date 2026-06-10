@@ -2,22 +2,148 @@
 /**
  * Semble-inspired benchmark runner for AFT semantic search.
  *
- * Spawns the AFT binary per repo, sends configure + semantic_eval commands
- * over NDJSON, and computes recall@k, MRR across all 50 queries.
+ * Goals of this rewrite:
+ * - Declare OpenAI-compatible embedding/reranking models and endpoints once.
+ * - Reuse that declaration across all OpenAI-compatible AFT profiles.
+ * - Use the correct llama.cpp rerank API shape: query + documents + top_n.
+ * - Avoid silently claiming reranking is disabled when it is not.
+ * - Keep CLI baselines separate, and apply optional explicit external reranking only
+ *   when this script has enough result text to rerank.
  *
  * Usage:
  *   bun run benchmarks/semble/run-semble-bench.ts [options]
  *
  * Options:
- *   --k <n>              Top-k for recall (default: 10)
- *   --cache-dir <dir>    Repo cache directory (default: .bench-cache)
- *   --output <file>      Output report (default: semble-bench-report.json)
- *   --binary <path>      AFT binary path (default: auto-detect)
+ *   --profile <id>              Profile to run: a,b,c,d,e,f,g (default: c)
+ *   --k <n>                     Top-k for recall/MRR result collection (default: 10)
+ *   --cache-dir <dir>           Repo cache directory (default: .bench-cache)
+ *   --output <file>             Output report path (default: semble-bench-report.json)
+ *   --binary <path>             AFT binary path (default: auto-detect)
+ *   --allow-rerank-degrade      If reranker health check fails, skip rerank pass instead of aborting
+ *   --skip-health               Do not ping model endpoints before benchmark
+ *   --fail-fast                 Stop after first repo/pass error
+ *   --help                      Print usage
+ *
+ * Environment overrides for the centralized OpenAI-compatible stack:
+ *   AFT_BENCH_OPENAI_SCHEME=http
+ *   AFT_BENCH_OPENAI_HOST=127.0.0.1
+ *   AFT_BENCH_OPENAI_API_PREFIX=/v1
+ *   AFT_BENCH_EMBED_PORT=8090
+ *   AFT_BENCH_EMBED_BASE_URL=http://127.0.0.1:8090/v1
+ *   AFT_BENCH_EMBED_MODEL=CodeRankEmbed
+ *   AFT_BENCH_RERANK_PORT=8090
+ *   AFT_BENCH_RERANK_BASE_URL=http://127.0.0.1:8090/v1
+ *   AFT_BENCH_RERANK_MODEL=GTE-Reranker-Modernbert
+ *   AFT_BENCH_MAX_BATCH_SIZE=16
+ *   AFT_BENCH_EMBED_TIMEOUT_MS=60000
+ *   AFT_BENCH_RERANK_TIMEOUT_MS=30000
+ *   AFT_BENCH_RERANK_MAX_CANDIDATES=30
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "fs";
 import { join, resolve } from "path";
-import { spawn, type ChildProcess } from "child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcess,
+  type SpawnSyncReturns,
+} from "child_process";
+
+// ---------------------------------------------------------------------------
+// Central OpenAI-compatible model stack declaration
+// ---------------------------------------------------------------------------
+
+function envString(name: string, fallback: string): string {
+  const value = process.env[name];
+  return value && value.trim() ? value.trim() : fallback;
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw || !raw.trim()) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function ensureLeadingSlash(value: string): string {
+  return value.startsWith("/") ? value : `/${value}`;
+}
+
+function joinUrl(baseUrl: string, path: string): string {
+  return `${trimTrailingSlash(baseUrl)}${ensureLeadingSlash(path)}`;
+}
+
+const OPENAI_STACK = (() => {
+  const scheme = envString("AFT_BENCH_OPENAI_SCHEME", "http");
+  const host = envString("AFT_BENCH_OPENAI_HOST", "127.0.0.1");
+  const apiPrefix = ensureLeadingSlash(envString("AFT_BENCH_OPENAI_API_PREFIX", "/v1"));
+
+  const embedPort = envInt("AFT_BENCH_EMBED_PORT", 8090);
+  const rerankPort = envInt("AFT_BENCH_RERANK_PORT", embedPort);
+
+  const defaultEmbedBaseUrl = `${scheme}://${host}:${embedPort}${apiPrefix}`;
+  const defaultRerankBaseUrl = `${scheme}://${host}:${rerankPort}${apiPrefix}`;
+
+  return {
+    scheme,
+    host,
+    apiPrefix,
+    embedding: {
+      port: embedPort,
+      baseUrl: trimTrailingSlash(envString("AFT_BENCH_EMBED_BASE_URL", defaultEmbedBaseUrl)),
+      model: envString("AFT_BENCH_EMBED_MODEL", "CodeRankEmbed"),
+      timeoutMs: envInt("AFT_BENCH_EMBED_TIMEOUT_MS", 60_000),
+      maxBatchSize: envInt("AFT_BENCH_MAX_BATCH_SIZE", 16),
+    },
+    reranker: {
+      port: rerankPort,
+      baseUrl: trimTrailingSlash(envString("AFT_BENCH_RERANK_BASE_URL", defaultRerankBaseUrl)),
+      model: envString("AFT_BENCH_RERANK_MODEL", "GTE-Reranker-Modernbert"),
+      timeoutMs: envInt("AFT_BENCH_RERANK_TIMEOUT_MS", 30_000),
+      maxCandidates: envInt("AFT_BENCH_RERANK_MAX_CANDIDATES", 30),
+    },
+  } as const;
+})();
+
+function embeddingUrl(): string {
+  return joinUrl(OPENAI_STACK.embedding.baseUrl, "/embeddings");
+}
+
+function rerankUrl(): string {
+  return joinUrl(OPENAI_STACK.reranker.baseUrl, "/rerank");
+}
+
+function openAiAftSemanticConfig(enableRerank: boolean): Record<string, unknown> {
+  const config: Record<string, unknown> = {
+    backend: "openai_compatible",
+    base_url: OPENAI_STACK.embedding.baseUrl,
+    model: OPENAI_STACK.embedding.model,
+    diagnostics_enabled: true,
+    max_batch_size: OPENAI_STACK.embedding.maxBatchSize,
+    timeout_ms: OPENAI_STACK.embedding.timeoutMs,
+    rerank_enabled: enableRerank,
+  };
+
+  if (enableRerank) {
+    Object.assign(config, {
+      rerank_model: OPENAI_STACK.reranker.model,
+      rerank_base_url: OPENAI_STACK.reranker.baseUrl,
+      rerank_timeout_ms: OPENAI_STACK.reranker.timeoutMs,
+      rerank_max_candidates: OPENAI_STACK.reranker.maxCandidates,
+    });
+  }
+
+  return config;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,9 +151,7 @@ import { spawn, type ChildProcess } from "child_process";
 
 interface Annotation {
   query: string;
-  /** Relevant file paths (string) or objects with {path, start_line, end_line}. */
   relevant: (string | { path: string; start_line?: number; end_line?: number })[];
-  /** Secondary file paths (string) or objects with {path, start_line, end_line}. */
   secondary: (string | { path: string; start_line?: number; end_line?: number })[];
   category: string;
   repo_name?: string;
@@ -44,6 +168,13 @@ interface Fixture {
   annotations: Annotation[];
 }
 
+interface SearchResult {
+  file: string;
+  score?: number;
+  line?: number;
+  content?: string;
+}
+
 interface BenchResult {
   mode: string;
   query: string;
@@ -57,225 +188,276 @@ interface BenchResult {
 
 interface BenchReport {
   timestamp: string;
-  profile?: string;
-  profile_label?: string;
+  profile: string;
+  profile_label: string;
   k: number;
   binary: string;
-  embedding_model?: string;
-  reranker_model?: string;
+  openai_stack: {
+    embedding: {
+      model: string;
+      base_url: string;
+      port: number;
+    };
+    reranker: {
+      model: string;
+      base_url: string;
+      port: number;
+      max_candidates: number;
+    };
+  };
   results: BenchResult[];
-  aggregate: Record<
-    string,
-    {
-      recall: number;
-      mrr: number;
-      count: number;
-      mean_latency_ms: number;
-    }
-  >;
-  by_category: Record<
-    string,
-    Record<string, { recall: number; mrr: number; count: number }>
-  >;
-  by_repo: Record<
-    string,
-    Record<string, { recall: number; mrr: number; count: number }>
-  >;
+  aggregate: Record<string, AggregateOut>;
+  by_category: Record<string, Record<string, GroupOut>>;
+  by_repo: Record<string, Record<string, GroupOut>>;
 }
 
-// ---------------------------------------------------------------------------
-// Profile definitions
-// ---------------------------------------------------------------------------
+interface AggregateOut {
+  recall: number;
+  mrr: number;
+  count: number;
+  mean_latency_ms: number;
+}
+
+interface GroupOut {
+  recall: number;
+  mrr: number;
+  count: number;
+}
 
 type ProfileMode = "aft" | "cli";
+type CliKind = "semble" | "colgrep";
 
 interface Profile {
   id: string;
   label: string;
   description: string;
   mode: ProfileMode;
-  /** Configure payload sent to AFT binary (profiles a-d) */
-  configurePayload?: Record<string, unknown>;
-  /** CLI command for spawning search (profiles e-g) */
-  cliCommand?: string;
-  /** CLI argument template — {query}, {path}, {k} are substituted */
-  cliArgsTemplate?: string;
-  /** Whether CLI output is JSON (parsed) or text (grepped) */
-  cliOutputJson?: boolean;
-  /** Endpoint to ping before benchmarking */
-  pingEndpoint?: { url: string; model: string; type: "embedding" | "reranker" };
-  /** Reranker configuration (profiles d, g) */
-  rerankerConfig?: { baseUrl: string; model: string };
-  /** Cargo feature required by this profile (checked against binary) */
-  requiresFeature?: string;
-  /**
-   * Dual-mode: run both pre-rerank (embedding-only) and post-rerank (embedding+reranker)
-   * passes for each repo. Results stored with mode labels "aft" (pre) and "aft+rerank" (post).
-   * Only valid for mode="aft" profiles.
-   */
+  requiresEmbedding?: boolean;
+  requiresReranker?: boolean;
   dual?: boolean;
+  requiresFeature?: string;
+
+  // AFT profiles
+  getAftSemanticConfig?: (enableRerank: boolean) => Record<string, unknown>;
+
+  // CLI profiles
+  cliKind?: CliKind;
+  applyExternalRerank?: boolean;
 }
 
 const PROFILES: Record<string, Profile> = {
   a: {
     id: "a",
     label: "fastembed",
-    description: "fastembed (built-in ONNX) — all-MiniLM-L6-v2",
+    description: "AFT fastembed backend — all-MiniLM-L6-v2",
     mode: "aft",
-    configurePayload: {
+    getAftSemanticConfig: () => ({
       backend: "fastembed",
       model: "all-MiniLM-L6-v2",
       diagnostics_enabled: true,
-    },
+    }),
   },
   b: {
     id: "b",
     label: "model2vec",
-    description: "model2vec — Potion Code 16M (local CPU, 256 dims) [requires --features semantic-model2vec]",
+    description: "AFT model2vec backend — Potion Code 16M [requires semantic-model2vec feature]",
     mode: "aft",
-    configurePayload: {
+    getAftSemanticConfig: () => ({
       backend: "model2vec",
       model: "minishlab/potion-code-16M",
-      model_path: "D:/AI/LLM_models/potion-code-16M",
+      model_path: envString("AFT_BENCH_MODEL2VEC_PATH", "D:/AI/LLM_models/potion-code-16M"),
       diagnostics_enabled: true,
-    },
-    // Model2Vec requires the `semantic-model2vec` Cargo feature.
-    // The release binary does NOT include this feature by default.
-    // Build with: cargo build --release --features semantic-model2vec
+    }),
     requiresFeature: "semantic-model2vec",
   },
   c: {
     id: "c",
-    label: "oasis",
-    description: "OpenAI-compatible → OASIS at 127.0.0.1:10002",
+    label: "openai-embed",
+    description: `AFT OpenAI-compatible embedding — ${OPENAI_STACK.embedding.model} @ ${OPENAI_STACK.embedding.baseUrl}`,
     mode: "aft",
-    configurePayload: {
-      backend: "openai_compatible",
-      base_url: "http://127.0.0.1:10002/v1",
-      model: "OASIS-code-embedding-1.5B.i1-Q4_K_M",
-      diagnostics_enabled: true,
-      max_batch_size: 16,
-      timeout_ms: 60_000,
-    },
-    pingEndpoint: {
-      url: "http://127.0.0.1:10002/v1/embeddings",
-      model: "OASIS-code-embedding-1.5B.i1-Q4_K_M",
-      type: "embedding",
-    },
+    requiresEmbedding: true,
+    getAftSemanticConfig: () => openAiAftSemanticConfig(false),
   },
   d: {
     id: "d",
-    label: "oasis+rerank",
-    description: "OASIS + reranker at 127.0.0.1:10001 (CodeRankLLM)",
+    label: "openai-embed+rerank",
+    description: `AFT OpenAI-compatible embedding + rerank — ${OPENAI_STACK.embedding.model} + ${OPENAI_STACK.reranker.model}`,
     mode: "aft",
-    configurePayload: {
-      backend: "openai_compatible",
-      base_url: "http://127.0.0.1:10002/v1",
-      model: "OASIS-code-embedding-1.5B.i1-Q4_K_M",
-      diagnostics_enabled: true,
-      max_batch_size: 16,
-      timeout_ms: 60_000,
-      rerank_enabled: true,
-      rerank_model: "CodeRankLLM.Q4_K_M",
-      rerank_base_url: "http://127.0.0.1:10001/v1",
-      rerank_timeout_ms: 30_000,
-      rerank_max_candidates: 30,
-    },
-    pingEndpoint: {
-      url: "http://127.0.0.1:10002/v1/embeddings",
-      model: "OASIS-code-embedding-1.5B.i1-Q4_K_M",
-      type: "embedding",
-    },
-    rerankerConfig: {
-      baseUrl: "http://127.0.0.1:10001/v1",
-      model: "CodeRankLLM.Q4_K_M",
-    },
-    /** Dual-mode: reports both pre-rerank and post-rerank metrics for comparison */
+    requiresEmbedding: true,
+    requiresReranker: true,
     dual: true,
+    getAftSemanticConfig: (enableRerank: boolean) => openAiAftSemanticConfig(enableRerank),
   },
   e: {
     id: "e",
     label: "semble",
-    description: "Semble CLI — `semble search` with semantic embeddings",
+    description: "Semble CLI baseline — no centralized OpenAI embedding injected by this script",
     mode: "cli",
-    cliCommand: "semble",
-    cliArgsTemplate: 'search --top-k {k} --content all "{query}" "{path}"',
-    cliOutputJson: false,
+    cliKind: "semble",
   },
   f: {
     id: "f",
     label: "colgrep",
-    description: "colgrep CLI — semantic code search CLI",
+    description: "colgrep CLI baseline — no centralized OpenAI embedding injected by this script",
     mode: "cli",
-    cliCommand: "colgrep",
-    cliArgsTemplate: '"{query}" --results {k} "{path}"',
-    cliOutputJson: false,
+    cliKind: "colgrep",
   },
   g: {
     id: "g",
-    label: "semble+rerank",
-    description: "Semble CLI + reranker at 127.0.0.1:10002",
+    label: "semble+central-rerank",
+    description: `Semble CLI baseline + explicit centralized rerank — ${OPENAI_STACK.reranker.model} @ ${OPENAI_STACK.reranker.baseUrl}`,
     mode: "cli",
-    cliCommand: "semble",
-    cliArgsTemplate: 'search --top-k {k} --content all "{query}" "{path}"',
-    cliOutputJson: false,
-    rerankerConfig: {
-      baseUrl: "http://127.0.0.1:10002/v1",
-      model: "CodeRankLLM.Q4_K_M",
-    },
+    cliKind: "semble",
+    requiresReranker: true,
+    applyExternalRerank: true,
   },
 };
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
+interface Options {
+  k: number;
+  cacheDir: string;
+  outputFile: string;
+  binaryPath: string;
+  profileId: string;
+  allowRerankDegrade: boolean;
+  skipHealth: boolean;
+  failFast: boolean;
+}
+
+function printUsage(): void {
+  console.log(`Usage:
+  bun run benchmarks/semble/run-semble-bench.ts [options]
+
+Options:
+  --profile <id>              Profile to run: ${Object.keys(PROFILES).join(",")} (default: c)
+  --k <n>                     Top-k for recall/MRR result collection (default: 10)
+  --cache-dir <dir>           Repo cache directory (default: .bench-cache)
+  --output <file>             Output report path (default: semble-bench-report.json)
+  --binary <path>             AFT binary path (default: auto-detect)
+  --allow-rerank-degrade      If reranker health fails, skip rerank pass instead of aborting
+  --skip-health               Do not ping model endpoints before benchmark
+  --fail-fast                 Stop after first repo/pass error
+  --help                      Print this help
+
+Central OpenAI-compatible stack:
+  embedding model: ${OPENAI_STACK.embedding.model}
+  embedding URL:   ${embeddingUrl()}
+  reranker model:  ${OPENAI_STACK.reranker.model}
+  rerank URL:      ${rerankUrl()}
+`);
+}
+
+function parseArgs(argv: string[]): Options {
+  const opts: Options = {
+    k: 10,
+    cacheDir: ".bench-cache",
+    outputFile: "semble-bench-report.json",
+    binaryPath: "",
+    profileId: "c",
+    allowRerankDegrade: false,
+    skipHealth: false,
+    failFast: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    switch (arg) {
+      case "--k":
+        opts.k = parsePositiveInt(argv[++i], "--k");
+        break;
+      case "--cache-dir":
+        opts.cacheDir = requireValue(argv[++i], "--cache-dir");
+        break;
+      case "--output":
+        opts.outputFile = requireValue(argv[++i], "--output");
+        break;
+      case "--binary":
+        opts.binaryPath = requireValue(argv[++i], "--binary");
+        break;
+      case "--profile":
+        opts.profileId = requireValue(argv[++i], "--profile");
+        break;
+      case "--allow-rerank-degrade":
+        opts.allowRerankDegrade = true;
+        break;
+      case "--skip-health":
+        opts.skipHealth = true;
+        break;
+      case "--fail-fast":
+        opts.failFast = true;
+        break;
+      case "--help":
+      case "-h":
+        printUsage();
+        process.exit(0);
+      default:
+        throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+
+  return opts;
+}
+
+function requireValue(value: string | undefined, flag: string): string {
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+function parsePositiveInt(value: string | undefined, flag: string): number {
+  const raw = requireValue(value, flag);
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer, got: ${raw}`);
+  }
+  return parsed;
+}
 
 // ---------------------------------------------------------------------------
 // Scoring helpers
 // ---------------------------------------------------------------------------
 
 function normalizePath(p: string): string {
-  if (typeof p !== "string") return String(p ?? "");
-  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+  return String(p ?? "")
+    .replace(/^\\\\\?\\/, "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .toLowerCase();
 }
 
-/** Normalize a relevant annotation entry (string or {path: string}) to a file path string. */
 function normalizeAnnotationPath(r: string | { path: string; [key: string]: unknown }): string {
   return typeof r === "string" ? r : r.path;
 }
 
-/** Build a flat list of normalized file paths from an annotation's relevant + secondary arrays. */
 function buildRelevantPaths(ann: Annotation): string[] {
   const all = [...(ann.relevant || []), ...(ann.secondary || [])];
-  return all.map((entry) => normalizeAnnotationPath(entry));
+  return all.map((entry) => normalizeAnnotationPath(entry)).filter(Boolean);
 }
 
-function recallAtK(
-  retrieved: Array<{ file: string }>,
-  relevant: string[],
-  k: number
-): number {
+function pathMatches(a: string, b: string): boolean {
+  const na = normalizePath(a);
+  const nb = normalizePath(b);
+  return Boolean(na && nb && (na === nb || na.endsWith(`/${nb}`) || nb.endsWith(`/${na}`)));
+}
+
+function recallAtK(retrieved: Array<{ file: string }>, relevant: string[], k: number): number {
   if (relevant.length === 0) return 0;
-  const rPaths = new Set(retrieved.slice(0, k).map((r) => normalizePath(r.file)));
+  const retrievedK = retrieved.slice(0, k);
   let hits = 0;
-  for (const r of relevant) {
-    const nr = normalizePath(r);
-    for (const rp of rPaths) {
-      if (rp.endsWith(nr) || nr.endsWith(rp)) {
-        hits++;
-        break;
-      }
-    }
+  for (const rel of relevant) {
+    if (retrievedK.some((r) => pathMatches(r.file, rel))) hits++;
   }
   return hits / relevant.length;
 }
 
-function mrr(
-  retrieved: Array<{ file: string }>,
-  relevant: string[]
-): number {
+function mrr(retrieved: Array<{ file: string }>, relevant: string[]): number {
   for (let i = 0; i < retrieved.length; i++) {
-    const rf = normalizePath(retrieved[i].file);
-    for (const r of relevant) {
-      const nr = normalizePath(r);
-      if (rf.endsWith(nr) || nr.endsWith(rf)) return 1 / (i + 1);
-    }
+    if (relevant.some((rel) => pathMatches(retrieved[i].file, rel))) return 1 / (i + 1);
   }
   return 0;
 }
@@ -287,40 +469,79 @@ function mrr(
 function findBinary(): string {
   const localAppData = process.env.LOCALAPPDATA || "";
   const home = process.env.HOME || process.env.USERPROFILE || "";
-  const candidates = [
+  const candidates: string[] = [
     resolve("crates/aft/target/release/aft.exe"),
     resolve("crates/aft/target/release/aft"),
-    // Windows: %LOCALAPPDATA%/aft/bin/v*/aft.exe
     ...(localAppData ? [join(localAppData, "aft/bin/aft.exe")] : []),
-    // macOS/Linux: ~/.cache/aft/bin/aft
     join(home, ".cache/aft/bin/aft"),
   ];
-  // Also scan for versioned Windows paths
+
   if (localAppData) {
-    try {
-      const { readdirSync } = require("fs");
-      const binDir = join(localAppData, "aft/bin");
-      if (existsSync(binDir)) {
-        for (const v of readdirSync(binDir)) {
-          const exe = join(binDir, v, "aft.exe");
-          if (existsSync(exe)) candidates.push(exe);
-        }
+    const binDir = join(localAppData, "aft/bin");
+    if (existsSync(binDir)) {
+      for (const v of readdirSync(binDir)) {
+        const exe = join(binDir, v, "aft.exe");
+        if (existsSync(exe)) candidates.push(exe);
       }
-    } catch {}
+    }
   }
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
   }
-  throw new Error("AFT binary not found. Build with cargo or set --binary.");
+  throw new Error("AFT binary not found. Build with cargo or pass --binary.");
 }
 
 interface BridgeResponse {
-  id: string;
+  id?: string;
   success: boolean;
   data?: Record<string, unknown>;
   text?: string;
   message?: string;
   code?: string;
+  status?: string;
+  results?: unknown[];
+  [key: string]: unknown;
+}
+
+const DEFAULT_READY_PROBES = [
+  "function",
+  "request",
+  "route",
+  "handler",
+  "class",
+  "module",
+  "config",
+  "schema",
+  "test",
+];
+
+function buildReadyProbeQueries(annotations: Array<Annotation & { repo_name: string }>): string[] {
+  const probes = new Set<string>(DEFAULT_READY_PROBES);
+  for (const ann of annotations.slice(0, 8)) {
+    const query = ann.query.trim();
+    if (query) probes.add(query);
+  }
+  return [...probes];
+}
+
+function isFatalEmbeddingServerMessage(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("exceed_context_size_error") ||
+    msg.includes("larger than the max context size") ||
+    msg.includes("too large to process") ||
+    (msg.includes("input") && msg.includes("too large") && msg.includes("batch size"))
+  );
+}
+
+function explainFatalEmbeddingServerMessage(message: string): string {
+  return (
+    `Embedding server rejected an indexing/search input: ${message}
+` +
+    `Likely fixes: restart llama-swap so the intended --ctx-size is active; ` +
+    `raise CodeRankEmbed --ctx-size/--batch-size/--ubatch-size; and add/correct AFT chunking so one huge symbol/file is not embedded as a single request.`
+  );
 }
 
 class AftBridge {
@@ -328,84 +549,93 @@ class AftBridge {
   private pending = new Map<string, {
     resolve: (v: BridgeResponse) => void;
     reject: (e: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
   }>();
   private buffer = "";
-  private configured = false;
   private stderrLines: string[] = [];
   private label: string;
+  private searchFailCount = 0;
 
   constructor(binaryPath: string, projectRoot: string, label = "") {
     this.label = label || projectRoot.split(/[\\/]/).pop() || "unknown";
 
     this.proc = spawn(binaryPath, [], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, RUST_LOG: "info" },
+      env: { ...process.env, RUST_LOG: process.env.RUST_LOG || "info" },
     });
 
-    this.proc.stdout!.on("data", (chunk: Buffer) => {
-      this.buffer += chunk.toString();
-      const lines = this.buffer.split("\n");
-      this.buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        // Skip push frames (status_bar, bash_completed, etc.) — not responses
-        if (trimmed.includes('"type"') && !trimmed.includes('"id"')) continue;
-        try {
-          const msg = JSON.parse(trimmed) as BridgeResponse;
-          const p = this.pending.get(msg.id);
-          if (p) {
-            this.pending.delete(msg.id);
-            p.resolve(msg);
-          }
-        } catch {}
-      }
-    });
-
-    // Pipe stderr lines through with a tag — critical for debugging hangs
-    this.proc.stderr!.on("data", (chunk: Buffer) => {
-      for (const line of chunk.toString().split("\n")) {
-        if (line.trim()) {
-          this.stderrLines.push(line.trim());
-          // Keep last 100 lines only
-          if (this.stderrLines.length > 100) this.stderrLines.shift();
-        }
+    this.proc.stdout!.on("data", (chunk: Buffer) => this.onStdout(chunk));
+    this.proc.stderr!.on("data", (chunk: Buffer) => this.onStderr(chunk));
+    this.proc.on("error", (err) => this.rejectAll(err));
+    this.proc.on("exit", (code, signal) => {
+      if (this.pending.size > 0) {
+        this.rejectAll(new Error(`AFT exited while requests were pending: code=${code}, signal=${signal}`));
       }
     });
   }
 
-  async send(command: string, params: Record<string, unknown>): Promise<BridgeResponse> {
-    const id = `${command}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const request = {
-      id,
-      command,
-      ...params,
-    };
+  private onStdout(chunk: Buffer): void {
+    this.buffer += chunk.toString();
+    const lines = this.buffer.split("\n");
+    this.buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      try {
+        const msg = JSON.parse(trimmed) as BridgeResponse;
+        if (!msg.id) continue;
+        const pending = this.pending.get(msg.id);
+        if (!pending) continue;
+        clearTimeout(pending.timeout);
+        this.pending.delete(msg.id);
+        pending.resolve(msg);
+      } catch {
+        // Ignore non-NDJSON logs on stdout.
+      }
+    }
+  }
+
+  private onStderr(chunk: Buffer): void {
+    for (const line of chunk.toString().split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      this.stderrLines.push(trimmed);
+      if (this.stderrLines.length > 200) this.stderrLines.shift();
+    }
+  }
+
+  private rejectAll(err: Error): void {
+    for (const [id, pending] of this.pending.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(err);
+      this.pending.delete(id);
+    }
+  }
+
+  async send(command: string, params: Record<string, unknown>, timeoutMs = 60_000): Promise<BridgeResponse> {
+    if (!this.proc.stdin || this.proc.stdin.destroyed) {
+      throw new Error(`AFT stdin is closed for ${this.label}`);
+    }
+
+    const id = `${command}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const request = { id, command, ...params };
+
     return new Promise<BridgeResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.proc.stdin!.write(JSON.stringify(request) + "\n");
-      // Timeout after 60s
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`Timeout on ${command}`));
-        }
-      }, 60_000);
+      const timeout = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        const tail = this.getStderrTail(20).join("\n");
+        reject(new Error(`Timeout on ${command} for ${this.label}${tail ? `\nStderr tail:\n${tail}` : ""}`));
+      }, timeoutMs);
+
+      this.pending.set(id, { resolve, reject, timeout });
+      this.proc.stdin!.write(`${JSON.stringify(request)}\n`);
     });
   }
 
-  /** Send configure and wait for it to complete. Returns the raw response. */
-  async sendConfigure(projectRoot: string): Promise<BridgeResponse> {
-    return this.sendConfigureEx(projectRoot, {
-      backend: "openai_compatible",
-      base_url: "http://127.0.0.1:10002/v1",
-      model: "OASIS-code-embedding-1.5B.i1-Q4_K_M",
-      diagnostics_enabled: true,
-    });
-  }
-
-  /** Send configure with a profile-specific semantic payload. */
-  async sendConfigureEx(projectRoot: string, semanticPayload: Record<string, unknown>): Promise<BridgeResponse> {
+  async configure(projectRoot: string, semanticPayload: Record<string, unknown>): Promise<BridgeResponse> {
     const resp = await this.send("configure", {
       project_root: projectRoot,
       harness: "opencode",
@@ -413,14 +643,14 @@ class AftBridge {
       search_index: true,
       semantic: semanticPayload,
     });
+
     if (!resp.success) {
-      const tail = this.getStderrTail(10);
       throw new Error(
-        `Configure failed for ${this.label}: ${resp.message ?? resp.code ?? "unknown"}\n` +
-        (tail.length ? `Stderr tail:\n${tail.join("\n")}` : "(no stderr)")
+        `Configure failed for ${this.label}: ${resp.message ?? resp.code ?? resp.text ?? "unknown"}\n` +
+        stderrBlock(this.getStderrTail(20)),
       );
     }
-    this.configured = true;
+
     return resp;
   }
 
@@ -428,687 +658,750 @@ class AftBridge {
     return this.stderrLines.slice(-n);
   }
 
-  async waitReady(): Promise<void> {
-    // Poll by sending probe searches. The binary uses #[serde(flatten)] so
-    // all response fields (status, results, text) are at the TOP LEVEL —
-    // there is no "data" wrapper. "building" responses have status:"building"
-    // with no "results" field; ready responses have results:[...] array.
-    // Poll up to 300 times (10 minutes with 2s intervals) — pydantic repos
-    // can take several minutes to build the chunk index on first run.
+  async waitReady(probeQueries: string[] = DEFAULT_READY_PROBES): Promise<void> {
+    const probes = probeQueries.length > 0 ? probeQueries : DEFAULT_READY_PROBES;
+    let consecutiveEmptyResultPolls = 0;
+    let consecutiveNonBuildingNoResultPolls = 0;
+
     for (let i = 0; i < 300; i++) {
+      const probeQuery = probes[i % probes.length];
       try {
-        const resp = await this.send("semantic_search", { query: "function", top_k: 3 });
-        const status = (resp as any).status;
+        const resp = await this.send("semantic_search", { query: probeQuery, top_k: 3 });
+        const status = String(resp.status || "");
+
         if (status === "building") {
+          consecutiveEmptyResultPolls = 0;
+          consecutiveNonBuildingNoResultPolls = 0;
+          if (i % 5 === 0) console.log(`      [poll ${i}] building (${String(resp.stage || "?")})`);
+        } else if (resp.success && Array.isArray(resp.results)) {
+          if (resp.results.length > 0) return;
+
+          consecutiveEmptyResultPolls++;
           if (i % 5 === 0) {
-            const stage = (resp as any).stage || "?";
-            console.log(`      [poll ${i}] building (${stage})`);
+            console.log(`      [poll ${i}] ready probe returned 0 results for "${truncate(probeQuery, 80)}"; waiting`);
           }
-        } else if (resp.success && Array.isArray((resp as any).results) && (resp as any).results.length > 0) {
-          return; // Index has content — ready
+
+          // Some projects legitimately do not match the generic probes, and AFT
+          // has no dedicated readiness command here. Do not return immediately,
+          // because that masks empty-index/parser failures such as Express.
+          if (consecutiveEmptyResultPolls >= Math.max(15, Math.min(30, probes.length * 2))) {
+            console.warn(
+              `      [poll ${i}] assuming index is ready after repeated successful empty probes. ` +
+              `If this repo later shows 0 results, suspect empty/unsupported indexing or wrong benchmark root.`,
+            );
+            return;
+          }
         } else if (!resp.success) {
-          const msg = resp.message ?? resp.code;
+          const msg = String(resp.message ?? resp.code ?? resp.text ?? "unknown");
+          if (isFatalEmbeddingServerMessage(msg)) {
+            throw new Error(explainFatalEmbeddingServerMessage(msg));
+          }
           if (i % 5 === 0) console.log(`      [poll ${i}] probe: ${msg}`);
         } else {
-          // success but no results — could be "ready" with empty results
-          // or some other status. Check text for building indicator.
           const text = String(resp.text || "");
           if (text.includes("building")) {
+            consecutiveNonBuildingNoResultPolls = 0;
             if (i % 5 === 0) console.log(`      [poll ${i}] building (via text)`);
           } else {
-            return; // No building indicator — assume ready
+            consecutiveNonBuildingNoResultPolls++;
+            if (i % 5 === 0) {
+              console.log(`      [poll ${i}] non-building response without results; waiting`);
+            }
+            if (consecutiveNonBuildingNoResultPolls >= 5) {
+              console.warn(`      [poll ${i}] assuming index is ready after repeated non-building responses without results.`);
+              return;
+            }
           }
         }
       } catch (err) {
+        if (String(err).includes("Embedding server rejected an indexing/search input")) throw err;
         if (i % 5 === 0) {
           console.log(`      [poll ${i}] error: ${err}`);
           const tail = this.getStderrTail(5);
           if (tail.length) console.log(`      stderr: ${tail.join("\n      stderr: ")}`);
         }
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await sleep(2_000);
     }
-    const tail = this.getStderrTail(30);
-    throw new Error(
-      `Timeout waiting for AFT to be ready (${this.label})\n` +
-      (tail.length ? `Last stderr:\n${tail.join("\n")}` : "(no stderr captured)")
-    );
+
+    throw new Error(`Timeout waiting for AFT to be ready (${this.label})\n${stderrBlock(this.getStderrTail(30))}`);
   }
 
-  async search(
-    query: string,
-    topK: number
-  ): Promise<{ results: Array<{ file: string; score?: number }>; latency_ms: number }> {
+  async search(query: string, topK: number): Promise<{ results: SearchResult[]; latency_ms: number }> {
     const start = performance.now();
-    const resp = await this.send("semantic_search", {
-      query,
-      top_k: topK,
-    });
+    const resp = await this.send("semantic_search", { query, top_k: topK });
     const latency_ms = performance.now() - start;
 
-    // The binary uses #[serde(flatten)] on Response.data, so all fields
-    // (results, status, text) are at the TOP LEVEL of the JSON object.
-    const raw = resp as any;
-    const resultsArr = raw.results;
-
     if (!resp.success) {
-      if (this._searchFailCount === undefined) this._searchFailCount = 0;
-      if (this._searchFailCount < 3) {
+      if (this.searchFailCount < 3) {
         console.log(`      [search] FAIL (${latency_ms.toFixed(0)}ms): ${resp.message ?? resp.code ?? resp.text ?? "unknown"}`);
-        this._searchFailCount++;
+        this.searchFailCount++;
       }
       return { results: [], latency_ms };
     }
 
-    if (!Array.isArray(resultsArr)) {
-      if (this._searchFailCount === undefined) this._searchFailCount = 0;
-      if (this._searchFailCount < 3) {
-        console.log(`      [search] NO RESULTS ARRAY (${latency_ms.toFixed(0)}ms): status=${raw.status} keys=[${Object.keys(raw).join(",")}]`);
-        if (raw.text) console.log(`      [search] text: ${String(raw.text).slice(0, 200)}`);
-        this._searchFailCount++;
+    if (!Array.isArray(resp.results)) {
+      if (this.searchFailCount < 3) {
+        console.log(`      [search] NO RESULTS ARRAY (${latency_ms.toFixed(0)}ms): status=${resp.status} keys=[${Object.keys(resp).join(",")}]`);
+        this.searchFailCount++;
       }
       return { results: [], latency_ms };
     }
 
     return {
-      results: resultsArr.map((r: Record<string, unknown>) => ({
-        file: String(r.file || ""),
-        score: typeof r.score === "number" ? r.score : undefined,
-      })),
+      results: resp.results.map((raw) => normalizeResult(raw as Record<string, unknown>)),
       latency_ms,
     };
   }
 
-  private _searchFailCount?: number;
-
   shutdown(): void {
-    this.proc.kill();
+    for (const pending of this.pending.values()) clearTimeout(pending.timeout);
+    this.pending.clear();
+    if (!this.proc.killed) this.proc.kill();
   }
 }
 
-// ---------------------------------------------------------------------------
-// CLI-based search (profiles e, f, g)
-// ---------------------------------------------------------------------------
-
-import { execSync } from "child_process";
-
-interface CliSearchResult {
-  file: string;
-  score?: number;
-  line?: number;
+function normalizeResult(r: Record<string, unknown>): SearchResult {
+  const file = String(r.file ?? r.path ?? r.file_path ?? r.filename ?? "");
+  const scoreRaw = r.score ?? r.similarity ?? r.relevance_score;
+  const lineRaw = r.line ?? r.start_line;
+  return {
+    file,
+    score: typeof scoreRaw === "number" ? scoreRaw : Number.isFinite(Number(scoreRaw)) ? Number(scoreRaw) : undefined,
+    line: typeof lineRaw === "number" ? lineRaw : Number.isFinite(Number(lineRaw)) ? Number(lineRaw) : undefined,
+    content: typeof r.content === "string" ? r.content : typeof r.text === "string" ? r.text : undefined,
+  };
 }
 
-/** Run semble CLI search against a repo directory. */
-function sembleSearch(
-  query: string,
-  searchDir: string,
-  benchmarkRoot: string | null,
-  k: number
-): { results: CliSearchResult[]; latency_ms: number } {
-  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
-  const start = performance.now();
-  let results: CliSearchResult[] = [];
+function stderrBlock(lines: string[]): string {
+  return lines.length ? `Stderr tail:\n${lines.join("\n")}` : "No stderr captured.";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible health checks and explicit reranking
+// ---------------------------------------------------------------------------
+
+interface HealthResult {
+  ok: boolean;
+  status?: number;
+  body?: string;
+  error?: string;
+}
+
+async function pingEmbedding(): Promise<HealthResult> {
   try {
-    const output = execSync(
-      `semble search --top-k ${k} --content all "${query.replace(/"/g, '\\"')}" "${targetDir}"`,
-      { encoding: "utf-8", stdio: "pipe", timeout: 30_000 }
-    ).toString().trim();
-    if (output) {
-      // Try JSON first
-      try {
-        const parsed = JSON.parse(output);
-        if (Array.isArray(parsed)) {
-          results = parsed.slice(0, k).map((r: Record<string, unknown>) => ({
-            file: String(r.file_path ?? r.file ?? ""),
-            score: typeof r.score === "number" ? r.score : undefined,
-            line: typeof r.line === "number" ? r.line : undefined,
-          }));
-        }
-      } catch {
-        // Not JSON — try line-by-line parse (tab-separated or path-like)
-        const lines = output.split("\n").filter(Boolean);
-        for (const line of lines.slice(0, k)) {
-          const parts = line.split("\t");
-          const file = parts[0]?.trim() || line.trim();
-          if (file) results.push({ file });
-        }
-      }
-    }
-  } catch (err: any) {
-    // execSync throws on non-zero exit — semble returns non-zero for no results
-    if ((err as any)?.stderr) {
-      const stderr = (err as any).stderr.toString();
-      if (stderr.includes("not found") || stderr.includes("No such file")) {
-        // CLI not available — return empty results
-      }
-    }
+    const resp = await fetch(embeddingUrl(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_STACK.embedding.model,
+        input: "test connectivity",
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (resp.ok) return { ok: true, status: resp.status };
+    return { ok: false, status: resp.status, body: await safeText(resp) };
+  } catch (err) {
+    return { ok: false, error: String(err) };
   }
-  return { results, latency_ms: performance.now() - start };
 }
 
-/** Run colgrep CLI search against a repo directory. */
-function colgrepSearch(
-  query: string,
-  searchDir: string,
-  benchmarkRoot: string | null,
-  k: number
-): { results: CliSearchResult[]; latency_ms: number } {
-  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
-  const start = performance.now();
-  let results: CliSearchResult[] = [];
+async function pingReranker(): Promise<HealthResult> {
   try {
-    const output = execSync(
-      `colgrep "${query.replace(/"/g, '\\"')}" --results ${k} "${targetDir}"`,
-      { encoding: "utf-8", stdio: "pipe", timeout: 30_000 }
-    ).toString().trim();
-    if (output) {
-      // Try JSON first
-      try {
-        const parsed = JSON.parse(output);
-        if (Array.isArray(parsed)) {
-          results = parsed.slice(0, k).map((r: Record<string, unknown>) => ({
-            file: String(r.file_path ?? r.file ?? ""),
-            score: typeof r.score === "number" ? r.score : undefined,
-            line: typeof r.line === "number" ? r.line : undefined,
-          }));
-        }
-      } catch {
-        // Not JSON — parse text output
-        const lines = output.split("\n").filter(Boolean);
-        for (const line of lines.slice(0, k)) {
-          const parts = line.split(":");
-          const file = parts[0]?.trim();
-          if (file) results.push({ file });
-        }
-      }
-    }
+    const resp = await fetch(rerankUrl(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_STACK.reranker.model,
+        query: "test connectivity",
+        documents: [
+          "irrelevant text",
+          "test connectivity document",
+          "another irrelevant text",
+        ],
+        top_n: 1,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (resp.ok) return { ok: true, status: resp.status };
+    return { ok: false, status: resp.status, body: await safeText(resp) };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+async function safeText(resp: Response): Promise<string> {
+  try {
+    return await resp.text();
   } catch {
-    // colgrep not available or no results
+    return "<failed to read response body>";
   }
-  return { results, latency_ms: performance.now() - start };
 }
 
-/** Find the colgrep or semble binary on PATH or known locations. */
-function findCliBinary(name: string): string | null {
-  try {
-    const output = execSync(`where ${name} 2>nul || which ${name} 2>/dev/null`, {
-      encoding: "utf-8",
-      stdio: "pipe",
-      timeout: 5_000,
-    }).toString().trim();
-    if (output) {
-      const firstLine = output.split("\n")[0].trim();
-      if (firstLine && existsSync(firstLine)) return firstLine;
-      return name; // rely on PATH
+function formatHealthFailure(result: HealthResult): string {
+  if (result.status) return `HTTP ${result.status}${result.body ? `: ${truncate(result.body, 600)}` : ""}`;
+  return result.error || "unknown error";
+}
+
+async function checkProfileHealth(profile: Profile, opts: Options): Promise<{ rerankAvailable: boolean }> {
+  if (opts.skipHealth) {
+    console.log("--- Model connectivity check skipped ---\n");
+    return { rerankAvailable: true };
+  }
+
+  console.log("\n--- Model connectivity check ---");
+  let rerankAvailable = true;
+
+  if (profile.requiresEmbedding) {
+    const embedding = await pingEmbedding();
+    if (embedding.ok) {
+      console.log(`  Embedding (${OPENAI_STACK.embedding.model} @ ${embeddingUrl()}): ✓ reachable`);
+    } else {
+      throw new Error(`Embedding health check failed: ${formatHealthFailure(embedding)}`);
     }
-  } catch {}
-  return null;
+  }
+
+  if (profile.requiresReranker) {
+    const reranker = await pingReranker();
+    if (reranker.ok) {
+      console.log(`  Reranker  (${OPENAI_STACK.reranker.model} @ ${rerankUrl()}): ✓ reachable`);
+    } else if (opts.allowRerankDegrade) {
+      rerankAvailable = false;
+      console.warn(`  Reranker  (${OPENAI_STACK.reranker.model} @ ${rerankUrl()}): ✗ ${formatHealthFailure(reranker)}`);
+      console.warn("  Rerank degradation allowed: rerank pass will be skipped.");
+    } else {
+      throw new Error(`Reranker health check failed: ${formatHealthFailure(reranker)}`);
+    }
+  }
+
+  console.log("");
+  return { rerankAvailable };
+}
+
+async function rerankResults(query: string, results: SearchResult[], topN: number, repoDir: string): Promise<SearchResult[]> {
+  const candidates = results.slice(0, Math.min(results.length, OPENAI_STACK.reranker.maxCandidates));
+  if (candidates.length <= 1) return results;
+
+  const documents = candidates.map((result) => result.content || readCandidateContent(repoDir, result.file));
+  const start = performance.now();
+
+  const resp = await fetch(rerankUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: OPENAI_STACK.reranker.model,
+      query,
+      documents,
+      top_n: Math.min(topN, candidates.length),
+    }),
+    signal: AbortSignal.timeout(OPENAI_STACK.reranker.timeoutMs),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`External rerank failed: HTTP ${resp.status}: ${truncate(await safeText(resp), 600)}`);
+  }
+
+  const json = await resp.json().catch((err) => {
+    throw new Error(`External rerank returned non-JSON response: ${err}`);
+  });
+
+  const ranked = parseRerankResponse(json, candidates);
+  const rankedKeys = new Set(ranked.map((r) => normalizePath(r.file)));
+  const tail = results.filter((r) => !rankedKeys.has(normalizePath(r.file)));
+  const latency = performance.now() - start;
+  if (process.env.AFT_BENCH_VERBOSE_RERANK === "1") {
+    console.log(`      [external-rerank] ${candidates.length} candidates -> ${ranked.length} ranked in ${latency.toFixed(0)}ms`);
+  }
+
+  return [...ranked, ...tail];
+}
+
+function parseRerankResponse(json: unknown, candidates: SearchResult[]): SearchResult[] {
+  const root = json as Record<string, unknown>;
+  const rawItems = Array.isArray(root.results)
+    ? root.results
+    : Array.isArray(root.data)
+      ? root.data
+      : [];
+
+  const ranked: SearchResult[] = [];
+  for (let position = 0; position < rawItems.length; position++) {
+    const item = rawItems[position] as Record<string, unknown>;
+    const indexRaw = item.index ?? (item.document as Record<string, unknown> | undefined)?.index ?? position;
+    const index = Number(indexRaw);
+    if (!Number.isInteger(index) || index < 0 || index >= candidates.length) continue;
+
+    const scoreRaw = item.relevance_score ?? item.score ?? item.rank_score;
+    const score = Number.isFinite(Number(scoreRaw)) ? Number(scoreRaw) : candidates[index].score;
+    ranked.push({ ...candidates[index], score });
+  }
+
+  return ranked.length ? ranked : candidates;
+}
+
+function readCandidateContent(repoDir: string, file: string): string {
+  const normalized = file.replace(/^\\\\\?\\/, "");
+  const maybeAbsolute = /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("/");
+  const path = maybeAbsolute ? normalized : join(repoDir, normalized);
+  try {
+    const content = readFileSync(path, "utf-8");
+    return content.length > 20_000 ? content.slice(0, 20_000) : content;
+  } catch {
+    return normalized;
+  }
+}
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}…`;
 }
 
 // ---------------------------------------------------------------------------
-// Table printing helpers
+// CLI-based search
 // ---------------------------------------------------------------------------
 
-/** Print a per-repo summary row. */
-function printRepoRow(
-  repoName: string,
-  profileLabel: string,
-  queryCount: number,
-  recall: number,
-  mrrVal: number,
-  meanLatencyMs: number
-): void {
-  console.log(
-    `  ${repoName.padEnd(12)} ${profileLabel.padEnd(16)} ${String(queryCount).padStart(3)} queries` +
-    `  recall=${(recall * 100).toFixed(1).padStart(5)}%  mrr=${mrrVal.toFixed(3)}` +
-    `  latency=${meanLatencyMs.toFixed(0).padStart(5)}ms`
-  );
+function runCommand(command: string, args: string[], timeoutMs: number): SpawnSyncReturns<string> {
+  return spawnSync(command, args, {
+    encoding: "utf-8",
+    stdio: "pipe",
+    timeout: timeoutMs,
+    windowsHide: true,
+  });
 }
 
-/** Print a final aggregate summary table. */
-function printSummaryTable(
-  aggregate: Record<string, { recall: number; mrr: number; count: number; mean_latency_ms: number }>,
-  k: number,
-  profileLabel: string
-): void {
-  console.log(`\n┌──────────────────────────────────────────────────────────────────────┐`);
+function sembleSearch(query: string, searchDir: string, benchmarkRoot: string | null, k: number): { results: SearchResult[]; latency_ms: number } {
+  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
+  const start = performance.now();
+  const out = runCommand("semble", ["search", "--top-k", String(k), query, targetDir, "--content", "all"], 30_000);
+
+  if (out.error || out.status !== 0) {
+    return { results: [], latency_ms: performance.now() - start };
+  }
+
+  const stdout = String(out.stdout || "").trim();
+  return { results: parseSembleOutput(stdout, k), latency_ms: performance.now() - start };
+}
+
+function parseSembleOutput(output: string, k: number): SearchResult[] {
+  if (!output) return [];
+  try {
+    const parsed = JSON.parse(output);
+    const items = Array.isArray(parsed) ? parsed : Array.isArray(parsed.results) ? parsed.results : [];
+    return items.slice(0, k).map((raw: Record<string, unknown>) => {
+      const chunk = (raw.chunk ?? raw) as Record<string, unknown>;
+      return {
+        file: String(chunk.file_path ?? chunk.file ?? raw.file_path ?? raw.file ?? ""),
+        score: typeof raw.score === "number" ? raw.score : undefined,
+        line: typeof chunk.start_line === "number" ? chunk.start_line : typeof raw.line === "number" ? raw.line : undefined,
+        content: typeof chunk.content === "string"
+          ? chunk.content
+          : typeof chunk.text === "string"
+            ? chunk.text
+            : typeof raw.content === "string"
+              ? raw.content
+              : undefined,
+      };
+    }).filter((r: SearchResult) => r.file);
+  } catch {
+    return output.split("\n").filter(Boolean).slice(0, k).map((line) => ({ file: line.trim() }));
+  }
+}
+
+function colgrepSearch(query: string, searchDir: string, benchmarkRoot: string | null, k: number): { results: SearchResult[]; latency_ms: number } {
+  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
+  const start = performance.now();
+  const out = runCommand("colgrep", ["--json", query, "--results", String(k), "--color", "never", targetDir], 30_000);
+
+  if (out.error || out.status !== 0) {
+    return { results: [], latency_ms: performance.now() - start };
+  }
+
+  const stdout = String(out.stdout || "").trim();
+  return { results: parseColgrepOutput(stdout, k), latency_ms: performance.now() - start };
+}
+
+function parseColgrepOutput(output: string, k: number): SearchResult[] {
+  if (!output) return [];
+  try {
+    const parsed = JSON.parse(output);
+    const items = Array.isArray(parsed) ? parsed : [];
+    return items.slice(0, k).map((raw: Record<string, unknown>) => {
+      const unit = (raw.unit ?? raw) as Record<string, unknown>;
+      return {
+        file: String(unit.file ?? unit.file_path ?? raw.file ?? "").replace(/^\\\\\?\\/, ""),
+        score: typeof raw.score === "number" ? raw.score : undefined,
+        line: typeof unit.line === "number" ? unit.line : undefined,
+        content: typeof unit.content === "string"
+          ? unit.content
+          : typeof unit.text === "string"
+            ? unit.text
+            : undefined,
+      };
+    }).filter((r: SearchResult) => r.file);
+  } catch {
+    return output.split("\n").filter(Boolean).slice(0, k).map((line) => {
+      const match = line.match(/^(.+):(\d+)-(\d+)$/);
+      return match ? { file: match[1].trim(), line: Number.parseInt(match[2], 10) } : { file: line.trim() };
+    });
+  }
+}
+
+function findCliBinary(name: string): string | null {
+  const lookupCommand = process.platform === "win32" ? "where" : "which";
+  const result = runCommand(lookupCommand, [name], 5_000);
+  if (result.error || result.status !== 0) return null;
+  const first = String(result.stdout || "").split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+  return first || null;
+}
+
+// ---------------------------------------------------------------------------
+// Reporting helpers
+// ---------------------------------------------------------------------------
+
+function printRepoRows(repoName: string, profileLabel: string, repoResults: BenchResult[]): void {
+  const byMode = groupBenchResults(repoResults);
+  for (const [mode, rows] of Object.entries(byMode)) {
+    const agg = aggregateRows(rows);
+    console.log(
+      `  ${repoName.padEnd(12)} ${profileLabel.padEnd(24)} ${mode.padEnd(18)} ${String(agg.count).padStart(3)} queries` +
+      `  recall=${(agg.recall * 100).toFixed(1).padStart(5)}%  mrr=${agg.mrr.toFixed(3)}` +
+      `  latency=${agg.mean_latency_ms.toFixed(0).padStart(5)}ms`,
+    );
+  }
+}
+
+function printSummaryTable(aggregate: Record<string, AggregateOut>, k: number, profileLabel: string): void {
+  console.log("\n┌────────────────────────────────────────────────────────────────────────────┐");
   console.log(`│  Semble Benchmark Summary (k=${k}, profile=${profileLabel})`);
-  console.log(`├──────────────────────────────────────────────────────────────────────┤`);
+  console.log("├────────────────────────────────────────────────────────────────────────────┤");
+
+  if (Object.keys(aggregate).length === 0) {
+    console.log("│  No successful benchmark results.".padEnd(77) + "│");
+  }
+
   for (const [mode, data] of Object.entries(aggregate)) {
-    const label = mode.padEnd(20);
+    const label = mode.padEnd(22);
     const recallStr = (data.recall * 100).toFixed(1).padStart(5);
     const mrrStr = data.mrr.toFixed(3);
     const latStr = data.mean_latency_ms.toFixed(0).padStart(5);
     console.log(`│  ${label} recall=${recallStr}%  mrr=${mrrStr}  latency=${latStr}ms  (${data.count} queries)`);
   }
-  console.log(`└──────────────────────────────────────────────────────────────────────┘`);
+  console.log("└────────────────────────────────────────────────────────────────────────────┘");
+}
+
+function groupBenchResults(rows: BenchResult[]): Record<string, BenchResult[]> {
+  const grouped: Record<string, BenchResult[]> = {};
+  for (const row of rows) {
+    if (!grouped[row.mode]) grouped[row.mode] = [];
+    grouped[row.mode].push(row);
+  }
+  return grouped;
+}
+
+function aggregateRows(rows: BenchResult[]): AggregateOut {
+  const n = rows.length;
+  if (n === 0) return { recall: 0, mrr: 0, count: 0, mean_latency_ms: 0 };
+  return {
+    recall: rows.reduce((sum, row) => sum + row.recall_at_k, 0) / n,
+    mrr: rows.reduce((sum, row) => sum + row.mrr, 0) / n,
+    count: n,
+    mean_latency_ms: rows.reduce((sum, row) => sum + row.latency_ms, 0) / n,
+  };
+}
+
+function aggregateByMode(rows: BenchResult[]): Record<string, AggregateOut> {
+  const out: Record<string, AggregateOut> = {};
+  for (const [mode, group] of Object.entries(groupBenchResults(rows))) {
+    out[mode] = aggregateRows(group);
+  }
+  return out;
+}
+
+function aggregateNested(rows: BenchResult[], key: "category" | "repo_name"): Record<string, Record<string, GroupOut>> {
+  const groups: Record<string, Record<string, BenchResult[]>> = {};
+  for (const row of rows) {
+    const outer = key === "category" ? row.category : row.repo_name;
+    if (!groups[outer]) groups[outer] = {};
+    if (!groups[outer][row.mode]) groups[outer][row.mode] = [];
+    groups[outer][row.mode].push(row);
+  }
+
+  const out: Record<string, Record<string, GroupOut>> = {};
+  for (const [outer, modes] of Object.entries(groups)) {
+    out[outer] = {};
+    for (const [mode, group] of Object.entries(modes)) {
+      const agg = aggregateRows(group);
+      out[outer][mode] = { recall: agg.recall, mrr: agg.mrr, count: agg.count };
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Main benchmark execution
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Model connectivity diagnostics
-// ---------------------------------------------------------------------------
-
-const EMBED_URL = "http://127.0.0.1:10002/v1/embeddings";
-const EMBED_MODEL = "OASIS-code-embedding-1.5B.i1-Q4_K_M";
-const RERANK_URL = "http://127.0.0.1:10002/v1/chat/completions";
-const RERANK_MODEL = "CodeRankLLM.Q4_K_M";
-
-async function pingModels(): Promise<{ embeddingOk: boolean; rerankerOk: boolean; embeddingError?: string; rerankerError?: string }> {
-  const results = { embeddingOk: false, rerankerOk: false, embeddingError: undefined as string | undefined, rerankerError: undefined as string | undefined };
-
-  // Ping embedding model
-  try {
-    const resp = await fetch(EMBED_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: "test connectivity", model: EMBED_MODEL }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (resp.ok) {
-      results.embeddingOk = true;
-    } else {
-      results.embeddingError = `HTTP ${resp.status}: ${await resp.text().catch(() => "no body")}`;
-    }
-  } catch (err) {
-    results.embeddingError = String(err);
-  }
-
-  // Ping reranking model
-  try {
-    const resp = await fetch(RERANK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: RERANK_MODEL,
-        messages: [{ role: "user", content: "Rank: A B C" }],
-        temperature: 0.0,
-        max_tokens: 50,
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (resp.ok) {
-      results.rerankerOk = true;
-    } else {
-      results.rerankerError = `HTTP ${resp.status}: ${await resp.text().catch(() => "no body")}`;
-    }
-  } catch (err) {
-    results.rerankerError = String(err);
-  }
-
-  return results;
+function repoSearchRoot(repoDir: string, repo: Repo): string {
+  return repo.benchmark_root ? join(repoDir, repo.benchmark_root) : repoDir;
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  let k = 10;
-  let cacheDir = ".bench-cache";
-  let outputFile = "semble-bench-report.json";
-  let binaryPath = "";
-  let profileId = "c";
+function repoRootLabel(repoDir: string, repo: Repo): string {
+  return repo.benchmark_root ? `${repo.benchmark_root} => ${repoSearchRoot(repoDir, repo)}` : `.`;
+}
 
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--k":
-        k = parseInt(args[++i], 10);
-        break;
-      case "--cache-dir":
-        cacheDir = args[++i];
-        break;
-      case "--output":
-        outputFile = args[++i];
-        break;
-      case "--binary":
-        binaryPath = args[++i];
-        break;
-      case "--profile":
-        profileId = args[++i];
-        break;
+async function runAftPass(params: {
+  binaryPath: string;
+  repo: Repo;
+  repoDir: string;
+  annotations: Array<Annotation & { repo_name: string }>;
+  semanticConfig: Record<string, unknown>;
+  passLabel: string;
+  modeLabel: string;
+  k: number;
+}): Promise<BenchResult[]> {
+  const { binaryPath, repo, repoDir, annotations, semanticConfig, passLabel, modeLabel, k } = params;
+  const bridge = new AftBridge(binaryPath, repoDir, `${repo.name}/${passLabel}`);
+  const rows: BenchResult[] = [];
+
+  try {
+    console.log(`    ${repo.name} (${passLabel}): configuring...`);
+    await bridge.configure(repoDir, semanticConfig);
+    console.log(`    ${repo.name} (${passLabel}): configured ✓`);
+
+    await bridge.waitReady(buildReadyProbeQueries(annotations));
+    console.log(`    ${repo.name} (${passLabel}): index ready ✓`);
+
+    let emptySearches = 0;
+    for (const ann of annotations) {
+      const relevant = buildRelevantPaths(ann);
+      const { results, latency_ms } = await bridge.search(ann.query, k);
+      if (results.length === 0) {
+        emptySearches++;
+        if (emptySearches <= 3) {
+          console.warn(`      [search] EMPTY RESULTS for query: ${truncate(ann.query, 120)}`);
+        }
+      }
+      rows.push(makeBenchResult(modeLabel, ann, repo.name, results, relevant, latency_ms, k));
     }
+
+    if (rows.length > 0 && rows.every((row) => row.results.length === 0)) {
+      console.warn(
+        `    ${repo.name} (${passLabel}): WARNING — every benchmark query returned 0 results. ` +
+        `Likely causes: wrong AFT binary, wrong benchmark root, unsupported parser/language, or empty index.`,
+      );
+    }
+  } finally {
+    bridge.shutdown();
   }
 
-  // Resolve profile
-  const profile = PROFILES[profileId];
+  return rows;
+}
+
+function makeBenchResult(
+  mode: string,
+  ann: Annotation,
+  repoName: string,
+  results: SearchResult[],
+  relevant: string[],
+  latencyMs: number,
+  k: number,
+): BenchResult {
+  return {
+    mode,
+    query: ann.query,
+    repo_name: repoName,
+    category: ann.category,
+    latency_ms: latencyMs,
+    results: results.map((r) => ({ file: r.file, score: r.score })),
+    recall_at_k: recallAtK(results, relevant, k),
+    mrr: mrr(results, relevant),
+  };
+}
+
+async function main(): Promise<void> {
+  const opts = parseArgs(process.argv.slice(2));
+  const profile = PROFILES[opts.profileId];
   if (!profile) {
-    console.error(`Unknown profile "${profileId}". Available profiles:`);
-    for (const [id, p] of Object.entries(PROFILES)) {
-      console.error(`  ${id}: ${p.description}`);
-    }
-    process.exit(1);
+    throw new Error(`Unknown profile "${opts.profileId}". Available profiles: ${Object.keys(PROFILES).join(", ")}`);
   }
-  console.log(`Using profile ${profileId}: ${profile.description}`);
 
-  // Binary resolution (only needed for AFT profiles)
+  console.log(`Using profile ${profile.id}: ${profile.description}`);
+  console.log(`Central embedding: ${OPENAI_STACK.embedding.model} @ ${embeddingUrl()}`);
+  console.log(`Central reranker:  ${OPENAI_STACK.reranker.model} @ ${rerankUrl()}`);
+
+  const health = await checkProfileHealth(profile, opts);
+
+  let binaryPath = opts.binaryPath;
   const needsBinary = profile.mode === "aft";
   if (needsBinary) {
     if (!binaryPath) binaryPath = findBinary();
     console.log(`  AFT binary: ${binaryPath}`);
-  } else {
-    // Verify CLI tool availability
-    const cliName = profile.cliCommand || "";
-    const cliPath = findCliBinary(cliName);
+    if (profile.requiresFeature) {
+      console.warn(`  NOTE: profile requires AFT feature "${profile.requiresFeature}". This script cannot verify feature flags in a prebuilt binary.`);
+    }
+  } else if (profile.cliKind) {
+    const cliPath = findCliBinary(profile.cliKind);
     if (!cliPath) {
-      console.warn(`  WARNING: "${cliName}" not found on PATH. CLI-based search may fail.`);
+      console.warn(`  WARNING: "${profile.cliKind}" not found on PATH. CLI-based search will return empty results.`);
     } else {
       console.log(`  CLI tool: ${cliPath}`);
     }
   }
 
-  // Model connectivity check (profile-specific endpoints)
-  console.log("\n--- Model connectivity check ---");
-  if (profile.pingEndpoint) {
-    const ep = profile.pingEndpoint;
-    try {
-      const resp = await fetch(ep.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: "test connectivity", model: ep.model }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (resp.ok) {
-        console.log(`  ${ep.type === "embedding" ? "Embedding" : "Reranker"} (${ep.model}): ✓ reachable`);
-      } else {
-        console.warn(`  ${ep.type === "embedding" ? "Embedding" : "Reranker"} (${ep.model}): ✗ HTTP ${resp.status}`);
-      }
-    } catch (err) {
-      console.warn(`  ${ep.type === "embedding" ? "Embedding" : "Reranker"} (${ep.model}): ✗ ${err}`);
-    }
-  } else {
-    // Try generic ping for OASIS endpoint anyway
-    const genStatus = await pingModels();
-    console.log(`  Embedding (${EMBED_MODEL}): ${genStatus.embeddingOk ? "✓ reachable" : `✗ ${genStatus.embeddingError}`}`);
-    console.log(`  Reranker  (${RERANK_MODEL}): ${genStatus.rerankerOk ? "✓ reachable" : `✗ ${genStatus.rerankerError}`}`);
-  }
-
-  if (profile.rerankerConfig) {
-    const rc = profile.rerankerConfig;
-    try {
-      const resp = await fetch(`${rc.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: rc.model,
-          messages: [{ role: "user", content: "Rank: A B C" }],
-          temperature: 0.0,
-          max_tokens: 50,
-        }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (resp.ok) {
-        console.log(`  Reranker (${rc.model} @ ${rc.baseUrl}): ✓ reachable`);
-      } else {
-        console.warn(`  Reranker (${rc.model} @ ${rc.baseUrl}): ✗ HTTP ${resp.status} — will run without reranking`);
-      }
-    } catch (err) {
-      console.warn(`  Reranker (${rc.model} @ ${rc.baseUrl}): ✗ ${err} — will run without reranking`);
-    }
-  }
-  console.log("");
-
-  // Load fixtures
-  const fixture: Fixture = JSON.parse(
-    readFileSync(resolve("benchmarks/semble/fixtures.json"), "utf-8")
-  );
-
-  // Load all annotations
+  const fixture: Fixture = JSON.parse(readFileSync(resolve("benchmarks/semble/fixtures.json"), "utf-8"));
   const allAnnotations: Array<Annotation & { repo_name: string }> = [];
+
   for (const repo of fixture.repos) {
     const annPath = resolve(`benchmarks/semble/annotations/${repo.name}.json`);
     if (!existsSync(annPath)) continue;
     const anns: Annotation[] = JSON.parse(readFileSync(annPath, "utf-8"));
-    for (const a of anns) {
-      allAnnotations.push({ ...a, repo_name: repo.name });
-    }
+    for (const ann of anns) allAnnotations.push({ ...ann, repo_name: repo.name });
   }
 
-  const modeLabel = profile.mode === "aft" ? "aft" : profile.label;
-  console.log(
-    `Running Semble benchmark: ${allAnnotations.length} queries across ${fixture.repos.length} repos (k=${k}, profile=${profileId})`
-  );
+  console.log(`\nRunning Semble benchmark: ${allAnnotations.length} queries across ${fixture.repos.length} repos (k=${opts.k}, profile=${profile.id})`);
 
   const allResults: BenchResult[] = [];
-  const repoSummaries: Array<{
-    repo: string;
-    recall: number;
-    mrr: number;
-    latency_ms: number;
-    count: number;
-  }> = [];
 
   for (const repo of fixture.repos) {
-    const repoDir = join(resolve(cacheDir), repo.name);
+    const repoDir = join(resolve(opts.cacheDir), repo.name);
     if (!existsSync(repoDir)) {
       console.log(`  Skipping ${repo.name} — not cloned at ${repoDir}`);
       continue;
     }
 
-    const repoAnnotations = allAnnotations.filter(
-      (a) => a.repo_name === repo.name
-    );
+    const searchRoot = repoSearchRoot(repoDir, repo);
+    if (!existsSync(searchRoot)) {
+      console.log(`  Skipping ${repo.name} — benchmark root not found at ${searchRoot}`);
+      continue;
+    }
+
+    const repoAnnotations = allAnnotations.filter((ann) => ann.repo_name === repo.name);
     if (repoAnnotations.length === 0) continue;
 
-    console.log(`\n  ${repo.name}: ${repoAnnotations.length} queries, root=${repo.benchmark_root || "."}`);
+    console.log(`\n  ${repo.name}: ${repoAnnotations.length} queries, root=${repoRootLabel(repoDir, repo)}`);
+    const beforeCount = allResults.length;
 
-    if (profile.mode === "aft") {
-      // ── AFT binary mode (profiles a-d) ──
+    try {
+      if (profile.mode === "aft") {
+        if (!profile.getAftSemanticConfig) throw new Error(`AFT profile ${profile.id} has no semantic config factory`);
 
-      /** Run a complete pass: configure → wait → search all queries → collect results */
-      const runPass = async (
-        passLabel: string,
-        passModeLabel: string,
-        configOverrides: Record<string, unknown>,
-      ): Promise<void> => {
-        const bridge = new AftBridge(binaryPath, repoDir, `${repo.name}/${passLabel}`);
-        try {
-          console.log(`    ${repo.name} (${passLabel}): configuring...`);
-          await bridge.sendConfigureEx(repoDir, {
-            ...profile.configurePayload,
-            ...configOverrides,
+        if (profile.dual) {
+          const preRows = await runAftPass({
+            binaryPath,
+            repo,
+            repoDir: searchRoot,
+            annotations: repoAnnotations,
+            semanticConfig: profile.getAftSemanticConfig(false),
+            passLabel: "pre-rerank",
+            modeLabel: "aft",
+            k: opts.k,
           });
-          console.log(`    ${repo.name} (${passLabel}): configured ✓`);
+          allResults.push(...preRows);
 
-          await bridge.waitReady();
-          console.log(`    ${repo.name} (${passLabel}): index ready ✓`);
-
-          for (const ann of repoAnnotations) {
-            const allRelevant = buildRelevantPaths(ann);
-            const { results, latency_ms } = await bridge.search(ann.query, k);
-
-            allResults.push({
-              mode: passModeLabel,
-              query: ann.query,
-              repo_name: repo.name,
-              category: ann.category,
-              latency_ms,
-              results,
-              recall_at_k: recallAtK(results, allRelevant, k),
-              mrr: mrr(results, allRelevant),
+          if (health.rerankAvailable) {
+            const postRows = await runAftPass({
+              binaryPath,
+              repo,
+              repoDir,
+              annotations: repoAnnotations,
+              semanticConfig: profile.getAftSemanticConfig(true),
+              passLabel: "post-rerank",
+              modeLabel: "aft+rerank",
+              k: opts.k,
             });
+            allResults.push(...postRows);
           }
-        } catch (err) {
-          console.error(`    ${repo.name} (${passLabel}): ERROR — ${err}`);
-        } finally {
-          bridge.shutdown();
+        } else {
+          const rows = await runAftPass({
+            binaryPath,
+            repo,
+            repoDir: searchRoot,
+            annotations: repoAnnotations,
+            semanticConfig: profile.getAftSemanticConfig(false),
+            passLabel: "single-pass",
+            modeLabel: profile.label,
+            k: opts.k,
+          });
+          allResults.push(...rows);
         }
-      };
-
-      if (profile.dual) {
-        // Dual-mode: run pre-rerank (embedding-only) then post-rerank (embedding+reranker)
-        // Pre-rerank pass: disable reranker, remove reranker-specific fields
-        const preRerankConfig: Record<string, unknown> = {
-          rerank_enabled: false,
-        };
-        await runPass("pre-rerank", "aft", preRerankConfig);
-
-        // Post-rerank pass: use profile defaults (rerank_enabled: true + reranker config)
-        await runPass("post-rerank", "aft+rerank", {});
       } else {
-        // Single pass: use profile payload as-is
-        await runPass("single-pass", modeLabel, {});
+        if (!profile.cliKind) throw new Error(`CLI profile ${profile.id} has no cliKind`);
+        for (const ann of repoAnnotations) {
+          const relevant = buildRelevantPaths(ann);
+          const start = performance.now();
+          const raw = profile.cliKind === "semble"
+            ? sembleSearch(ann.query, searchRoot, null, opts.k)
+            : colgrepSearch(ann.query, searchRoot, null, opts.k);
+
+          let results = raw.results;
+          let latency = raw.latency_ms;
+          if (profile.applyExternalRerank && health.rerankAvailable) {
+            results = await rerankResults(ann.query, results, opts.k, searchRoot);
+            latency = performance.now() - start;
+          }
+
+          allResults.push(makeBenchResult(profile.label, ann, repo.name, results, relevant, latency, opts.k));
+        }
       }
-    } else {
-      // ── CLI mode (profiles e-g) ──
-      const searchFn = profile.cliCommand === "semble" ? sembleSearch
-        : profile.cliCommand === "colgrep" ? colgrepSearch
-        : null;
-
-      if (!searchFn) {
-        console.error(`    ${repo.name}: unknown CLI command "${profile.cliCommand}"`);
-        continue;
-      }
-
-      for (const ann of repoAnnotations) {
-        const allRelevant = buildRelevantPaths(ann);
-
-        const { results, latency_ms } = searchFn(
-          ann.query,
-          repoDir,
-          repo.benchmark_root,
-          k
-        );
-
-        allResults.push({
-          mode: modeLabel,
-          query: ann.query,
-          repo_name: repo.name,
-          category: ann.category,
-          latency_ms,
-          results,
-          recall_at_k: recallAtK(results, allRelevant, k),
-          mrr: mrr(results, allRelevant),
-        });
-      }
+    } catch (err) {
+      console.error(`    ${repo.name}: ERROR — ${err}`);
+      if (opts.failFast) throw err;
     }
 
-    // Per-repo summary after processing
-    const repoResults = allResults.filter((r) => r.repo_name === repo.name);
-    if (repoResults.length > 0) {
-      const avgRecall = repoResults.reduce((s, r) => s + r.recall_at_k, 0) / repoResults.length;
-      const avgMrr = repoResults.reduce((s, r) => s + r.mrr, 0) / repoResults.length;
-      const avgLat = repoResults.reduce((s, r) => s + r.latency_ms, 0) / repoResults.length;
-      repoSummaries.push({
-        repo: repo.name,
-        recall: avgRecall,
-        mrr: avgMrr,
-        latency_ms: avgLat,
-        count: repoResults.length,
-      });
-      printRepoRow(repo.name, profile.label, repoResults.length, avgRecall, avgMrr, avgLat);
-    }
+    const repoResults = allResults.slice(beforeCount);
+    if (repoResults.length > 0) printRepoRows(repo.name, profile.label, repoResults);
   }
 
-  // Aggregate
-  const aggregate: Record<
-    string,
-    { recalls: number[]; mrrs: number[]; lats: number[] }
-  > = {};
-  for (const r of allResults) {
-    if (!aggregate[r.mode])
-      aggregate[r.mode] = { recalls: [], mrrs: [], lats: [] };
-    aggregate[r.mode].recalls.push(r.recall_at_k);
-    aggregate[r.mode].mrrs.push(r.mrr);
-    aggregate[r.mode].lats.push(r.latency_ms);
-  }
-
-  const aggregateOut: Record<string, { recall: number; mrr: number; count: number; mean_latency_ms: number }> = {};
-  for (const [mode, data] of Object.entries(aggregate)) {
-    const n = data.recalls.length;
-    aggregateOut[mode] = {
-      recall: data.recalls.reduce((s, v) => s + v, 0) / n,
-      mrr: data.mrrs.reduce((s, v) => s + v, 0) / n,
-      count: n,
-      mean_latency_ms: data.lats.reduce((s, v) => s + v, 0) / n,
-    };
-  }
-
-  // By category
-  const byCategory: Record<string, Record<string, { recalls: number[]; mrrs: number[] }>> = {};
-  for (const r of allResults) {
-    if (!byCategory[r.category]) byCategory[r.category] = {};
-    if (!byCategory[r.category][r.mode])
-      byCategory[r.category][r.mode] = { recalls: [], mrrs: [] };
-    byCategory[r.category][r.mode].recalls.push(r.recall_at_k);
-    byCategory[r.category][r.mode].mrrs.push(r.mrr);
-  }
-  const byCategoryOut: Record<string, Record<string, { recall: number; mrr: number; count: number }>> = {};
-  for (const [cat, modes] of Object.entries(byCategory)) {
-    byCategoryOut[cat] = {};
-    for (const [mode, data] of Object.entries(modes)) {
-      const n = data.recalls.length;
-      byCategoryOut[cat][mode] = {
-        recall: data.recalls.reduce((s, v) => s + v, 0) / n,
-        mrr: data.mrrs.reduce((s, v) => s + v, 0) / n,
-        count: n,
-      };
-    }
-  }
-
-  // By repo
-  const byRepo: Record<string, Record<string, { recalls: number[]; mrrs: number[] }>> = {};
-  for (const r of allResults) {
-    if (!byRepo[r.repo_name]) byRepo[r.repo_name] = {};
-    if (!byRepo[r.repo_name][r.mode])
-      byRepo[r.repo_name][r.mode] = { recalls: [], mrrs: [] };
-    byRepo[r.repo_name][r.mode].recalls.push(r.recall_at_k);
-    byRepo[r.repo_name][r.mode].mrrs.push(r.mrr);
-  }
-  const byRepoOut: Record<string, Record<string, { recall: number; mrr: number; count: number }>> = {};
-  for (const [repo, modes] of Object.entries(byRepo)) {
-    byRepoOut[repo] = {};
-    for (const [mode, data] of Object.entries(modes)) {
-      const n = data.recalls.length;
-      byRepoOut[repo][mode] = {
-        recall: data.recalls.reduce((s, v) => s + v, 0) / n,
-        mrr: data.mrrs.reduce((s, v) => s + v, 0) / n,
-        count: n,
-      };
-    }
-  }
+  const aggregate = aggregateByMode(allResults);
+  const byCategory = aggregateNested(allResults, "category");
+  const byRepo = aggregateNested(allResults, "repo_name");
 
   const report: BenchReport = {
     timestamp: new Date().toISOString(),
-    profile: profileId,
+    profile: profile.id,
     profile_label: profile.label,
-    k,
-    binary: needsBinary ? binaryPath : profile.cliCommand || "",
-    embedding_model: profile.configurePayload?.model as string | undefined,
-    reranker_model: profile.rerankerConfig?.model,
+    k: opts.k,
+    binary: needsBinary ? binaryPath : profile.cliKind || "",
+    openai_stack: {
+      embedding: {
+        model: OPENAI_STACK.embedding.model,
+        base_url: OPENAI_STACK.embedding.baseUrl,
+        port: OPENAI_STACK.embedding.port,
+      },
+      reranker: {
+        model: OPENAI_STACK.reranker.model,
+        base_url: OPENAI_STACK.reranker.baseUrl,
+        port: OPENAI_STACK.reranker.port,
+        max_candidates: OPENAI_STACK.reranker.maxCandidates,
+      },
+    },
     results: allResults,
-    aggregate: aggregateOut,
-    by_category: byCategoryOut,
-    by_repo: byRepoOut,
+    aggregate,
+    by_category: byCategory,
+    by_repo: byRepo,
   };
 
-  writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
+  writeFileSync(resolve(opts.outputFile), `${JSON.stringify(report, null, 2)}\n`);
 
-  // ── Per-repo summary table ──
-  console.log(`\n── Per-repo results ──`);
-  console.log(`  ${"Repo".padEnd(12)} ${"Profile".padEnd(16)} ${"Queries".padStart(7)}  Recall    MRR       Latency`);
-  console.log(`  ${"─".repeat(12)} ${"─".repeat(16)} ${"─".repeat(7)}  ─────── ─────── ─────────`);
-  for (const rs of repoSummaries) {
-    printRepoRow(rs.repo, profile.label, rs.count, rs.recall, rs.mrr, rs.latency_ms);
-  }
+  console.log("\n── Per-repo results are printed inline above ──");
+  printSummaryTable(aggregate, opts.k, profile.id);
 
-  // ── Summary table ──
-  printSummaryTable(aggregateOut, k, profileId);
-
-  // ── By category ──
-  console.log(`\nBy category:`);
-  for (const [cat, modes] of Object.entries(byCategoryOut)) {
+  console.log("\nBy category:");
+  for (const [cat, modes] of Object.entries(byCategory)) {
     for (const [mode, data] of Object.entries(modes)) {
-      console.log(
-        `  ${cat}/${mode}: recall=${(data.recall * 100).toFixed(1)}% mrr=${data.mrr.toFixed(3)}`
-      );
+      console.log(`  ${cat}/${mode}: recall=${(data.recall * 100).toFixed(1)}% mrr=${data.mrr.toFixed(3)} count=${data.count}`);
     }
   }
 
-  console.log(`\nReport saved to ${outputFile}`);
+  console.log(`\nReport saved to ${opts.outputFile}`);
 }
 
 main().catch((err) => {
-  console.error("Fatal:", err);
+  console.error("Fatal:", err instanceof Error ? err.message : err);
   process.exit(1);
 });

@@ -25,6 +25,7 @@ A manually-triggered workflow builds the binary with all feature flags enabled:
 
 ```bash
 # Trigger the workflow
+gh workflow run build-aft.yml -f targets=windows -f branch=semantic-search-enhancement -f features=
 gh workflow run build-aft.yml --ref semantic-search-enhancement
 
 # Wait for completion, then download the artifact

@@ -124,7 +124,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --target aarch64-apple-darwin --features semantic-model2vec,semantic-fts5
 
       - name: Strip binary
         run: strip target/aarch64-apple-darwin/release/aft
@@ -154,7 +154,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release --target x86_64-apple-darwin --features semantic-model2vec,semantic-fts5
 
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
@@ -189,7 +189,7 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu
+        run: cross build --release --target aarch64-unknown-linux-gnu --features semantic-model2vec,semantic-fts5
 
       - uses: actions/upload-artifact@v4
         with:
@@ -220,7 +220,7 @@ jobs:
       # Native x64 build on Ubuntu runner — no cross-compilation needed.
       # Uses gnu target (not musl) so dlopen works for ONNX Runtime loading.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --features semantic-model2vec,semantic-fts5
 
       - uses: actions/upload-artifact@v4
         with:
@@ -248,7 +248,7 @@ jobs:
         shell: pwsh
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target x86_64-pc-windows-msvc --features semantic-model2vec,semantic-fts5
 
       - uses: actions/upload-artifact@v4
         with:
@@ -279,7 +279,7 @@ jobs:
         shell: pwsh
 
       - name: Build
-        run: cargo build --release --target aarch64-pc-windows-msvc
+        run: cargo build --release --target aarch64-pc-windows-msvc --features semantic-model2vec,semantic-fts5
 
       - uses: actions/upload-artifact@v4
         with:

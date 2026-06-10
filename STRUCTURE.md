@@ -23,6 +23,12 @@ opencode-aft/
 ├── docs/                      # User-facing documentation
 ├── assets/                    # Repository assets (banner image, etc.)
 ├── .github/workflows/         # CI and release automation workflows
+│   ├── _e2e-suite.yml         # Shared E2E test suite template
+│   ├── _unit-suite.yml        # Shared unit test suite template
+│   ├── build-aft.yml          # Manual binary build (workflow_dispatch)
+│   ├── e2e-iter.yml           # Fast E2E iteration (iter/** branches)
+│   ├── release.yml            # Tag-driven full release pipeline
+│   └── tests.yml              # Main CI entry point
 ├── Cargo.toml                 # Rust workspace manifest
 ├── package.json               # JavaScript workspace manifest
 ├── ARCHITECTURE.md            # Architecture documentation
@@ -58,9 +64,9 @@ opencode-aft/
 - Key files: `crates/aft/src/imports/mod.rs`, `crates/aft/src/imports/java.rs`, `crates/aft/src/imports/csharp.rs`, `crates/aft/src/imports/php.rs`, `crates/aft/src/imports/kotlin.rs`, `crates/aft/src/imports/scala.rs`, `crates/aft/src/imports/swift.rs`, `crates/aft/src/imports/ruby.rs`, `crates/aft/src/imports/lua.rs`, `crates/aft/src/imports/c.rs`, `crates/aft/src/imports/perl.rs`
 
 **`crates/aft/src/inspect/`:**
-- Purpose: Provide codebase-health scanning (dead code, unused exports, duplicates, metrics, TODOs, LSP diagnostics).
-- Contains: Scanner modules for each inspection category
-- Key files: `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`, `crates/aft/src/inspect/scanners/metrics.rs`, `crates/aft/src/inspect/scanners/todos.rs`
+- Purpose: Provide codebase-health scanning (dead code, unused exports, duplicates, metrics, TODOs, LSP diagnostics) with Tier 1 (inline) and Tier 2 (background, debounced) execution.
+- Contains: `InspectManager` (orchestration), `Tier2RefreshScheduler` (debounce/storm protection), `InspectWorker` (rayon parallel dispatch), `InspectCache` (persistent results), scanner modules for each category
+- Key files: `crates/aft/src/inspect/manager.rs`, `crates/aft/src/inspect/tier2_scheduler.rs`, `crates/aft/src/inspect/job.rs`, `crates/aft/src/inspect/dispatch.rs`, `crates/aft/src/inspect/cache.rs`, `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`
 
 **`crates/aft/src/lsp/`:**
 - Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
@@ -68,9 +74,9 @@ opencode-aft/
 - Key files: `crates/aft/src/lsp/manager.rs`, `crates/aft/src/lsp/client.rs`, `crates/aft/src/lsp/diagnostics.rs`
 
 **`crates/aft/src/bash_background/`:**
-- Purpose: Manage background bash tasks, PTY sessions, and output compression.
-- Contains: Process pool, PTY runtime, watchdog thread, persistence, buffer management
-- Key files: `crates/aft/src/bash_background/registry.rs`, `crates/aft/src/bash_background/process.rs`, `crates/aft/src/bash_background/pty_process.rs`, `crates/aft/src/bash_background/watchdog.rs`
+- Purpose: Manage background bash tasks, PTY sessions, output compression, and watch-pattern matching.
+- Contains: Process pool, PTY runtime, watchdog thread, persistence, output buffer management (`buffer.rs`), structured output snapshots (`output.rs`), watch-pattern notification (`watches.rs`)
+- Key files: `crates/aft/src/bash_background/registry.rs`, `crates/aft/src/bash_background/process.rs`, `crates/aft/src/bash_background/pty_process.rs`, `crates/aft/src/bash_background/watchdog.rs`, `crates/aft/src/bash_background/watches.rs`, `crates/aft/src/bash_background/buffer.rs`, `crates/aft/src/bash_background/output.rs`
 
 **`crates/aft/src/db/`:**
 - Purpose: Provide persistent SQLite-backed storage for backups, bash tasks, compression events, and state.
@@ -135,11 +141,11 @@ lugin/src/tools/hoisted.ts`
 
 ## Key File Locations
 
-**Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `.github/workflows/release.yml` -- drive tagged release publishing.
+**Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `.github/workflows/release.yml` -- drive tagged release publishing; `.github/workflows/build-aft.yml` -- manual binary build on selected platforms; `.github/workflows/e2e-iter.yml` -- fast E2E iteration on `iter/**` branches.
 
 **Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.).
 
-**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
+**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/callgraph_store/` -- persist callgraph data to SQLite generations; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/semantic_rerank.rs` -- LLM-based search reranker; `crates/aft/src/local_embed.rs` -- local ONNX embeddings (ort-driven); `crates/aft/src/vector_store.rs` -- pluggable vector storage; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/grep_executor.rs` -- grep scope resolution and dispatch; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners (Tier 1/2); `crates/aft/src/format.rs` -- formatter detection and execution; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/` -- plugin unit and e2e tests; `packages/pi-plugin/src/__tests__/` -- Pi plugin unit and e2e tests; `packages/aft-cli/src/__tests__/` -- CLI command tests; `packages/aft-bridge/src/__tests__/` -- bridge transport tests; `crates/aft/tests/integration/` -- Rust integration tests; `crates/aft/tests/semantic_test.rs` -- semantic index tests; `tests/docker/` -- Docker e2e; `tests/macos-e2e/` -- macOS e2e; `tests/windows-e2e/` -- Windows e2e; `tests/pi-rpc/` -- Pi RPC tests.
 
