@@ -248,31 +248,60 @@ interface Profile {
   supportsExternalRerank?: boolean;
 }
 
+function localBackendAftSemanticConfig(
+  backendConfig: Record<string, unknown>,
+  enableRerank: boolean,
+  rerankMaxCandidates: number,
+): Record<string, unknown> {
+  const config: Record<string, unknown> = {
+    ...backendConfig,
+    diagnostics_enabled: true,
+    rerank_enabled: enableRerank,
+  };
+
+  if (enableRerank) {
+    Object.assign(config, {
+      rerank_model: OPENAI_STACK.reranker.model,
+      rerank_base_url: OPENAI_STACK.reranker.baseUrl,
+      rerank_timeout_ms: OPENAI_STACK.reranker.timeoutMs,
+      rerank_max_candidates: rerankMaxCandidates,
+      rerank_api_type: "rerank",
+    });
+  }
+
+  return config;
+}
+
 const PROFILES: Record<string, Profile> = {
   a: {
     id: "a",
     label: "fastembed",
     description: "AFT fastembed backend — all-MiniLM-L6-v2",
     mode: "aft",
-    supportsRerank: false,
-    getAftSemanticConfig: () => ({
-      backend: "fastembed",
-      model: "all-MiniLM-L6-v2",
-      diagnostics_enabled: true,
-    }),
+    supportsRerank: true,
+    getAftSemanticConfig: (enableRerank: boolean, rerankMaxCandidates: number) =>
+      localBackendAftSemanticConfig(
+        { backend: "fastembed", model: "all-MiniLM-L6-v2" },
+        enableRerank,
+        rerankMaxCandidates,
+      ),
   },
   b: {
     id: "b",
     label: "model2vec",
     description: "AFT model2vec backend — Potion Code 16M [requires semantic-model2vec feature]",
     mode: "aft",
-    supportsRerank: false,
-    getAftSemanticConfig: () => ({
-      backend: "model2vec",
-      model: "minishlab/potion-code-16M",
-      model_path: envString("AFT_BENCH_MODEL2VEC_PATH", "D:/AI/LLM_models/potion-code-16M"),
-      diagnostics_enabled: true,
-    }),
+    supportsRerank: true,
+    getAftSemanticConfig: (enableRerank: boolean, rerankMaxCandidates: number) =>
+      localBackendAftSemanticConfig(
+        {
+          backend: "model2vec",
+          model: "minishlab/potion-code-16M",
+          model_path: envString("AFT_BENCH_MODEL2VEC_PATH", "D:/AI/LLM_models/potion-code-16M"),
+        },
+        enableRerank,
+        rerankMaxCandidates,
+      ),
     requiresFeature: "semantic-model2vec",
   },
   c: {
