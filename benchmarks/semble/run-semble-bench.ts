@@ -139,6 +139,7 @@ function openAiAftSemanticConfig(enableRerank: boolean): Record<string, unknown>
       rerank_base_url: OPENAI_STACK.reranker.baseUrl,
       rerank_timeout_ms: OPENAI_STACK.reranker.timeoutMs,
       rerank_max_candidates: OPENAI_STACK.reranker.maxCandidates,
+      rerank_api_type: "rerank", // cross-encoder models use /v1/rerank endpoint
     });
   }
 
