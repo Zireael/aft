@@ -18,7 +18,7 @@ opencode-aft/
 │   ├── macos-e2e/             # macOS end-to-end tests
 │   ├── pi-rpc/                # Pi RPC protocol tests
 │   └── windows-e2e/           # Windows end-to-end tests
-├── benchmarks/                # Performance benchmarks (search, compression, retrieval)
+├── benchmarks/                # Performance benchmarks (search, compression, retrieval, semantic)
 ├── scripts/                   # Release, validation, and version-management scripts
 ├── docs/                      # User-facing documentation
 ├── assets/                    # Repository assets (banner image, etc.)
@@ -33,7 +33,8 @@ opencode-aft/
 ├── package.json               # JavaScript workspace manifest
 ├── ARCHITECTURE.md            # Architecture documentation
 ├── STRUCTURE.md               # This file
-└── README.md                  # User-facing product and tool reference
+├── README.md                  # User-facing product and tool reference
+└── semantic-benchmark-dev-readme.md  # Dev guide for building and testing semantic search
 ```
 
 ## Directory Purposes
@@ -120,9 +121,19 @@ lugin/src/tools/hoisted.ts`
 - Key files: `packages/npm/darwin-arm64/package.json`, `packages/npm/darwin-x64/package.json`, `packages/npm/linux-arm64/package.json`, `packages/npm/linux-x64/package.json`, `packages/npm/win32-arm64/package.json`, `packages/npm/win32-x64/package.json`
 
 **`benchmarks/`:**
-- Purpose: Run benchmark scenarios for search, compression, and retrieval performance.
+- Purpose: Run benchmark scenarios for search, compression, retrieval, and semantic search performance.
 - Contains: Benchmark source files, configs, cached results, corpora data, package manifests
-- Key subdirectories: `benchmarks/src/`, `benchmarks/aft-search/`, `benchmarks/codegraph-replication/`, `benchmarks/codegraph-vs-aft-agent/`, `benchmarks/codegraph-vs-aft-retrieval/`, `benchmarks/compression-tokens/`
+- Key subdirectories: `benchmarks/src/`, `benchmarks/aft-search/`, `benchmarks/codegraph-replication/`, `benchmarks/codegraph-vs-aft-agent/`, `benchmarks/codegraph-vs-aft-retrieval/`, `benchmarks/compression-tokens/`, `benchmarks/semble/`, `benchmarks/settle-time/`
+
+**`benchmarks/semble/`:**
+- Purpose: Benchmark the `semble` semantic code search tool against baseline `rg` (ripgrep) across multi-profile test configurations.
+- Contains: Test profiles (a-f) with different reranking and retrieval strategies, ablation tests, pilot selection, corpus management, CI integration scripts, annotation fixtures, and profile result reports
+- Key files: `benchmarks/semble/run-semble-bench.ts`, `benchmarks/semble/pilot.ts`, `benchmarks/semble/ablation.ts`, `benchmarks/semble/baseline-rg.ts`, `benchmarks/semble/corpus.ts`
+
+**`benchmarks/settle-time/`:**
+- Purpose: Measure the settle time of AFT's file-watching and index-building after a fresh checkout or large file change.
+- Contains: Docker-based benchmark runner, Python benchmark script, and results documentation
+- Key files: `benchmarks/settle-time/run.sh`, `benchmarks/settle-time/run-benchmark.py`, `benchmarks/settle-time/Dockerfile`
 
 **`scripts/`:**
 - Purpose: Automate release, validation, and version synchronization tasks.

@@ -230,7 +230,7 @@
 **Release automation entry point:**
 - Location: `.github/workflows/release.yml`
 - Triggers: Git tag pushes matching `v*`
-- Responsibilities: Test the workspace, build platform binaries, publish crates and npm packages, and create a GitHub release
+- Responsibilities: Test the workspace, build platform binaries (all 6 platforms with `--features semantic-model2vec,semantic-fts5` to enable semantic search and local embeddings), publish crates and npm packages, and create a GitHub release
 
 **Manual build entry point:**
 - Location: `.github/workflows/build-aft.yml`

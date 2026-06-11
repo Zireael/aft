@@ -17,8 +17,7 @@ on:
     inputs:
       branch:
         description: "Git branch or tag to build from"
-        required: false
-        default: "main"
+        required: true
       features:
         description: "Cargo features to enable (comma-separated)"
         required: false
