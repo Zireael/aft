@@ -9,13 +9,16 @@
  * - Avoid silently claiming reranking is disabled when it is not.
  * - Keep CLI baselines separate, and apply optional explicit external reranking only
  *   when this script has enough result text to rerank.
+ * - Any profile can be augmented with an optional reranker pass via --rerank.
  *
  * Usage:
  *   bun run benchmarks/semble/run-semble-bench.ts [options]
  *
  * Options:
- *   --profile <id>              Profile to run: a,b,c,d,e,f,g (default: c)
+ *   --profile <id>              Profile to run: a,b,c,e,f (default: c)
  *   --k <n>                     Top-k for recall/MRR result collection (default: 10)
+ *   --rerank                    Enable reranker pass after embedding search
+ *   --rerank-candidates <n>     Number of candidates fed to reranker (default: 30)
  *   --cache-dir <dir>           Repo cache directory (default: .bench-cache)
  *   --output <file>             Output report path (default: semble-bench-report.json)
  *   --binary <path>             AFT binary path (default: auto-detect)
@@ -122,7 +125,7 @@ function rerankUrl(): string {
   return joinUrl(OPENAI_STACK.reranker.baseUrl, "/rerank");
 }
 
-function openAiAftSemanticConfig(enableRerank: boolean): Record<string, unknown> {
+function openAiAftSemanticConfig(enableRerank: boolean, rerankMaxCandidates: number = OPENAI_STACK.reranker.maxCandidates): Record<string, unknown> {
   const config: Record<string, unknown> = {
     backend: "openai_compatible",
     base_url: OPENAI_STACK.embedding.baseUrl,
@@ -138,7 +141,7 @@ function openAiAftSemanticConfig(enableRerank: boolean): Record<string, unknown>
       rerank_model: OPENAI_STACK.reranker.model,
       rerank_base_url: OPENAI_STACK.reranker.baseUrl,
       rerank_timeout_ms: OPENAI_STACK.reranker.timeoutMs,
-      rerank_max_candidates: OPENAI_STACK.reranker.maxCandidates,
+      rerank_max_candidates: rerankMaxCandidates,
       rerank_api_type: "rerank", // cross-encoder models use /v1/rerank endpoint
     });
   }
@@ -234,16 +237,15 @@ interface Profile {
   description: string;
   mode: ProfileMode;
   requiresEmbedding?: boolean;
-  requiresReranker?: boolean;
-  dual?: boolean;
   requiresFeature?: string;
 
-  // AFT profiles
-  getAftSemanticConfig?: (enableRerank: boolean) => Record<string, unknown>;
+  // AFT profiles — supportsRerank means the AFT binary can handle reranking internally
+  supportsRerank?: boolean;
+  getAftSemanticConfig?: (enableRerank: boolean, rerankMaxCandidates: number) => Record<string, unknown>;
 
-  // CLI profiles
+  // CLI profiles — supportsExternalRerank means the script can apply reranking after CLI search
   cliKind?: CliKind;
-  applyExternalRerank?: boolean;
+  supportsExternalRerank?: boolean;
 }
 
 const PROFILES: Record<string, Profile> = {
@@ -252,6 +254,7 @@ const PROFILES: Record<string, Profile> = {
     label: "fastembed",
     description: "AFT fastembed backend — all-MiniLM-L6-v2",
     mode: "aft",
+    supportsRerank: false,
     getAftSemanticConfig: () => ({
       backend: "fastembed",
       model: "all-MiniLM-L6-v2",
@@ -263,6 +266,7 @@ const PROFILES: Record<string, Profile> = {
     label: "model2vec",
     description: "AFT model2vec backend — Potion Code 16M [requires semantic-model2vec feature]",
     mode: "aft",
+    supportsRerank: false,
     getAftSemanticConfig: () => ({
       backend: "model2vec",
       model: "minishlab/potion-code-16M",
@@ -277,17 +281,9 @@ const PROFILES: Record<string, Profile> = {
     description: `AFT OpenAI-compatible embedding — ${OPENAI_STACK.embedding.model} @ ${OPENAI_STACK.embedding.baseUrl}`,
     mode: "aft",
     requiresEmbedding: true,
-    getAftSemanticConfig: () => openAiAftSemanticConfig(false),
-  },
-  d: {
-    id: "d",
-    label: "openai-embed+rerank",
-    description: `AFT OpenAI-compatible embedding + rerank — ${OPENAI_STACK.embedding.model} + ${OPENAI_STACK.reranker.model}`,
-    mode: "aft",
-    requiresEmbedding: true,
-    requiresReranker: true,
-    dual: true,
-    getAftSemanticConfig: (enableRerank: boolean) => openAiAftSemanticConfig(enableRerank),
+    supportsRerank: true,
+    getAftSemanticConfig: (enableRerank: boolean, rerankMaxCandidates: number) =>
+      openAiAftSemanticConfig(enableRerank, rerankMaxCandidates),
   },
   e: {
     id: "e",
@@ -295,6 +291,7 @@ const PROFILES: Record<string, Profile> = {
     description: "Semble CLI baseline — no centralized OpenAI embedding injected by this script",
     mode: "cli",
     cliKind: "semble",
+    supportsExternalRerank: true,
   },
   f: {
     id: "f",
@@ -302,15 +299,7 @@ const PROFILES: Record<string, Profile> = {
     description: "colgrep CLI baseline — no centralized OpenAI embedding injected by this script",
     mode: "cli",
     cliKind: "colgrep",
-  },
-  g: {
-    id: "g",
-    label: "semble+central-rerank",
-    description: `Semble CLI baseline + explicit centralized rerank — ${OPENAI_STACK.reranker.model} @ ${OPENAI_STACK.reranker.baseUrl}`,
-    mode: "cli",
-    cliKind: "semble",
-    requiresReranker: true,
-    applyExternalRerank: true,
+    supportsExternalRerank: true,
   },
 };
 
@@ -327,6 +316,8 @@ interface Options {
   allowRerankDegrade: boolean;
   skipHealth: boolean;
   failFast: boolean;
+  rerank: boolean;
+  rerankCandidates: number;
 }
 
 function printUsage(): void {
@@ -336,6 +327,8 @@ function printUsage(): void {
 Options:
   --profile <id>              Profile to run: ${Object.keys(PROFILES).join(",")} (default: c)
   --k <n>                     Top-k for recall/MRR result collection (default: 10)
+  --rerank                    Enable reranker pass after embedding search
+  --rerank-candidates <n>     Number of candidates fed to reranker (default: ${OPENAI_STACK.reranker.maxCandidates})
   --cache-dir <dir>           Repo cache directory (default: .bench-cache)
   --output <file>             Output report path (default: semble-bench-report.json)
   --binary <path>             AFT binary path (default: auto-detect)
@@ -349,6 +342,12 @@ Central OpenAI-compatible stack:
   embedding URL:   ${embeddingUrl()}
   reranker model:  ${OPENAI_STACK.reranker.model}
   rerank URL:      ${rerankUrl()}
+
+Reranker behavior:
+  When --rerank is enabled, the benchmark fetches --rerank-candidates results
+  from the embedding model, feeds them to the reranker, and evaluates recall
+  on the top --k reranked results. Without --rerank, only --k results are
+  fetched and evaluated directly.
 `);
 }
 
@@ -362,6 +361,8 @@ function parseArgs(argv: string[]): Options {
     allowRerankDegrade: false,
     skipHealth: false,
     failFast: false,
+    rerank: false,
+    rerankCandidates: OPENAI_STACK.reranker.maxCandidates,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -381,6 +382,12 @@ function parseArgs(argv: string[]): Options {
         break;
       case "--profile":
         opts.profileId = requireValue(argv[++i], "--profile");
+        break;
+      case "--rerank":
+        opts.rerank = true;
+        break;
+      case "--rerank-candidates":
+        opts.rerankCandidates = parsePositiveInt(argv[++i], "--rerank-candidates");
         break;
       case "--allow-rerank-degrade":
         opts.allowRerankDegrade = true;
@@ -868,7 +875,7 @@ async function checkProfileHealth(profile: Profile, opts: Options): Promise<{ re
     }
   }
 
-  if (profile.requiresReranker) {
+  if (opts.rerank && (profile.supportsRerank || profile.supportsExternalRerank)) {
     const reranker = await pingReranker();
     if (reranker.ok) {
       console.log(`  Reranker  (${OPENAI_STACK.reranker.model} @ ${rerankUrl()}): ✓ reachable`);
@@ -885,8 +892,8 @@ async function checkProfileHealth(profile: Profile, opts: Options): Promise<{ re
   return { rerankAvailable };
 }
 
-async function rerankResults(query: string, results: SearchResult[], topN: number, repoDir: string): Promise<SearchResult[]> {
-  const candidates = results.slice(0, Math.min(results.length, OPENAI_STACK.reranker.maxCandidates));
+async function rerankResults(query: string, results: SearchResult[], topN: number, maxCandidates: number, repoDir: string): Promise<SearchResult[]> {
+  const candidates = results.slice(0, Math.min(results.length, maxCandidates));
   if (candidates.length <= 1) return results;
 
   const documents = candidates.map((result) => result.content || readCandidateContent(repoDir, result.file));
@@ -1235,6 +1242,18 @@ async function main(): Promise<void> {
   console.log(`Central embedding: ${OPENAI_STACK.embedding.model} @ ${embeddingUrl()}`);
   console.log(`Central reranker:  ${OPENAI_STACK.reranker.model} @ ${rerankUrl()}`);
 
+  // Validate rerank options
+  if (opts.rerank) {
+    if (!profile.supportsRerank && !profile.supportsExternalRerank) {
+      throw new Error(`Profile "${profile.id}" does not support reranking. Use profiles c, e, or f with --rerank.`);
+    }
+    if (opts.rerankCandidates < opts.k) {
+      console.warn(`  WARNING: --rerank-candidates (${opts.rerankCandidates}) < --k (${opts.k}). Adjusting to ${opts.k}.`);
+      opts.rerankCandidates = opts.k;
+    }
+    console.log(`  Rerank: enabled (${opts.rerankCandidates} candidates → top ${opts.k})`);
+  }
+
   const health = await checkProfileHealth(profile, opts);
 
   let binaryPath = opts.binaryPath;
@@ -1264,7 +1283,7 @@ async function main(): Promise<void> {
     for (const ann of anns) allAnnotations.push({ ...ann, repo_name: repo.name });
   }
 
-  console.log(`\nRunning Semble benchmark: ${allAnnotations.length} queries across ${fixture.repos.length} repos (k=${opts.k}, profile=${profile.id})`);
+  console.log(`\nRunning Semble benchmark: ${allAnnotations.length} queries across ${fixture.repos.length} repos (k=${opts.k}, profile=${profile.id}${opts.rerank ? `, rerank candidates=${opts.rerankCandidates}` : ""})`);
 
   const allResults: BenchResult[] = [];
 
@@ -1291,39 +1310,25 @@ async function main(): Promise<void> {
       if (profile.mode === "aft") {
         if (!profile.getAftSemanticConfig) throw new Error(`AFT profile ${profile.id} has no semantic config factory`);
 
-        if (profile.dual) {
-          const preRows = await runAftPass({
+        if (opts.rerank && profile.supportsRerank && health.rerankAvailable) {
+          const rows = await runAftPass({
             binaryPath,
             repo,
             repoDir: searchRoot,
             annotations: repoAnnotations,
-            semanticConfig: profile.getAftSemanticConfig(false),
-            passLabel: "pre-rerank",
-            modeLabel: "aft",
+            semanticConfig: profile.getAftSemanticConfig(true, opts.rerankCandidates),
+            passLabel: "rerank",
+            modeLabel: `${profile.label}+rerank`,
             k: opts.k,
           });
-          allResults.push(...preRows);
-
-          if (health.rerankAvailable) {
-            const postRows = await runAftPass({
-              binaryPath,
-              repo,
-              repoDir,
-              annotations: repoAnnotations,
-              semanticConfig: profile.getAftSemanticConfig(true),
-              passLabel: "post-rerank",
-              modeLabel: "aft+rerank",
-              k: opts.k,
-            });
-            allResults.push(...postRows);
-          }
+          allResults.push(...rows);
         } else {
           const rows = await runAftPass({
             binaryPath,
             repo,
             repoDir: searchRoot,
             annotations: repoAnnotations,
-            semanticConfig: profile.getAftSemanticConfig(false),
+            semanticConfig: profile.getAftSemanticConfig(false, 0),
             passLabel: "single-pass",
             modeLabel: profile.label,
             k: opts.k,
@@ -1332,17 +1337,19 @@ async function main(): Promise<void> {
         }
       } else {
         if (!profile.cliKind) throw new Error(`CLI profile ${profile.id} has no cliKind`);
+        const fetchK = opts.rerank && profile.supportsExternalRerank ? opts.rerankCandidates : opts.k;
+
         for (const ann of repoAnnotations) {
           const relevant = buildRelevantPaths(ann);
           const start = performance.now();
           const raw = profile.cliKind === "semble"
-            ? sembleSearch(ann.query, searchRoot, null, opts.k)
-            : colgrepSearch(ann.query, searchRoot, null, opts.k);
+            ? sembleSearch(ann.query, searchRoot, null, fetchK)
+            : colgrepSearch(ann.query, searchRoot, null, fetchK);
 
           let results = raw.results;
           let latency = raw.latency_ms;
-          if (profile.applyExternalRerank && health.rerankAvailable) {
-            results = await rerankResults(ann.query, results, opts.k, searchRoot);
+          if (opts.rerank && profile.supportsExternalRerank && health.rerankAvailable) {
+            results = await rerankResults(ann.query, results, opts.k, opts.rerankCandidates, searchRoot);
             latency = performance.now() - start;
           }
 
@@ -1378,7 +1385,7 @@ async function main(): Promise<void> {
         model: OPENAI_STACK.reranker.model,
         base_url: OPENAI_STACK.reranker.baseUrl,
         port: OPENAI_STACK.reranker.port,
-        max_candidates: OPENAI_STACK.reranker.maxCandidates,
+        max_candidates: opts.rerankCandidates,
       },
     },
     results: allResults,
