@@ -3008,12 +3008,18 @@ impl SemanticIndex {
         embed_fn: &mut F,
         max_batch_size: usize,
         mut progress: Option<&mut P>,
+        max_embed_tokens: usize,
+        chunk_overlap_tokens: usize,
     ) -> Result<SemanticIndexSnapshot, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
         debug_assert!(project_root.is_absolute());
+
+        // Chunk large symbols to prevent HTTP 400 errors on remote backends.
+        // Local backends (Fastembed, Model2Vec) already truncate internally.
+        let chunks = chunk_large_embed_texts(chunks, max_embed_tokens, chunk_overlap_tokens);
         let total_chunks = chunks.len();
 
         if chunks.is_empty() {
@@ -3109,6 +3115,8 @@ impl SemanticIndex {
             embed_fn,
             max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
+            512, // max_embed_tokens default
+            100, // chunk_overlap_tokens default
         )?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
@@ -3205,6 +3213,8 @@ impl SemanticIndex {
             embed_fn,
             max_batch_size,
             Some(progress),
+            512, // max_embed_tokens default
+            100, // chunk_overlap_tokens default
         )?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
@@ -5644,6 +5654,139 @@ fn truncate_snippet(text: &str) -> String {
         let mut truncated: String = s.chars().take(197).collect();
         truncated.push_str("...");
         truncated
+    }
+}
+
+/// Chunk large embed texts to prevent HTTP 400 errors on remote backends.
+///
+/// Splits chunks whose `embed_text` exceeds `max_embed_tokens` (estimated as
+/// chars / 4) at paragraph boundaries with configurable overlap. This only
+/// affects remote backends — local backends (Fastembed, Model2Vec) already
+/// truncate internally via `tokenizers::Tokenizer` with `max_length`.
+fn chunk_large_embed_texts(
+    chunks: Vec<SemanticChunk>,
+    max_embed_tokens: usize,
+    chunk_overlap_tokens: usize,
+) -> Vec<SemanticChunk> {
+    if max_embed_tokens == 0 {
+        return chunks;
+    }
+
+    // Convert token limit to character limit (approximate: 1 token ≈ 4 chars)
+    let max_chars = max_embed_tokens * 4;
+    let overlap_chars = chunk_overlap_tokens * 4;
+
+    let mut result = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.embed_text.len() <= max_chars {
+            result.push(chunk);
+        } else {
+            result.extend(split_chunk_with_overlap(&chunk, max_chars, overlap_chars));
+        }
+    }
+    result
+}
+
+/// Split a chunk into smaller chunks at paragraph boundaries with overlap.
+///
+/// Each chunk includes the last `overlap_chars` of the previous chunk to
+/// preserve boundary context. The first chunk retains the original name;
+/// subsequent chunks get " (cont.)" suffix.
+fn split_chunk_with_overlap(
+    chunk: &SemanticChunk,
+    max_chars: usize,
+    overlap_chars: usize,
+) -> Vec<SemanticChunk> {
+    let mut result = Vec::new();
+    let mut current_body = String::new();
+    let mut chunk_start = chunk.start_line;
+    let mut current_lines: u32 = 0;
+    let mut prev_tail: Option<String> = None;
+
+    for para in chunk.embed_text.split("\n\n") {
+        // Check if adding this paragraph would exceed the limit
+        let test_len = if let Some(ref tail) = prev_tail {
+            tail.len() + 2 + para.len() // +2 for "\n\n"
+        } else {
+            current_body.len() + if current_body.is_empty() { 0 } else { 2 } + para.len()
+        };
+
+        if !current_body.is_empty() && test_len > max_chars {
+            // Flush current sub-chunk
+            let body = current_body.trim().to_string();
+            result.push(SemanticChunk {
+                file: chunk.file.clone(),
+                name: if result.is_empty() {
+                    chunk.name.clone()
+                } else {
+                    format!("{} (cont.)", chunk.name)
+                },
+                kind: chunk.kind.clone(),
+                start_line: chunk_start,
+                end_line: chunk_start + current_lines,
+                exported: false,
+                embed_text: body.clone(),
+                snippet: truncate_snippet(&body),
+            });
+
+            // Save overlap tail for next chunk
+            prev_tail = Some(extract_tail(&current_body, overlap_chars));
+            chunk_start += current_lines;
+            current_body.clear();
+            current_lines = 0;
+        }
+
+        // Prepend overlap from previous chunk
+        if let Some(ref tail) = prev_tail {
+            if !current_body.is_empty() {
+                current_body.push_str("\n\n");
+            }
+            current_body.push_str(tail);
+            current_body.push_str("\n\n");
+            prev_tail = None;
+        }
+
+        if !current_body.is_empty() {
+            current_body.push_str("\n\n");
+        }
+        current_body.push_str(para);
+        current_lines += para.lines().count() as u32;
+    }
+
+    if !current_body.trim().is_empty() {
+        let body = current_body.trim().to_string();
+        result.push(SemanticChunk {
+            file: chunk.file.clone(),
+            name: if result.is_empty() {
+                chunk.name.clone()
+            } else {
+                format!("{} (cont.)", chunk.name)
+            },
+            kind: chunk.kind.clone(),
+            start_line: chunk_start,
+            end_line: chunk_start + current_lines,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    result
+}
+
+/// Extract the last `max_chars` from text, breaking at a paragraph boundary.
+fn extract_tail(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+
+    // Find the last paragraph boundary before max_chars
+    let truncated = &text[..text.floor_char_boundary(max_chars)];
+    if let Some(last_para) = truncated.rfind("\n\n") {
+        text[last_para + 2..].to_string()
+    } else {
+        // No paragraph boundary found; just take the tail
+        truncated.to_string()
     }
 }
 

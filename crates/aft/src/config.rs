@@ -249,6 +249,14 @@ pub struct SemanticBackendConfig {
     /// Max characters per candidate snippet sent to reranker (default: 2500).
     #[serde(default = "default_rerank_max_candidate_chars")]
     pub rerank_max_candidate_chars: usize,
+    /// Reranker API format: `"chat"` for LLM-based chat completions (default),
+    /// `"rerank"` for cross-encoder `/v1/rerank` endpoints (e.g. GTE-Reranker-Modernbert).
+    #[serde(default = "default_rerank_api_type")]
+    pub rerank_api_type: RerankApiType,
+    /// Max characters per candidate snippet for cross-encoder rerankers (default: 512).
+    /// Cross-encoders have tighter context windows than chat models.
+    #[serde(default = "default_rerank_max_candidate_chars_cross_encoder")]
+    pub rerank_max_candidate_chars_cross_encoder: usize,
     /// Local filesystem path to a model2vec model directory (e.g. `minishlab/potion-code-16M`).
     /// Required when `backend = "model2vec"`. Must contain `config.json`, `tokenizer.json`,
     /// and `model.safetensors`. No remote downloads are performed.
@@ -268,6 +276,17 @@ pub struct SemanticBackendConfig {
     /// embedding memory on huge project roots; remote backends can raise it.
     #[serde(default = "default_max_semantic_files")]
     pub max_files: usize,
+    /// Max tokens per embedding request for remote backends (default: 512).
+    /// When a symbol exceeds this limit, it is chunked before embedding.
+    /// Local backends (Fastembed, Model2Vec) already truncate internally.
+    /// Per-model defaults: text-embedding-3-small: 8191, text-embedding-ada-002: 8191,
+    /// BAAI/bge-large-en: 512. Set to 0 to disable chunking.
+    #[serde(default = "default_max_embed_tokens")]
+    pub max_embed_tokens: usize,
+    /// Number of overlapping tokens between chunks when splitting large symbols (default: 100).
+    /// Overlap preserves boundary context across chunks.
+    #[serde(default = "default_chunk_overlap_tokens")]
+    pub chunk_overlap_tokens: usize,
 }
 
 /// How much diagnostic detail to include in the tool output text.
@@ -307,12 +326,46 @@ fn default_rerank_max_candidate_chars() -> usize {
     2500
 }
 
+/// Reranker API format type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankApiType {
+    /// LLM-based chat completions endpoint (`/v1/chat/completions`).
+    /// Expects JSON array of indices in `choices[0].message.content`.
+    Chat,
+    /// Cross-encoder rerank endpoint (`/v1/rerank`).
+    /// Expects `{results: [{index, relevance_score}]}` or provider variants.
+    Rerank,
+}
+
+impl Default for RerankApiType {
+    fn default() -> Self {
+        Self::Chat
+    }
+}
+
+fn default_rerank_api_type() -> RerankApiType {
+    RerankApiType::Chat
+}
+
+fn default_rerank_max_candidate_chars_cross_encoder() -> usize {
+    512
+}
+
 fn default_model2vec_max_length() -> usize {
     512
 }
 
 fn default_max_results_per_file() -> usize {
     2
+}
+
+fn default_max_embed_tokens() -> usize {
+    512
+}
+
+fn default_chunk_overlap_tokens() -> usize {
+    100
 }
 
 fn default_max_semantic_files() -> usize {
