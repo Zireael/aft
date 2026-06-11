@@ -775,6 +775,35 @@ fn parse_semantic_config(
         semantic.max_files = usize::try_from(max_files)
             .map_err(|_| "configure: semantic.max_files is too large".to_string())?;
     }
+    if let Some(raw) = obj.get("model_path") {
+        semantic.model_path = if raw.is_null() {
+            None
+        } else {
+            let s = raw
+                .as_str()
+                .ok_or_else(|| {
+                    "configure: semantic.model_path must be a string or null".to_string()
+                })?
+                .trim();
+            if s.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(s);
+                if !path.exists() {
+                    return Err(format!(
+                        "configure: semantic.model_path does not exist: {}",
+                        path.display()
+                    ));
+                }
+                Some(path)
+            }
+        };
+    }
+    if let Some(raw) = obj.get("model2vec_max_length") {
+        semantic.model2vec_max_length = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.model2vec_max_length must be an unsigned integer".to_string()
+        })? as usize;
+    }
 
     Ok(semantic)
 }
