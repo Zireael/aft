@@ -701,6 +701,20 @@ fn parse_semantic_config(
             "configure: semantic.rerank_max_candidate_chars is too large".to_string()
         })?;
     }
+    if let Some(raw) = obj.get("rerank_api_type") {
+        let s = raw
+            .as_str()
+            .ok_or_else(|| "configure: semantic.rerank_api_type must be a string".to_string())?;
+        semantic.rerank_api_type = match s {
+            "chat" => crate::config::RerankApiType::Chat,
+            "rerank" => crate::config::RerankApiType::Rerank,
+            _ => {
+                return Err(format!(
+                    "configure: unknown semantic.rerank_api_type \"{s}\" (expected \"chat\" or \"rerank\")"
+                ));
+            }
+        };
+    }
     if let Some(raw) = obj.get("jsonl_logging") {
         semantic.jsonl_logging = raw
             .as_bool()
