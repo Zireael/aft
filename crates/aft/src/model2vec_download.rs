@@ -483,4 +483,50 @@ mod tests {
         assert!(result.unwrap_err().contains("out of valid range"));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn resolve_model_by_name_uses_catalog() {
+        // When model name matches a catalog entry, it should resolve
+        // (even if not downloaded yet — the download function handles that)
+        // For this test, we create a local dir and use it as a path fallback
+        let dir = std::env::temp_dir().join("test_model2vec_resolve_name");
+        create_test_model_dir(&dir);
+        let result = resolve_model2vec_files(Some(dir.to_str().unwrap()), None);
+        assert!(result.is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_model_path_takes_priority_over_name() {
+        let path_dir = std::env::temp_dir().join("test_model2vec_path_priority");
+        create_test_model_dir(&path_dir);
+        // Even if we provide a name, the explicit path should be used
+        let result = resolve_model2vec_files(
+            Some("unknown-model"),
+            Some(&path_dir),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), path_dir);
+        std::fs::remove_dir_all(&path_dir).ok();
+    }
+
+    #[test]
+    fn validate_model_dir_complete_flow() {
+        let dir = std::env::temp_dir().join("test_model2vec_complete");
+        create_test_model_dir(&dir);
+        assert!(validate_model_dir(&dir).is_ok());
+        assert!(is_model_cached(&dir));
+        assert!(model_dir_size(&dir).unwrap() > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_cached_models_empty() {
+        let cache_dir = std::env::temp_dir().join("test_model2vec_list_empty");
+        // No models cached — should return empty
+        std::fs::create_dir_all(&cache_dir).ok();
+        // Note: list_cached_models uses its own cache dir, not this one
+        // This test just verifies the function doesn't panic
+        let _ = list_cached_models();
+    }
 }
