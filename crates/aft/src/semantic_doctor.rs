@@ -225,6 +225,7 @@ mod tests {
                 probed_dimension: Some(384),
                 error: None,
             },
+            model2vec_health: None,
             warnings: vec![],
             suggestions: vec![Suggestion {
                 label: "all_clear".into(),

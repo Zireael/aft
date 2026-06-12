@@ -283,6 +283,71 @@ pub fn remove_cached_model(repo_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Metadata about a downloaded model.
+#[derive(Debug, Clone)]
+pub struct ModelVersionInfo {
+    /// The repo ID (e.g., "minishlab/potion-code-16M")
+    pub repo_id: String,
+    /// Path to the model directory
+    pub model_dir: PathBuf,
+    /// Download timestamp (seconds since epoch)
+    pub downloaded_at: u64,
+    /// File sizes in bytes
+    pub total_size_bytes: u64,
+}
+
+/// Get version information about a cached model.
+pub fn get_model_version_info(repo_id: &str) -> Option<ModelVersionInfo> {
+    let cache_dir = model2vec_cache_dir();
+    let model_dir = cache_dir.join(model_name_to_dir_name(repo_id));
+
+    if !is_model_cached(&model_dir) {
+        return None;
+    }
+
+    let downloaded_at = std::fs::metadata(&model_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let total_size_bytes = model_dir_size(&model_dir).unwrap_or(0);
+
+    Some(ModelVersionInfo {
+        repo_id: repo_id.to_string(),
+        model_dir,
+        downloaded_at,
+        total_size_bytes,
+    })
+}
+
+/// Check if a model update might be available.
+///
+/// Since HuggingFace models are identified by git revisions, a simple
+/// heuristic is: if the model was downloaded more than 30 days ago,
+/// suggest checking for updates. This avoids network calls.
+pub fn check_for_update(repo_id: &str) -> Option<String> {
+    let info = get_model_version_info(repo_id)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let age_days = (now.saturating_sub(info.downloaded_at)) / 86400;
+
+    if age_days > 30 {
+        Some(format!(
+            "Model {} was downloaded {} days ago. Consider checking for updates: \
+             delete the cached model and re-download to get the latest version.",
+            repo_id, age_days
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +593,17 @@ mod tests {
         // Note: list_cached_models uses its own cache dir, not this one
         // This test just verifies the function doesn't panic
         let _ = list_cached_models();
+    }
+
+    #[test]
+    fn get_model_version_info_returns_none_for_missing() {
+        let result = get_model_version_info("nonexistent/model");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_for_update_returns_none_for_missing() {
+        let result = check_for_update("nonexistent/model");
+        assert!(result.is_none());
     }
 }
