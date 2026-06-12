@@ -151,7 +151,6 @@ fn rerank_chat(
         ],
         "temperature": 0.0,
         "max_tokens": 1024,
-        "response_format": { "type": "json_object" }
     });
 
     let start = Instant::now();

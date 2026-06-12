@@ -542,19 +542,27 @@ fn handle_semantic_or_hybrid_search(
     let has_semantic = !semantic_results.is_empty();
     let has_lexical = !lexical.files.is_empty();
     let max_results_per_file = ctx.config().semantic.max_results_per_file;
+    // When reranking is enabled, overfetch candidates through fusion so the
+    // reranker sees the full pool (up to rerank_max_candidates) rather than
+    // only the final top_k.  Truncation to top_k happens after reranking.
+    let rerank_enabled = ctx.config().semantic.rerank_enabled;
+    let fusion_limit = if rerank_enabled {
+        ctx.config().semantic.rerank_max_candidates.max(top_k)
+    } else {
+        top_k
+    };
     let fusion_timer = PhaseTimer::start();
     let mut results = fuse_hybrid_results(
         semantic_results,
         lexical.files,
         &shape,
-        top_k.saturating_add(1),
+        fusion_limit.saturating_add(1),
         max_results_per_file,
     );
     let hybrid_fusion_latency_ms = fusion_timer.stop();
-    let fused_more_available = results.len() > top_k;
-    if fused_more_available {
-        results.truncate(top_k);
-    }
+    let fused_more_available = results.len() > fusion_limit;
+    // Do NOT truncate to top_k here — the reranker needs the full pool.
+    // Truncation happens after reranking (or after the rerank block).
     let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
     let pipeline_type = match (has_semantic, has_lexical) {
         (true, true) => SearchPipelineType::Hybrid,
@@ -613,6 +621,10 @@ fn handle_semantic_or_hybrid_search(
             results
         }
     };
+
+    // Truncate to top_k after reranking so the reranker sees the full pool
+    // but the caller only receives the requested number of results.
+    results.truncate(top_k);
 
     let scores: Vec<f32> = results.iter().map(|result| result.score).collect();
     let low_conf_threshold = ctx.config().semantic.low_confidence_threshold;
