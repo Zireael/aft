@@ -63,10 +63,10 @@
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
-- Purpose: Parse code, compute call graphs, persist callgraph state, apply edits, format files, manage imports, index code semantically and with trigrams, rerank search results, generate embeddings locally, and provide AST-grep integration.
+- Purpose: Parse code, compute call graphs, persist callgraph state, apply edits, format files, manage imports, index code semantically and with trigrams, rerank search results (chat-based or cross-encoder), generate embeddings locally, chunk large symbols for embedding overflow, and provide AST-grep integration.
 - Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_eval.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, callgraph computation and persistence (SQLite-backed with generational snapshots), semantic embedding index, trigram search index, LLM-based search reranker, local ONNX embedding (ort-driven, replacing fastembed), pluggable vector storage (flat f32 / binary Hamming), search diagnostics and health reports, disk-backed symbol cache, AST-grep integration, grep scope resolution and execution pipeline
-- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (via `ort`), OpenAI-compatible chat endpoints (reranker), SQLite (callgraph store), the `tokenizers` crate (local embed)
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, callgraph computation and persistence (SQLite-backed with generational snapshots), semantic embedding index with overflow chunking for large symbols, trigram search index, dual-mode search reranker (chat-based LLM and cross-encoder `/v1/rerank` endpoints), local ONNX embedding (ort-driven, replacing fastembed), pluggable vector storage (flat f32 / binary Hamming), search diagnostics and health reports, disk-backed symbol cache, AST-grep integration, grep scope resolution and execution pipeline
+- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (via `ort`), OpenAI-compatible chat and rerank endpoints (reranker), SQLite (callgraph store), the `tokenizers` crate (local embed)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
@@ -101,8 +101,9 @@
 1. Index project files with trigram-based search index -- `crates/aft/src/search_index.rs`
 2. Optionally index with dense embeddings (local ONNX ort-driven, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`
 3. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/commands/semantic_search.rs`
-4. Optionally rerank search results via LLM for improved relevance -- `crates/aft/src/semantic_rerank.rs`
-5. Track search pipeline decisions for diagnostics -- `crates/aft/src/semantic_diagnostics.rs`
+4. Optionally rerank search results via LLM chat completions or cross-encoder `/v1/rerank` endpoints -- `crates/aft/src/semantic_rerank.rs`
+5. For remote backends, chunk large symbol embeddings that exceed `max_embed_tokens` to prevent HTTP 400 errors -- `crates/aft/src/semantic_index.rs`
+6. Track search pipeline decisions for diagnostics -- `crates/aft/src/semantic_diagnostics.rs`
 
 **Bash execution flow:**
 
@@ -173,12 +174,12 @@
 **SemanticIndex:**
 - Purpose: Provide dense-embedding semantic search across the project.
 - Location: `crates/aft/src/semantic_index.rs`
-- Pattern: Optional index backed by local ONNX (`crates/aft/src/local_embed.rs` — orth-driven, replacing fastembed), OpenAI-compatible, or Ollama embeddings. Vector storage is pluggable via `VectorStore` trait (`crates/aft/src/vector_store.rs` — flat f32 cosine and binary Hamming backends). Configurable `max_files` cap.
+- Pattern: Optional index backed by local ONNX (`crates/aft/src/local_embed.rs` — orth-driven, replacing fastembed), OpenAI-compatible, or Ollama embeddings. Vector storage is pluggable via `VectorStore` trait (`crates/aft/src/vector_store.rs` — flat f32 cosine and binary Hamming backends). Configurable `max_files` cap. For remote backends, symbols exceeding `max_embed_tokens` are split into overlapping chunks (`chunk_overlap_tokens`) to prevent HTTP 400 errors; local backends (Fastembed, Model2Vec) truncate internally.
 
 **SemanticReranker:**
-- Purpose: Re-rank semantic search results using an OpenAI-compatible chat endpoint for improved relevance.
+- Purpose: Re-rank semantic search results using an OpenAI-compatible endpoint for improved relevance. Supports two API formats: `chat` (LLM-based, `/v1/chat/completions` with a ranking prompt) and `rerank` (cross-encoder, `/v1/rerank` for models like GTE-Reranker-Modernbert served via vLLM, TEI, or llama.cpp).
 - Location: `crates/aft/src/semantic_rerank.rs`
-- Pattern: Sends candidate chunks with a ranking prompt; falls back to original order on any error. The `SearchPipeline` diagnostic module (`crates/aft/src/semantic_diagnostics.rs`) tracks which pipeline path (lexical, semantic, hybrid, rerank, lexical-fallback) served each query.
+- Pattern: Dispatches based on `RerankApiType` (config field `rerank_api_type`). Chat mode sends candidate chunks with a ranking prompt; cross-encoder mode sends `{model, query, documents, top_n}`. Falls back to original order on any error. Cross-encoder mode uses shorter snippets (`rerank_max_candidate_chars_cross_encoder`, default 512). The `SearchPipeline` diagnostic module (`crates/aft/src/semantic_diagnostics.rs`) tracks which pipeline path (lexical, semantic, hybrid, rerank, lexical-fallback) served each query.
 
 **BgTaskRegistry:**
 - Purpose: Manage background bash tasks, PTY sessions, and output watch patterns.
