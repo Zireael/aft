@@ -2547,7 +2547,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
                                     &semantic_files,
-                                    semantic_config.document_prompt_template.as_deref(),
+                                    semantic_config.effective_document_prompt_template().as_deref(),
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2673,7 +2673,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             semantic_config.max_batch_size.max(1),
                             &mut progress,
                             &semantic_files,
-                            semantic_config.document_prompt_template.as_deref(),
+                            semantic_config.effective_document_prompt_template().as_deref(),
                         )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
@@ -2760,7 +2760,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             semantic_config.max_batch_size.max(1),
                             semantic_config.max_files,
                             semantic_files.clone(),
-                            semantic_config.document_prompt_template.clone(),
+                            semantic_config.effective_document_prompt_template(),
                             refresh_rx,
                             refresh_event_tx,
                             log_ctx::current_session(),

@@ -1282,7 +1282,10 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<(Vec<f32>, bool), String
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
     let (query_vector, query_cache_hit) = model
-        .embed_query_cached(query, semantic_config.query_prompt_template.as_deref())
+        .embed_query_cached(
+            query,
+            semantic_config.effective_query_prompt_template().as_deref(),
+        )
         .map_err(|error| format!("failed to embed query: {error}"))?;
 
     if let Some(index) = ctx.semantic_index().borrow().as_ref() {

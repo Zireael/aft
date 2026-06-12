@@ -196,6 +196,11 @@ pub struct SemanticBackendConfig {
     /// Example: "Represent this code snippet for retrieval: {text}"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_prompt_template: Option<String>,
+    /// When true (default), AFT auto-detects the embedding model and applies
+    /// built-in query/document prefixes for known models (E5, CodeRankEmbed,
+    /// BGE, etc.) when no manual template is set. Set to false to disable.
+    #[serde(default = "default_true")]
+    pub use_model_profiles: bool,
     /// Enable per-query search diagnostics collection (default: false).
     #[serde(default)]
     pub diagnostics_enabled: bool,
@@ -311,6 +316,10 @@ fn default_low_confidence_threshold() -> f32 {
     0.3
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_jsonl_retention_days() -> u32 {
     14
 }
@@ -413,6 +422,40 @@ impl SemanticBackendConfig {
 
     pub fn output_mode(&self) -> DiagnosticsOutputMode {
         self.output_mode
+    }
+
+    /// Resolve the effective query prompt template.
+    /// Returns the user's explicit template if set, otherwise falls back to
+    /// the built-in model profile prefix when `use_model_profiles` is true.
+    pub fn effective_query_prompt_template(&self) -> Option<String> {
+        if let Some(ref tpl) = self.query_prompt_template {
+            return Some(tpl.clone());
+        }
+        if self.use_model_profiles {
+            if let Some(profile) = crate::semantic_index::resolve_embedding_profile(&self.model) {
+                if !profile.query_prefix.is_empty() {
+                    return Some(format!("{}{{query}}", profile.query_prefix));
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the effective document prompt template.
+    /// Returns the user's explicit template if set, otherwise falls back to
+    /// the built-in model profile prefix when `use_model_profiles` is true.
+    pub fn effective_document_prompt_template(&self) -> Option<String> {
+        if let Some(ref tpl) = self.document_prompt_template {
+            return Some(tpl.clone());
+        }
+        if self.use_model_profiles {
+            if let Some(profile) = crate::semantic_index::resolve_embedding_profile(&self.model) {
+                if !profile.document_prefix.is_empty() {
+                    return Some(format!("{}{{text}}", profile.document_prefix));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -570,6 +613,7 @@ impl Default for SemanticBackendConfig {
             distance_metric: None,
             query_prompt_template: None,
             document_prompt_template: None,
+            use_model_profiles: true,
             diagnostics_enabled: false,
             low_confidence_threshold: 0.3,
             metrics_window_size: 100,

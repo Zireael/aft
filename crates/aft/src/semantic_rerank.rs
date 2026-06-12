@@ -280,7 +280,13 @@ fn rerank_cross_encoder(
     let max_chars = config.rerank_max_candidate_chars_cross_encoder;
     let documents: Vec<String> = candidates
         .iter()
-        .map(|r| r.snippet.chars().take(max_chars).collect::<String>())
+        .map(|r| {
+            let snippet = r.snippet.chars().take(max_chars).collect::<String>();
+            format!("{} {}:{}-{}", r.file.display(), r.name, r.start_line, r.end_line)
+                + " \""
+                + &snippet
+                + "\""
+        })
         .collect();
 
     let body = serde_json::json!({

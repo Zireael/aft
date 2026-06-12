@@ -817,6 +817,124 @@ pub fn apply_document_template(text: &str, template: Option<&str>) -> String {
     }
 }
 
+/// Built-in prompt profile for a known embedding model.
+/// When a model matches a profile, its query/document prefixes are applied
+/// automatically unless the user has set explicit templates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingPromptProfile {
+    /// Prefix prepended to queries before embedding (e.g. "query: " for E5).
+    pub query_prefix: &'static str,
+    /// Prefix prepended to document chunks before embedding (e.g. "passage: " for E5).
+    pub document_prefix: &'static str,
+}
+
+/// Resolve an embedding prompt profile from a model name.
+/// Returns None for unknown models (no prefix applied).
+pub fn resolve_embedding_profile(model: &str) -> Option<&'static EmbeddingPromptProfile> {
+    // Normalize: lowercase, strip common path prefixes
+    let normalized = model
+        .to_lowercase()
+        .replace('\\', "/")
+        .replace("nomic-ai/", "")
+        .replace("intfloat/", "")
+        .replace("BAAI/", "")
+        .replace("Alibaba-NLP/", "")
+        .replace("jinaai/", "");
+
+    static PROFILES: &[(&str, EmbeddingPromptProfile)] = &[
+        // CodeRankEmbed — requires query prefix for code search
+        (
+            "coderankerembed",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this query for searching relevant code: ",
+                document_prefix: "",
+            },
+        ),
+        // E5 / multilingual-E5 — requires "query: " / "passage: " prefixes
+        (
+            "e5-base",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "e5-large",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "e5-small",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "multilingual-e5",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        // BGE v1.5 — optional query instruction, no document prefix
+        (
+            "bge-base-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        (
+            "bge-large-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        (
+            "bge-small-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        // BGE-M3 — no prefixes needed
+        (
+            "bge-m3",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+        // GTE ModernBERT — no prefixes needed
+        (
+            "gte-modernbert",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+        // GTE-Reranker-ModernBERT — no prefixes (reranker, not embedder)
+        (
+            "gte-reranker-modernbert",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+    ];
+
+    for (pattern, profile) in PROFILES {
+        if normalized.contains(pattern) {
+            return Some(profile);
+        }
+    }
+    None
+}
+
 /// Compute a stable hash for a prompt template.
 /// Returns empty string when the template is None or empty/whitespace-only,
 /// so that `None` and `Some("")` produce identical fingerprints and avoid
@@ -6547,6 +6665,7 @@ mod tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -6652,6 +6771,7 @@ mod tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -6729,6 +6849,7 @@ mod tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8051,6 +8172,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8126,6 +8248,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8180,6 +8303,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8240,6 +8364,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8303,6 +8428,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8359,6 +8485,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -9363,7 +9490,6 @@ mod fingerprint_invalidation_tests {
 
     #[test]
     fn collect_chunks_applies_document_prompt_template() {
-        use std::path::PathBuf;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.rs");
         std::fs::write(&file, "fn hello() { world() }").unwrap();
@@ -9386,7 +9512,6 @@ mod fingerprint_invalidation_tests {
 
     #[test]
     fn collect_chunks_no_prefix_when_template_none() {
-        use std::path::PathBuf;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.rs");
         std::fs::write(&file, "fn hello() { world() }").unwrap();
@@ -9401,6 +9526,44 @@ mod fingerprint_invalidation_tests {
                 &chunk.embed_text[..50.min(chunk.embed_text.len())]
             );
         }
+    }
+
+    #[test]
+    fn resolve_embedding_profile_coderankerembed() {
+        let profile = resolve_embedding_profile("nomic-ai/CodeRankEmbed");
+        assert!(profile.is_some());
+        let p = profile.unwrap();
+        assert!(p.query_prefix.contains("query for searching relevant code"));
+        assert_eq!(p.document_prefix, "");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_e5_base() {
+        let profile = resolve_embedding_profile("intfloat/e5-base-v2");
+        assert!(profile.is_some());
+        let p = profile.unwrap();
+        assert_eq!(p.query_prefix, "query: ");
+        assert_eq!(p.document_prefix, "passage: ");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_bge_m3() {
+        let profile = resolve_embedding_profile("BAAI/bge-m3");
+        assert!(profile.is_some());
+        let p = profile.unwrap();
+        assert_eq!(p.query_prefix, "");
+        assert_eq!(p.document_prefix, "");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_unknown_returns_none() {
+        assert!(resolve_embedding_profile("some-random-model").is_none());
+    }
+
+    #[test]
+    fn resolve_embedding_profile_case_insensitive() {
+        let profile = resolve_embedding_profile("intfloat/E5-BASE-V2");
+        assert!(profile.is_some());
     }
 
     #[test]
@@ -10335,6 +10498,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -10465,6 +10629,7 @@ mod fingerprint_invalidation_tests {
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
             rerank_prompt_template: None,
+            use_model_profiles: true,
             model_path: Some(PathBuf::from("/any/path")),
             model2vec_max_length: 512,
             max_results_per_file: 2,
