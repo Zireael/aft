@@ -67,13 +67,28 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
         return trim_matches;
     }
 
-    // Pass 4: normalized Unicode + trim
+    // Pass 4: normalized Unicode + trim. Normalize each line once instead of
+    // allocating inside the O(haystack_lines × needle_lines) comparison loop.
+    let normalized_haystack_lines: Vec<String> = haystack_lines
+        .iter()
+        .map(|line| normalize_unicode(line.trim()))
+        .collect();
+    let normalized_needle_lines: Vec<String> = needle_lines
+        .iter()
+        .map(|line| normalize_unicode(line.trim()))
+        .collect();
+    let normalized_haystack_refs: Vec<&str> = normalized_haystack_lines
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let normalized_needle_refs: Vec<&str> =
+        normalized_needle_lines.iter().map(String::as_str).collect();
     let normalized_matches = find_line_matches(
-        &haystack_lines,
-        &needle_lines,
+        &normalized_haystack_refs,
+        &normalized_needle_refs,
         &line_byte_offsets,
         haystack,
-        |a, b| normalize_unicode(a.trim()) == normalize_unicode(b.trim()),
+        |a, b| a == b,
         4,
     );
     normalized_matches
@@ -192,6 +207,17 @@ mod tests {
         let matches = find_all_fuzzy(source, needle);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pass, 4); // unicode pass
+    }
+
+    #[test]
+    fn test_unicode_normalize_multiline_variants() {
+        let source = "alpha\n  let title = \u{201C}hello\u{201D}\u{2026}\n  let slug = foo\u{2014}bar\u{00A0}baz\nomega\n";
+        let needle = "let title = \"hello\"...\nlet slug = foo-bar baz";
+        let matches = find_all_fuzzy(source, needle);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].pass, 4);
+        assert_eq!(matches[0].byte_start, source.find("  let title").unwrap());
     }
 
     #[test]

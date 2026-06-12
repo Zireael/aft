@@ -33,9 +33,11 @@ import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 
-const DIAGNOSTICS_PARAM_DESCRIPTION =
-  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
-
+// Diagnostics on edit are config-driven only (`lsp.diagnostics_on_edit`).
+// There is deliberately NO per-call `diagnostics` param: agents never used it,
+// and the agent-facing diagnostics paths are the status bar (passive,
+// automatic E/W on tool results) and aft_inspect (active pull). The config
+// knob remains for users whose models won't call aft_inspect.
 function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
   return ctx.config.lsp?.diagnostics_on_edit ?? false;
 }
@@ -160,7 +162,6 @@ const WriteParams = Type.Object({
     description: "Path to the file to write (absolute or relative to project root)",
   }),
   content: Type.String({ description: "Full file contents to write" }),
-  diagnostics: Type.Optional(Type.Boolean({ description: DIAGNOSTICS_PARAM_DESCRIPTION })),
 });
 
 const EditParams = Type.Object({
@@ -179,7 +180,6 @@ const EditParams = Type.Object({
         "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
     }),
   ),
-  diagnostics: Type.Optional(Type.Boolean({ description: DIAGNOSTICS_PARAM_DESCRIPTION })),
 });
 
 const GrepParams = Type.Object({
@@ -318,9 +318,8 @@ export function registerHoistedTools(
       name: "write",
       label: "write",
       description:
-        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
-      promptSnippet:
-        "Create or overwrite files (uses filePath; auto-formats; diagnostics follow lsp.diagnostics_on_edit unless overridden)",
+        "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety) and auto-formatted when the project has a formatter configured. Uses `filePath` (not `path`). For partial edits, use the `edit` tool.",
+      promptSnippet: "Create or overwrite files (uses filePath; auto-formats)",
       promptGuidelines: ["Use write only for new files or complete rewrites."],
       parameters: WriteParams,
       async execute(
@@ -345,7 +344,7 @@ export function registerHoistedTools(
           {
             file: filePath,
             content: params.content,
-            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            diagnostics: diagnosticsOnEditDefault(ctx),
             include_diff_content: true,
           },
           extCtx,
@@ -366,9 +365,9 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`.",
       promptSnippet:
-        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics follow lsp.diagnostics_on_edit unless overridden.",
+        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing).",
       promptGuidelines: [
         "Prefer edit over write when changing part of an existing file.",
         "Include enough surrounding context in oldString to make the match unique, or set replaceAll/occurrence explicitly.",
@@ -400,7 +399,7 @@ export function registerHoistedTools(
             op: "append",
             file: filePath,
             append_content: params.appendContent,
-            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+            diagnostics: diagnosticsOnEditDefault(ctx),
             include_diff_content: true,
           };
           const response = await callBridge(bridge, "edit_match", req, extCtx);
@@ -411,7 +410,7 @@ export function registerHoistedTools(
           file: filePath,
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
-          diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
+          diagnostics: diagnosticsOnEditDefault(ctx),
           include_diff_content: true,
         };
         if (params.replaceAll === true) req.replace_all = true;

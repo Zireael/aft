@@ -4,6 +4,7 @@ import {
   _resetSessionDirectoryCacheForTest,
   getSessionDirectory,
   getSessionDirectoryCached,
+  verifySessionDirectory,
   warmSessionDirectory,
 } from "../shared/session-directory.js";
 
@@ -191,6 +192,72 @@ describe("session-directory", () => {
     warmSessionDirectory(client, undefined, "/cwd");
     warmSessionDirectory(client, "", "/cwd");
     expect(calls).toBe(0);
+  });
+});
+
+describe("verifySessionDirectory (cross-project serve gate)", () => {
+  test("returns the SDK-confirmed directory", async () => {
+    const client = {
+      session: {
+        get: async () => ({ data: { directory: "/real/project" } }),
+      },
+    };
+    expect(await verifySessionDirectory(client, "ses_v1")).toBe("/real/project");
+  });
+
+  test("returns null on SDK failure and does NOT memoize the failure", async () => {
+    let calls = 0;
+    const client = {
+      session: {
+        get: async () => {
+          calls++;
+          if (calls === 1) throw new Error("transient");
+          return { data: { directory: "/recovered" } };
+        },
+      },
+    };
+    expect(await verifySessionDirectory(client, "ses_v2")).toBeNull();
+    // Next poll retries instead of serving a memoized failure.
+    expect(await verifySessionDirectory(client, "ses_v2")).toBe("/recovered");
+    expect(calls).toBe(2);
+  });
+
+  test("does not trust the warm cache: poisoned cached entry is ignored", async () => {
+    // Seed the long-lived cache with a WRONG mapping (the poisoning scenario:
+    // a fallback-seeded warm in a multi-project host).
+    const poisoner = {
+      session: { get: async () => ({ data: { directory: "/wrong/project" } }) },
+    };
+    await getSessionDirectory(poisoner, "ses_v3", "/cwd");
+    expect(getSessionDirectoryCached("ses_v3")).toBe("/wrong/project");
+
+    // verify must do a FRESH lookup, not read the poisoned cache.
+    const truth = {
+      session: { get: async () => ({ data: { directory: "/right/project" } }) },
+    };
+    expect(await verifySessionDirectory(truth, "ses_v3")).toBe("/right/project");
+    // And it heals the long-lived cache with the SDK truth.
+    expect(getSessionDirectoryCached("ses_v3")).toBe("/right/project");
+  });
+
+  test("memoizes successful verification within the TTL", async () => {
+    let calls = 0;
+    const client = {
+      session: {
+        get: async () => {
+          calls++;
+          return { data: { directory: "/memo" } };
+        },
+      },
+    };
+    await verifySessionDirectory(client, "ses_v4");
+    await verifySessionDirectory(client, "ses_v4");
+    expect(calls).toBe(1);
+  });
+
+  test("returns null for empty session id and clients without session.get", async () => {
+    expect(await verifySessionDirectory({}, "")).toBeNull();
+    expect(await verifySessionDirectory({}, "ses_v5")).toBeNull();
   });
 });
 

@@ -32,10 +32,11 @@ fn is_binary(content: &[u8]) -> bool {
 ///   - `limit` (u32, optional) — max lines to return (default: 2000)
 ///
 /// Returns for files:
-///   `{ content, complete, total_lines, lines_read, start_line, end_line, truncated, byte_size }`
+///   `{ content, complete, total_lines?, lines_read, start_line, end_line, truncated, byte_size }`
 ///
-/// `complete` is false whenever the returned content is a slice/truncated; in
-/// that case `truncated`, `total_lines`, and the returned range describe the gap.
+/// `complete` is false whenever the returned content is a slice/truncated. Full
+/// reads report exact `total_lines`; explicit ranged reads omit `total_lines`
+/// when they stop after the one-line lookahead and therefore do not know EOF.
 ///
 /// Returns for directories:
 ///   `{ entries[], total_entries }`
@@ -323,6 +324,7 @@ fn handle_streaming_range_read(
     let mut selected_lines = Vec::new();
     let mut observed_lines = 0u32;
     let mut invalid_utf8 = false;
+    let mut has_more_after_range = false;
     let reader = std::io::BufReader::new(file);
 
     for (index, line_result) in reader.lines().enumerate() {
@@ -345,6 +347,10 @@ fn handle_streaming_range_read(
         if index >= requested_start_idx && index < requested_end_idx {
             selected_lines.push(line);
         }
+        if index >= requested_end_idx {
+            has_more_after_range = true;
+            break;
+        }
     }
 
     if invalid_utf8 {
@@ -359,20 +365,24 @@ fn handle_streaming_range_read(
         );
     }
 
+    let exact_total_lines = (!has_more_after_range).then_some(observed_lines);
+
     if selected_lines.is_empty() {
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "content": "",
-                "complete": true,
-                "total_lines": observed_lines,
-                "lines_read": 0,
-                "start_line": start_line,
-                "end_line": start_line,
-                "truncated": false,
-                "byte_size": byte_size as usize,
-            }),
-        );
+        let mut data = serde_json::json!({
+            "content": "",
+            "complete": true,
+            "lines_read": 0,
+            "start_line": start_line,
+            "end_line": start_line,
+            "truncated": false,
+            "byte_size": byte_size as usize,
+        });
+        if let Some(total_lines) = exact_total_lines {
+            data.as_object_mut()
+                .expect("read response data is an object")
+                .insert("total_lines".to_string(), serde_json::json!(total_lines));
+        }
+        return Response::success(&req.id, data);
     }
 
     let mut output = String::new();
@@ -410,22 +420,25 @@ fn handle_streaming_range_read(
     }
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
-    let has_more = requested_start_idx > 0 || (requested_end_idx as u32) < observed_lines;
+    let has_more = requested_start_idx > 0 || has_more_after_range;
     let truncated = has_more || truncated_by_size;
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "content": output,
-            "complete": !truncated,
-            "total_lines": observed_lines,
-            "lines_read": lines_read,
-            "start_line": start_line,
-            "end_line": actual_end,
-            "truncated": truncated,
-            "byte_size": byte_size as usize,
-        }),
-    )
+    let mut data = serde_json::json!({
+        "content": output,
+        "complete": !truncated,
+        "lines_read": lines_read,
+        "start_line": start_line,
+        "end_line": actual_end,
+        "truncated": truncated,
+        "byte_size": byte_size as usize,
+    });
+    if let Some(total_lines) = exact_total_lines {
+        data.as_object_mut()
+            .expect("read response data is an object")
+            .insert("total_lines".to_string(), serde_json::json!(total_lines));
+    }
+
+    Response::success(&req.id, data)
 }
 
 /// Handle directory listing.

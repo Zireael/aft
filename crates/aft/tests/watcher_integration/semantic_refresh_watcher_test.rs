@@ -609,6 +609,7 @@ fn semantic_refresh_defers_new_files_when_max_files_cap_is_reached() {
             1,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh should succeed while deferring the new file");
 

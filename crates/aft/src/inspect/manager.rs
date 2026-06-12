@@ -12,14 +12,11 @@ use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::ContributionFreshness;
 use super::job::{
-    normalize_path, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution,
-    InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
-    JobOutcome, JobScope, DISPATCHED_CALLEE_SEPARATOR,
+    normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
+    InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
-use super::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::callgraph::{is_bare_callee, resolve_symbol_query_in_data, CallGraph, EdgeResolution};
-use crate::symbols::SymbolKind;
+use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -606,8 +603,8 @@ impl InspectManager {
             Err(message) => InspectResult::failed(&job, message, started.elapsed()),
         };
         // Always-on perf line: a full (reuse=miss) scan is the expensive path —
-        // for dead_code it includes the callgraph snapshot rebuild. ms here lets
-        // us attribute background CPU bursts to a specific category from the log.
+        // for dead_code it includes store snapshot projection plus the scanner.
+        // ms here lets us attribute background CPU bursts to a specific category from the log.
         crate::slog_info!(
             "perf tier2 category={} reuse=miss ms={}",
             job.category,
@@ -723,10 +720,7 @@ impl InspectManager {
             if scan_job.category == InspectCategory::DeadCode
                 && scan_job.callgraph_snapshot.is_none()
             {
-                scan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(
-                    &scan_job.project_root,
-                    scan_job.config.max_callgraph_files,
-                );
+                scan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&scan_job);
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
@@ -797,10 +791,7 @@ impl InspectManager {
                 if rescan_job.category == InspectCategory::DeadCode
                     && rescan_job.callgraph_snapshot.is_none()
                 {
-                    rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(
-                        &rescan_job.project_root,
-                        rescan_job.config.max_callgraph_files,
-                    );
+                    rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&rescan_job);
                 }
                 let scan_result = run_tier2_scan(&rescan_job);
                 let scan_success = scan_result.outcome.map_err(|message| {
@@ -839,10 +830,7 @@ impl InspectManager {
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            aggregate_job.callgraph_snapshot = build_tier2_callgraph_snapshot(
-                &aggregate_job.project_root,
-                aggregate_job.config.max_callgraph_files,
-            );
+            aggregate_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&aggregate_job);
         }
         let contributions = load_contributions(cache, &aggregate_job)?;
         let aggregate = roll_up_tier2_contributions(&aggregate_job, &contributions);
@@ -1179,204 +1167,82 @@ fn log_tier2_benchmark_category_end(result: &InspectResult) {
     }
 }
 
-fn build_tier2_callgraph_snapshot(
-    project_root: &Path,
-    max_callgraph_files: usize,
-) -> Option<Arc<CallgraphSnapshot>> {
+fn build_tier2_callgraph_snapshot(job: &InspectJob) -> Option<Arc<CallgraphSnapshot>> {
     let started = Instant::now();
-    let mut graph = CallGraph::new(project_root.to_path_buf());
-    let graph_files = graph.project_files().to_vec();
-    // Interim #86 guard: the per-file parse + cross-file resolve loop below is the
-    // unbounded multi-core CPU sink on large repos (the interactive call graph already
-    // self-caps at the same threshold). Skipping above the cap returns None, which
-    // dead_code surfaces honestly as `callgraph_available: false` rather than a partial
-    // (silently-corrupt) graph. The file-discovery walk above is cheap; the parse loop is
-    // the cost we avoid. `--force`/UNCAPPED (1e9) keeps full builds for benchmarks.
-    if graph_files.len() > max_callgraph_files {
+    if !job.config.callgraph_store {
         crate::slog_info!(
-            "tier2 dead_code: skipping callgraph snapshot — {} files exceeds max_callgraph_files={}; reporting dead_code as callgraph_unavailable (raise lsp.max_callgraph_files or scope the repo)",
-            graph_files.len(),
-            max_callgraph_files
+            "tier2 dead_code: callgraph store disabled; reporting callgraph_unavailable"
         );
         return None;
     }
 
-    // Prewarm the parse in ONE bounded-parallel pass before the per-file loop
-    // below. Without this, the loop's `graph.build_file(file)` calls parse every
-    // project file SEQUENTIALLY on this single thread (N× slower). Prewarm makes
-    // each `build_file` a cache hit; the parse runs on a bounded half-cores pool
-    // (not the global all-cores pool — avoids starving the bridge). Bounded by
-    // the same max_callgraph_files cap already checked above.
-    if let Err(error) = graph.prewarm_project_files(max_callgraph_files) {
+    let Some(callgraph_dir) = callgraph_store_dir_from_inspect_dir(&job.inspect_dir) else {
         crate::slog_info!(
-            "tier2 dead_code: callgraph prewarm bailed ({error}); reporting callgraph_unavailable"
+            "tier2 dead_code: inspect_dir has no harness parent ({}); reporting callgraph_unavailable",
+            job.inspect_dir.display()
         );
         return None;
-    }
-    if tier2_benchmark_logging_enabled() {
-        crate::slog_info!(
-            "settle bench: tier2_callgraph_snapshot_start files={}",
-            graph_files.len()
-        );
-    }
-    // Canonicalize each file ONCE (std::fs::canonicalize is a realpath syscall —
-    // disk I/O per call, slow on large repos / Windows). Previously this ran
-    // twice per file: once to build `files` and again as `snapshot_file` inside
-    // the loop, i.e. 2*N syscalls. Compute once here and reuse via zip below so
-    // it is N syscalls. (Behavior identical — same canonical value; we are NOT
-    // changing WHETHER we canonicalize, only removing the redundant call.)
-    let files = graph_files
-        .iter()
-        .map(canonicalize_for_snapshot)
-        .collect::<Vec<_>>();
-    let resolved_entry_points = super::entry_points::resolve_entry_points(project_root);
+    };
 
-    let mut exported_symbols = Vec::new();
-    let mut outbound_calls = Vec::new();
-    let mut entry_points = BTreeSet::new();
-    let mut built_files = 0usize;
-
-    for (file, snapshot_file) in graph_files.iter().zip(files.iter()) {
-        if is_entry_point_file(&resolved_entry_points, snapshot_file) {
-            entry_points.insert(snapshot_file.clone());
+    let store = match CallGraphStore::open_readonly(callgraph_dir.clone(), job.project_root.clone())
+    {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            crate::slog_info!(
+                "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); reporting callgraph_unavailable",
+                callgraph_dir.display()
+            );
+            return None;
         }
-
-        let file_data = match graph.build_file(file) {
-            Ok(file_data) => file_data.clone(),
-            Err(_) => continue,
-        };
-        built_files += 1;
-
-        for symbol in &file_data.exported_symbols {
-            let metadata = file_data.symbol_metadata_for(symbol);
-            exported_symbols.push(CallgraphExport {
-                file: snapshot_file.clone(),
-                symbol: symbol.clone(),
-                kind: metadata
-                    .map(|metadata| symbol_kind_name(&metadata.kind))
-                    .unwrap_or("unknown")
-                    .to_string(),
-                line: metadata.map(|metadata| metadata.line).unwrap_or(1),
-            });
+        Err(error) => {
+            crate::slog_warn!(
+                "tier2 dead_code: failed to open callgraph store at {}: {}; reporting callgraph_unavailable",
+                callgraph_dir.display(),
+                error
+            );
+            return None;
         }
+    };
 
-        if let Some(default_symbol) = &file_data.default_export_symbol {
-            let metadata = file_data.symbol_metadata_for(default_symbol);
-            exported_symbols.push(CallgraphExport {
-                file: snapshot_file.clone(),
-                symbol: default_symbol.clone(),
-                kind: DEFAULT_EXPORT_MARKER_KIND.to_string(),
-                line: metadata.map(|metadata| metadata.line).unwrap_or(1),
-            });
+    let snapshot = match project_dead_code_snapshot(store.sqlite_path()) {
+        Ok(snapshot) => snapshot,
+        Err(CallGraphStoreError::Unavailable(message)) => {
+            crate::slog_info!(
+                "tier2 dead_code: callgraph store projection unavailable ({}); reporting callgraph_unavailable",
+                message
+            );
+            return None;
         }
-
-        for (caller_symbol, calls) in &file_data.calls_by_symbol {
-            for call in calls {
-                let target = match graph.resolve_cross_file_edge(
-                    &call.full_callee,
-                    &call.callee_name,
-                    file,
-                    &file_data.import_block,
-                ) {
-                    EdgeResolution::Resolved { file, symbol } => {
-                        let file = canonicalize_for_snapshot(&file);
-                        format!("{}::{symbol}", file.display())
-                    }
-                    // Unresolved cross-file edge. Before falling back to a bare
-                    // callee name, try to resolve it to a symbol DEFINED IN THE
-                    // SAME FILE (private functions included) — mirroring
-                    // build_reverse_index. This is what makes a local call like
-                    // `main()` -> `dispatch()` resolve to `main.rs::dispatch`
-                    // (the private command router) instead of leaking a bare
-                    // `dispatch` that dead_code then misresolves to an unrelated
-                    // exported `dispatch` in another file. Without this, liveness
-                    // breaks at every private same-file intermediary.
-                    EdgeResolution::Unresolved { callee_name } => {
-                        if is_bare_callee(&call.full_callee, &callee_name) {
-                            match resolve_symbol_query_in_data(&file_data, file, &callee_name) {
-                                Ok(symbol) => {
-                                    format!("{}::{symbol}", snapshot_file.display())
-                                }
-                                Err(_) => callee_name,
-                            }
-                        } else {
-                            callee_name
-                        }
-                    }
-                };
-                let target = if is_method_dispatch_callee(&call.full_callee, &call.callee_name) {
-                    format!("{target}{DISPATCHED_CALLEE_SEPARATOR}{}", call.full_callee)
-                } else {
-                    target
-                };
-                outbound_calls.push(CallgraphOutboundCall {
-                    caller_file: snapshot_file.clone(),
-                    caller_symbol: caller_symbol.clone(),
-                    target,
-                    line: call.line,
-                });
-            }
+        Err(error) => {
+            crate::slog_warn!(
+                "tier2 dead_code: callgraph store projection failed: {}; reporting callgraph_unavailable",
+                error
+            );
+            return None;
         }
-    }
+    };
 
-    // Always-on perf line: this full from-scratch parse of every project file is
-    // the multi-core CPU spike behind tier2 dead_code (it does NOT yet reuse the
-    // persisted incremental CallgraphStore). Logged unconditionally (only fires
-    // when a snapshot actually builds, so it is not per-request spam) so we can
-    // attribute background CPU bursts from the live log.
     crate::slog_info!(
-        "perf tier2_callgraph_snapshot: files={} built={} exports={} edges={} entry_points={} ms={}",
-        graph_files.len(),
-        built_files,
-        exported_symbols.len(),
-        outbound_calls.len(),
-        entry_points.len(),
+        "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
+        snapshot.files.len(),
+        snapshot.exported_symbols.len(),
+        snapshot.outbound_calls.len(),
+        snapshot.entry_points.len(),
         started.elapsed().as_millis()
     );
 
-    Some(Arc::new(CallgraphSnapshot {
-        generated_at: Some(SystemTime::now()),
-        files,
-        exported_symbols,
-        outbound_calls,
-        entry_points,
-    }))
+    Some(Arc::new(snapshot))
 }
 
-fn canonicalize_for_snapshot(path: &PathBuf) -> PathBuf {
+fn callgraph_store_dir_from_inspect_dir(inspect_dir: &Path) -> Option<PathBuf> {
+    inspect_dir
+        .parent()
+        .map(|harness_dir| harness_dir.join("callgraph"))
+}
+
+#[cfg(test)]
+fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
-}
-
-fn is_entry_point_file(entry_points: &super::entry_points::EntryPointSet, file: &Path) -> bool {
-    entry_points.is_entry_point(file)
-}
-
-fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
-    let full_callee = full_callee.trim();
-    if !full_callee.contains('.') || full_callee == callee_name.trim() {
-        return false;
-    }
-
-    full_callee
-        .rsplit('.')
-        .next()
-        .map(|segment| segment.trim().trim_start_matches('?') == callee_name.trim())
-        .unwrap_or(false)
-}
-
-fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Method => "method",
-        SymbolKind::Class => "class",
-        SymbolKind::Struct => "struct",
-        SymbolKind::Interface => "interface",
-        SymbolKind::Enum => "enum",
-        SymbolKind::TypeAlias => "type_alias",
-        SymbolKind::Variable => "variable",
-        SymbolKind::Heading => "heading",
-        SymbolKind::FileSummary => "file_summary",
-    }
 }
 
 fn load_contribution_fingerprint(
@@ -2204,27 +2070,73 @@ mod guard_tests {
         );
     }
 
+    fn snapshot_job(root: &Path, inspect_dir: &Path, callgraph_store: bool) -> InspectJob {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: Vec::new(),
+            project_root: root.to_path_buf(),
+            inspect_dir: inspect_dir.to_path_buf(),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                callgraph_store,
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            callgraph_snapshot: None,
+        }
+    }
+
     #[test]
-    fn callgraph_snapshot_skips_above_max_callgraph_files() {
-        // Interim #86 guard: above the cap, the expensive parse loop is skipped and
-        // None is returned (dead_code then reports callgraph_available: false).
+    fn callgraph_snapshot_reports_unavailable_when_store_disabled() {
         let dir = write_ts_project(3);
-        let snapshot = build_tier2_callgraph_snapshot(dir.path(), 1);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+
+        let snapshot = build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, false));
+
         assert!(
             snapshot.is_none(),
-            "3 files with max=1 must skip the snapshot build"
+            "dead_code must not rebuild the legacy graph when the store is disabled"
         );
     }
 
     #[test]
-    fn callgraph_snapshot_builds_at_or_below_max_callgraph_files() {
-        // Below the cap the snapshot builds normally (real edges, not skipped).
+    fn callgraph_snapshot_reports_unavailable_when_store_not_ready() {
         let dir = write_ts_project(3);
-        let snapshot = build_tier2_callgraph_snapshot(dir.path(), 5000);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let _store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open empty store");
+
+        let snapshot = build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true));
+
         assert!(
-            snapshot.is_some(),
-            "3 files with max=5000 must build the snapshot"
+            snapshot.is_none(),
+            "a cold/mid-build store must surface callgraph_unavailable instead of rebuilding inline"
         );
+    }
+
+    #[test]
+    fn callgraph_snapshot_reads_ready_callgraph_store() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&files).expect("cold build store");
+
+        let snapshot = build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true))
+            .expect("ready store snapshot");
+
+        assert_eq!(snapshot.files.len(), 3);
+        assert_eq!(snapshot.exported_symbols.len(), 3);
     }
 
     // A scoped payload must not carry the project-wide `by_language` breakdown
@@ -2261,6 +2173,8 @@ mod dead_code_projection_tests {
     use crate::callgraph::walk_project_files;
     use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
     use crate::config::Config;
+    use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
+    use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
     use crate::parser::SymbolCache;
     use filetime::FileTime;
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
@@ -2277,14 +2191,12 @@ mod dead_code_projection_tests {
     }
 
     #[test]
-    fn dead_code_projection_matches_builder_byte_parity() {
+    fn dead_code_projection_contains_expected_fixture_surface() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
-        let old = legacy_snapshot(&root);
-        let projected = store_projected_snapshot(&root, ".store-dead-code-parity");
+        let projected = store_projected_snapshot(&root, ".store-dead-code-surface");
 
-        assert_snapshot_parts_eq("fixture byte parity", &old, &projected);
         assert_projection_fixture_coverage(&root, &projected);
     }
 
@@ -2310,22 +2222,14 @@ mod dead_code_projection_tests {
     }
 
     #[test]
-    fn dead_code_projection_dead_code_scan_matches_builder_verdicts() {
+    fn dead_code_projection_dead_code_scan_reports_expected_verdicts() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let files = project_files(&root);
-        let old = legacy_snapshot(&root);
         let projected = store_projected_snapshot(&root, ".store-dead-code-e2e");
-        assert_snapshot_parts_eq("e2e fixture byte parity", &old, &projected);
 
-        let old_aggregate = dead_code_aggregate(&root, files.clone(), old);
         let projected_aggregate = dead_code_aggregate(&root, files, projected);
-        assert_eq!(
-            serde_json::to_string(&projected_aggregate).expect("projected aggregate json"),
-            serde_json::to_string(&old_aggregate).expect("legacy aggregate json"),
-            "store-projected dead_code verdicts must match builder verdicts\nlegacy: {old_aggregate:#}\nprojected: {projected_aggregate:#}"
-        );
         assert_dead_item(&projected_aggregate, "src/dead.ts", "knownDead");
         assert_live_item(&projected_aggregate, "src/live.ts", "knownLive");
         assert_live_item(&projected_aggregate, "src/render.ts", "render");
@@ -2427,22 +2331,11 @@ mod dead_code_projection_tests {
         assert_snapshot_parts_eq(name, &cold, &incremental);
     }
 
-    fn legacy_snapshot(root: &Path) -> CallgraphSnapshot {
-        build_tier2_callgraph_snapshot(root, usize::MAX)
-            .expect("legacy snapshot")
-            .as_ref()
-            .clone()
-    }
-
-    /// Phase 3a Decision-B benchmark (cap removal). Measures, on a real large
-    /// repo, the three numbers that decide whether the `max_callgraph_files`
-    /// cap is still needed once the callgraph reparse is replaced by the store:
-    ///   (1) OLD snapshot build  = `build_tier2_callgraph_snapshot` full reparse
-    ///   (2) NEW snapshot build  = store cold_build + `project_dead_code_snapshot`
-    ///   (3) REMAINING cold cost = `run_dead_code_scan` given a ready snapshot
-    ///       (the par_iter scan + per-file reexport/type-ref reparse + BFS roll-up
-    ///        that the cap currently suppresses entirely above 5000 files)
-    /// (1) vs (2) is the #86 headline; (3) is what determines the cap decision.
+    /// Store-backed dead_code benchmark. Measures, on a real checkout, the
+    /// persisted-store cold build, the warm SQLite projection cost, and the
+    /// remaining `run_dead_code_scan` cost (per-file reexport/type-ref reparse +
+    /// BFS roll-up). Production Tier-2 reads a warm store; cold_build is included
+    /// here only to make end-to-end store cost visible.
     /// Ignored by default; run with:
     ///   AFT_BENCH_REPO=/path/to/large/repo cargo test -p agent-file-tools --lib \
     ///     -- --ignored --nocapture --test-threads=1 dead_code_decision_b_benchmark
@@ -2460,13 +2353,13 @@ mod dead_code_projection_tests {
         let root = canonical_root(Path::new(&repo));
         let files = project_files(&root);
         mark!(
-            "\n=== Phase 3a Decision-B benchmark ===\nrepo: {}\nsource files (walk_project_files): {}\nstarted phase (2)...",
+            "\n=== Store-backed dead_code benchmark ===\nrepo: {}\nsource files (walk_project_files): {}\nstarted store cold_build...",
             root.display(),
             files.len()
         );
 
-        // (2) NEW snapshot path: store cold_build + projection. Run FIRST — this is
-        // the new per-cold-build cost that replaces the reparse.
+        // Store cold_build + projection. Production warm runs skip cold_build and
+        // pay only the projection below.
         let store_dir = root.join(".aft-bench-store");
         let _ = std::fs::remove_dir_all(&store_dir);
         let store = CallGraphStore::open(store_dir.clone(), root.clone()).expect("open store");
@@ -2477,48 +2370,24 @@ mod dead_code_projection_tests {
         let projected = project_dead_code_snapshot(store.sqlite_path()).expect("projection");
         let proj_ms = t.elapsed().as_millis();
         mark!(
-            "(2) NEW store cold_build: {} ms ({:?}) + projection: {} ms = {} ms  (exports={}, outbound={})\nstarted phase (3)...",
+            "store cold_build: {} ms ({:?}) + projection: {} ms = {} ms  (exports={}, outbound={})\nstarted scan...",
             store_build_ms, cold_stats, proj_ms, store_build_ms + proj_ms,
             projected.exported_symbols.len(), projected.outbound_calls.len()
         );
 
-        // (3) REMAINING cold cost: run_dead_code_scan given a ready snapshot — the
-        // par_iter scan + per-file reexport/type-ref reparse + BFS roll-up the cap
-        // currently suppresses. THIS is the Decision-B number.
+        // Remaining scanner cost: run_dead_code_scan given a ready snapshot.
         let t = Instant::now();
         let _result = dead_code_aggregate(&root, files.clone(), projected.clone());
         let scan_ms = t.elapsed().as_millis();
-        mark!(
-            "(3) REMAINING run_dead_code_scan (cold, uncapped): {} ms",
-            scan_ms
-        );
-
-        // (1) OLD full-reparse build — the #86 sink, headline only. OPT-IN
-        // (AFT_BENCH_OLD=1) because it can take many minutes on large repos.
-        let old_desc = if std::env::var("AFT_BENCH_OLD").is_ok() {
-            mark!("started phase (1) OLD reparse (the slow #86 sink)...");
-            let t = Instant::now();
-            let old = build_tier2_callgraph_snapshot(&root, usize::MAX).expect("old snapshot");
-            let ms = t.elapsed().as_millis();
-            mark!(
-                "(1) OLD build_tier2 reparse: {} ms  (exports={}, outbound={})",
-                ms,
-                old.exported_symbols.len(),
-                old.outbound_calls.len()
-            );
-            format!("{}ms", ms)
-        } else {
-            mark!("(1) OLD build_tier2 reparse: SKIPPED (set AFT_BENCH_OLD=1)");
-            "skipped".to_string()
-        };
+        mark!("run_dead_code_scan (cold contributions): {} ms", scan_ms);
 
         mark!(
-            "\nSUMMARY  files={}  new_build={}ms  scan_cold={}ms  NEW_total={}ms  old_reparse={}",
+            "\nSUMMARY  files={}  store_cold_plus_projection={}ms  projection={}ms  scan_cold={}ms  total={}ms",
             files.len(),
             store_build_ms + proj_ms,
+            proj_ms,
             scan_ms,
-            store_build_ms + proj_ms + scan_ms,
-            old_desc
+            store_build_ms + proj_ms + scan_ms
         );
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -2566,7 +2435,7 @@ mod dead_code_projection_tests {
         let actual = comparable_snapshot(actual);
         assert_eq!(
             actual, expected,
-            "{label} store-projected snapshot must match legacy builder snapshot"
+            "{label} store-projected snapshot must match cold store snapshot"
         );
     }
 

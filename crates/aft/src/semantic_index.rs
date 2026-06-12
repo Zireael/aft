@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Display;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -844,7 +845,7 @@ pub fn resolve_embedding_profile(model: &str) -> Option<&'static EmbeddingPrompt
     static PROFILES: &[(&str, EmbeddingPromptProfile)] = &[
         // CodeRankEmbed — requires query prefix for code search
         (
-            "coderankerembed",
+            "coderankembed",
             EmbeddingPromptProfile {
                 query_prefix: "Represent this query for searching relevant code: ",
                 document_prefix: "",
@@ -3778,8 +3779,12 @@ impl SemanticIndex {
             });
         }
 
-        let (chunks, fresh_metadata) =
-            Self::collect_chunks(project_root, &to_embed, file_policy, document_prompt_template);
+        let (chunks, fresh_metadata) = Self::collect_chunks(
+            project_root,
+            &to_embed,
+            file_policy,
+            document_prompt_template,
+        );
 
         if chunks.is_empty() {
             progress(0, 0);
@@ -4096,8 +4101,12 @@ impl SemanticIndex {
             });
         }
 
-        let (mut chunks, mut fresh_metadata) =
-            Self::collect_chunks(project_root, &existing_paths, file_policy, document_prompt_template);
+        let (mut chunks, mut fresh_metadata) = Self::collect_chunks(
+            project_root,
+            &existing_paths,
+            file_policy,
+            document_prompt_template,
+        );
 
         let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
@@ -5486,6 +5495,87 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         9 => SymbolKind::FileSummary,
         _ => SymbolKind::Heading,
     }
+}
+
+fn write_counted<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    bytes_written: &mut usize,
+) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    *bytes_written = bytes_written.saturating_add(bytes.len());
+    Ok(())
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: usize,
+}
+
+impl<R> CountingReader<R> {
+    fn with_bytes_read(inner: R, bytes_read: usize) -> Self {
+        Self { inner, bytes_read }
+    }
+
+    fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(read);
+        Ok(read)
+    }
+}
+
+fn read_exact_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    buf: &mut [u8],
+    eof_message: &'static str,
+) -> Result<(), String> {
+    reader.read_exact(buf).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            eof_message.to_string()
+        } else {
+            format!("{eof_message}: {error}")
+        }
+    })
+}
+
+fn read_u8_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    eof_message: &'static str,
+) -> Result<u8, String> {
+    let mut bytes = [0u8; 1];
+    read_exact_stream(reader, &mut bytes, eof_message)?;
+    Ok(bytes[0])
+}
+
+fn read_u32_stream<R: Read>(reader: &mut CountingReader<R>) -> Result<u32, String> {
+    let mut bytes = [0u8; 4];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading u32")?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_stream<R: Read>(reader: &mut CountingReader<R>) -> Result<u64, String> {
+    let mut bytes = [0u8; 8];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading u64")?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_string_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    total_len: Option<usize>,
+) -> Result<String, String> {
+    let len = read_u32_stream(reader)? as usize;
+    if total_len.is_some_and(|total_len| reader.bytes_read().saturating_add(len) > total_len) {
+        return Err("unexpected end of data reading string".to_string());
+    }
+    let mut bytes = vec![0u8; len];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading string")?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
@@ -7879,6 +7969,261 @@ mod tests {
         drop(_snap1);
         assert_eq!(Arc::strong_count(&index.snapshot), 2);
     }
+
+    fn default_test_config(backend: SemanticBackend, base_url: String) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend,
+            model: "test-model".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        }
+    }
+
+    fn encode_int8_base64_test(values: &[i8]) -> String {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn mock_server_openai_compatible_embedsSuccessfully() {
+        let (base_url, handle) = start_mock_http_server(|request_line, path, _body| {
+            assert!(request_line.starts_with("POST "));
+            assert_eq!(path, "/v1/embeddings");
+            r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0},{"embedding":[0.4,0.5,0.6],"index":1}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_wrong_dimension_returns_error() {
+        let v1 = encode_int8_base64_test(&[10, -20, 30, 40, 50]);
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            format!(r#"{{"data":[{{"embedding":"{}","index":0}}]}}"#, v1)
+        });
+
+        let mut config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        config.dimensions = Some(3);
+        config.output_encoding = Some(OutputEncoding::Base64Int8);
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("dimension"),
+            "expected dimension error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_wrong_count_returns_error() {
+        let (base_url, handle) = start_mock_http_server(|_request, _path, _body| {
+            r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0},{"embedding":[0.4,0.5,0.6],"index":1},{"embedding":[0.7,0.8,0.9],"index":2}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model
+            .embed(vec!["a".to_string(), "b".to_string()])
+            .unwrap_err();
+        assert!(
+            err.contains("2 embeddings") || err.contains("for 2 inputs"),
+            "expected count mismatch error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_timeout_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers = String::from_utf8_lossy(&buf[..pos + 4]);
+                        for line in headers.lines() {
+                            let lower = line.trim().to_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+            let _ = listener;
+        });
+
+        let mut config = default_test_config(
+            SemanticBackend::OpenAiCompatible,
+            format!("http://{}", addr),
+        );
+        config.timeout_ms = 200;
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("request failed") || err.contains("timeout") || err.contains("timed out"),
+            "expected timeout/connection error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_500_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_clone = Arc::clone(&attempt_count);
+
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    let n = stream.read(&mut chunk).expect("read");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let headers = String::from_utf8_lossy(&buf[..pos + 4]);
+                            for line in headers.lines() {
+                                let lower = line.trim().to_lowercase();
+                                if let Some(value) = lower.strip_prefix("content-length:") {
+                                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_length {
+                            break;
+                        }
+                    }
+                }
+
+                let attempt = attempt_count_clone.fetch_add(1, Ordering::SeqCst);
+                let (status_line, body) = if attempt < 2 {
+                    (
+                        "HTTP/1.1 500 Internal Server Error",
+                        r#"{"error":"temporary failure"}"#,
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#,
+                    )
+                };
+                let response = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let config = default_test_config(
+            SemanticBackend::OpenAiCompatible,
+            format!("http://{}", addr),
+        );
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model.embed(vec!["test".to_string()]).unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+        assert!(
+            attempt_count.load(Ordering::SeqCst) >= 3,
+            "should have retried at least 3 times"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_perplexity_embeds_with_mock_server() {
+        let (base_url, handle) = start_mock_http_server(|request_line, path, _body| {
+            assert!(request_line.starts_with("POST "));
+            assert_eq!(path, "/v1/embeddings");
+            r#"{"data":[{"embedding":[0.7,0.8,0.9],"index":0},{"embedding":[1.0,1.1,1.2],"index":1}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::Perplexity, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![0.7, 0.8, 0.9], vec![1.0, 1.1, 1.2]]);
+        handle.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -9496,7 +9841,7 @@ mod fingerprint_invalidation_tests {
         let policy = SemanticFilePolicy::default();
         let (chunks, _) = SemanticIndex::collect_chunks(
             dir.path(),
-            &[file.clone()],
+            std::slice::from_ref(&file),
             &policy,
             Some("Doc: {text}"),
         );
@@ -9517,7 +9862,7 @@ mod fingerprint_invalidation_tests {
         std::fs::write(&file, "fn hello() { world() }").unwrap();
         let policy = SemanticFilePolicy::default();
         let (chunks, _) =
-            SemanticIndex::collect_chunks(dir.path(), &[file.clone()], &policy, None);
+            SemanticIndex::collect_chunks(dir.path(), std::slice::from_ref(&file), &policy, None);
         assert!(!chunks.is_empty(), "should have at least one chunk");
         for chunk in &chunks {
             assert!(
@@ -9531,7 +9876,10 @@ mod fingerprint_invalidation_tests {
     #[test]
     fn resolve_embedding_profile_coderankerembed() {
         let profile = resolve_embedding_profile("nomic-ai/CodeRankEmbed");
-        assert!(profile.is_some());
+        assert!(
+            profile.is_some(),
+            "profile should be Some for 'nomic-ai/CodeRankEmbed'"
+        );
         let p = profile.unwrap();
         assert!(p.query_prefix.contains("query for searching relevant code"));
         assert_eq!(p.document_prefix, "");
@@ -10673,5 +11021,97 @@ mod fingerprint_invalidation_tests {
         assert!(progress_calls[0].1 > 0, "total should be > 0");
         let last = progress_calls.last().unwrap();
         assert_eq!(last.0, last.1, "final progress: done == total");
+    }
+
+    #[test]
+    fn concurrent_snapshot_swap_does_not_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+        let mut index = SemanticIndex::new(project_root.clone(), 3);
+        index.set_dimension(3);
+        let index = Arc::new(std::sync::Mutex::new(index));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let index = Arc::clone(&index);
+                std::thread::spawn(move || {
+                    let mut idx = index.lock().unwrap();
+                    let mut snap = (*idx.snapshot).clone();
+                    let entry = EmbeddingEntry {
+                        chunk: SemanticChunk {
+                            file: PathBuf::from(format!("src/t{i}.rs")),
+                            name: format!("fn_{i}"),
+                            kind: SymbolKind::Function,
+                            start_line: 0,
+                            end_line: 2,
+                            exported: true,
+                            embed_text: format!("fn_{i}"),
+                            snippet: format!("fn fn_{i}() {{}}"),
+                        },
+                        vector: vec![1.0, 0.0, 0.0],
+                        chunk_hash: String::new(),
+                    };
+                    snap.entries_mut_inner().push(entry);
+                    idx.swap_snapshot(snap);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let idx = index.lock().unwrap();
+        assert!(
+            idx.entry_count() > 0,
+            "index should have entries after concurrent swaps"
+        );
+    }
+
+    #[test]
+    fn concurrent_query_embedding_cache_access() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Test concurrency of the query embedding cache data structure
+        // directly, without needing ONNX Runtime for an actual embedding model.
+        type Cache = Arc<Mutex<(HashMap<String, Vec<f32>>, VecDeque<String>, u64, u64)>>;
+
+        let cache: Cache = Arc::new(Mutex::new((HashMap::new(), VecDeque::new(), 0u64, 0u64)));
+        let hit_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let hit_count = Arc::clone(&hit_count);
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let key = format!("query_{i}_{j}");
+                        let vector = vec![i as f32, j as f32, 0.0];
+                        let mut c = cache.lock().unwrap();
+                        if c.0.contains_key(&key) {
+                            c.2 += 1;
+                            hit_count.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            c.0.insert(key.clone(), vector);
+                            c.1.push_back(key);
+                            c.3 += 1;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let c = cache.lock().unwrap();
+        assert_eq!(
+            c.0.len(),
+            40,
+            "cache should have 40 entries (4 threads x 10 queries)"
+        );
+        assert!(c.2 + c.3 > 0, "should have cache activity");
     }
 }

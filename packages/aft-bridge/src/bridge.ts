@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
+import { LONG_RUNNING_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
@@ -12,6 +13,28 @@ const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
+const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
+const TERMINAL_BASH_STATUSES = new Set([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  // Historical/defensive aliases seen in plugin-side compatibility code.
+  "cancelled",
+  "timeout",
+]);
+
+function isTerminalBashStatus(status: unknown): boolean {
+  return typeof status === "string" && TERMINAL_BASH_STATUSES.has(status);
+}
+
+function bashTaskIdFrom(response: Record<string, unknown>): string | undefined {
+  const snakeCase = response.task_id;
+  if (typeof snakeCase === "string" && snakeCase.length > 0) return snakeCase;
+  const camelCase = response.taskId;
+  if (typeof camelCase === "string" && camelCase.length > 0) return camelCase;
+  return undefined;
+}
 
 // ## Note on TypeScript `as` type assertions
 //
@@ -83,7 +106,7 @@ export function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-function clampSemanticTimeout(
+export function clampSemanticTimeout(
   configOverrides: Record<string, unknown>,
   bridgeTimeoutMs: number,
 ): Record<string, unknown> {
@@ -97,17 +120,28 @@ function clampSemanticTimeout(
     return configOverrides;
   }
 
+  // The clamp exists so a Rust-side embed request fails BEFORE the transport
+  // gives up on the request that carries it. But `semantic_search` doesn't
+  // run on the bridge default budget — plugins send it with the per-command
+  // override from LONG_RUNNING_COMMAND_TIMEOUT_MS. Clamping against the bare
+  // default (30s) silently cut user-configured cold-load headroom (e.g.
+  // LMStudio 8B: 60s → 25s) and aborted background refresh batches that have
+  // no transport constraint at all. Clamp against the real budget.
+  const semanticTransportBudgetMs = Math.max(
+    bridgeTimeoutMs,
+    LONG_RUNNING_COMMAND_TIMEOUT_MS.semantic_search ?? 0,
+  );
   const maxSemanticTimeoutMs =
-    bridgeTimeoutMs > SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      ? bridgeTimeoutMs - SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      : Math.max(1, bridgeTimeoutMs - 1);
+    semanticTransportBudgetMs > SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
+      ? semanticTransportBudgetMs - SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
+      : Math.max(1, semanticTransportBudgetMs - 1);
 
   if (timeoutMs <= maxSemanticTimeoutMs) {
     return configOverrides;
   }
 
   warn(
-    `semantic.timeout_ms=${timeoutMs} exceeds bridge timeout budget; clamping to ${maxSemanticTimeoutMs}ms (bridge timeout: ${bridgeTimeoutMs}ms)`,
+    `semantic.timeout_ms=${timeoutMs} exceeds the semantic transport budget; clamping to ${maxSemanticTimeoutMs}ms (budget: ${semanticTransportBudgetMs}ms)`,
   );
 
   return {
@@ -124,6 +158,7 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
+  command: string;
 }
 
 /** Single configure-time warning produced by the Rust side. */
@@ -291,8 +326,10 @@ export class BinaryBridge {
   private cwd: string;
   private process: ChildProcess | null = null;
   private pending = new Map<string, PendingRequest>();
+  private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
   private stdoutBuffer = "";
+  private stdoutReadOffset = 0;
   private stderrBuffer = "";
   /** Ring buffer of the last N stderr lines, cleared on every spawn. */
   private stderrTail: string[] = [];
@@ -445,6 +482,10 @@ export class BinaryBridge {
 
   hasPendingRequests(): boolean {
     return this.pending.size > 0;
+  }
+
+  hasOutstandingBackgroundTasks(): boolean {
+    return this.outstandingBackgroundTaskIds.size > 0;
   }
 
   /** Project root this bridge was spawned/configured for. */
@@ -672,7 +713,7 @@ export class BinaryBridge {
           this.handleTimeout(requestSessionId);
         }, effectiveTimeoutMs);
 
-        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
+        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress, command });
 
         if (!this.process?.stdin?.writable) {
           this.pending.delete(id);
@@ -1066,6 +1107,7 @@ export class BinaryBridge {
 
     this.process = child;
     this.stdoutBuffer = "";
+    this.stdoutReadOffset = 0;
     this.stderrBuffer = "";
     this.lastChildActivityAt = 0;
     this.consecutiveRequestTimeouts = 0;
@@ -1115,29 +1157,51 @@ export class BinaryBridge {
   }
 
   private onStdoutData(data: string): void {
+    if (this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD) {
+      this.compactStdoutBuffer();
+    }
     this.stdoutBuffer += data;
-    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
+    if (this.stdoutBuffer.length - this.stdoutReadOffset > MAX_STDOUT_BUFFER) {
       this.handleCrash(
         new Error(`aft bridge stdout buffer exceeded ${MAX_STDOUT_BUFFER} bytes — killing bridge`),
       );
       return;
     }
 
-    // Process complete lines
+    // Process complete lines without repeatedly slicing the remaining buffer.
     let newlineIdx: number;
-    while ((newlineIdx = this.stdoutBuffer.indexOf("\n")) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newlineIdx).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIdx + 1);
+    while ((newlineIdx = this.stdoutBuffer.indexOf("\n", this.stdoutReadOffset)) !== -1) {
+      const line = this.stdoutBuffer.slice(this.stdoutReadOffset, newlineIdx).trim();
+      this.stdoutReadOffset = newlineIdx + 1;
 
-      if (!line) continue;
+      if (line) {
+        this.processStdoutLine(line);
+      }
 
-      this.processStdoutLine(line);
+      if (
+        this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD &&
+        this.stdoutReadOffset > this.stdoutBuffer.length / 2
+      ) {
+        this.compactStdoutBuffer();
+      }
+    }
+
+    if (this.stdoutReadOffset === this.stdoutBuffer.length) {
+      this.stdoutBuffer = "";
+      this.stdoutReadOffset = 0;
     }
   }
 
+  private compactStdoutBuffer(): void {
+    if (this.stdoutReadOffset === 0) return;
+    this.stdoutBuffer = this.stdoutBuffer.slice(this.stdoutReadOffset);
+    this.stdoutReadOffset = 0;
+  }
+
   private flushStdoutBuffer(): void {
-    const line = this.stdoutBuffer.trim();
+    const line = this.stdoutBuffer.slice(this.stdoutReadOffset).trim();
     this.stdoutBuffer = "";
+    this.stdoutReadOffset = 0;
     if (!line) return;
     this.processStdoutLine(line);
   }
@@ -1170,6 +1234,8 @@ export class BinaryBridge {
         return;
       }
       if (response.type === "bash_completed") {
+        const taskId = bashTaskIdFrom(response);
+        if (taskId) this.outstandingBackgroundTaskIds.delete(taskId);
         this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
         return;
       }
@@ -1201,6 +1267,7 @@ export class BinaryBridge {
         clearTimeout(entry.timer);
         this.consecutiveRequestTimeouts = 0;
         this.scheduleRestartCountReset();
+        this.accountForBashTaskResponse(entry.command, response);
         this.captureStatusBar(response);
         entry.resolve(response);
       } else if (typeof response.type === "string") {
@@ -1208,6 +1275,24 @@ export class BinaryBridge {
       }
     } catch (_err) {
       this.warnVia(`Failed to parse stdout line: ${line}`);
+    }
+  }
+
+  private accountForBashTaskResponse(command: string, response: Record<string, unknown>): void {
+    const taskId = bashTaskIdFrom(response);
+    if (!taskId) return;
+
+    if (isTerminalBashStatus(response.status)) {
+      this.outstandingBackgroundTaskIds.delete(taskId);
+      return;
+    }
+
+    // A successful bash spawn returns { task_id, status: "running", ... }.
+    // Bias toward wake safety: if a bash response has a task id but an unknown
+    // non-terminal/missing status, keep the bridge alive until a terminal
+    // bash_completed frame or terminal bash_status/bash_kill response removes it.
+    if (command === "bash" && response.success !== false) {
+      this.outstandingBackgroundTaskIds.add(taskId);
     }
   }
 
@@ -1239,6 +1324,13 @@ export class BinaryBridge {
     this.rejectAllPending(
       new Error(`${this.errorPrefix} bridge killed during sibling timeout — request aborted`),
     );
+    // Forget outstanding background task ids: their removal hooks died with
+    // the child (foreground polls were just rejected and won't resume, and a
+    // completion frame can't arrive from a killed process), so keeping them
+    // would pin this bridge against idle eviction forever. Safe to forget —
+    // detached tasks persist undelivered completions on disk, and the next
+    // spawn rehydrates and delivers them.
+    this.outstandingBackgroundTaskIds.clear();
     if (this.process) {
       this.process.kill("SIGKILL");
       this.process = null;
@@ -1276,6 +1368,11 @@ export class BinaryBridge {
     }
     this.clearRestartResetTimer();
     this.configured = false; // Force reconfigure on next command after restart
+    // Forget outstanding background task ids — same rationale as
+    // handleTimeout: abandoned removal hooks would otherwise pin this bridge
+    // against idle eviction permanently (phantom ids). Disk-persisted
+    // completions are re-delivered after the next spawn rehydrates.
+    this.outstandingBackgroundTaskIds.clear();
 
     // Capture the tail BEFORE spawning the replacement, because the next spawn
     // clears the ring. The tail goes to the plugin log only — it's operator

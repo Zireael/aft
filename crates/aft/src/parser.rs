@@ -1203,6 +1203,71 @@ impl FileParser {
         Ok((tree.clone(), lang))
     }
 
+    /// Like [`FileParser::parse`] but reuses caller-provided file contents and
+    /// metadata instead of reading + stat'ing the file again.
+    ///
+    /// `parse()` reads the file from disk to build the tree. A caller that has
+    /// ALREADY read the source (e.g. [`FileParser::extract_symbols`], which
+    /// reads it to hash + extract symbols) would otherwise pay a second
+    /// `read_to_string` for the exact same bytes on every cold-cache file — a
+    /// real cost when warming the symbol cache / call graph over a large repo.
+    /// This variant takes the already-read `source` and the already-computed
+    /// `current_mtime`/`size`/`content_hash` so the cold path does one read and
+    /// one hash. Tree-cache freshness semantics are identical to `parse()`.
+    fn parse_with_source(
+        &mut self,
+        path: &Path,
+        source: &str,
+        current_mtime: std::time::SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+    ) -> Result<(&Tree, LangId), AftError> {
+        let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
+            message: format!(
+                "unsupported file extension: {}",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("<none>")
+            ),
+        })?;
+
+        let canon = path.to_path_buf();
+        let needs_reparse = match self.cache.get(&canon) {
+            Some(cached) => !cached_file_is_fresh(
+                path,
+                cached.mtime,
+                cached.size,
+                cached.content_hash,
+                current_mtime,
+            ),
+            None => true,
+        };
+
+        if needs_reparse {
+            let tree = self.parser_for(lang)?.parse(source, None).ok_or_else(|| {
+                crate::slog_error!("parse failed for {}", path.display());
+                AftError::ParseError {
+                    message: format!("tree-sitter parse returned None for {}", path.display()),
+                }
+            })?;
+
+            self.cache.insert(
+                canon.clone(),
+                CachedTree {
+                    mtime: current_mtime,
+                    size,
+                    content_hash,
+                    tree,
+                },
+            );
+        }
+
+        let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
+            message: format!("parser cache missing entry for {}", path.display()),
+        })?;
+        Ok((&cached.tree, lang))
+    }
+
     /// Extract symbols from a file using language-specific query patterns.
     /// Results are cached by `(path, mtime)` — subsequent calls for unchanged
     /// files return the cached symbol table without re-parsing.
@@ -1233,7 +1298,10 @@ impl FileParser {
         let content_hash = content_hash_for_source(&source);
 
         let symbols = {
-            let (tree, lang) = self.parse(path)?;
+            // Reuse the source we just read instead of letting parse() read the
+            // same file a second time (cold-path double-read, council perf #5).
+            let (tree, lang) =
+                self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
             extract_symbols_from_tree(&source, tree, lang)?
         };
 

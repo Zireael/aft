@@ -303,14 +303,22 @@ pub enum SemanticIndexEvent {
 
 #[derive(Debug, Clone)]
 pub enum SemanticRefreshRequest {
-    Files { paths: Vec<PathBuf> },
-    Corpus { current_files: Vec<PathBuf> },
+    Files {
+        paths: Vec<PathBuf>,
+    },
+    /// Refresh the whole semantic corpus on the refresh worker. The worker owns
+    /// the project walk so watcher/configure drains never do corpus-scale work
+    /// on the single dispatch thread before scheduling embedding.
+    Corpus,
 }
 
 #[derive(Debug)]
 pub enum SemanticRefreshEvent {
     Started {
         paths: Vec<PathBuf>,
+    },
+    CorpusStarted {
+        files: usize,
     },
     Completed {
         added_entries: Vec<EmbeddingEntry>,

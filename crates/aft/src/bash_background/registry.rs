@@ -26,7 +26,7 @@ use std::os::windows::process::CommandExt;
 use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
 use super::output::{
     cap_completion_output, cap_completion_output_with_marker, cap_final_output,
-    cap_final_output_with_marker, json_output_pointer, quote_path, COMPLETION_OUTPUT_PREVIEW_BYTES,
+    cap_final_output_with_marker, completion_preview_threshold, json_output_pointer, quote_path,
     COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
     FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
     RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
@@ -57,10 +57,6 @@ const STALE_RUNNING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Completion previews are derived from the per-task terminal render cache using
-/// a small char-boundary-safe head+tail cap. Keep this bounded: completion
-/// reminders may batch multiple tasks into one prompt injection.
-const BG_COMPLETION_PREVIEW_BYTES: usize = COMPLETION_OUTPUT_PREVIEW_BYTES;
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +215,12 @@ pub(crate) struct BgTaskState {
     terminal_output_cache: Option<TerminalOutputCache>,
     /// PTY-only: set for timeout kill intent before signaling the child.
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
+}
+
+fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str>) -> bool {
+    session_id
+        .map(|session_id| completion.session_id == session_id)
+        .unwrap_or(true)
 }
 
 impl BgTaskRegistry {
@@ -1171,7 +1173,7 @@ impl BgTaskRegistry {
 
             let completion = self
                 .remove_pending_completion(&task_id)
-                .or_else(|| self.completion_snapshot_for_task(&task, BG_COMPLETION_PREVIEW_BYTES));
+                .or_else(|| self.completion_snapshot_for_task(&task));
             if terminal_matches.is_empty() {
                 if let Some(completion) = completion.as_ref() {
                     self.emit_bash_watch_exit(completion);
@@ -1674,13 +1676,21 @@ impl BgTaskRegistry {
 
         completions
             .iter()
-            .filter(|completion| {
-                session_id
-                    .map(|session_id| completion.session_id == session_id)
-                    .unwrap_or(true)
-            })
+            .filter(|completion| completion_matches_session(completion, session_id))
             .cloned()
             .collect()
+    }
+
+    pub fn has_completions_for_session(&self, session_id: Option<&str>) -> bool {
+        match self.inner.completions.lock() {
+            Ok(completions) => completions
+                .iter()
+                .any(|completion| completion_matches_session(completion, session_id)),
+            // Bias to safety: if the queue state cannot be inspected cheaply,
+            // let callers take the existing drain path rather than risk
+            // suppressing a pending completion.
+            Err(_) => true,
+        }
     }
 
     pub fn ack_completions_for_session(
@@ -1749,11 +1759,7 @@ impl BgTaskRegistry {
         completions.remove(idx)
     }
 
-    fn completion_snapshot_for_task(
-        &self,
-        task: &Arc<BgTask>,
-        _preview_bytes: usize,
-    ) -> Option<BgCompletion> {
+    fn completion_snapshot_for_task(&self, task: &Arc<BgTask>) -> Option<BgCompletion> {
         let snapshot = self.snapshot_with_terminal_cache(task, RUNNING_OUTPUT_PREVIEW_BYTES);
         if !snapshot.info.status.is_terminal() {
             return None;
@@ -1762,7 +1768,7 @@ impl BgTaskRegistry {
             (String::new(), false)
         } else {
             self.ensure_terminal_output_cache(task)
-                .map(|cache| completion_preview_for_cache(&cache))
+                .map(|cache| completion_preview_for_cache(&cache, snapshot.exit_code))
                 .unwrap_or_else(|| (String::new(), false))
         };
         Some(BgCompletion {
@@ -2275,9 +2281,10 @@ impl BgTaskRegistry {
         let render = terminal_render.or(owned_render.as_ref());
 
         // Completion reminders use the already-rendered terminal output and a
-        // smaller head+tail cap. They never invoke the compressor themselves.
+        // smaller, exit-aware head+tail cap. They never invoke the compressor
+        // themselves.
         let (output_preview, output_truncated) = render
-            .map(completion_preview_for_cache)
+            .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
             .unwrap_or_else(|| (String::new(), false));
 
         let token_counts = self.completion_token_counts(
@@ -3036,10 +3043,15 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
     }
 }
 
-fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
-    if cache.kind == TerminalOutputKind::Structured
-        && cache.output_preview.len() > BG_COMPLETION_PREVIEW_BYTES
-    {
+fn completion_preview_for_cache(
+    cache: &TerminalOutputCache,
+    exit_code: Option<i32>,
+) -> (String, bool) {
+    // Reminder previews are sized by exit status: success gets a short tail,
+    // failure keeps head+tail context (see output.rs completion caps).
+    let exit_ok = exit_code == Some(0);
+    let threshold = completion_preview_threshold(exit_ok);
+    if cache.kind == TerminalOutputKind::Structured && cache.output_preview.len() > threshold {
         if let Some(path) = cache.output_path.as_deref() {
             return (
                 json_output_pointer(cache.output_preview.len() as u64, path),
@@ -3050,19 +3062,19 @@ fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
     }
 
     if let Some(recovery) = cache.recovery.as_ref() {
-        if cache.output_preview.len() <= BG_COMPLETION_PREVIEW_BYTES {
+        if cache.output_preview.len() <= threshold {
             return (cache.output_preview.clone(), cache.output_truncated);
         }
         let body = strip_recovery_marker_lines(&cache.output_preview);
         let mut completion_recovery = recovery.clone();
         completion_recovery.byte_truncated = true;
         if let Some(marker) = recovery_marker(&completion_recovery) {
-            let capped = cap_completion_output_with_marker(&body, &marker);
+            let capped = cap_completion_output_with_marker(&body, &marker, exit_ok);
             return (capped.text, true);
         }
     }
 
-    let capped = cap_completion_output(&cache.output_preview);
+    let capped = cap_completion_output(&cache.output_preview, exit_ok);
     (capped.text, cache.output_truncated || capped.truncated)
 }
 
@@ -3598,13 +3610,31 @@ fn terminal_metadata_from_marker(
 }
 
 #[cfg(unix)]
-fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
+fn write_unix_command_script(command: &str, paths: &TaskPaths) -> Result<PathBuf, String> {
+    let stem = paths
+        .json
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("wrapper");
+    let script_path = paths.dir.join(format!("{stem}.sh"));
+    fs::write(&script_path, command)
+        .map_err(|e| format!("failed to write background bash command script: {e}"))?;
+    Ok(script_path)
+}
+
+#[cfg(unix)]
+fn detached_shell_command(command_script: &Path, exit_path: &Path) -> Command {
     let shell = resolve_posix_shell();
     let mut cmd = Command::new(&shell);
+    // Keep the user-provided command body out of argv and shell `-c` parsing.
+    // The direct child is still a tiny wrapper so it can write the authoritative
+    // exit marker after the command script exits (including if that script calls
+    // `exit`). Passing only file paths through `-c` avoids newline/quote/length
+    // edge cases where a multi-command script can be mangled before execution.
     cmd.arg("-c")
-        .arg("\"$0\" -c \"$1\"; code=$?; printf \"%s\" \"$code\" > \"$2.tmp.$$\"; mv -f \"$2.tmp.$$\" \"$2\"")
+        .arg(r#""$0" "$1"; code=$?; printf "%s" "$code" > "$2.tmp.$$"; mv -f "$2.tmp.$$" "$2""#)
         .arg(&shell)
-        .arg(command)
+        .arg(command_script)
         .arg(exit_path);
     unsafe {
         cmd.pre_exec(|| {
@@ -3743,7 +3773,8 @@ fn spawn_detached_child(
             .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
         let stderr = create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
-        detached_shell_command(command, &paths.exit)
+        let command_script = write_unix_command_script(command, paths)?;
+        detached_shell_command(&command_script, &paths.exit)
             .current_dir(workdir)
             .envs(env)
             .stdin(Stdio::null())
@@ -3965,6 +3996,106 @@ mod tests {
         (task_id, task)
     }
 
+    #[cfg(unix)]
+    fn wait_for_terminal_snapshot(
+        registry: &BgTaskRegistry,
+        task_id: &str,
+        session_id: &str,
+        project: &Path,
+        storage: &Path,
+    ) -> BgTaskSnapshot {
+        let started = Instant::now();
+        loop {
+            let snapshot = registry
+                .status(task_id, session_id, Some(project), Some(storage), 4096)
+                .expect("spawned task should be visible to status");
+            if snapshot.info.status.is_terminal() {
+                return snapshot;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out waiting for task {task_id} to finish; last status={:?}",
+                snapshot.info.status
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiline_pipeline_stdout_persists_all_lines_after_terminal_status() {
+        let cases = [
+            (
+                "long-first",
+                "sleep 0.5; printf 'one\\n' | cat\nprintf 'two\\n' | grep -c two\nprintf 'three\\n' | cat",
+                vec!["one", "1", "three"],
+            ),
+            (
+                "short-first",
+                "printf 'one\\n' | cat\nsleep 0.2; printf 'two\\n' | grep -c two\nprintf 'three\\n' | cat",
+                vec!["one", "1", "three"],
+            ),
+            (
+                "failing-middle",
+                "sleep 0.2; printf 'one\\n' | cat\nfalse; printf 'after-false\\n' | cat\nprintf 'three\\n' | cat",
+                vec!["one", "after-false", "three"],
+            ),
+        ];
+
+        for (name, command, expected_lines) in cases {
+            let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = format!("session-{name}");
+            let task_id = registry
+                .spawn(
+                    command,
+                    session_id.clone(),
+                    dir.path().to_path_buf(),
+                    HashMap::new(),
+                    Some(Duration::from_secs(30)),
+                    dir.path().to_path_buf(),
+                    10,
+                    true,
+                    true,
+                    Some(dir.path().to_path_buf()),
+                )
+                .unwrap();
+
+            let snapshot = wait_for_terminal_snapshot(
+                &registry,
+                &task_id,
+                &session_id,
+                dir.path(),
+                dir.path(),
+            );
+            assert_eq!(
+                snapshot.info.status,
+                BgTaskStatus::Completed,
+                "{name}: task should complete; snapshot={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.exit_code,
+                Some(0),
+                "{name}: script should use the final command's exit code"
+            );
+
+            let stdout_path = task_paths(dir.path(), &session_id, &task_id).stdout;
+            let stdout = fs::read_to_string(&stdout_path).unwrap_or_else(|error| {
+                panic!(
+                    "{name}: failed to read raw stdout file {}: {error}",
+                    stdout_path.display()
+                )
+            });
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(
+                lines,
+                expected_lines,
+                "{name}: raw stdout file must include every newline-separated command's output; stdout_path={}",
+                stdout_path.display()
+            );
+        }
+    }
+
     #[test]
     fn recognizes_all_recovery_marker_forms() {
         assert!(is_recovery_marker(
@@ -4041,7 +4172,11 @@ mod tests {
     }
 
     #[test]
-    fn completion_preview_uses_head_and_tail_not_blind_tail() {
+    fn completion_preview_success_keeps_tail_only() {
+        // Exit-aware completion previews: a SUCCESSFUL task's reminder keeps a
+        // short tail only — head context is noise when the command worked
+        // (regression: the uniform 4 KiB head+tail cap flooded reminders with
+        // ~1K tokens of build noise per completed task).
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
@@ -4052,12 +4187,66 @@ mod tests {
         let completions = registry.drain_completions_for_session(Some("session"));
         assert_eq!(completions.len(), 1);
         let preview = &completions[0].output_preview;
+        assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+        assert!(!preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
+        assert!(completions[0].output_truncated);
+    }
+
+    #[test]
+    fn completion_preview_failure_keeps_head_and_tail() {
+        // A FAILED task keeps a small head (first error / command banner) plus
+        // a larger tail (tracebacks and summaries land at the end).
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
+        let task_id = format!("bash-test-{}", random_slug());
+        let paths = task_paths(dir.path(), "session", &task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.stdout, &output).unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "cat big.log".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .expect("insert terminal task");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        registry.post_terminal_transition(&task, true).unwrap();
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        let preview = &completions[0].output_preview;
         assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
         assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
-        assert!(
-            preview.contains("...<truncated "),
-            "preview was {preview:?}"
-        );
+    }
+
+    #[test]
+    fn has_completions_for_session_matches_pending_delivery() {
+        let registry = BgTaskRegistry::default();
+        assert!(!registry.has_completions_for_session(Some("session")));
+        assert!(!registry.has_completions_for_session(None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, QUICK_SUCCESS_COMMAND, "done\n", "", false);
+        registry.post_terminal_transition(&task, true).unwrap();
+
+        assert!(registry.has_completions_for_session(Some("session")));
+        assert!(registry.has_completions_for_session(None));
+        assert!(!registry.has_completions_for_session(Some("other-session")));
+
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].task_id, task.task_id);
     }
 
     #[test]

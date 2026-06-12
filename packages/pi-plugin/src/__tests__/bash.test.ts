@@ -992,3 +992,71 @@ describe("registerBashTool registers bash + bash_status + bash_kill as a unit", 
     expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
   });
 });
+
+describe("bash tool description (agent-facing wording)", () => {
+  function registeredDescription(
+    aftSearchRegistered: boolean,
+    configOverride?: Record<string, unknown>,
+  ): {
+    description: string;
+    promptGuidelines: string[];
+  } {
+    let captured: { description: string; promptGuidelines: string[] } | null = null;
+    const api = {
+      registerTool: (def: { name: string; description: string; promptGuidelines: string[] }) => {
+        // registerBashTool registers bash + bash_status/kill/watch/write —
+        // only the bash tool itself carries the code-search prohibition.
+        if (def.name !== "bash") return;
+        captured = { description: def.description, promptGuidelines: def.promptGuidelines };
+      },
+    } as unknown as ExtensionAPI;
+    const ctx = makeMockContext({} as BinaryBridge);
+    if (configOverride) ctx.config = configOverride as PluginContext["config"];
+    registerBashTool(api, ctx, aftSearchRegistered);
+    if (!captured) throw new Error("registerTool was not called");
+    return captured;
+  }
+
+  test("prohibits bash code search and steers to aft_search when registered", () => {
+    const { description, promptGuidelines } = registeredDescription(true);
+    expect(description).toContain("DO NOT use bash for code search");
+    expect(description).toContain("STOP");
+    expect(description).toContain("aft_search");
+    expect(promptGuidelines.join("\n")).toContain("DO NOT use bash for code search");
+  });
+
+  test("steers to the grep tool when aft_search is not registered", () => {
+    const { description } = registeredDescription(false);
+    expect(description).toContain("DO NOT use bash for code search");
+    expect(description).toContain("`grep` tool");
+    expect(description).not.toContain("aft_search");
+  });
+
+  test("contains no internal vocabulary agents don't care about", () => {
+    for (const flag of [true, false]) {
+      const { description } = registeredDescription(flag);
+      expect(description.toLowerCase()).not.toContain("hoisted");
+      expect(description.toLowerCase()).not.toContain("rust bash handler");
+      expect(description.toLowerCase()).not.toContain("rewrit");
+    }
+  });
+
+  test("compression and background sentences track the resolved bash config", () => {
+    // Default mock config resolves to compress+background on.
+    const on = registeredDescription(true).description;
+    expect(on).toContain("compressed: false");
+    expect(on).toContain("background: true");
+    expect(on).toContain("pty: true");
+
+    // Both features off: never advertise a guaranteed feature_disabled error,
+    // but still explain auto-promoted tasks (promotion is not gated).
+    const off = registeredDescription(true, {
+      bash: { compress: false, background: false },
+    }).description;
+    expect(off).not.toContain("compressed: false");
+    expect(off).not.toContain("background: true");
+    expect(off).not.toContain("pty: true");
+    expect(off).toContain("promoted to background");
+    expect(off).toContain("bash_status");
+  });
+});

@@ -5,9 +5,23 @@ pub const FINAL_OUTPUT_HEAD_BYTES: usize = 6 * 1024;
 pub const FINAL_OUTPUT_TAIL_BYTES: usize = 10 * 1024;
 
 pub const RUNNING_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
-pub const COMPLETION_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
-pub const COMPLETION_OUTPUT_HEAD_BYTES: usize = 2 * 1024;
-pub const COMPLETION_OUTPUT_TAIL_BYTES: usize = 2 * 1024;
+
+// Completion previews ride inside reminder/wake messages and in-turn tool
+// result appends — they are a glance, not the output channel (full output is
+// always recoverable via bash_status / the stdout+stderr file pointers). They
+// are sized by exit status:
+//  - success: a short tail is all the agent needs ("done, here's the gist");
+//    head context is dead weight at ~150 tokens/task.
+//  - failure: keep a small head (the command banner / first error) plus a
+//    meaningful tail (tracebacks and test summaries land at the end).
+// The uniform 4 KiB head+tail this replaced injected ~1K tokens of mostly
+// build noise per completed task into reminders.
+pub const COMPLETION_SUCCESS_PREVIEW_BYTES: usize = 600;
+pub const COMPLETION_SUCCESS_HEAD_BYTES: usize = 0;
+pub const COMPLETION_SUCCESS_TAIL_BYTES: usize = 600;
+pub const COMPLETION_FAILURE_PREVIEW_BYTES: usize = 2304;
+pub const COMPLETION_FAILURE_HEAD_BYTES: usize = 512;
+pub const COMPLETION_FAILURE_TAIL_BYTES: usize = 1792;
 
 pub const RAW_PASSTHROUGH_CAP_BYTES: usize = 50 * 1024;
 pub const RAW_PASSTHROUGH_HEAD_BYTES: usize = 20 * 1024;
@@ -44,23 +58,37 @@ pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
     )
 }
 
-pub fn cap_completion_output(input: &str) -> CappedText {
-    cap_head_tail(
-        input,
-        COMPLETION_OUTPUT_PREVIEW_BYTES,
-        COMPLETION_OUTPUT_HEAD_BYTES,
-        COMPLETION_OUTPUT_TAIL_BYTES,
-    )
+/// Byte threshold under which a completion preview is passed through uncapped.
+pub fn completion_preview_threshold(exit_ok: bool) -> usize {
+    completion_caps(exit_ok).0
 }
 
-pub fn cap_completion_output_with_marker(input: &str, marker: &str) -> CappedText {
-    cap_head_tail_with_marker(
-        input,
-        COMPLETION_OUTPUT_PREVIEW_BYTES,
-        COMPLETION_OUTPUT_HEAD_BYTES,
-        COMPLETION_OUTPUT_TAIL_BYTES,
-        marker,
-    )
+fn completion_caps(exit_ok: bool) -> (usize, usize, usize) {
+    if exit_ok {
+        (
+            COMPLETION_SUCCESS_PREVIEW_BYTES,
+            COMPLETION_SUCCESS_HEAD_BYTES,
+            COMPLETION_SUCCESS_TAIL_BYTES,
+        )
+    } else {
+        (
+            COMPLETION_FAILURE_PREVIEW_BYTES,
+            COMPLETION_FAILURE_HEAD_BYTES,
+            COMPLETION_FAILURE_TAIL_BYTES,
+        )
+    }
+}
+
+/// Cap a completion preview by exit status: success keeps a short tail,
+/// failure keeps a small head plus a larger tail (see the constants above).
+pub fn cap_completion_output(input: &str, exit_ok: bool) -> CappedText {
+    let (threshold, head, tail) = completion_caps(exit_ok);
+    cap_head_tail(input, threshold, head, tail)
+}
+
+pub fn cap_completion_output_with_marker(input: &str, marker: &str, exit_ok: bool) -> CappedText {
+    let (threshold, head, tail) = completion_caps(exit_ok);
+    cap_head_tail_with_marker(input, threshold, head, tail, marker)
 }
 
 pub fn cap_head_tail(
@@ -114,7 +142,12 @@ pub fn cap_head_tail(
     let truncated_bytes = tail_start - head_end;
     let mut output = String::with_capacity(threshold_bytes.min(input.len()));
     output.push_str(&input[..head_end]);
-    if !output.ends_with('\n') {
+    // Only insert a separator newline when there IS a head that doesn't end
+    // with one — mirroring marker_prefix_len above. With keep_head == 0 the
+    // old `!output.ends_with('\n')` check pushed an unbudgeted leading
+    // newline (empty string never ends with '\n'), overshooting the
+    // threshold by one byte.
+    if head_end > 0 && !output.ends_with('\n') {
         output.push('\n');
     }
     output.push_str("...<truncated ");
@@ -330,5 +363,56 @@ mod tests {
         assert!(capped.truncated);
         assert!(capped.text.len() <= 10, "{}", capped.text.len());
         assert!(capped.text.contains("[x]"));
+    }
+
+    #[test]
+    fn completion_cap_success_is_tail_only_and_small() {
+        // A successful task's reminder preview keeps a short tail — no head.
+        // Regression: the uniform 4 KiB head+tail cap flooded completion
+        // reminders with build noise (~1K tokens per task).
+        let input = format!("HEAD-NOISE\n{}\nFINAL SUMMARY LINE", "x".repeat(8_000));
+        let capped = cap_completion_output(&input, true);
+        assert!(capped.truncated);
+        assert!(
+            capped.text.len() <= COMPLETION_SUCCESS_PREVIEW_BYTES,
+            "{}",
+            capped.text.len()
+        );
+        assert!(capped.text.ends_with("FINAL SUMMARY LINE"));
+        assert!(!capped.text.contains("HEAD-NOISE"));
+    }
+
+    #[test]
+    fn completion_cap_failure_keeps_head_and_larger_tail() {
+        // A failed task keeps a small head (command banner / first error) and
+        // a meaningful tail (tracebacks land at the end).
+        let input = format!(
+            "FIRST-ERROR-CONTEXT\n{}\nTraceback: ModuleNotFoundError",
+            "y".repeat(8_000)
+        );
+        let capped = cap_completion_output(&input, false);
+        assert!(capped.truncated);
+        assert!(
+            capped.text.len() <= COMPLETION_FAILURE_PREVIEW_BYTES,
+            "{}",
+            capped.text.len()
+        );
+        assert!(capped.text.starts_with("FIRST-ERROR-CONTEXT"));
+        assert!(capped.text.ends_with("Traceback: ModuleNotFoundError"));
+        // Failure budget is larger than success budget but far below the old 4 KiB.
+        const {
+            assert!(COMPLETION_FAILURE_PREVIEW_BYTES > COMPLETION_SUCCESS_PREVIEW_BYTES);
+            assert!(COMPLETION_FAILURE_PREVIEW_BYTES < 4 * 1024);
+        }
+    }
+
+    #[test]
+    fn completion_cap_passes_short_output_through_untouched() {
+        let input = "ok: 12 tests passed";
+        for exit_ok in [true, false] {
+            let capped = cap_completion_output(input, exit_ok);
+            assert!(!capped.truncated);
+            assert_eq!(capped.text, input);
+        }
     }
 }

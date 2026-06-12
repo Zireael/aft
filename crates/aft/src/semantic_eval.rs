@@ -134,7 +134,6 @@ fn strip_trailing_commas(s: &str) -> String {
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        out.push(bytes[i] as char);
         // Look for `,` followed by optional whitespace then `}` or `]`.
         if bytes[i] == b',' {
             let mut j = i + 1;
@@ -149,6 +148,7 @@ fn strip_trailing_commas(s: &str) -> String {
                 continue;
             }
         }
+        out.push(bytes[i] as char);
         i += 1;
     }
     out

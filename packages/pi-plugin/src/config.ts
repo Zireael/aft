@@ -36,7 +36,7 @@ export type Checker =
 /** How configure-time missing-tool warnings are delivered (OpenCode plugin). */
 export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
 
-export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
+export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama" | "model2vec" | "perplexity";
 
 export interface SemanticConfig {
   backend?: SemanticBackend;
@@ -46,6 +46,24 @@ export interface SemanticConfig {
   timeout_ms?: number;
   max_batch_size?: number;
   max_files?: number;
+  rerank_enabled?: boolean;
+  rerank_model?: string;
+  rerank_base_url?: string;
+  rerank_api_key_env?: string;
+  rerank_timeout_ms?: number;
+  rerank_max_candidates?: number;
+  rerank_max_candidate_chars?: number;
+  rerank_api_type?: "chat" | "rerank";
+  rerank_max_candidate_chars_cross_encoder?: number;
+  rerank_prompt_template?: string;
+  diagnostics_enabled?: boolean;
+  output_mode?: "off" | "minimal" | "verbose";
+  query_prompt_template?: string;
+  document_prompt_template?: string;
+  use_model_profiles?: boolean;
+  max_results_per_file?: number;
+  max_embed_tokens?: number;
+  chunk_overlap_tokens?: number;
 }
 
 export interface LspServerConfig {
@@ -332,13 +350,31 @@ const CheckerEnum = z.enum([
 const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
 
 const SemanticConfigSchema = z.object({
-  backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
+  backend: z.enum(["fastembed", "openai_compatible", "ollama", "model2vec", "perplexity"]).optional(),
   model: z.string().trim().min(1).optional(),
   base_url: z.string().trim().min(1).optional(),
   api_key_env: z.string().trim().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   max_batch_size: z.number().int().positive().optional(),
   max_files: z.number().int().positive().optional(),
+  rerank_enabled: z.boolean().optional(),
+  rerank_model: z.string().optional(),
+  rerank_base_url: z.string().optional(),
+  rerank_api_key_env: z.string().optional(),
+  rerank_timeout_ms: z.number().optional(),
+  rerank_max_candidates: z.number().optional(),
+  rerank_max_candidate_chars: z.number().optional(),
+  rerank_api_type: z.enum(["chat", "rerank"]).optional(),
+  rerank_max_candidate_chars_cross_encoder: z.number().optional(),
+  rerank_prompt_template: z.string().optional(),
+  diagnostics_enabled: z.boolean().optional(),
+  output_mode: z.enum(["off", "minimal", "verbose"]).optional(),
+  query_prompt_template: z.string().optional(),
+  document_prompt_template: z.string().optional(),
+  use_model_profiles: z.boolean().optional(),
+  max_results_per_file: z.number().optional(),
+  max_embed_tokens: z.number().optional(),
+  chunk_overlap_tokens: z.number().optional(),
 });
 
 const LspExtensionSchema = z

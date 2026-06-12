@@ -14,7 +14,11 @@ describe("buildWorkflowHints", () => {
       disabledTools: new Set(),
     });
     expect(out).not.toBeNull();
-    expect(out).toContain("## Prefer AFT tools for token efficiency");
+    expect(out).toContain("## IMPORTANT NOTICE about your tools");
+    // Opening notice: the agent is told its tool set is non-standard and to
+    // reach for it first, before any individual section.
+    expect(out).toContain("You are equipped with a non-standard tool set");
+    expect(out).toContain("Always reach for these tools first");
     expect(out).toContain("**Parallel tool calls**");
     expect(out).toContain("emit them in ONE response instead of serializing");
     expect(out).toContain("**Codebase health & diagnostics**");
@@ -23,10 +27,11 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes concepts, identifiers, regex");
-    // Imperative anti-bash-grep + parallel-wave steer must be present.
-    expect(out).toContain("fire independent lookups in ONE parallel tool-call wave");
-    expect(out).toContain("DO NOT run `grep`/`rg`/`find` through `bash` to locate code");
+    // Imperative anti-bash-grep steer with concrete reflex translations.
+    expect(out).toContain("DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash`");
     expect(out).toContain("the bash path is unindexed, unranked, serial");
+    expect(out).toContain("Reflex translations:");
+    expect(out).toContain('aft_search({ query: "handleAuth" })');
     expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("- `callers`");
     expect(out).toContain("- `impact`");
@@ -39,15 +44,15 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
     expect(out).toContain("`bash({ background: true })`");
-    // Anti-polling guidance must be present so agents stop calling
-    // bash_status back-to-back when waiting for a background task.
-    expect(out).toContain("a completion reminder arrives automatically");
-    expect(out).toContain("Do not poll");
-    // Anti-sync-block steer: agents must not sync-wait bash_watch on a long task
-    // (it freezes the turn and locks the user out); end the turn or use async.
-    expect(out).toContain("end your turn");
-    expect(out).toContain("do not sync-wait with `bash_watch` for a long task");
-    expect(out).toContain("background: true");
+    // Positive-first waiting protocol (Discord feedback: "what NOT to do"
+    // framing made models acknowledge the rule then poll anyway). The three
+    // sanctioned outlets lead; bash_status gets a legitimate role.
+    expect(out).toContain("Then do ONE of these:");
+    expect(out).toContain("Keep working on something independent");
+    expect(out).toContain("completion reminder with the result arrives automatically");
+    expect(out).toContain("bash_watch({ taskId, pattern, background: true })");
+    expect(out).toContain("never call it repeatedly to wait");
+    expect(out).toContain("locks the user out");
   });
 
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {
@@ -79,8 +84,11 @@ describe("buildWorkflowHints", () => {
       disabledTools: new Set(),
     });
     expect(on).toContain(
-      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+      "bash output is auto-compressed — failures and the summary are always kept",
     );
+    expect(on).toContain("`bun test | grep fail` → run `bun test`");
+    // The agent can't check the config — the section is gated instead of hedged.
+    expect(on).not.toContain("compression is on,");
 
     const off = buildWorkflowHints({
       toolSurface: "recommended",
@@ -90,9 +98,8 @@ describe("buildWorkflowHints", () => {
       bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
-    expect(off).not.toContain(
-      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
-    );
+    expect(off).not.toContain("bash output is auto-compressed");
+    expect(off).not.toContain("`bun test | grep fail`");
   });
 
   test("omits the navigate section at tool_surface=recommended", () => {
@@ -216,7 +223,7 @@ describe("buildHintsFromConfig", () => {
     const config: AftConfig = { tool_surface: "recommended" };
     const out = buildHintsFromConfig(config, new Set());
     expect(out).not.toBeNull();
-    expect(out).toContain("## Prefer AFT tools for token efficiency");
+    expect(out).toContain("## IMPORTANT NOTICE about your tools");
   });
 
   test("honors hoist_builtin_tools=false (uses aft_grep)", () => {

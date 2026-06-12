@@ -1,0 +1,2472 @@
+{
+  "timestamp": "2026-06-10T06:11:34.128Z",
+  "k": 10,
+  "binary": "C:\\Users\\zir\\AppData\\Local\\aft\\bin\\v0.29.1\\aft.exe",
+  "results": [
+    {
+      "mode": "semantic",
+      "query": "how axum Handler trait dispatches requests to async handler functions",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 8.454799999999523,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
+          "score": 0.8412272334098816
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\handler\\mod.rs",
+          "score": 0.8246324062347412
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
+          "score": 0.7067423462867737
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\returns_self.rs",
+          "score": 0.6883278489112854
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\src\\lib.rs",
+          "score": 0.6730040311813354
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\set_state.rs",
+          "score": 0.6644201874732971
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\fail\\extract_self_mut.rs",
+          "score": 0.6643517017364502
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\self_receiver.rs",
+          "score": 0.6631519198417664
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\fail\\generics.rs",
+          "score": 0.6612634658813477
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\fail\\extract_self_ref.rs",
+          "score": 0.6601001024246216
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Router path_router implementation for storing and matching routes",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 8.757799999999406,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.6464080810546875
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.6167899966239929
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.6108589768409729
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\routes-and-handlers-close-together\\src\\main.rs",
+          "score": 0.6056715250015259
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.5966378450393677
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\mod.rs",
+          "score": 0.5741882920265198
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\typed.rs",
+          "score": 0.5716775059700012
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\matched_path.rs",
+          "score": 0.5690831542015076
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
+          "score": 0.5598750114440918
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\resource.rs",
+          "score": 0.54486083984375
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "how extractors implement FromRequest and FromRequestParts",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 9.108000000000175,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\extract\\mod.rs",
+          "score": 0.6916270852088928
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\extract\\mod.rs",
+          "score": 0.6440439820289612
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\empty_named_parts.rs",
+          "score": 0.6391906142234802
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\empty_tuple_parts.rs",
+          "score": 0.6352084279060364
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\container_parts.rs",
+          "score": 0.6331415176391602
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\named_via_parts.rs",
+          "score": 0.6293476223945618
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\with_rejection.rs",
+          "score": 0.623725175857544
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\named_parts.rs",
+          "score": 0.6177852749824524
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\unit_parts.rs",
+          "score": 0.6173038482666016
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\state_explicit_parts.rs",
+          "score": 0.6139519810676575
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "Json extractor and response for deserializing and serializing JSON bodies",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 8.86109999999826,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
+          "score": 0.6824489235877991
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.6469604969024658
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\response\\erased_json.rs",
+          "score": 0.615412712097168
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.5995535254478455
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
+          "score": 0.5700721144676208
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.5551244616508484
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\customize-extractor-error\\src\\derive_from_request.rs",
+          "score": 0.5524418950080872
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.5522492527961731
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.5509198904037476
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\json_deserializer.rs",
+          "score": 0.5409061908721924
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "how IntoResponse converts handler return values to HTTP responses",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 9.58640000000014,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\into_response.rs",
+          "score": 0.5990915894508362
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\mod.rs",
+          "score": 0.5175821185112
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\impl_into_response.rs",
+          "score": 0.4832446277141571
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
+          "score": 0.47279831767082214
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\result_impl_into_response.rs",
+          "score": 0.4661708474159241
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\result_impl_into_response.rs",
+          "score": 0.4641684889793396
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\mod.rs",
+          "score": 0.455788254737854
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\response\\error_response.rs",
+          "score": 0.45336779952049255
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\into_response.rs",
+          "score": 0.4472091794013977
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\reverse-proxy\\src\\main.rs",
+          "score": 0.44212302565574646
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25
+    },
+    {
+      "mode": "semantic",
+      "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
+      "repo_name": "axum",
+      "category": "architecture",
+      "latency_ms": 8.165999999997439,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
+          "score": 0.5443950295448303
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\resource.rs",
+          "score": 0.5416437387466431
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
+          "score": 0.5204684138298035
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\mod.rs",
+          "score": 0.46897491812705994
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\mod.rs",
+          "score": 0.45845186710357666
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\routing\\resource.rs",
+          "score": 0.4301382005214691
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\handle_error.rs",
+          "score": 0.4284279942512512
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\serve\\mod.rs",
+          "score": 0.42737677693367004
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\routes-and-handlers-close-together\\src\\main.rs",
+          "score": 0.42317646741867065
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.4171139597892761
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "how axum maps Tower middleware layers onto the router",
+      "repo_name": "axum",
+      "category": "semantic",
+      "latency_ms": 9.641500000001543,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\middleware.rs",
+          "score": 0.6726291179656982
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
+          "score": 0.671231210231781
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
+          "score": 0.659881591796875
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_fn.rs",
+          "score": 0.6026561260223389
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.5911766886711121
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.5802676677703857
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
+          "score": 0.5796933770179749
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\strip_prefix.rs",
+          "score": 0.5667745471000671
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
+          "score": 0.561475396156311
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.5603168606758118
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "Router",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 5.674399999999878,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\connect_info.rs",
+          "score": 0.4337327778339386
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.4263213872909546
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
+          "score": 0.42301610112190247
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\validator\\src\\main.rs",
+          "score": 0.41306477785110474
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\templates\\src\\main.rs",
+          "score": 0.41077280044555664
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\routes-and-handlers-close-together\\src\\main.rs",
+          "score": 0.3961727023124695
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\simple-router-wasm\\src\\main.rs",
+          "score": 0.39418771862983704
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\anyhow-error-response\\src\\main.rs",
+          "score": 0.391450434923172
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\routes-and-handlers-close-together\\src\\main.rs",
+          "score": 0.383986234664917
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\versioning\\src\\main.rs",
+          "score": 0.38199952244758606
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "semantic",
+      "query": "IntoResponse",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 7.808099999998376,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\into_response.rs",
+          "score": 0.5384590029716492
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\mod.rs",
+          "score": 0.484770804643631
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\response\\error_response.rs",
+          "score": 0.480873167514801
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
+          "score": 0.4109054207801819
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\mod.rs",
+          "score": 0.3919035494327545
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
+          "score": 0.38634800910949707
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\response\\into_response.rs",
+          "score": 0.38607680797576904
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\protobuf.rs",
+          "score": 0.3806382715702057
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
+          "score": 0.3713240325450897
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\debug_handler\\pass\\impl_into_response.rs",
+          "score": 0.3709248900413513
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.16666666666666666
+    },
+    {
+      "mode": "semantic",
+      "query": "FromRequest",
+      "repo_name": "axum",
+      "category": "symbol",
+      "latency_ms": 6.583300000002055,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\extract\\mod.rs",
+          "score": 0.3835487961769104
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-core\\src\\extract\\mod.rs",
+          "score": 0.369522362947464
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\consume-body-in-extractor-or-middleware\\src\\main.rs",
+          "score": 0.3535115420818329
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
+          "score": 0.35089385509490967
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\with_rejection.rs",
+          "score": 0.3479769229888916
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\print-request-response\\src\\main.rs",
+          "score": 0.3369368314743042
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\examples\\validator\\src\\main.rs",
+          "score": 0.33209899067878723
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-extra\\src\\extract\\form.rs",
+          "score": 0.3168681263923645
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\pass\\unit_parts.rs",
+          "score": 0.31076955795288086
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum-macros\\tests\\from_request\\fail\\unknown_attr_field.rs",
+          "score": 0.3101498484611511
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "application initialization and default configuration",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 6.852399999999761,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.static.js",
+          "score": 0.21940283477306366
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.sendFile.js",
+          "score": 0.21582375466823578
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.render.js",
+          "score": 0.21048356592655182
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.render.js",
+          "score": 0.20504087209701538
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\search\\index.js",
+          "score": 0.18483057618141174
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\config.js",
+          "score": 0.18334800004959106
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.query.js",
+          "score": 0.1821974366903305
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\static-files\\public\\js\\app.js",
+          "score": 0.16711944341659546
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\web-service.js",
+          "score": 0.15451128780841827
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\middleware.basic.js",
+          "score": 0.13963797688484192
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "request API helpers and header access",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 6.701600000000326,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\support\\utils.js",
+          "score": 0.4340621531009674
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\support\\utils.js",
+          "score": 0.42552652955055237
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.json.js",
+          "score": 0.37659966945648193
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\auth\\index.js",
+          "score": 0.3525542616844177
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.sendFile.js",
+          "score": 0.3455028235912323
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\route-middleware\\index.js",
+          "score": 0.33455005288124084
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\auth.js",
+          "score": 0.32419392466545105
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.append.js",
+          "score": 0.3230220377445221
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.router.js",
+          "score": 0.31337228417396545
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.urlencoded.js",
+          "score": 0.30776265263557434
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "response sending and content negotiation",
+      "repo_name": "express",
+      "category": "semantic",
+      "latency_ms": 5.665499999999156,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\content-negotiation.js",
+          "score": 0.35876935720443726
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.text.js",
+          "score": 0.30552995204925537
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.urlencoded.js",
+          "score": 0.2970510721206665
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\content-negotiation\\users.js",
+          "score": 0.29210785031318665
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.json.js",
+          "score": 0.2736862897872925
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.raw.js",
+          "score": 0.2716655135154724
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.urlencoded.js",
+          "score": 0.26968276500701904
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.text.js",
+          "score": 0.2684265971183777
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.json.js",
+          "score": 0.2627735733985901
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.format.js",
+          "score": 0.2627415060997009
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "response",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 3.6863000000012107,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\mvc\\index.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\search\\public\\client.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\params.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\resource.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.options.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\exports.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.fresh.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.stale.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.download.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.get.js",
+          "score": 0.25
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "how sub-applications are mounted with use() and path prefix stripping",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 8.63459999999759,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.render.js",
+          "score": 0.2243098020553589
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\route-separation\\user.js",
+          "score": 0.21510548889636993
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\route-middleware\\index.js",
+          "score": 0.19979900121688843
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\route-separation\\site.js",
+          "score": 0.19540518522262573
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.sendFile.js",
+          "score": 0.18672755360603333
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\static-files\\public\\js\\app.js",
+          "score": 0.1784495711326599
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\route-separation\\index.js",
+          "score": 0.17590980231761932
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.route.js",
+          "score": 0.17404469847679138
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.render.js",
+          "score": 0.172885000705719
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.render.js",
+          "score": 0.16702154278755188
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "how express creates the app function and attaches prototype methods",
+      "repo_name": "express",
+      "category": "architecture",
+      "latency_ms": 6.572100000001228,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.sendFile.js",
+          "score": 0.6575321555137634
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.render.js",
+          "score": 0.63871169090271
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.render.js",
+          "score": 0.6369400024414062
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.static.js",
+          "score": 0.6239666938781738
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.query.js",
+          "score": 0.584219217300415
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.raw.js",
+          "score": 0.5808225870132446
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.urlencoded.js",
+          "score": 0.5619988441467285
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.text.js",
+          "score": 0.5605928897857666
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\express.json.js",
+          "score": 0.5355579257011414
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\app.use.js",
+          "score": 0.49497658014297485
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "application",
+      "repo_name": "express",
+      "category": "symbol",
+      "latency_ms": 3.654900000001362,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\error-pages\\index.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\examples\\view-locals\\index.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\error-pages.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\acceptance\\route-separation.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\exports.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\middleware.basic.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.accepts.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.get.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\req.is.js",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\test\\res.format.js",
+          "score": 0.25
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "how is BaseModel defined and instantiated",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 16.376499999983935,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generics.py",
+          "score": 0.5271770358085632
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\typechecking\\base_model.py",
+          "score": 0.52237468957901
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_main.py",
+          "score": 0.5174548625946045
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_callable.py",
+          "score": 0.5169271230697632
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_callable.py",
+          "score": 0.5169271230697632
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\modules\\create_model_var.py",
+          "score": 0.5127294659614563
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\modules\\create_model_var.py",
+          "score": 0.5093046426773071
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_main.py",
+          "score": 0.4954911768436432
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_computed_fields.py",
+          "score": 0.4865439236164093
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.48404112458229065
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "how are model fields declared and constrained",
+      "repo_name": "pydantic",
+      "category": "architecture",
+      "latency_ms": 15.240400000009686,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
+          "score": 0.5667344927787781
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
+          "score": 0.5532078146934509
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\networks.py",
+          "score": 0.5439518690109253
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_model_construction.py",
+          "score": 0.5376738905906677
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
+          "score": 0.5342912673950195
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\benchmarks\\test_model_schema_generation.py",
+          "score": 0.516923189163208
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\main.py",
+          "score": 0.5168408751487732
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic-core\\python\\pydantic_core\\core_schema.py",
+          "score": 0.516389012336731
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
+          "score": 0.5132978558540344
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic-core\\src\\serializers\\fields.rs",
+          "score": 0.5128957033157349
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "JSON schema generation from models",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 16.18289999998524,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
+          "score": 0.6308002471923828
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.6231669187545776
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.6174076795578003
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.5895054340362549
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\tools.py",
+          "score": 0.5888607501983643
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_json_schema.py",
+          "score": 0.5884426236152649
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.5854254364967346
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_json_schema.py",
+          "score": 0.5850028991699219
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.581232488155365
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
+          "score": 0.5782042741775513
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "semantic",
+      "query": "custom field and model validators",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 16.947800000023562,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic-core\\src\\validators\\model_fields.rs",
+          "score": 0.6479870080947876
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_fields.py",
+          "score": 0.6326268315315247
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6159672737121582
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6085093021392822
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6057906150817871
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6034364700317383
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6007425785064697
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.5960176587104797
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.5950788259506226
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.5929170250892639
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "model configuration and settings",
+      "repo_name": "pydantic",
+      "category": "semantic",
+      "latency_ms": 15.586700000014389,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_model_construction.py",
+          "score": 0.49030184745788574
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
+          "score": 0.4694852828979492
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.45507100224494934
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.4452141523361206
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.4435703158378601
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_main.py",
+          "score": 0.43518251180648804
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\mypy.py",
+          "score": 0.4344222843647003
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.43244314193725586
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_root_model.py",
+          "score": 0.43232572078704834
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_config.py",
+          "score": 0.4285043179988861
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "BaseModel",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 14.17280000000028,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\typechecking\\base_model.py",
+          "score": 0.5263655185699463
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_main.py",
+          "score": 0.4817848801612854
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_construction.py",
+          "score": 0.4712179899215698
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_main.py",
+          "score": 0.4638773500919342
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_root_model.py",
+          "score": 0.4598812162876129
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_generics.py",
+          "score": 0.45774322748184204
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_json_schema.py",
+          "score": 0.45711302757263184
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_generics.py",
+          "score": 0.4562840163707733
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_construction.py",
+          "score": 0.45405563712120056
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\utils.py",
+          "score": 0.44940367341041565
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "field_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 15.807299999985844,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
+          "score": 0.7198516726493835
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.7129961848258972
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.703795850276947
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\deprecated\\class_validators.py",
+          "score": 0.7036935091018677
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators_dataclass.py",
+          "score": 0.7026944756507874
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_edge_cases.py",
+          "score": 0.6865009069442749
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6726751923561096
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.6702935099601746
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\utils.py",
+          "score": 0.6673017144203186
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_types_typeddict.py",
+          "score": 0.6629022359848022
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "semantic",
+      "query": "model_validator",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 15.702799999999115,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\benchmarks\\test_model_schema_generation.py",
+          "score": 0.7868329882621765
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_root_model.py",
+          "score": 0.7694790363311768
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.7394988536834717
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
+          "score": 0.7278642058372498
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_model_validator.py",
+          "score": 0.7252068519592285
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_model_validator.py",
+          "score": 0.7188634276390076
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.7138993144035339
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_validators.py",
+          "score": 0.7131409645080566
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_edge_cases.py",
+          "score": 0.7127009034156799
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_edge_cases.py",
+          "score": 0.7045251131057739
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333
+    },
+    {
+      "mode": "semantic",
+      "query": "ConfigDict",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 15.299599999998463,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\outputs\\mypy-default_ini\\pydantic_settings.py",
+          "score": 0.7283948063850403
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\outputs\\mypy-plugin_ini\\pydantic_settings.py",
+          "score": 0.726752758026123
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\modules\\pydantic_settings.py",
+          "score": 0.7032711505889893
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
+          "score": 0.7019396424293518
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\outputs\\pyproject-default_toml\\pydantic_settings.py",
+          "score": 0.6847223043441772
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\mypy\\outputs\\pyproject-plugin_toml\\pydantic_settings.py",
+          "score": 0.679451048374176
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\warnings.py",
+          "score": 0.6748595833778381
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
+          "score": 0.6701292395591736
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
+          "score": 0.6506351232528687
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_types_typeddict.py",
+          "score": 0.6033240556716919
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "Field",
+      "repo_name": "pydantic",
+      "category": "symbol",
+      "latency_ms": 14.565399999992223,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic-core\\src\\serializers\\fields.rs",
+          "score": 0.4674156606197357
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
+          "score": 0.45442816615104675
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\fields.py",
+          "score": 0.4433949291706085
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_computed_fields.py",
+          "score": 0.44128134846687317
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
+          "score": 0.44053390622138977
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\fields.py",
+          "score": 0.43811506032943726
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_computed_fields.py",
+          "score": 0.43400436639785767
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic-core\\src\\serializers\\fields.rs",
+          "score": 0.423174113035202
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\tests\\test_strict.py",
+          "score": 0.4173585772514343
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_fields.py",
+          "score": 0.4158649146556854
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333
+    },
+    {
+      "mode": "semantic",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 7.432900000014342,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.7228154540061951
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6732296347618103
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "score": 0.6646571159362793
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.6493708491325378
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6472925543785095
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6366590857505798
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.6364251375198364
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
+          "score": 0.6319184899330139
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.628766655921936
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6247074604034424
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 7.693200000037905,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.7078220248222351
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.6830238103866577
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.677627444267273
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.6742334365844727
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.669806718826294
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.6306611895561218
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "score": 0.614470899105072
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.6070533990859985
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.6003186702728271
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.595978319644928
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 6.486800000013318,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5694944262504578
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5678578615188599
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5669038891792297
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5663205981254578
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5621767044067383
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5541722178459167
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5535274147987366
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5533449649810791
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5531483292579651
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.5521267652511597
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "semantic",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 9.392400000011548,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.7381091117858887
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.7042880058288574
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "score": 0.7008469104766846
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.6995269656181335
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "score": 0.6939992904663086
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
+          "score": 0.6830947399139404
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.6741927266120911
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.6716099977493286
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
+          "score": 0.6599003076553345
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.6573908925056458
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333
+    },
+    {
+      "mode": "semantic",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 10.449599999992643,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_self.rs",
+          "score": 0.6887187957763672
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.6721698641777039
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.6518498063087463
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\tuple.rs",
+          "score": 0.6264258027076721
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "score": 0.6215775012969971
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.619846761226654
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.618698000907898
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "score": 0.618695855140686
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "score": 0.6128170490264893
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
+          "score": 0.6083558201789856
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 5.767400000011548,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5839082598686218
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5831673741340637
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.5772112011909485
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.5712794065475464
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.5712794065475464
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impossible.rs",
+          "score": 0.5685131549835205
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impossible.rs",
+          "score": 0.5685131549835205
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "score": 0.564266562461853
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5635852813720703
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5633430480957031
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.1111111111111111
+    },
+    {
+      "mode": "semantic",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 7.518700000015087,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\precondition\\deserialize_dst.rs",
+          "score": 0.6043356657028198
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.598328709602356
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.5948870778083801
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5908820629119873
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5861438512802124
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.5847762823104858
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5828638076782227
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.5783175826072693
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.5719741582870483
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.5719262361526489
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25
+    },
+    {
+      "mode": "semantic",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 5.087699999974575,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5922979116439819
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5760600566864014
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "score": 0.5602267384529114
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impossible.rs",
+          "score": 0.5502054691314697
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5415263175964355
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "score": 0.536794126033783
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.536041796207428
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\attr.rs",
+          "score": 0.536041796207428
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5274470448493958
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.5256438255310059
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 4.726800000004005,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.41783952713012695
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "score": 0.4000025987625122
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.3916025757789612
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\bytes\\mod.rs",
+          "score": 0.3819059431552887
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.3414687216281891
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\receiver.rs",
+          "score": 0.3275204598903656
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\ignored_any.rs",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\macros.rs",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\private\\seed.rs",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\bound.rs",
+          "score": 0.25
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "semantic",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 8.81260000000475,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6940808892250061
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6349412798881531
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6273878216743469
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6248424053192139
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.6231035590171814
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5976381301879883
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5826587677001953
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.580152153968811
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.579559326171875
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "score": 0.5760793089866638
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "how routes are grouped and registered",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 8.311399999947753,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.621528148651123
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5930259227752686
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.55012047290802
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.5370892286300659
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5331449508666992
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5273893475532532
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5142043828964233
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5133963227272034
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5124011039733887
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5050567388534546
+        }
+      ],
+      "recall_at_k": 0.5,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "radix tree path matching",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 7.024499999999534,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree.go",
+          "score": 0.5834382176399231
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.5221726894378662
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.4899260103702545
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.4774681627750397
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.46116483211517334
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.4516625702381134
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.4484616219997406
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.44056904315948486
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree.go",
+          "score": 0.4344852566719055
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree.go",
+          "score": 0.42688828706741333
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 7.669799999974202,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.5231531262397766
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.4943654239177704
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.4893281161785126
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.475021094083786
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.44484397768974304
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.44284945726394653
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.42997437715530396
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
+          "score": 0.42591285705566406
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.42299479246139526
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.4148791432380676
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 9.098700000031386,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.6316234469413757
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.6147488951683044
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.5831992626190186
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
+          "score": 0.5704557299613953
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
+          "score": 0.5513927936553955
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.5496178865432739
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.5489159822463989
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.534194827079773
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
+          "score": 0.5302534699440002
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.5253196358680725
+        }
+      ],
+      "recall_at_k": 0.5,
+      "mrr": 0.25
+    },
+    {
+      "mode": "semantic",
+      "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 9.42349999997532,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.7471524477005005
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.7087146639823914
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.6913430690765381
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.6589392423629761
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.64007967710495
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.6114286780357361
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.6005882024765015
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.5697661638259888
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
+          "score": 0.5453928112983704
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5449155569076538
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Engine",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 4.900199999974575,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.39060577750205994
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.3828659951686859
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.2990969121456146
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.28594252467155457
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.2583167850971222
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\default_validator.go",
+          "score": 0.2579422891139984
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding.go",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_nomsgpack.go",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\validate_test.go",
+          "score": 0.25
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.25
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "Context",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 6.602500000037253,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.35339975357055664
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.3531697392463684
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
+          "score": 0.3492909371852875
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
+          "score": 0.3343663513660431
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
+          "score": 0.32557621598243713
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
+          "score": 0.31555187702178955
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.2816372513771057
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.2614724934101105
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.25927895307540894
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\auth.go",
+          "score": 0.25
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "RouterGroup",
+      "repo_name": "gin",
+      "category": "symbol",
+      "latency_ms": 6.328900000022259,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.7988327145576477
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.7221129536628723
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
+          "score": 0.7095351815223694
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.6991246342658997
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
+          "score": 0.630320131778717
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.6033762693405151
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routes_test.go",
+          "score": 0.5632557272911072
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.5395411252975464
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routes_test.go",
+          "score": 0.455241858959198
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\middleware_test.go",
+          "score": 0.39739248156547546
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "how middleware is applied globally and to route groups",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 9.115400000009686,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.602681040763855
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5889695286750793
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.5633856654167175
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
+          "score": 0.5467198491096497
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.516416609287262
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.5028113126754761
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
+          "score": 0.48515406250953674
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.46913430094718933
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.4363674819469452
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
+          "score": 0.4220709502696991
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "semantic",
+      "query": "catching runtime panics in request handlers and returning 500",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 10.459100000036415,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery_test.go",
+          "score": 0.5174847841262817
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery.go",
+          "score": 0.46318864822387695
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery_test.go",
+          "score": 0.46108388900756836
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.4538606107234955
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\benchmarks_test.go",
+          "score": 0.45366209745407104
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
+          "score": 0.4520331025123596
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
+          "score": 0.45160964131355286
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery_test.go",
+          "score": 0.4288109242916107
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery.go",
+          "score": 0.42768532037734985
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery.go",
+          "score": 0.4196383059024811
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    }
+  ],
+  "aggregate": {
+    "semantic": {
+      "recall": 0.5957446808510638,
+      "mrr": 0.4367612293144208,
+      "count": 47,
+      "mean_latency_ms": 9.204108510639964
+    }
+  },
+  "by_category": {
+    "architecture": {
+      "semantic": {
+        "recall": 0.5789473684210527,
+        "mrr": 0.4912280701754385,
+        "count": 19
+      }
+    },
+    "semantic": {
+      "semantic": {
+        "recall": 0.5454545454545454,
+        "mrr": 0.45454545454545453,
+        "count": 11
+      }
+    },
+    "symbol": {
+      "semantic": {
+        "recall": 0.6470588235294118,
+        "mrr": 0.3643790849673203,
+        "count": 17
+      }
+    }
+  },
+  "by_repo": {
+    "axum": {
+      "semantic": {
+        "recall": 0.7,
+        "mrr": 0.4916666666666667,
+        "count": 10
+      }
+    },
+    "express": {
+      "semantic": {
+        "recall": 0,
+        "mrr": 0,
+        "count": 7
+      }
+    },
+    "pydantic": {
+      "semantic": {
+        "recall": 0.4,
+        "mrr": 0.16666666666666666,
+        "count": 10
+      }
+    },
+    "serde": {
+      "semantic": {
+        "recall": 0.8,
+        "mrr": 0.5194444444444445,
+        "count": 10
+      }
+    },
+    "gin": {
+      "semantic": {
+        "recall": 0.9,
+        "mrr": 0.875,
+        "count": 10
+      }
+    }
+  }
+}

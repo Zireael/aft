@@ -107,7 +107,6 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 - **`apply_patch`**: multi-file `*** Begin Patch` format with atomic rollback.
 - **`aft_refactor`**: workspace-wide symbol move (updates every import), function extraction, and inlining.
 - **`aft_import`**: language-aware import add, remove, and organize.
-- **`aft_transform`**: structural transforms such as adding class members, Rust derives, Python decorators, Go struct tags, or wrapping a body in try/catch.
 - **`ast_grep_search` / `ast_grep_replace`**: structural search and replace using AST patterns with meta-variables.
 
 ---

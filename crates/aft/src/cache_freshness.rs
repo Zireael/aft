@@ -1,5 +1,6 @@
+use rayon::prelude::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,6 +63,45 @@ pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdi
     #[cfg(debug_assertions)]
     STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
     verify_file_inner(path, cached, true)
+}
+
+/// Verify semantic cache file freshness in a private bounded Rayon pool.
+///
+/// Do not use the global pool here: load-time strict verification can hash every
+/// indexed file, and the semantic load/build already runs beside the bridge's
+/// single dispatch thread. Match the half-cores/cap-8 policy used by the search
+/// and callgraph cold-build pools.
+#[allow(dead_code)]
+pub(crate) fn verify_files_strict_bounded<K: Send>(
+    files: Vec<(K, PathBuf, FileFreshness)>,
+) -> Vec<(K, PathBuf, FreshnessVerdict)> {
+    fn verify_one<K>(
+        (key, path, cached): (K, PathBuf, FileFreshness),
+    ) -> (K, PathBuf, FreshnessVerdict) {
+        let verdict = verify_file_strict(&path, &cached);
+        (key, path, verdict)
+    }
+
+    if files.len() <= 1 {
+        return files.into_iter().map(verify_one::<K>).collect();
+    }
+
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(strict_verify_pool_size())
+        .thread_name(|index| format!("aft-semantic-verify-{index}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| files.into_par_iter().map(verify_one::<K>).collect()),
+        Err(_) => files.into_iter().map(verify_one::<K>).collect(),
+    }
+}
+
+fn strict_verify_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .div_ceil(2)
+        .clamp(1, 8)
 }
 
 #[cfg(debug_assertions)]

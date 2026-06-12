@@ -1,0 +1,13 @@
+suite	candidate	fixtures	rank1_rate	top5_rate	mrr	query_latency_ms_p50	query_latency_ms_p95	rerank_latency_ms_p50	rerank_latency_ms_p95
+identifier	current	13	0.461538	0.692308	0.555483	8.635	56.95	0.007	0.011
+identifier	rrf_exact_lane	13	0.692308	0.692308	0.719364	8.635	56.95	0.128	0.193
+identifier	exact_identifier_first	13	1.0	1.0	1.0	8.635	56.95	0.019	0.028
+identifier	identifier_lexical_uncapped	13	0.230769	0.923077	0.54304	8.635	56.95	0.051	0.062
+existing	current	28	0.535714	0.714286	0.618657	7.209	8.448	0.007	0.01
+existing	rrf_exact_lane	28	0.392857	0.714286	0.535538	7.209	8.448	0.119	0.145
+existing	exact_identifier_first	28	0.5	0.75	0.600552	7.209	8.448	0.008	0.027
+existing	identifier_lexical_uncapped	28	0.357143	0.571429	0.464757	7.209	8.448	0.037	0.06
+all	current	41	0.512195	0.707317	0.598626	7.476	9.559	0.007	0.01
+all	rrf_exact_lane	41	0.487805	0.707317	0.593824	7.476	9.559	0.122	0.15
+all	exact_identifier_first	41	0.658537	0.829268	0.727206	7.476	9.559	0.015	0.027
+all	identifier_lexical_uncapped	41	0.317073	0.682927	0.489579	7.476	9.559	0.045	0.06

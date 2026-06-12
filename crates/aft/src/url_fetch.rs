@@ -8,6 +8,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use htmd::{
+    element_handler::{HandlerResult, Handlers},
+    Element, HtmlToMarkdown,
+};
 use reqwest::blocking::{Client, Response as HttpResponse};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::redirect::Policy;
@@ -35,6 +39,7 @@ const TRANSIENT_RETRY_ATTEMPTS: usize = 2;
 const TRANSIENT_RETRY_BACKOFFS_MS: [u64; TRANSIENT_RETRY_ATTEMPTS] = [200, 600];
 const ACCEPT_HEADER: &str = "application/vnd.github.raw, text/markdown, text/x-markdown, text/html;q=0.9, application/json;q=0.8, text/plain;q=0.5";
 const USER_AGENT_VALUE: &str = "aft-opencode-plugin";
+const CONVERTED_MARKDOWN_CONTENT_TYPE: &str = "text/markdown; charset=utf-8";
 
 #[derive(Clone, Default)]
 pub struct UrlFetchOptions {
@@ -139,6 +144,16 @@ pub fn fetch_url_to_cache(
     }
 
     let body = read_response_body(response, url)?;
+    let (body, content_type, extension) = if extension == ".html" {
+        (
+            convert_html_body_to_markdown(&body, url)?,
+            CONVERTED_MARKDOWN_CONTENT_TYPE.to_string(),
+            ".md",
+        )
+    } else {
+        (body, content_type, extension)
+    };
+
     let content_file = content_path(storage_dir, &hash, extension);
     atomic_write(&content_file, &body, &options)?;
 
@@ -254,6 +269,10 @@ fn fresh_cached_path(
         None => return Ok(None),
     };
     let age = now_ms().saturating_sub(meta.fetched_at);
+    if meta.extension == ".html" {
+        return Ok(None);
+    }
+
     let cached = content_path(storage_dir, hash, &meta.extension);
     if age < CACHE_TTL_MS && cached.exists() {
         return Ok(Some(cached));
@@ -535,6 +554,93 @@ fn resolve_extension(content_type: &str) -> Option<&'static str> {
         other if other.ends_with("+json") => Some(".json"),
         _ => None,
     }
+}
+
+fn convert_html_body_to_markdown(body: &[u8], url: &str) -> Result<Vec<u8>, UrlFetchError> {
+    let html = String::from_utf8_lossy(body);
+    let mut markdown = html_to_markdown_converter()
+        .convert(&html)
+        .map_err(|error| {
+            UrlFetchError::new(format!(
+                "Failed to convert HTML from {url} to Markdown: {error}"
+            ))
+        })?;
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    Ok(markdown.into_bytes())
+}
+
+fn html_to_markdown_converter() -> HtmlToMarkdown {
+    HtmlToMarkdown::builder()
+        .skip_tags(vec![
+            "head", "script", "style", "nav", "footer", "aside", "noscript",
+        ])
+        .add_handler(
+            vec!["a"],
+            |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                if is_permalink_anchor(&element) {
+                    None
+                } else {
+                    handlers.fallback(element)
+                }
+            },
+        )
+        .add_handler(
+            vec!["header"],
+            |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                if should_skip_header(&element) {
+                    None
+                } else {
+                    handlers.fallback(element)
+                }
+            },
+        )
+        .add_handler(
+            vec!["span"],
+            |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                if element_has_class_token(&element, "token-line") {
+                    let mut content = handlers.walk_children(element.node).content;
+                    content.push('\n');
+                    Some(content.into())
+                } else {
+                    handlers.fallback(element)
+                }
+            },
+        )
+        .build()
+}
+
+fn is_permalink_anchor(element: &Element<'_>) -> bool {
+    element_has_class_token(element, "hash-link")
+        || element_attr_value(element, "aria-label")
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("direct link to"))
+}
+
+fn should_skip_header(element: &Element<'_>) -> bool {
+    element_has_class_token(element, "navbar")
+        || element_has_class_token(element, "site-header")
+        || element_has_class_token(element, "site-nav")
+        || element_has_class_token(element, "topbar")
+        || element_attr_value(element, "role")
+            .is_some_and(|value| value.eq_ignore_ascii_case("banner"))
+        || element_attr_value(element, "id").is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("navbar") || value.contains("site-header") || value.contains("site-nav")
+        })
+}
+
+fn element_has_class_token(element: &Element<'_>, token: &str) -> bool {
+    element_attr_value(element, "class")
+        .is_some_and(|value| value.split_ascii_whitespace().any(|class| class == token))
+}
+
+fn element_attr_value<'a>(element: &'a Element<'_>, name: &str) -> Option<&'a str> {
+    element
+        .attrs
+        .iter()
+        .find(|attr| attr.name.local.as_ref() == name)
+        .map(|attr| attr.value.as_ref())
 }
 
 enum BodyReadEvent {

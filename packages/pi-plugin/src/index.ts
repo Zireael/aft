@@ -78,6 +78,7 @@ setActiveLogger(bridgeLogger);
 
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { resolveSessionId } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
 import { registerBashTool } from "./tools/bash.js";
@@ -91,7 +92,6 @@ import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
 import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
-import { registerStructureTool } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -184,12 +184,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.36.0";
+const ANNOUNCEMENT_VERSION = "0.37.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
-  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
-  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
-  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
+  "Much lower background CPU: idle bridges shut down after 30 minutes, deleted project roots stop the watcher instead of spinning it, and background scans reuse warm caches on a bounded thread pool.",
+  "`aft_transform` removed: usage data showed agents never called it — `edit` covers everything it did, and every request now carries a smaller tool surface.",
+  "Leaner tools: `bash`, `write`, `edit`, `apply_patch`, `aft_search`, and `aft_refactor` descriptions trimmed and config-aware; system-prompt guidance rewritten around what to do instead of what to avoid.",
+  "Background bash reminders are right-sized: failures keep head + tail context, successes show a short tail, and compressors never print a success summary for a non-zero exit.",
 ];
 
 /**
@@ -201,13 +201,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
  */
 const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 
-const ALL_ONLY_TOOLS = new Set([
-  "aft_callgraph",
-  "aft_delete",
-  "aft_move",
-  "aft_transform",
-  "aft_refactor",
-]);
+const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
 
 const pendingEagerWarnings = new Map<string, ConfigureWarning[]>();
 
@@ -322,7 +316,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  structure: boolean;
   refactor: boolean;
 } {
   const surface = config.tool_surface ?? "recommended";
@@ -355,7 +348,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       move: false,
       astSearch: false,
       astReplace: false,
-      structure: false,
       refactor: false,
     };
   }
@@ -380,7 +372,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    structure: false,
     refactor: false,
   };
 
@@ -390,7 +381,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
-      structure: allOnly("aft_transform"),
       refactor: allOnly("aft_refactor"),
     };
   }
@@ -785,9 +775,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (surface.delete || surface.move) {
     registerFsTools(pi, ctx, surface);
   }
-  if (surface.structure) {
-    registerStructureTool(pi, ctx);
-  }
   if (surface.refactor) {
     registerRefactorTool(pi, ctx);
   }
@@ -856,6 +843,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       sessionID: resolveSessionId(extCtx),
       runtime: pi,
     });
+  });
+
+  // User-message abort: when the user sends a message while the agent is
+  // blocked in a sync bash_watch wait, signal the wait to abort and convert
+  // to an async watch so the user isn't locked out.
+  (
+    pi.on as (
+      event: "input",
+      handler: (
+        event: { type: string; text: string; source: string },
+        ctx: Parameters<typeof resolveSessionId>[0] & { cwd: string },
+      ) => unknown,
+    ) => void
+  )("input", (_event, extCtx) => {
+    signalSyncWatchAbort(resolveSessionId(extCtx));
   });
 
   // Also register process-level signal handlers so children get an orderly

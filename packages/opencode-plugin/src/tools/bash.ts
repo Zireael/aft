@@ -49,7 +49,43 @@ function resolveForegroundWaitMs(configured: number): number {
   return configured;
 }
 
-const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to block on or register for pattern matches and exit events.`;
+/**
+ * Agent-facing tool description, selected from the live configuration so it
+ * never advertises behavior this project doesn't have:
+ * - code-search prohibition steers to `aft_search` when registered, else the
+ *   `grep` tool (same surface logic as the Rust grep-rewrite footer); the
+ *   registration variant is selected late in index.ts once the final tool map
+ *   is known.
+ * - the compression sentence only appears when output compression is on —
+ *   advertising `compressed: false` otherwise would describe a no-op.
+ * - the background/PTY sentences only appear when `bash.background` is on —
+ *   with it off, explicit `background: true`/`pty: true` is a guaranteed
+ *   `feature_disabled` error from Rust. Foreground promotion still happens
+ *   regardless (the flag gates explicit spawning only), so the no-background
+ *   variant still explains promoted tasks and bash_status/bash_kill.
+ *
+ * Wording rules: this is read by AGENTS choosing a tool, not by users reading
+ * docs. No internal vocabulary ("hoisted", "command rewriting", "unified bash
+ * schema") — describe what the tool does and what NOT to use it for.
+ */
+export function bashToolDescription(
+  aftSearchRegistered: boolean,
+  compressionOn: boolean,
+  backgroundOn: boolean,
+): string {
+  const searchSteer = aftSearchRegistered
+    ? "use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead"
+    : "use the grep tool, read, aft_outline, or aft_zoom instead";
+  const compression = compressionOn
+    ? " Output is compressed by default; pass compressed: false for raw output."
+    : "";
+  const tasks = backgroundOn
+    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically).'
+    : " Commands that outlive the foreground wait window are promoted to background tasks; inspect them with bash_status({ taskId }) or terminate with bash_kill.";
+  return `Execute shell commands.${compression}${tasks} Use bash_watch to wait for output patterns or exit events.
+
+DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`;
+}
 
 interface PermissionAsk {
   kind: "external_directory" | "bash";
@@ -102,12 +138,15 @@ export function createBashTool(
   aftSearchRegisteredOverride?: boolean,
 ): ToolDefinition {
   return {
-    description: BASH_DESCRIPTION,
+    description: (() => {
+      const cfg = resolveBashConfig(ctx.config);
+      return bashToolDescription(false, cfg.compress, cfg.background);
+    })(),
     args: {
       command: z
         .string()
         .describe(
-          "Shell command to execute through AFT's unified bash schema. Supports normal shell syntax, pipes, redirection, and command rewriting to dedicated AFT tools when available.",
+          "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
         ),
       timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
         "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",

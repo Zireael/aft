@@ -341,21 +341,16 @@ fn default_rerank_max_candidate_chars() -> usize {
 }
 
 /// Reranker API format type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankApiType {
     /// LLM-based chat completions endpoint (`/v1/chat/completions`).
     /// Expects JSON array of indices in `choices[0].message.content`.
+    #[default]
     Chat,
     /// Cross-encoder rerank endpoint (`/v1/rerank`).
     /// Expects `{results: [{index, relevance_score}]}` or provider variants.
     Rerank,
-}
-
-impl Default for RerankApiType {
-    fn default() -> Self {
-        Self::Chat
-    }
 }
 
 fn default_rerank_api_type() -> RerankApiType {
@@ -698,7 +693,7 @@ pub struct Config {
     pub semantic_search: bool,
     /// Whether the plugin registered the `aft_search` tool for this surface.
     pub aft_search_registered: bool,
-    /// Enable the persisted callgraph store substrate (default: false).
+    /// Enable the persisted callgraph store substrate (default: true).
     pub callgraph_store: bool,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
@@ -716,10 +711,10 @@ pub struct Config {
     pub bash_permissions: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
-    /// Maximum number of source files allowed for call-graph operations
-    /// (`callers`, `trace_to`, `trace_data`, `impact`). When a project
-    /// exceeds this count the reverse index is not built and those
-    /// commands return a `project_too_large` error. Does not affect
+    /// Maximum number of source files allowed for legacy in-memory call-graph operations
+    /// (`trace_data` and symbol move analysis). Store-backed dead_code and
+    /// edge-query commands (`callers`, `call_tree`, `impact`, `trace_to`,
+    /// `trace_to_symbol`) are not capped by this setting. Does not affect
     /// `grep`, `glob`, `read`, `edit`, or other non-callgraph features.
     /// Default: 5_000 (matches measured per-op cost ceilings; raise for
     /// very large projects if you accept multi-minute per-call latency).
@@ -788,7 +783,7 @@ impl Default for Config {
             search_index: false,
             semantic_search: false,
             aft_search_registered: false,
-            callgraph_store: false,
+            callgraph_store: true,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,
@@ -830,5 +825,84 @@ impl Default for Config {
             harness: None,
             diagnostic_cache_size: 5000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_backend_config_default_values() {
+        let config = SemanticBackendConfig::default();
+        assert_eq!(config.backend, SemanticBackend::Fastembed);
+        assert_eq!(config.max_batch_size, 64);
+        assert_eq!(config.max_files, 20_000);
+        assert!(!config.rerank_enabled);
+    }
+
+    #[test]
+    fn effective_query_prompt_template_none_returns_none() {
+        let config = SemanticBackendConfig {
+            query_prompt_template: None,
+            use_model_profiles: false,
+            ..SemanticBackendConfig::default()
+        };
+        assert!(config.effective_query_prompt_template().is_none());
+    }
+
+    #[test]
+    fn effective_query_prompt_template_set_returns_template() {
+        let tpl = "Instruct: {query}".to_string();
+        let config = SemanticBackendConfig {
+            query_prompt_template: Some(tpl.clone()),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(
+            config.effective_query_prompt_template().as_deref(),
+            Some(tpl.as_str())
+        );
+    }
+
+    #[test]
+    fn effective_document_prompt_template_none_returns_none() {
+        let config = SemanticBackendConfig {
+            document_prompt_template: None,
+            use_model_profiles: false,
+            ..SemanticBackendConfig::default()
+        };
+        assert!(config.effective_document_prompt_template().is_none());
+    }
+
+    #[test]
+    fn rerank_api_type_default_is_chat() {
+        let config = SemanticBackendConfig::default();
+        assert_eq!(config.rerank_api_type, RerankApiType::Chat);
+    }
+
+    #[test]
+    fn diagnostics_output_mode_default_is_minimal() {
+        let config = SemanticBackendConfig::default();
+        assert_eq!(config.output_mode, DiagnosticsOutputMode::Minimal);
+    }
+
+    #[test]
+    fn semantic_file_policy_default_includes_code_and_docs() {
+        let policy = SemanticFilePolicy::default();
+        assert!(policy.include_code);
+        assert!(policy.include_docs);
+        assert!(!policy.include_configs);
+    }
+
+    #[test]
+    fn semantic_file_policy_builtin_excludes_node_modules() {
+        let policy = SemanticFilePolicy::default();
+        assert!(
+            policy
+                .builtin_exclude_globs
+                .iter()
+                .any(|g| g.contains("node_modules")),
+            "builtin excludes should contain node_modules"
+        );
     }
 }

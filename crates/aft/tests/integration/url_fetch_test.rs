@@ -91,6 +91,44 @@ fn configure_with_storage(project: &Path, storage: &Path) -> AftProcess {
     aft
 }
 
+const DOCUSAURUS_HTML: &str = r##"<!doctype html>
+<html>
+<head>
+  <title>Oh My Pi: Hindsight Memory</title>
+  <style>.navbar{display:flex}</style>
+  <script>window.__docusaurus = {};</script>
+</head>
+<body>
+  <nav class="navbar navbar--fixed-top"><a href="/">Home</a></nav>
+  <aside class="theme-doc-toc-desktop">The Retain Pipeline</aside>
+  <main>
+    <article>
+      <h1>Oh My Pi: Hindsight Memory<a class="hash-link" href="#oh-my-pi" aria-label="Direct link to Oh My Pi">&#8203;</a></h1>
+      <p>Hindsight Memory helps agents keep useful context.</p>
+      <h2 id="motivating-example">Motivating Example<a class="hash-link" href="#motivating-example" aria-label="Direct link to Motivating Example">&#8203;</a></h2>
+      <p>A short example introduces the problem.</p>
+      <h2 id="index-pipeline">The Index Pipeline<a class="hash-link" href="#index-pipeline" aria-label="Direct link to The Index Pipeline">&#8203;</a></h2>
+      <p>The index stage stores observations.</p>
+      <h2 id="retrieve-pipeline">The Retrieve Pipeline<a class="hash-link" href="#retrieve-pipeline" aria-label="Direct link to The Retrieve Pipeline">&#8203;</a></h2>
+      <p>The retrieve stage finds useful memories.</p>
+      <h2 id="retain-pipeline">The Retain Pipeline<a class="hash-link" href="#retain-pipeline" aria-label="Direct link to The Retain Pipeline">&#8203;</a></h2>
+      <p>The retain stage trims old memories while preserving the important facts.</p>
+      <div class="language-ts codeBlockContainer_mQmQ" style="--prism-color:#F8F8F2">
+        <pre class="prism-code language-ts" style="color:#f8f8f2"><code class="codeBlockLines_AclH"><span class="token-line"><span class="token keyword">const</span><span class="token plain"> retain = async (items: MemoryItem[]) =&gt; {</span></span><span class="token-line"><span class="token plain">  return items.filter((item) =&gt; item.score &gt; 0.7);</span></span><span class="token-line"><span class="token plain">};</span></span></code></pre>
+      </div>
+      <h2 id="benchmarks">Benchmarks<a class="hash-link" href="#benchmarks" aria-label="Direct link to Benchmarks">&#8203;</a></h2>
+      <p>Benchmarks compare retention quality.</p>
+      <h2 id="what-comes-next">What Comes Next<a class="hash-link" href="#what-comes-next" aria-label="Direct link to What Comes Next">&#8203;</a></h2>
+      <p>Future work improves recall.</p>
+      <h2 id="conclusion">Conclusion<a class="hash-link" href="#conclusion" aria-label="Direct link to Conclusion">&#8203;</a></h2>
+      <p>Clean markdown keeps the article readable.</p>
+    </article>
+  </main>
+  <footer>Footer chrome</footer>
+</body>
+</html>
+"##;
+
 #[test]
 fn private_ip_blocked_at_fetch_time() {
     let project = TempDir::new().unwrap();
@@ -254,6 +292,145 @@ fn unsupported_content_type_rejected() {
     assert!(message.contains("Unsupported content type"), "{message}");
     assert!(message.contains("Supported:"), "{message}");
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn html_url_is_converted_to_markdown_before_cache_and_zoom_heading_is_clean() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            DOCUSAURUS_HTML.as_bytes(),
+        );
+    });
+    let url = server.url("/blog/oh-my-pi");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let outline = aft.send(
+        &json!({
+            "id": "html-outline",
+            "command": "outline",
+            "file": &url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        outline["success"], true,
+        "HTML outline should succeed after conversion: {outline:?}"
+    );
+    let text = outline["text"].as_str().expect("outline text");
+    let heading_count = text.lines().filter(|line| line.contains(" h ")).count();
+    assert_eq!(
+        heading_count, 8,
+        "outline should contain exactly article headings: {text}"
+    );
+    assert!(
+        text.contains("The Retain Pipeline"),
+        "outline should contain visible heading text: {text}"
+    );
+    assert!(
+        !text.contains('\u{200b}'),
+        "outline heading text must not include Docusaurus permalink text: {text:?}"
+    );
+    assert!(
+        !text.contains("hash-link"),
+        "outline should be markdown, not raw HTML: {text}"
+    );
+
+    let zoom = aft.send(
+        &json!({
+            "id": "html-zoom",
+            "command": "zoom",
+            "file": &url,
+            "symbol": "The Retain Pipeline",
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        zoom["success"], true,
+        "zoom by visible HTML heading should succeed after conversion: {zoom:?}"
+    );
+    let content = zoom["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("## The Retain Pipeline"),
+        "zoom should return markdown heading: {content}"
+    );
+    assert!(
+        content.contains("The retain stage trims old memories"),
+        "zoom should include prose body: {content}"
+    );
+    assert!(
+        content.contains("```ts"),
+        "Docusaurus prism code should become a fenced ts block: {content}"
+    );
+    assert!(
+        content.contains("const retain = async"),
+        "zoom should include code body: {content}"
+    );
+    assert!(
+        content.contains("return items.filter"),
+        "zoom should preserve Docusaurus token-line code text: {content}"
+    );
+    assert!(
+        !content.contains("<div") && !content.contains("class="),
+        "zoom should not expose raw prism/class/style HTML: {content}"
+    );
+
+    let markdown_cache = cache_content_path_for_url(storage.path(), &url, ".md");
+    let html_cache = cache_content_path_for_url(storage.path(), &url, ".html");
+    assert!(
+        markdown_cache.exists(),
+        "HTML response should be cached as markdown"
+    );
+    assert!(
+        !html_cache.exists(),
+        "converted HTML response should not leave a fresh .html cache entry"
+    );
+    let meta: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(cache_meta_path_for_url(storage.path(), &url)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["extension"], ".md");
+    assert_eq!(meta["contentType"], "text/markdown; charset=utf-8");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn markdown_url_cache_content_is_unchanged() {
+    let storage = TempDir::new().unwrap();
+    let body = b"# Native Markdown\n\n```rs\nfn main() {}\n```\n";
+    let server = spawn_mock_server(1, move |_path, stream| {
+        write_response(stream, "200 OK", "text/markdown; charset=utf-8", body);
+    });
+    let url = server.url("/readme.md");
+
+    let cached = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("markdown fetch should succeed");
+
+    assert_eq!(
+        cached,
+        cache_content_path_for_url(storage.path(), &url, ".md")
+    );
+    assert_eq!(fs::read(&cached).unwrap(), body);
+    assert!(
+        !cache_content_path_for_url(storage.path(), &url, ".html").exists(),
+        "native markdown URLs must not be routed through HTML cache"
+    );
 }
 
 #[test]

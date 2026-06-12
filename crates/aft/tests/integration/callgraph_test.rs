@@ -2623,9 +2623,12 @@ fn callgraph_ops_return_building_then_ready_async() {
     );
 
     // Retry until the background build lands and the store is installed via the
-    // drain loop. Bounded retries so a genuine regression fails the test.
+    // drain loop. Deadline-bounded so a genuine regression still fails the test,
+    // but slow CI runners (Windows debug builds under parallel load) get the
+    // headroom a fixed 5s retry count denied them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut succeeded = false;
-    for _ in 0..50 {
+    while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let resp = aft.send(&format!(
             r#"{{"id":"3","command":"callers","file":{},"symbol":"validate","depth":1}}"#,

@@ -13,6 +13,52 @@ use crate::imports;
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 
+/// Coerce an array-of-strings param, tolerating the shapes models/MCP
+/// clients send in practice: a real array, a JSON-stringified array
+/// (`'["a","b"]'`), or a single bare string (one-element array).
+///
+/// The old inline parse used `.as_array()` + `unwrap_or_default()`, which
+/// SILENTLY dropped a stringified `names` array — the request then fell
+/// through to the side-effect-import branch and wrote `import "module";`
+/// with `success: true` (observed live twice). Wrong-typed values are now a
+/// hard `invalid_request` instead of a silent behavior change.
+fn coerce_string_array_param(params: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = params.get(key) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(arr) => Ok(arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if let Ok(serde_json::Value::Array(arr)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                {
+                    return Ok(arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect());
+                }
+            }
+            Ok(vec![trimmed.to_string()])
+        }
+        _ => Err(format!(
+            "add_import: param '{key}' must be an array of strings"
+        )),
+    }
+}
+
 /// Handle an `add_import` request.
 ///
 /// Params:
@@ -48,16 +94,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let names: Vec<String> = req
-        .params
-        .get("names")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let names: Vec<String> = match coerce_string_array_param(&req.params, "names") {
+        Ok(values) => values,
+        Err(message) => return Response::error(&req.id, "invalid_request", message),
+    };
 
     let default_import = req
         .params
@@ -85,16 +125,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let mut modifiers: Vec<String> = req
-        .params
-        .get("modifiers")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut modifiers: Vec<String> = match coerce_string_array_param(&req.params, "modifiers") {
+        Ok(values) => values,
+        Err(message) => return Response::error(&req.id, "invalid_request", message),
+    };
 
     let import_kind = req
         .params
@@ -663,4 +697,65 @@ fn php_braced_namespace_anchor(source: &str, node: tree_sitter::Node<'_>) -> Opt
     source[node.start_byte()..node.end_byte()]
         .find('{')
         .map(|offset| node.start_byte() + offset + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coerce_string_array_param;
+    use serde_json::json;
+
+    #[test]
+    fn coerce_accepts_real_array() {
+        let params = json!({ "names": ["a", "b"] });
+        assert_eq!(
+            coerce_string_array_param(&params, "names").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn coerce_parses_json_stringified_array() {
+        // The live bug: an MCP/model boundary delivered names as the STRING
+        // '["bashToolDescription"]'. The old `.as_array()` parse silently
+        // dropped it and add_import wrote a bare side-effect import.
+        let params = json!({ "names": "[\"bashToolDescription\"]" });
+        assert_eq!(
+            coerce_string_array_param(&params, "names").unwrap(),
+            vec!["bashToolDescription".to_string()]
+        );
+    }
+
+    #[test]
+    fn coerce_treats_bare_string_as_single_name() {
+        let params = json!({ "names": "useState" });
+        assert_eq!(
+            coerce_string_array_param(&params, "names").unwrap(),
+            vec!["useState".to_string()]
+        );
+    }
+
+    #[test]
+    fn coerce_missing_null_and_empty_yield_empty() {
+        assert!(coerce_string_array_param(&json!({}), "names")
+            .unwrap()
+            .is_empty());
+        assert!(
+            coerce_string_array_param(&json!({ "names": null }), "names")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(coerce_string_array_param(&json!({ "names": "" }), "names")
+            .unwrap()
+            .is_empty());
+        assert!(coerce_string_array_param(&json!({ "names": [] }), "names")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn coerce_rejects_non_string_non_array_types() {
+        let err = coerce_string_array_param(&json!({ "names": 42 }), "names").unwrap_err();
+        assert!(err.contains("must be an array of strings"), "{err}");
+        assert!(coerce_string_array_param(&json!({ "names": { "a": 1 } }), "names").is_err());
+    }
 }

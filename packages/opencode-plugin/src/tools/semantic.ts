@@ -35,22 +35,15 @@ function arg(schema: unknown): ToolArg {
 
 export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
+    // Lean and positive on purpose: this is the primary code-search tool, so
+    // the description must not push agents elsewhere. The old "When NOT to
+    // use: ... use grep directly" line fed the exact bash-grep reflex the
+    // system prompt works to suppress, and sibling tools (aft_outline,
+    // aft_callgraph) already describe themselves.
     description: [
-      "Find code with unified semantic, lexical, literal, and regex search. Returns ranked symbol/file results or exact matching lines, with routing metadata.",
+      "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. Use it for any code search — including when you only know what the code does, not what it's named ('where is rate limiting handled', 'retry logic', '^export', 'Cargo.lock').",
       "",
-      "When to reach for it:",
-      "- Exploring an unfamiliar area: 'where is rate limiting handled', 'how does auth flow work'",
-      "- Concept doesn't appear as a literal string: 'retry logic', 'cache invalidation', 'graceful shutdown'",
-      "- Filename-shaped concepts: 'the bridge spawn helper', 'the session detection module'",
-      "- Regex-shaped or exact text queries when you want AFT to classify and route automatically",
-      "- You know roughly what the function does but not what it's named",
-      "",
-      "When NOT to use:",
-      "- You need exhaustive literal enumeration → use grep directly",
-      "- You want the file/module structure → use aft_outline",
-      "- You're following a call chain → use aft_callgraph",
-      "",
-      "Set hint to 'regex', 'literal', 'semantic', or 'auto' to override or document routing intent.",
+      "Set hint to 'regex', 'literal', or 'semantic' to force a lane.",
     ].join("\n"),
     args: {
       query: arg(

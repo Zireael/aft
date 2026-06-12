@@ -49,7 +49,6 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 | `lsp_diagnostics`   | On-demand LSP diagnostics (edit/write already inline diagnostics automatically)   |
 | `aft_delete`        | Delete a file with backup (surface: `all`)                                        |
 | `aft_move`          | Move/rename a file (surface: `all`)                                               |
-| `aft_transform`     | Scope-aware structural transformations (surface: `all`)                           |
 | `aft_refactor`      | Workspace-wide refactor: move symbol, extract function, inline call (surface: `all`) |
 
 ### Slash command
@@ -88,7 +87,7 @@ All keys are optional. Example:
   "experimental_semantic_search": true,
 
   // Disable specific tool names (applied after tool_surface selection).
-  "disabled_tools": ["aft_transform", "aft_refactor"],
+  "disabled_tools": ["aft_refactor"],
 
   "formatter": {
     "typescript": "biome",
@@ -121,7 +120,7 @@ Sensitive semantic backend fields (`backend`, `base_url`, `api_key_env`) are onl
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `minimal`         | `aft_outline`, `aft_zoom`, `aft_safety`                                                                                 |
 | `recommended` (default) | `minimal` + hoisted `read`/`write`/`edit` + `aft_import` + `ast_grep_*` + `lsp_diagnostics` + `aft_conflicts` + (optional) `grep` + (optional) `aft_search` |
-| `all`             | `recommended` + `aft_callgraph` + `aft_delete` + `aft_move` + `aft_transform` + `aft_refactor`                           |
+| `all`             | `recommended` + `aft_callgraph` + `aft_delete` + `aft_move` + `aft_refactor`                           |
 
 ## Architecture
 

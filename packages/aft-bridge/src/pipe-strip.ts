@@ -207,16 +207,34 @@ function isCompressorHandledRunner(stage: string): boolean {
     return false;
   }
 
+  // Peel leading POSIX env-var assignments (`VAR=value`, possibly several) that
+  // prefix the runner (e.g. `CI=1 bun test`, `FOO=bar BAZ=qux npm test`).
+  // `containsUnsplittableConstruct` already rejects `VAR=$(cmd)` (command
+  // substitution), so values here are safe literals or simple expansions.
+  let tokenOffset = 0;
+  while (tokenOffset < tokens.length && isEnvAssignment(tokens[tokenOffset])) {
+    tokenOffset++;
+  }
+
   // Basename the launcher so `./gradlew`, `./mvnw`, `node_modules/.bin/jest`,
   // and `./vendor/bin/phpunit` resolve to their tool name.
-  const first = runnerName(tokens[0]);
-  const second = tokens[1];
-  const third = tokens[2];
-  const rest = tokens.slice(1);
+  const first = runnerName(tokens[tokenOffset]);
+  const runnerArgs = tokens.slice(tokenOffset + 1);
+  const second = runnerArgs[0];
+  const third = runnerArgs[1];
+  const rest = runnerArgs;
   if (!first) return false;
 
   // --- JavaScript / TypeScript ---
-  if (first === "bun") return second === "test" || (second === "run" && startsWithTest(third));
+  if (first === "bun") {
+    // Skip `--cwd <dir>` / `--cwd=<dir>` before the subcommand.
+    let args = rest;
+    if (args[0] === "--cwd") args = args.slice(2);
+    else if (args[0]?.startsWith("--cwd=")) args = args.slice(1);
+    const sub = args[0];
+    const subNext = args[1];
+    return sub === "test" || (sub === "run" && startsWithTest(subNext));
+  }
   if (first === "npm" || first === "pnpm") {
     return second === "test" || (second === "run" && startsWithTest(third));
   }
@@ -246,7 +264,7 @@ function isCompressorHandledRunner(stage: string): boolean {
     return hasBuildTask(rest, ["test", "check", "build", "assemble", "clean"]);
   }
   if (first === "mvn" || first === "mvnw") {
-    return hasBuildTask(rest, ["test", "verify", "package", "install"]);
+    return hasBuildTask(rest, ["test", "verify", "package", "install", "clean"]);
   }
 
   // --- .NET ---
@@ -254,9 +272,16 @@ function isCompressorHandledRunner(stage: string): boolean {
 
   // --- Ruby ---
   if (first === "rspec") return true;
-  // Exact task match only — `rake test`/`rake spec`, not arbitrary
-  // project tasks like `rake test_db_reset` that merely start with "test".
-  if (first === "rake") return second === "test" || second === "spec";
+  // Allow multiple task words when all are plain task names (no flags/paths)
+  // and at least one is `test` or `spec` — so `rake db:setup test` strips but
+  // `rake test_db_reset` or `rake deploy` does not.
+  if (first === "rake") {
+    const positionals = rest.filter((a) => !a.startsWith("-"));
+    if (positionals.length === 0) return false;
+    if (positionals.some((a) => a.includes("/") || a.includes(".") || a.includes("=")))
+      return false;
+    return positionals.some((a) => a === "test" || a === "spec");
+  }
 
   // --- PHP ---
   if (first === "phpunit" || first === "pest") return true;
@@ -288,6 +313,17 @@ function isCompressorHandledRunner(stage: string): boolean {
     "tox",
     "nox",
   ].includes(first);
+}
+
+/**
+ * Is this token a POSIX env-var assignment (`NAME=value`)? Name must start with
+ * a letter or underscore, followed by alphanumerics/underscores, then `=`.
+ * Rejects `--flag=value`, `path/cmd`, and `$()` values (the latter already
+ * caught by `containsUnsplittableConstruct` on the whole command).
+ */
+function isEnvAssignment(token: string | undefined): boolean {
+  if (!token) return false;
+  return /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(token);
 }
 
 /** Last path segment of a launcher token (`./gradlew` → `gradlew`, `jest` → `jest`). */

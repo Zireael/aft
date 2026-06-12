@@ -12,7 +12,13 @@ import {
   trackBgTask,
 } from "../bg-notifications.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
-import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
+import { __resetSyncWatchAbortForTests, signalSyncWatchAbort } from "../sync-watch-abort.js";
+import {
+  bashToolDescription,
+  createBashKillTool,
+  createBashStatusTool,
+  createBashTool,
+} from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
@@ -100,7 +106,7 @@ describe("OpenCode bash adapter", () => {
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }));
 
-    expect(bash.description).toContain("By default, output is compressed");
+    expect(bash.description).toContain("Output is compressed by default");
     expect(bash.description).toContain("compressed: false");
     expect(bash.description).toContain("background: true");
 
@@ -966,6 +972,77 @@ describe("bash_status tool", () => {
       "task already finished",
     );
   });
+
+  // ─── sync-watch user-message abort ───
+  test("bash_watch sync wait aborts on user message and converts to async (with pattern)", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-abort-pattern";
+    let pollCount = 0;
+    const { calls, watchTool } = makeCtx((cmd) => {
+      if (cmd === "bash_notify") return { success: true, watch_id: "watch-aborted" };
+      pollCount++;
+      // Signal abort after the first poll
+      if (pollCount === 1) signalSyncWatchAbort(sessionId);
+      return { success: true, status: "running", mode: "pipes" };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-abort", pattern: "READY" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should contain the conversion message
+    expect(result).toContain("interrupted because you sent a message");
+    expect(result).toContain("converted to an async watch");
+    expect(result).toContain("watch-aborted");
+    // Should have called bash_notify to register the async watch
+    const notifyCall = calls.find((c) => c.cmd === "bash_notify");
+    expect(notifyCall).toBeDefined();
+    expect(notifyCall?.params.task_id).toBe("bash-abort");
+    expect(notifyCall?.params.pattern).toBe("READY");
+  });
+
+  test("bash_watch sync wait aborts on user message without pattern (exit-only)", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-abort-no-pattern";
+    let pollCount = 0;
+    const { calls, watchTool } = makeCtx(() => {
+      pollCount++;
+      if (pollCount === 1) signalSyncWatchAbort(sessionId);
+      return { success: true, status: "running", mode: "pipes" };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-abort-exit" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should contain the conversion message mentioning auto-reminder
+    expect(result).toContain("interrupted because you sent a message");
+    expect(result).toContain("completion reminder will be delivered automatically");
+    // Should NOT have called bash_notify (no pattern = auto-reminder handles it)
+    const notifyCall = calls.find((c) => c.cmd === "bash_notify");
+    expect(notifyCall).toBeUndefined();
+  });
+
+  test("bash_watch stale abort flag is cleared at wait start", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-stale-abort";
+    // Set a stale flag before the wait starts
+    signalSyncWatchAbort(sessionId);
+    const { watchTool } = makeCtx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      duration_ms: 5,
+    }));
+    const result = await watchTool.execute(
+      { taskId: "bash-stale" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should return normally (task exited), not abort
+    expect(result).toContain("task exited");
+    expect(result).not.toContain("interrupted");
+  });
 });
 
 // =============================================================================
@@ -1261,5 +1338,50 @@ describe("OpenCode bash adapter — subagent gating", () => {
       'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
     );
     expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+  });
+});
+
+describe("bash tool description (agent-facing wording)", () => {
+  test("prohibits bash code search and steers to aft_search when registered", () => {
+    const desc = bashToolDescription(true, true, true);
+    expect(desc).toContain("DO NOT use bash for code search");
+    expect(desc).toContain("STOP");
+    expect(desc).toContain("aft_search");
+  });
+
+  test("steers to the grep tool when aft_search is not registered", () => {
+    const desc = bashToolDescription(false, true, true);
+    expect(desc).toContain("DO NOT use bash for code search");
+    expect(desc).toContain("grep tool");
+    expect(desc).not.toContain("aft_search");
+  });
+
+  test("contains no internal vocabulary agents don't care about", () => {
+    for (const variant of [
+      bashToolDescription(true, true, true),
+      bashToolDescription(false, false, false),
+    ]) {
+      expect(variant.toLowerCase()).not.toContain("hoisted");
+      expect(variant.toLowerCase()).not.toContain("rewrit");
+      expect(variant.toLowerCase()).not.toContain("unified bash schema");
+    }
+  });
+
+  test("compression sentence only appears when compression is on", () => {
+    expect(bashToolDescription(true, true, true)).toContain("compressed: false");
+    expect(bashToolDescription(true, false, true)).not.toContain("compressed");
+  });
+
+  test("background/PTY sentences track bash.background config", () => {
+    const on = bashToolDescription(true, true, true);
+    expect(on).toContain("background: true");
+    expect(on).toContain("pty: true");
+    // Background off: never advertise a guaranteed feature_disabled error,
+    // but still explain auto-promoted tasks (promotion is not gated).
+    const off = bashToolDescription(true, true, false);
+    expect(off).not.toContain("background: true");
+    expect(off).not.toContain("pty: true");
+    expect(off).toContain("promoted to background");
+    expect(off).toContain("bash_status");
   });
 });

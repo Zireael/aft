@@ -65,7 +65,7 @@ The schema is identical across harnesses. Only file location differs.
   //              + aft_inspect + grep/glob (when search_index is enabled)
   //              + aft_search (when semantic_search is enabled)
   //              (bash sub-features are gated by the top-level `bash` block)
-  // all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
+  // all:         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
   "tool_surface": "recommended",
 
   // List of tool names to disable after surface filtering

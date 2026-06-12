@@ -309,6 +309,17 @@
 
 **Compression site:** terminal-state output only. Live tail of running tasks (via `bash_status` polling) is shown raw so agents debugging long commands see exactly what the process emitted. Compression fires inside `BgTaskRegistry::maybe_compress_snapshot` (status / list paths) and `enqueue_completion_locked` (completion frame + `bash_drain_completions` cache).
 
+## Semantic Search Forward-Looking Types
+
+The `#![allow(dead_code)]` annotations in `crates/aft/src/semantic_index.rs` and `crates/aft/src/vector_store.rs` mark intentional forward-looking code that is tested but not yet wired into the production code path.
+
+- **`TypedVector`** (`semantic_index.rs:137`) — enum with `DenseF32(Vec<f32>)`, `DenseInt8(Vec<i8>)`, and `BinaryPacked { bytes, logical_dims }` variants. Represents embeddings as received from providers in their native format. Includes `into_stored()` to convert to the storage form.
+- **`StoredVector`** (`semantic_index.rs:331`) — enum with `DenseF32(Vec<f32>)` and `BinaryPacked { bytes, logical_dims }` variants. The on-disk/cache representation. Currently `EmbeddingEntry.vector` (a raw `Vec<f32>`) is the primary storage path; `StoredVector` is tested but not yet used as the canonical form.
+- **`FlatBinaryHammingVectorStore`** (`vector_store.rs:336`) — flat in-memory Hamming distance store for packed binary vectors. Fully implemented and tested with its own `VectorStore` impl, but not yet dispatched in production — `FlatF32VectorStore` is always used.
+- **`SemanticEmbeddingModel`** (`semantic_index.rs:1238`) — forward-looking embedding model abstraction holding backend config, engine, caching, and encoding/strategy fields.
+
+These types exist and are tested so the migration can happen incrementally without breaking changes. When production code is ready to use typed storage or binary search, the `#[allow(dead_code)]` annotations can be removed and the code paths connected.
+
 ## Cross-Cutting Concerns
 
 **Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` or `packages/pi-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.

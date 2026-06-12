@@ -143,9 +143,10 @@ impl LocalEmbedder {
             return Ok(Vec::new());
         }
 
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let encodings = self
             .tokenizer
-            .encode_batch(texts.to_vec(), true)
+            .encode_batch(text_refs, true)
             .map_err(|e| format!("tokenize batch: {e}"))?;
 
         // Greedily partition (order-preserving) into sub-batches bounded by the
@@ -367,4 +368,91 @@ fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)
         .get(MINILM_TOKENIZER_FILE)
         .map_err(|e| format!("failed to download {MINILM_TOKENIZER_FILE}: {e}"))?;
     Ok((model, tokenizer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MINILM_MAX_LENGTH;
+    use std::io::Write;
+    use tokenizers::Tokenizer;
+
+    fn minilm_like_tokenizer_json() -> Vec<u8> {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": {
+                "direction": "Right",
+                "max_length": MINILM_MAX_LENGTH,
+                "strategy": "LongestFirst",
+                "stride": 0
+            },
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "[PAD]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 1, "content": "[CLS]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 2, "content": "[SEP]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 3, "content": "[UNK]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": {
+                "type": "BertNormalizer",
+                "clean_text": true,
+                "handle_chinese_chars": true,
+                "strip_accents": null,
+                "lowercase": true
+            },
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "post_processor": {"type": "BertProcessing", "sep": ["[SEP]", 2], "cls": ["[CLS]", 1]},
+            "decoder": null,
+            "model": {
+                "type": "WordPiece",
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {
+                    "[PAD]": 0,
+                    "[CLS]": 1,
+                    "[SEP]": 2,
+                    "[UNK]": 3,
+                    "hello": 4,
+                    "world": 5,
+                    "!": 6,
+                    "cafe": 7,
+                    "naive": 8,
+                    "##ly": 9
+                }
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn assert_load_encode_parity(tokenizer: Tokenizer) {
+        let ascii = tokenizer.encode("Hello WORLD!", true).unwrap();
+        assert_eq!(ascii.get_ids(), &[1, 4, 5, 6, 2]);
+
+        let unicode = tokenizer.encode("Café naïvely", true).unwrap();
+        assert_eq!(unicode.get_ids(), &[1, 7, 8, 9, 2]);
+
+        let long_text = std::iter::repeat("hello")
+            .take(MINILM_MAX_LENGTH + 20)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let long = tokenizer.encode(long_text.as_str(), true).unwrap();
+        let ids = long.get_ids();
+        assert_eq!(ids.len(), MINILM_MAX_LENGTH);
+        assert_eq!(ids.first(), Some(&1));
+        assert_eq!(ids.last(), Some(&2));
+        assert!(ids[1..MINILM_MAX_LENGTH - 1].iter().all(|id| *id == 4));
+    }
+
+    #[test]
+    fn tokenizers_slim_features_load_and_encode_minilm_wordpiece() {
+        let json = minilm_like_tokenizer_json();
+
+        assert_load_encode_parity(Tokenizer::from_bytes(&json).unwrap());
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&json).unwrap();
+        file.flush().unwrap();
+        assert_load_encode_parity(Tokenizer::from_file(file.path()).unwrap());
+    }
 }

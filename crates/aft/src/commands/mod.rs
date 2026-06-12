@@ -1,8 +1,4 @@
-pub mod add_decorator;
-pub mod add_derive;
 pub mod add_import;
-pub mod add_member;
-pub mod add_struct_tags;
 pub mod ast_replace;
 pub mod ast_scope;
 pub mod ast_search;
@@ -58,6 +54,5 @@ pub mod trace_to_symbol;
 pub mod trust_filter_project;
 pub mod undo;
 pub mod untrust_filter_project;
-pub mod wrap_try_catch;
 pub mod write;
 pub mod zoom;

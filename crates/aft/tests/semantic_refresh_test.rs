@@ -136,6 +136,7 @@ fn refresh_is_noop_when_nothing_changed() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -172,6 +173,7 @@ fn refresh_re_embeds_only_changed_file() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -216,6 +218,7 @@ fn refresh_drops_entries_for_files_no_longer_in_walk() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -257,6 +260,7 @@ fn refresh_embeds_new_files_added_to_walk() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -310,6 +314,7 @@ fn refresh_handles_changed_plus_deleted_plus_new_in_one_call() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -354,6 +359,7 @@ fn refresh_reuses_line_shifted_file_chunks_without_embedding() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -389,6 +395,7 @@ fn refresh_reembeds_only_edited_symbol_in_changed_file() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -439,6 +446,7 @@ fn refresh_stale_files_collect_failure_keeps_stale_entries() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -485,6 +493,7 @@ fn invalidated_refresh_mixed_reuse_and_miss_retains_all_after_apply() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -539,6 +548,7 @@ fn invalidated_refresh_delta_retains_reused_chunks_after_apply() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -590,6 +600,7 @@ fn invalidated_refresh_reuses_duplicate_embed_text_for_new_identical_symbol() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -640,6 +651,7 @@ fn invalidated_refresh_file_summary_reuse_and_miss_are_text_based() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("body refresh succeeds");
     assert_eq!(body_stub.total_embedded_texts(), 1);
@@ -660,6 +672,7 @@ fn invalidated_refresh_file_summary_reuse_and_miss_are_text_based() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("doc refresh succeeds");
     assert_eq!(doc_stub.total_embedded_texts(), 1);
@@ -687,6 +700,7 @@ fn invalidated_refresh_deleted_file_drops_entries_after_apply() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -721,6 +735,7 @@ fn invalidated_refresh_collect_failure_does_not_resurrect_stale_entries() {
             100,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 
@@ -766,6 +781,7 @@ fn invalidated_refresh_cap_deferral_stays_file_count_based() {
             1,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("refresh succeeds");
 

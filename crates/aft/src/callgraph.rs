@@ -1225,15 +1225,8 @@ impl CallGraph {
     }
 
     /// Build call data for all project files, failing fast when the configured
-    /// source-file cap is exceeded.
-    /// Parse all uncached project files in parallel (bounded pool) and cache the
-    /// results, so subsequent `build_file` calls are cache hits. Used by the
-    /// tier2 dead_code snapshot, whose loop would otherwise parse every file
-    /// sequentially on one thread. No-op when the cache is already warm.
-    pub(crate) fn prewarm_project_files(&mut self, max_files: usize) -> Result<(), AftError> {
-        self.ensure_project_files_built(max_files)
-    }
-
+    /// source-file cap is exceeded. Parses uncached files in a bounded parallel
+    /// pool and caches the results for legacy in-memory callgraph operations.
     fn ensure_project_files_built(&mut self, max_files: usize) -> Result<(), AftError> {
         // Bounded count first — never populate project_files on oversized roots.
         // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an

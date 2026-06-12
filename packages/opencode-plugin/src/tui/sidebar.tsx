@@ -259,6 +259,49 @@ export function shouldSuppressUninitializedDowngrade(
   return incomingCacheRole === "not_initialized" && haveInitializedForContext;
 }
 
+/**
+ * Cross-project contamination belt. The RPC layer can hand back a snapshot
+ * describing a DIFFERENT project than the one this sidebar asked about — a
+ * multi-project host (Desktop / `opencode serve`) whose status handler
+ * resolved another project's warm bridge, including long-lived processes
+ * still running pre-fix plugin code. Rendering it shows another repo's
+ * indexes/health in this window.
+ *
+ * A mismatched project_root is acceptable ONLY when the serving handler says
+ * it resolved that directory DELIBERATELY: new servers attach
+ * `served_directory` (their own cwd, or the SDK-verified `opencode -s` resume
+ * directory) to every status response. That marker is handler-attached
+ * provenance — it cannot be faked by snapshot contents. We explicitly do NOT
+ * use `snapshot.session.id` here: Rust echoes the REQUESTED session id into
+ * the snapshot, so it matches even when the data came from another project's
+ * bridge (the hole that let contamination through this belt's first version).
+ *
+ * Rules:
+ *  - placeholder/synthetic snapshots (no project_root) → accept (not data)
+ *  - project_root (or canonical_root) matches the sidebar directory → accept
+ *  - mismatched root AND served_directory matches a snapshot root → accept
+ *    (deliberate, SDK-verified resume serve from a new server)
+ *  - otherwise → reject (stray; includes everything old servers cross-serve)
+ */
+export function isSnapshotForContext(
+  snapshot: AftStatusSnapshot,
+  directory: string,
+  servedDirectory: string | undefined,
+): boolean {
+  const stripSlash = (p: string) => p.replace(/\/+$/, "");
+  const roots = [snapshot.project_root, snapshot.canonical_root].filter(
+    (r): r is string => typeof r === "string" && r.length > 0,
+  );
+  if (roots.length === 0) return true; // placeholder / synthetic
+  const dir = stripSlash(directory);
+  if (roots.some((r) => stripSlash(r) === dir)) return true;
+  if (typeof servedDirectory === "string" && servedDirectory.length > 0) {
+    const served = stripSlash(servedDirectory);
+    return roots.some((r) => stripSlash(r) === served);
+  }
+  return false;
+}
+
 const SidebarContent = (props: {
   api: TuiPluginApi;
   sessionID: () => string;
@@ -330,12 +373,32 @@ const SidebarContent = (props: {
       const response = await client.call(
         "status",
         { sessionID: sid },
-        { signal: controller.signal },
+        {
+          signal: controller.signal,
+          // With several RPC servers alive for this project hash, a stray
+          // warm response (another project's bridge) must not beat the right
+          // server or the placeholder — skip it at the port-scan level.
+          accept: (result) => {
+            const rec = result as Record<string, unknown>;
+            if (rec?.success === false) return true; // errors handled below
+            return isSnapshotForContext(
+              coerceAftStatus(rec),
+              directory,
+              rec?.served_directory as string | undefined,
+            );
+          },
+        },
       );
       if (controller.signal.aborted || requestGeneration !== generation) return;
       if (currentDirectory() !== directory || props.sessionID() !== sid) return;
       if (response && (response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
+        // Belt: never render a snapshot describing another project (see
+        // isSnapshotForContext). Keep whatever we currently show instead.
+        const servedDirectory = (response as Record<string, unknown>).served_directory as
+          | string
+          | undefined;
+        if (!isSnapshotForContext(snapshot, directory, servedDirectory)) return;
         // Stale-while-revalidate: keep the last-good snapshot instead of
         // flickering to the lazy-bridge placeholder on a transient
         // not_initialized. See shouldSuppressUninitializedDowngrade.

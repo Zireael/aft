@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, SemanticFilePolicy, UserServerDef};
 use crate::context::{
-    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
+    SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -190,15 +190,15 @@ fn spawn_semantic_refresh_worker(
         log_ctx::with_session(session_id, || {
             while let Ok(first_request) = request_rx.recv() {
                 let mut paths = Vec::new();
-                let mut corpus_files = None;
+                let mut corpus_requested = false;
                 match first_request {
                     SemanticRefreshRequest::Files {
                         paths: request_paths,
                     } => {
                         paths.extend(request_paths);
                     }
-                    SemanticRefreshRequest::Corpus { current_files } => {
-                        corpus_files = Some(current_files);
+                    SemanticRefreshRequest::Corpus => {
+                        corpus_requested = true;
                     }
                 }
 
@@ -206,7 +206,7 @@ fn spawn_semantic_refresh_worker(
                 let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
                 let mut deadline = Instant::now() + quiet_window;
 
-                while corpus_files.is_none() && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                while !corpus_requested && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         break;
                     };
@@ -220,9 +220,9 @@ fn spawn_semantic_refresh_worker(
                             }
                             deadline = Instant::now() + quiet_window;
                         }
-                        Ok(SemanticRefreshRequest::Corpus { current_files }) => {
+                        Ok(SemanticRefreshRequest::Corpus) => {
                             paths.clear();
-                            corpus_files = Some(current_files);
+                            corpus_requested = true;
                             break;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
@@ -237,7 +237,32 @@ fn spawn_semantic_refresh_worker(
                     break;
                 }
 
-                if let Some(mut current_files) = corpus_files {
+                if corpus_requested {
+                    let mut current_files = match walk_semantic_project_files_bounded(
+                        &project_root,
+                        max_files,
+                    ) {
+                        Ok(files) => files,
+                        Err(observed) => {
+                            let error = format!(
+                                "too many files (>{}) for semantic indexing (max {})",
+                                max_files, max_files
+                            );
+                            slog_warn!(
+                                "skipping semantic corpus refresh: more than {} files exceeds limit of {}. \
+                                 Raise semantic.max_files or open a specific project directory.",
+                                observed.saturating_sub(1),
+                                max_files
+                            );
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                     current_files.sort();
                     current_files.dedup();
                     if current_files.len() > max_files {
@@ -247,6 +272,14 @@ fn spawn_semantic_refresh_worker(
                         );
                         let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed { error });
                         continue;
+                    }
+                    if event_tx
+                        .send(SemanticRefreshEvent::CorpusStarted {
+                            files: current_files.len(),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
 
                     let mut embed = |texts: Vec<String>| model.embed(texts);
@@ -2142,7 +2175,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     if exceeds {
         slog_warn!(
-            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, symbol move analysis) will be disabled. Store-backed callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
+            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, symbol move analysis) will be disabled. Store-backed dead_code and callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
             max_callgraph_files
         );
     }
@@ -2547,7 +2580,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
                                     &semantic_files,
-                                    semantic_config.effective_document_prompt_template().as_deref(),
+                                    semantic_config
+                                        .effective_document_prompt_template()
+                                        .as_deref(),
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2673,7 +2708,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             semantic_config.max_batch_size.max(1),
                             &mut progress,
                             &semantic_files,
-                            semantic_config.effective_document_prompt_template().as_deref(),
+                            semantic_config
+                                .effective_document_prompt_template()
+                                .as_deref(),
                         )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
@@ -2789,6 +2826,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Initialize call graph with the project root
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);
+
+    if next_config.callgraph_store && !home_match {
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(_) => {
+                slog_debug!("callgraph store ready at configure");
+            }
+            CallgraphStoreAccess::Building => {
+                slog_info!("callgraph store warm build scheduled at configure");
+            }
+            CallgraphStoreAccess::Unavailable => {
+                slog_info!("callgraph store unavailable at configure; dead_code will retry later");
+            }
+            CallgraphStoreAccess::Error(error) => {
+                slog_warn!("callgraph store configure warm failed: {}", error);
+            }
+        }
+    }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);

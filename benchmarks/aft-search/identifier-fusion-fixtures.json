@@ -1,0 +1,105 @@
+[
+  {
+    "id": "python-ready-timeout-constant",
+    "query": "DEFAULT_READY_TIMEOUT_SECS",
+    "shape": "identifier",
+    "expected_top_files": ["benchmarks/aft-search/run.py"],
+    "notes": "Exact Python benchmark constant; semantic-only rankings often prefer generic timeout code."
+  },
+  {
+    "id": "python-volatile-top-keys",
+    "query": "VOLATILE_TOP_LEVEL_KEYS",
+    "shape": "identifier",
+    "expected_top_files": ["benchmarks/aft-search/run.py"],
+    "notes": "Exact Python benchmark constant whose natural-language pieces point at cache metadata elsewhere."
+  },
+  {
+    "id": "dogfood-subagent-token",
+    "query": "subagent_type",
+    "shape": "identifier",
+    "expected_top_files": ["crates/aft/tests/integration/query_shape_test.rs"],
+    "notes": "Exact identifier-shaped dogfood token from the classifier fixture; semantically similar subagent code is elsewhere."
+  },
+  {
+    "id": "dogfood-safety-token",
+    "query": "aft_safety_history",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/tests/integration/query_shape_test.rs",
+      "crates/aft/tests/integration/extract_tokens_test.rs"
+    ],
+    "notes": "Exact tool-shaped token from classifier/tokenizer fixtures; semantic retrieval drifts to bridge/doctor code."
+  },
+  {
+    "id": "lexical-ceiling-constant",
+    "query": "LEXICAL_ONLY_SCORE_CEILING",
+    "shape": "identifier",
+    "expected_top_files": ["crates/aft/src/commands/semantic_search.rs"],
+    "notes": "Exact Rust fusion constant; semantically similar lexical-rank code can outrank it."
+  },
+  {
+    "id": "degraded-grep-result-limit",
+    "query": "DEGRADED_GREP_RESULT_LIMIT",
+    "shape": "identifier",
+    "expected_top_files": ["crates/aft/src/commands/semantic_search.rs"],
+    "notes": "Exact Rust fallback limit constant with grep-result distractors in the grep executor."
+  },
+  {
+    "id": "semantic-overfetch-constant",
+    "query": "SEMANTIC_OVERFETCH_MULTIPLIER",
+    "shape": "identifier",
+    "expected_top_files": ["crates/aft/src/commands/semantic_search.rs"],
+    "notes": "Exact Rust overfetch constant in the fusion implementation."
+  },
+  {
+    "id": "bash-transport-timeout",
+    "query": "BASH_TRANSPORT_TIMEOUT_MS",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/_shared.ts",
+      "packages/pi-plugin/src/tools/bash.ts"
+    ],
+    "notes": "Exact timeout constant mirrored across plugin harnesses."
+  },
+  {
+    "id": "callgraph-soft-codes",
+    "query": "CALLGRAPH_SOFT_CODES",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/navigation.ts",
+      "packages/pi-plugin/src/tools/navigate.ts"
+    ],
+    "notes": "Exact TypeScript constant with callgraph implementation distractors."
+  },
+  {
+    "id": "footer-max-files",
+    "query": "MAX_UNCHECKED_FILES_IN_FOOTER",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/reading.ts",
+      "packages/pi-plugin/src/tools/reading.ts"
+    ],
+    "notes": "Exact TypeScript rendering constant; nearby reading/rendering helpers are semantic distractors."
+  },
+  {
+    "id": "npm-fetch-timeout",
+    "query": "NPM_FETCH_TIMEOUT",
+    "shape": "identifier",
+    "expected_top_files": ["packages/opencode-plugin/src/hooks/auto-update-checker/constants.ts"],
+    "notes": "Exact TypeScript constant with generic timeout/fetch distractors."
+  },
+  {
+    "id": "semantic-grep-collector",
+    "query": "collect_degraded_grep_files",
+    "shape": "identifier",
+    "expected_top_files": ["crates/aft/src/commands/semantic_search.rs"],
+    "notes": "Exact Rust helper in the hybrid/degraded search implementation."
+  },
+  {
+    "id": "permission-loop-helper",
+    "query": "withPermissionLoop",
+    "shape": "identifier",
+    "expected_top_files": ["packages/opencode-plugin/src/tools/bash.ts"],
+    "notes": "Exact TypeScript helper; permission-related helpers elsewhere are semantic distractors."
+  }
+]

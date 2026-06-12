@@ -41,16 +41,54 @@ fn read_allows_explicit_ranges_from_large_files() {
         resp["truncated"], true,
         "range read should flag gap: {resp:?}"
     );
-    assert_eq!(
-        resp["total_lines"], 4,
-        "total_lines must scan to EOF: {resp:?}"
+    assert!(
+        resp.get("total_lines").is_none(),
+        "ranged read should not scan to EOF just to report total_lines: {resp:?}"
     );
 
     assert!(aft.shutdown().success());
 }
 
 #[test]
-fn read_range_reports_partial_and_accurate_total_lines() {
+fn read_range_stops_after_one_line_lookahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("invalid-after-lookahead.txt");
+    let mut bytes = (1..=11)
+        .map(|n| format!("line {n}\n"))
+        .collect::<String>()
+        .into_bytes();
+    bytes.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    bytes.extend_from_slice(&vec![b'x'; 1024 * 1024]);
+    fs::write(&path, bytes).expect("write ranged fixture");
+
+    let mut aft = AftProcess::spawn();
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "read-range-lookahead",
+            "command": "read",
+            "file": path,
+            "start_line": 1,
+            "end_line": 10,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(resp["success"], true, "read should succeed: {resp:?}");
+    assert_eq!(resp["content"].as_str().unwrap().lines().count(), 10);
+    assert_eq!(
+        resp["truncated"], true,
+        "lookahead should detect more lines: {resp:?}"
+    );
+    assert!(
+        resp.get("total_lines").is_none(),
+        "lookahead-only ranged read must not report an inexact total: {resp:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn read_range_reports_partial_and_omits_unknown_total_lines() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hundred.txt");
     let content = (1..=100)
@@ -77,9 +115,9 @@ fn read_range_reports_partial_and_accurate_total_lines() {
         resp["truncated"], true,
         "range read should flag gap: {resp:?}"
     );
-    assert_eq!(
-        resp["total_lines"], 100,
-        "total_lines must be full file count: {resp:?}"
+    assert!(
+        resp.get("total_lines").is_none(),
+        "total_lines is unknown when the ranged read stops after lookahead: {resp:?}"
     );
     assert_eq!(
         resp["lines_read"], 10,

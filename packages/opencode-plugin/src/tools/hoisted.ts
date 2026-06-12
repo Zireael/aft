@@ -341,9 +341,11 @@ function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): numbe
 }
 
 const z = tool.schema;
-const DIAGNOSTICS_PARAM_DESCRIPTION =
-  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
-
+// Diagnostics on edit are config-driven only (`lsp.diagnostics_on_edit`).
+// There is deliberately NO per-call `diagnostics` param: agents never used it,
+// and the agent-facing diagnostics paths are the status bar (passive,
+// automatic E/W on tool results) and aft_inspect (active pull). The config
+// knob remains for users whose models won't call aft_inspect.
 function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
   return ctx.config.lsp?.diagnostics_on_edit ?? false;
 }
@@ -534,22 +536,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 // ---------------------------------------------------------------------------
 
 function getWriteDescription(editToolName: string): string {
-  return `Write content to a file, creating it (and parent directories) if needed.
-
-Automatically creates parent directories. Backs up existing files before overwriting.
-If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
-is auto-formatted after writing. Edits return as soon as the write completes unless
-the configured \`lsp.diagnostics_on_edit\` default or a per-call \`diagnostics: true\`
-asks for legacy sync-wait behavior. Call \`aft_inspect\` afterward to check
-diagnostics across a batch of edits.
-
-**Behavior:**
-- Creates parent directories automatically (no need to mkdir first)
-- Existing files are backed up before overwriting (recoverable via aft_safety undo)
-- Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- LSP diagnostics follow \`lsp.diagnostics_on_edit\` by default; pass \`diagnostics\` to override per call
-- Use this for creating new files or completely replacing file contents
-- For partial edits (find/replace), use the \`${editToolName}\` tool instead`;
+  return `Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety) and auto-formatted when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -560,7 +547,6 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
       content: z.string().describe("The full content to write to the file"),
-      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<ToolResult> => {
       const file = args.filePath as string;
@@ -591,7 +577,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         file: filePath,
         content,
         create_dirs: true,
-        diagnostics: args.diagnostics ?? diagnosticsOnEditDefault(ctx),
+        diagnostics: diagnosticsOnEditDefault(ctx),
         include_diff_content: true,
       });
 
@@ -726,7 +712,6 @@ Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldS
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
 - Response is a JSON string for the selected edit mode; key fields include success, diff, backup_id, syntax_valid, and mode-specific fields.`;
 }
 
@@ -764,7 +749,6 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe(
           "Batch edits — array of { oldString: string, newString: string } or { startLine: number (1-based), endLine: number (1-based, inclusive), content: string }",
         ),
-      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<ToolResult> => {
       // Footgun guard: top-level startLine/endLine are not valid params on
@@ -861,7 +845,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      params.diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
+      params.diagnostics = diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
       params.include_diff_content = true;
 
@@ -1021,11 +1005,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
-      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<ToolResult> => {
       const patchText = args.patchText as string;
-      const diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
+      const diagnostics = diagnosticsOnEditDefault(ctx);
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch

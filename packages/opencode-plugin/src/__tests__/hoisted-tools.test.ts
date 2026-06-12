@@ -154,7 +154,7 @@ describe("Hoisted tool execute handlers", () => {
     });
   });
 
-  test("write uses lsp.diagnostics_on_edit as the default", async () => {
+  test("write follows lsp.diagnostics_on_edit (config-driven; no per-call param)", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -165,27 +165,30 @@ describe("Hoisted tool execute handlers", () => {
     await tools.write.execute({ filePath: "src/app.ts", content: "export {};\n" }, sdkCtx);
     expect(calls[0].params.diagnostics).toBe(true);
 
+    // The per-call `diagnostics` param was removed (agents never used it; the
+    // status bar + aft_inspect are the agent-facing diagnostics paths). A
+    // stray param must NOT override the configured default.
     await tools.write.execute(
       { filePath: "src/app.ts", content: "export {};\n", diagnostics: false },
       sdkCtx,
     );
-    expect(calls[1].params.diagnostics).toBe(false);
+    expect(calls[1].params.diagnostics).toBe(true);
   });
 
-  test("write honors diagnostics true and includes LSP payload", async () => {
+  test("write surfaces LSP payload when diagnostics_on_edit is configured", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
-    const { calls, tools } = createMockHoistedHarness(async () => ({
-      success: true,
-      lsp_diagnostics: [{ severity: "error", line: 7, message: "Bad type" }],
-    }));
+    const { calls, tools } = createMockHoistedHarness(
+      async () => ({
+        success: true,
+        lsp_diagnostics: [{ severity: "error", line: 7, message: "Bad type" }],
+      }),
+      { lsp: { diagnostics_on_edit: true } } as PluginContext["config"],
+    );
 
     const result = text(
-      await tools.write.execute(
-        { filePath: "src/app.ts", content: "export {};\n", diagnostics: true },
-        sdkCtx,
-      ),
+      await tools.write.execute({ filePath: "src/app.ts", content: "export {};\n" }, sdkCtx),
     );
 
     expect(calls[0].params.diagnostics).toBe(true);
@@ -218,25 +221,23 @@ describe("Hoisted tool execute handlers", () => {
     expect(calls[0].params.diagnostics).toBe(false);
   });
 
-  test("edit honors diagnostics true and includes LSP payload", async () => {
+  test("edit surfaces LSP payload when diagnostics_on_edit is configured", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const diagnostics = [{ severity: "error", line: 3, message: "Missing import" }];
-    const { calls, tools } = createMockHoistedHarness(async () => ({
-      success: true,
-      replacements: 1,
-      lsp_diagnostics: diagnostics,
-    }));
+    const { calls, tools } = createMockHoistedHarness(
+      async () => ({
+        success: true,
+        replacements: 1,
+        lsp_diagnostics: diagnostics,
+      }),
+      { lsp: { diagnostics_on_edit: true } } as PluginContext["config"],
+    );
 
     const result = text(
       await tools.edit.execute(
-        {
-          filePath: "src/app.ts",
-          oldString: "before",
-          newString: "after",
-          diagnostics: true,
-        },
+        { filePath: "src/app.ts", oldString: "before", newString: "after" },
         sdkCtx,
       ),
     );
@@ -276,7 +277,7 @@ describe("Hoisted tool execute handlers", () => {
     expect(result).not.toContain("LSP errors detected");
   });
 
-  test("apply_patch honors diagnostics true and includes LSP payload", async () => {
+  test("apply_patch surfaces LSP payload when diagnostics_on_edit is configured", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
     await writeFile(resolve(tmpDir, "file.ts"), "old\n");
@@ -290,18 +291,21 @@ describe("Hoisted tool execute handlers", () => {
       "*** End Patch",
     ].join("\n");
 
-    const { calls, tools } = createMockHoistedHarness(async (command) => {
-      if (command === "checkpoint") return { success: true };
-      if (command === "write") {
-        return {
-          success: true,
-          lsp_diagnostics: [{ severity: "error", line: 9, message: "Patch type error" }],
-        };
-      }
-      throw new Error(`Unexpected command: ${command}`);
-    });
+    const { calls, tools } = createMockHoistedHarness(
+      async (command) => {
+        if (command === "checkpoint") return { success: true };
+        if (command === "write") {
+          return {
+            success: true,
+            lsp_diagnostics: [{ severity: "error", line: 9, message: "Patch type error" }],
+          };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+      { lsp: { diagnostics_on_edit: true } } as PluginContext["config"],
+    );
 
-    const result = text(await tools.apply_patch.execute({ patchText, diagnostics: true }, sdkCtx));
+    const result = text(await tools.apply_patch.execute({ patchText }, sdkCtx));
 
     const writeCall = calls.find((call) => call.command === "write");
     expect(writeCall?.params.diagnostics).toBe(true);
@@ -309,13 +313,15 @@ describe("Hoisted tool execute handlers", () => {
     expect(result).toContain("Line 9: Patch type error");
   });
 
-  test("mutation tool schemas reject non-boolean diagnostics", () => {
+  test("mutation tool schemas expose no per-call diagnostics param", () => {
     const { tools } = createMockHoistedHarness(async () => ({ success: true }));
     const pool = {
       getBridge: () => ({ send: async () => ({ success: true }) }),
     } as unknown as BridgePool;
     const prefixedTools = aftPrefixedTools(createPluginContext(pool));
 
+    // Removed deliberately: agents never used it; diagnostics are the status
+    // bar (passive) + aft_inspect (pull) + the lsp.diagnostics_on_edit config.
     for (const toolDef of [
       tools.write,
       tools.edit,
@@ -324,8 +330,7 @@ describe("Hoisted tool execute handlers", () => {
       prefixedTools.aft_edit,
       prefixedTools.aft_apply_patch,
     ]) {
-      const diagnosticsSchema = toolDef.args.diagnostics as { parse: (value: unknown) => unknown };
-      expect(() => diagnosticsSchema.parse("yes")).toThrow();
+      expect(toolDef.args.diagnostics).toBeUndefined();
     }
   });
 

@@ -320,4 +320,150 @@ describe("maybeStripCompressorPipe", () => {
       expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
     }
   });
+
+  // --- Gap 1: env-var-prefixed runners ---
+  describe("env-var-prefixed runners", () => {
+    test("strips CI=1 bun test piped through grep", () => {
+      const result = maybeStripCompressorPipe("CI=1 bun test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("CI=1 bun test");
+    });
+
+    test("strips FOO=bar npm test piped through tail", () => {
+      const result = maybeStripCompressorPipe("FOO=bar npm test | tail -5", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("FOO=bar npm test");
+    });
+
+    test("strips multiple env-var assignments before runner", () => {
+      const result = maybeStripCompressorPipe("CI=1 NODE_ENV=test bun test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("CI=1 NODE_ENV=test bun test");
+    });
+
+    test("strips env-var prefix with cd && chain", () => {
+      const result = maybeStripCompressorPipe("cd pkg && CI=1 bun test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("cd pkg && CI=1 bun test");
+    });
+
+    test("strips env-var prefix for cargo test", () => {
+      const result = maybeStripCompressorPipe("RUST_BACKTRACE=1 cargo test | grep FAILED", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("RUST_BACKTRACE=1 cargo test");
+    });
+
+    test("does NOT strip VAR=$(cmd) env-var with command substitution", () => {
+      const cmd = "VAR=$(echo x) bun test | grep fail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("does NOT strip env-var prefix when filter has redirection", () => {
+      const cmd = "CI=1 bun test | grep fail > out.txt";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("does NOT strip env-var prefix when runner is not recognized", () => {
+      const cmd = "CI=1 ls | grep foo";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("does NOT strip when value contains backtick command substitution", () => {
+      const cmd = "VAR=`date` bun test | grep fail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+  });
+
+  // --- Gap 2: bun --cwd ---
+  describe("bun --cwd flag", () => {
+    test("strips bun --cwd <pkg> test piped through grep", () => {
+      const result = maybeStripCompressorPipe("bun --cwd packages/app test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("bun --cwd packages/app test");
+    });
+
+    test("strips bun --cwd=<pkg> test piped through tail", () => {
+      const result = maybeStripCompressorPipe("bun --cwd=packages/app test | tail -5", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("bun --cwd=packages/app test");
+    });
+
+    test("strips bun --cwd <pkg> run test:unit", () => {
+      const result = maybeStripCompressorPipe("bun --cwd pkg run test:unit | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("bun --cwd pkg run test:unit");
+    });
+
+    test("does NOT strip bun --cwd without test subcommand", () => {
+      const cmd = "bun --cwd packages/app build | grep fail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+  });
+
+  // --- Gap 3: mvn clean ---
+  describe("mvn clean task", () => {
+    test("strips mvn clean test piped through grep", () => {
+      const result = maybeStripCompressorPipe("mvn clean test | grep ERROR", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("mvn clean test");
+    });
+
+    test("strips mvn clean verify", () => {
+      const result = maybeStripCompressorPipe("mvn clean verify | tail -20", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("mvn clean verify");
+    });
+
+    test("strips ./mvnw clean test", () => {
+      const result = maybeStripCompressorPipe("./mvnw clean test | grep FAIL", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("./mvnw clean test");
+    });
+
+    test("does NOT strip mvn clean deploy (stateful goal)", () => {
+      const cmd = "mvn clean deploy | tail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+  });
+
+  // --- Gap 4: rake multi-task ---
+  describe("rake multi-task", () => {
+    test("strips rake db:setup test (multi-task with test)", () => {
+      const result = maybeStripCompressorPipe("rake db:setup test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("rake db:setup test");
+    });
+
+    test("strips rake db:migrate spec (multi-task with spec)", () => {
+      const result = maybeStripCompressorPipe("rake db:migrate spec | tail -10", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("rake db:migrate spec");
+    });
+
+    test("strips rake with flags and test task", () => {
+      const result = maybeStripCompressorPipe("rake --trace test | grep fail", true);
+      expect(result.stripped).toBe(true);
+      expect(result.command).toBe("rake --trace test");
+    });
+
+    test("does NOT strip rake deploy (no test/spec task)", () => {
+      const cmd = "rake deploy | tail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("does NOT strip rake db:setup (no test/spec task)", () => {
+      const cmd = "rake db:setup | tail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("does NOT strip rake with path-like operand", () => {
+      const cmd = "rake test some/path | tail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+
+    test("still does NOT strip rake test_db_reset", () => {
+      const cmd = "rake test_db_reset | tail";
+      expect(maybeStripCompressorPipe(cmd, true).stripped).toBe(false);
+    });
+  });
 });

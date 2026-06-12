@@ -282,8 +282,13 @@ fn rerank_cross_encoder(
         .iter()
         .map(|r| {
             let snippet = r.snippet.chars().take(max_chars).collect::<String>();
-            format!("{} {}:{}-{}", r.file.display(), r.name, r.start_line, r.end_line)
-                + " \""
+            format!(
+                "{} {}:{}-{}",
+                r.file.display(),
+                r.name,
+                r.start_line,
+                r.end_line
+            ) + " \""
                 + &snippet
                 + "\""
         })
@@ -351,7 +356,7 @@ fn rerank_cross_encoder(
 /// 3. `{data: [{index, score}]}` — OpenAI-style rerank response
 /// 4. `{scores: [float, ...]}` — score-only array (map to indices by position)
 /// 5. Direct `[index, ...]` array — simple index list
-fn parse_cross_encoder_response(text: &str, candidate_count: usize) -> RerankOutcome {
+fn parse_cross_encoder_response(text: &str, _candidate_count: usize) -> RerankOutcome {
     let cleaned = strip_markdown_fences(text);
     let v: serde_json::Value = match serde_json::from_str(&cleaned) {
         Ok(v) => v,
@@ -604,10 +609,15 @@ mod tests {
         let mut result = make_result(0);
         result.snippet = "a".repeat(100);
         let results = vec![result];
-        // The function will try to connect and fail, but we can verify the config is used
-        // by checking that the function doesn't panic with a small max_candidate_chars.
         let _outcome = rerank_candidates(&config, "test", &results);
-        // No panic means the config field is being used.
+        // Verify the config is consumed: the candidate's snippet field is
+        // truncated to max_candidate_chars when building the rerank prompt.
+        let max_chars = config.rerank_max_candidate_chars;
+        assert_eq!(max_chars, 10);
+        let truncated: String = results[0].snippet.chars().take(max_chars).collect();
+        assert_eq!(truncated.len(), 10);
+        assert_eq!(truncated, "a".repeat(10));
+        assert!(results[0].snippet.len() > max_chars);
     }
 
     #[test]
@@ -626,6 +636,16 @@ mod tests {
             ..SemanticBackendConfig::default()
         };
         assert_eq!(config.rerank_max_candidate_chars, 100);
+        // Verify truncation actually happens with the custom value.
+        let mut result = make_result(0);
+        result.snippet = "b".repeat(200);
+        let truncated: String = result
+            .snippet
+            .chars()
+            .take(config.rerank_max_candidate_chars)
+            .collect();
+        assert_eq!(truncated.len(), 100);
+        assert_eq!(truncated, "b".repeat(100));
     }
 
     #[test]

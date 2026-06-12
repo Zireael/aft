@@ -499,7 +499,6 @@ function aftBenchConfig(): Record<string, unknown> {
       "aft_conflicts",
       "lsp_diagnostics",
       "aft_refactor",
-      "aft_transform",
       "aft_move",
       "aft_delete",
     ],

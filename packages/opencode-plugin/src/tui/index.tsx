@@ -16,6 +16,7 @@ import {
 import {
   createAftSidebarSlot,
   formatCompressionSidebarRows,
+  isSnapshotForContext,
   resolveTuiStorageDir,
   shouldSuppressUninitializedDowngrade,
 } from "./sidebar";
@@ -128,10 +129,28 @@ const R = (props: {
 interface StatusDialogProps {
   api: TuiPluginApi;
   client: AftRpcClient;
+  directory: string;
   sessionID: string;
   initial: AftStatusSnapshot | null;
   initialError: string | null;
   onClose: () => void;
+}
+
+/**
+ * Shared accept-gate for status RPC calls: skip warm responses that describe
+ * another project (cross-project contamination from multi-project hosts —
+ * see isSnapshotForContext) so they can't beat the right server's response.
+ */
+function statusAcceptGate(directory: string): (result: unknown) => boolean {
+  return (result) => {
+    const rec = result as Record<string, unknown>;
+    if (rec?.success === false) return true; // error envelopes handled by callers
+    return isSnapshotForContext(
+      coerceAftStatus(rec),
+      directory,
+      rec?.served_directory as string | undefined,
+    );
+  };
 }
 
 const StatusDialog = (props: StatusDialogProps) => {
@@ -157,7 +176,7 @@ const StatusDialog = (props: StatusDialogProps) => {
       const response = await props.client.call(
         "status",
         { sessionID: props.sessionID },
-        { signal: controller.signal },
+        { signal: controller.signal, accept: statusAcceptGate(props.directory) },
       );
       if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       if ((response as Record<string, unknown>).success !== false) {
@@ -545,7 +564,11 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
   let initial: AftStatusSnapshot | null = null;
   let initialError: string | null = null;
   try {
-    const response = await client.call("status", { sessionID });
+    const response = await client.call(
+      "status",
+      { sessionID },
+      { accept: statusAcceptGate(directory) },
+    );
     if ((response as Record<string, unknown>).success !== false) {
       initial = coerceAftStatus(response as Record<string, unknown>);
     } else {
@@ -561,6 +584,7 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
       <StatusDialog
         api={api}
         client={client}
+        directory={directory}
         sessionID={sessionID}
         initial={initial}
         initialError={initialError}

@@ -5,10 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::cache_freshness;
+use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
 use aft::config::Config;
-use aft::context::AppContext;
+use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
     FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
     InspectSnapshot, JobKey,
@@ -56,6 +57,10 @@ fn request(payload: Value) -> RawRequest {
 }
 
 fn configured_context(root: &Path) -> AppContext {
+    configured_context_with_callgraph_store(root, false)
+}
+
+fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -> AppContext {
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -72,11 +77,64 @@ fn configured_context(root: &Path) -> AppContext {
         "storage_dir": storage_dir.to_string_lossy(),
         "search_index": false,
         "semantic_search": false,
+        "callgraph_store": callgraph_store,
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
     ctx
+}
+
+fn drain_callgraph_store_for_test(ctx: &AppContext) {
+    let (latest, disconnected) = {
+        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+        let mut latest = None;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(store) => latest = Some(store),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        (latest, disconnected)
+    };
+
+    if let Some(store) = latest {
+        *ctx.callgraph_store().borrow_mut() = Some(store);
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+    } else if disconnected {
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+    }
+}
+
+fn ensure_callgraph_store_ready(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(_) => return,
+            CallgraphStoreAccess::Building => {
+                drain_callgraph_store_for_test(ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for callgraph store cold build"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            CallgraphStoreAccess::Unavailable => {
+                panic!("callgraph store unexpectedly unavailable in test")
+            }
+            CallgraphStoreAccess::Error(error) => {
+                panic!("callgraph store failed in test: {error}")
+            }
+        }
+    }
 }
 
 fn inspect(ctx: &AppContext, payload: Value) -> Value {
@@ -99,6 +157,9 @@ fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
 }
 
 fn tier2_run(ctx: &AppContext, categories: &[&str]) {
+    if categories.contains(&"dead_code") {
+        ensure_callgraph_store_ready(ctx);
+    }
     enqueue_tier2_run(ctx, categories);
     wait_for_tier2(ctx, categories);
 }
@@ -403,7 +464,7 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
         "src/lib.ts",
         "export function used() { return 1; }\nexport function unused() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     // aft_inspect never scans Tier 2 categories synchronously. Tier 2 scans run
     // via aft_inspect_tier2_run on session.idle in production. Simulate that
@@ -484,7 +545,8 @@ fn inspect_tier2_run_returns_promptly_with_background_in_flight() {
             ),
         );
     }
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
 
     let response = enqueue_tier2_run(&ctx, &["dead_code"]);
 
@@ -535,6 +597,52 @@ fn tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectSnapshot {
         Arc::new(config),
         Arc::new(RwLock::new(SymbolCache::new())),
     )
+}
+
+fn dead_code_tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectSnapshot {
+    let config = Config {
+        project_root: Some(project_root.to_path_buf()),
+        callgraph_store: true,
+        ..Config::default()
+    };
+    InspectSnapshot::new(
+        project_root.to_path_buf(),
+        inspect_dir.to_path_buf(),
+        Arc::new(config),
+        Arc::new(RwLock::new(SymbolCache::new())),
+    )
+}
+
+#[test]
+fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+    let callgraph_dir = inspect_dir.parent().expect("harness dir").join("callgraph");
+    let _not_ready_store =
+        CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
+
+    let manager = InspectManager::new();
+    let success = manager
+        .tier2_run_with_reuse_result(
+            dead_code_tier2_snapshot(&root, &inspect_dir),
+            InspectCategory::DeadCode,
+            None,
+        )
+        .outcome
+        .expect("dead_code unavailable aggregate succeeds");
+
+    assert!(
+        success.contributions.is_empty(),
+        "unavailable callgraph must not fabricate per-file dead_code contributions"
+    );
+    assert_eq!(success.aggregate["callgraph_available"], false);
+    assert_eq!(success.aggregate["notes"], json!(["callgraph_unavailable"]));
+    assert_eq!(success.aggregate["count"], 0);
 }
 
 fn run_duplicates_reuse(
@@ -758,7 +866,7 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
         "src/lib.ts",
         "export function used() { return 1; }\nexport function unused() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let before = inspect(
@@ -819,7 +927,7 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
         "test setup must force the exact-hash aggregate lookup to miss"
     );
 
-    let restarted_ctx = configured_context(&root);
+    let restarted_ctx = configured_context_with_callgraph_store(&root, true);
     let after = inspect(
         &restarted_ctx,
         json!({
@@ -969,7 +1077,7 @@ path = "src/bin/app.rs"
         "tools/main.rs",
         "pub fn nested_only() -> u32 { 2 }\npub fn nested_main() -> u32 { nested_only() }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let response = inspect(
@@ -1090,7 +1198,7 @@ fn inspect_command_dead_code_and_unused_exports_share_workspace_public_api_resol
         "apps/service/src/internal.ts",
         "export function serviceInternal() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code", "unused_exports"]);
     let response = inspect(
@@ -1135,7 +1243,7 @@ fn inspect_command_manifestless_projects_keep_conventional_entry_point_fallback(
         "src/internal.ts",
         "export function fallbackInternal() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code", "unused_exports"]);
     let response = inspect(
@@ -1181,7 +1289,7 @@ fn inspect_command_manifest_without_declared_entries_uses_conventional_fallback(
         "src/internal.ts",
         "export function fallbackInternal() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code", "unused_exports"]);
     let response = inspect(
@@ -1295,7 +1403,7 @@ fn inspect_command_dead_code_keeps_same_name_exports_distinct_after_tier2_run() 
         "src/dead.ts",
         "export function foo() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let response = inspect(
@@ -1329,7 +1437,7 @@ fn inspect_command_dead_code_reports_unreachable_cycle_after_tier2_run() {
         "src/b.ts",
         "import { a } from './a';\nexport function b() { return a(); }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let response = inspect(
@@ -1369,7 +1477,7 @@ fn inspect_command_dead_code_keeps_multi_hop_entry_reachability_after_tier2_run(
         "import { c } from './c';\nexport function b() { return c(); }\n",
     );
     write_file(&root, "src/c.ts", "export function c() { return 3; }\n");
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let response = inspect(
@@ -1399,7 +1507,7 @@ fn inspect_command_dead_code_resolves_extensionless_package_module_entry_after_t
         "src/index.mts",
         "export function publicApi() { return 1; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     tier2_run(&ctx, &["dead_code"]);
     let response = inspect(

@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.36.1"
+version = "0.37.1"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -74,7 +74,7 @@ sha2 = "0.10"
 crc32fast = "1"
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.36.1" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.37.1" }
 
 glob = "0.3"
 which = "7"
@@ -91,10 +91,14 @@ model2vec-rs = { version = "0.2.1", default-features = false, features = ["fancy
 # the model on fresh installs; ureq feature = sync + rustls (no native-tls, for
 # clean cross-platform builds).
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
-tokenizers = "0.22.2"
+# We only load tokenizer.json and encode; serde/json support is always-on in
+# tokenizers. The pure-Rust fancy-regex backend satisfies tokenizers
+# compile-time regex selection without pulling in onig's C library.
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 ndarray = "0.17.2"
 half = "2"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+htmd = "0.5.4"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

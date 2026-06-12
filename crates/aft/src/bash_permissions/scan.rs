@@ -329,6 +329,17 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
         return PathArgTarget::None;
     };
 
+    // Check the raw string BEFORE PathBuf construction/canonicalization:
+    // - on Linux /dev/stderr etc. are symlinks (/proc/self/fd/2 -> /dev/pts/0)
+    //   that no longer match the allowlist once resolved;
+    // - on Windows, `cwd.join("/dev/null")` mangles the path to `C:\dev\null`,
+    //   so a PathBuf-based check never matches (the PR #107 tests failed on
+    //   Windows CI for exactly this reason). The agent typed a POSIX device
+    //   path; match it as the string it is.
+    if is_device_file(text) {
+        return PathArgTarget::None;
+    }
+
     let path = PathBuf::from(text);
     let resolved = if path.is_absolute() {
         path
@@ -449,6 +460,26 @@ fn push_xargs_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, tok
     push_bash_ask(asks, seen, tokens[index..].join(" "), &tokens[index..]);
 }
 
+/// Match POSIX device-file paths on the RAW string the agent typed (not a
+/// canonicalized PathBuf — see the call site for why). `/dev/fd/` accepts
+/// only bare numeric descriptors: `/dev/fd/../sda` resolves to a real block
+/// device, and the scanner must fail closed on anything path-shaped.
+fn is_device_file(s: &str) -> bool {
+    matches!(
+        s,
+        "/dev/null"
+            | "/dev/zero"
+            | "/dev/random"
+            | "/dev/urandom"
+            | "/dev/stdin"
+            | "/dev/stdout"
+            | "/dev/stderr"
+            | "/dev/tty"
+    ) || s
+        .strip_prefix("/dev/fd/")
+        .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn push_external_path(
     asks: &mut Vec<PermissionAsk>,
     seen: &mut HashSet<String>,
@@ -521,5 +552,96 @@ mod tests {
         let path = arg_path("./file.log", &scan_cwd).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
+    }
+
+    #[test]
+    fn dev_fd_accepts_only_numeric_descriptors() {
+        // `/dev/fd/2` is a process file descriptor; `/dev/fd/../sda` resolves
+        // to a real block device. The scanner fails closed on the latter.
+        for arg in ["/dev/fd/0", "/dev/fd/2", "/dev/fd/255"] {
+            assert!(
+                matches!(path_arg_target(arg, Path::new("/tmp")), PathArgTarget::None),
+                "expected {arg} to be skipped as a device path"
+            );
+        }
+        for arg in ["/dev/fd/../sda", "/dev/fd/", "/dev/fd/2x", "/dev/fd/2/x"] {
+            assert!(
+                matches!(
+                    path_arg_target(arg, Path::new("/tmp")),
+                    PathArgTarget::Path(_)
+                ),
+                "expected {arg} to be treated as a regular path (fail closed)"
+            );
+        }
+    }
+
+    #[test]
+    fn device_paths_are_skipped_before_canonicalization() {
+        // On Linux /dev/stderr is a symlink chain ending at the TTY (or a
+        // pipe inode under CI), so the device check must run on the raw
+        // path — after canonicalize it no longer matches the allowlist.
+        for arg in ["/dev/stderr", "/dev/stdin", "/dev/stdout", "/dev/fd/2"] {
+            let target = path_arg_target(arg, Path::new("/tmp"));
+            assert!(
+                matches!(target, PathArgTarget::None),
+                "expected {arg} to be skipped as a device path"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_null_redirect_does_not_trigger_permission_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root.clone()),
+                bash_permissions: true,
+                ..crate::config::Config::default()
+            },
+        );
+
+        let asks = scan_with_cwd("echo test 2>/dev/null", &ctx, &project_root);
+
+        let external_asks: Vec<_> = asks
+            .iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .collect();
+        assert!(
+            external_asks.is_empty(),
+            "Expected no external directory asks for /dev/null redirect, got: {:?}",
+            external_asks
+        );
+    }
+
+    #[test]
+    fn dev_stderr_redirect_does_not_trigger_permission_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root.clone()),
+                bash_permissions: true,
+                ..crate::config::Config::default()
+            },
+        );
+
+        let asks = scan_with_cwd("some-command 2>/dev/stderr", &ctx, &project_root);
+
+        let external_asks: Vec<_> = asks
+            .iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .collect();
+        assert!(
+            external_asks.is_empty(),
+            "Expected no external directory asks for /dev/stderr redirect, got: {:?}",
+            external_asks
+        );
     }
 }

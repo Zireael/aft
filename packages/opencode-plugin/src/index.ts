@@ -21,7 +21,7 @@ import {
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
-import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import { loadAftConfig, resolveBashConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import {
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
@@ -51,14 +51,17 @@ import { AftRpcServer } from "./shared/rpc-server.js";
 import {
   getSessionDirectory,
   getSessionDirectoryCached,
+  verifySessionDirectory,
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
+import { bashToolDescription } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
@@ -73,7 +76,6 @@ import { refactoringTools } from "./tools/refactoring.js";
 import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
-import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
 
@@ -199,12 +201,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.36.0";
+const ANNOUNCEMENT_VERSION = "0.37.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
-  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
-  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
-  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
+  "Much lower background CPU: idle bridges shut down after 30 minutes, deleted project roots stop the watcher instead of spinning it, and background scans reuse warm caches on a bounded thread pool.",
+  "`aft_transform` removed: usage data showed agents never called it — `edit` covers everything it did, and every request now carries a smaller tool surface.",
+  "Leaner tools: `bash`, `write`, `edit`, `apply_patch`, `aft_search`, and `aft_refactor` descriptions trimmed and config-aware; system-prompt guidance rewritten around what to do instead of what to avoid.",
+  "Background bash reminders are right-sized: failures keep head + tail context, successes show a short tail, and compressors never print a success summary for a non-zero exit.",
 ];
 
 /**
@@ -230,7 +232,6 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
  * - Reading: aft_outline
  * - Safety: aft_safety
  * - Imports: aft_import
- * - Structure: aft_transform
  * - Navigation: aft_callgraph
  * - Refactoring: aft_refactor
  */
@@ -681,25 +682,47 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // synthetic "not_initialized" status so the sidebar shows something
     // sensible without triggering project indexing.
     //
-    // Prefer THIS server's own project (the plugin-init cwd) first, then fall
-    // back to the session-stored directory. Order matters: in OpenCode Desktop a
-    // single process hosts one RPC server per open project, all sharing this
-    // process's session-dir cache. Resolving the session-cached dir first let
-    // project A's server serve project B's bridge when the cache mapped this
-    // session elsewhere ("another session's data" in the sidebar). Serving our
-    // own directory first removes that cross-project bleed; the session-dir
-    // fallback still fixes `opencode -s` from a different cwd, where the
-    // plugin-init cwd has no bridge and the real project lives in the cache.
-    const cachedDir = getSessionDirectoryCached(sessionID);
-    const candidateDirs = new Set<string>();
-    candidateDirs.add(input.directory);
-    if (typeof cachedDir === "string" && cachedDir.length > 0) {
-      candidateDirs.add(cachedDir);
-    }
+    // Status is scoped to the POLLED SESSION's project, not this server's
+    // launch cwd. With `opencode -s <sessid>` run from another project's
+    // directory, OpenCode hands the plugin and the TUI the launch cwd — tool
+    // calls already re-resolve the session's real directory via the SDK, and
+    // the sidebar must match them, or it renders the launch-cwd project's
+    // data for a session that lives elsewhere.
+    //
+    // Resolution order:
+    //  1. SDK-verified session directory (fresh `session.get`, 15s memo) —
+    //     NEVER the process-wide session-dir warm cache: in a multi-project
+    //     host (Desktop / `opencode serve`) that cache is shared by all plugin
+    //     instances and a fallback-seeded entry once made project A's server
+    //     serve project B's bridge (RPC contamination).
+    //  2. If the verified directory differs from ours and has NO warm bridge
+    //     in this pool, return the placeholder — never another project's data
+    //     for a foreign session; the client keeps scanning ports for the
+    //     process that actually hosts that session's bridge.
+    //  3. Own directory only when verification yields nothing (placeholder /
+    //     empty session id, SDK miss) — the common single-project case.
     let bridge: ReturnType<typeof pool.getActiveBridgeForRoot> = null;
-    for (const dir of candidateDirs) {
-      bridge = pool.getActiveBridgeForRoot(dir);
-      if (bridge) break;
+    let servedDirectory = input.directory;
+    const realSessionID = (params.sessionID as string) || "";
+    const verifiedDir = realSessionID
+      ? await verifySessionDirectory(input.client, realSessionID)
+      : null;
+    if (verifiedDir) {
+      bridge = pool.getActiveBridgeForRoot(verifiedDir);
+      if (bridge) {
+        servedDirectory = verifiedDir;
+      } else if (verifiedDir !== input.directory) {
+        return {
+          success: true,
+          status: "not_initialized",
+          message:
+            "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
+        };
+      }
+    }
+    if (!bridge) {
+      bridge = pool.getActiveBridgeForRoot(input.directory);
+      servedDirectory = input.directory;
     }
     if (!bridge) {
       return {
@@ -716,19 +739,27 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // would mis-attribute another session's per-session slice — most visibly
     // showing `Session: 0 events` in the sidebar even when this session has
     // many compression events. Only serve the cache when its session matches.
+    // `served_directory` is the cross-project provenance marker: it names the
+    // project this server DELIBERATELY resolved for the caller (its own cwd,
+    // or an SDK-verified resume directory). Clients reject mismatched-root
+    // snapshots that lack a matching marker — that's what distinguishes a
+    // legit resume serve from a stray multi-project-host response (old
+    // servers, which could serve another project's bridge via the poisoned
+    // session-dir cache, never set this field). Do NOT derive it from echoed
+    // request params or the snapshot body.
     const cached = bridge.getCachedStatus();
     const cachedSessionId = (cached as Record<string, unknown> | null)?.session as
       | Record<string, unknown>
       | undefined;
     const cachedId = cachedSessionId?.id as string | undefined;
     if (cached !== null && cachedId === sessionID) {
-      return { success: true, ...cached };
+      return { success: true, ...cached, served_directory: servedDirectory };
     }
     const response = await bridge.send("status", { session_id: sessionID });
     if (response.success !== false) {
       bridge.cacheStatusSnapshot(response);
     }
-    return response;
+    return { ...response, served_directory: servedDirectory };
   });
   // Feature announcement — TUI plugin calls this on startup to show a dialog.
   // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
@@ -838,17 +869,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
   //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
-  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
+  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
-  const ALL_ONLY_TOOLS = new Set([
-    "aft_callgraph",
-    "aft_delete",
-    "aft_move",
-    "aft_transform",
-    "aft_refactor",
-  ]);
+  const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
 
   // Build full tool map
   const allTools = normalizeToolMap({
@@ -860,7 +885,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...safetyTools(ctx),
     // aft_import: recommended+
     ...(surface !== "minimal" && importTools(ctx)),
-    ...structureTools(ctx),
     ...navigationTools(ctx),
     // AST tools: recommended+
     ...(surface !== "minimal" && astTools(ctx)),
@@ -943,6 +967,23 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // not rewrite (for example, greps with unsupported flags or pipes).
   (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
     aftSearchRegistered;
+  // The bash tool description embeds a code-search prohibition that steers to
+  // aft_search when registered (else the grep tool). Registration is only
+  // known once the full tool map exists, so select the variant here — the
+  // factory default assumes aft_search is absent. The compression and
+  // background/PTY sentences are config-gated too: only advertised when the
+  // feature is actually on for this project.
+  for (const name of ["bash", "aft_bash"]) {
+    const def = allTools[name];
+    if (def) {
+      const bashCfg = resolveBashConfig(aftConfig);
+      def.description = bashToolDescription(
+        aftSearchRegistered,
+        bashCfg.compress,
+        bashCfg.background,
+      );
+    }
+  }
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);
@@ -1013,6 +1054,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
+      // Signal any in-flight sync bash_watch to abort and convert to async
+      // so the user's message isn't blocked by a long-running wait.
+      signalSyncWatchAbort(sid);
     },
     "tool.execute.before": async (toolInput: { sessionID?: string }) => {
       if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);

@@ -152,7 +152,63 @@ export function warmSessionDirectory(
   void getSessionDirectory(client, sessionId, fallbackDirectory);
 }
 
+/**
+ * Serve-time verification for cross-project bridge resolution.
+ *
+ * The RPC status handler may serve a bridge for a DIFFERENT project root than
+ * the requesting instance's own directory (the `opencode -s` resume case).
+ * That cross-directory path must never trust a possibly-stale cache entry:
+ * a wrong mapping makes the sidebar render another project's data (RPC
+ * contamination). This helper re-resolves the session's directory via a
+ * fresh SDK lookup and only returns a directory the SDK confirms RIGHT NOW.
+ *
+ * Results are memoized briefly (VERIFY_TTL_MS) so a 1.5s sidebar poll doesn't
+ * hammer the SDK; the TTL is short enough that stale mappings die quickly.
+ * Returns `null` when the lookup fails or the SDK reports no directory —
+ * callers must treat that as "do not serve cross-project data".
+ */
+const VERIFY_TTL_MS = 15_000;
+const verifyCache = new Map<string, { directory: string | null; verifiedAt: number }>();
+
+export async function verifySessionDirectory(
+  client: unknown,
+  sessionId: string,
+): Promise<string | null> {
+  if (!sessionId) return null;
+  const hit = verifyCache.get(sessionId);
+  if (hit && Date.now() - hit.verifiedAt < VERIFY_TTL_MS) return hit.directory;
+
+  const c = client as OpenCodeClientShape;
+  const sessionApi = c?.session;
+  if (!sessionApi || typeof sessionApi.get !== "function") return null;
+
+  let dir: string | null = null;
+  try {
+    const result = await sessionApi.get({ path: { id: sessionId } });
+    const session: SessionInfo | undefined =
+      (result as { data?: SessionInfo } | undefined)?.data ?? (result as SessionInfo | undefined);
+    if (session && typeof session.directory === "string" && session.directory.length > 0) {
+      dir = session.directory;
+    }
+  } catch {
+    // Verification failure = do not serve cross-project data. Do NOT memoize
+    // failures: the next poll should retry (transient SDK errors must not
+    // stick the sidebar on placeholder for the TTL window).
+    return null;
+  }
+
+  verifyCache.set(sessionId, { directory: dir, verifiedAt: Date.now() });
+  if (verifyCache.size > CACHE_MAX_ENTRIES) {
+    const oldest = verifyCache.keys().next().value;
+    if (oldest !== undefined) verifyCache.delete(oldest);
+  }
+  // Keep the long-lived cache coherent with what the SDK just said.
+  if (dir !== null) setCache(sessionId, dir);
+  return dir;
+}
+
 /** Test-only: clear the cache between unit tests. */
 export function _resetSessionDirectoryCacheForTest(): void {
   cache.clear();
+  verifyCache.clear();
 }

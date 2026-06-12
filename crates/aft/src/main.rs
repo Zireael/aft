@@ -3,7 +3,7 @@ use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest,
+    SemanticRefreshRequest, StatusBarCounts,
 };
 use aft::log_ctx;
 use aft::lsp::client::LspEvent;
@@ -148,7 +148,6 @@ fn main() {
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 if shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -184,7 +183,6 @@ fn main() {
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
@@ -449,6 +447,12 @@ fn attach_bg_completions(
     ) {
         return;
     }
+    if !ctx
+        .bash_background()
+        .has_completions_for_session(Some(session_id))
+    {
+        return;
+    }
     let completions = ctx
         .bash_background()
         .drain_completions_for_session(Some(session_id));
@@ -472,6 +476,18 @@ fn attach_bg_completions(
 /// responses never reach the agent, and bash-lifecycle commands fire rapidly).
 /// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
 /// last-known. Omitted entirely until the Tier-2 cache is populated once.
+fn status_bar_last_emitted() -> &'static Mutex<Option<StatusBarCounts>> {
+    static LAST_EMITTED_STATUS_BAR: OnceLock<Mutex<Option<StatusBarCounts>>> = OnceLock::new();
+    LAST_EMITTED_STATUS_BAR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn reset_status_bar_emission_for_test() {
+    if let Ok(mut last) = status_bar_last_emitted().lock() {
+        *last = None;
+    }
+}
+
 fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     if matches!(
         command,
@@ -492,6 +508,18 @@ fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     let Some(counts) = ctx.status_bar_counts() else {
         return;
     };
+    match status_bar_last_emitted().lock() {
+        Ok(mut last) => {
+            if last.as_ref() == Some(&counts) {
+                return;
+            }
+            *last = Some(counts.clone());
+        }
+        Err(_) => {
+            // If the fingerprint lock is poisoned, prefer the previous behavior
+            // (emit) over accidentally suppressing a changed status bar.
+        }
+    }
     let value = serde_json::json!({
         "errors": counts.errors,
         "warnings": counts.warnings,
@@ -551,11 +579,6 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
         "batch" => aft::commands::batch::handle_batch(&req, ctx),
         "add_import" => aft::commands::add_import::handle_add_import(&req, ctx),
-        "add_member" => aft::commands::add_member::handle_add_member(&req, ctx),
-        "add_derive" => aft::commands::add_derive::handle_add_derive(&req, ctx),
-        "add_decorator" => aft::commands::add_decorator::handle_add_decorator(&req, ctx),
-        "add_struct_tags" => aft::commands::add_struct_tags::handle_add_struct_tags(&req, ctx),
-        "wrap_try_catch" => aft::commands::wrap_try_catch::handle_wrap_try_catch(&req, ctx),
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -953,17 +976,6 @@ where
         changed,
         ignore_file_changed,
     }
-}
-
-fn semantic_project_files_for_refresh(
-    root: &std::path::Path,
-    max_files: usize,
-) -> Result<Vec<std::path::PathBuf>, usize> {
-    aft::search_index::walk_project_files_bounded_default_matching(
-        root,
-        max_files,
-        aft::semantic_index::is_semantic_indexed_extension,
-    )
 }
 
 fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &std::path::Path) -> bool {
@@ -1391,40 +1403,26 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     }
 
     if config.semantic_search {
-        match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
-            Ok(current_files) => {
-                if let Some(sender) = ctx.semantic_refresh_sender() {
-                    let file_count = current_files.len();
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                        stage: "refreshing_corpus".to_string(),
-                        files: Some(file_count),
-                        entries_done: None,
-                        entries_total: None,
-                    };
-                    match sender.send(SemanticRefreshRequest::Corpus { current_files }) {
-                        Ok(()) => {
-                            status_changed = true;
-                        }
-                        Err(error) => {
-                            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                                format!("semantic corpus refresh worker unavailable: {error}"),
-                            );
-                            status_changed = true;
-                        }
-                    }
-                } else if ctx.semantic_index_rx().borrow().is_some() {
-                    ctx.mark_pending_semantic_corpus_refresh();
+        if let Some(sender) = ctx.semantic_refresh_sender() {
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "refreshing_corpus".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            match sender.send(SemanticRefreshRequest::Corpus) {
+                Ok(()) => {
+                    status_changed = true;
+                }
+                Err(error) => {
+                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                        format!("semantic corpus refresh worker unavailable: {error}"),
+                    );
+                    status_changed = true;
                 }
             }
-            Err(_) => {
-                ctx.clear_semantic_refresh_worker();
-                *ctx.semantic_index().borrow_mut() = None;
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(format!(
-                    "too many files (>{}) for semantic indexing (max {})",
-                    config.semantic.max_files, config.semantic.max_files
-                ));
-                status_changed = true;
-            }
+        } else if ctx.semantic_index_rx().borrow().is_some() {
+            ctx.mark_pending_semantic_corpus_refresh();
         }
     }
 
@@ -1929,40 +1927,22 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if replay_corpus_refresh {
-        if let Some(root) = ctx.canonical_cache_root_opt() {
-            let config = ctx.config().clone();
-            match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
-                Ok(current_files) => {
-                    let file_count = current_files.len();
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                        stage: "refreshing_corpus".to_string(),
-                        files: Some(file_count),
-                        entries_done: None,
-                        entries_total: None,
-                    };
-                    let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-                        sender
-                            .send(SemanticRefreshRequest::Corpus { current_files })
-                            .is_ok()
-                    });
-                    if !sent {
-                        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                            "semantic corpus refresh worker unavailable".to_string(),
-                        );
-                    }
-                    status_changed = true;
-                }
-                Err(_) => {
-                    ctx.clear_semantic_refresh_worker();
-                    *ctx.semantic_index().borrow_mut() = None;
-                    *ctx.semantic_index_status().borrow_mut() =
-                        SemanticIndexStatus::Failed(format!(
-                            "too many files (>{}) for semantic indexing (max {})",
-                            config.semantic.max_files, config.semantic.max_files
-                        ));
-                    status_changed = true;
-                }
+        if ctx.canonical_cache_root_opt().is_some() {
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "refreshing_corpus".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            let sent = ctx
+                .semantic_refresh_sender()
+                .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
+            if !sent {
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                    "semantic corpus refresh worker unavailable".to_string(),
+                );
             }
+            status_changed = true;
         }
     } else if !replay_refresh_paths.is_empty() {
         {
@@ -2039,6 +2019,15 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     }
                     status_changed = true;
                 }
+            }
+            SemanticRefreshEvent::CorpusStarted { files } => {
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: Some(files),
+                    entries_done: None,
+                    entries_total: None,
+                };
+                status_changed = true;
             }
             SemanticRefreshEvent::Completed {
                 added_entries,
@@ -2258,9 +2247,10 @@ fn drain_lsp_events(ctx: &AppContext) {
 #[cfg(test)]
 mod watcher_filter_tests {
     use super::{
-        dispatch_panic_response, drain_configure_warning_events, drain_semantic_index_events,
-        drain_semantic_refresh_events, drain_watcher_events, filter_watcher_raw_paths,
-        project_root_was_deleted, reset_semantic_refresh_retry_state_for_test,
+        attach_status_bar, dispatch_panic_response, drain_configure_warning_events,
+        drain_semantic_index_events, drain_semantic_refresh_events, drain_watcher_events,
+        filter_watcher_raw_paths, project_root_was_deleted,
+        reset_semantic_refresh_retry_state_for_test, reset_status_bar_emission_for_test,
         schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
         semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_event_invalidates,
@@ -2277,7 +2267,7 @@ mod watcher_filter_tests {
     use aft::lsp::registry::ServerKind;
     use aft::lsp::roots::ServerKey;
     use aft::parser::TreeSitterProvider;
-    use aft::protocol::{ConfigureWarningsFrame, PushFrame};
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, Response};
     use aft::semantic_index::SemanticIndex;
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
@@ -2385,7 +2375,7 @@ mod watcher_filter_tests {
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => paths,
-            SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
     }
 
@@ -2714,6 +2704,30 @@ mod watcher_filter_tests {
     }
 
     #[test]
+    fn status_bar_attach_skips_unchanged_fingerprint() {
+        reset_status_bar_emission_for_test();
+        let tmp = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+
+        let mut first = Response::success("one", serde_json::json!({}));
+        attach_status_bar(&mut first, &ctx, "read");
+        assert_eq!(first.data["status_bar"]["dead_code"], 1);
+        assert_eq!(first.data["status_bar"]["unused_exports"], 2);
+        assert_eq!(first.data["status_bar"]["duplicates"], 3);
+        assert_eq!(first.data["status_bar"]["todos"], 4);
+
+        let mut unchanged = Response::success("two", serde_json::json!({}));
+        attach_status_bar(&mut unchanged, &ctx, "read");
+        assert!(unchanged.data.get("status_bar").is_none());
+
+        ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
+        let mut changed = Response::success("three", serde_json::json!({}));
+        attach_status_bar(&mut changed, &ctx, "read");
+        assert_eq!(changed.data["status_bar"]["dead_code"], 5);
+    }
+
+    #[test]
     fn configure_warning_drain_drops_stale_generation() {
         let tmp = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(tmp.path());
@@ -2955,7 +2969,7 @@ mod watcher_filter_tests {
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
-            SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
     }
 
@@ -2991,7 +3005,7 @@ mod watcher_filter_tests {
                 .expect("retry request")
             {
                 SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file.clone()]),
-                SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+                SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
             }
             assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 1);
         });

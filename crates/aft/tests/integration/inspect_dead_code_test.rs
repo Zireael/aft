@@ -89,6 +89,7 @@ fn outbound(
         caller_symbol: caller_symbol.to_string(),
         target: target.to_string(),
         line,
+        provenance: "treesitter".to_string(),
     }
 }
 
@@ -949,7 +950,7 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
                 {"symbol": "helper", "kind": "function", "line": 2, "is_entry_point": false}
             ],
             "internal_calls": [
-                {"caller_symbol": "helper", "file": "src/bar.ts", "symbol": "Bar", "line": 2}
+                {"caller_symbol": "helper", "file": "src/bar.ts", "symbol": "Bar", "line": 2, "provenance": "treesitter"}
             ],
             "liveness_roots": []
         })

@@ -14,7 +14,10 @@ describe("Pi buildWorkflowHints", () => {
       absentTools: new Set(),
     });
     expect(out).not.toBeNull();
-    expect(out).toContain("## Prefer AFT tools for token efficiency");
+    expect(out).toContain("## IMPORTANT NOTICE about your tools");
+    // Opening notice: non-standard tool set, reach for it first (parity).
+    expect(out).toContain("You are equipped with a non-standard tool set");
+    expect(out).toContain("Always reach for these tools first");
     expect(out).toContain("**Parallel tool calls**");
     expect(out).toContain("emit them in ONE response instead of serializing");
     expect(out).toContain("**Web/URL access**");
@@ -24,10 +27,11 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes concepts, identifiers, regex");
-    // Imperative anti-bash-grep + parallel-wave steer must be present (parity).
-    expect(out).toContain("fire independent lookups in ONE parallel tool-call wave");
-    expect(out).toContain("DO NOT run `grep`/`rg`/`find` through `bash` to locate code");
+    // Imperative anti-bash-grep steer with concrete reflex translations (parity).
+    expect(out).toContain("DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash`");
     expect(out).toContain("the bash path is unindexed, unranked, serial");
+    expect(out).toContain("Reflex translations:");
+    expect(out).toContain('aft_search({ query: "handleAuth" })');
     expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("`aft_inspect`");
@@ -35,15 +39,15 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("before you run tests or commit");
     expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
-    // Anti-polling guidance must be present so agents stop calling
-    // bash_status back-to-back. Mirrors OpenCode plugin parity.
-    expect(out).toContain("a completion reminder arrives automatically");
-    expect(out).toContain("Do not poll");
-    // Anti-sync-block steer (parity with OpenCode): end the turn or use async,
-    // never sync-wait bash_watch on a long task.
-    expect(out).toContain("end your turn");
-    expect(out).toContain("do not sync-wait with `bash_watch` for a long task");
-    expect(out).toContain("`task_id`");
+    // Positive-first waiting protocol (parity with OpenCode — see the Discord
+    // feedback rationale there): sanctioned outlets lead, bash_status gets a
+    // legitimate role, and Pi keeps snake_case param names.
+    expect(out).toContain("Then do ONE of these:");
+    expect(out).toContain("Keep working on something independent");
+    expect(out).toContain("completion reminder with the result arrives automatically");
+    expect(out).toContain("bash_watch({ task_id, pattern, background: true })");
+    expect(out).toContain("never call it repeatedly to wait");
+    expect(out).toContain("locks the user out");
     expect(out).toContain("`bash_status({ task_id })`");
     expect(out).not.toContain("taskId");
   });
@@ -70,8 +74,11 @@ describe("Pi buildWorkflowHints", () => {
       absentTools: new Set(),
     });
     expect(on).toContain(
-      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+      "bash output is auto-compressed — failures and the summary are always kept",
     );
+    expect(on).toContain("`bun test | grep fail` → run `bun test`");
+    // The agent can't check the config — the section is gated instead of hedged.
+    expect(on).not.toContain("compression is on,");
 
     const off = buildWorkflowHints({
       toolSurface: "recommended",
@@ -81,9 +88,8 @@ describe("Pi buildWorkflowHints", () => {
       bashCompressionEnabled: false,
       absentTools: new Set(),
     });
-    expect(off).not.toContain(
-      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
-    );
+    expect(off).not.toContain("bash output is auto-compressed");
+    expect(off).not.toContain("`bun test | grep fail`");
   });
 
   test("omits navigate at recommended surface", () => {

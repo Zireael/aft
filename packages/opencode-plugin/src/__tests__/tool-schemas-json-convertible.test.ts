@@ -14,7 +14,6 @@ import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
-import { structureTools } from "../tools/structure.js";
 import type { PluginContext } from "../types.js";
 
 const z = tool.schema;
@@ -77,7 +76,6 @@ function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
     ...safetyTools(ctx),
     ...searchTools(ctx),
     ...semanticTools(ctx),
-    ...structureTools(ctx),
   };
 }
 

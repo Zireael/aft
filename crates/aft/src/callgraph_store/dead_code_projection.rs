@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -25,9 +25,10 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     }
 
     let project_root = project_root_from_backend_state(&conn)?;
-    let files = project_files_from_store(&conn, &project_root)?;
-    let exported_symbols = exported_symbols_from_store(&conn, &project_root)?;
-    let outbound_calls = outbound_calls_from_store(&conn, &project_root)?;
+    let mut paths = SnapshotPathResolver::new(&project_root);
+    let files = project_files_from_store(&conn, &mut paths)?;
+    let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
+    let outbound_calls = outbound_calls_from_store(&conn, &mut paths)?;
     let entry_points = entry_points_for_files(&project_root, &files);
 
     Ok(CallgraphSnapshot {
@@ -62,20 +63,21 @@ fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
     }
 }
 
-fn project_files_from_store(conn: &Connection, project_root: &Path) -> Result<Vec<PathBuf>> {
+fn project_files_from_store(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+) -> Result<Vec<PathBuf>> {
     let mut statement = conn.prepare("SELECT path FROM files ORDER BY path")?;
     let files = statement
         .query_map([], |row| row.get::<_, String>(0))?
-        .map(|path| {
-            path.map(|path| canonicalize_for_snapshot(&absolute_store_path(project_root, &path)))
-        })
+        .map(|path| path.map(|path| paths.resolve(&path)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(files)
 }
 
 fn exported_symbols_from_store(
     conn: &Connection,
-    project_root: &Path,
+    paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphExport>> {
     let mut statement = conn.prepare(
         "SELECT file_path, name, kind, start_line, exported, is_default_export
@@ -97,7 +99,7 @@ fn exported_symbols_from_store(
     let mut exports = Vec::new();
     for row in rows {
         let row = row?;
-        let file = canonicalize_for_snapshot(&absolute_store_path(project_root, &row.file_path));
+        let file = paths.resolve(&row.file_path);
         if row.exported {
             exports.push(CallgraphExport {
                 file: file.clone(),
@@ -120,23 +122,25 @@ fn exported_symbols_from_store(
 
 fn outbound_calls_from_store(
     conn: &Connection,
-    project_root: &Path,
+    paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
     let mut statement = conn.prepare(
         "SELECT r.ref_id,
                 r.caller_file,
-                n.scoped_name,
+                n.name,
                 r.short_name,
                 r.full_ref,
                 r.status,
                 COALESCE(r.target_file, e.target_file),
-                COALESCE(r.target_symbol, e.target_symbol),
-                r.line
+                COALESCE(tn.name, r.target_symbol, e.target_symbol),
+                r.line,
+                COALESCE(e.provenance, r.provenance)
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
          LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = 'call'
+         LEFT JOIN nodes tn ON tn.id = e.target_node
          WHERE r.kind = 'call'
-         ORDER BY r.caller_file, n.scoped_name, r.line, r.byte_start, r.byte_end, r.ref_id",
+         ORDER BY r.caller_file, n.name, r.line, r.byte_start, r.byte_end, r.ref_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(OutboundRow {
@@ -149,25 +153,24 @@ fn outbound_calls_from_store(
             target_file: row.get(6)?,
             target_symbol: row.get(7)?,
             line: row.get::<_, i64>(8)? as u32,
+            provenance: row.get(9)?,
         })
     })?;
 
     let mut calls = Vec::new();
     for row in rows {
         let row = row?;
-        let caller_file =
-            canonicalize_for_snapshot(&absolute_store_path(project_root, &row.caller_file));
+        let caller_file = paths.resolve(&row.caller_file);
         let caller_symbol = caller_symbol_from_row(&row)?;
         let short_name = row
             .short_name
             .as_deref()
             .or(row.full_ref.as_deref())
             .unwrap_or_default();
-        let mut target = if is_resolved_status(&row.status) {
+        let mut target = if is_resolved_edge(&row.status, Some(row.provenance.as_str())) {
             match (row.target_file.as_deref(), row.target_symbol.as_deref()) {
                 (Some(target_file), Some(target_symbol)) => {
-                    let target_file =
-                        canonicalize_for_snapshot(&absolute_store_path(project_root, target_file));
+                    let target_file = paths.resolve(target_file);
                     format!("{}::{target_symbol}", target_file.display())
                 }
                 _ => short_name.to_string(),
@@ -190,6 +193,7 @@ fn outbound_calls_from_store(
             caller_symbol,
             target,
             line: row.line,
+            provenance: row.provenance,
         });
     }
     Ok(calls)
@@ -213,8 +217,12 @@ fn caller_symbol_from_row(row: &OutboundRow) -> Result<String> {
     })
 }
 
-fn is_resolved_status(status: &str) -> bool {
+fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
+        || provenance.is_some_and(|provenance| {
+            provenance != "name_match"
+                && (provenance.contains("treesitter") || provenance.contains("resolver"))
+        })
 }
 
 fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
@@ -228,6 +236,29 @@ fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
         .next()
         .map(|segment| segment.trim().trim_start_matches('?') == callee_name.trim())
         .unwrap_or(false)
+}
+
+struct SnapshotPathResolver<'a> {
+    project_root: &'a Path,
+    cache: HashMap<String, PathBuf>,
+}
+
+impl<'a> SnapshotPathResolver<'a> {
+    fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, store_path: &str) -> PathBuf {
+        if let Some(path) = self.cache.get(store_path) {
+            return path.clone();
+        }
+        let path = canonicalize_for_snapshot(&absolute_store_path(self.project_root, store_path));
+        self.cache.insert(store_path.to_string(), path.clone());
+        path
+    }
 }
 
 fn absolute_store_path(project_root: &Path, store_path: &str) -> PathBuf {
@@ -264,16 +295,78 @@ struct OutboundRow {
     target_file: Option<String>,
     target_symbol: Option<String>,
     line: u32,
+    provenance: String,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        CallGraphStore, PROVENANCE_NAME_MATCH, PROVENANCE_TREESITTER, PROVENANCE_TYPE_MATCH,
+    };
     use super::*;
+    use std::fs;
 
     fn assert_send<T: Send>() {}
 
     #[test]
     fn projection_result_is_send() {
         assert_send::<Result<CallgraphSnapshot>>();
+    }
+
+    #[test]
+    fn outbound_rows_carry_store_provenance_for_each_tier() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.rs");
+        fs::write(
+            &source,
+            r#"struct TypedTarget;
+impl TypedTarget {
+    fn typed_edge(&self) {}
+}
+
+struct NamedTarget;
+impl NamedTarget {
+    fn named_edge(&self) {}
+}
+
+fn run(typed: &TypedTarget) {
+    local_target();
+    typed.typed_edge();
+    unknown.named_edge();
+}
+
+fn local_target() {}
+"#,
+        )
+        .expect("write provenance fixture");
+
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build provenance fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+
+        assert_call_with_provenance(&snapshot, "local_target", PROVENANCE_TREESITTER);
+        assert_call_with_provenance(&snapshot, "typed_edge", PROVENANCE_TYPE_MATCH);
+        assert_call_with_provenance(&snapshot, "named_edge", PROVENANCE_NAME_MATCH);
+    }
+
+    fn assert_call_with_provenance(
+        snapshot: &CallgraphSnapshot,
+        target_fragment: &str,
+        expected_provenance: &str,
+    ) {
+        assert!(
+            snapshot.outbound_calls.iter().any(|call| {
+                call.target.contains(target_fragment) && call.provenance == expected_provenance
+            }),
+            "expected projected call containing {target_fragment:?} with provenance \
+             {expected_provenance:?}; calls: {:#?}",
+            snapshot.outbound_calls
+        );
     }
 }

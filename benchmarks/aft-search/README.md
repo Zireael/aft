@@ -47,6 +47,28 @@ The runner starts `aft`, sends `configure` with search and semantic search
 enabled, waits for the semantic index to be ready, runs `semantic_search(top_k=5)`
 for every fixture, and writes the baseline-shaped JSON report.
 
+## Search-fusion quality sub-benchmark
+
+`run-fusion-quality` is a focused investigation harness for hybrid fusion
+ranking. It runs the existing in-tree `fixtures.json` plus
+`identifier-fusion-fixtures.json`, asks `aft_search` for a wide top-100
+candidate pool, and applies bench-only offline rerankers (RRF, exact-identifier
+first, and uncapped identifier lexical score) without changing production Rust.
+From `benchmarks/aft-search`:
+
+```bash
+python3 run-fusion-quality \
+  --binary ../../target/release/aft \
+  --project-root ../.. \
+  --out results/search-fusion-quality.json \
+  --summary results/search-fusion-quality-summary.tsv
+```
+
+The script auto-detects the managed ONNX Runtime at
+`~/.local/share/cortexkit/aft/onnxruntime/1.24.4/` when `ORT_DYLIB_PATH` is not
+set. It writes a detailed JSON run manifest plus a TSV aggregate summary used by
+`.alfonso/reports/search-fusion-quality.md`.
+
 ## External Vera-comparable benchmark
 
 After setup, run:

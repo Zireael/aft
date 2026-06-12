@@ -440,3 +440,45 @@ describe("rpc-utils pid/record parsing", () => {
     expect(isPidAlive(2_000_000_000)).toBe(false);
   });
 });
+
+describe("RPC port file hygiene (server-start sweep)", () => {
+  test("server start removes dead-pid and corrupt sibling port files, keeps live and legacy ones", async () => {
+    const fixture = makeFixture();
+    const portsDir = rpcPortFileDir(fixture.storageDir, fixture.directory);
+    mkdirSync(portsDir, { recursive: true });
+
+    // Dead sibling: valid record, pid provably dead.
+    writeFileSync(
+      join(portsDir, "deadbeef00000001.json"),
+      JSON.stringify({ port: 45001, token: "t", pid: 2_000_000_000, started_at: 1 }),
+    );
+    // Corrupt sibling: unparsable contents.
+    writeFileSync(join(portsDir, "deadbeef00000002.json"), "{not json");
+    // Live sibling: our own process pid (provably alive).
+    writeFileSync(
+      join(portsDir, "deadbeef00000003.json"),
+      JSON.stringify({ port: 45003, token: "t", pid: process.pid, started_at: 2 }),
+    );
+    // Legacy sibling: no pid — cannot prove dead, must be kept.
+    writeFileSync(
+      join(portsDir, "deadbeef00000004.json"),
+      JSON.stringify({ port: 45004, token: "t" }),
+    );
+
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    try {
+      await server.start();
+      const remaining = readdirSync(portsDir)
+        .filter((f) => f.endsWith(".json"))
+        .sort();
+      expect(remaining).not.toContain("deadbeef00000001.json"); // dead: swept
+      expect(remaining).not.toContain("deadbeef00000002.json"); // corrupt: swept
+      expect(remaining).toContain("deadbeef00000003.json"); // alive: kept
+      expect(remaining).toContain("deadbeef00000004.json"); // legacy pid-less: kept
+      // Our own fresh port file exists too.
+      expect(remaining.length).toBe(3);
+    } finally {
+      server.stop();
+    }
+  });
+});

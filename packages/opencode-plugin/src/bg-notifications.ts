@@ -25,7 +25,11 @@ export interface BgCompletion {
   duration_ms?: number;
   runtime_ms?: number;
   runtime?: number;
-  /** Tail of stdout+stderr captured at completion (≤300 bytes from Rust). */
+  /**
+   * Exit-aware preview of stdout+stderr captured at completion (from Rust):
+   * success = short tail (≤600 B), failure = small head + larger tail
+   * (≤2.25 KiB). Full output stays recoverable via bash_status / file pointers.
+   */
   output_preview?: string;
   /** True when the captured tail is shorter than the actual output. */
   output_truncated?: boolean;

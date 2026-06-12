@@ -12,6 +12,17 @@ type PortInfo = ParsedPortInfo & { source: PortInfoSource; path?: string };
 
 export interface AftRpcCallOptions {
   signal?: AbortSignal;
+  /**
+   * Optional gate over WARM (non-placeholder) responses. With multiple RPC
+   * servers alive for one project hash (multi-project hosts, stale long-lived
+   * processes), a warm response can describe ANOTHER project's bridge
+   * (cross-project contamination). Return false to skip that response and
+   * keep trying other ports instead of returning it — so a stray server can't
+   * mask the right one. Skipped responses are never cached as the good port
+   * and never returned; if only strays and placeholders answer, the
+   * placeholder wins.
+   */
+  accept?: (result: unknown) => boolean;
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -80,6 +91,11 @@ export class AftRpcClient {
         const result = await this.callOne<T>(method, params, info, signal);
         if (this.looksLikePlaceholder(result)) {
           placeholder = result; // remember but keep trying
+          continue;
+        }
+        if (options.accept && !options.accept(result)) {
+          // Stray warm response (e.g. another project's data) — skip it and
+          // keep scanning so it can't mask the right server.
           continue;
         }
         // Warm response — cache this port for subsequent calls.

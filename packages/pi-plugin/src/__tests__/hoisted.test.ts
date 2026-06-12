@@ -8,8 +8,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { TSchema } from "typebox";
-import { Value } from "typebox/value";
 import { formatReadFooter, registerHoistedTools } from "../tools/hoisted.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
@@ -20,10 +18,6 @@ async function tempRoot(): Promise<string> {
   roots.push(root);
   await mkdir(root, { recursive: true });
   return root;
-}
-
-function schemaAccepts(schema: unknown, value: unknown): boolean {
-  return Value.Check(schema as TSchema, value);
 }
 
 afterEach(async () => {
@@ -125,7 +119,7 @@ describe("hoisted tool adapters", () => {
     expect(result.details.diagnostics).toBeUndefined();
   });
 
-  test("edit honors diagnostics true and includes LSP payload", async () => {
+  test("edit surfaces LSP payload when diagnostics_on_edit is configured", async () => {
     const diagnostics = [{ severity: "error", line: 5, message: "Broken edit" }];
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({
@@ -134,19 +128,22 @@ describe("hoisted tool adapters", () => {
       replacements: 1,
       lsp_diagnostics: diagnostics,
     }));
-    registerHoistedTools(api, makePluginContext(bridge), {
-      hoistRead: false,
-      hoistWrite: false,
-      hoistEdit: true,
-      hoistGrep: false,
-      restrictToProjectRoot: true,
-    });
+    registerHoistedTools(
+      api,
+      makePluginContext(bridge, { config: { lsp: { diagnostics_on_edit: true } } }),
+      {
+        hoistRead: false,
+        hoistWrite: false,
+        hoistEdit: true,
+        hoistGrep: false,
+        restrictToProjectRoot: true,
+      },
+    );
 
     const result = (await executeTool(tools.get("edit")!, {
       filePath: "src/app.ts",
       oldString: "before",
       newString: "after",
-      diagnostics: true,
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
     expect(calls[0].params.diagnostics).toBe(true);
@@ -236,7 +233,7 @@ describe("hoisted tool adapters", () => {
     expect(result.details.diagnostics).toBeUndefined();
   });
 
-  test("write uses lsp.diagnostics_on_edit as the default", async () => {
+  test("write follows lsp.diagnostics_on_edit (config-driven; no per-call param)", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
     registerHoistedTools(
@@ -257,15 +254,18 @@ describe("hoisted tool adapters", () => {
     });
     expect(calls[0].params.diagnostics).toBe(true);
 
+    // The per-call `diagnostics` param was removed (agents never used it; the
+    // status bar + aft_inspect are the agent-facing diagnostics paths). A
+    // stray param must NOT override the configured default.
     await executeTool(tools.get("write")!, {
       filePath: "src/app.ts",
       content: "export {};\n",
       diagnostics: false,
     });
-    expect(calls[1].params.diagnostics).toBe(false);
+    expect(calls[1].params.diagnostics).toBe(true);
   });
 
-  test("write honors diagnostics true and includes LSP payload", async () => {
+  test("write surfaces LSP payload when diagnostics_on_edit is configured", async () => {
     const diagnostics = [{ severity: "error", line: 11, message: "Broken write" }];
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({
@@ -273,18 +273,21 @@ describe("hoisted tool adapters", () => {
       diff: { additions: 1 },
       lsp_diagnostics: diagnostics,
     }));
-    registerHoistedTools(api, makePluginContext(bridge), {
-      hoistRead: false,
-      hoistWrite: true,
-      hoistEdit: false,
-      hoistGrep: false,
-      restrictToProjectRoot: true,
-    });
+    registerHoistedTools(
+      api,
+      makePluginContext(bridge, { config: { lsp: { diagnostics_on_edit: true } } }),
+      {
+        hoistRead: false,
+        hoistWrite: true,
+        hoistEdit: false,
+        hoistGrep: false,
+        restrictToProjectRoot: true,
+      },
+    );
 
     const result = (await executeTool(tools.get("write")!, {
       filePath: "src/app.ts",
       content: "export {};\n",
-      diagnostics: true,
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
     expect(calls[0].command).toBe("write");
@@ -294,7 +297,7 @@ describe("hoisted tool adapters", () => {
     expect(result.content[0].text).toContain("Broken write");
   });
 
-  test("mutation schemas reject non-boolean diagnostics", () => {
+  test("mutation schemas expose no per-call diagnostics param", () => {
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({ success: true }));
     registerHoistedTools(api, makePluginContext(bridge), {
@@ -305,21 +308,14 @@ describe("hoisted tool adapters", () => {
       restrictToProjectRoot: true,
     });
 
-    expect(
-      schemaAccepts(tools.get("write")!.parameters, {
-        filePath: "src/app.ts",
-        content: "export {};\n",
-        diagnostics: "yes",
-      }),
-    ).toBe(false);
-    expect(
-      schemaAccepts(tools.get("edit")!.parameters, {
-        filePath: "src/app.ts",
-        oldString: "before",
-        newString: "after",
-        diagnostics: "yes",
-      }),
-    ).toBe(false);
+    // Removed deliberately: agents never used it; diagnostics are the status
+    // bar (passive) + aft_inspect (pull) + the lsp.diagnostics_on_edit config.
+    const writeProps = (tools.get("write")!.parameters as { properties: Record<string, unknown> })
+      .properties;
+    const editProps = (tools.get("edit")!.parameters as { properties: Record<string, unknown> })
+      .properties;
+    expect(writeProps.diagnostics).toBeUndefined();
+    expect(editProps.diagnostics).toBeUndefined();
   });
 
   test("write to external path triggers ui.confirm; denial rejects, approval calls bridge", async () => {

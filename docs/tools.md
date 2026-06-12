@@ -66,7 +66,6 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_delete` | Delete one or more files (or directories) with backup | `files`, `recursive` |
 | `aft_move` | Move or rename a file with backup | `filePath`, `destination` |
 | `aft_callgraph` | Call graph and data-flow navigation | `op`, `filePath`, `symbol`, `depth` |
-| `aft_transform` | Structural code transforms (members, derives, decorators) | `op`, `filePath`, `container`, `target` |
 | `aft_refactor` | Workspace-wide move, extract, inline | `op`, `filePath`, `symbol`, `destination` |
 
 ---
@@ -109,9 +108,9 @@ doesn't exist. Backs up any existing content before overwriting.
 
 Auto-formats using the project's configured formatter (biome, oxfmt, prettier, etc.).
 
-LSP diagnostics are **off by default** (since v0.33) — the write returns as soon as the file is
-written. Pass `diagnostics: true` to wait up to 3s for fresh LSP diagnostics and include them
-inline, or call `aft_inspect` / `lsp_diagnostics` at a verification checkpoint instead.
+The write returns as soon as the file is written. Diagnostics surface through the AFT status
+bar and `aft_inspect`; set `lsp.diagnostics_on_edit: true` in `aft.jsonc` to additionally wait
+for and inline fresh LSP diagnostics on every edit.
 
 For partial edits (find/replace), use `edit` instead.
 
@@ -174,10 +173,10 @@ To edit multiple files, make parallel `edit` calls in one response.
 Creates the file (and parent directories) if missing. Faster than read+write for adding to logs,
 notepad files, or large appendable structures.
 
-LSP diagnostics are **off by default** (since v0.33). Pass `diagnostics: true` on any edit mode to
-wait up to 3s for fresh diagnostics and include them inline; otherwise the edit returns as soon as
-the write completes. Use `aft_inspect` or `lsp_diagnostics` to check diagnostics across a batch of
-edits or before tests/commits. Use `aft_safety checkpoint` / `undo` for recovery before risky edits.
+The edit returns as soon as the write completes. Diagnostics surface through the AFT status bar
+and `aft_inspect`; set `lsp.diagnostics_on_edit: true` in `aft.jsonc` to additionally wait for
+and inline fresh LSP diagnostics on every edit. Use `aft_safety checkpoint` / `undo` for
+recovery before risky edits.
 
 ---
 
@@ -202,7 +201,7 @@ abort). A move hunk never deletes the source unless the destination write succee
 ```
 
 Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
-LSP diagnostics are off by default; pass `diagnostics: true` to include them inline for updated files.
+Diagnostics surface through the AFT status bar and `aft_inspect` (or inline on every edit with `lsp.diagnostics_on_edit: true`).
 
 ---
 
@@ -640,21 +639,12 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 
 ### aft_search
 
-Find symbols by **concept** when grep keywords fall short. Returns ranked code matches with
-similarity scores plus provenance (semantic, lexical, or hybrid). Requires
-`semantic_search: true` and [ONNX Runtime](https://onnxruntime.ai/) installed on the system
-when using the default `fastembed` backend.
-
-**When to use it:**
-- Exploring an unfamiliar area: *"where is rate limiting handled"*
-- Concept doesn't appear as a literal string: *"retry logic"*, *"cache invalidation"*
-- After grep attempts came back empty or noisy
-- You know roughly what the function does but not its name
-
-**When NOT to use it:**
-- Error message or stack trace → use grep
-- File/module structure → use `aft_outline`
-- Following a call chain → use `aft_callgraph`
+The primary code-search tool: concepts, identifiers, error strings, regex, literals, and
+filenames are auto-routed to the right engine and returned ranked. Works even when you only
+know what the code does, not what it's named (*"where is rate limiting handled"*, *"retry
+logic"*, `^export`, `Cargo.lock`). Requires `semantic_search: true` and
+[ONNX Runtime](https://onnxruntime.ai/) installed on the system when using the default
+`fastembed` backend.
 
 **How it works — hybrid retrieval:** AFT classifies each query by shape (identifier, path,
 error-code, mixed, natural-language) and routes through two lanes:
@@ -966,33 +956,6 @@ in it) instead of pretending the removal succeeded. For languages whose grammar 
 safely regenerated (wildcard/group/rename forms), `organize` sorts verbatim and refuses
 rather than corrupting syntax; a generated line that fails to parse rolls back and reports
 `generated_invalid_syntax` instead of a false success.
-
----
-
-### aft_transform
-
-Scope-aware structural transformations that handle indentation correctly.
-
-| Op | Description |
-|----|-------------|
-| `add_member` | Insert a method or field into a class, struct, or impl block |
-| `add_derive` | Add Rust derive macros (deduplicates) |
-| `wrap_try_catch` | Wrap a TS/JS function body in try/catch |
-| `add_decorator` | Add a Python decorator to a function or class |
-| `add_struct_tags` | Add or update Go struct field tags |
-
-```json
-// Add a method to a TypeScript class
-{
-  "op": "add_member",
-  "filePath": "src/user.ts",
-  "container": "UserService",
-  "code": "async deleteUser(id: string): Promise<void> {\n  await this.db.users.delete(id);\n}",
-  "position": "last"
-}
-```
-
-All ops support `validate` (`"syntax"` or `"full"`). Use `aft_safety checkpoint` / `undo` before risky transforms.
 
 ---
 

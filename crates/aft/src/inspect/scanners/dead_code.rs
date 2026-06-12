@@ -11,7 +11,9 @@ use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
-use crate::inspect::job::{is_test_support_file, DISPATCHED_CALLEE_SEPARATOR};
+use crate::inspect::job::{
+    is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
+};
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess,
@@ -228,6 +230,7 @@ fn gather_file_contribution(
                 "file": call.file,
                 "symbol": call.symbol,
                 "line": call.line,
+                "provenance": call.provenance,
             }))
             .collect::<Vec<_>>(),
         "liveness_roots": liveness_roots,
@@ -579,6 +582,7 @@ fn project_internal_call(
         file,
         symbol,
         line: call.line,
+        provenance: call.provenance.clone(),
     })
 }
 
@@ -698,6 +702,7 @@ fn ts_reexport_edges_for_statement(
                 file: target_file,
                 symbol: target_symbol,
                 line,
+                provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
             });
         }
     }
@@ -818,6 +823,7 @@ fn rust_reexport_liveness_edges(
                     file: target_file,
                     symbol: target_symbol,
                     line,
+                    provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
                 });
             }
         }
@@ -865,6 +871,7 @@ fn reexport_edges_for_all_target_symbols(
                 file: target_file,
                 symbol: resolved_symbol,
                 line,
+                provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
             });
         }
     }
@@ -1707,6 +1714,7 @@ struct InternalCall {
     file: String,
     symbol: String,
     line: u32,
+    provenance: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1723,7 +1731,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use crate::config::Config;
-    use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
+    use crate::inspect::job::{CALLGRAPH_PROVENANCE_TREESITTER, DISPATCHED_CALLEE_SEPARATOR};
     use crate::inspect::{CallgraphExport, JobKey};
     use crate::parser::SymbolCache;
 
@@ -1807,6 +1815,7 @@ mod tests {
             caller_symbol: caller_symbol.to_string(),
             target: target.to_string(),
             line: 1,
+            provenance: CALLGRAPH_PROVENANCE_TREESITTER.to_string(),
         }
     }
 

@@ -4,7 +4,7 @@ import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
 
-const DEFAULT_IDLE_TIMEOUT_MS = Infinity; // keep alive as long as the host is running
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // evict idle bridges after 30 minutes
 const DEFAULT_MAX_POOL_SIZE = 8;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // check every minute
 
@@ -238,7 +238,8 @@ export class BridgePool {
   private cleanup(): void {
     const now = Date.now();
     for (const [dir, entry] of this.bridges) {
-      if (entry.bridge.hasPendingRequests()) continue;
+      if (entry.bridge.hasPendingRequests() || entry.bridge.hasOutstandingBackgroundTasks())
+        continue;
       if (now - entry.lastUsed > this.idleTimeoutMs) {
         entry.bridge.shutdown().catch((err) => this.error("cleanup shutdown failed:", err));
         this.bridges.delete(dir);
@@ -246,7 +247,7 @@ export class BridgePool {
     }
 
     for (const bridge of this.staleBridges) {
-      if (bridge.hasPendingRequests()) continue;
+      if (bridge.hasPendingRequests() || bridge.hasOutstandingBackgroundTasks()) continue;
       bridge.shutdown().catch((err) => this.error("stale cleanup shutdown failed:", err));
       this.staleBridges.delete(bridge);
     }
@@ -257,7 +258,8 @@ export class BridgePool {
     let oldestDir: string | null = null;
     let oldestTime = Infinity;
     for (const [dir, entry] of this.bridges) {
-      if (entry.bridge.hasPendingRequests()) continue;
+      if (entry.bridge.hasPendingRequests() || entry.bridge.hasOutstandingBackgroundTasks())
+        continue;
       if (entry.lastUsed < oldestTime) {
         oldestTime = entry.lastUsed;
         oldestDir = dir;

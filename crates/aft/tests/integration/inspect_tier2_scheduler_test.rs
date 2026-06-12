@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::handle_inspect;
 use aft::config::Config;
-use aft::context::AppContext;
+use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
 use aft::inspect::Tier2TriggerReason;
 use aft::parser::TreeSitterProvider;
@@ -50,11 +50,65 @@ fn configured_context(root: &Path) -> AppContext {
         "storage_dir": storage_dir.to_string_lossy(),
         "search_index": false,
         "semantic_search": false,
+        "callgraph_store": true,
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    ensure_callgraph_store_ready(&ctx);
     ctx
+}
+
+fn drain_callgraph_store_for_test(ctx: &AppContext) {
+    let (latest, disconnected) = {
+        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+        let mut latest = None;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(store) => latest = Some(store),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        (latest, disconnected)
+    };
+
+    if let Some(store) = latest {
+        *ctx.callgraph_store().borrow_mut() = Some(store);
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+    } else if disconnected {
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+    }
+}
+
+fn ensure_callgraph_store_ready(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(_) => return,
+            CallgraphStoreAccess::Building => {
+                drain_callgraph_store_for_test(ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for callgraph store cold build"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            CallgraphStoreAccess::Unavailable => {
+                panic!("callgraph store unexpectedly unavailable in test")
+            }
+            CallgraphStoreAccess::Error(error) => {
+                panic!("callgraph store failed in test: {error}")
+            }
+        }
+    }
 }
 
 fn inspect(ctx: &AppContext) -> Value {

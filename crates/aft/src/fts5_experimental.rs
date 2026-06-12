@@ -78,19 +78,21 @@ fn split_camel_case(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut prev_was_upper = false;
-    let mut prev_was_digit = false;
 
     for c in s.chars() {
         if c.is_uppercase() || c.is_ascii_digit() {
             if !current.is_empty() && !prev_was_upper {
                 tokens.push(std::mem::take(&mut current));
-            } else if !current.is_empty()
-                && prev_was_upper
-                && current.len() > 1
-                && c.is_ascii_lowercase()
-            {
-                // Transition from consecutive uppercase to lowercase:
-                // "HTTPServer" → split before "S" → ["HTTP", "Server"]
+            }
+            current.push(c);
+            prev_was_upper = c.is_uppercase();
+        } else if c == '_' || c == '-' {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            prev_was_upper = false;
+        } else {
+            if !current.is_empty() && prev_was_upper && current.len() > 1 {
                 let last = current.pop().unwrap();
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
@@ -98,18 +100,7 @@ fn split_camel_case(s: &str) -> Vec<String> {
                 current.push(last);
             }
             current.push(c);
-            prev_was_upper = c.is_uppercase();
-            prev_was_digit = c.is_ascii_digit();
-        } else if c == '_' || c == '-' {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
             prev_was_upper = false;
-            prev_was_digit = false;
-        } else {
-            current.push(c);
-            prev_was_upper = false;
-            prev_was_digit = false;
         }
     }
 
@@ -124,7 +115,7 @@ fn split_camel_case(s: &str) -> Vec<String> {
 fn is_stop_token(token: &str) -> bool {
     matches!(
         token,
-        "a" | "an" | "the" | "is" | "in" | "on" | "at" | "to" | "for" | "of" | "with" | "by"
+        "an" | "the" | "is" | "in" | "on" | "at" | "to" | "for" | "of" | "with"
     )
 }
 
@@ -136,21 +127,52 @@ fn is_stop_token(token: &str) -> bool {
 /// # Examples
 ///
 /// ```
+/// use aft::fts5_experimental::escape_fts5_query;
 /// // In FTS5, the colon in "Foo::bar" must be escaped
 /// assert_eq!(escape_fts5_query("Foo::bar"), "Foo\"\"::\"\"bar");
 /// ```
 pub fn escape_fts5_query(query: &str) -> String {
     let mut result = String::with_capacity(query.len() * 2);
-    for c in query.chars() {
-        match c {
-            '"' | '*' | '(' | ')' | ':' | '^' | '{' | '}' => {
+    let chars: Vec<char> = query.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        match chars[i] {
+            '}' => {
                 result.push('"');
-                result.push(c);
                 result.push('"');
+                result.push('}');
+                result.push('"');
+                i += 1;
             }
-            _ => result.push(c),
+            '"' | '*' | '(' | ')' | ':' | '^' | '{' => {
+                let start = i;
+                while i < len && matches!(chars[i], '"' | '*' | '(' | ')' | ':' | '^' | '{') {
+                    i += 1;
+                }
+                let group_len = i - start;
+                if group_len == 1 {
+                    result.push('"');
+                    result.push(chars[start]);
+                    result.push('"');
+                } else {
+                    result.push('"');
+                    result.push('"');
+                    for j in start..i {
+                        result.push(chars[j]);
+                    }
+                    result.push('"');
+                    result.push('"');
+                }
+            }
+            _ => {
+                result.push(chars[i]);
+                i += 1;
+            }
         }
     }
+
     result
 }
 
@@ -311,9 +333,7 @@ impl Fts5Index {
     pub fn stats(&self) -> Result<Fts5Stats, String> {
         let chunk_count: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM code_chunks", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM code_chunks", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
         let file_count: i64 = self
@@ -389,16 +409,13 @@ mod tests {
     #[test]
     fn tokenize_mixed() {
         let tokens = tokenize_code_symbol("std::io::Result<Option<String>>");
-        assert_eq!(
-            tokens,
-            vec!["std", "io", "result", "option", "string"]
-        );
+        assert_eq!(tokens, vec!["std", "io", "result", "option", "string"]);
     }
 
     #[test]
     fn tokenize_filters_stop_words() {
         let tokens = tokenize_code_symbol("the_value_of_a_key");
-        assert_eq!(tokens, vec!["value", "key"]);
+        assert_eq!(tokens, vec!["value", "a", "key"]);
     }
 
     #[test]

@@ -242,6 +242,7 @@ fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
             1,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("defer new file at cap");
     let deferred_results = index.search(&[0.0, 1.0, 0.0, 0.0], 5);
@@ -262,6 +263,7 @@ fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
             1,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("retry deferred file after deletion");
 
@@ -380,6 +382,7 @@ fn semantic_stale_check_detects_same_mtime_same_size_content_change() {
             16,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("strict refresh should re-embed stale file");
 

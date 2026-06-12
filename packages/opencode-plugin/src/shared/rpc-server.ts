@@ -1,9 +1,16 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { log, warn } from "../logger";
-import { rpcPortFileDir } from "./rpc-utils";
+import { isPidAlive, parseRpcPortRecord, rpcPortFileDir } from "./rpc-utils";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -68,6 +75,13 @@ export class AftRpcServer {
           );
           renameSync(tmpPath, this.portFilePath);
           log(`RPC server listening on 127.0.0.1:${this.port}`);
+          // Hygiene: sweep dead siblings while we're here. The client only
+          // reclaims dead-pid files on a cold port scan, and it caches the
+          // first warm port afterwards — so crash/restart leftovers piled up
+          // (dozens of dead files per project hash were observed). Server
+          // startup is the natural sweep point: it runs once per instance and
+          // already owns this directory.
+          this.sweepDeadPortFiles();
         } catch (err) {
           warn(`Failed to write RPC port file: ${err}`);
         }
@@ -78,6 +92,41 @@ export class AftRpcServer {
       // Don't keep the process alive just for the RPC server
       server.unref();
     });
+  }
+
+  /**
+   * Remove sibling port files whose owning process is provably dead.
+   * Only files with a recorded pid that no longer maps to a live process are
+   * removed; pid-less (legacy) files and live entries are left untouched.
+   * Never touches our own freshly written file.
+   */
+  private sweepDeadPortFiles(): void {
+    let entries: string[];
+    try {
+      entries = readdirSync(this.portsDir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const filePath = join(this.portsDir, entry);
+      if (filePath === this.portFilePath) continue;
+      try {
+        const record = parseRpcPortRecord(readFileSync(filePath, "utf-8"));
+        // Unparsable file: stale tmp/corrupt leftover — remove. Parsable but
+        // pid-less (legacy): keep, we cannot prove the owner is dead.
+        if (record === null) {
+          unlinkSync(filePath);
+          continue;
+        }
+        if (record.pid !== undefined && !isPidAlive(record.pid)) {
+          unlinkSync(filePath);
+        }
+      } catch {
+        // Racing another instance's sweep or hitting a permission issue is
+        // fine — the file will be retried on the next server start.
+      }
+    }
   }
 
   /** Stop the server and clean up port file. */

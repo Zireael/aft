@@ -35,40 +35,14 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
-const SemanticBackendEnum = z.enum([
-  "fastembed",
-  "openai_compatible",
-  "ollama",
-  "perplexity",
-  "model2vec",
-]);
+/** How configure-time missing-tool warnings reach the user. Default: toast (no chat transcript). */
+export const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
+export type ConfigureWarningsDelivery = z.infer<typeof ConfigureWarningsDeliveryEnum>;
 
-/** Output encoding mode for embeddings. Accepts legacy aliases for backward compatibility. */
-const SemanticOutputEncodingEnum = z.preprocess(
-  (val) => {
-    // Backward-compat: old enum values mapped to their replacements.
-    const legacyMap: Record<string, string> = {
-      binary: "base64_binary",
-      ubinary: "base64_binary",
-      int8: "base64_int8",
-      uint8: "base64_int8",
-    };
-    return typeof val === "string" && val in legacyMap ? legacyMap[val] : val;
-  },
-  z.enum(["float", "base64_int8", "base64_binary"]),
-);
-
-/** Storage strategy for embedding vectors. */
-const SemanticStorageStrategyEnum = z.enum(["native_f32", "decode_normalize_f32", "binary_packed"]);
-
-/** Input mode for document chunking before embedding. */
-const SemanticInputModeEnum = z.enum(["flat_texts", "document_chunks"]);
-
-/** Distance metric for similarity search. */
-const SemanticDistanceMetricEnum = z.enum(["auto", "cosine", "dot_product", "euclidean", "hamming"]);
+const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama", "model2vec", "perplexity"]);
 
 const SemanticConfigSchema = z.object({
-  /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
+  /** Semantic backend type: local fastembed, OpenAI-compatible API, Ollama, model2vec, or Perplexity. */
   backend: SemanticBackendEnum.optional(),
   /** Model identifier passed to the selected semantic backend. */
   model: z.string().trim().min(1).optional(),
@@ -80,73 +54,46 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
-  /** Output encoding for embedding vectors: "float" (default), "base64_int8", or "base64_binary". */
-  output_encoding: SemanticOutputEncodingEnum.optional(),
-  /** Storage strategy: "native_f32" (default), "decode_normalize_f32", or "binary_packed". */
-  storage_strategy: SemanticStorageStrategyEnum.optional(),
-  /** Input mode for document processing: "flat_texts" (default) or "document_chunks". */
-  input_mode: SemanticInputModeEnum.optional(),
-  /** Embedding dimension count (for providers that support variable dimensions). */
-  dimensions: z.number().int().positive().optional(),
-  /** Distance metric: "auto" (default), "cosine", "dot_product", "euclidean", or "hamming". */
-  distance_metric: SemanticDistanceMetricEnum.optional(),
-  /** Optional query prompt template (applied before embedding queries). */
-  query_prompt_template: z.string().optional(),
-  /** Optional document prompt template (applied before embedding documents). */
-  document_prompt_template: z.string().optional(),
+  /** Maximum number of project files to semantically index (default 20000). */
+  max_files: z.number().int().positive().optional(),
+  /** Enable optional reranking via an OpenAI-compatible endpoint (default: false). */
+  rerank_enabled: z.boolean().optional(),
+  /** Override model for reranking. Defaults to codellama/codellama:7b-instruct if unset. */
+  rerank_model: z.string().optional(),
+  /** Base URL for reranker endpoint. Falls back to base_url if unset. */
+  rerank_base_url: z.string().optional(),
+  /** Env var name for reranker API key. Falls back to api_key_env if unset. */
+  rerank_api_key_env: z.string().optional(),
+  /** Timeout in ms for reranker requests (default: 15000). */
+  rerank_timeout_ms: z.number().optional(),
+  /** Max number of candidates to send to the reranker per query (default: 20). */
+  rerank_max_candidates: z.number().optional(),
+  /** Max characters per candidate snippet sent to reranker (default: 2500). */
+  rerank_max_candidate_chars: z.number().optional(),
+  /** Reranker API format: "chat" for LLM-based (default), "rerank" for cross-encoder. */
+  rerank_api_type: z.enum(["chat", "rerank"]).optional(),
+  /** Max chars per candidate for cross-encoder rerankers (default: 512). */
+  rerank_max_candidate_chars_cross_encoder: z.number().optional(),
+  /** Optional override for the reranker prompt template. Use {query} and {candidates}. */
+  rerank_prompt_template: z.string().optional(),
   /** Enable per-query search diagnostics collection (default: false). */
   diagnostics_enabled: z.boolean().optional(),
-  /** Score threshold below which results are flagged as low-confidence (default: 0.3). */
-  low_confidence_threshold: z.number().optional(),
-  /** Number of recent queries to retain for aggregate metrics (default: 100). */
-  metrics_window_size: z.number().int().positive().optional(),
-  /** Write per-query diagnostics as JSONL to a local file (default: false). */
-  jsonl_logging: z.boolean().optional(),
-  /** Override path for the JSONL diagnostics log. */
-  jsonl_path: z.string().optional(),
-  /** Include the raw query text in JSONL diagnostics (default: false). */
-  include_raw_queries: z.boolean().optional(),
-  /** Include code snippets in JSONL diagnostics (default: false). */
-  include_snippets: z.boolean().optional(),
-  /** Number of days to retain JSONL diagnostics before cleanup (default: 14). */
-  retention_days: z.number().int().positive().optional(),
-  /** Diagnostic detail level in tool output: "off", "minimal" (default), or "verbose". */
+  /** How much diagnostic detail to include in tool output: "off", "minimal", "verbose". */
   output_mode: z.enum(["off", "minimal", "verbose"]).optional(),
-  /** Enable optional reranking via an OpenAI-compatible chat endpoint (default: false). */
-  rerank_enabled: z.boolean().optional(),
-  /** Override model for reranking. Falls back to a default instruct model if unset. */
-  rerank_model: z.string().trim().min(1).optional(),
-  /** Base URL for reranker (OpenAI-compatible /v1/chat/completions endpoint). */
-  rerank_base_url: z.string().trim().min(1).optional(),
-  /** Env var name for reranker API key. Falls back to api_key_env if unset. */
-  rerank_api_key_env: z.string().trim().min(1).optional(),
-  /** Reranker request timeout in milliseconds (default: 15000). */
-  rerank_timeout_ms: z.number().int().positive().optional(),
-  /** Maximum candidate count passed to the reranker (default: 20). */
-  rerank_max_candidates: z.number().int().positive().optional(),
-  /** Maximum characters per candidate text sent to the reranker (default: 2500). */
-  rerank_max_candidate_chars: z.number().int().positive().optional(),
-  /** Reranker API format: "chat" for LLM-based chat completions (default), "rerank" for cross-encoder /v1/rerank endpoints. */
-  rerank_api_type: z.enum(["chat", "rerank"]).optional(),
-  /** Max characters per candidate snippet for cross-encoder rerankers (default: 512). Cross-encoders have tighter context windows. */
-  rerank_max_candidate_chars_cross_encoder: z.number().int().positive().optional(),
-  /** Optional reranker prompt template. Use {query} and {candidates} as placeholders. When omitted, the built-in prompt is used. */
-  rerank_prompt_template: z.string().optional(),
-  /** When true (default), AFT auto-detects the embedding model and applies built-in query/document prefixes for known models (E5, CodeRankEmbed, BGE). Set false to disable. */
+  /** Optional template applied to user queries before embedding. Use {query} placeholder. */
+  query_prompt_template: z.string().optional(),
+  /** Optional template applied to document/chunk text before embedding. Use {text} placeholder. */
+  document_prompt_template: z.string().optional(),
+  /** Auto-detect embedding model and apply built-in prefixes (default: true). */
   use_model_profiles: z.boolean().optional(),
-  /** Local filesystem path to a model2vec model directory (USER-ONLY, trust boundary). */
-  model_path: z.string().optional(),
-  /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */
-  model2vec_max_length: z.number().int().positive().optional(),
-  /** Maximum results per file after hybrid fusion (default: 2). Prevents a single dense module from dominating. */
-  max_results_per_file: z.number().int().positive().optional(),
-  /** Max tokens per embedding request for remote backends (default: 512). When a symbol exceeds this, it is chunked before embedding. Set to 0 to disable. */
-  max_embed_tokens: z.number().int().nonnegative().optional(),
-  /** Number of overlapping tokens between chunks when splitting large symbols (default: 100). Overlap preserves boundary context. */
-  chunk_overlap_tokens: z.number().int().nonnegative().optional(),
-  /** Maximum number of project files to semantically index (default: 20000). Guards memory on huge project roots. */
-  max_files: z.number().int().positive().optional(),
+  /** Maximum results returned per file after hybrid fusion (default: 2). */
+  max_results_per_file: z.number().optional(),
+  /** Max tokens per embedding request for remote backends (default: 512). */
+  max_embed_tokens: z.number().optional(),
+  /** Overlapping tokens between chunks when splitting large symbols (default: 100). */
+  chunk_overlap_tokens: z.number().optional(),
 });
+
 const LspExtensionSchema = z
   .string()
   .trim()
@@ -156,8 +103,11 @@ const LspExtensionSchema = z
   });
 
 const LspServerEntrySchema = z.object({
-  extensions: z.array(LspExtensionSchema).min(1),
-  binary: z.string().trim().min(1),
+  // Optional: when overriding a built-in server (e.g. `rust`) to tweak one
+  // field, AFT inherits the built-in's extensions/binary. Requiring them here
+  // silently dropped the whole `lsp` section on a partial override.
+  extensions: z.array(LspExtensionSchema).min(1).optional(),
+  binary: z.string().trim().min(1).optional(),
   args: z.array(z.string()).optional().default([]),
   root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
   disabled: z.boolean().optional().default(false),
@@ -175,6 +125,12 @@ const LspConfigSchema = z.object({
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
+  /**
+   * Restore legacy edit behavior by waiting for inline LSP diagnostics on every
+   * edit/write/apply_patch call unless the tool call overrides diagnostics.
+   * Default: false.
+   */
+  diagnostics_on_edit: z.boolean().optional(),
   /**
    * Auto-install npm-distributed and GitHub-release language servers when
    * the project needs them. Default: true. Set false to require manual
@@ -247,9 +203,39 @@ const BashFeaturesSchema = z.object({
   subagent_background: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
+  /**
+   * How long foreground bash blocks before auto-promoting the task to
+   * background. Default 8000ms; values below the 5000ms floor are clamped up.
+   */
+  foreground_wait_window_ms: z.number().int().positive().optional(),
 });
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
+
+const InspectConfigSchema = z.object({
+  /** Master switch for the aft_inspect tool. Defaults to true. */
+  enabled: z.boolean().optional(),
+  /** OpenCode session.idle delay before Tier 2 inspect prewarm. Default: 4 minutes. */
+  tier2_idle_minutes: z.number().min(0).optional(),
+  categories: z.record(z.string(), z.boolean()).optional(),
+  tier2_soft_deadline_ms: z.number().int().positive().optional(),
+  max_drill_down_items: z.number().int().positive().max(100).optional(),
+  duplicates: z
+    .object({
+      lower_bound: z.number().int().positive().optional(),
+      discard_cost: z.number().int().min(0).optional(),
+      anonymize: z
+        .object({
+          variables: z.boolean().optional(),
+          fields: z.boolean().optional(),
+          methods: z.boolean().optional(),
+          types: z.boolean().optional(),
+          literals: z.boolean().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
 
 export const AftConfigSchema = z
   .object({
@@ -275,6 +261,16 @@ export const AftConfigSchema = z
     /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
     checker: z.record(z.string(), CheckerEnum).optional(),
     /**
+     * How missing formatter/checker/LSP warnings are shown after configure.
+     * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
+     * - `log`: plugin log only
+     * - `chat`: legacy ignored user messages in the session transcript
+     *
+     * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
+     * `checker` instead.
+     */
+    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+    /**
      * Replace opencode's built-in read/write/edit/apply_patch tools with AFT's
      * faster Rust implementations. Adds backup tracking, auto-formatting,
      * inline diagnostics, and permission checks. Default: true.
@@ -283,15 +279,15 @@ export const AftConfigSchema = z
     /**
      * Tool surface level. Controls which tools are registered:
      * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
-     * - "recommended": minimal + hoisted read/write/edit/apply_patch + lsp_diagnostics
+     * - "recommended": minimal + hoisted read/write/edit/apply_patch
      *                  + ast_grep_search/replace + aft_import (default)
-     * - "all":         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
+     * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
      */
     tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
     /**
      * List of tool names to disable. Disabled tools are not registered with
      * OpenCode and will be invisible to agents. Use exact tool names, e.g.
-     * ["aft_navigate", "aft_refactor"]. Hoisted names ("read", "edit") and
+     * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
      * aft-prefixed names both work. Applied after tool_surface filtering.
      */
     disabled_tools: z.array(z.string()).optional(),
@@ -305,6 +301,8 @@ export const AftConfigSchema = z
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
     semantic_search: z.boolean().optional(),
+    /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+    inspect: InspectConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
      * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -328,7 +326,7 @@ export const AftConfigSchema = z
     semantic: SemanticConfigSchema.optional(),
     /**
      * Maximum source files allowed for call-graph operations (callers, trace_to,
-     * trace_data, impact). Projects above this size return `project_too_large`
+     * trace_to_symbol, trace_data, impact). Projects above this size return `project_too_large`
      * instead of attempting the reverse-index build. Does not affect grep,
      * glob, read, edit, or any other tool. Default: 5000.
      */
@@ -344,8 +342,10 @@ export type LspServerConfig = z.infer<typeof LspServerSchema>;
 
 export interface ConfigureLspServer {
   id: string;
-  extensions: string[];
-  binary: string;
+  /** Omitted when overriding a built-in server to inherit its extensions. */
+  extensions?: string[];
+  /** Omitted when overriding a built-in server to inherit its binary. */
+  binary?: string;
   args: string[];
   root_markers: string[];
   disabled: boolean;
@@ -400,12 +400,16 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
     const entry: ConfigureLspServer = {
       id,
-      extensions: server.extensions.map(normalizeLspExtension),
-      binary: server.binary,
       args: server.args,
       root_markers: server.root_markers,
       disabled: server.disabled,
     };
+    if (server.extensions && server.extensions.length > 0) {
+      entry.extensions = server.extensions.map(normalizeLspExtension);
+    }
+    if (server.binary) {
+      entry.binary = server.binary;
+    }
     if (server.env && Object.keys(server.env).length > 0) {
       entry.env = server.env;
     }
@@ -467,6 +471,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.max_callgraph_files !== undefined)
     overrides.max_callgraph_files = config.max_callgraph_files;
 
@@ -493,7 +498,17 @@ export interface ResolvedBashConfig {
   subagent_background: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
+  /**
+   * Foreground poll window before auto-promotion to background, in ms.
+   * Always resolved: defaults to 8000, floored at 5000.
+   */
+  foreground_wait_window_ms: number;
 }
+
+/** Default foreground wait-window before auto-promotion (ms). */
+export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 8_000;
+/** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
+export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
 
 /**
  * Single source of truth for bash config across the plugin. Resolution
@@ -536,6 +551,15 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const topSubagentBg =
     typeof top === "object" && top !== null ? top.subagent_background === true : false;
 
+  // Foreground wait-window: only the object form can set it; clamp to the
+  // 5000ms floor and default to 8000ms when unset.
+  const rawForegroundWait =
+    typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
+  const foregroundWaitWindowMs = Math.max(
+    FOREGROUND_WAIT_WINDOW_MIN_MS,
+    rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
+  );
+
   const base: ResolvedBashConfig = {
     enabled: false,
     rewrite: false,
@@ -544,6 +568,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     subagent_background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
+    foreground_wait_window_ms: foregroundWaitWindowMs,
   };
 
   // Top-level wins over legacy when both are present.
@@ -957,6 +982,11 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     const content = readFileSync(configPath, "utf-8");
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     migrateRawConfig(rawConfig, configPath, { log, warn });
+    // comment-json attaches Symbol(before/after:<key>) props to track comments.
+    // Zod stringifies keys when building error paths, which throws on those
+    // symbols and would silently drop the whole config to defaults (issue #88).
+    // Validate against a symbol-free deep copy; the migration disk-write path
+    // above still uses the symbol-bearing object so comments survive.
     const cleanConfig = stripJsoncSymbols(rawConfig);
     const result = AftConfigSchema.safeParse(cleanConfig);
 
@@ -993,6 +1023,8 @@ function mergeSemanticConfig(
       projectSemantic.timeout_ms = overrideSemantic.timeout_ms;
     if (overrideSemantic.max_batch_size !== undefined)
       projectSemantic.max_batch_size = overrideSemantic.max_batch_size;
+    if (overrideSemantic.max_files !== undefined)
+      projectSemantic.max_files = overrideSemantic.max_files;
   }
 
   const semantic = {
@@ -1024,10 +1056,14 @@ function mergeLspConfig(
   // relies on, suppressing diagnostics for its own malicious code
   // (audit v0.17 #5).
   //
-  // SAFE project-level fields: `python` (per-language preference, no
-  //   executable origin) and (none right now).
+  // SAFE project-level fields:
+  //   - `python` (per-language preference, no executable origin)
+  //   - `diagnostics_on_edit` (agent workflow/latency preference only)
   const projectLsp: AftConfig["lsp"] = {};
   if (overrideLsp?.python !== undefined) projectLsp.python = overrideLsp.python;
+  if (overrideLsp?.diagnostics_on_edit !== undefined) {
+    projectLsp.diagnostics_on_edit = overrideLsp.diagnostics_on_edit;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = baseLsp?.disabled ?? [];
@@ -1045,6 +1081,40 @@ function mergeLspConfig(
   return Object.fromEntries(
     Object.entries(lsp).filter(([, value]) => value !== undefined),
   ) as AftConfig["lsp"];
+}
+
+function mergeInspectConfig(
+  baseInspect: AftConfig["inspect"],
+  overrideInspect: AftConfig["inspect"],
+): AftConfig["inspect"] {
+  const inspect = {
+    ...baseInspect,
+    ...overrideInspect,
+    duplicates:
+      baseInspect?.duplicates || overrideInspect?.duplicates
+        ? {
+            ...baseInspect?.duplicates,
+            ...overrideInspect?.duplicates,
+            anonymize:
+              baseInspect?.duplicates?.anonymize || overrideInspect?.duplicates?.anonymize
+                ? {
+                    ...baseInspect?.duplicates?.anonymize,
+                    ...overrideInspect?.duplicates?.anonymize,
+                  }
+                : undefined,
+          }
+        : undefined,
+  };
+
+  if (inspect.duplicates && inspect.duplicates.anonymize === undefined) {
+    delete inspect.duplicates.anonymize;
+  }
+  if (Object.values(inspect).every((value) => value === undefined)) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(inspect).filter(([, value]) => value !== undefined),
+  ) as AftConfig["inspect"];
 }
 
 /**
@@ -1124,35 +1194,8 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
 }
 
 /**
- * Semantic config fields that are USER-ONLY (security boundary).
- * These fields control remote endpoints, vector storage, and prompt behavior —
- * a hostile project config could weaponize any of them.
+ * Top-level fields that are SAFE to inherit from project config.
  *
- * Returns a comma-separated list of the offending field names found in `semantic`,
- * so the caller can generate a warning. Empty string means no restricted fields.
- */
-function getStrippedSemanticKeys(semantic: AftConfig["semantic"]): string {
-  if (!semantic) return "";
-  const stripped: string[] = [];
-  if (semantic.backend !== undefined) stripped.push("backend");
-  if (semantic.base_url !== undefined) stripped.push("base_url");
-  if (semantic.api_key_env !== undefined) stripped.push("api_key_env");
-  if (semantic.output_encoding !== undefined) stripped.push("output_encoding");
-  if (semantic.storage_strategy !== undefined) stripped.push("storage_strategy");
-  if (semantic.input_mode !== undefined) stripped.push("input_mode");
-  if (semantic.dimensions !== undefined) stripped.push("dimensions");
-  if (semantic.distance_metric !== undefined) stripped.push("distance_metric");
-  if (semantic.query_prompt_template !== undefined) stripped.push("query_prompt_template");
-  if (semantic.document_prompt_template !== undefined) stripped.push("document_prompt_template");
-  if (semantic.model_path !== undefined) stripped.push("model_path");
-  if (semantic.model2vec_max_length !== undefined) stripped.push("model2vec_max_length");
-  if (semantic.rerank_base_url !== undefined) stripped.push("rerank_base_url");
-  if (semantic.rerank_api_key_env !== undefined) stripped.push("rerank_api_key_env");
-  return stripped.join(", ");
-}
-
-/**
- * Top-level fields that are SAFE to inherit from project config. *
  * Anything NOT in this list flows from user config only. This is the
  * strict-allowlist trust boundary — adding a new field requires explicit
  * security review of whether a hostile repo could weaponize it.
@@ -1169,10 +1212,12 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "hoist_builtin_tools",
   "format_on_edit",
   "validate_on_edit",
+  "configure_warnings_delivery",
   // Experimental flags: project-settable so users can enable globally
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in
@@ -1183,6 +1228,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
+  // "inspect" handled separately — deep-merged.
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "storage_dir" — USER ONLY (controls where AFT writes).
@@ -1222,6 +1268,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
+  const inspect = mergeInspectConfig(base.inspect, override.inspect);
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
   // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
@@ -1230,6 +1277,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // would wipe out user's `bash: { rewrite: true }`.
   const safeOverride = pickProjectSafeFields(override);
   delete safeOverride.bash;
+  delete safeOverride.inspect;
 
   return {
     ...base,
@@ -1239,6 +1287,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
+    ...(inspect !== undefined ? { inspect } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
@@ -1301,10 +1350,13 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   // Override with project config
   const projectConfig = loadConfigFromPath(projectConfigPath);
   if (projectConfig) {
-    const strippedSemanticKeys = getStrippedSemanticKeys(projectConfig.semantic);
-    if (strippedSemanticKeys) {
+    if (
+      projectConfig.semantic?.backend !== undefined ||
+      projectConfig.semantic?.base_url !== undefined ||
+      projectConfig.semantic?.api_key_env !== undefined
+    ) {
       warn(
-        `Ignoring semantic.${strippedSemanticKeys} from project config (security: these semantic settings only honor user-level config)`,
+        "Ignoring semantic.backend/base_url/api_key_env from project config (security: use user config for external backends)",
       );
     }
     const strippedLspKeys = getProjectLspStrippedKeys(projectConfig.lsp);

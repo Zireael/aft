@@ -352,9 +352,9 @@ pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
         paths.pty.clone(),
     ];
     if let Some(stem) = paths.json.file_stem().and_then(|stem| stem.to_str()) {
-        // Windows background bash writes per-task wrapper scripts next to the
+        // Background bash writes per-task wrapper/command scripts next to the
         // capture files as `<task-id>.ps1`, `<task-id>.bat`, or `<task-id>.sh`
-        // depending on the shell selected in `detached_shell_command_for`.
+        // depending on platform and shell selection.
         for extension in ["ps1", "bat", "sh"] {
             files.push(paths.dir.join(format!("{stem}.{extension}")));
         }

@@ -17,7 +17,6 @@ import { registerNavigateTool } from "../tools/navigate.js";
 import { registerReadingTools } from "../tools/reading.js";
 import { registerRefactorTool } from "../tools/refactor.js";
 import { registerSafetyTool } from "../tools/safety.js";
-import { registerStructureTool } from "../tools/structure.js";
 import type { PluginContext } from "../types.js";
 import {
   executeTool,
@@ -77,18 +76,6 @@ describe("AFT external-directory permissions", () => {
         toolName: "aft_safety",
         params: { op: "undo", filePath: "/outside/safety.ts" },
         command: "undo",
-        action: "modify",
-      },
-      {
-        label: "aft_transform",
-        toolName: "aft_transform",
-        params: {
-          op: "add_member",
-          filePath: "/outside/structure.ts",
-          container: "Service",
-          code: "value = 1;",
-        },
-        command: "add_member",
         action: "modify",
       },
       {
@@ -173,7 +160,6 @@ describe("AFT external-directory permissions", () => {
       if (entry.label === "aft_import") registerImportTools(api, restrictedContext(bridge));
       if (entry.label === "aft_refactor") registerRefactorTool(api, restrictedContext(bridge));
       if (entry.label === "aft_safety undo") registerSafetyTool(api, restrictedContext(bridge));
-      if (entry.label === "aft_transform") registerStructureTool(api, restrictedContext(bridge));
       if (entry.label === "ast_grep_search") {
         registerAstTools(api, restrictedContext(bridge), { astSearch: true, astReplace: false });
       }
@@ -398,7 +384,6 @@ describe("AFT external-directory permissions", () => {
     const refactorDestination = homePath("refactor-destination.ts");
     const safetyUndoFile = homePath("safety-undo.ts");
     const safetyCheckpointFile = homePath("safety-checkpoint.ts");
-    const transformFile = homePath("structure.ts");
     const astSearchPath = homePath("ast-search");
     const astReplacePath = homePath("ast-replace");
     const deleteFile = homePath("delete.ts");
@@ -457,20 +442,6 @@ describe("AFT external-directory permissions", () => {
         action: "modify",
         promptPaths: [safetyCheckpointFile.resolved],
         expectedParams: { files: [safetyCheckpointFile.resolved] },
-      },
-      {
-        label: "aft_transform",
-        toolName: "aft_transform",
-        params: {
-          op: "add_member",
-          filePath: transformFile.input,
-          container: "Service",
-          code: "value = 1;",
-        },
-        command: "add_member",
-        action: "modify",
-        promptPaths: [transformFile.resolved],
-        expectedParams: { file: transformFile.resolved },
       },
       {
         label: "ast_grep_search",
@@ -542,7 +513,6 @@ describe("AFT external-directory permissions", () => {
       if (entry.label === "aft_safety undo" || entry.label === "aft_safety checkpoint") {
         registerSafetyTool(api, restrictedContext(bridge));
       }
-      if (entry.label === "aft_transform") registerStructureTool(api, restrictedContext(bridge));
       if (entry.label === "ast_grep_search") {
         registerAstTools(api, restrictedContext(bridge), { astSearch: true, astReplace: false });
       }

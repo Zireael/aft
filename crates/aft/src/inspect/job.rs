@@ -342,6 +342,12 @@ pub struct CallgraphExport {
 }
 
 pub(crate) const DISPATCHED_CALLEE_SEPARATOR: char = '\u{1f}';
+pub(crate) const CALLGRAPH_PROVENANCE_TREESITTER: &str = "treesitter";
+pub(crate) const CALLGRAPH_PROVENANCE_REEXPORT: &str = "reexport";
+
+fn default_callgraph_outbound_provenance() -> String {
+    CALLGRAPH_PROVENANCE_TREESITTER.to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallgraphOutboundCall {
@@ -349,6 +355,8 @@ pub struct CallgraphOutboundCall {
     pub caller_symbol: String,
     pub target: String,
     pub line: u32,
+    #[serde(default = "default_callgraph_outbound_provenance")]
+    pub provenance: String,
 }
 
 #[derive(Debug, Clone)]
