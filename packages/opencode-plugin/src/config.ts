@@ -130,6 +130,8 @@ const SemanticConfigSchema = z.object({
   rerank_api_type: z.enum(["chat", "rerank"]).optional(),
   /** Max characters per candidate snippet for cross-encoder rerankers (default: 512). Cross-encoders have tighter context windows. */
   rerank_max_candidate_chars_cross_encoder: z.number().int().positive().optional(),
+  /** Optional reranker prompt template. Use {query} and {candidates} as placeholders. When omitted, the built-in prompt is used. */
+  rerank_prompt_template: z.string().optional(),
   /** Local filesystem path to a model2vec model directory (USER-ONLY, trust boundary). */
   model_path: z.string().optional(),
   /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */

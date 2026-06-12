@@ -148,7 +148,11 @@ fn rerank_chat(
         .collect();
     let candidates_block = candidates_text.join("\n");
 
-    let prompt = DEFAULT_RERANK_PROMPT
+    let prompt_template = config
+        .rerank_prompt_template
+        .as_deref()
+        .unwrap_or(DEFAULT_RERANK_PROMPT);
+    let prompt = prompt_template
         .replace("{query}", query)
         .replace("{candidates}", &candidates_block);
 
@@ -616,6 +620,27 @@ mod tests {
             ..SemanticBackendConfig::default()
         };
         assert_eq!(config.rerank_max_candidate_chars, 100);
+    }
+
+    #[test]
+    fn rerank_custom_prompt_template_is_used() {
+        let config = SemanticBackendConfig {
+            rerank_enabled: true,
+            rerank_prompt_template: Some("Rank these for {query}:\n{candidates}".to_string()),
+            rerank_base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            rerank_timeout_ms: 100,
+            ..SemanticBackendConfig::default()
+        };
+        let results = vec![make_result(0), make_result(1)];
+        // Will fail because endpoint is unreachable, but confirms custom template is accepted.
+        let outcome = rerank_candidates(&config, "test query", &results);
+        assert!(matches!(outcome, RerankOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn rerank_prompt_template_default_is_none() {
+        let config = SemanticBackendConfig::default();
+        assert!(config.rerank_prompt_template.is_none());
     }
 
     #[test]

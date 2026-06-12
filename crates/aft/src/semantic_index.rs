@@ -3308,13 +3308,16 @@ impl SemanticIndex {
     /// Build the semantic index using a contextualized document-chunk embedding
     /// function. Groups chunks by source document so the embedding provider can
     /// use surrounding chunks as context.
+    ///
+    /// Returns the built index and contextualized build diagnostics (split
+    /// counts, retry counts, failure counts) so the caller can surface them.
     pub fn build_with_progress_contextualized<F, P>(
         project_root: &Path,
         files: &[PathBuf],
         embed_fn: &mut F,
         progress: &mut P,
         file_policy: &SemanticFilePolicy,
-    ) -> Result<Self, String>
+    ) -> Result<(Self, ContextualizedBuildDiagnostics), String>
     where
         F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
         P: FnMut(usize, usize),
@@ -3326,24 +3329,27 @@ impl SemanticIndex {
         progress(0, total_chunks);
 
         if chunks.is_empty() {
-            return Ok(Self {
-                snapshot: Arc::new(SemanticIndexSnapshot {
-                    store: crate::vector_store::FlatF32VectorStore::from_parts(
-                        Vec::new(),
-                        DEFAULT_DIMENSION,
-                        file_metadata,
-                    ),
-                    dimension: DEFAULT_DIMENSION,
-                    project_root: project_root.to_path_buf(),
-                    file_manifest: HashMap::new(),
-                    next_chunk_id: 0,
-                    fingerprint_string: None,
-                }),
-                lifecycle: SemanticIndexLifecycle::Ready,
-                last_error: None,
-                fingerprint: None,
-                deferred_files: HashSet::new(),
-            });
+            return Ok((
+                Self {
+                    snapshot: Arc::new(SemanticIndexSnapshot {
+                        store: crate::vector_store::FlatF32VectorStore::from_parts(
+                            Vec::new(),
+                            DEFAULT_DIMENSION,
+                            file_metadata,
+                        ),
+                        dimension: DEFAULT_DIMENSION,
+                        project_root: project_root.to_path_buf(),
+                        file_manifest: HashMap::new(),
+                        next_chunk_id: 0,
+                        fingerprint_string: None,
+                    }),
+                    lifecycle: SemanticIndexLifecycle::Ready,
+                    last_error: None,
+                    fingerprint: None,
+                    deferred_files: HashSet::new(),
+                },
+                ContextualizedBuildDiagnostics::default(),
+            ));
         }
 
         // Group chunks by file path using BTreeMap for deterministic ordering
@@ -3501,13 +3507,16 @@ impl SemanticIndex {
             fingerprint_string: None,
         };
         new_snapshot.build_manifest_from_store();
-        Ok(Self {
-            snapshot: Arc::new(new_snapshot),
-            lifecycle: SemanticIndexLifecycle::Ready,
-            last_error: None,
-            fingerprint: None,
-            deferred_files: HashSet::new(),
-        })
+        Ok((
+            Self {
+                snapshot: Arc::new(new_snapshot),
+                lifecycle: SemanticIndexLifecycle::Ready,
+                last_error: None,
+                fingerprint: None,
+                deferred_files: HashSet::new(),
+            },
+            diagnostics,
+        ))
     }
 
     /// Incrementally refresh entries for changed/new files only, preserving cached
@@ -6515,6 +6524,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -6619,6 +6629,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -6695,6 +6706,7 @@ mod tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8016,6 +8028,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8090,6 +8103,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8143,6 +8157,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8202,6 +8217,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8264,6 +8280,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -8319,6 +8336,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -9426,7 +9444,7 @@ mod fingerprint_invalidation_tests {
             &SemanticFilePolicy::default(),
         );
         assert!(result.is_ok(), "build failed: {:?}", result.err());
-        let index = result.unwrap();
+        let (index, _diag) = result.unwrap();
         assert!(!index.is_empty(), "index should have entries");
 
         // Verify documents grouped by file: each file's chunks appear together
@@ -9638,7 +9656,7 @@ mod fingerprint_invalidation_tests {
         let mut embed_fn = mock_contextual_embed_fn(3);
         let mut progress = |_: usize, _: usize| {};
 
-        let mut index = SemanticIndex::build_with_progress_contextualized(
+        let (mut index, _diag) = SemanticIndex::build_with_progress_contextualized(
             &project_root,
             std::slice::from_ref(&file),
             &mut embed_fn,
@@ -9734,7 +9752,7 @@ mod fingerprint_invalidation_tests {
             &SemanticFilePolicy::default(),
         );
         assert!(result.is_ok(), "build should succeed: {:?}", result.err());
-        let index = result.unwrap();
+        let (index, _diag) = result.unwrap();
         assert!(
             !index.is_empty(),
             "oversized doc should still produce entries"
@@ -9773,7 +9791,7 @@ mod fingerprint_invalidation_tests {
             &SemanticFilePolicy::default(),
         );
         assert!(result.is_ok(), "empty build should succeed");
-        let index = result.unwrap();
+        let (index, _diag) = result.unwrap();
         assert_eq!(index.len(), 0, "empty files → empty index");
     }
 
@@ -9898,7 +9916,7 @@ mod fingerprint_invalidation_tests {
             "oversized split build should succeed: {:?}",
             result.err()
         );
-        let index = result.unwrap();
+        let (index, _diag) = result.unwrap();
 
         // Should have 101 entries (all functions embedded)
         assert_eq!(index.len(), 101, "all 101 chunks should be embedded");
@@ -10024,7 +10042,7 @@ mod fingerprint_invalidation_tests {
             "build should succeed with partial results: {:?}",
             result.err()
         );
-        let index = result.unwrap();
+        let (index, _diag) = result.unwrap();
 
         // Should have entries for ok.rs only (fail.rs skipped after retry exhaustion)
         assert!(
@@ -10238,6 +10256,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path,
             model2vec_max_length: 512,
             max_results_per_file: 2,
@@ -10367,6 +10386,7 @@ mod fingerprint_invalidation_tests {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: crate::config::RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: Some(PathBuf::from("/any/path")),
             model2vec_max_length: 512,
             max_results_per_file: 2,

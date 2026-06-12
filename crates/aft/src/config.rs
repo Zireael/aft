@@ -257,6 +257,11 @@ pub struct SemanticBackendConfig {
     /// Cross-encoders have tighter context windows than chat models.
     #[serde(default = "default_rerank_max_candidate_chars_cross_encoder")]
     pub rerank_max_candidate_chars_cross_encoder: usize,
+    /// Optional override for the reranker prompt template.
+    /// When set, replaces the default prompt. Use `{query}` and `{candidates}`
+    /// as placeholders. When null, the built-in prompt is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_prompt_template: Option<String>,
     /// Local filesystem path to a model2vec model directory (e.g. `minishlab/potion-code-16M`).
     /// Required when `backend = "model2vec"`. Must contain `config.json`, `tokenizer.json`,
     /// and `model.safetensors`. No remote downloads are performed.
@@ -583,6 +588,7 @@ impl Default for SemanticBackendConfig {
             rerank_max_candidate_chars: 2500,
             rerank_api_type: RerankApiType::Chat,
             rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
