@@ -6513,10 +6513,14 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -6613,10 +6617,14 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -6685,10 +6693,14 @@ mod tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8002,10 +8014,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8072,10 +8088,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8121,10 +8141,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8176,10 +8200,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8234,10 +8262,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -8285,10 +8317,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
@@ -10200,9 +10236,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path,
             model2vec_max_length: 512,
             max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         }
     }
 
@@ -10324,10 +10365,14 @@ mod fingerprint_invalidation_tests {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: Some(PathBuf::from("/any/path")),
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
         let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
         assert!(err.contains("semantic-model2vec"), "error: {err}");

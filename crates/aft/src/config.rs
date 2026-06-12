@@ -581,10 +581,14 @@ impl Default for SemanticBackendConfig {
             rerank_timeout_ms: 15000,
             rerank_max_candidates: 20,
             rerank_max_candidate_chars: 2500,
+            rerank_api_type: RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
             model_path: None,
             model2vec_max_length: 512,
             max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         }
     }
 }
