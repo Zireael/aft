@@ -2858,6 +2858,7 @@ impl SemanticIndex {
         project_root: &Path,
         files: &[PathBuf],
         file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
         let policy = file_policy.clone();
         let per_file: Vec<(
@@ -2998,6 +2999,14 @@ impl SemanticIndex {
             }
         }
 
+        // Apply document prompt template to each chunk's embed_text.
+        // This prefixes document text for models that require it (e.g. E5 "passage: " prefix).
+        if let Some(tpl) = document_prompt_template {
+            for chunk in &mut chunks {
+                chunk.embed_text = apply_document_template(&chunk.embed_text, Some(tpl));
+            }
+        }
+
         (chunks, file_metadata)
     }
 
@@ -3107,7 +3116,7 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let (chunks, file_mtimes) =
-            Self::collect_chunks(project_root, files, &SemanticFilePolicy::default());
+            Self::collect_chunks(project_root, files, &SemanticFilePolicy::default(), None);
         let snapshot = Self::build_from_chunks(
             project_root,
             chunks,
@@ -3196,6 +3205,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         progress: &mut P,
         file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> Result<Self, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -3203,7 +3213,8 @@ impl SemanticIndex {
     {
         let mut files = files.to_vec();
         Self::sort_files_by_priority(&mut files);
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, &files, file_policy);
+        let (chunks, file_mtimes) =
+            Self::collect_chunks(project_root, &files, file_policy, document_prompt_template);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let snapshot = Self::build_from_chunks(
@@ -3317,6 +3328,7 @@ impl SemanticIndex {
         embed_fn: &mut F,
         progress: &mut P,
         file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> Result<(Self, ContextualizedBuildDiagnostics), String>
     where
         F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
@@ -3324,7 +3336,8 @@ impl SemanticIndex {
     {
         let mut files = files.to_vec();
         Self::sort_files_by_priority(&mut files);
-        let (chunks, file_metadata) = Self::collect_chunks(project_root, &files, file_policy);
+        let (chunks, file_metadata) =
+            Self::collect_chunks(project_root, &files, file_policy, document_prompt_template);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
 
@@ -3537,6 +3550,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         progress: &mut P,
         file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> Result<RefreshSummary, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -3646,7 +3660,8 @@ impl SemanticIndex {
             });
         }
 
-        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed, file_policy);
+        let (chunks, fresh_metadata) =
+            Self::collect_chunks(project_root, &to_embed, file_policy, document_prompt_template);
 
         if chunks.is_empty() {
             progress(0, 0);
@@ -3899,6 +3914,7 @@ impl SemanticIndex {
         max_files: usize,
         progress: &mut P,
         file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> Result<InvalidatedFilesRefresh, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -3963,7 +3979,7 @@ impl SemanticIndex {
         }
 
         let (mut chunks, mut fresh_metadata) =
-            Self::collect_chunks(project_root, &existing_paths, file_policy);
+            Self::collect_chunks(project_root, &existing_paths, file_policy, document_prompt_template);
 
         let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
@@ -6275,6 +6291,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -6318,6 +6335,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -6349,6 +6367,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -6384,6 +6403,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -6417,6 +6437,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -6458,6 +6479,7 @@ mod tests {
                 8,
                 &mut progress,
                 &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -9340,6 +9362,48 @@ mod fingerprint_invalidation_tests {
     }
 
     #[test]
+    fn collect_chunks_applies_document_prompt_template() {
+        use std::path::PathBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn hello() { world() }").unwrap();
+        let policy = SemanticFilePolicy::default();
+        let (chunks, _) = SemanticIndex::collect_chunks(
+            dir.path(),
+            &[file.clone()],
+            &policy,
+            Some("Doc: {text}"),
+        );
+        assert!(!chunks.is_empty(), "should have at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                chunk.embed_text.starts_with("Doc: "),
+                "embed_text should be prefixed with 'Doc: ', got: {}",
+                &chunk.embed_text[..50.min(chunk.embed_text.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn collect_chunks_no_prefix_when_template_none() {
+        use std::path::PathBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn hello() { world() }").unwrap();
+        let policy = SemanticFilePolicy::default();
+        let (chunks, _) =
+            SemanticIndex::collect_chunks(dir.path(), &[file.clone()], &policy, None);
+        assert!(!chunks.is_empty(), "should have at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                !chunk.embed_text.starts_with("Doc: "),
+                "embed_text should NOT be prefixed when template is None, got: {}",
+                &chunk.embed_text[..50.min(chunk.embed_text.len())]
+            );
+        }
+    }
+
+    #[test]
     fn prompt_template_hash_none_equals_empty_string() {
         // None and empty string should produce the same hash (both normalize to empty).
         assert_eq!(prompt_template_hash(None), "");
@@ -9442,6 +9506,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(result.is_ok(), "build failed: {:?}", result.err());
         let (index, _diag) = result.unwrap();
@@ -9490,6 +9555,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(result.is_ok(), "build failed: {:?}", result.err());
 
@@ -9546,6 +9612,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
 
         assert!(result.is_err(), "should fail on wrong chunk count");
@@ -9585,6 +9652,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
 
         assert!(result.is_err(), "should fail on unknown file path");
@@ -9632,6 +9700,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
 
         assert!(result.is_err(), "should fail on dimension change");
@@ -9662,6 +9731,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         )
         .expect("initial build");
 
@@ -9686,6 +9756,7 @@ mod fingerprint_invalidation_tests {
             8,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
 
         assert!(
@@ -9750,6 +9821,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(result.is_ok(), "build should succeed: {:?}", result.err());
         let (index, _diag) = result.unwrap();
@@ -9789,6 +9861,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(result.is_ok(), "empty build should succeed");
         let (index, _diag) = result.unwrap();
@@ -9833,6 +9906,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -9871,6 +9945,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -9910,6 +9985,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -9980,6 +10056,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -10034,6 +10111,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
 
         // Build should succeed (partial — fail.rs skipped, ok.rs embedded)
@@ -10421,6 +10499,7 @@ mod fingerprint_invalidation_tests {
             &mut embed_fn,
             &mut progress,
             &SemanticFilePolicy::default(),
+            None,
         );
         assert!(result.is_ok());
 

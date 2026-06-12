@@ -181,6 +181,7 @@ fn spawn_semantic_refresh_worker(
     max_batch_size: usize,
     max_files: usize,
     file_policy: SemanticFilePolicy,
+    document_prompt_template: Option<String>,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
     session_id: Option<String>,
@@ -257,6 +258,7 @@ fn spawn_semantic_refresh_worker(
                         max_batch_size,
                         &mut progress,
                         &file_policy,
+                        document_prompt_template.as_deref(),
                     ) {
                         Ok(summary) => {
                             if !summary.is_noop() {
@@ -319,6 +321,7 @@ fn spawn_semantic_refresh_worker(
                     max_files,
                     &mut progress,
                     &file_policy,
+                    document_prompt_template.as_deref(),
                 ) {
                     Ok(update) => {
                         if !update.summary.is_noop() {
@@ -2544,6 +2547,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
                                     &semantic_files,
+                                    semantic_config.document_prompt_template.as_deref(),
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2669,6 +2673,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             semantic_config.max_batch_size.max(1),
                             &mut progress,
                             &semantic_files,
+                            semantic_config.document_prompt_template.as_deref(),
                         )?;
                         let mut index = index;
                         index.set_fingerprint(fingerprint);
@@ -2755,6 +2760,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             semantic_config.max_batch_size.max(1),
                             semantic_config.max_files,
                             semantic_files.clone(),
+                            semantic_config.document_prompt_template.clone(),
                             refresh_rx,
                             refresh_event_tx,
                             log_ctx::current_session(),
