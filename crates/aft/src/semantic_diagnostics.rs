@@ -708,7 +708,9 @@ fn format_warning_minimal(w: &SearchWarning) -> Option<String> {
         SearchWarning::EmbeddingFailure { .. } => None,
         SearchWarning::LexicalFailure { .. } => None,
         SearchWarning::DimensionMismatch { .. } => None,
-        SearchWarning::RerankerFailure { .. } => None,
+        SearchWarning::RerankerFailure { .. } => {
+            Some("⚠ reranker unavailable, using original order".to_string())
+        }
         SearchWarning::DistanceMetricChanged { previous, current } => {
             Some(format!(
                 "⚠ distance metric changed from {previous} to {current} — scores may be stale (index was not re-embedded)"

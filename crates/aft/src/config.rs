@@ -265,6 +265,11 @@ pub struct SemanticBackendConfig {
     /// Optional override for the reranker prompt template.
     /// When set, replaces the default prompt. Use `{query}` and `{candidates}`
     /// as placeholders. When null, the built-in prompt is used.
+    ///
+    /// **Trust-boundary field**: project-level config cannot set this.
+    /// The OpenCode/Pi plugin strips it from project config before merging.
+    /// A hostile repo could inject arbitrary instructions into the reranker
+    /// prompt, influencing which code results the agent sees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_prompt_template: Option<String>,
     /// Local filesystem path to a model2vec model directory (e.g. `minishlab/potion-code-16M`).

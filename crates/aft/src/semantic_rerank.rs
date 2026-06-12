@@ -418,18 +418,30 @@ fn parse_cross_encoder_response(text: &str, _candidate_count: usize) -> RerankOu
 /// Extract 0-based indices from a rerank results array.
 ///
 /// Handles `{index, relevance_score}`, `{index, score}`, and `{position, score}` shapes.
+/// Items with a score field (`relevance_score` or `score`) are sorted by score
+/// descending (highest relevance first) before returning the indices.
 fn extract_indices_from_rerank_results(arr: &[serde_json::Value]) -> Option<Vec<usize>> {
-    // Check if items have an "index" field.
+    // Check if items have an "index" field — these may carry a score to sort by.
     if arr.first().and_then(|item| item.get("index")).is_some() {
-        let indices: Vec<usize> = arr
+        // Try to sort by score descending when a score field is present.
+        let mut indexed: Vec<(usize, f64)> = arr
             .iter()
             .filter_map(|item| {
-                item.get("index")
-                    .and_then(|i| i.as_u64())
-                    .map(|i| i as usize)
+                let idx = item.get("index").and_then(|i| i.as_u64())? as usize;
+                let score = item
+                    .get("relevance_score")
+                    .or_else(|| item.get("score"))
+                    .and_then(|s| s.as_f64())
+                    .unwrap_or(f64::NAN);
+                Some((idx, score))
             })
             .collect();
-        if !indices.is_empty() {
+        if !indexed.is_empty() {
+            // If any score is a real number (not NaN), sort by score descending.
+            if indexed.iter().any(|(_, s)| !s.is_nan()) {
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            let indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
             return Some(indices);
         }
     }
@@ -746,7 +758,8 @@ mod tests {
         let text = r#"{"data": [{"index": 0, "score": 0.3}, {"index": 2, "score": 0.9}, {"index": 1, "score": 0.5}]}"#;
         let outcome = parse_cross_encoder_response(text, 3);
         match outcome {
-            RerankOutcome::ReRanked(indices) => assert_eq!(indices, vec![0, 2, 1]),
+            // Should be sorted by score descending: index 2 (0.9) > index 1 (0.5) > index 0 (0.3)
+            RerankOutcome::ReRanked(indices) => assert_eq!(indices, vec![2, 1, 0]),
             other => panic!("expected ReRanked, got {other:?}"),
         }
     }

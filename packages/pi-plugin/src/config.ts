@@ -1202,6 +1202,15 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
         "Ignoring semantic.backend/base_url/api_key_env from project config (security: use user config for external backends)",
       );
     }
+    if (
+      projectConfig.semantic?.rerank_prompt_template !== undefined ||
+      projectConfig.semantic?.query_prompt_template !== undefined ||
+      projectConfig.semantic?.document_prompt_template !== undefined
+    ) {
+      warn(
+        "Ignoring semantic.rerank_prompt_template/query_prompt_template/document_prompt_template from project config (security: trust-boundary fields — use user config for prompt templates)",
+      );
+    }
     const strippedLspKeys = getProjectLspStrippedKeys(projectConfig.lsp);
     if (strippedLspKeys.length > 0) {
       warn(

@@ -563,7 +563,8 @@ fn handle_semantic_or_hybrid_search(
     let fused_more_available = results.len() > fusion_limit;
     // Do NOT truncate to top_k here — the reranker needs the full pool.
     // Truncation happens after reranking (or after the rerank block).
-    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
+    let mut more_available =
+        fused_more_available || semantic_more_available || lexical.engine_capped;
     let pipeline_type = match (has_semantic, has_lexical) {
         (true, true) => SearchPipelineType::Hybrid,
         (true, false) => SearchPipelineType::Semantic,
@@ -624,6 +625,11 @@ fn handle_semantic_or_hybrid_search(
 
     // Truncate to top_k after reranking so the reranker sees the full pool
     // but the caller only receives the requested number of results.
+    // If the pre-truncation pool exceeded top_k, signal more_available so the
+    // agent knows additional results were dropped.
+    if results.len() > top_k {
+        more_available = true;
+    }
     results.truncate(top_k);
 
     let scores: Vec<f32> = results.iter().map(|result| result.score).collect();
