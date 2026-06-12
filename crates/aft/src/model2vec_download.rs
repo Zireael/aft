@@ -115,6 +115,69 @@ fn validate_model_dir(path: &Path) -> Result<(), String> {
         ));
     }
 
+    // Validate config.json has required fields
+    validate_model_config(path)?;
+
+    Ok(())
+}
+
+/// Validate that config.json in a model directory has the required fields.
+fn validate_model_config(model_dir: &Path) -> Result<(), String> {
+    let config_path = model_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+
+    let config: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| format!("invalid JSON in {}: {e}", config_path.display()))?;
+
+    // Check for required fields
+    if config.get("hidden_size").is_none() {
+        return Err(format!(
+            "config.json in {} is missing 'hidden_size' field",
+            model_dir.display()
+        ));
+    }
+
+    // Validate hidden_size is a positive integer
+    if let Some(size) = config.get("hidden_size").and_then(|v| v.as_u64()) {
+        if size == 0 || size > 16384 {
+            return Err(format!(
+                "config.json hidden_size={} is out of valid range (1-16384)",
+                size
+            ));
+        }
+    }
+
+    // Validate normalize field exists (boolean)
+    if config.get("normalize").is_none() {
+        // Some models don't have this field — that's OK, default is true
+    }
+
+    Ok(())
+}
+
+/// Validate a model directory against expected dimensions from the catalog.
+///
+/// If the model is in the catalog, checks that the config.json hidden_size
+/// matches the expected dimensions.
+pub fn validate_model_dimensions(model_dir: &Path, expected_repo_id: &str) -> Result<(), String> {
+    if let Some(catalog_model) = lookup_model(expected_repo_id) {
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| format!("invalid JSON in {}: {e}", config_path.display()))?;
+
+        if let Some(actual_dims) = config.get("hidden_size").and_then(|v| v.as_u64()) {
+            if actual_dims as usize != catalog_model.dimensions {
+                return Err(format!(
+                    "model {} has {} dimensions but catalog expects {}",
+                    expected_repo_id, actual_dims, catalog_model.dimensions
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -338,6 +401,86 @@ mod tests {
         create_test_model_dir(&dir);
         let result = resolve_model2vec_files(Some(dir.to_str().unwrap()), None);
         assert!(result.is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_config_json_missing_hidden_size() {
+        let dir = std::env::temp_dir().join("test_model2vec_no_hidden");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("config.json")).unwrap()
+            .write_all(b"{\"normalize\": true}").unwrap();
+        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
+            .write_all(b"{}").unwrap();
+        std::fs::File::create(dir.join("model.safetensors")).unwrap()
+            .write_all(b"fake").unwrap();
+
+        let result = validate_model_dir(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hidden_size"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_config_json_invalid_json() {
+        let dir = std::env::temp_dir().join("test_model2vec_bad_json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("config.json")).unwrap()
+            .write_all(b"not json").unwrap();
+        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
+            .write_all(b"{}").unwrap();
+        std::fs::File::create(dir.join("model.safetensors")).unwrap()
+            .write_all(b"fake").unwrap();
+
+        let result = validate_model_dir(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid JSON"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_dimensions_matches_catalog() {
+        let dir = std::env::temp_dir().join("test_model2vec_dims_ok");
+        create_test_model_dir(&dir);
+        // Our test model has hidden_size: 256, which matches all catalog models
+        let result = validate_model_dimensions(&dir, "minishlab/potion-code-16M");
+        assert!(result.is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_dimensions_mismatch() {
+        let dir = std::env::temp_dir().join("test_model2vec_dims_bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("config.json")).unwrap()
+            .write_all(b"{\"normalize\": true, \"hidden_size\": 128}").unwrap();
+        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
+            .write_all(b"{}").unwrap();
+        std::fs::File::create(dir.join("model.safetensors")).unwrap()
+            .write_all(b"fake").unwrap();
+
+        let result = validate_model_dimensions(&dir, "minishlab/potion-code-16M");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("128"), "error should mention actual dims: {}", err);
+        assert!(err.contains("256"), "error should mention expected dims: {}", err);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_hidden_size_out_of_range() {
+        let dir = std::env::temp_dir().join("test_model2vec_hidden_range");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("config.json")).unwrap()
+            .write_all(b"{\"normalize\": true, \"hidden_size\": 0}").unwrap();
+        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
+            .write_all(b"{}").unwrap();
+        std::fs::File::create(dir.join("model.safetensors")).unwrap()
+            .write_all(b"fake").unwrap();
+
+        let result = validate_model_dir(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("out of valid range"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
