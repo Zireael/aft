@@ -246,6 +246,7 @@ pub fn handle_semantic_doctor(req: &RawRequest, ctx: &crate::context::AppContext
         index: index_summary,
         metrics: metrics_summary,
         provider: provider_summary,
+        model2vec_health: build_model2vec_health(&*ctx.config()),
         warnings,
         suggestions,
     };
@@ -253,6 +254,63 @@ pub fn handle_semantic_doctor(req: &RawRequest, ctx: &crate::context::AppContext
     let mut payload = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
     payload["summary_line"] = serde_json::Value::String(report.render_line());
     Response::success(&req.id, payload)
+}
+
+/// Build model2vec health summary if backend is model2vec.
+fn build_model2vec_health(config: &crate::config::Config) -> Option<Model2VecHealthSummary> {
+    if config.semantic.backend != crate::config::SemanticBackend::Model2Vec {
+        return None;
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    {
+        use crate::model2vec_catalog::is_known_model;
+        use crate::model2vec_download::{model_dir_size, resolve_model2vec_files};
+
+        match resolve_model2vec_files(
+            Some(&config.semantic.model),
+            config.semantic.model_path.as_deref(),
+        ) {
+            Ok(model_dir) => {
+                let total_size = model_dir_size(&model_dir).ok();
+                let config_path = model_dir.join("config.json");
+                let dimensions = std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("hidden_size").and_then(|h| h.as_u64()))
+                    .map(|d| d as usize);
+
+                Some(Model2VecHealthSummary {
+                    files_valid: true,
+                    model_dir: Some(model_dir.to_string_lossy().to_string()),
+                    total_size_bytes: total_size,
+                    dimensions,
+                    is_catalog_model: is_known_model(&config.semantic.model),
+                    error: None,
+                })
+            }
+            Err(e) => Some(Model2VecHealthSummary {
+                files_valid: false,
+                model_dir: None,
+                total_size_bytes: None,
+                dimensions: None,
+                is_catalog_model: is_known_model(&config.semantic.model),
+                error: Some(e),
+            }),
+        }
+    }
+
+    #[cfg(not(feature = "semantic-model2vec"))]
+    {
+        Some(Model2VecHealthSummary {
+            files_valid: false,
+            model_dir: None,
+            total_size_bytes: None,
+            dimensions: None,
+            is_catalog_model: false,
+            error: Some("semantic-model2vec feature not enabled".to_string()),
+        })
+    }
 }
 
 #[cfg(test)]

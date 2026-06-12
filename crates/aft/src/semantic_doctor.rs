@@ -103,6 +103,23 @@ pub struct ProviderSummary {
     pub error: Option<String>,
 }
 
+/// Model2Vec model health status (only relevant when backend=model2vec).
+#[derive(Debug, Clone, Serialize)]
+pub struct Model2VecHealthSummary {
+    /// Whether the model directory exists and has all required files.
+    pub files_valid: bool,
+    /// Path to the model directory.
+    pub model_dir: Option<String>,
+    /// Total size of model files in bytes.
+    pub total_size_bytes: Option<u64>,
+    /// Model dimensions from config.json.
+    pub dimensions: Option<usize>,
+    /// Whether the model matches a known catalog entry.
+    pub is_catalog_model: bool,
+    /// Validation error message (if any).
+    pub error: Option<String>,
+}
+
 /// Actionable suggestion for the user.
 #[derive(Debug, Clone, Serialize)]
 pub struct Suggestion {
@@ -125,6 +142,8 @@ pub struct SemanticHealthReport {
     pub metrics: MetricsSummary,
     /// Provider connectivity.
     pub provider: ProviderSummary,
+    /// Model2Vec model health (only populated when backend=model2vec).
+    pub model2vec_health: Option<Model2VecHealthSummary>,
     /// Active warnings from recent searches.
     pub warnings: Vec<String>,
     /// Actionable next steps for the user.
