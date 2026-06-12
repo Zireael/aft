@@ -1709,19 +1709,17 @@ impl SemanticEmbeddingModel {
             SemanticBackend::Model2Vec => {
                 #[cfg(feature = "semantic-model2vec")]
                 {
-                    let model_path = config.model_path.as_ref().ok_or_else(|| {
-                        "model_path is required for model2vec backend".to_string()
-                    })?;
-                    if !model_path.exists() {
-                        return Err(format!(
-                            "model_path does not exist: {}",
-                            model_path.display()
-                        ));
-                    }
+                    use crate::model2vec_download::resolve_model2vec_files;
+
+                    let model_dir = resolve_model2vec_files(
+                        Some(&config.model),
+                        config.model_path.as_deref(),
+                    )?;
+
                     let static_model = Model2VecStaticModel::from_pretrained(
-                        model_path
+                        model_dir
                             .to_str()
-                            .ok_or_else(|| "model_path is not valid UTF-8".to_string())?,
+                            .ok_or_else(|| "model path is not valid UTF-8".to_string())?,
                         None, // hf_token
                         None, // normalize_embeddings (use model default)
                         None, // subfolder
