@@ -90,6 +90,7 @@ pub mod semantic_eval;
 pub mod semantic_index;
 pub mod semantic_rerank;
 pub mod model2vec_catalog;
+pub mod model2vec_download;
 pub mod symbol_cache_disk;
 pub mod symbols;
 pub mod tool_path;
