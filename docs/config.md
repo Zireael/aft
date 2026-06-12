@@ -109,6 +109,21 @@ The schema is identical across harnesses. Only file location differs.
     "max_files": 20000                  // max files indexed (default 20000); raise for remote backends
   },
 
+  // Model2Vec backend — a pure-Rust static embedding alternative to fastembed.
+  // Requires no ONNX Runtime or C dependencies. Models are downloaded automatically
+  // from HuggingFace Hub on first use. Supported models:
+  //   minishlab/potion-code-16M (code, 256 dims, 16M params)
+  //   minishlab/potion-base-32M (general, 256 dims, 32M params)
+  //   minishlab/potion-base-8M  (general, 256 dims, 8M params)
+  //   minishlab/potion-base-4M  (general, 256 dims, 4M params)
+  //   minishlab/potion-base-2M  (general, 256 dims, 2M params)
+  //   minishlab/potion-retrieval-32M (retrieval, 256 dims)
+  //   minishlab/potion-multilingual-128M (multilingual, 256 dims)
+  //
+  // "model" accepts a HuggingFace model name (auto-download) or a local path.
+  // "model_path" is optional and overrides "model" for local models.
+  // USER-only fields: "model_path" cannot be set in project config.
+
   // Restrict all file operations to the project root directory.
   // Default: false. Matches OpenCode's and Pi's native behavior — neither host
   // hard-rejects out-of-root paths from their built-in tools (OpenCode prompts
