@@ -126,6 +126,34 @@ impl EvalSummary {
     }
 }
 
+/// Strip trailing commas before `}` or `]` so hand-edited JSONL files
+/// with trailing commas parse correctly.
+fn strip_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        out.push(bytes[i] as char);
+        // Look for `,` followed by optional whitespace then `}` or `]`.
+        if bytes[i] == b',' {
+            let mut j = i + 1;
+            while j < len
+                && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+            {
+                j += 1;
+            }
+            if j < len && (bytes[j] == b'}' || bytes[j] == b']') {
+                // Skip the comma (and any trailing whitespace we already consumed).
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Parse a JSONL document into eval cases.
 ///
 /// Each non-empty, non-comment line must be a valid JSON object with a
@@ -138,8 +166,9 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<EvalCase>, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        let cleaned = strip_trailing_commas(trimmed);
         let case: EvalCase =
-            serde_json::from_str(trimmed).map_err(|e| format!("line {}: {e}", line_no + 1))?;
+            serde_json::from_str(&cleaned).map_err(|e| format!("line {}: {e}", line_no + 1))?;
         if case.query.trim().is_empty() {
             return Err(format!("line {}: query must be non-empty", line_no + 1));
         }
@@ -403,6 +432,33 @@ not json
 "#;
         let cases = parse_jsonl(text).unwrap();
         assert_eq!(cases[0].top_k, Some(3));
+    }
+
+    #[test]
+    fn parse_jsonl_accepts_trailing_commas() {
+        let text = r#"{"query":"q1","expected_paths":["a.rs"],}
+{"query":"q2","expected_symbols":["foo"],}
+"#;
+        let cases = parse_jsonl(text).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].query, "q1");
+        assert_eq!(cases[1].expected_symbols, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn parse_jsonl_accepts_trailing_commas_with_whitespace() {
+        let text = "{\"query\":\"q1\",\"expected_paths\":[\"a.rs\"],   }\n";
+        let cases = parse_jsonl(text).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].query, "q1");
+    }
+
+    #[test]
+    fn strip_trailing_commas_only_removes_before_braces() {
+        // Commas NOT followed by } or ] should be kept.
+        let input = r#"{"a":"b,c","d":[1,2]}"#;
+        let cleaned = strip_trailing_commas(input);
+        assert_eq!(cleaned, input);
     }
 
     #[test]

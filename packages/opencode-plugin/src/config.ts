@@ -120,18 +120,28 @@ const SemanticConfigSchema = z.object({
   rerank_base_url: z.string().trim().min(1).optional(),
   /** Env var name for reranker API key. Falls back to api_key_env if unset. */
   rerank_api_key_env: z.string().trim().min(1).optional(),
-  /** Reranker request timeout in milliseconds (default: 10000). */
+  /** Reranker request timeout in milliseconds (default: 15000). */
   rerank_timeout_ms: z.number().int().positive().optional(),
-  /** Maximum candidate count passed to the reranker (default: 50). */
+  /** Maximum candidate count passed to the reranker (default: 20). */
   rerank_max_candidates: z.number().int().positive().optional(),
-  /** Maximum characters per candidate text sent to the reranker (default: 2000). */
+  /** Maximum characters per candidate text sent to the reranker (default: 2500). */
   rerank_max_candidate_chars: z.number().int().positive().optional(),
+  /** Reranker API format: "chat" for LLM-based chat completions (default), "rerank" for cross-encoder /v1/rerank endpoints. */
+  rerank_api_type: z.enum(["chat", "rerank"]).optional(),
+  /** Max characters per candidate snippet for cross-encoder rerankers (default: 512). Cross-encoders have tighter context windows. */
+  rerank_max_candidate_chars_cross_encoder: z.number().int().positive().optional(),
   /** Local filesystem path to a model2vec model directory (USER-ONLY, trust boundary). */
   model_path: z.string().optional(),
   /** Max token length for model2vec truncation (USER-ONLY, trust boundary). Default: 512. */
   model2vec_max_length: z.number().int().positive().optional(),
   /** Maximum results per file after hybrid fusion (default: 2). Prevents a single dense module from dominating. */
   max_results_per_file: z.number().int().positive().optional(),
+  /** Max tokens per embedding request for remote backends (default: 512). When a symbol exceeds this, it is chunked before embedding. Set to 0 to disable. */
+  max_embed_tokens: z.number().int().nonnegative().optional(),
+  /** Number of overlapping tokens between chunks when splitting large symbols (default: 100). Overlap preserves boundary context. */
+  chunk_overlap_tokens: z.number().int().nonnegative().optional(),
+  /** Maximum number of project files to semantically index (default: 20000). Guards memory on huge project roots. */
+  max_files: z.number().int().positive().optional(),
 });
 const LspExtensionSchema = z
   .string()

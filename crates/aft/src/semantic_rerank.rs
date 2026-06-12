@@ -93,6 +93,18 @@ pub fn rerank_candidates(
     }
 }
 
+/// Build the rerank endpoint URL from a base URL and path suffix.
+///
+/// Handles trailing `/v1` in base_url to avoid double `/v1/v1`.
+fn build_rerank_endpoint(base_url: &str, path_suffix: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/{}", base, path_suffix)
+    } else {
+        format!("{}/v1/{}", base, path_suffix)
+    }
+}
+
 /// Rerank using LLM chat completions endpoint.
 ///
 /// Sends a prompt asking the LLM to return a JSON array of 0-based indices
@@ -116,11 +128,7 @@ fn rerank_chat(
         .unwrap_or("codellama/codellama:7b-instruct");
     let api_key = resolve_rerank_api_key(config);
 
-    let endpoint = if base_url.ends_with("/v1") {
-        format!("{}/chat/completions", base_url.trim_end_matches('/'))
-    } else {
-        format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
-    };
+    let endpoint = build_rerank_endpoint(base_url, "chat/completions");
 
     let candidates_text: Vec<String> = candidates
         .iter()
@@ -262,11 +270,7 @@ fn rerank_cross_encoder(
         .unwrap_or("BAAI/bge-reranker-v2-m3");
     let api_key = resolve_rerank_api_key(config);
 
-    let endpoint = if base_url.ends_with("/v1") {
-        format!("{}/rerank", base_url.trim_end_matches('/'))
-    } else {
-        format!("{}/v1/rerank", base_url.trim_end_matches('/'))
-    };
+    let endpoint = build_rerank_endpoint(base_url, "rerank");
 
     // Cross-encoders use shorter snippets due to tighter context windows.
     let max_chars = config.rerank_max_candidate_chars_cross_encoder;
@@ -338,12 +342,13 @@ fn rerank_cross_encoder(
 /// 4. `{scores: [float, ...]}` — score-only array (map to indices by position)
 /// 5. Direct `[index, ...]` array — simple index list
 fn parse_cross_encoder_response(text: &str, candidate_count: usize) -> RerankOutcome {
-    let v: serde_json::Value = match serde_json::from_str(text) {
+    let cleaned = strip_markdown_fences(text);
+    let v: serde_json::Value = match serde_json::from_str(&cleaned) {
         Ok(v) => v,
         Err(_) => {
             return RerankOutcome::Failed(format!(
                 "cross-encoder response is not valid JSON: {}",
-                text.chars().take(100).collect::<String>()
+                cleaned.chars().take(100).collect::<String>()
             ));
         }
     };
@@ -391,7 +396,7 @@ fn parse_cross_encoder_response(text: &str, candidate_count: usize) -> RerankOut
 
     RerankOutcome::Failed(format!(
         "cross-encoder response did not contain recognizable rerank results: {}",
-        text.chars().take(100).collect::<String>()
+        cleaned.chars().take(100).collect::<String>()
     ))
 }
 
@@ -740,6 +745,16 @@ mod tests {
     }
 
     #[test]
+    fn cross_encoder_parse_strips_markdown_fences() {
+        let text = "```json\n{\"results\": [{\"index\": 1, \"score\": 0.9}, {\"index\": 0, \"score\": 0.7}]}\n```";
+        let outcome = parse_cross_encoder_response(text, 2);
+        match outcome {
+            RerankOutcome::ReRanked(indices) => assert_eq!(indices, vec![1, 0]),
+            other => panic!("expected ReRanked, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cross_encoder_config_defaults() {
         let config = SemanticBackendConfig::default();
         assert_eq!(config.rerank_api_type, RerankApiType::Chat);
@@ -759,5 +774,41 @@ mod tests {
         let outcome = rerank_candidates(&config, "test", &results);
         // Will fail because endpoint is unreachable, but confirms dispatch works.
         assert!(matches!(outcome, RerankOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn build_rerank_endpoint_chat_default_base() {
+        let url = build_rerank_endpoint("http://127.0.0.1:11434/v1", "chat/completions");
+        assert_eq!(url, "http://127.0.0.1:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_rerank_endpoint_chat_trailing_slash() {
+        let url = build_rerank_endpoint("http://127.0.0.1:11434/v1/", "chat/completions");
+        assert_eq!(url, "http://127.0.0.1:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_rerank_endpoint_chat_without_v1() {
+        let url = build_rerank_endpoint("http://127.0.0.1:11434", "chat/completions");
+        assert_eq!(url, "http://127.0.0.1:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_rerank_endpoint_rerank_default_base() {
+        let url = build_rerank_endpoint("http://127.0.0.1:8080/v1", "rerank");
+        assert_eq!(url, "http://127.0.0.1:8080/v1/rerank");
+    }
+
+    #[test]
+    fn build_rerank_endpoint_rerank_without_v1() {
+        let url = build_rerank_endpoint("http://127.0.0.1:8080", "rerank");
+        assert_eq!(url, "http://127.0.0.1:8080/v1/rerank");
+    }
+
+    #[test]
+    fn build_rerank_endpoint_rerank_trailing_slash() {
+        let url = build_rerank_endpoint("http://127.0.0.1:8080/v1/", "rerank");
+        assert_eq!(url, "http://127.0.0.1:8080/v1/rerank");
     }
 }
