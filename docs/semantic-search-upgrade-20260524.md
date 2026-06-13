@@ -434,6 +434,21 @@ Run:
 - manual test with openai_compatible mock
 - manual test with local llama-swap OASIS + CodeRankLLM if available
 
+## Model2vec fixture contract
+
+Model2vec tests use a tiny inline tokenizer fixture built by
+`build_tokenizer_json()` in `crates/aft/src/semantic_index.rs` (test module).
+
+Key constraints:
+- `"padding": null` — partial padding is invalid; use null when padding is not needed.
+- `"pre_tokenizer": { "type": "Whitespace" }` — ensures "hello world" tokenizes as separate tokens.
+- `"ignore_merges": true` — allows whole-token vocab hits even with empty merges.
+- Root-level `"strategy"` is NOT a valid tokenizer JSON field.
+- All root fields must be present: version, truncation, padding, added_tokens, normalizer, pre_tokenizer, post_processor, decoder, and model.
+- `model2vec-rs` 0.2.1 resolves `tokenizers` 0.21.4 (transitive), not AFT's direct 0.22.2.
+
+Do not "simplify" the fixture by removing fields or adding partial padding.
+
 10. Definition of done
 
 The patch is complete when:

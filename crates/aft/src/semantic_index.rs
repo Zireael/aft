@@ -10647,6 +10647,47 @@ mod fingerprint_invalidation_tests {
 
     // ── model2vec tests ─────────────────────────────────────────────
 
+    /// Build a tiny model2vec-compatible tokenizer JSON string from a vocab map.
+    ///
+    /// This is the canonical fixture shape for model2vec tokenizer tests. Key design choices:
+    /// - `"padding": null`: partial padding is invalid; use null when padding is not needed.
+    /// - `"pre_tokenizer": { "type": "Whitespace" }`: ensures "hello world" tokenizes as separate tokens.
+    /// - `"ignore_merges": true`: allows whole-token vocab hits even with empty merges.
+    /// - Root-level `"strategy"` is NOT a valid tokenizer JSON field — it must not appear.
+    /// - All root fields are present: version, truncation, padding, added_tokens, normalizer,
+    ///   pre_tokenizer, post_processor, decoder, and model.
+    /// - model2vec-rs 0.2.1 resolves tokenizers 0.21.4, not AFT's direct 0.22.2.
+    #[cfg(feature = "semantic-model2vec")]
+    fn build_tokenizer_json(vocab: &[(String, u32)]) -> String {
+        let vocab_map = vocab.iter().fold(serde_json::Map::new(), |mut m, (k, v)| {
+            m.insert(k.clone(), serde_json::json!(v));
+            m
+        });
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "ignore_merges": true,
+                "vocab": vocab_map,
+                "merges": [],
+            }
+        });
+        serde_json::to_string(&tokenizer_json).unwrap()
+    }
+
     /// Build a tiny model2vec-compatible fixture directory with `vocab_size` tokens and `dim` dimensions.
     #[cfg(feature = "semantic-model2vec")]
     fn build_model2vec_fixture(dir: &Path, vocab_size: usize, dim: usize) -> PathBuf {
@@ -10671,24 +10712,8 @@ mod fingerprint_invalidation_tests {
             };
             vocab.push((word, i as u32));
         }
-        let tokenizer_json = serde_json::json!({
-            "model": {
-                "type": "BPE",
-                "vocab": vocab.iter().fold(serde_json::Map::new(), |mut m, (k, v)| {
-                    m.insert(k.clone(), serde_json::json!(v));
-                    m
-                }),
-                "merges": [],
-            },
-            "strategy": {"type": "BPE"},
-            "padding": { "pad_token": "[PAD]" },
-            "added_tokens": [],
-        });
-        fs::write(
-            dir.join("tokenizer.json"),
-            serde_json::to_string(&tokenizer_json).unwrap(),
-        )
-        .unwrap();
+        let tokenizer_json_str = build_tokenizer_json(&vocab);
+        fs::write(dir.join("tokenizer.json"), &tokenizer_json_str).unwrap();
 
         // Build a tiny embeddings tensor: vocab_size x dim, all 0.1
         let data: Vec<f32> = vec![0.1; vocab_size * dim];
@@ -10745,14 +10770,44 @@ mod fingerprint_invalidation_tests {
         .expect("load from_bytes")
     }
 
+    /// Characterization test: verify that `build_tokenizer_json` produces a valid tokenizer
+    /// that deserializes through `tokenizers::Tokenizer::from_bytes()` and tokenizes known
+    /// words as expected. This catches invalid fixture JSON before model2vec is invoked.
     #[cfg(feature = "semantic-model2vec")]
     #[test]
-    #[ignore = "tokenizers v0.22.2 requires specific tokenizer JSON format - needs investigation"]
+    fn tokenizer_json_characterization() {
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+            ("world".into(), 2),
+        ]);
+        let tokenizer = tokenizers::Tokenizer::from_bytes(&tok)
+            .expect("tokenizer JSON must deserialize through Tokenizer::from_bytes");
+        let encoding = tokenizer
+            .encode("hello world", true)
+            .expect("encode must succeed");
+        let ids: Vec<u32> = encoding.get_ids().to_vec();
+        assert!(
+            ids.contains(&1),
+            "expected token ID 1 for 'hello', got IDs: {ids:?}"
+        );
+        assert!(
+            ids.contains(&2),
+            "expected token ID 2 for 'world', got IDs: {ids:?}"
+        );
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
     fn model2vec_from_bytes_deterministic_encoding() {
-        let tok = r###"{"model":{"type":"BPE","vocab":{"[UNK]":0,"hello":1,"world":2},"merges":[]},"strategy":{"type":"BPE"},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"###;
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+            ("world".into(), 2),
+        ]);
         let cfg = r#"{"normalize":true,"hidden_size":4}"#;
         let data: Vec<f32> = vec![0.25; 3 * 4];
-        let model = model2vec_from_bytes_helper(tok, cfg, &data, 4);
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 4);
 
         let emb1 = model.encode(&["hello world".to_string()]);
         let emb2 = model.encode(&["hello world".to_string()]);
@@ -10763,12 +10818,14 @@ mod fingerprint_invalidation_tests {
 
     #[cfg(feature = "semantic-model2vec")]
     #[test]
-    #[ignore = "tokenizers v0.22.2 requires specific tokenizer JSON format - needs investigation"]
     fn model2vec_from_bytes_empty_input() {
-        let tok = r###"{"model":{"type":"BPE","vocab":{"[UNK]":0,"hello":1},"merges":[]},"strategy":{"type":"BPE"},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"###;
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+        ]);
         let cfg = r#"{"normalize":true}"#;
         let data: Vec<f32> = vec![0.5; 2 * 2];
-        let model = model2vec_from_bytes_helper(tok, cfg, &data, 2);
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 2);
 
         let emb = model.encode(&["".to_string()]);
         assert_eq!(emb.len(), 1);
@@ -10777,12 +10834,14 @@ mod fingerprint_invalidation_tests {
 
     #[cfg(feature = "semantic-model2vec")]
     #[test]
-    #[ignore = "tokenizers v0.22.2 requires specific tokenizer JSON format - needs investigation"]
     fn model2vec_from_bytes_unknown_tokens_only() {
-        let tok = r###"{"model":{"type":"BPE","vocab":{"[UNK]":0,"known":1},"merges":[]},"strategy":{"type":"BPE"},"padding":{"pad_token":"[PAD]"},"added_tokens":[]}"###;
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("known".into(), 1),
+        ]);
         let cfg = r#"{"normalize":false}"#;
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
-        let model = model2vec_from_bytes_helper(tok, cfg, &data, 3);
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 3);
 
         let emb = model.encode(&["xyz_unknown_token".to_string()]);
         assert_eq!(emb.len(), 1);
@@ -10793,7 +10852,6 @@ mod fingerprint_invalidation_tests {
 
     #[cfg(feature = "semantic-model2vec")]
     #[test]
-    #[ignore = "tokenizers v0.22.2 requires specific tokenizer JSON format - needs investigation"]
     fn model2vec_from_pretrained_fixture_roundtrip() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let fixture_path = build_model2vec_fixture(dir.path(), 10, 8);
@@ -10885,7 +10943,6 @@ mod fingerprint_invalidation_tests {
 
     #[cfg(feature = "semantic-model2vec")]
     #[test]
-    #[ignore = "tokenizers v0.22.2 requires specific tokenizer JSON format - needs investigation"]
     fn model2vec_engine_embed_texts_roundtrip() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let fixture_path = build_model2vec_fixture(dir.path(), 20, 16);
