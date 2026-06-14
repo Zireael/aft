@@ -20,7 +20,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, resolve } from "path";
-import { spawnSync } from "child_process";
+import { aftNdjson } from "./aft-ndjson";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,85 +127,62 @@ function mrr(retrieved: SearchResult[], relevant: string[]): number {
 // AFT search
 // ---------------------------------------------------------------------------
 
-function aftSearch(
+async function aftSearch(
   query: string,
   searchDir: string,
   benchmarkRoot: string | null,
   k: number,
   binaryPath: string,
   mode: string
-): { results: SearchResult[]; latency_ms: number } {
+): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
   const start = performance.now();
   let results: SearchResult[] = [];
 
   try {
-    // Build NDJSON commands based on mode
-    const commands: string[] = [];
-
-    // Configure
-    commands.push(
-      JSON.stringify({
+    const commands: Record<string, unknown>[] = [
+      {
         id: "cfg-aft",
         command: "configure",
         harness: "opencode",
         project_root: targetDir,
         storage_dir: join(targetDir, ".aft-bench"),
         semantic_search: mode !== "grep",
-      })
-    );
+      },
+    ];
 
-    // Search command depends on mode
     if (mode === "grep") {
-      // Use grep command (trigram-indexed)
-      commands.push(
-        JSON.stringify({
-          id: "search-aft",
-          command: "grep",
-          pattern: query,
-          max_results: k,
-        })
-      );
+      commands.push({
+        id: "search-aft",
+        command: "grep",
+        pattern: query,
+        max_results: k,
+      });
     } else {
-      // Use semantic_search command (semantic/hybrid)
-      commands.push(
-        JSON.stringify({
-          id: "search-aft",
-          command: "semantic_search",
-          query,
-          top_k: k,
-          mode: mode,
-        })
-      );
+      commands.push({
+        id: "search-aft",
+        command: "semantic_search",
+        query,
+        top_k: k,
+        mode,
+      });
     }
 
-    const input = commands.join("\n") + "\n";
+    const responses = await aftNdjson(binaryPath, commands, 60000);
 
-    const result = spawnSync(binaryPath, [], {
-      input,
-      encoding: "utf-8",
-      timeout: 60000,
-      stdio: "pipe",
-    });
-
-    if (result.stdout) {
-      const lines = result.stdout.trim().split("\n").filter(Boolean);
-      // Find the search response (last JSON line with results)
-      for (const line of lines.reverse()) {
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed.results && Array.isArray(parsed.results)) {
-            results = parsed.results.map((r: any) => ({
-              file: r.file_path || r.path || r.file || "",
-              line: r.start_line || r.line,
-              score: r.score,
-            }));
-            break;
-          }
-        } catch {}
+    for (const parsed of [...responses].reverse()) {
+      if (parsed.results && Array.isArray(parsed.results)) {
+        results = (parsed.results as any[]).map((r: any) => ({
+          file: r.file_path || r.path || r.file || "",
+          line: r.start_line || r.line,
+          score: r.score,
+        }));
+        break;
       }
     }
-  } catch {}
+  } catch (e) {
+    console.error(`  aftSearch error: ${e}`);
+  }
 
   return { results, latency_ms: performance.now() - start };
 }
@@ -214,7 +191,7 @@ function aftSearch(
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   let cacheDir = ".bench-cache";
   let inputFile = "benchmarks/semble/fixtures.json";

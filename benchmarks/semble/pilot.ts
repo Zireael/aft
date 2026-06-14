@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
+import { aftNdjson } from "./aft-ndjson";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,67 +187,51 @@ function rgSearch(
 // FTS5 mode
 // ---------------------------------------------------------------------------
 
-function fts5Search(
+async function fts5Search(
   query: string,
   searchDir: string,
   benchmarkRoot: string | null,
   k: number,
   binaryPath: string | null
-): { results: SearchResult[]; latency_ms: number } {
+): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
   const bin = binaryPath || "aft";
   const start = performance.now();
   let results: SearchResult[] = [];
 
   try {
-    // Spawn aft process and send configure + fts5_index + fts5_search
-    const { spawnSync } = require("child_process");
-
-    // Write NDJSON commands to stdin
-    const commands = [
-      JSON.stringify({
+    const commands: Record<string, unknown>[] = [
+      {
         id: "cfg-fts5",
         command: "configure",
         harness: "opencode",
         project_root: targetDir,
         storage_dir: join(targetDir, ".aft-bench"),
-      }),
-      JSON.stringify({
+      },
+      {
         id: "idx-fts5",
         command: "fts5_index",
         action: "update",
-      }),
-      JSON.stringify({
+      },
+      {
         id: "search-fts5",
         command: "fts5_search",
         query,
         scope: "all",
         top_k: k,
-      }),
-    ].join("\n");
+      },
+    ];
 
-    const result = spawnSync(bin, [], {
-      input: commands + "\n",
-      encoding: "utf-8",
-      timeout: 30000,
-      stdio: "pipe",
-    });
+    const responses = await aftNdjson(bin, commands, 60000);
 
-    if (result.stdout) {
-      const lines = result.stdout.trim().split("\n").filter(Boolean);
-      // Find the search response (last JSON line that has results)
-      for (const line of lines.reverse()) {
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed.results && Array.isArray(parsed.results)) {
-            results = parsed.results.map((r: any) => ({
-              file: r.file_path || r.path || "",
-              line: r.start_line || r.line,
-              score: r.score,
-            }));
-            break;
-          }
-        } catch {}
+    for (const parsed of [...responses].reverse()) {
+      if (parsed.results && Array.isArray(parsed.results)) {
+        results = (parsed.results as any[]).map((r: any) => ({
+          file: r.file_path || r.path || "",
+          line: r.start_line || r.line,
+          score: r.score,
+        }));
+        break;
       }
     }
   } catch {}
@@ -258,58 +243,45 @@ function fts5Search(
 // AFT grep mode (trigram-indexed)
 // ---------------------------------------------------------------------------
 
-function aftGrepSearch(
+async function aftGrepSearch(
   query: string,
   searchDir: string,
   benchmarkRoot: string | null,
   k: number,
   binaryPath: string | null
-): { results: SearchResult[]; latency_ms: number } {
+): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
   const bin = binaryPath || "aft";
   const start = performance.now();
   let results: SearchResult[] = [];
 
   try {
-    const { spawnSync } = require("child_process");
-
-    const commands = [
-      JSON.stringify({
+    const commands: Record<string, unknown>[] = [
+      {
         id: "cfg-aft",
         command: "configure",
         harness: "opencode",
         project_root: targetDir,
         storage_dir: join(targetDir, ".aft-bench"),
-      }),
-      JSON.stringify({
+      },
+      {
         id: "search-aft",
         command: "grep",
         pattern: query,
         max_results: k,
-      }),
-    ].join("\n");
+      },
+    ];
 
-    const result = spawnSync(bin, [], {
-      input: commands + "\n",
-      encoding: "utf-8",
-      timeout: 30000,
-      stdio: "pipe",
-    });
+    const responses = await aftNdjson(bin, commands, 60000);
 
-    if (result.stdout) {
-      const lines = result.stdout.trim().split("\n").filter(Boolean);
-      for (const line of lines.reverse()) {
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed.results && Array.isArray(parsed.results)) {
-            results = parsed.results.map((r: any) => ({
-              file: r.file_path || r.path || r.file || "",
-              line: r.start_line || r.line,
-              score: r.score,
-            }));
-            break;
-          }
-        } catch {}
+    for (const parsed of [...responses].reverse()) {
+      if (parsed.results && Array.isArray(parsed.results)) {
+        results = (parsed.results as any[]).map((r: any) => ({
+          file: r.file_path || r.path || r.file || "",
+          line: r.start_line || r.line,
+          score: r.score,
+        }));
+        break;
       }
     }
   } catch {}
@@ -321,7 +293,7 @@ function aftGrepSearch(
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   let cacheDir = ".bench-cache";
   let inputFile = "benchmarks/semble/fixtures.json";
@@ -389,7 +361,7 @@ function main() {
     });
 
     // FTS5 mode
-    const { results: fts5Results, latency_ms: fts5Latency } = fts5Search(
+    const { results: fts5Results, latency_ms: fts5Latency } = await fts5Search(
       ann.query,
       repoDir,
       repo.benchmark_root,
@@ -412,7 +384,7 @@ function main() {
     }
 
     // AFT grep mode (trigram-indexed)
-    const { results: aftResults, latency_ms: aftLatency } = aftGrepSearch(
+    const { results: aftResults, latency_ms: aftLatency } = await aftGrepSearch(
       ann.query,
       repoDir,
       repo.benchmark_root,
