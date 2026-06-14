@@ -85,7 +85,7 @@ interface BaselineReport {
 // ---------------------------------------------------------------------------
 
 function normalizePath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+  return p.replace(/\\/g, "/").replace(/^\/\?\//, "").replace(/^\.\//, "");
 }
 
 function recallAtK(
@@ -163,8 +163,9 @@ async function fts5Search(
     const responses = await aftNdjson(binaryPath, commands, 60000);
 
     for (const parsed of [...responses].reverse()) {
-      if (parsed.results && Array.isArray(parsed.results)) {
-        results = (parsed.results as any[]).map((r: any) => ({
+      const items = parsed.results || parsed.matches;
+      if (items && Array.isArray(items)) {
+        results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || "",
           line: r.start_line || r.line,
           score: r.score,

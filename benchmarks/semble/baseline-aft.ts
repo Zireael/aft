@@ -20,6 +20,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
+import { join, resolve } from "path";
 import { aftNdjson } from "./aft-ndjson";
 
 // ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ interface BaselineReport {
 // ---------------------------------------------------------------------------
 
 function normalizePath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+  return p.replace(/\\/g, "/").replace(/^\/\?\//, "").replace(/^\.\//, "");
 }
 
 function recallAtK(
@@ -172,8 +173,10 @@ async function aftSearch(
     const responses = await aftNdjson(binaryPath, commands, 60000);
 
     for (const parsed of [...responses].reverse()) {
-      if (parsed.results && Array.isArray(parsed.results)) {
-        results = (parsed.results as any[]).map((r: any) => ({
+      // Handle both "results" (semantic_search) and "matches" (grep) response formats
+      const items = parsed.results || parsed.matches;
+      if (items && Array.isArray(items)) {
+        results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || r.file || "",
           line: r.start_line || r.line,
           score: r.score,
@@ -261,7 +264,7 @@ async function main() {
       ...ann.secondary.map((r) => r.path),
     ];
 
-    const { results, latency_ms } = aftSearch(
+    const { results, latency_ms } = await aftSearch(
       ann.query,
       repoDir,
       repo.benchmark_root,

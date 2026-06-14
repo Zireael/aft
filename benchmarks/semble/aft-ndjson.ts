@@ -53,16 +53,16 @@ export function aftNdjson(
       if (!trimmed) return;
       try {
         const parsed = JSON.parse(trimmed) as AftResponse;
+        // Skip push frames (they have "type" not "id")
+        if (!parsed.id || parsed.type) return;
         responses.push(parsed);
-        // Resolve after we've received all expected responses
+        // Resolve after we've received all expected command responses
         if (responses.length >= commands.length && !resolved) {
           resolved = true;
           clearTimeout(timer);
           rl.close();
           child.stdin!.end();
-          // Give the process a moment to exit cleanly
           child.on("exit", () => resolve(responses));
-          // Force resolve after a short delay if exit doesn't fire
           setTimeout(() => {
             if (!resolved) {
               resolved = true;
