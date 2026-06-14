@@ -145,6 +145,7 @@ async function fts5Search(
         harness: "opencode",
         project_root: targetDir,
         storage_dir: join(targetDir, ".aft-bench"),
+        fts5: { enabled: true },
       },
       {
         id: "idx-fts5",
