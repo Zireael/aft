@@ -106,6 +106,8 @@ pub mod windows_shell;
 #[cfg(feature = "semantic-fts5")]
 pub mod fts5_experimental;
 #[cfg(feature = "semantic-fts5")]
+pub mod fts5_indexer;
+#[cfg(feature = "semantic-fts5")]
 pub mod fts5_store;
 
 #[cfg(test)]
