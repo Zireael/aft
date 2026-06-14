@@ -182,6 +182,12 @@ export interface AftConfig {
   restrict_to_project_root?: boolean;
   search_index?: boolean;
   semantic_search?: boolean;
+  fts5?: {
+    enabled?: boolean;
+    auto_index?: boolean;
+    index_on_start?: boolean;
+    max_results?: number;
+  };
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;
   /**

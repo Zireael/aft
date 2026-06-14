@@ -301,6 +301,15 @@ export const AftConfigSchema = z
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
     semantic_search: z.boolean().optional(),
+    /** FTS5 full-text search configuration. Default: { enabled: false }. */
+    fts5: z
+      .object({
+        enabled: z.boolean().optional(),
+        auto_index: z.boolean().optional(),
+        index_on_start: z.boolean().optional(),
+        max_results: z.number().optional(),
+      })
+      .optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
     /**
