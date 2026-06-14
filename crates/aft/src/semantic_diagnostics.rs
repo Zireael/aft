@@ -1504,7 +1504,7 @@ mod tests {
             format_warning_minimal(&SearchWarning::RerankerFailure {
                 reason: "err".into()
             }),
-            None
+            Some("⚠ reranker unavailable, using original order".to_string())
         );
     }
 
