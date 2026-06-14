@@ -21,6 +21,8 @@ benchmarks/semble/
 ├── import.ts                # Semble annotation importer
 ├── corpus.ts                # Repo clone/cache tooling
 ├── baseline-rg.ts           # Ripgrep lexical-only baseline
+├── baseline-aft.ts          # AFT grep/semantic/hybrid baseline
+├── baseline-fts5.ts         # FTS5 baseline
 ├── speed.ts                 # Cold-start index + query latency
 ├── pilot.ts                 # Multi-mode pilot runner
 ├── token-efficiency.ts      # Recall@token_budget curves
@@ -46,8 +48,14 @@ Clones 5 repos (axum, express, pydantic, serde, gin) into `.bench-cache/` and ch
 # Ripgrep lexical baseline
 bun run benchmarks/semble/baseline-rg.ts --pilot --k 10
 
+# AFT grep baseline (trigram-indexed, no embedding model needed)
+bun run benchmarks/semble/baseline-aft.ts --pilot --k 10 --binary ./target/release/aft
+
+# AFT semantic baseline (requires embedding model configured)
+bun run benchmarks/semble/baseline-aft.ts --pilot --k 10 --binary ./target/release/aft --mode semantic
+
 # FTS5 baseline
-bun run benchmarks/semble/baseline-fts5.ts --pilot --k 10
+bun run benchmarks/semble/baseline-fts5.ts --pilot --k 10 --binary ./target/release/aft
 ```
 
 Runs search against all annotations and produces recall@10, MRR, and latency metrics.
@@ -55,10 +63,10 @@ Runs search against all annotations and produces recall@10, MRR, and latency met
 ### 3. Run the full pilot
 
 ```bash
-bun run benchmarks/semble/pilot.ts --cache-dir .bench-cache --k 10
+bun run benchmarks/semble/pilot.ts --binary ./target/release/aft --k 10
 ```
 
-Compares lexical mode across all 50 queries. When AFT binary is available, also runs semantic, hybrid, and reranked modes.
+Compares lexical (ripgrep), AFT grep (trigram-indexed), FTS5, and semantic modes across all 50 queries. Produces a single `pilot-report.json` with aggregate and per-category breakdowns.
 
 ### 4. Check for regressions
 
