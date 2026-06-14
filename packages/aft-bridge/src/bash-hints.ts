@@ -126,6 +126,12 @@ function collectPathOperands(firstStage: string, startAfterCommand: number): str
     const tokenResult = readShellToken(firstStage, index);
     if (tokenResult === null) break;
     const { token, end } = tokenResult;
+    // No forward progress means readShellToken is parked on a redirection/
+    // operator boundary char (`<`, `>`, `|`, `;`, `&`) that it returns as an
+    // empty token without advancing. Stop here: grep's search-path operands
+    // precede any redirection, and continuing would spin forever (e.g.
+    // `grep p f 2>/dev/null` parks on `>`). This guarantees loop termination.
+    if (end <= index) break;
     index = skipSpaces(firstStage, end);
 
     if (token.startsWith("-")) continue;

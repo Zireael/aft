@@ -32,6 +32,7 @@ mock.module("solid-js", () => ({
 const {
   collapsedCompressionValue,
   collapsedHealthLights,
+  degradedReasonLabel,
   formatCompressionSidebarRows,
   isSnapshotForContext,
   resolveTuiStorageDir,
@@ -107,6 +108,18 @@ describe("sidebar compression rows", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]).toEqual({ kind: "scope", label: "Project" });
     expect(rows.some((row) => row.kind === "scope" && row.label === "Session")).toBe(false);
+  });
+});
+
+describe("degradedReasonLabel", () => {
+  test("renders watcher_unavailable as a non-alarming degraded-mode note", () => {
+    expect(degradedReasonLabel("watcher_unavailable")).toBe(
+      "file watcher unavailable; continuing without live external-change invalidation",
+    );
+  });
+
+  test("keeps unknown degraded reason codes visible", () => {
+    expect(degradedReasonLabel("custom_reason")).toBe("custom_reason");
   });
 });
 

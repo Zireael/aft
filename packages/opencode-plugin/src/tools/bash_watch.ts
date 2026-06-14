@@ -25,7 +25,7 @@ const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
   | { kind: "substring"; value: string }
-  | { kind: "regex"; value: RegExp; source: string };
+  | { kind: "regex"; source: string };
 export type BashStatusWaited = {
   reason: "matched" | "exited" | "timeout" | "user_message";
   elapsed_ms: number;
@@ -263,6 +263,9 @@ export async function waitForBashStatus(
   let scanText = "";
   let scanBaseOffset = 0;
   const bridgeOptions: BridgeRequestOptions = {};
+  if (waitFor?.kind === "regex") {
+    await validateWaitRegex(ctx, runtime, waitFor);
+  }
   // Clear any stale abort flag from a previous turn so it doesn't insta-abort
   // this new wait.
   clearSyncWatchAbort(runtime.sessionID);
@@ -278,7 +281,12 @@ export async function waitForBashStatus(
           spillCursor = scan.nextCursor;
           if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
           scanText += scan.text;
-          const match = findWaitMatch(scanText, waitFor);
+          if (waitFor.kind === "regex") {
+            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
+            scanText = trimmed.text;
+            scanBaseOffset = trimmed.baseOffset;
+          }
+          const match = await findWaitMatch(ctx, runtime, scanText, waitFor);
           if (match) {
             if (terminal) {
               sawTerminal = true;
@@ -292,13 +300,14 @@ export async function waitForBashStatus(
               reason: "matched",
               elapsed_ms: Date.now() - startedAt,
               match: match.text,
-              match_offset:
-                scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
+              match_offset: scanBaseOffset + match.byteOffset,
             });
           }
-          const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
-          scanText = trimmed.text;
-          scanBaseOffset = trimmed.baseOffset;
+          if (waitFor.kind === "substring") {
+            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
+            scanText = trimmed.text;
+            scanBaseOffset = trimmed.baseOffset;
+          }
         }
       }
       if (terminal) {
@@ -390,8 +399,7 @@ async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Bu
 
 export function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
-  if (isRegexWaitObject(value))
-    return { kind: "regex", value: new RegExp(value.regex), source: value.regex };
+  if (isRegexWaitObject(value)) return { kind: "regex", source: value.regex };
   return undefined;
 }
 function isRegexWaitObject(value: unknown): value is { regex: string } {
@@ -402,17 +410,55 @@ function isRegexWaitObject(value: unknown): value is { regex: string } {
     typeof (value as { regex?: unknown }).regex === "string"
   );
 }
-function findWaitMatch(
+
+type WaitMatch = { text: string; byteOffset: number };
+
+async function validateWaitRegex(
+  ctx: PluginContext,
+  runtime: ToolContext,
+  pattern: Extract<BashWaitPattern, { kind: "regex" }>,
+): Promise<void> {
+  await matchRegexWithBridge(ctx, runtime, pattern.source, "");
+}
+
+async function findWaitMatch(
+  ctx: PluginContext,
+  runtime: ToolContext,
   text: string,
   pattern: BashWaitPattern,
-): { text: string; index: number } | undefined {
+): Promise<WaitMatch | undefined> {
   if (pattern.kind === "substring") {
     const index = text.indexOf(pattern.value);
-    return index >= 0 ? { text: pattern.value, index } : undefined;
+    return index >= 0
+      ? { text: pattern.value, byteOffset: Buffer.byteLength(text.slice(0, index), "utf8") }
+      : undefined;
   }
-  pattern.value.lastIndex = 0;
-  const match = pattern.value.exec(text);
-  return match ? { text: match[0], index: match.index } : undefined;
+  return await matchRegexWithBridge(ctx, runtime, pattern.source, text);
+}
+
+async function matchRegexWithBridge(
+  ctx: PluginContext,
+  runtime: ToolContext,
+  pattern: string,
+  text: string,
+): Promise<WaitMatch | undefined> {
+  const result = await callBashBridge(ctx, runtime, "bash_regex_match", { pattern, text });
+  if (result.success === false) {
+    const code = String(result.code ?? "invalid_request");
+    const message = String(result.message ?? "bash_regex_match failed");
+    if (code === "invalid_regex") throw new Error(`invalid_request: invalid_regex: ${message}`);
+    throw new Error(`${code}: ${message}`);
+  }
+  if (result.matched !== true) return undefined;
+  return {
+    text: typeof result.match_text === "string" ? result.match_text : "",
+    byteOffset: coerceMatchOffset(result.match_offset),
+  };
+}
+
+function coerceMatchOffset(value: unknown): number {
+  const offset = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(offset) && offset >= 0 ? offset : 0;
 }
 
 function trimWaitScanBuffer(

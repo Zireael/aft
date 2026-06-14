@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { tagStderrLine } from "../bridge.js";
+import { shouldSurfaceStderrLine, tagStderrLine } from "../bridge.js";
 
 describe("tagStderrLine — never doubles the [aft] prefix", () => {
   for (const { name, line, expected } of [
@@ -79,5 +79,22 @@ describe("tagStderrLine — never doubles the [aft] prefix", () => {
     // we don't pretend the tag matches; we add our own.
     const line = "  [aft] indented";
     expect(tagStderrLine(line)).toBe(`[aft] ${line}`);
+  });
+});
+
+describe("shouldSurfaceStderrLine — filters only benign cpuinfo sandbox noise", () => {
+  test("filters the known ONNX/cpuinfo /proc/cpuinfo parse failure", () => {
+    expect(
+      shouldSurfaceStderrLine(
+        "Error in cpuinfo: failed to parse processor information from /proc/cpuinfo",
+      ),
+    ).toBe(false);
+  });
+
+  test("keeps genuine stderr errors visible", () => {
+    expect(shouldSurfaceStderrLine("Error in aft: failed to parse request JSON")).toBe(true);
+    expect(shouldSurfaceStderrLine("Error in cpuinfo: failed to allocate processor table")).toBe(
+      true,
+    );
   });
 });

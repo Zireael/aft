@@ -194,6 +194,25 @@ export function collapsedCompressionValue(
 
 export type HealthLightTone = "ok" | "warn" | "err";
 
+// Degraded-mode reason → human-readable hint. Distinct strings per reason
+// because the UX direction is different: "home_root" tells the user to open a
+// real project subdirectory, "search_too_many_files" tells them the tree is too
+// big for full indexing, and "watcher_unavailable" is an honest soft
+// degradation (AFT continues without live external-change invalidation).
+export function degradedReasonLabel(reason: string): string {
+  if (reason === "home_root") {
+    return "project root is your home directory";
+  }
+  if (reason.startsWith("search_too_many_files:")) {
+    const threshold = reason.split(":")[1] ?? "20000";
+    return `project exceeds ${threshold} files`;
+  }
+  if (reason === "watcher_unavailable") {
+    return "file watcher unavailable; continuing without live external-change invalidation";
+  }
+  return reason; // unknown reason — surface verbatim so users can grep logs
+}
+
 export interface HealthLights {
   // Diagnostics: red if any errors, yellow if any warnings, else green.
   diagnostics: HealthLightTone;
@@ -543,20 +562,6 @@ const SidebarContent = (props: {
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
   const statusBar = () => s()?.status_bar;
 
-  // Degraded-mode reason → human-readable hint. Distinct strings per reason
-  // because the UX direction is different: "home_root" tells the user to
-  // open a real project subdirectory, "search_too_many_files" tells them the
-  // tree is too big for full indexing.
-  const degradedReasonLabel = (reason: string): string => {
-    if (reason === "home_root") {
-      return "project root is your home directory";
-    }
-    if (reason.startsWith("search_too_many_files:")) {
-      const threshold = reason.split(":")[1] ?? "20000";
-      return `project exceeds ${threshold} files`;
-    }
-    return reason; // unknown reason — surface verbatim so users can grep logs
-  };
   const degradedSummary = () => {
     const snap = s();
     if (!snap?.degraded) return null;

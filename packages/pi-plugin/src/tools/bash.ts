@@ -39,6 +39,7 @@ import {
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
+  BridgeError,
   bridgeFor,
   callBridge,
   coerceOptionalInt,
@@ -57,6 +58,7 @@ const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
+const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
@@ -849,9 +851,7 @@ function bashKillResult(
   };
 }
 
-type BashWaitPattern =
-  | { kind: "substring"; value: string }
-  | { kind: "regex"; value: RegExp; source: string };
+type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; source: string };
 type OutputCursor = { output: number; stderr: number; combined: number };
 
 async function bashStatusSnapshot(
@@ -889,6 +889,9 @@ async function waitForBashStatus(
     keepBridgeOnTimeout: true,
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
   };
+  if (waitFor?.kind === "regex") {
+    await validateWaitRegex(bridge, extCtx, waitFor);
+  }
 
   // Pre-mark BEFORE first poll: ingestBgCompletions will suppress any push
   // frame that arrives while we're waiting, so no wake is ever scheduled for
@@ -910,7 +913,12 @@ async function waitForBashStatus(
           spillCursor = scan.nextCursor;
           if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
           scanText += scan.text;
-          const match = findWaitMatch(scanText, waitFor);
+          if (waitFor.kind === "regex") {
+            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
+            scanText = trimmed.text;
+            scanBaseOffset = trimmed.baseOffset;
+          }
+          const match = await findWaitMatch(bridge, extCtx, scanText, waitFor);
           if (match) {
             if (waitForExit && terminal) {
               sawTerminal = true;
@@ -924,9 +932,13 @@ async function waitForBashStatus(
               reason: "matched",
               elapsed_ms: Date.now() - startedAt,
               match: match.text,
-              match_offset:
-                scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
+              match_offset: scanBaseOffset + match.byteOffset,
             });
+          }
+          if (waitFor.kind === "substring") {
+            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
+            scanText = trimmed.text;
+            scanBaseOffset = trimmed.baseOffset;
           }
         }
       }
@@ -1030,9 +1042,12 @@ async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Bu
 
 function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
-  if (isRegexWaitObject(value))
-    return { kind: "regex", value: new RegExp(value.regex), source: value.regex };
+  if (isRegexWaitObject(value)) return { kind: "regex", source: value.regex };
   return undefined;
+}
+
+export function __parseWaitPatternForTests(value: unknown): BashWaitPattern | undefined {
+  return parseWaitPattern(value);
 }
 
 function isRegexWaitObject(value: unknown): value is { regex: string } {
@@ -1044,17 +1059,101 @@ function isRegexWaitObject(value: unknown): value is { regex: string } {
   );
 }
 
-function findWaitMatch(
+type WaitMatch = { text: string; byteOffset: number };
+
+async function validateWaitRegex(
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
+  pattern: Extract<BashWaitPattern, { kind: "regex" }>,
+): Promise<void> {
+  await matchRegexWithBridge(bridge, extCtx, pattern.source, "");
+}
+
+async function findWaitMatch(
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
   text: string,
   pattern: BashWaitPattern,
-): { text: string; index: number } | undefined {
+): Promise<WaitMatch | undefined> {
   if (pattern.kind === "substring") {
     const index = text.indexOf(pattern.value);
-    return index >= 0 ? { text: pattern.value, index } : undefined;
+    return index >= 0
+      ? { text: pattern.value, byteOffset: Buffer.byteLength(text.slice(0, index), "utf8") }
+      : undefined;
   }
-  pattern.value.lastIndex = 0;
-  const match = pattern.value.exec(text);
-  return match ? { text: match[0], index: match.index } : undefined;
+  return await matchRegexWithBridge(bridge, extCtx, pattern.source, text);
+}
+
+async function matchRegexWithBridge(
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
+  pattern: string,
+  text: string,
+): Promise<WaitMatch | undefined> {
+  try {
+    const result = await callBashBridge(bridge, "bash_regex_match", { pattern, text }, extCtx);
+    if (result.matched !== true) return undefined;
+    return {
+      text: typeof result.match_text === "string" ? result.match_text : "",
+      byteOffset: coerceMatchOffset(result.match_offset),
+    };
+  } catch (err) {
+    if (err instanceof BridgeError && err.code === "invalid_regex") {
+      throw new Error(`invalid_request: invalid_regex: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+function coerceMatchOffset(value: unknown): number {
+  const offset = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(offset) && offset >= 0 ? offset : 0;
+}
+
+function trimWaitScanBuffer(
+  text: string,
+  baseOffset: number,
+  pattern: BashWaitPattern,
+): { text: string; baseOffset: number } {
+  const keepFrom =
+    pattern.kind === "substring"
+      ? substringKeepStart(text, pattern.value)
+      : regexKeepStart(text, REGEX_WAIT_SCAN_WINDOW_BYTES);
+  if (keepFrom <= 0) return { text, baseOffset };
+
+  return {
+    text: text.slice(keepFrom),
+    baseOffset: baseOffset + Buffer.byteLength(text.slice(0, keepFrom), "utf8"),
+  };
+}
+
+function substringKeepStart(text: string, pattern: string): number {
+  const keepChars = Math.max(0, pattern.length - 1);
+  return text.length > keepChars ? text.length - keepChars : 0;
+}
+
+function regexKeepStart(text: string, maxBytes: number): number {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return 0;
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(text.slice(mid), "utf8") > maxBytes) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+export function __trimWaitScanBufferForTests(
+  text: string,
+  baseOffset: number,
+  pattern: BashWaitPattern,
+): { text: string; baseOffset: number } {
+  return trimWaitScanBuffer(text, baseOffset, pattern);
 }
 
 function withWaited(

@@ -1914,6 +1914,10 @@ fn humanize_one(code: &str) -> String {
             threshold
         );
     }
+    if code == "watcher_unavailable" {
+        return "file watcher unavailable; continuing without live external-change invalidation"
+            .to_string();
+    }
     format!("(Degraded: {})", code)
 }
 
@@ -2183,13 +2187,18 @@ mod tests {
         let reasons = vec![
             "home_root".to_string(),
             "search_too_many_files:20000".to_string(),
+            "watcher_unavailable".to_string(),
             "custom".to_string(),
         ];
         let human = humanize_degraded_reasons(&reasons);
         assert!(human[0].contains("home directory"));
         assert!(human[1].contains("search_index threshold (20000 files)"));
         assert!(human[1].contains("Narrow project_root"));
-        assert_eq!(human[2], "(Degraded: custom)");
+        assert_eq!(
+            human[2],
+            "file watcher unavailable; continuing without live external-change invalidation"
+        );
+        assert_eq!(human[3], "(Degraded: custom)");
         assert!(human.join("; ").contains("; "));
     }
 

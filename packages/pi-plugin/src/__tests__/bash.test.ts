@@ -16,7 +16,11 @@ import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notifications.js";
-import { registerBashTool } from "../tools/bash.js";
+import {
+  __parseWaitPatternForTests,
+  __trimWaitScanBufferForTests,
+  registerBashTool,
+} from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
 
 // Minimal mock types
@@ -114,6 +118,24 @@ function toolText(result: unknown): string {
 }
 
 describe("bash tool adapter", () => {
+  test("regex wait patterns keep raw source without compiling JS RegExp", () => {
+    const pattern = __parseWaitPatternForTests({ regex: "(" });
+
+    expect(pattern).toEqual({ kind: "regex", source: "(" });
+    expect("value" in pattern!).toBe(false);
+  });
+
+  test("regex watches retain at most a 64 KB rolling scan window", () => {
+    const pattern = __parseWaitPatternForTests({ regex: "not-found" });
+    expect(pattern).toBeDefined();
+    const text = "x".repeat(80 * 1024);
+
+    const trimmed = __trimWaitScanBufferForTests(text, 5, pattern!);
+
+    expect(Buffer.byteLength(trimmed.text, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    expect(trimmed.baseOffset).toBe(5 + 16 * 1024);
+  });
+
   test("schema has comprehensive descriptions", () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -709,9 +731,106 @@ describe("bash tool adapter", () => {
         match: "ready",
         match_offset: 6,
       });
+      expect(calls.some((call) => (call as [string])[0] === "bash_regex_match")).toBe(false);
       const callArgs = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
       expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
       expect(callArgs[2].transportTimeoutMs).toBe(30_000);
+    } finally {
+      await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch pattern regex routes to bridge and returns waited matched details", async () => {
+    const outputPath = await spill("abc ready: 4242\n");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const calls: unknown[] = [];
+      const bridge = {
+        send: async (...args: unknown[]) => {
+          calls.push(args);
+          const [command, params] = args as [string, Record<string, unknown>];
+          if (command === "bash_regex_match") {
+            return {
+              success: true,
+              matched: params.text === "abc ready: 4242\n",
+              match_text: "ready: 4242",
+              match_offset: 4,
+              match_index_chars: 4,
+            };
+          }
+          return {
+            success: true,
+            status: "running",
+            mode: "pipes",
+            output_path: outputPath,
+          };
+        },
+      } as unknown as BinaryBridge;
+      registerBashTool(api, makeMockContext(bridge));
+
+      const result = (await tools
+        .get("bash_watch")!
+        .execute(
+          "call",
+          { task_id: "bash-pi-regex", pattern: { regex: "ready: \\d+" } },
+          undefined,
+          undefined,
+          { cwd: "/test" },
+        )) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
+
+      expect(toolText(result)).toContain('matched "ready: 4242" at offset 4');
+      expect(result.details.waited).toMatchObject({
+        reason: "matched",
+        match: "ready: 4242",
+        match_offset: 4,
+      });
+      expect(calls.filter((call) => (call as [string])[0] === "bash_regex_match")).toEqual([
+        expect.arrayContaining([
+          "bash_regex_match",
+          expect.objectContaining({ pattern: "ready: \\d+", text: "" }),
+        ]),
+        expect.arrayContaining([
+          "bash_regex_match",
+          expect.objectContaining({ pattern: "ready: \\d+", text: "abc ready: 4242\n" }),
+        ]),
+      ]);
+    } finally {
+      await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch pattern regex surfaces invalid_regex as invalid_request", async () => {
+    const outputPath = await spill("abc ready\n");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const bridge = {
+        send: async (command: string) => {
+          if (command === "bash_regex_match") {
+            return { success: false, code: "invalid_regex", message: "unclosed group" };
+          }
+          return {
+            success: true,
+            status: "running",
+            mode: "pipes",
+            output_path: outputPath,
+          };
+        },
+      } as unknown as BinaryBridge;
+      registerBashTool(api, makeMockContext(bridge));
+
+      await expect(
+        tools
+          .get("bash_watch")!
+          .execute(
+            "call",
+            { task_id: "bash-pi-regex-invalid", pattern: { regex: "(" } },
+            undefined,
+            undefined,
+            { cwd: "/test" },
+          ),
+      ).rejects.toThrow("invalid_request: invalid_regex");
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }

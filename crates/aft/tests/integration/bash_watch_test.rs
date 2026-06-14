@@ -106,6 +106,40 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
 }
 
 #[test]
+fn bash_regex_match_command_uses_multiline_regex_and_byte_offsets() {
+    let mut aft = AftProcess::spawn();
+    let response = aft.send(
+        &json!({
+            "id": "regex-match",
+            "command": "bash_regex_match",
+            "params": { "pattern": "^foo$", "text": "α\nfoo\nbar" }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "regex match failed: {response:?}"
+    );
+    assert_eq!(response["matched"], true);
+    assert_eq!(response["match_text"], "foo");
+    assert_eq!(response["match_offset"], 3);
+    assert_eq!(response["match_index_chars"], 2);
+
+    let invalid = aft.send(
+        &json!({
+            "id": "regex-invalid",
+            "command": "bash_regex_match",
+            "params": { "pattern": "(", "text": "" }
+        })
+        .to_string(),
+    );
+    assert_eq!(invalid["success"], false);
+    assert_eq!(invalid["code"], "invalid_regex");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn register_pattern_watch_returns_watch_id() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);

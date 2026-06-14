@@ -773,7 +773,7 @@ describe("bash_status tool", () => {
     const outputPath = await spill("prefix Server listening on port 3000\n");
     try {
       const metadata = mock(() => {});
-      const { watchTool } = makeCtx(() => ({
+      const { calls, watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
@@ -789,25 +789,71 @@ describe("bash_status tool", () => {
         match: "Server listening",
         match_offset: 7,
       });
+      expect(calls.some((call) => call.cmd === "bash_regex_match")).toBe(false);
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }
   });
 
-  test("bash_watch pattern regex match returns matched reason, text, and offset", async () => {
+  test("bash_watch pattern regex match routes to bridge and returns matched details", async () => {
     const outputPath = await spill("abc ready: 4242\n");
     try {
-      const { watchTool } = makeCtx(() => ({
-        success: true,
-        status: "running",
-        mode: "pipes",
-        output_path: outputPath,
-      }));
+      const { calls, watchTool } = makeCtx((cmd, params) => {
+        if (cmd === "bash_regex_match") {
+          return {
+            success: true,
+            matched: params.text === "abc ready: 4242\n",
+            match_text: "ready: 4242",
+            match_offset: 4,
+            match_index_chars: 4,
+          };
+        }
+        return {
+          success: true,
+          status: "running",
+          mode: "pipes",
+          output_path: outputPath,
+        };
+      });
       const result = await watchTool.execute(
         { taskId: "bash-regex", pattern: { regex: "ready: \\d+" } },
         createMockSdkContext(),
       );
       expect(result).toContain('matched "ready: 4242" at offset 4');
+      expect(calls.filter((call) => call.cmd === "bash_regex_match")).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({ pattern: "ready: \\d+", text: "" }),
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({ pattern: "ready: \\d+", text: "abc ready: 4242\n" }),
+        }),
+      ]);
+    } finally {
+      await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch pattern regex surfaces invalid_regex as invalid_request", async () => {
+    const outputPath = await spill("abc ready\n");
+    try {
+      const { watchTool } = makeCtx((cmd) => {
+        if (cmd === "bash_regex_match") {
+          return { success: false, code: "invalid_regex", message: "unclosed group" };
+        }
+        return {
+          success: true,
+          status: "running",
+          mode: "pipes",
+          output_path: outputPath,
+        };
+      });
+
+      await expect(
+        watchTool.execute(
+          { taskId: "bash-regex-invalid", pattern: { regex: "(" } },
+          createMockSdkContext(),
+        ),
+      ).rejects.toThrow("invalid_request: invalid_regex: unclosed group");
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }

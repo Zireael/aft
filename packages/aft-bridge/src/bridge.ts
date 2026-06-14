@@ -70,6 +70,22 @@ export function tagStderrLine(line: string): string {
   return /^\[aft(-\w+)?\] /.test(line) ? line : `[aft] ${line}`;
 }
 
+const BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE =
+  "failed to parse processor information from /proc/cpuinfo";
+
+/**
+ * Return false only for the known benign third-party cpuinfo line emitted by
+ * ONNX Runtime's bundled pytorch/cpuinfo library in restricted Linux sandboxes.
+ * This line is not an AFT failure; all other child stderr must still surface.
+ */
+export function shouldSurfaceStderrLine(line: string): boolean {
+  const normalized = line.trim();
+  return !(
+    normalized === `Error in cpuinfo: ${BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE}` ||
+    normalized === BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE
+  );
+}
+
 export function compareSemver(a: string, b: string): number {
   const [aMain, aPre] = a.split("-", 2);
   const [bMain, bPre] = b.split("-", 2);
@@ -194,6 +210,12 @@ export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
   /**
+   * Consecutive silent request timeouts (no id-matched response) before the
+   * bridge is killed and respawned. Default: 2. Child stdout activity since
+   * the request still keeps the bridge warm regardless of this counter.
+   */
+  hangThreshold?: number;
+  /**
    * Extra environment variables to set on the spawned `aft` child process,
    * applied on top of the inherited `process.env` at spawn time. Use this to
    * scope per-bridge child env (e.g. `AFT_CACHE_DIR` in tests) WITHOUT mutating
@@ -225,20 +247,11 @@ export interface BridgeOptions {
     reminder: BashLongRunningPayload,
     bridge: BinaryBridge,
   ) => void | Promise<void>;
-  /** Called for server-pushed bash pattern watch matches. */
+  /** Called when a registered bash_watch pattern matches on stdout/stderr. */
   onBashPatternMatch?: (frame: BashPatternMatchFrame, bridge: BinaryBridge) => void | Promise<void>;
-  /**
-   * Prefix for user-facing error messages thrown by the bridge (e.g. timeout,
-   * stdin-write, configure-failure errors). Hosts pass their own tag so the
-   * agent and operators see consistent attribution. Defaults to `[aft-bridge]`.
-   */
+  /** Prefix for error messages. Default: "[aft-bridge]" */
   errorPrefix?: string;
-  /**
-   * Optional logger to use for this bridge's diagnostics. When omitted, the
-   * bridge falls back to the active-logger singleton (set via
-   * `setActiveLogger`). Matches the same option on `BridgePool` (Oracle F9) so
-   * hosts that bundle aft-bridge multiple times can route logs deterministically.
-   */
+  /** Optional structured logger; falls back to active logger / console. */
   logger?: Logger;
 }
 
@@ -336,6 +349,7 @@ export class BinaryBridge {
   private _restartCount = 0;
   private _shuttingDown = false;
   private timeoutMs: number;
+  private hangThreshold: number;
   private maxRestarts: number;
   private configured = false;
   private _configurePromise: Promise<void> | null = null;
@@ -383,6 +397,7 @@ export class BinaryBridge {
     this.binaryPath = binaryPath;
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
+    this.hangThreshold = options?.hangThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
     this.maxRestarts = options?.maxRestarts ?? 3;
     this.configOverrides = clampSemanticTimeout(configOverrides ?? {}, this.timeoutMs);
     this.minVersion = options?.minVersion;
@@ -686,8 +701,7 @@ export class BinaryBridge {
           const childActiveSinceRequest = this.lastChildActivityAt > requestSentAt;
           const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
           this.consecutiveRequestTimeouts = consecutiveTimeouts;
-          const keepWarm =
-            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD;
+          const keepWarm = childActiveSinceRequest || consecutiveTimeouts < this.hangThreshold;
           const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
@@ -1129,7 +1143,7 @@ export class BinaryBridge {
     while ((newlineIdx = this.stderrBuffer.indexOf("\n")) !== -1) {
       const line = this.stderrBuffer.slice(0, newlineIdx).replace(/\r$/, "");
       this.stderrBuffer = this.stderrBuffer.slice(newlineIdx + 1);
-      if (!line) continue;
+      if (!line || !shouldSurfaceStderrLine(line)) continue;
       const tagged = tagStderrLine(line);
       this.logVia(tagged);
       this.pushStderrLine(tagged);
@@ -1139,7 +1153,7 @@ export class BinaryBridge {
   private flushStderrBuffer(): void {
     const line = this.stderrBuffer.replace(/\r$/, "");
     this.stderrBuffer = "";
-    if (!line) return;
+    if (!line || !shouldSurfaceStderrLine(line)) return;
     const tagged = tagStderrLine(line);
     this.logVia(tagged);
     this.pushStderrLine(tagged);

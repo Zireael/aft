@@ -13,6 +13,13 @@ describe("bash_watch audit regressions", () => {
     expect(trimmed.baseOffset).toBe(11);
   });
 
+  test("regex wait patterns keep raw source without compiling JS RegExp", () => {
+    const pattern = parseWaitPattern({ regex: "(" });
+
+    expect(pattern).toEqual({ kind: "regex", source: "(" });
+    expect("value" in pattern!).toBe(false);
+  });
+
   test("regex watches retain at most a 64 KB rolling scan window", () => {
     const pattern = parseWaitPattern({ regex: "not-found" });
     expect(pattern).toBeDefined();

@@ -183,3 +183,43 @@ describe("maybeAppendGrepSearchHint", () => {
     );
   });
 });
+
+describe("maybeAppendGrepSearchHint — redirection operand scan terminates", () => {
+  // Regression: collectPathOperands looped forever when a grep statement
+  // contained a redirection (`2>/dev/null`). readShellToken parks on `>` and
+  // returns an empty token without advancing, so the operand `while` spun
+  // without progress and blocked the event loop (hung the host). A reaching
+  // value (not a timeout) here proves the scan now terminates.
+  const PROJECT_ROOT = "/Users/dev/proj";
+
+  test("the reported hang command returns instead of looping", () => {
+    const command = [
+      "cd ~/proj/packages/plugin",
+      'echo "=== does it PREPEND or APPEND? synthetic? ==="',
+      'grep -rnE "synthetic|unshift|push\\(|role:\\s*\\"user\\"|parts\\.push|\\.text \\+=|ctx-search-hint|messages\\.splice" src/hooks/auto-search-hint.ts 2>/dev/null | head -25',
+      'echo ""',
+      "ls src/hooks/auto-search*.ts 2>/dev/null",
+    ].join("\n");
+    // Must return (terminate); value itself is not the point.
+    const out = maybeAppendGrepSearchHint("matches found", command, true, PROJECT_ROOT);
+    expect(typeof out).toBe("string");
+  });
+
+  test("grep with redirection still collects the in-project path operand (hint fires)", () => {
+    const command = "grep -rn foo src/index.ts 2>/dev/null";
+    const out = maybeAppendGrepSearchHint("hit", command, true, PROJECT_ROOT);
+    expect(out).toContain(AFT_SEARCH_HINT);
+  });
+
+  test("grep with redirection to an out-of-project path is suppressed", () => {
+    const command = "grep -rn foo /etc/hosts 2>/dev/null";
+    const out = maybeAppendGrepSearchHint("hit", command, true, PROJECT_ROOT);
+    expect(out).toBe("hit");
+  });
+
+  test("grep redirection with no path operand (recursive cwd) still fires", () => {
+    const command = "grep -rn foo 2>/dev/null";
+    const out = maybeAppendGrepSearchHint("hit", command, true, PROJECT_ROOT);
+    expect(out).toContain(AFT_SEARCH_HINT);
+  });
+});
