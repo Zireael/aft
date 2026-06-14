@@ -19,8 +19,11 @@ opencode-aft/
 │   ├── pi-rpc/                # Pi RPC protocol tests
 │   └── windows-e2e/           # Windows end-to-end tests
 ├── benchmarks/                # Performance benchmarks (search, compression, retrieval, semantic)
+│   └── semble/                # Semble benchmark suite (FTS5 baseline, pilot runner)
 ├── scripts/                   # Release, validation, and version-management scripts
 ├── docs/                      # User-facing documentation
+│   ├── fts5.md                # FTS5 side feature documentation
+│   └── fts5-graduation-report.md  # FTS5 graduation decision report
 ├── assets/                    # Repository assets (banner image, etc.)
 ├── .github/workflows/         # CI and release automation workflows
 │   ├── _e2e-suite.yml         # Shared E2E test suite template
