@@ -106,7 +106,15 @@ The schema is identical across harnesses. Only file location differs.
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
     "timeout_ms": 25000,                // per-request timeout, kept under bridge limit
     "max_batch_size": 64,               // embeddings batched in groups of this size
-    "max_files": 20000                  // max files indexed (default 20000); raise for remote backends
+    "max_files": 20000,                 // max files indexed (default 20000); raise for remote backends
+    "dimensions": null,                 // optional: override embedding dimensions (null = provider default)
+    "distance_metric": "auto",          // "auto" | "cosine" | "euclidean" | "dot" | "hamming"
+    "diagnostics_enabled": false,       // enable per-query search diagnostics
+    "output_mode": "minimal",           // "minimal" | "verbose" — diagnostic detail in aft_search output
+    "rerank_enabled": false,            // enable reranking via OpenAI-compatible endpoint
+    "rerank_api_type": "chat",          // "chat" | "rerank" — reranker API style
+    "rerank_max_candidate_chars": null, // max chars for reranker candidate snippets (null = no limit)
+    "cap_per_file": null                // max results per file (null = default from fusion logic)
   },
 
   // Model2Vec backend — a pure-Rust static embedding alternative to fastembed.
