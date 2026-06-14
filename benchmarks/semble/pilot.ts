@@ -183,6 +183,78 @@ function rgSearch(
 }
 
 // ---------------------------------------------------------------------------
+// FTS5 mode
+// ---------------------------------------------------------------------------
+
+function fts5Search(
+  query: string,
+  searchDir: string,
+  benchmarkRoot: string | null,
+  k: number,
+  binaryPath: string | null
+): { results: SearchResult[]; latency_ms: number } {
+  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
+  const bin = binaryPath || "aft";
+  const start = performance.now();
+  let results: SearchResult[] = [];
+
+  try {
+    // Spawn aft process and send configure + fts5_index + fts5_search
+    const { spawnSync } = require("child_process");
+
+    // Write NDJSON commands to stdin
+    const commands = [
+      JSON.stringify({
+        id: "cfg-fts5",
+        command: "configure",
+        harness: "opencode",
+        project_root: targetDir,
+        storage_dir: join(targetDir, ".aft-bench"),
+      }),
+      JSON.stringify({
+        id: "idx-fts5",
+        command: "fts5_index",
+        action: "update",
+      }),
+      JSON.stringify({
+        id: "search-fts5",
+        command: "fts5_search",
+        query,
+        scope: "all",
+        top_k: k,
+      }),
+    ].join("\n");
+
+    const result = spawnSync(bin, [], {
+      input: commands + "\n",
+      encoding: "utf-8",
+      timeout: 30000,
+      stdio: "pipe",
+    });
+
+    if (result.stdout) {
+      const lines = result.stdout.trim().split("\n").filter(Boolean);
+      // Find the search response (last JSON line that has results)
+      for (const line of lines.reverse()) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.results && Array.isArray(parsed.results)) {
+            results = parsed.results.map((r: any) => ({
+              file: r.file_path || r.path || "",
+              line: r.start_line || r.line,
+              score: r.score,
+            }));
+            break;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return { results, latency_ms: performance.now() - start };
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -192,6 +264,7 @@ function main() {
   let inputFile = "benchmarks/semble/fixtures.json";
   let k = 10;
   let outputFile = "pilot-report.json";
+  let binaryPath: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -206,6 +279,9 @@ function main() {
         break;
       case "--output":
         outputFile = args[++i];
+        break;
+      case "--binary":
+        binaryPath = args[++i];
         break;
     }
   }
@@ -248,6 +324,29 @@ function main() {
       mrr: mrr(rgResults, allRelevant),
       ndcg_at_k: ndcgAtK(rgResults, allRelevant, k),
     });
+
+    // FTS5 mode
+    const { results: fts5Results, latency_ms: fts5Latency } = fts5Search(
+      ann.query,
+      repoDir,
+      repo.benchmark_root,
+      k,
+      binaryPath
+    );
+
+    if (fts5Results.length > 0) {
+      allResults.push({
+        mode: "fts5",
+        query: ann.query,
+        repo_name: ann.repo_name,
+        category: ann.category,
+        latency_ms: fts5Latency,
+        results: fts5Results,
+        recall_at_k: recallAtK(fts5Results, allRelevant, k),
+        mrr: mrr(fts5Results, allRelevant),
+        ndcg_at_k: ndcgAtK(fts5Results, allRelevant, k),
+      });
+    }
   }
 
   // Aggregate by mode

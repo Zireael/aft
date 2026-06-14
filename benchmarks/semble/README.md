@@ -40,13 +40,17 @@ bun run benchmarks/semble/corpus.ts sync --pilot
 
 Clones 5 repos (axum, express, pydantic, serde, gin) into `.bench-cache/` and checks out pinned commits.
 
-### 2. Run the baseline benchmark
+### 2. Run the baseline benchmarks
 
 ```bash
+# Ripgrep lexical baseline
 bun run benchmarks/semble/baseline-rg.ts --pilot --k 10
+
+# FTS5 baseline
+bun run benchmarks/semble/baseline-fts5.ts --pilot --k 10
 ```
 
-Runs ripgrep lexical search against all annotations and produces recall@10, MRR, and latency metrics.
+Runs search against all annotations and produces recall@10, MRR, and latency metrics.
 
 ### 3. Run the full pilot
 
