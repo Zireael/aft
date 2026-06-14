@@ -22,7 +22,7 @@ name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
 
 [features]
-default = ["semantic-model2vec", "semantic-fts5"]
+default = ["semantic-model2vec"]
 semantic-model2vec = ["dep:model2vec-rs"]
 semantic-fts5 = []
 
