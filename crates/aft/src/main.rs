@@ -677,6 +677,7 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
 
         match ctx.semantic_index_status().borrow().clone() {
             SemanticIndexStatus::Ready { .. }
+            | SemanticIndexStatus::Partial { .. }
             | SemanticIndexStatus::Disabled
             | SemanticIndexStatus::Failed(_) => return None,
             SemanticIndexStatus::Building { stage, .. } => {

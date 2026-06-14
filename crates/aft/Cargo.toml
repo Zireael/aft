@@ -21,11 +21,17 @@ path = "src/main.rs"
 name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
 
+[features]
+default = ["semantic-model2vec", "semantic-fts5"]
+semantic-model2vec = ["dep:model2vec-rs"]
+semantic-fts5 = []
+
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
 portable-pty = "0.9"
@@ -99,6 +105,7 @@ ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray
 # tokenizers. The pure-Rust fancy-regex backend satisfies tokenizers
 # compile-time regex selection without pulling in onig's C library.
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["fancy-regex", "local-only"], optional = true }
 ndarray = "0.17.2"
 half = "2"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }

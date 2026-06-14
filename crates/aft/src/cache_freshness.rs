@@ -86,6 +86,7 @@ pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdi
 /// indexed file, and the semantic load/build already runs beside the bridge's
 /// single dispatch thread. Match the half-cores/cap-8 policy used by the search
 /// and callgraph cold-build pools.
+#[allow(dead_code)]
 pub(crate) fn verify_files_strict_bounded<K: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
 ) -> Vec<(K, PathBuf, FreshnessVerdict)> {
@@ -110,6 +111,7 @@ pub(crate) fn verify_files_strict_bounded<K: Send>(
     }
 }
 
+#[allow(dead_code)]
 fn strict_verify_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())

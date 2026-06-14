@@ -246,7 +246,7 @@ pub fn handle_semantic_doctor(req: &RawRequest, ctx: &crate::context::AppContext
         index: index_summary,
         metrics: metrics_summary,
         provider: provider_summary,
-        model2vec_health: build_model2vec_health(&*ctx.config()),
+        model2vec_health: build_model2vec_health(&ctx.config()),
         warnings,
         suggestions,
     };
