@@ -476,6 +476,27 @@ impl Fts5Store {
         Ok(result)
     }
 
+    /// Get a file record by ID.
+    pub fn get_file_by_id(&self, file_id: i64) -> Result<Option<FileRecord>, Fts5StoreError> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT id, path, hash, mtime_secs, indexed_at FROM fts5_files WHERE id = ?1",
+                params![file_id],
+                |row| {
+                    Ok(FileRecord {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        hash: row.get(2)?,
+                        mtime_secs: row.get(3)?,
+                        indexed_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     /// Get all file records.
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>, Fts5StoreError> {
         let mut stmt = self.conn.prepare(
