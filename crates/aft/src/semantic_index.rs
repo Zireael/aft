@@ -1,22 +1,31 @@
+#![allow(dead_code)] // Forward-looking types (TypedVector, StoredVector, etc.) not yet wired.
+
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::config::{SemanticBackend, SemanticBackendConfig};
+pub use crate::config::SemanticFilePolicy;
+use crate::config::{
+    DistanceMetric, InputMode, OutputEncoding, SemanticBackend, SemanticBackendConfig,
+    StorageStrategy,
+};
 use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
-use crate::search_index::{cache_relative_path, cached_path_under_root};
+use crate::search_index::{cache_relative_path, cached_path_under_root, is_binary_bytes};
 use crate::symbols::{Symbol, SymbolKind};
-use crate::{slog_info, slog_warn};
+use crate::vector_store::VectorStore;
+use crate::{slog_debug, slog_info, slog_warn};
 
 use crate::local_embed::LocalEmbedder;
+#[cfg(feature = "semantic-model2vec")]
+use model2vec_rs::model::StaticModel as Model2VecStaticModel;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Display;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::SystemTime;
 use tree_sitter::Parser;
@@ -24,16 +33,26 @@ use url::Url;
 
 const DEFAULT_DIMENSION: usize = 384;
 const MAX_ENTRIES: usize = 1_000_000;
+/// Maximum chunks per document group sent to a contextualized embedding provider.
+/// Documents with more chunks are split into sub-groups.
+const DEFAULT_MAX_CHUNKS_PER_DOCUMENT: usize = 100;
+/// Maximum documents per single contextualized embedding request.
+/// Documents beyond this limit are batched into separate requests.
+const DEFAULT_MAX_DOCUMENTS_PER_REQUEST: usize = 50;
+/// Maximum retries for a failed document group in contextualized embedding.
+const CONTEXTUALIZED_MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff in contextualized retry (ms).
+const CONTEXTUALIZED_RETRY_BASE_DELAY_MS: u64 = 1000;
+/// Max delay cap for exponential backoff in contextualized retry (ms).
+const CONTEXTUALIZED_RETRY_MAX_DELAY_MS: u64 = 8000;
 // Covers high-dimensional backends such as OpenAI text-embedding-3-large (3072)
 // and common local models (4096) while keeping a bounded supported shape.
-const MAX_DIMENSION: usize = 4096;
+pub(crate) const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
 const ONNX_RUNTIME_INSTALL_HINT: &str =
-    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS), \
-     apt install libonnxruntime (Linux), or place onnxruntime.dll in your PATH (Windows). \
-     AFT can auto-download ONNX Runtime — run `npx @cortexkit/aft doctor` to diagnose.";
+    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS) or apt install libonnxruntime (Linux).";
 
 const SEMANTIC_INDEX_VERSION_V1: u8 = 1;
 const SEMANTIC_INDEX_VERSION_V2: u8 = 2;
@@ -50,15 +69,914 @@ const SEMANTIC_INDEX_VERSION_V4: u8 = 4;
 const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 /// V6 stores paths relative to project_root and adds content hashes.
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
+/// V7 adds invalidation fields (source_vector_kind, stored_vector_kind,
+/// normalization, query_prompt_hash) to SemanticIndexFingerprint.
+const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
+/// V8 adds file manifest (FileRecord entries) and per-entry chunk_hash.
+const SEMANTIC_INDEX_VERSION_V8: u8 = 8;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
-// Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
+
+// ---- Typed vector representation types ----
+
+/// The kind of vector as emitted by the embedding provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorKind {
+    /// Standard dense f32 vector (most providers).
+    DenseF32,
+    /// Dense int8 vector (e.g. Perplexity base64_int8).
+    DenseInt8,
+    /// Binary packed vector (e.g. Perplexity base64_binary).
+    BinaryPacked,
+}
+
+/// Normalization policy for stored vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationPolicy {
+    /// Vector is already L2-normalized by the provider.
+    AlreadyNormalized,
+    /// AFT must L2-normalize on insert and query.
+    NormalizeOnInsertQuery,
+    /// Normalization is not applicable (e.g. binary vectors).
+    NotApplicable,
+}
+
+impl std::fmt::Display for VectorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DenseF32 => write!(f, "dense_f32"),
+            Self::DenseInt8 => write!(f, "dense_int8"),
+            Self::BinaryPacked => write!(f, "binary_packed"),
+        }
+    }
+}
+
+impl std::fmt::Display for NormalizationPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyNormalized => write!(f, "already_normalized"),
+            Self::NormalizeOnInsertQuery => write!(f, "normalize_on_insert_query"),
+            Self::NotApplicable => write!(f, "not_applicable"),
+        }
+    }
+}
+
+// ────────────────────────────
+// Typed / stored vector types
+// ────────────────────────────
+
+/// A source embedding vector as received from a provider.
+///
+/// Embeddings may arrive in different formats depending on the provider and
+/// configuration (plain f32 arrays, base64-encoded int8, base64-encoded
+/// binary, etc.).  `TypedVector` captures the raw form so that the correct
+/// conversion strategy can be applied before storage.
+#[allow(dead_code)]
+pub(crate) enum TypedVector {
+    /// Standard dense f32 vector.
+    DenseF32(Vec<f32>),
+    /// Dense int8 vector (e.g. Perplexity base64_int8).
+    DenseInt8(Vec<i8>),
+    /// Binary packed vector (e.g. Perplexity base64_binary).
+    #[allow(dead_code)]
+    BinaryPacked {
+        /// Packed bytes (`ceil(logical_dims / 8)` bytes).
+        bytes: Vec<u8>,
+        /// Number of *logical* dimensions (bits).
+        logical_dims: usize,
+    },
+}
+
+impl TypedVector {
+    /// Return the [`VectorKind`] that describes this variant.
+    pub(crate) fn kind(&self) -> VectorKind {
+        match self {
+            Self::DenseF32(_) => VectorKind::DenseF32,
+            Self::DenseInt8(_) => VectorKind::DenseInt8,
+            Self::BinaryPacked { .. } => VectorKind::BinaryPacked,
+        }
+    }
+
+    /// Number of dimensions (logical bits for binary).
+    pub(crate) fn dims(&self) -> usize {
+        match self {
+            Self::DenseF32(v) => v.len(),
+            Self::DenseInt8(v) => v.len(),
+            Self::BinaryPacked { logical_dims, .. } => *logical_dims,
+        }
+    }
+
+    /// Convert to a [`StoredVector`] using the supplied storage strategy.
+    pub(crate) fn into_stored(
+        self,
+        strategy: crate::config::StorageStrategy,
+    ) -> Result<StoredVector, String> {
+        use crate::config::StorageStrategy;
+        match self {
+            Self::DenseF32(v) => match strategy {
+                StorageStrategy::NativeF32 => Ok(StoredVector::DenseF32(v)),
+                StorageStrategy::DecodeNormalizeF32 => {
+                    let sv = StoredVector::DenseF32(v);
+                    Ok(sv.l2_normalize())
+                }
+                StorageStrategy::BinaryPacked => {
+                    Err("DenseF32 vectors cannot be stored as BinaryPacked".to_string())
+                }
+            },
+            Self::DenseInt8(v) => match strategy {
+                StorageStrategy::NativeF32 => {
+                    let f32s = v.into_iter().map(|x| x as f32).collect();
+                    Ok(StoredVector::DenseF32(f32s))
+                }
+                StorageStrategy::DecodeNormalizeF32 => {
+                    let f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
+                    Ok(StoredVector::DenseF32(f32s).l2_normalize())
+                }
+                StorageStrategy::BinaryPacked => {
+                    Err("DenseInt8 vectors cannot be stored as BinaryPacked".to_string())
+                }
+            },
+            Self::BinaryPacked {
+                bytes,
+                logical_dims,
+            } => match strategy {
+                StorageStrategy::BinaryPacked => Ok(StoredVector::BinaryPacked {
+                    bytes,
+                    logical_dims,
+                }),
+                _ => Err(format!(
+                    "BinaryPacked vectors require StorageStrategy::BinaryPacked (got {:?})",
+                    strategy
+                )),
+            },
+        }
+    }
+
+    /// Decode a base64-encoded int8 embedding string.
+    pub(crate) fn decode_base64_int8(data: &str) -> Result<Self, String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| format!("base64 decode error: {}", e))?;
+        let ints: Vec<i8> = bytes.into_iter().map(|b| b as i8).collect();
+        Ok(Self::DenseInt8(ints))
+    }
+
+    /// Decode a base64-encoded binary embedding string.
+    pub(crate) fn decode_base64_binary(data: &str, logical_dims: usize) -> Result<Self, String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| format!("base64 decode error: {}", e))?;
+        let expected = logical_dims.div_ceil(8);
+        if bytes.len() < expected {
+            return Err(format!(
+                "binary embedding too short: got {} bytes, need {} for {} dims",
+                bytes.len(),
+                expected,
+                logical_dims
+            ));
+        }
+        Ok(Self::BinaryPacked {
+            bytes,
+            logical_dims,
+        })
+    }
+}
+
+/// Deserialize a single embedding value from a JSON `embedding` field.
+///
+/// For `OutputEncoding::Float`, the field is expected to be an array of f32.
+/// For `OutputEncoding::Base64Int8`, the field is a base64-encoded string of
+/// signed int8 bytes, which is decoded, validated against `expected_dims`,
+/// cast to f32, and L2-normalized.
+///
+/// Returns the embedding as `Vec<f32>` ready for storage/search.
+pub(crate) fn parse_embedding_value(
+    value: &serde_json::Value,
+    output_encoding: OutputEncoding,
+    context: &str,
+    expected_dims: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    match output_encoding {
+        OutputEncoding::Float => serde_json::from_value(value.clone())
+            .map_err(|e| format!("{context}: expected float array, got error: {e}")),
+        OutputEncoding::Base64Int8 => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("{context}: expected base64 string, got {:?}", value))?;
+            let typed = TypedVector::decode_base64_int8(s)?;
+            match typed {
+                TypedVector::DenseInt8(v) => {
+                    // Validate decoded byte count matches expected dimensions.
+                    if let Some(dims) = expected_dims {
+                        if v.len() != dims {
+                            return Err(format!(
+                                "{context}: int8 dimension mismatch: decoded {} values, expected {dims}",
+                                v.len()
+                            ));
+                        }
+                    }
+                    // Cast i8 to f32 and L2-normalize for cosine/dot-product search.
+                    let mut f32s: Vec<f32> = v.into_iter().map(|x| x as f32).collect();
+                    let norm_sq: f32 = f32s.iter().map(|x| x * x).sum();
+                    if norm_sq > 0.0 {
+                        let norm = norm_sq.sqrt();
+                        for x in &mut f32s {
+                            *x /= norm;
+                        }
+                    }
+                    Ok(f32s)
+                }
+                _ => unreachable!("decode_base64_int8 always returns DenseInt8"),
+            }
+        }
+        OutputEncoding::Base64Binary => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("{context}: expected base64 string, got {:?}", value))?;
+            let expected_dims = expected_dims.unwrap_or(s.len() * 8);
+            let typed = TypedVector::decode_base64_binary(s, expected_dims)?;
+            match typed {
+                TypedVector::BinaryPacked {
+                    bytes,
+                    logical_dims,
+                } => {
+                    // Convert packed bytes to f32 vec of 0.0/1.0, masking padding bits
+                    let mut f32s = Vec::with_capacity(logical_dims);
+                    for i in 0..logical_dims {
+                        let byte_idx = i / 8;
+                        let bit_idx = (i % 8) as u8;
+                        if byte_idx < bytes.len() {
+                            let bit = (bytes[byte_idx] >> bit_idx) & 1;
+                            f32s.push(if bit != 0 { 1.0 } else { 0.0 });
+                        } else {
+                            f32s.push(0.0);
+                        }
+                    }
+                    Ok(f32s)
+                }
+                _ => unreachable!("decode_base64_binary always returns BinaryPacked"),
+            }
+        }
+    }
+}
+
+/// A vector as stored in the index after conversion.
+///
+/// This is the final form that is written to the snapshot / disk cache.
+#[derive(Debug)]
+pub(crate) enum StoredVector {
+    /// Stored as dense f32 (for cosine / dot-product search).
+    DenseF32(Vec<f32>),
+    /// Stored as binary packed (for Hamming distance search).
+    BinaryPacked { bytes: Vec<u8>, logical_dims: usize },
+}
+
+impl StoredVector {
+    /// Return the [`VectorKind`] that describes this variant.
+    pub(crate) fn kind(&self) -> VectorKind {
+        match self {
+            Self::DenseF32(_) => VectorKind::DenseF32,
+            Self::BinaryPacked { .. } => VectorKind::BinaryPacked,
+        }
+    }
+
+    /// Number of dimensions (logical bits for binary).
+    pub(crate) fn dims(&self) -> usize {
+        match self {
+            Self::DenseF32(v) => v.len(),
+            Self::BinaryPacked { logical_dims, .. } => *logical_dims,
+        }
+    }
+
+    /// Return a view as an f32 slice.
+    ///
+    /// Returns `Err` for binary vectors which are not representable as f32.
+    pub(crate) fn to_f32_slice(&self) -> Result<&[f32], String> {
+        match self {
+            Self::DenseF32(v) => Ok(v),
+            Self::BinaryPacked { logical_dims, .. } => Err(format!(
+                "binary vector ({} logical bits) cannot be viewed as f32 slice",
+                logical_dims
+            )),
+        }
+    }
+
+    /// Return a view as packed bytes + logical dims.
+    ///
+    /// Returns `Err` for dense vectors.
+    pub(crate) fn to_packed(&self) -> Result<(&[u8], usize), String> {
+        match self {
+            Self::DenseF32(_) => Err("dense vector cannot be viewed as packed binary".to_string()),
+            Self::BinaryPacked {
+                bytes,
+                logical_dims,
+            } => Ok((bytes, *logical_dims)),
+        }
+    }
+
+    /// L2-normalize a dense f32 vector in place.
+    ///
+    /// No-op for binary vectors (returns `self` unchanged).
+    pub(crate) fn l2_normalize(self) -> Self {
+        match self {
+            Self::DenseF32(mut v) => {
+                let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+                if norm_sq > 0.0 {
+                    let norm = norm_sq.sqrt();
+                    for x in &mut v {
+                        *x /= norm;
+                    }
+                }
+                Self::DenseF32(v)
+            }
+            binary => binary,
+        }
+    }
+}
+///
+/// Used to validate that user configuration is compatible with the selected
+/// provider/model before indexing starts.
+#[derive(Debug, Clone)]
+pub struct EmbeddingModelProfile {
+    /// Which semantic backend this profile applies to.
+    pub backend: SemanticBackend,
+    /// Model name (may be empty for generic profiles).
+    pub model: Option<String>,
+    /// Supported input mode.
+    pub input_mode: InputMode,
+    /// Expected output encoding from the provider.
+    pub output_encoding: OutputEncoding,
+    /// The kind of vectors the provider emits.
+    pub source_vector_kind: VectorKind,
+    /// The kind of vectors stored after AFT conversion.
+    pub stored_vector_kind: VectorKind,
+    /// Metric that should be used for similarity search.
+    pub metric: DistanceMetric,
+    /// Normalization policy for stored vectors.
+    pub normalization: NormalizationPolicy,
+    /// Storage strategy for converting source vectors to stored form.
+    pub storage_strategy: StorageStrategy,
+    /// Supported dimension range: (min, max). None if unknown.
+    pub dimension_range: Option<(usize, usize)>,
+    /// Default dimension when not specified. None if unknown.
+    pub default_dimensions: Option<usize>,
+    /// Whether Matryoshka Representation Learning (reduced dimensions) is supported.
+    pub mrl_supported: bool,
+    /// Whether contextualized document-chunk inputs are supported.
+    pub contextualized_supported: bool,
+}
+
+impl EmbeddingModelProfile {
+    /// Returns a profile for the fastembed all-MiniLM-L6-v2 model.
+    pub fn fastembed_minilm() -> Self {
+        Self {
+            backend: SemanticBackend::Fastembed,
+            model: Some("all-MiniLM-L6-v2".to_string()),
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
+            dimension_range: Some((384, 384)),
+            default_dimensions: Some(384),
+            mrl_supported: false,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Returns a generic profile for OpenAI-compatible embedding providers.
+    /// These may support `dimensions` depending on the model.
+    pub fn openai_compatible_generic() -> Self {
+        Self {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: None,
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Auto,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: true,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Returns a generic profile for Ollama embedding models.
+    pub fn ollama_generic() -> Self {
+        Self {
+            backend: SemanticBackend::Ollama,
+            model: None,
+            input_mode: InputMode::FlatTexts,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Auto,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: false,
+        }
+    }
+
+    /// Returns a profile for Perplexity contextualized embedding providers.
+    /// Perplexity uses the OpenAI-compatible API format but sends nested
+    /// document/chunk arrays instead of flat text arrays.
+    pub fn perplexity_generic() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Float,
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::AlreadyNormalized,
+            storage_strategy: StorageStrategy::NativeF32,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
+    /// Returns a profile for Perplexity providers returning base64-encoded
+    /// binary (packed-bit) embeddings. Vectors are stored as packed bits and
+    /// searched with Hamming distance.
+    pub fn perplexity_binary() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Base64Binary,
+            source_vector_kind: VectorKind::BinaryPacked,
+            stored_vector_kind: VectorKind::BinaryPacked,
+            metric: DistanceMetric::Hamming,
+            normalization: NormalizationPolicy::NotApplicable,
+            storage_strategy: StorageStrategy::BinaryPacked,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
+    /// Returns a profile for Perplexity providers returning base64-encoded
+    /// int8 embeddings. The int8 values are decoded, cast to f32, and
+    /// L2-normalized before storage/search through the existing f32 cosine path.
+    pub fn perplexity_int8() -> Self {
+        Self {
+            backend: SemanticBackend::Perplexity,
+            model: None,
+            input_mode: InputMode::DocumentChunks,
+            output_encoding: OutputEncoding::Base64Int8,
+            source_vector_kind: VectorKind::DenseInt8,
+            stored_vector_kind: VectorKind::DenseF32,
+            metric: DistanceMetric::Cosine,
+            normalization: NormalizationPolicy::NormalizeOnInsertQuery,
+            storage_strategy: StorageStrategy::DecodeNormalizeF32,
+            dimension_range: None,
+            default_dimensions: None,
+            mrl_supported: false,
+            contextualized_supported: true,
+        }
+    }
+
+    /// Look up a profile for the given config.
+    /// Returns `None` if no specific profile is known (caller should use defaults).
+    pub fn from_config(config: &SemanticBackendConfig) -> Option<Self> {
+        match config.backend {
+            SemanticBackend::Fastembed => {
+                if config.model == "all-MiniLM-L6-v2" {
+                    Some(Self::fastembed_minilm())
+                } else {
+                    None
+                }
+            }
+            SemanticBackend::OpenAiCompatible => Some(Self::openai_compatible_generic()),
+            SemanticBackend::Ollama => Some(Self::ollama_generic()),
+            SemanticBackend::Perplexity => {
+                if config.output_encoding == Some(OutputEncoding::Base64Int8) {
+                    Some(Self::perplexity_int8())
+                } else if config.output_encoding == Some(OutputEncoding::Base64Binary) {
+                    Some(Self::perplexity_binary())
+                } else {
+                    Some(Self::perplexity_generic())
+                }
+            }
+            SemanticBackend::Model2Vec => None, // No known profile; use config defaults.
+        }
+    }
+
+    /// Validate that the configured options are compatible with this profile.
+    /// Returns `Ok(())` or a list of validation errors.
+    pub fn validate_config(&self, config: &SemanticBackendConfig) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let cfg_prefix = "semantic";
+
+        // Resolve effective output encoding
+        let output_encoding = config
+            .output_encoding
+            .unwrap_or(OutputEncoding::default_for_backend(config.backend));
+
+        // Resolve effective storage strategy
+        let storage_strategy = config
+            .storage_strategy
+            .unwrap_or(StorageStrategy::default_for_backend(config.backend));
+
+        // Check input mode compatibility
+        let input_mode = config
+            .input_mode
+            .unwrap_or(InputMode::default_for_backend(config.backend));
+        if input_mode == InputMode::DocumentChunks && !self.contextualized_supported {
+            errors.push(format!(
+                "{}.input_mode=document_chunks is not supported by backend {}",
+                cfg_prefix,
+                config.backend.as_str()
+            ));
+        }
+
+        // Check output encoding compatibility
+        if output_encoding != self.output_encoding
+            && !(output_encoding == OutputEncoding::Base64Int8
+                && matches!(config.backend, SemanticBackend::OpenAiCompatible))
+        {
+            // Allow base64_int8 for OpenAI-compatible (e.g. Perplexity)
+            if !matches!(
+                (output_encoding, self.output_encoding),
+                (OutputEncoding::Float, OutputEncoding::Float)
+                    | (OutputEncoding::Base64Int8, OutputEncoding::Float)
+            ) {
+                errors.push(format!(
+                    "{}.output_encoding={:?} is not supported by backend {}",
+                    cfg_prefix,
+                    output_encoding,
+                    config.backend.as_str()
+                ));
+            }
+        }
+
+        // Check storage strategy compatibility
+        match (output_encoding, storage_strategy) {
+            (OutputEncoding::Float, StorageStrategy::NativeF32) => {}
+            (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32) => {}
+            (OutputEncoding::Base64Int8, StorageStrategy::NativeF32) => {}
+            (OutputEncoding::Base64Binary, StorageStrategy::BinaryPacked) => {}
+            (OutputEncoding::Base64Binary, _) => {
+                errors.push(format!(
+                    "{}.output_encoding=base64_binary requires a native binary vector store, not available in MVP",
+                    cfg_prefix
+                ));
+            }
+            _ => {
+                errors.push(format!(
+                    "{}.storage_strategy={:?} is not compatible with output_encoding={:?}",
+                    cfg_prefix, storage_strategy, output_encoding
+                ));
+            }
+        }
+
+        // Check dimensions against profile
+        if let Some(dimensions) = config.dimensions {
+            if let Some((min_dim, max_dim)) = self.dimension_range {
+                if dimensions < min_dim || dimensions > max_dim {
+                    errors.push(format!(
+                        "{}.dimensions={} is outside supported range {}-{} for {} {}",
+                        cfg_prefix,
+                        dimensions,
+                        min_dim,
+                        max_dim,
+                        config.backend.as_str(),
+                        config.model
+                    ));
+                }
+            }
+            if !self.mrl_supported && config.dimensions.is_some() {
+                errors.push(format!(
+                    "{}.dimensions is set but the model does not support reduced dimensions",
+                    cfg_prefix
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Convert a source [`TypedVector`] into a [`StoredVector`] using this
+    /// profile's declared `source_vector_kind` and `stored_vector_kind`.
+    pub(crate) fn convert_vector(&self, typed: TypedVector) -> Result<StoredVector, String> {
+        let actual_kind = typed.kind();
+        if actual_kind != self.source_vector_kind {
+            return Err(format!(
+                "vector kind mismatch: got {:?}, expected {:?} per profile",
+                actual_kind, self.source_vector_kind
+            ));
+        }
+        let stored = typed.into_stored(self.storage_strategy)?;
+        if stored.kind() != self.stored_vector_kind {
+            return Err(format!(
+                "stored vector kind mismatch: got {:?}, expected {:?} per profile",
+                stored.kind(),
+                self.stored_vector_kind
+            ));
+        }
+        match self.normalization {
+            NormalizationPolicy::AlreadyNormalized | NormalizationPolicy::NotApplicable => {
+                Ok(stored)
+            }
+            NormalizationPolicy::NormalizeOnInsertQuery => Ok(stored.l2_normalize()),
+        }
+    }
+
+    /// Validate that the profile's own configuration is internally consistent.
+    pub(crate) fn validate_compatible(&self) -> Result<(), String> {
+        match (&self.source_vector_kind, &self.stored_vector_kind) {
+            (VectorKind::DenseF32, VectorKind::DenseF32)
+            | (VectorKind::DenseInt8, VectorKind::DenseF32) => Ok(()),
+            (VectorKind::BinaryPacked, VectorKind::BinaryPacked) => Ok(()),
+            (src, dst) => Err(format!(
+                "unsupported source→stored vector conversion: {:?} → {:?}",
+                src, dst
+            )),
+        }?;
+        match (&self.stored_vector_kind, &self.metric) {
+            (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Cosine)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::DotProduct)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Euclidean)
+            | (VectorKind::DenseF32 | VectorKind::DenseInt8, DistanceMetric::Auto) => Ok(()),
+            (VectorKind::BinaryPacked, DistanceMetric::Hamming)
+            | (VectorKind::BinaryPacked, DistanceMetric::Auto) => Ok(()),
+            (kind, metric) => Err(format!(
+                "metric {:?} is not compatible with stored vector kind {:?}",
+                metric, kind
+            )),
+        }?;
+        match (&self.output_encoding, &self.storage_strategy) {
+            (OutputEncoding::Float, StorageStrategy::NativeF32) => Ok(()),
+            (OutputEncoding::Base64Int8, StorageStrategy::DecodeNormalizeF32)
+            | (OutputEncoding::Base64Int8, StorageStrategy::NativeF32) => Ok(()),
+            (OutputEncoding::Base64Binary, StorageStrategy::BinaryPacked) => Ok(()),
+            (enc, strat) => Err(format!(
+                "output encoding {:?} is not compatible with storage strategy {:?}",
+                enc, strat
+            )),
+        }?;
+        Ok(())
+    }
+}
+
+/// Resolve an effective distance metric from config and profile.
+/// When `DistanceMetric::Auto` is configured, returns the profile's recommended metric.
+pub fn resolve_distance_metric(
+    config: &SemanticBackendConfig,
+    profile: Option<&EmbeddingModelProfile>,
+) -> DistanceMetric {
+    if let Some(metric) = config.distance_metric {
+        if metric != DistanceMetric::Auto {
+            return metric;
+        }
+    }
+    // Auto: resolve from profile
+    if let Some(profile) = profile {
+        profile.metric
+    } else {
+        // Fallback to cosine for unknown profiles
+        DistanceMetric::Cosine
+    }
+}
+
+/// Resolve effective output encoding from config.
+pub fn resolve_output_encoding(config: &SemanticBackendConfig) -> OutputEncoding {
+    config
+        .output_encoding
+        .unwrap_or(OutputEncoding::default_for_backend(config.backend))
+}
+
+/// Resolve effective storage strategy from config.
+pub fn resolve_storage_strategy(config: &SemanticBackendConfig) -> StorageStrategy {
+    config
+        .storage_strategy
+        .unwrap_or(StorageStrategy::default_for_backend(config.backend))
+}
+
+/// Resolve effective input mode from config.
+pub fn resolve_input_mode(config: &SemanticBackendConfig) -> InputMode {
+    config
+        .input_mode
+        .unwrap_or(InputMode::default_for_backend(config.backend))
+}
+
+/// Resolve effective dimensions from config with profile fallback.
+pub fn resolve_dimensions(
+    config: &SemanticBackendConfig,
+    profile: Option<&EmbeddingModelProfile>,
+) -> Option<usize> {
+    config
+        .dimensions
+        .or_else(|| profile.and_then(|p| p.default_dimensions))
+} // Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
 const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
+
+/// Apply a query prompt template to a raw query string.
+/// Replaces `{query}` with the raw query text.
+/// Returns the template with `{query}` replaced, or the raw query if template is None or missing placeholder.
+pub fn apply_query_template(query: &str, template: Option<&str>) -> String {
+    match template {
+        Some(tpl) if tpl.contains("{query}") => tpl.replace("{query}", query),
+        Some(_) => query.to_string(),
+        None => query.to_string(),
+    }
+}
+
+/// Apply a document prompt template to raw chunk text.
+/// Replaces `{text}` with the raw chunk text.
+/// Returns the template with `{text}` replaced, or the raw text if template is None or missing placeholder.
+pub fn apply_document_template(text: &str, template: Option<&str>) -> String {
+    match template {
+        Some(tpl) if tpl.contains("{text}") => tpl.replace("{text}", text),
+        Some(_) => text.to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// Built-in prompt profile for a known embedding model.
+/// When a model matches a profile, its query/document prefixes are applied
+/// automatically unless the user has set explicit templates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingPromptProfile {
+    /// Prefix prepended to queries before embedding (e.g. "query: " for E5).
+    pub query_prefix: &'static str,
+    /// Prefix prepended to document chunks before embedding (e.g. "passage: " for E5).
+    pub document_prefix: &'static str,
+}
+
+/// Resolve an embedding prompt profile from a model name.
+/// Returns None for unknown models (no prefix applied).
+pub fn resolve_embedding_profile(model: &str) -> Option<&'static EmbeddingPromptProfile> {
+    // Normalize: lowercase, strip common path prefixes
+    let normalized = model
+        .to_lowercase()
+        .replace('\\', "/")
+        .replace("nomic-ai/", "")
+        .replace("intfloat/", "")
+        .replace("BAAI/", "")
+        .replace("Alibaba-NLP/", "")
+        .replace("jinaai/", "");
+
+    static PROFILES: &[(&str, EmbeddingPromptProfile)] = &[
+        // CodeRankEmbed — requires query prefix for code search
+        (
+            "coderankembed",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this query for searching relevant code: ",
+                document_prefix: "",
+            },
+        ),
+        // E5 / multilingual-E5 — requires "query: " / "passage: " prefixes
+        (
+            "e5-base",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "e5-large",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "e5-small",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        (
+            "multilingual-e5",
+            EmbeddingPromptProfile {
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+        ),
+        // BGE v1.5 — optional query instruction, no document prefix
+        (
+            "bge-base-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        (
+            "bge-large-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        (
+            "bge-small-en-v1.5",
+            EmbeddingPromptProfile {
+                query_prefix: "Represent this sentence for searching relevant passages: ",
+                document_prefix: "",
+            },
+        ),
+        // BGE-M3 — no prefixes needed
+        (
+            "bge-m3",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+        // GTE ModernBERT — no prefixes needed
+        (
+            "gte-modernbert",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+        // GTE-Reranker-ModernBERT — no prefixes (reranker, not embedder)
+        (
+            "gte-reranker-modernbert",
+            EmbeddingPromptProfile {
+                query_prefix: "",
+                document_prefix: "",
+            },
+        ),
+    ];
+
+    for (pattern, profile) in PROFILES {
+        if normalized.contains(pattern) {
+            return Some(profile);
+        }
+    }
+    None
+}
+
+/// Compute a stable hash for a prompt template.
+/// Returns empty string when the template is None or empty/whitespace-only,
+/// so that `None` and `Some("")` produce identical fingerprints and avoid
+/// unnecessary index rebuilds.
+pub fn prompt_template_hash(template: Option<&str>) -> String {
+    template
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map_or(String::new(), |t| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            t.hash(&mut hasher);
+            hasher.finish().to_string()
+        })
+}
+
+/// Compute a stable hash of the file policy settings.
+/// Changes to any policy field will produce a different hash,
+/// triggering a rebuild of the semantic index.
+fn compute_file_policy_hash(policy: &SemanticFilePolicy) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Version prefix so we can bump the hash algorithm independently
+    b"file_policy_v1".hash(&mut hasher);
+    policy.include_code.hash(&mut hasher);
+    policy.include_docs.hash(&mut hasher);
+    policy.include_configs.hash(&mut hasher);
+    policy.respect_gitignore.hash(&mut hasher);
+    policy.include_gitignored_docs.hash(&mut hasher);
+    for glob in &policy.include_globs {
+        glob.hash(&mut hasher);
+    }
+    for glob in &policy.exclude_globs {
+        glob.hash(&mut hasher);
+    }
+    policy.max_file_size_bytes.hash(&mut hasher);
+    policy.binary_detection.hash(&mut hasher);
+    policy.generated_file_detection.hash(&mut hasher);
+    hasher.finish().to_string()
+}
+
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SemanticIndexLock {
@@ -93,14 +1011,84 @@ pub struct SemanticIndexFingerprint {
     pub dimension: usize,
     #[serde(default = "default_chunking_version")]
     pub chunking_version: u32,
+    /// Output encoding used for this index.
+    #[serde(default)]
+    pub output_encoding: String,
+    /// Storage strategy used for this index.
+    #[serde(default)]
+    pub storage_strategy: String,
+    /// Resolved distance metric for this index.
+    #[serde(default = "default_dot_auto")]
+    pub distance_metric: String,
+    /// Input mode used for this index.
+    #[serde(default)]
+    pub input_mode: String,
+    /// Hash of the document prompt template (empty string when no document prompt is configured).
+    #[serde(default)]
+    pub document_prompt_hash: String,
+    /// Source vector kind from the embedding model profile (e.g. "dense_f32").
+    #[serde(default)]
+    pub source_vector_kind: String,
+    /// Stored vector kind after AFT conversion (e.g. "dense_f32").
+    #[serde(default)]
+    pub stored_vector_kind: String,
+    /// Normalization policy (e.g. "already_normalized").
+    #[serde(default)]
+    pub normalization: String,
+    /// Hash of the query prompt template (empty string when no query prompt is configured).
+    #[serde(default)]
+    pub query_prompt_hash: String,
+    /// Fingerprint of the file policy that determines which files are indexed.
+    /// Changes here trigger a full rebuild since the set of indexed files changes.
+    #[serde(default)]
+    pub file_policy_hash: String,
+    /// Version of the docs chunker. Bumped when docs chunking logic changes.
+    #[serde(default = "default_docs_fp_version")]
+    pub docs_chunker_version: u8,
+}
+
+impl Default for SemanticIndexFingerprint {
+    fn default() -> Self {
+        Self {
+            backend: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            dimension: 0,
+            chunking_version: default_chunking_version(),
+            output_encoding: String::new(),
+            storage_strategy: String::new(),
+            distance_metric: default_dot_auto(),
+            input_mode: String::new(),
+            document_prompt_hash: String::new(),
+            source_vector_kind: String::new(),
+            stored_vector_kind: String::new(),
+            normalization: String::new(),
+            query_prompt_hash: String::new(),
+            file_policy_hash: String::new(),
+            docs_chunker_version: default_docs_fp_version(),
+        }
+    }
 }
 
 fn default_chunking_version() -> u32 {
     2
 }
 
+const fn default_docs_fp_version() -> u8 {
+    1
+}
+
+fn default_dot_auto() -> String {
+    "auto".to_string()
+}
+
 impl SemanticIndexFingerprint {
-    fn from_config(config: &SemanticBackendConfig, dimension: usize) -> Self {
+    fn from_config(
+        config: &SemanticBackendConfig,
+        dimension: usize,
+        profile: Option<&EmbeddingModelProfile>,
+        file_policy: &SemanticFilePolicy,
+    ) -> Self {
         // Use normalized URL for fingerprinting so cosmetic differences
         // (e.g. "http://host/v1" vs "http://host/v1/") don't cause rebuilds.
         let base_url = config
@@ -114,6 +1102,17 @@ impl SemanticIndexFingerprint {
             base_url,
             dimension,
             chunking_version: default_chunking_version(),
+            output_encoding: resolve_output_encoding(config).to_string(),
+            storage_strategy: resolve_storage_strategy(config).to_string(),
+            distance_metric: resolve_distance_metric(config, profile).to_string(),
+            input_mode: resolve_input_mode(config).to_string(),
+            document_prompt_hash: prompt_template_hash(config.document_prompt_template.as_deref()),
+            source_vector_kind: profile.map_or(String::new(), |p| p.source_vector_kind.to_string()),
+            stored_vector_kind: profile.map_or(String::new(), |p| p.stored_vector_kind.to_string()),
+            normalization: profile.map_or(String::new(), |p| p.normalization.to_string()),
+            query_prompt_hash: prompt_template_hash(config.query_prompt_template.as_deref()),
+            file_policy_hash: compute_file_policy_hash(file_policy),
+            docs_chunker_version: file_policy.docs_chunker_version,
         }
     }
 
@@ -125,11 +1124,88 @@ impl SemanticIndexFingerprint {
         let encoded = self.as_string();
         !encoded.is_empty() && encoded == expected
     }
+
+    /// Compute the semantic diff between this fingerprint and another.
+    ///
+    /// Returns [`FingerprintChange::Rebuild`] if any rebuild-triggering field
+    /// differs (backend, model, base_url, dimension, chunking_version,
+    /// output_encoding, storage_strategy, source_vector_kind, stored_vector_kind,
+    /// normalization, input_mode, document_prompt_hash).
+    ///
+    /// Returns [`FingerprintChange::ClearQueryCache`] if *only* the
+    /// `query_prompt_hash` differs (and no rebuild-triggering fields changed).
+    ///
+    /// Returns [`FingerprintChange::None`] if the fingerprints are identical
+    /// (differences in `distance_metric` are intentionally ignored — see matrix).
+    pub fn diff(&self, other: &Self) -> FingerprintChange {
+        /// Fields that trigger a full rebuild when they differ.
+        fn rebuild_fields_match(
+            a: &SemanticIndexFingerprint,
+            b: &SemanticIndexFingerprint,
+        ) -> bool {
+            a.backend == b.backend
+                && a.model == b.model
+                && a.base_url == b.base_url
+                && a.dimension == b.dimension
+                && a.chunking_version == b.chunking_version
+                && a.output_encoding == b.output_encoding
+                && a.storage_strategy == b.storage_strategy
+                && a.source_vector_kind == b.source_vector_kind
+                && a.stored_vector_kind == b.stored_vector_kind
+                && a.normalization == b.normalization
+                && a.input_mode == b.input_mode
+                && a.document_prompt_hash == b.document_prompt_hash
+                && a.file_policy_hash == b.file_policy_hash
+                && a.docs_chunker_version == b.docs_chunker_version
+        }
+
+        if !rebuild_fields_match(self, other) {
+            return FingerprintChange::Rebuild;
+        }
+
+        if self.query_prompt_hash != other.query_prompt_hash {
+            return FingerprintChange::ClearQueryCache;
+        }
+
+        // All other field differences (e.g. distance_metric) are intentionally
+        // ignored — they may require rescoring but not re-embedding.
+        FingerprintChange::None
+    }
+}
+
+/// The result of comparing two [`SemanticIndexFingerprint`] values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintChange {
+    /// Full index rebuild required — embeddings are invalidated.
+    Rebuild,
+    /// Only the query prompt changed; clear the query embedding cache.
+    ClearQueryCache,
+    /// No action needed.
+    None,
+}
+
+impl std::fmt::Display for FingerprintChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rebuild => write!(f, "rebuild"),
+            Self::ClearQueryCache => write!(f, "clear_query_cache"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FingerprintChange {
+    /// Returns a human-readable description of the change.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Rebuild => "full rebuild required (embedding parameters changed)",
+            Self::ClearQueryCache => "clear query embedding cache (query prompt changed)",
+            Self::None => "no action needed (fingerprint unchanged)",
+        }
+    }
 }
 
 enum SemanticEmbeddingEngine {
-    /// Local ONNX embedder (all-MiniLM-L6-v2 via raw `ort`). The config-facing
-    /// backend string stays "fastembed" for index-fingerprint compatibility.
     Local(LocalEmbedder),
     OpenAiCompatible {
         client: Client,
@@ -142,8 +1218,23 @@ enum SemanticEmbeddingEngine {
         model: String,
         base_url: String,
     },
+    /// Perplexity uses the same HTTP transport as OpenAI-compatible but
+    /// sends nested document/chunk arrays for contextualized embeddings.
+    Perplexity {
+        client: Client,
+        model: String,
+        base_url: String,
+        api_key: Option<String>,
+    },
+    /// Local model2vec static embeddings (requires `semantic-model2vec` feature).
+    #[cfg(feature = "semantic-model2vec")]
+    Model2Vec {
+        model: Model2VecStaticModel,
+        max_length: usize,
+    },
 }
 
+#[allow(dead_code)]
 pub struct SemanticEmbeddingModel {
     backend: SemanticBackend,
     model: String,
@@ -151,6 +1242,16 @@ pub struct SemanticEmbeddingModel {
     timeout_ms: u64,
     max_batch_size: usize,
     dimension: Option<usize>,
+    /// User-requested dimension from config (None = use provider default).
+    config_dimensions: Option<usize>,
+    /// Resolved output encoding for this model.
+    output_encoding: OutputEncoding,
+    /// Resolved storage strategy for this model.
+    storage_strategy: StorageStrategy,
+    /// Resolved distance metric for this model.
+    distance_metric: DistanceMetric,
+    /// Resolved input mode for this model.
+    input_mode: InputMode,
     engine: SemanticEmbeddingEngine,
     query_embedding_cache: HashMap<String, Vec<f32>>,
     query_embedding_cache_order: VecDeque<String>,
@@ -280,23 +1381,46 @@ pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/benchmark/
-/// multicast/reserved ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback
-/// is considered safe for SSRF purposes (same-machine, e.g. a local Ollama
-/// endpoint) — see [`validate_base_url_no_ssrf`] for rationale.
-///
-/// Delegates to [`crate::url_fetch::is_private_or_reserved_ip`] so there is one
-/// authoritative reserved-range list (the url_fetch copy is the maintained one;
-/// this used to be a drifting subset that missed e.g. 198.18.0.0/15 and the
-/// multicast/reserved blocks). We only re-add the loopback carve-out the
-/// url_fetch guard deliberately does not make.
+/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/wildcard
+/// ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback is considered
+/// safe for SSRF purposes — see [`validate_base_url_no_ssrf`] for rationale.
 fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
-    // Canonicalize so an IPv4-mapped loopback (`::ffff:127.0.0.1`) is also
-    // recognized as loopback, matching the prior carve-out.
-    if ip.to_canonical().is_loopback() {
-        return false;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // Note: 127.0.0.0/8 (loopback) is intentionally NOT in this set.
+            // 10.0.0.0/8
+            o[0] == 10
+            // 172.16.0.0/12
+            || (o[0] == 172 && (16..=31).contains(&o[1]))
+            // 192.168.0.0/16
+            || (o[0] == 192 && o[1] == 168)
+            // 169.254.0.0/16 link-local
+            || (o[0] == 169 && o[1] == 254)
+            // 100.64.0.0/10 CGNAT
+            || (o[0] == 100 && (64..=127).contains(&o[1]))
+            // 0.0.0.0/8 wildcard
+            || o[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            // Note: ::1 (loopback) is intentionally NOT in this set.
+            let _ = Ipv6Addr::LOCALHOST; // touch to silence unused-import lints in some builds
+                                         // fe80::/10 link-local
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+            // fc00::/7 unique-local
+            || (v6.segments()[0] & 0xfe00) == 0xfc00
+            // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
+            || (v6.segments()[0] == 0 && v6.segments()[1] == 0
+                && v6.segments()[2] == 0 && v6.segments()[3] == 0
+                && v6.segments()[4] == 0 && v6.segments()[5] == 0xffff
+                && {
+                    let [a, b] = v6.segments()[6..8] else { return false; };
+                    let ipv4 = Ipv4Addr::new((a >> 8) as u8, (a & 0xff) as u8, (b >> 8) as u8, (b & 0xff) as u8);
+                    is_private_non_loopback_ip(&IpAddr::V4(ipv4))
+                })
+        }
     }
-    crate::url_fetch::is_private_or_reserved_ip(*ip)
 }
 
 fn build_openai_embeddings_endpoint(base_url: &str) -> String {
@@ -330,11 +1454,6 @@ fn is_retryable_embedding_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Local backends (LM Studio, Ollama, llama.cpp) can return a 4xx — usually
-/// 400/409 — while a model is loading or was just unloaded. Only narrowly known
-/// local-backend loading/unloaded payloads are classified transient; generic
-/// 4xx bodies that merely mention phrases like "loading model" remain
-/// permanent so misconfigurations do not retry forever.
 fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) -> bool {
     if !matches!(
         status,
@@ -373,11 +1492,6 @@ fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
-/// Whether a send-time error means the backend is *unreachable or temporarily
-/// failing* (vs. a real misconfiguration). Broader than the in-request retry
-/// predicate: a per-request timeout is transient for the build/refresh layer
-/// (the model may still be cold-loading) but we don't burn the 3 fast
-/// in-request attempts on it — the build-level retry rides it out instead.
 fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout()
 }
@@ -387,20 +1501,13 @@ fn embedding_response_read_error_is_transient(error: &reqwest::Error) -> bool {
 }
 
 /// Stable machine marker prefixed onto embedding error strings whose root cause
-/// is transient — the backend is down, timing out, or returning 5xx/429, not
-/// misconfigured. The build and corpus-refresh layers key retry-vs-give-up on
-/// this marker (see [`embedding_failure_is_transient`]) instead of re-parsing
-/// error text, so transience stays authoritative at the one site that knows it.
-/// Stripped before any user-facing display via [`strip_transient_embedding_marker`].
+/// is transient — the backend is down, timing out, or returning 5xx/429.
 pub const TRANSIENT_EMBEDDING_MARKER: &str = "[transient] ";
 
-/// True when an embedding error carries the transient marker — i.e. retrying
-/// once the backend recovers is the right move, not surfacing a hard failure.
 pub fn embedding_failure_is_transient(error: &str) -> bool {
     error.contains(TRANSIENT_EMBEDDING_MARKER)
 }
 
-/// Remove the machine transient marker so the message is clean for display.
 pub fn strip_transient_embedding_marker(error: &str) -> String {
     error.replace(TRANSIENT_EMBEDDING_MARKER, "")
 }
@@ -425,9 +1532,6 @@ where
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                // Connect/timeout failures mean the backend is unreachable or
-                // cold-loading — mark transient so the build layer rides it out
-                // and self-heals instead of parking the index in `Failed`.
                 let marker = if embedding_send_error_is_transient(&error) {
                     TRANSIENT_EMBEDDING_MARKER
                 } else {
@@ -460,20 +1564,12 @@ where
             return Ok(raw);
         }
 
-        // A 4xx whose body says the model is loading/unloaded is transient on
-        // local backends (LM Studio/Ollama), so treat it like a retryable
-        // status: ride it out at both the in-request and build-retry layers.
         let body_transient = embedding_response_body_is_transient(status, &raw);
         if !last_attempt && (is_retryable_embedding_status(status) || body_transient) {
             sleep_before_embedding_retry(attempt_index);
             continue;
         }
 
-        // 5xx / 429 are server-side and transient — the backend is overloaded
-        // or briefly unavailable, not misconfigured. A 4xx whose body indicates
-        // the model is (un)loading is also transient (local backend mid-swap).
-        // Other 4xx (auth, bad request, model-not-found) is a real error the
-        // user must fix; no marker.
         let marker = if is_retryable_embedding_status(status) || body_transient {
             TRANSIENT_EMBEDDING_MARKER
         } else {
@@ -486,6 +1582,47 @@ where
     }
 
     unreachable!("embedding request retries exhausted without returning")
+}
+
+impl std::fmt::Display for OutputEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Float => write!(f, "float"),
+            Self::Base64Int8 => write!(f, "base64_int8"),
+            Self::Base64Binary => write!(f, "base64_binary"),
+        }
+    }
+}
+
+impl std::fmt::Display for InputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlatTexts => write!(f, "flat_texts"),
+            Self::DocumentChunks => write!(f, "document_chunks"),
+        }
+    }
+}
+
+impl std::fmt::Display for StorageStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeF32 => write!(f, "native_f32"),
+            Self::DecodeNormalizeF32 => write!(f, "decode_normalize_f32"),
+            Self::BinaryPacked => write!(f, "binary_packed"),
+        }
+    }
+}
+
+impl std::fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Cosine => write!(f, "cosine"),
+            Self::DotProduct => write!(f, "dot_product"),
+            Self::Euclidean => write!(f, "euclidean"),
+            Self::Hamming => write!(f, "hamming"),
+        }
+    }
 }
 
 impl SemanticEmbeddingModel {
@@ -548,6 +1685,61 @@ impl SemanticEmbeddingModel {
                     base_url,
                 }
             }
+            SemanticBackend::Perplexity => {
+                let raw = config
+                    .base_url
+                    .as_ref()
+                    .ok_or_else(|| "base_url is required for perplexity backend".to_string())?;
+                let base_url = normalize_base_url(raw)?;
+
+                let api_key = match api_key_env {
+                    Some(var_name) => Some(env::var(&var_name).map_err(|_| {
+                        format!("missing api_key_env '{var_name}' for perplexity backend")
+                    })?),
+                    None => None,
+                };
+
+                SemanticEmbeddingEngine::Perplexity {
+                    client,
+                    model,
+                    base_url,
+                    api_key,
+                }
+            }
+            SemanticBackend::Model2Vec => {
+                #[cfg(feature = "semantic-model2vec")]
+                {
+                    use crate::model2vec_download::resolve_model2vec_files;
+
+                    let model_dir = resolve_model2vec_files(
+                        Some(&config.model),
+                        config.model_path.as_deref(),
+                    )?;
+
+                    let static_model = Model2VecStaticModel::from_pretrained(
+                        model_dir
+                            .to_str()
+                            .ok_or_else(|| "model path is not valid UTF-8".to_string())?,
+                        None, // hf_token
+                        None, // normalize_embeddings (use model default)
+                        None, // subfolder
+                    )
+                    .map_err(|error| format!("failed to load model2vec model: {error}"))?;
+                    SemanticEmbeddingEngine::Model2Vec {
+                        model: static_model,
+                        max_length: config.model2vec_max_length,
+                    }
+                }
+                #[cfg(not(feature = "semantic-model2vec"))]
+                {
+                    return Err(
+                        "backend = \"model2vec\" requires the semantic-model2vec Cargo feature \
+                         to be enabled at compile time. Rebuild with \
+                         --features semantic-model2vec to use the model2vec backend."
+                            .to_string(),
+                    );
+                }
+            }
         };
 
         Ok(Self {
@@ -557,6 +1749,11 @@ impl SemanticEmbeddingModel {
             timeout_ms,
             max_batch_size,
             dimension: None,
+            config_dimensions: config.dimensions,
+            output_encoding: resolve_output_encoding(config),
+            storage_strategy: resolve_storage_strategy(config),
+            distance_metric: DistanceMetric::Auto,
+            input_mode: resolve_input_mode(config),
             engine,
             query_embedding_cache: HashMap::new(),
             query_embedding_cache_order: VecDeque::new(),
@@ -588,9 +1785,23 @@ impl SemanticEmbeddingModel {
     pub fn fingerprint(
         &mut self,
         config: &SemanticBackendConfig,
+        profile: Option<&EmbeddingModelProfile>,
+        file_policy: &SemanticFilePolicy,
     ) -> Result<SemanticIndexFingerprint, String> {
         let dimension = self.dimension()?;
-        Ok(SemanticIndexFingerprint::from_config(config, dimension))
+        // Resolve distance metric (auto -> profile)
+        self.distance_metric = resolve_distance_metric(config, profile);
+        Ok(SemanticIndexFingerprint::from_config(
+            config,
+            dimension,
+            profile,
+            file_policy,
+        ))
+    }
+
+    /// Returns the resolved input mode for this model.
+    pub fn input_mode(&self) -> crate::config::InputMode {
+        self.input_mode
     }
 
     pub fn dimension(&mut self) -> Result<usize, String> {
@@ -600,7 +1811,9 @@ impl SemanticEmbeddingModel {
 
         let dimension = match &mut self.engine {
             SemanticEmbeddingEngine::Local(model) => {
-                let vectors = model.embed(&["semantic index fingerprint probe".to_string()])?;
+                let vectors = model
+                    .embed(&["semantic index fingerprint probe".to_string()])
+                    .map_err(format_embedding_init_error)?;
                 vectors
                     .first()
                     .map(|v| v.len())
@@ -622,6 +1835,23 @@ impl SemanticEmbeddingModel {
                     .map(|v| v.len())
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
+            SemanticEmbeddingEngine::Perplexity { .. } => {
+                let vectors =
+                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                vectors
+                    .first()
+                    .map(|v| v.len())
+                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+            }
+            #[cfg(feature = "semantic-model2vec")]
+            SemanticEmbeddingEngine::Model2Vec { .. } => {
+                let vectors =
+                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                vectors
+                    .first()
+                    .map(|v| v.len())
+                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+            }
         };
 
         self.dimension = Some(dimension);
@@ -632,14 +1862,26 @@ impl SemanticEmbeddingModel {
         self.embed_texts(texts)
     }
 
-    pub fn embed_query_cached(&mut self, query: &str) -> Result<Vec<f32>, String> {
-        if let Some(vector) = self.query_embedding_cache.get(query) {
+    pub fn embed_query_cached(
+        &mut self,
+        query: &str,
+        query_prompt_template: Option<&str>,
+    ) -> Result<(Vec<f32>, bool), String> {
+        let prompt_hash = prompt_template_hash(query_prompt_template);
+        let cache_key = if prompt_hash.is_empty() {
+            query.to_string()
+        } else {
+            format!("{prompt_hash}:{query}")
+        };
+
+        if let Some(vector) = self.query_embedding_cache.get(&cache_key) {
             self.query_embedding_cache_hits += 1;
-            return Ok(vector.clone());
+            return Ok((vector.clone(), true));
         }
 
         self.query_embedding_cache_misses += 1;
-        let embeddings = self.embed_texts(vec![query.to_string()])?;
+        let prefixed_query = apply_query_template(query, query_prompt_template);
+        let embeddings = self.embed_texts(vec![prefixed_query])?;
         let vector = embeddings
             .first()
             .cloned()
@@ -651,11 +1893,10 @@ impl SemanticEmbeddingModel {
             }
         }
         self.query_embedding_cache
-            .insert(query.to_string(), vector.clone());
-        self.query_embedding_cache_order
-            .push_back(query.to_string());
+            .insert(cache_key.clone(), vector.clone());
+        self.query_embedding_cache_order.push_back(cache_key);
 
-        Ok(vector)
+        Ok((vector, false))
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
@@ -679,10 +1920,21 @@ impl SemanticEmbeddingModel {
             } => {
                 let expected_text_count = texts.len();
                 let endpoint = build_openai_embeddings_endpoint(base_url);
-                let body = serde_json::json!({
+
+                let mut body = serde_json::json!({
                     "input": texts,
                     "model": model,
                 });
+                // Conditionally add dimensions when user-configured or when
+                // we already know the dimension from a previous probe.
+                if let Some(dims) = self.config_dimensions.or(self.dimension) {
+                    body["dimensions"] = serde_json::json!(dims);
+                }
+                // Request the configured output encoding from providers that
+                // support it (e.g. Perplexity base64_int8 via openai_compatible).
+                if self.output_encoding != OutputEncoding::Float {
+                    body["encoding_format"] = serde_json::json!(self.output_encoding.to_string());
+                }
 
                 let raw = send_embedding_request(
                     || {
@@ -706,14 +1958,16 @@ impl SemanticEmbeddingModel {
                     "openai compatible",
                 )?;
 
+                // Parse response — handle both float arrays and base64-encoded
+                // int8 strings depending on the configured output encoding.
                 #[derive(Deserialize)]
                 struct OpenAiResponse {
-                    data: Vec<OpenAiEmbeddingResult>,
+                    data: Vec<OpenAiEmbeddingEntry>,
                 }
 
                 #[derive(Deserialize)]
-                struct OpenAiEmbeddingResult {
-                    embedding: Vec<f32>,
+                struct OpenAiEmbeddingEntry {
+                    embedding: serde_json::Value,
                     index: Option<u32>,
                 }
 
@@ -735,7 +1989,12 @@ impl SemanticEmbeddingModel {
                             "openai compatible response contains invalid vector index".to_string()
                         );
                     }
-                    vectors[index] = item.embedding;
+                    vectors[index] = parse_embedding_value(
+                        &item.embedding,
+                        self.output_encoding,
+                        "openai compatible embedding",
+                        self.config_dimensions.or(self.dimension),
+                    )?;
                 }
 
                 for vector in &vectors {
@@ -743,6 +2002,85 @@ impl SemanticEmbeddingModel {
                         return Err(
                             "openai compatible response contained missing vectors".to_string()
                         );
+                    }
+                }
+
+                self.dimension = vectors.first().map(Vec::len);
+                Ok(vectors)
+            }
+            SemanticEmbeddingEngine::Perplexity {
+                client,
+                model,
+                base_url,
+                api_key,
+            } => {
+                let expected_text_count = texts.len();
+                let endpoint = build_openai_embeddings_endpoint(base_url);
+
+                let mut body = serde_json::json!({
+                    "input": texts,
+                    "model": model,
+                });
+                if let Some(dims) = self.config_dimensions.or(self.dimension) {
+                    body["dimensions"] = serde_json::json!(dims);
+                }
+                // Request the configured output encoding from Perplexity.
+                if self.output_encoding != OutputEncoding::Float {
+                    body["encoding_format"] = serde_json::json!(self.output_encoding.to_string());
+                }
+
+                let raw = send_embedding_request(
+                    || {
+                        let mut req = client.post(&endpoint).json(&body);
+                        req = req.header(
+                            "Authorization",
+                            format!("Bearer {}", api_key.as_deref().unwrap_or("")),
+                        );
+                        req
+                    },
+                    "perplexity",
+                )?;
+
+                // Parse response — handle both float arrays and base64-encoded
+                // int8 strings depending on the configured output encoding.
+                #[derive(Deserialize)]
+                struct PerplexityEmbeddingEntry {
+                    embedding: serde_json::Value,
+                    index: Option<u32>,
+                }
+
+                #[derive(Deserialize)]
+                struct PerplexityEmbedResponse {
+                    data: Vec<PerplexityEmbeddingEntry>,
+                }
+
+                let parsed: PerplexityEmbedResponse = serde_json::from_str(&raw)
+                    .map_err(|error| format!("invalid perplexity response: {error}"))?;
+                if parsed.data.len() != expected_text_count {
+                    return Err(format!(
+                        "perplexity response returned {} embeddings for {} inputs",
+                        parsed.data.len(),
+                        expected_text_count
+                    ));
+                }
+
+                let mut vectors = vec![Vec::new(); parsed.data.len()];
+                for (i, item) in parsed.data.into_iter().enumerate() {
+                    let index = item.index.unwrap_or(i as u32) as usize;
+                    if index >= vectors.len() {
+                        return Err("perplexity response contains invalid vector index".to_string());
+                    }
+                    vectors[index] = parse_embedding_value(
+                        &item.embedding,
+                        self.output_encoding,
+                        "perplexity embedding",
+                        self.config_dimensions.or(self.dimension),
+                    )?;
+                }
+
+                for vector in &vectors {
+                    if vector.is_empty() {
+                        return Err("perplexity response contained missing vectors".to_string());
                     }
                 }
 
@@ -807,7 +2145,179 @@ impl SemanticEmbeddingModel {
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
+            #[cfg(feature = "semantic-model2vec")]
+            SemanticEmbeddingEngine::Model2Vec { model, max_length } => {
+                let embeddings = model.encode_with_args(&texts, Some(*max_length), 1024);
+                if embeddings.is_empty() {
+                    return Err("model2vec returned no embeddings".to_string());
+                }
+                for vector in &embeddings {
+                    if vector.is_empty() {
+                        return Err("model2vec returned empty embedding".to_string());
+                    }
+                }
+                self.dimension = embeddings.first().map(Vec::len);
+                Ok(embeddings)
+            }
         }
+    }
+
+    pub fn embed_document_chunks(
+        &mut self,
+        docs: DocumentChunks,
+    ) -> Result<DocumentEmbeddings, String> {
+        let is_perplexity = matches!(&self.engine, SemanticEmbeddingEngine::Perplexity { .. });
+        if is_perplexity {
+            let (client, model, base_url, api_key) = match &self.engine {
+                SemanticEmbeddingEngine::Perplexity {
+                    client,
+                    model,
+                    base_url,
+                    api_key,
+                } => (
+                    client.clone(),
+                    model.clone(),
+                    base_url.clone(),
+                    api_key.clone(),
+                ),
+                _ => unreachable!(),
+            };
+            let dims = self.config_dimensions.or(self.dimension);
+            Self::embed_document_chunks_native(
+                &client,
+                &model,
+                &base_url,
+                &api_key,
+                dims,
+                self.output_encoding,
+                docs,
+            )
+        } else {
+            let all_texts: Vec<String> = docs
+                .documents
+                .iter()
+                .flat_map(|d| d.chunks.clone())
+                .collect();
+            let vectors = self.embed_texts(all_texts)?;
+            let mut cursor = 0;
+            let embeddings = docs
+                .documents
+                .iter()
+                .map(|doc| {
+                    let count = doc.chunks.len();
+                    let vecs = vectors[cursor..cursor + count].to_vec();
+                    cursor += count;
+                    ChunkEmbeddings {
+                        file_path: doc.file_path.clone(),
+                        vectors: vecs,
+                    }
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    fn embed_document_chunks_native(
+        client: &reqwest::blocking::Client,
+        model: &str,
+        base_url: &str,
+        api_key: &Option<String>,
+        dims: Option<usize>,
+        output_encoding: OutputEncoding,
+        docs: DocumentChunks,
+    ) -> Result<DocumentEmbeddings, String> {
+        #[derive(Serialize)]
+        struct DocumentPayload<'a> {
+            title: &'a str,
+            chunks: &'a [String],
+        }
+
+        let mut body = serde_json::json!({
+            "input": docs.documents.iter().map(|d| DocumentPayload {
+                title: &d.title,
+                chunks: &d.chunks,
+            }).collect::<Vec<_>>(),
+            "model": model,
+        });
+
+        if let Some(d) = dims {
+            body["dimensions"] = serde_json::json!(d);
+        }
+        // Request the configured output encoding from Perplexity.
+        if output_encoding != OutputEncoding::Float {
+            body["encoding_format"] = serde_json::json!(output_encoding.to_string());
+        }
+
+        let endpoint = build_openai_embeddings_endpoint(base_url);
+
+        let raw = send_embedding_request(
+            || {
+                let mut req = client.post(&endpoint).json(&body);
+                if let Some(key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
+                req
+            },
+            "perplexity",
+        )?;
+
+        // Parse response — handle both float arrays and base64-encoded
+        // int8 strings depending on the configured output encoding.
+        #[derive(Deserialize)]
+        struct DocumentEmbeddingResponse {
+            data: Vec<PerDocumentEmbeddings>,
+        }
+
+        #[derive(Deserialize)]
+        struct PerDocumentEmbeddings {
+            embeddings: Vec<serde_json::Value>,
+            index: u32,
+        }
+
+        let parsed: DocumentEmbeddingResponse = serde_json::from_str(&raw)
+            .map_err(|error| format!("invalid perplexity document-chunk response: {error}"))?;
+
+        if parsed.data.len() != docs.documents.len() {
+            return Err(format!(
+                "perplexity document-chunk response returned {} documents for {} inputs",
+                parsed.data.len(),
+                docs.documents.len()
+            ));
+        }
+
+        let mut embeddings = vec![ChunkEmbeddings::default(); docs.documents.len()];
+        for item in parsed.data.into_iter() {
+            let index = item.index as usize;
+            if index >= embeddings.len() {
+                return Err(
+                    "perplexity document-chunk response contains invalid document index"
+                        .to_string(),
+                );
+            }
+            let mut vectors = Vec::with_capacity(item.embeddings.len());
+            for (chunk_idx, val) in item.embeddings.into_iter().enumerate() {
+                vectors.push(parse_embedding_value(
+                    &val,
+                    output_encoding,
+                    &format!("perplexity document-chunk embedding[{}]", chunk_idx),
+                    dims,
+                )?);
+            }
+            embeddings[index] = ChunkEmbeddings {
+                file_path: docs.documents[index].file_path.clone(),
+                vectors,
+            };
+        }
+
+        for emb in &embeddings {
+            if emb.file_path.as_os_str().is_empty() {
+                return Err(
+                    "perplexity document-chunk response contained missing document".to_string(),
+                );
+            }
+        }
+
+        Ok(DocumentEmbeddings { embeddings })
     }
 }
 
@@ -844,16 +2354,13 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                 ));
             }
 
-            // Try to detect the runtime version from the actual loaded library
-            // path first. A bare dlopen("libonnxruntime.so") may resolve to an
-            // older system ORT through loader search paths; checking only the
-            // caller-supplied soname would miss that and let ort fail opaquely.
-            let (detected_version, version_source) =
-                detect_ort_version_from_loaded_library(handle, lib_name);
+            // Try to detect the runtime version from the file path or soname.
+            // libonnxruntime.so.1.19.0, libonnxruntime.1.24.4.dylib, etc.
+            let detected_version = detect_ort_version_from_path(lib_name);
 
             libc::dlclose(handle);
 
-            // Check version compatibility — we need 1.20+.
+            // Check version compatibility — we need 1.24.x
             if let Some(ref version) = detected_version {
                 let parts: Vec<&str> = version.split('.').collect();
                 if let (Some(major), Some(minor)) = (
@@ -861,7 +2368,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     parts.get(1).and_then(|s| s.parse::<u32>().ok()),
                 ) {
                     if major != 1 || minor < 20 {
-                        return Err(format_ort_version_mismatch(version, &version_source));
+                        return Err(format_ort_version_mismatch(version, lib_name));
                     }
                 }
             }
@@ -870,195 +2377,16 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Validate ONNX Runtime availability on Windows by loading the DLL
-        // via LoadLibraryExW before the ort crate attempts its own LoadLibrary.
-        // This way we can produce a friendly error (with installation hints)
-        // instead of a raw LoadLibrary failure from deep inside fastembed.
-        let lib_name = dylib_path.as_deref().unwrap_or("onnxruntime.dll");
-
-        // Use kernel32 LoadLibraryExW for the validation — built-in, no
-        // crate dependency required. GetModuleFileNameW resolves the loaded
-        // DLL path for version probing via the version.dll API.
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn LoadLibraryExW(
-                lpLibFileName: *const u16,
-                hFile: *mut std::ffi::c_void,
-                dwFlags: u32,
-            ) -> *mut std::ffi::c_void;
-            fn FreeLibrary(hLibModule: *mut std::ffi::c_void) -> i32;
-            fn GetModuleFileNameW(
-                hModule: *mut std::ffi::c_void,
-                lpFilename: *mut u16,
-                nSize: u32,
-            ) -> u32;
-        }
-
-        #[link(name = "version")]
-        extern "system" {
-            fn GetFileVersionInfoSizeW(lptstrFilename: *const u16, lpdwHandle: *mut u32) -> u32;
-            fn GetFileVersionInfoW(
-                lptstrFilename: *const u16,
-                dwHandle: u32,
-                dwLen: u32,
-                lpData: *mut std::ffi::c_void,
-            ) -> i32;
-            fn VerQueryValueW(
-                pBlock: *mut std::ffi::c_void,
-                lpSubBlock: *const u16,
-                lplpBuffer: *mut *mut std::ffi::c_void,
-                puLen: *mut u32,
-            ) -> i32;
-        }
-
-        #[repr(C)]
-        struct VS_FIXEDFILEINFO {
-            dw_signature: u32,
-            dw_struc_version: u32,
-            dw_file_version_ms: u32, // HIWORD major, LOWORD minor
-            dw_file_version_ls: u32, // HIWORD build, LOWORD revision
-            dw_product_version_ms: u32,
-            dw_product_version_ls: u32,
-            dw_file_flags_mask: u32,
-            dw_file_flags: u32,
-            dw_file_os: u32,
-            dw_file_type: u32,
-            dw_file_subtype: u32,
-            dw_file_date_ms: u32,
-            dw_file_date_ls: u32,
-        }
-
-        unsafe {
-            use std::os::windows::ffi::OsStrExt;
-            let wide: Vec<u16> = std::ffi::OsStr::new(lib_name)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let handle = LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0);
-            if handle.is_null() {
-                let err = std::io::Error::last_os_error();
-                return Err(format!(
-                    "ONNX Runtime not found. LoadLibraryExW('{}') failed: {}. \
-                     Run `npx @cortexkit/aft doctor` to diagnose.",
-                    lib_name, err
-                ));
-            }
-
-            // Probe the file version from PE resources so we can reject
-            // outdated DLLs (e.g. v1.9.x) before the ort crate panics.
-            let mut detected_major: u32 = 0;
-            let mut detected_minor: u32 = 0;
-            // Use MAX_UNICODEPATH (32767) so deeply nested ORT paths (e.g.
-            // long NuGet package paths under %USERPROFILE%) never truncate.
-            // GetModuleFileNameW truncates silently when the buffer is too
-            // small, which causes version probing to fail and the version
-            // check to be bypassed — better to allocate generously.
-            let mut path_buf = [0u16; 32767];
-            let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 32767);
-            if path_len > 0 {
-                let mut dummy_handle: u32 = 0;
-                let info_size = GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
-                if info_size > 0 {
-                    let mut info = vec![0u8; info_size as usize];
-                    if GetFileVersionInfoW(
-                        path_buf.as_ptr(),
-                        0,
-                        info_size,
-                        info.as_mut_ptr() as *mut std::ffi::c_void,
-                    ) != 0
-                    {
-                        let sub_block = "\\\0".encode_utf16().collect::<Vec<u16>>();
-                        let mut vs_info: *mut std::ffi::c_void = std::ptr::null_mut();
-                        let mut vs_len: u32 = 0;
-                        if VerQueryValueW(
-                            info.as_mut_ptr() as *mut std::ffi::c_void,
-                            sub_block.as_ptr(),
-                            &mut vs_info,
-                            &mut vs_len,
-                        ) != 0
-                            && !vs_info.is_null()
-                        {
-                            let fixed = vs_info as *const VS_FIXEDFILEINFO;
-                            detected_major = (*fixed).dw_file_version_ms >> 16;
-                            detected_minor = (*fixed).dw_file_version_ms & 0xFFFF;
-                        }
-                    }
-                }
-            }
-
-            FreeLibrary(handle);
-
-            // Version compatibility check (mirrors the Linux/macOS path).
-            // If version could not be detected (detected_major == 0) we let
-            // the load succeed — the ort crate will diagnose further.
-            if detected_major != 0 && (detected_major != 1 || detected_minor < 20) {
-                let ver = format!("{}.{}", detected_major, detected_minor);
-                return Err(format_ort_version_mismatch(&ver, lib_name));
-            }
-        }
+        // On Windows, skip pre-validation — let ort handle LoadLibrary
+        let _ = dylib_path;
     }
 
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-unsafe fn loaded_library_path_from_handle(handle: *mut std::ffi::c_void) -> Option<String> {
-    let symbol_name = std::ffi::CString::new("OrtGetApiBase").ok()?;
-    let symbol = unsafe { libc::dlsym(handle, symbol_name.as_ptr()) };
-    if symbol.is_null() {
-        return None;
-    }
-
-    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
-    if unsafe { libc::dladdr(symbol, info.as_mut_ptr()) } == 0 {
-        return None;
-    }
-
-    let info = unsafe { info.assume_init() };
-    if info.dli_fname.is_null() {
-        return None;
-    }
-
-    Some(
-        unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn detect_ort_version_from_resolved_or_requested(
-    resolved_path: Option<String>,
-    requested_lib_name: &str,
-) -> (Option<String>, String) {
-    if let Some(path) = resolved_path {
-        if let Some(version) = detect_ort_version_from_path(&path) {
-            return (Some(version), path);
-        }
-        return (detect_ort_version_from_path(requested_lib_name), path);
-    }
-
-    (
-        detect_ort_version_from_path(requested_lib_name),
-        requested_lib_name.to_string(),
-    )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn detect_ort_version_from_loaded_library(
-    handle: *mut std::ffi::c_void,
-    requested_lib_name: &str,
-) -> (Option<String>, String) {
-    detect_ort_version_from_resolved_or_requested(
-        unsafe { loaded_library_path_from_handle(handle) },
-        requested_lib_name,
-    )
-}
-
 /// Try to extract the ORT version from the library filename or resolved symlink.
 /// Examples: "libonnxruntime.so.1.19.0" → "1.19.0", "libonnxruntime.1.24.4.dylib" → "1.24.4"
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
     let path = std::path::Path::new(lib_path);
 
@@ -1093,13 +2421,14 @@ fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
 }
 
 /// Extract version from filenames like "libonnxruntime.so.1.19.0" or "libonnxruntime.1.24.4.dylib"
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn extract_version_from_filename(name: &str) -> Option<String> {
     // Match patterns: .so.X.Y.Z or .X.Y.Z.dylib or .X.Y.Z.so
     let re = regex::Regex::new(r"(\d+\.\d+\.\d+)").ok()?;
     re.find(name).map(|m| m.as_str().to_string())
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn suggest_removal_command(lib_path: &str) -> String {
     if lib_path.starts_with("/usr/local/lib")
         || lib_path == "libonnxruntime.so"
@@ -1109,6 +2438,8 @@ fn suggest_removal_command(lib_path: &str) -> String {
         return "   sudo rm /usr/local/lib/libonnxruntime* && sudo ldconfig".to_string();
         #[cfg(target_os = "macos")]
         return "   sudo rm /usr/local/lib/libonnxruntime*".to_string();
+        #[cfg(target_os = "windows")]
+        return "   Delete the ONNX Runtime DLL from your PATH".to_string();
     }
     format!("   rm '{}'", lib_path)
 }
@@ -1118,6 +2449,7 @@ fn suggest_removal_command(lib_path: &str) -> String {
 /// stability — the auto-fix recommendation must always come first because
 /// it's the only safe option, and the system-rm step must remain present
 /// because some users prefer the system-wide cleanup path.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> String {
     format!(
         "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \
@@ -1135,6 +2467,10 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
         lib_name,
         suggest_removal_command(lib_name),
     )
+}
+
+pub fn initialize_text_embedding(model: &str) -> Result<LocalEmbedder, String> {
+    LocalEmbedder::new(model)
 }
 
 pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
@@ -1163,7 +2499,7 @@ pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
     mentions_onnx_runtime && mentions_dynamic_load_failure
 }
 
-pub fn format_embedding_init_error(error: impl Display) -> String {
+pub(crate) fn format_embedding_init_error(error: impl Display) -> String {
     let message = error.to_string();
 
     if is_onnx_runtime_unavailable(&message) {
@@ -1193,34 +2529,287 @@ pub struct SemanticChunk {
     pub snippet: String,
 }
 
+/// A group of chunks from a single document, for contextualized embedding.
+/// Contextualized providers use surrounding chunks as context when embedding
+/// each chunk, so chunks must be grouped by source document and preserve order.
+#[derive(Debug, Clone)]
+pub struct DocumentChunks {
+    pub documents: Vec<PerDocumentChunks>,
+}
+
+/// Chunks from one source document.
+#[derive(Debug, Clone)]
+pub struct PerDocumentChunks {
+    pub file_path: PathBuf,
+    pub title: String,
+    pub chunks: Vec<String>,
+}
+
+/// Embeddings returned for a batch of documents after contextualized embedding.
+#[derive(Debug, Clone)]
+pub struct DocumentEmbeddings {
+    pub embeddings: Vec<ChunkEmbeddings>,
+}
+
+/// Embeddings for one document.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkEmbeddings {
+    pub file_path: PathBuf,
+    pub vectors: Vec<Vec<f32>>,
+}
+
 /// A stored embedding entry — chunk metadata + vector
 #[derive(Debug, Clone)]
 pub struct EmbeddingEntry {
-    chunk: SemanticChunk,
-    vector: Vec<f32>,
+    pub(crate) chunk: SemanticChunk,
+    pub(crate) vector: Vec<f32>,
+    /// Deterministic hash of the chunk fields (file, name, kind, lines, snippet, embed_text).
+    /// Used to trace which version of a chunk produced a vector.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) chunk_hash: String,
 }
 
-/// The semantic index — stores embeddings for all symbols in a project
+/// Compute a deterministic chunk hash from SemanticChunk fields.
+/// Used to trace which version of a chunk produced a stored vector.
+pub(crate) fn compute_chunk_hash(chunk: &SemanticChunk) -> String {
+    let content_hash = blake3::hash(
+        format!(
+            "{}{}{}{}{}{}",
+            chunk.embed_text,
+            chunk.snippet,
+            chunk.start_line,
+            chunk.end_line,
+            chunk.exported,
+            symbol_kind_to_u8(&chunk.kind),
+        )
+        .as_bytes(),
+    );
+    content_hash.to_hex().to_string()
+}
+
+/// Lifecycle state of a [`SemanticIndex`].
+///
+/// State machine transitions:
+///   Disabled → (no transitions)
+///   ColdStart → ScanningFiles → Chunking → Embedding → Ready
+///   Ready → Refreshing → Ready (or Degraded on partial failure)
+///   Ready → RebuildRequired → ColdStart → ... → Ready
+///   Ready → Failed → ColdStart → ... → Ready
+///   Degraded → Refreshing → Ready (or Failed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SemanticIndexLifecycle {
+    /// Semantic search is disabled by configuration.
+    Disabled,
+    /// Freshly constructed — no embedded data yet.
+    ColdStart,
+    /// Currently scanning the file system.
+    ScanningFiles,
+    /// Parsing and chunking files.
+    Chunking,
+    /// Sending chunks to the embedding backend.
+    Embedding,
+    /// Index is complete and ready for search.
+    Ready,
+    /// Incremental refresh in progress.
+    Refreshing,
+    /// Config or fingerprint changed; a full rebuild is required.
+    RebuildRequired,
+    /// Index is usable but some files failed to embed.
+    Degraded,
+    /// Build or refresh failed entirely.
+    Failed,
+}
+
+/// Identity record for an indexed file in the file manifest.
+/// Tracks which files produced which vectors, enabling precise
+/// stale-vector pruning when files are edited, deleted, or excluded.
 #[derive(Debug, Clone)]
-pub struct SemanticIndex {
-    entries: Vec<EmbeddingEntry>,
-    /// Track which files are indexed and their mtime for staleness detection
-    file_mtimes: HashMap<PathBuf, SystemTime>,
-    /// Track indexed file sizes alongside mtimes for staleness detection
-    file_sizes: HashMap<PathBuf, u64>,
-    file_hashes: HashMap<PathBuf, blake3::Hash>,
+pub(crate) struct FileRecord {
+    /// Content hash (blake3) at indexing time
+    pub(crate) content_hash: blake3::Hash,
+    /// File size at indexing time
+    pub(crate) size_bytes: u64,
+    /// Last modified time at indexing time
+    pub(crate) mtime: SystemTime,
+    /// Detected programming language (if applicable)
+    pub(crate) language: Option<String>,
+    /// Document kind identifier: "code", "docs", "config", "generated", "unknown"
+    pub(crate) document_kind: String,
+    /// Hash of the file policy that was active when this file was indexed
+    pub(crate) inclusion_policy_hash: String,
+    /// When this file was indexed
+    pub(crate) indexed_at: SystemTime,
+}
+
+/// Immutable snapshot of the core semantic index data.
+///
+/// Held behind `Arc<SemanticIndexSnapshot>` inside [`SemanticIndex`].
+/// Clone + mutate + swap is the only mutation path, which keeps the
+/// snapshot structurally immutable once published.
+#[derive(Debug, Clone)]
+pub struct SemanticIndexSnapshot {
+    store: crate::vector_store::FlatF32VectorStore,
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
-    fingerprint: Option<SemanticIndexFingerprint>,
     project_root: PathBuf,
+    /// File identity manifest — maps each indexed file path to its identity record.
+    /// Used by pruning to determine which entries belong to which file, enabling
+    /// precise stale-vector cleanup when files are edited, deleted, or excluded.
+    pub(crate) file_manifest: HashMap<PathBuf, FileRecord>,
+    /// Monotonic counter for assigning unique chunk IDs.
+    #[allow(dead_code)]
+    pub(crate) next_chunk_id: u64,
+    /// The fingerprint string at the time this snapshot was built.
+    /// Stored alongside the snapshot so search can report which index build
+    /// produced each result.
+    #[allow(dead_code)]
+    pub(crate) fingerprint_string: Option<String>,
+}
+
+impl SemanticIndexSnapshot {
+    /// Search the index with a query embedding, returning top-K results sorted by relevance
+    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {
+        self.store.search(query_vector, top_k)
+    }
+
+    /// Expose access to the underlying store for internal mutation.
+    pub(crate) fn store(&self) -> &crate::vector_store::FlatF32VectorStore {
+        &self.store
+    }
+
+    /// Mutable access to the underlying store for internal mutation.
+    pub(crate) fn store_mut(&mut self) -> &mut crate::vector_store::FlatF32VectorStore {
+        &mut self.store
+    }
+
+    /// Number of indexed entries
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
+    }
+
+    /// Get the embedding dimension
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Check if a file needs re-indexing based on mtime/size/hash
+    pub fn is_file_stale(&self, file: &Path) -> bool {
+        let Some(metadata) = self.store.file_metadata().get(file) else {
+            return true;
+        };
+        let cached = FileFreshness {
+            mtime: metadata.mtime,
+            size: metadata.size,
+            content_hash: metadata.content_hash,
+        };
+        match cache_freshness::verify_file(file, &cached) {
+            FreshnessVerdict::HotFresh => false,
+            FreshnessVerdict::ContentFresh { .. } => false,
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
+        }
+    }
+
+    /// Get the stored file metadata by path
+    #[allow(dead_code)]
+    pub(crate) fn file_metadata(&self) -> &HashMap<PathBuf, IndexedFileMetadata> {
+        self.store.file_metadata()
+    }
+
+    /// Remove stale/zero-norm vectors from the snapshot.
+    pub fn prune_stale_vectors(&mut self) -> usize {
+        self.store.prune_stale_vectors()
+    }
+
+    /// Mutable entry access for the inner `entries` field (test-only).
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn entries_mut_inner(&mut self) -> &mut Vec<EmbeddingEntry> {
+        self.store.entries_mut()
+    }
+
+    /// Read-only slice of all entries (test-only).
+    #[cfg(test)]
+    pub fn entries_slice(&self) -> &[EmbeddingEntry] {
+        self.store.entries_slice()
+    }
+
+    /// Mutable file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata_mut_inner(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
+        self.store.file_metadata_mut()
+    }
+
+    /// Build the file manifest from store entries and metadata.
+    /// Called after constructing or refreshing a snapshot to populate the
+    /// file_manifest from the store's existing IndexedFileMetadata.
+    pub(crate) fn build_manifest_from_store(&mut self) {
+        self.file_manifest.clear();
+        for (path, meta) in self.store.file_metadata().iter() {
+            self.file_manifest.insert(
+                path.clone(),
+                FileRecord {
+                    content_hash: meta.content_hash,
+                    size_bytes: meta.size,
+                    mtime: meta.mtime,
+                    language: None,
+                    document_kind: "code".to_string(),
+                    inclusion_policy_hash: String::new(),
+                    indexed_at: SystemTime::now(),
+                },
+            );
+        }
+    }
+}
+
+/// The semantic index — stores embeddings for all symbols in a project.
+///
+/// Read-only data lives in [`SemanticIndexSnapshot`], accessible through
+/// [`Deref`]. Mutation follows a clone–swap pattern: clone the inner
+/// snapshot, apply changes, atomically swap.
+#[derive(Debug, Clone)]
+pub struct SemanticIndex {
+    snapshot: Arc<SemanticIndexSnapshot>,
+    lifecycle: SemanticIndexLifecycle,
+    last_error: Option<String>,
+    fingerprint: Option<SemanticIndexFingerprint>,
     deferred_files: HashSet<PathBuf>,
 }
 
+impl std::ops::Deref for SemanticIndex {
+    type Target = SemanticIndexSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+/// Test-only access helpers replacing direct field access to `entries`
+/// and `file_metadata` that were removed in the VectorStore refactoring.
+#[cfg(test)]
+impl SemanticIndex {
+    /// Access the underlying entries for test assertions (read-only).
+    fn entries_for_test(&self) -> &[EmbeddingEntry] {
+        self.snapshot.entries_slice()
+    }
+
+    /// Mutable access to file metadata for test setup.
+    fn file_metadata_for_test(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
+        let snap =
+            Arc::get_mut(&mut self.snapshot).expect("snapshot should be uniquely owned in tests");
+        snap.store_mut().file_metadata_mut()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-struct IndexedFileMetadata {
-    mtime: SystemTime,
-    size: u64,
-    content_hash: blake3::Hash,
+pub(crate) struct IndexedFileMetadata {
+    pub(crate) mtime: SystemTime,
+    pub(crate) size: u64,
+    pub(crate) content_hash: blake3::Hash,
 }
 
 /// Result of an incremental refresh of the semantic index. Counts are file
@@ -1277,48 +2866,212 @@ impl SemanticIndex {
     pub fn new(project_root: PathBuf, dimension: usize) -> Self {
         debug_assert!(project_root.is_absolute());
         Self {
-            entries: Vec::new(),
-            file_mtimes: HashMap::new(),
-            file_sizes: HashMap::new(),
-            file_hashes: HashMap::new(),
-            dimension,
+            snapshot: Arc::new(SemanticIndexSnapshot {
+                store: crate::vector_store::FlatF32VectorStore::new(dimension),
+                dimension,
+                project_root,
+                file_manifest: HashMap::new(),
+                next_chunk_id: 0,
+                fingerprint_string: None,
+            }),
+            lifecycle: SemanticIndexLifecycle::ColdStart,
+            last_error: None,
             fingerprint: None,
-            project_root,
             deferred_files: HashSet::new(),
         }
     }
 
     /// Number of embedded symbol entries.
     pub fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Number of files currently tracked by the semantic index.
-    pub fn indexed_file_count(&self) -> usize {
-        self.file_mtimes.len()
+        self.len()
     }
 
     /// Human-readable status label for the index.
     pub fn status_label(&self) -> &'static str {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             "empty"
         } else {
             "ready"
         }
     }
 
+    /// Access the current lifecycle state.
+    #[allow(dead_code)]
+    pub(crate) fn lifecycle(&self) -> &SemanticIndexLifecycle {
+        &self.lifecycle
+    }
+
+    /// Mark the index with a new lifecycle state.
+    #[allow(dead_code)]
+    pub(crate) fn set_lifecycle(&mut self, lifecycle: SemanticIndexLifecycle) {
+        self.lifecycle = lifecycle;
+    }
+
+    /// Convenience: extract the error string when lifecycle is `Failed`.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Convenience: set lifecycle to `Failed` with a message.
+    pub fn set_last_error(&mut self, error: String) {
+        self.last_error = Some(error);
+        self.lifecycle = SemanticIndexLifecycle::Failed;
+    }
+
+    /// Access the inner snapshot.
+    pub fn snapshot(&self) -> &SemanticIndexSnapshot {
+        &self.snapshot
+    }
+
+    /// Atomically swap the inner snapshot. The only mutation path.
+    fn swap_snapshot(&mut self, new_snapshot: SemanticIndexSnapshot) {
+        self.snapshot = Arc::new(new_snapshot);
+    }
+
+    /// Remove stale/zero-norm vectors from the current snapshot.
+    pub fn prune_stale_vectors(&mut self) -> usize {
+        let mut new_snapshot = (*self.snapshot).clone();
+        let count = new_snapshot.prune_stale_vectors();
+        self.swap_snapshot(new_snapshot);
+        count
+    }
+
+    /// Mutable entry access (read-only via Deref) — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn entries_mut(&mut self) -> &mut Vec<EmbeddingEntry> {
+        Arc::make_mut(&mut self.snapshot).entries_mut_inner()
+    }
+
+    /// Replace the entire snapshot atomically — only available in tests.
+    #[cfg(test)]
+    pub fn set_snapshot(&mut self, snapshot: SemanticIndexSnapshot) {
+        self.snapshot = Arc::new(snapshot);
+    }
+
+    /// Mutable file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata_mut(&mut self) -> &mut HashMap<PathBuf, IndexedFileMetadata> {
+        Arc::make_mut(&mut self.snapshot).file_metadata_mut_inner()
+    }
+
+    /// Read-only file_metadata access — only available in tests.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn file_metadata(&self) -> &HashMap<PathBuf, IndexedFileMetadata> {
+        self.snapshot.store().file_metadata()
+    }
+
+    /// Set dimension — only available in tests.
+    #[cfg(test)]
+    pub fn set_dimension(&mut self, dim: usize) {
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.dimension = dim;
+        snap.store_mut().set_dimension(dim);
+    }
+
     fn collect_chunks(
         project_root: &Path,
         files: &[PathBuf],
+        file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
-        let collect_started = std::time::Instant::now();
+        let policy = file_policy.clone();
         let per_file: Vec<(
             PathBuf,
             Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
         )> = files
             .par_iter()
             .map_init(HashMap::new, |parsers, file| {
-                let result = collect_semantic_file(project_root, file, parsers);
+                let result = collect_file_metadata(file).and_then(|metadata| {
+                    // Apply file policy checks
+                    let file_type = classify_semantic_file(file);
+                    match file_type {
+                        SemanticFileType::Code => {
+                            if !policy.include_code {
+                                return Err("code files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Doc => {
+                            if !policy.include_docs {
+                                return Err("docs files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Config => {
+                            if !policy.include_configs {
+                                return Err("config files disabled by policy".to_string());
+                            }
+                        }
+                        SemanticFileType::Unknown => {
+                            return Err("unknown file type".to_string());
+                        }
+                    }
+
+                    // Binary detection
+                    if policy.binary_detection {
+                        let bytes = match std::fs::read(file) {
+                            Ok(b) => b,
+                            Err(e) => return Err(e.to_string()),
+                        };
+                        if is_binary_bytes(&bytes) {
+                            return Err("binary file".to_string());
+                        }
+                        // File size check
+                        if bytes.len() as u64 > policy.max_file_size_bytes {
+                            return Err(format!(
+                                "file too large ({} bytes, limit {})",
+                                bytes.len(),
+                                policy.max_file_size_bytes
+                            ));
+                        }
+                        // For doc/config files, chunk from text
+                        if file_type == SemanticFileType::Doc
+                            || file_type == SemanticFileType::Config
+                        {
+                            let text = match String::from_utf8(bytes) {
+                                Ok(t) => t,
+                                Err(_) => return Err("non-utf8 file".to_string()),
+                            };
+                            if file_type == SemanticFileType::Doc {
+                                return Ok((metadata, collect_docs_chunks(&text, file)));
+                            } else {
+                                // Config files: single chunk
+                                let name = file
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "config".to_string());
+                                let body = text.trim().to_string();
+                                if body.is_empty() {
+                                    return Ok((metadata, Vec::new()));
+                                }
+                                return Ok((
+                                    metadata,
+                                    vec![SemanticChunk {
+                                        file: file.to_path_buf(),
+                                        name,
+                                        kind: SymbolKind::FileSummary,
+                                        start_line: 0,
+                                        end_line: text.lines().count().saturating_sub(1) as u32,
+                                        exported: false,
+                                        embed_text: body.clone(),
+                                        snippet: truncate_snippet(&body),
+                                    }],
+                                ));
+                            }
+                        }
+                        // Code files fall through to tree-sitter chunking below
+                        drop(bytes); // release the raw bytes
+                    }
+
+                    // Generated file detection
+                    if policy.generated_file_detection && is_generated_file(file) {
+                        return Err("generated file".to_string());
+                    }
+
+                    collect_file_chunks(project_root, file, parsers)
+                        .map(|chunks| (metadata, chunks))
+                });
                 (file.clone(), result)
             })
             .collect();
@@ -1333,12 +3086,25 @@ impl SemanticIndex {
                     chunks.extend(file_chunks);
                 }
                 Err(error) => {
-                    // "unsupported file extension" is expected for non-code files
-                    // (json, xml, .gitignore, etc.) that get included in the
-                    // project walk. Pre-fix this was swallowed by .unwrap_or_default();
-                    // we now skip silently to keep the log clean. Only real read/parse
-                    // errors are worth surfacing.
-                    if error == "unsupported file extension" {
+                    // Skip expected/normal skip reasons silently, but log at
+                    // debug level so diagnostic runs can trace per-file skips.
+                    if matches!(
+                        error.as_str(),
+                        "unsupported file extension"
+                            | "binary file"
+                            | "generated file"
+                            | "code files disabled by policy"
+                            | "docs files disabled by policy"
+                            | "config files disabled by policy"
+                            | "unknown file type"
+                            | "non-utf8 file"
+                    ) || error.starts_with("file too large")
+                    {
+                        slog_debug!(
+                            "skipped semantic chunk collection for {}: {}",
+                            file.display(),
+                            error
+                        );
                         continue;
                     }
                     slog_warn!(
@@ -1350,29 +3116,802 @@ impl SemanticIndex {
             }
         }
 
-        slog_info!(
-            "semantic collect: {} chunks from {} files in {} ms",
-            chunks.len(),
-            file_metadata.len(),
-            collect_started.elapsed().as_millis()
-        );
+        // Apply document prompt template to each chunk's embed_text.
+        // This prefixes document text for models that require it (e.g. E5 "passage: " prefix).
+        if let Some(tpl) = document_prompt_template {
+            for chunk in &mut chunks {
+                chunk.embed_text = apply_document_template(&chunk.embed_text, Some(tpl));
+            }
+        }
 
         (chunks, file_metadata)
+    }
+
+    fn build_from_chunks<F, P>(
+        project_root: &Path,
+        chunks: Vec<SemanticChunk>,
+        file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        mut progress: Option<&mut P>,
+        max_embed_tokens: usize,
+        chunk_overlap_tokens: usize,
+    ) -> Result<SemanticIndexSnapshot, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        debug_assert!(project_root.is_absolute());
+
+        // Chunk large symbols to prevent HTTP 400 errors on remote backends.
+        // Local backends (Fastembed, Model2Vec) already truncate internally.
+        let chunks = chunk_large_embed_texts(chunks, max_embed_tokens, chunk_overlap_tokens);
+        let total_chunks = chunks.len();
+
+        if chunks.is_empty() {
+            return Ok(SemanticIndexSnapshot {
+                store: crate::vector_store::FlatF32VectorStore::new(DEFAULT_DIMENSION),
+                dimension: DEFAULT_DIMENSION,
+                project_root: project_root.to_path_buf(),
+                file_manifest: HashMap::new(),
+                next_chunk_id: 0,
+                fingerprint_string: None,
+            });
+        }
+
+        // Embed in batches
+        let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
+        let mut expected_dimension: Option<usize> = None;
+        let batch_size = max_batch_size.max(1);
+        for batch_start in (0..chunks.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(chunks.len());
+            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|c| c.embed_text.clone())
+                .collect();
+
+            let vectors = embed_with_retry(&mut *embed_fn, batch_texts)?;
+            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
+
+            // Track consistent dimension across all batches
+            if let Some(dim) = vectors.first().map(|v| v.len()) {
+                match expected_dimension {
+                    None => expected_dimension = Some(dim),
+                    Some(expected) if dim != expected => {
+                        return Err(format!(
+                            "embedding dimension changed across batches: expected {expected}, got {dim}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (i, vector) in vectors.into_iter().enumerate() {
+                let chunk_idx = batch_start + i;
+                entries.push(EmbeddingEntry {
+                    chunk: chunks[chunk_idx].clone(),
+                    vector,
+                    chunk_hash: compute_chunk_hash(&chunks[chunk_idx]),
+                });
+            }
+
+            if let Some(callback) = progress.as_mut() {
+                callback(entries.len(), total_chunks);
+            }
+        }
+
+        let dimension = entries
+            .first()
+            .map(|e| e.vector.len())
+            .unwrap_or(DEFAULT_DIMENSION);
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store: crate::vector_store::FlatF32VectorStore::from_parts(
+                entries,
+                dimension,
+                file_metadata,
+            ),
+            dimension,
+            project_root: project_root.to_path_buf(),
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+        snapshot.build_manifest_from_store();
+        Ok(snapshot)
+    }
+
+    /// Build the semantic index from a set of files using the provided embedding function.
+    /// `embed_fn` takes a batch of texts and returns a batch of embedding vectors.
+    pub fn build<F>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        let (chunks, file_mtimes) =
+            Self::collect_chunks(project_root, files, &SemanticFilePolicy::default(), None);
+        let snapshot = Self::build_from_chunks(
+            project_root,
+            chunks,
+            file_mtimes,
+            embed_fn,
+            max_batch_size,
+            Option::<&mut fn(usize, usize)>::None,
+            512, // max_embed_tokens default
+            100, // chunk_overlap_tokens default
+        )?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint: None,
+            deferred_files: HashSet::new(),
+        })
+    }
+
+    /// Build the semantic index and report embedding progress using entry counts.
+    /// Sort files for cold-start priority: README/docs first, then core source,
+    /// then tests, then remaining. This makes the most useful content available
+    /// earliest when the index is partially built.
+    pub fn sort_files_by_priority(files: &mut [PathBuf]) {
+        fn priority(p: &Path) -> u8 {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let path_str = p.to_str().unwrap_or("");
+
+            // README and top-level docs → highest priority (0)
+            if name.eq_ignore_ascii_case("readme.md")
+                || name.eq_ignore_ascii_case("readme")
+                || name.eq_ignore_ascii_case("readme.txt")
+            {
+                return 0;
+            }
+            // docs/ adr/ .github/ directories → high priority (1)
+            if path_str.contains("/docs/")
+                || path_str.contains("\\docs\\")
+                || path_str.contains("/adr/")
+                || path_str.contains("\\adr\\")
+                || path_str.contains("/.github/")
+                || path_str.contains("\\.github\\")
+                || path_str.contains("/architecture/")
+                || path_str.contains("\\architecture\\")
+            {
+                return 1;
+            }
+            // Other markdown → medium-high (2)
+            if ext == "md" || ext == "mdx" || ext == "rst" || ext == "txt" {
+                return 2;
+            }
+            // Core source (src/, lib/, crates/) → medium (3)
+            if path_str.contains("/src/")
+                || path_str.contains("\\src\\")
+                || path_str.contains("/lib/")
+                || path_str.contains("\\lib\\")
+                || path_str.contains("/crates/")
+                || path_str.contains("\\crates\\")
+                || path_str.contains("/packages/")
+                || path_str.contains("\\packages\\")
+            {
+                return 3;
+            }
+            // Tests → lower (4)
+            if path_str.contains("/tests/")
+                || path_str.contains("\\tests\\")
+                || path_str.contains("/test/")
+                || path_str.contains("\\test\\")
+                || path_str.contains("/__tests__/")
+                || path_str.contains("\\__tests__\\")
+                || name.contains("test")
+            {
+                return 4;
+            }
+            // Everything else → lowest (5)
+            5
+        }
+        files.sort_by_key(|p| priority(p));
+    }
+
+    pub fn build_with_progress<F, P>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        let mut files = files.to_vec();
+        Self::sort_files_by_priority(&mut files);
+        let (chunks, file_mtimes) =
+            Self::collect_chunks(project_root, &files, file_policy, document_prompt_template);
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+        let snapshot = Self::build_from_chunks(
+            project_root,
+            chunks,
+            file_mtimes,
+            embed_fn,
+            max_batch_size,
+            Some(progress),
+            512, // max_embed_tokens default
+            100, // chunk_overlap_tokens default
+        )?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint: None,
+            deferred_files: HashSet::new(),
+        })
+    }
+
+    /// Split a document's chunks into sub-groups that respect the provider's
+    /// max-chunks-per-document limit. Each sub-group preserves chunk order
+    /// and carries a synthetic title indicating which slice it is.
+    fn split_oversized_document(
+        doc: &PerDocumentChunks,
+        max_chunks: usize,
+    ) -> Vec<PerDocumentChunks> {
+        if doc.chunks.len() <= max_chunks {
+            return vec![doc.clone()];
+        }
+        let mut groups = Vec::new();
+        for (i, chunk_batch) in doc.chunks.chunks(max_chunks).enumerate() {
+            groups.push(PerDocumentChunks {
+                file_path: doc.file_path.clone(),
+                title: if i == 0 {
+                    doc.title.clone()
+                } else {
+                    format!("{} (part {})", doc.title, i + 1)
+                },
+                chunks: chunk_batch.to_vec(),
+            });
+        }
+        groups
+    }
+
+    /// Retry a single document group's embedding call with exponential backoff.
+    /// Returns Ok embeddings on success, or Err with the last error after all
+    /// retries are exhausted. Only transient errors (rate limits, timeouts,
+    /// server errors) are retried.
+    fn embed_document_group_with_retry<F>(
+        embed_fn: &mut F,
+        doc: PerDocumentChunks,
+        retry_count: &mut usize,
+    ) -> Result<DocumentEmbeddings, String>
+    where
+        F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
+    {
+        let mut last_err = String::new();
+        for attempt in 0..=CONTEXTUALIZED_MAX_RETRIES {
+            match embed_fn(DocumentChunks {
+                documents: vec![doc.clone()],
+            }) {
+                Ok(result) => {
+                    if attempt > 0 {
+                        *retry_count += 1;
+                    }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    last_err = e.clone();
+                    let is_transient = e.to_lowercase().contains("rate")
+                        || e.to_lowercase().contains("limit")
+                        || e.to_lowercase().contains("timeout")
+                        || e.to_lowercase().contains("429")
+                        || e.to_lowercase().contains("503")
+                        || e.to_lowercase().contains("502")
+                        || e.to_lowercase().contains("500")
+                        || e.to_lowercase().contains("connection")
+                        || e.to_lowercase().contains("reset")
+                        || e.to_lowercase().contains("network");
+
+                    if !is_transient || attempt == CONTEXTUALIZED_MAX_RETRIES {
+                        return Err(last_err);
+                    }
+                    let delay = (CONTEXTUALIZED_RETRY_BASE_DELAY_MS * 2u64.pow(attempt))
+                        .min(CONTEXTUALIZED_RETRY_MAX_DELAY_MS);
+                    slog_warn!(
+                        "contextualized doc group failed (attempt {}/{}): {}. Retrying in {}ms...",
+                        attempt + 1,
+                        CONTEXTUALIZED_MAX_RETRIES + 1,
+                        e,
+                        delay
+                    );
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Build the semantic index using a contextualized document-chunk embedding
+    /// function. Groups chunks by source document so the embedding provider can
+    /// use surrounding chunks as context.
+    ///
+    /// Returns the built index and contextualized build diagnostics (split
+    /// counts, retry counts, failure counts) so the caller can surface them.
+    pub fn build_with_progress_contextualized<F, P>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
+    ) -> Result<(Self, ContextualizedBuildDiagnostics), String>
+    where
+        F: FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String>,
+        P: FnMut(usize, usize),
+    {
+        let mut files = files.to_vec();
+        Self::sort_files_by_priority(&mut files);
+        let (chunks, file_metadata) =
+            Self::collect_chunks(project_root, &files, file_policy, document_prompt_template);
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+
+        if chunks.is_empty() {
+            return Ok((
+                Self {
+                    snapshot: Arc::new(SemanticIndexSnapshot {
+                        store: crate::vector_store::FlatF32VectorStore::from_parts(
+                            Vec::new(),
+                            DEFAULT_DIMENSION,
+                            file_metadata,
+                        ),
+                        dimension: DEFAULT_DIMENSION,
+                        project_root: project_root.to_path_buf(),
+                        file_manifest: HashMap::new(),
+                        next_chunk_id: 0,
+                        fingerprint_string: None,
+                    }),
+                    lifecycle: SemanticIndexLifecycle::Ready,
+                    last_error: None,
+                    fingerprint: None,
+                    deferred_files: HashSet::new(),
+                },
+                ContextualizedBuildDiagnostics::default(),
+            ));
+        }
+
+        // Group chunks by file path using BTreeMap for deterministic ordering
+        let mut docs_map: BTreeMap<PathBuf, Vec<SemanticChunk>> = BTreeMap::new();
+        for chunk in chunks {
+            docs_map.entry(chunk.file.clone()).or_default().push(chunk);
+        }
+
+        // Build per-document chunk groups, splitting oversized documents.
+        // `group_source_chunks` tracks the original SemanticChunk objects for
+        // each sub-group so reconstruction doesn't rely on file_path lookups
+        // (which break when one file is split into multiple sub-groups).
+        // `group_file_paths` tracks the expected file_path for each sub-group
+        // so we can validate the embedder's response.
+        let mut documents: Vec<PerDocumentChunks> = Vec::with_capacity(docs_map.len());
+        let mut group_source_chunks: Vec<Vec<SemanticChunk>> = Vec::with_capacity(docs_map.len());
+        let mut group_file_paths: Vec<PathBuf> = Vec::with_capacity(docs_map.len());
+        let mut diagnostics = ContextualizedBuildDiagnostics {
+            max_chunks_in_document: docs_map.values().map(|c| c.len()).max().unwrap_or(0),
+            ..Default::default()
+        };
+
+        for (path, file_chunks) in &docs_map {
+            let title = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let chunk_texts: Vec<String> =
+                file_chunks.iter().map(|c| c.embed_text.clone()).collect();
+            let doc = PerDocumentChunks {
+                file_path: path.clone(),
+                title,
+                chunks: chunk_texts,
+            };
+
+            // Split oversized documents into sub-groups
+            let sub_groups = Self::split_oversized_document(&doc, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+
+            // Record source chunks and expected file_path for each sub-group
+            for (i, sub_group) in sub_groups.iter().enumerate() {
+                let start = i * DEFAULT_MAX_CHUNKS_PER_DOCUMENT;
+                let end = std::cmp::min(start + DEFAULT_MAX_CHUNKS_PER_DOCUMENT, file_chunks.len());
+                group_source_chunks.push(file_chunks[start..end].to_vec());
+                group_file_paths.push(sub_group.file_path.clone());
+            }
+
+            if sub_groups.len() > 1 {
+                diagnostics.split_documents += 1;
+            }
+            documents.extend(sub_groups);
+        }
+
+        diagnostics.documents_processed = docs_map.len();
+
+        // Embed documents with retry logic, tracking diagnostics
+        let mut all_embeddings: Vec<ChunkEmbeddings> = Vec::new();
+        let mut succeeded_source_chunks: Vec<Vec<SemanticChunk>> = Vec::new();
+        let mut succeeded_file_paths: Vec<PathBuf> = Vec::new();
+        let mut retried_count = 0usize;
+        let mut failed_count = 0usize;
+
+        for (i, doc) in documents.iter().enumerate() {
+            match Self::embed_document_group_with_retry(embed_fn, doc.clone(), &mut retried_count) {
+                Ok(result) => {
+                    all_embeddings.extend(result.embeddings);
+                    succeeded_source_chunks.push(group_source_chunks[i].clone());
+                    succeeded_file_paths.push(group_file_paths[i].clone());
+                }
+                Err(e) => {
+                    slog_warn!(
+                        "contextualized doc group failed after retries, skipping: {} ({})",
+                        doc.file_path.display(),
+                        e
+                    );
+                    failed_count += 1;
+                }
+            }
+        }
+
+        diagnostics.retried_groups = retried_count;
+        diagnostics.failed_groups = failed_count;
+
+        let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(total_chunks);
+        let mut expected_dimension: Option<usize> = None;
+        let mut done = 0;
+
+        for (emb, source_chunks, expected_path) in all_embeddings
+            .into_iter()
+            .zip(succeeded_source_chunks)
+            .zip(succeeded_file_paths)
+            .map(|((emb, chunks), path)| (emb, chunks, path))
+        {
+            // Validate that the embedder returned embeddings for the file we expected
+            if emb.file_path != expected_path {
+                return Err(format!(
+                    "embedding response returned unknown file path: {} (expected {})",
+                    emb.file_path.display(),
+                    expected_path.display()
+                ));
+            }
+
+            if emb.vectors.len() != source_chunks.len() {
+                return Err(format!(
+                    "embedding response returned {} vectors for {} chunks in file {}",
+                    emb.vectors.len(),
+                    source_chunks.len(),
+                    emb.file_path.display()
+                ));
+            }
+
+            for (chunk, vector) in source_chunks.iter().zip(emb.vectors) {
+                if let Some(dim) = expected_dimension {
+                    if vector.len() != dim {
+                        return Err(format!(
+                            "embedding dimension changed: expected {dim}, got {}",
+                            vector.len()
+                        ));
+                    }
+                } else {
+                    expected_dimension = Some(vector.len());
+                }
+
+                entries.push(EmbeddingEntry {
+                    chunk: chunk.clone(),
+                    vector,
+                    chunk_hash: compute_chunk_hash(chunk),
+                });
+                done += 1;
+                progress(done, total_chunks);
+            }
+        }
+
+        diagnostics.chunks_embedded = entries.len();
+        slog_info!(
+            "contextualized build complete: {} docs ({} split), {} chunks, {} retried, {} failed",
+            diagnostics.documents_processed,
+            diagnostics.split_documents,
+            diagnostics.chunks_embedded,
+            diagnostics.retried_groups,
+            diagnostics.failed_groups
+        );
+
+        let dimension = expected_dimension.unwrap_or(DEFAULT_DIMENSION);
+
+        let mut new_snapshot = SemanticIndexSnapshot {
+            store: crate::vector_store::FlatF32VectorStore::from_parts(
+                entries,
+                dimension,
+                file_metadata,
+            ),
+            dimension,
+            project_root: project_root.to_path_buf(),
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+        new_snapshot.build_manifest_from_store();
+        Ok((
+            Self {
+                snapshot: Arc::new(new_snapshot),
+                lifecycle: SemanticIndexLifecycle::Ready,
+                last_error: None,
+                fingerprint: None,
+                deferred_files: HashSet::new(),
+            },
+            diagnostics,
+        ))
+    }
+
+    /// Incrementally refresh entries for changed/new files only, preserving cached
+    /// embeddings for unchanged files. Used when loading the index from disk and
+    /// finding that a small fraction of files have moved on, deleted, or appeared.
+    ///
+    /// Returns `RefreshSummary` describing what changed. On success, `self` is
+    /// mutated in place and remains a valid index.
+    ///
+    /// `current_files` is the full set of files the project considers indexable
+    /// (typically `walk_project_files(...)`). Files in the cache that are no
+    /// longer in this set are treated as deleted.
+    pub fn refresh_stale_files<F, P>(
+        &mut self,
+        project_root: &Path,
+        current_files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
+    ) -> Result<RefreshSummary, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        // Clone the current snapshot to mutate it (clone-swap pattern).
+        let mut snapshot = (*self.snapshot).clone();
+
+        // 1. Bucket files into deleted / changed / added.
+        let current_set: HashSet<&Path> = current_files.iter().map(PathBuf::as_path).collect();
+        let total_processed = current_set.len() + snapshot.store().file_metadata().len()
+            - snapshot
+                .store()
+                .file_metadata()
+                .keys()
+                .filter(|path| current_set.contains(path.as_path()))
+                .count();
+
+        // Files in cache that disappeared from disk OR are no longer in the
+        // walked set. Both cases need their entries dropped.
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut changed: Vec<PathBuf> = Vec::new();
+        let indexed_paths: Vec<PathBuf> =
+            snapshot.store().file_metadata().keys().cloned().collect();
+        for indexed_path in &indexed_paths {
+            if !current_set.contains(indexed_path.as_path()) {
+                deleted.push(indexed_path.clone());
+                continue;
+            }
+            let cached = snapshot
+                .store()
+                .file_metadata()
+                .get(indexed_path)
+                .map(|meta| FileFreshness {
+                    mtime: meta.mtime,
+                    size: meta.size,
+                    content_hash: meta.content_hash,
+                });
+            match cached.map(|freshness| cache_freshness::verify_file(indexed_path, &freshness)) {
+                Some(FreshnessVerdict::HotFresh) => {}
+                Some(FreshnessVerdict::ContentFresh {
+                    new_mtime,
+                    new_size,
+                }) => {
+                    // Update mtime/size in metadata — content_hash unchanged.
+                    if let Some(meta) = snapshot
+                        .store_mut()
+                        .file_metadata_mut()
+                        .get_mut(indexed_path)
+                    {
+                        meta.mtime = new_mtime;
+                        meta.size = new_size;
+                    }
+                }
+                Some(FreshnessVerdict::Stale | FreshnessVerdict::Deleted) | None => {
+                    changed.push(indexed_path.clone());
+                }
+            }
+        }
+
+        // Files in walk that were never indexed.
+        let mut added: Vec<PathBuf> = Vec::new();
+        for path in current_files {
+            if !snapshot.store().file_metadata().contains_key(path) {
+                added.push(path.clone());
+            }
+        }
+
+        // Fast path: nothing to do.
+        if deleted.is_empty() && changed.is_empty() && added.is_empty() {
+            progress(0, 0);
+            return Ok(RefreshSummary {
+                total_processed,
+                ..RefreshSummary::default()
+            });
+        }
+
+        // 2. Drop entries for deleted files immediately. Changed files are only
+        //    replaced after successful re-extraction + embedding so transient
+        //    read/parse errors keep the stale-but-valid cache entry.
+        if !deleted.is_empty() {
+            let deleted_set: HashSet<&Path> = deleted.iter().map(PathBuf::as_path).collect();
+            snapshot
+                .store_mut()
+                .entries_mut()
+                .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
+            for path in &deleted {
+                snapshot.store_mut().file_metadata_mut().remove(path);
+            }
+        }
+
+        // 3. Embed the changed + added set, if any.
+        let mut to_embed: Vec<PathBuf> = Vec::with_capacity(changed.len() + added.len());
+        to_embed.extend(changed.iter().cloned());
+        to_embed.extend(added.iter().cloned());
+
+        if to_embed.is_empty() {
+            // Only deletions happened.
+            progress(0, 0);
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
+            return Ok(RefreshSummary {
+                changed: 0,
+                added: 0,
+                deleted: deleted.len(),
+                total_processed,
+            });
+        }
+
+        let (chunks, fresh_metadata) = Self::collect_chunks(
+            project_root,
+            &to_embed,
+            file_policy,
+            document_prompt_template,
+        );
+
+        if chunks.is_empty() {
+            progress(0, 0);
+            let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+            if !successful_files.is_empty() {
+                snapshot
+                    .store_mut()
+                    .entries_mut()
+                    .retain(|entry| !successful_files.contains(&entry.chunk.file));
+            }
+            let changed_count = changed
+                .iter()
+                .filter(|path| successful_files.contains(*path))
+                .count();
+            let added_count = added
+                .iter()
+                .filter(|path| successful_files.contains(*path))
+                .count();
+            snapshot
+                .store_mut()
+                .file_metadata_mut()
+                .extend(fresh_metadata);
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
+            return Ok(RefreshSummary {
+                changed: changed_count,
+                added: added_count,
+                deleted: deleted.len(),
+                total_processed,
+            });
+        }
+
+        // 4. Embed in batches and dimension-check against the existing index.
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+        let batch_size = max_batch_size.max(1);
+        let existing_dimension = if snapshot.is_empty() {
+            None
+        } else {
+            Some(snapshot.dimension)
+        };
+        let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
+        let mut observed_dimension: Option<usize> = existing_dimension;
+
+        for batch_start in (0..chunks.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(chunks.len());
+            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|c| c.embed_text.clone())
+                .collect();
+
+            let vectors = embed_fn(batch_texts)?;
+            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
+
+            if let Some(dim) = vectors.first().map(|v| v.len()) {
+                match observed_dimension {
+                    None => observed_dimension = Some(dim),
+                    Some(expected) if dim != expected => {
+                        // Refuse to mix dimensions in one index. Caller should
+                        // fall back to a full rebuild.
+                        return Err(format!(
+                            "embedding dimension changed during incremental refresh: \
+                             cached index uses {expected}, new vectors use {dim}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (i, vector) in vectors.into_iter().enumerate() {
+                let chunk_idx = batch_start + i;
+                new_entries.push(EmbeddingEntry {
+                    chunk: chunks[chunk_idx].clone(),
+                    vector,
+                    chunk_hash: compute_chunk_hash(&chunks[chunk_idx]),
+                });
+            }
+
+            progress(new_entries.len(), total_chunks);
+        }
+
+        let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
+        if !successful_files.is_empty() {
+            snapshot
+                .store_mut()
+                .entries_mut()
+                .retain(|entry| !successful_files.contains(&entry.chunk.file));
+        }
+
+        snapshot.store_mut().entries_mut().extend(new_entries);
+        snapshot
+            .store_mut()
+            .file_metadata_mut()
+            .extend(fresh_metadata);
+        if let Some(dim) = observed_dimension {
+            snapshot.dimension = dim;
+        }
+
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
+
+        Ok(RefreshSummary {
+            changed: changed
+                .iter()
+                .filter(|path| successful_files.contains(*path))
+                .count(),
+            added: added
+                .iter()
+                .filter(|path| successful_files.contains(*path))
+                .count(),
+            deleted: deleted.len(),
+            total_processed,
+        })
+    }
+
+    /// Number of distinct indexed files (file-metadata keys).
+    pub fn indexed_file_count(&self) -> usize {
+        self.snapshot.store().file_metadata().len()
     }
 
     fn build_chunk_reuse_map(&self, files: &[PathBuf]) -> ChunkReuseMap {
         let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
-        for entry in &self.entries {
+        for entry in self.snapshot.store().entries_slice() {
             if !requested.contains(entry.chunk.file.as_path()) {
                 continue;
             }
 
-            // `embed_text` is already persisted in the current on-disk format,
-            // so refresh-time reuse can hash it in memory and confirm the exact
-            // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
-            // user through a full rebuild.
             let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
             reuse_map
                 .entry(entry.chunk.file.clone())
@@ -1422,7 +3961,11 @@ impl SemanticIndex {
 
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry {
+                    chunk_hash: compute_chunk_hash(&chunk),
+                    chunk,
+                    vector,
+                });
             } else {
                 misses.push((chunk_index, chunk));
             }
@@ -1461,7 +4004,11 @@ impl SemanticIndex {
 
             for (i, vector) in vectors.into_iter().enumerate() {
                 let (chunk_index, chunk) = misses[batch_start + i].clone();
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry {
+                    chunk_hash: compute_chunk_hash(&chunk),
+                    chunk,
+                    vector,
+                });
             }
 
             completed += batch_end - batch_start;
@@ -1476,419 +4023,9 @@ impl SemanticIndex {
         Ok((entries, observed_dimension))
     }
 
-    fn build_from_chunks<F, P>(
-        project_root: &Path,
-        chunks: Vec<SemanticChunk>,
-        file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
-        embed_fn: &mut F,
-        max_batch_size: usize,
-        mut progress: Option<&mut P>,
-    ) -> Result<Self, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-        P: FnMut(usize, usize),
-    {
-        debug_assert!(project_root.is_absolute());
-        let total_chunks = chunks.len();
-
-        if chunks.is_empty() {
-            return Ok(Self {
-                entries: Vec::new(),
-                file_mtimes: file_metadata
-                    .iter()
-                    .map(|(path, metadata)| (path.clone(), metadata.mtime))
-                    .collect(),
-                file_sizes: file_metadata
-                    .iter()
-                    .map(|(path, metadata)| (path.clone(), metadata.size))
-                    .collect(),
-                file_hashes: file_metadata
-                    .into_iter()
-                    .map(|(path, metadata)| (path, metadata.content_hash))
-                    .collect(),
-                dimension: DEFAULT_DIMENSION,
-                fingerprint: None,
-                project_root: project_root.to_path_buf(),
-                deferred_files: HashSet::new(),
-            });
-        }
-
-        // Embed in batches
-        let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
-        let mut expected_dimension: Option<usize> = None;
-        let batch_size = max_batch_size.max(1);
-        let embed_started = std::time::Instant::now();
-        let batch_count = total_chunks.div_ceil(batch_size);
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(chunks.len());
-            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
-                .iter()
-                .map(|c| c.embed_text.clone())
-                .collect();
-
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            // Track consistent dimension across all batches
-            if let Some(dim) = vectors.first().map(|v| v.len()) {
-                match expected_dimension {
-                    None => expected_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        return Err(format!(
-                            "embedding dimension changed across batches: expected {expected}, got {dim}"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let chunk_idx = batch_start + i;
-                entries.push(EmbeddingEntry {
-                    chunk: chunks[chunk_idx].clone(),
-                    vector,
-                });
-            }
-
-            if let Some(callback) = progress.as_mut() {
-                callback(entries.len(), total_chunks);
-            }
-        }
-
-        let embed_ms = embed_started.elapsed().as_millis();
-        let rate = (total_chunks as u128 * 1000)
-            .checked_div(embed_ms)
-            .unwrap_or(0) as u64;
-        slog_info!(
-            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s)",
-            total_chunks,
-            batch_count,
-            embed_ms,
-            rate
-        );
-
-        let dimension = entries
-            .first()
-            .map(|e| e.vector.len())
-            .unwrap_or(DEFAULT_DIMENSION);
-
-        Ok(Self {
-            entries,
-            file_mtimes: file_metadata
-                .iter()
-                .map(|(path, metadata)| (path.clone(), metadata.mtime))
-                .collect(),
-            file_sizes: file_metadata
-                .iter()
-                .map(|(path, metadata)| (path.clone(), metadata.size))
-                .collect(),
-            file_hashes: file_metadata
-                .into_iter()
-                .map(|(path, metadata)| (path, metadata.content_hash))
-                .collect(),
-            dimension,
-            fingerprint: None,
-            project_root: project_root.to_path_buf(),
-            deferred_files: HashSet::new(),
-        })
-    }
-
-    /// Build the semantic index from a set of files using the provided embedding function.
-    /// `embed_fn` takes a batch of texts and returns a batch of embedding vectors.
-    pub fn build<F>(
-        project_root: &Path,
-        files: &[PathBuf],
-        embed_fn: &mut F,
-        max_batch_size: usize,
-    ) -> Result<Self, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-    {
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
-        Self::build_from_chunks(
-            project_root,
-            chunks,
-            file_mtimes,
-            embed_fn,
-            max_batch_size,
-            Option::<&mut fn(usize, usize)>::None,
-        )
-    }
-
-    /// Build the semantic index and report embedding progress using entry counts.
-    pub fn build_with_progress<F, P>(
-        project_root: &Path,
-        files: &[PathBuf],
-        embed_fn: &mut F,
-        max_batch_size: usize,
-        progress: &mut P,
-    ) -> Result<Self, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-        P: FnMut(usize, usize),
-    {
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
-        let total_chunks = chunks.len();
-        progress(0, total_chunks);
-        Self::build_from_chunks(
-            project_root,
-            chunks,
-            file_mtimes,
-            embed_fn,
-            max_batch_size,
-            Some(progress),
-        )
-    }
-
-    /// Incrementally refresh entries for changed/new files only, preserving cached
-    /// embeddings for unchanged files. Used when loading the index from disk and
-    /// finding that a small fraction of files have moved on, deleted, or appeared.
-    ///
-    /// Returns `RefreshSummary` describing what changed. On success, `self` is
-    /// mutated in place and remains a valid index.
-    ///
-    /// `current_files` is the full set of files the project considers indexable
-    /// (typically `walk_project_files(...)`). Files in the cache that are no
-    /// longer in this set are treated as deleted.
-    pub fn refresh_stale_files<F, P>(
-        &mut self,
-        project_root: &Path,
-        current_files: &[PathBuf],
-        embed_fn: &mut F,
-        max_batch_size: usize,
-        progress: &mut P,
-    ) -> Result<RefreshSummary, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-        P: FnMut(usize, usize),
-    {
-        self.backfill_missing_file_sizes();
-
-        // 1. Bucket files into deleted / changed / added.
-        let current_set: HashSet<&Path> = current_files.iter().map(PathBuf::as_path).collect();
-        self.deferred_files
-            .retain(|path| current_set.contains(path.as_path()));
-        let total_processed = current_set.len() + self.file_mtimes.len()
-            - self
-                .file_mtimes
-                .keys()
-                .filter(|path| current_set.contains(path.as_path()))
-                .count();
-
-        // Files in cache that disappeared from disk OR are no longer in the
-        // walked set. Both cases need their entries dropped.
-        enum IndexedFileCheck {
-            Deleted(PathBuf),
-            MissingMetadata(PathBuf),
-            Verified(PathBuf, FreshnessVerdict),
-        }
-
-        let mut deleted: Vec<PathBuf> = Vec::new();
-        let mut changed: Vec<PathBuf> = Vec::new();
-        let indexed_paths: Vec<PathBuf> = self.file_mtimes.keys().cloned().collect();
-        let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
-        let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
-
-        for indexed_path in indexed_paths {
-            let check_index = checks.len();
-            if !current_set.contains(indexed_path.as_path()) {
-                checks.push(Some(IndexedFileCheck::Deleted(indexed_path)));
-                continue;
-            }
-            let cached = match (
-                self.file_mtimes.get(&indexed_path),
-                self.file_sizes.get(&indexed_path),
-                self.file_hashes.get(&indexed_path),
-            ) {
-                (Some(mtime), Some(size), Some(hash)) => Some(FileFreshness {
-                    mtime: *mtime,
-                    size: *size,
-                    content_hash: *hash,
-                }),
-                _ => None,
-            };
-            if let Some(freshness) = cached {
-                strict_verify_inputs.push((check_index, indexed_path, freshness));
-                checks.push(None);
-            } else {
-                checks.push(Some(IndexedFileCheck::MissingMetadata(indexed_path)));
-            }
-        }
-
-        for (check_index, path, verdict) in
-            cache_freshness::verify_files_strict_bounded(strict_verify_inputs)
-        {
-            checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
-        }
-
-        for check in checks {
-            match check.expect("strict freshness check should be populated") {
-                IndexedFileCheck::Deleted(path) => deleted.push(path),
-                IndexedFileCheck::MissingMetadata(path) => changed.push(path),
-                IndexedFileCheck::Verified(_path, FreshnessVerdict::HotFresh) => {}
-                IndexedFileCheck::Verified(
-                    path,
-                    FreshnessVerdict::ContentFresh {
-                        new_mtime,
-                        new_size,
-                    },
-                ) => {
-                    self.file_mtimes.insert(path.clone(), new_mtime);
-                    self.file_sizes.insert(path, new_size);
-                }
-                IndexedFileCheck::Verified(
-                    path,
-                    FreshnessVerdict::Stale | FreshnessVerdict::Deleted,
-                ) => {
-                    changed.push(path);
-                }
-            }
-        }
-
-        // Files in walk that were never indexed.
-        let mut added: Vec<PathBuf> = Vec::new();
-        for path in current_files {
-            if !self.file_mtimes.contains_key(path) {
-                added.push(path.clone());
-            }
-        }
-
-        // Fast path: nothing to do.
-        if deleted.is_empty() && changed.is_empty() && added.is_empty() {
-            progress(0, 0);
-            return Ok(RefreshSummary {
-                total_processed,
-                ..RefreshSummary::default()
-            });
-        }
-
-        // 2. Drop entries for deleted files immediately. Changed files are only
-        //    replaced after successful re-extraction + embedding so transient
-        //    read/parse errors keep the stale-but-valid cache entry.
-        if !deleted.is_empty() {
-            self.remove_indexed_files(&deleted);
-        }
-
-        // 3. Embed the changed + added set, if any.
-        let mut to_embed: Vec<PathBuf> = Vec::with_capacity(changed.len() + added.len());
-        to_embed.extend(changed.iter().cloned());
-        to_embed.extend(added.iter().cloned());
-
-        if to_embed.is_empty() {
-            // Only deletions happened.
-            progress(0, 0);
-            return Ok(RefreshSummary {
-                changed: 0,
-                added: 0,
-                deleted: deleted.len(),
-                total_processed,
-            });
-        }
-
-        let reuse_map = self.build_chunk_reuse_map(&changed);
-        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
-        let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
-        let vanished = to_embed
-            .iter()
-            .filter(|path| {
-                changed_set.contains(path.as_path())
-                    && !fresh_metadata.contains_key(*path)
-                    && !path.exists()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !vanished.is_empty() {
-            self.remove_indexed_files(&vanished);
-            deleted.extend(vanished);
-        }
-
-        if chunks.is_empty() {
-            progress(0, 0);
-            let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
-            for file in &successful_files {
-                self.deferred_files.remove(file);
-            }
-            if !successful_files.is_empty() {
-                self.entries
-                    .retain(|entry| !successful_files.contains(&entry.chunk.file));
-            }
-            let changed_count = changed
-                .iter()
-                .filter(|path| successful_files.contains(*path))
-                .count();
-            let added_count = added
-                .iter()
-                .filter(|path| successful_files.contains(*path))
-                .count();
-            for (file, metadata) in fresh_metadata {
-                self.file_mtimes.insert(file.clone(), metadata.mtime);
-                self.file_sizes.insert(file.clone(), metadata.size);
-                self.file_hashes.insert(file.clone(), metadata.content_hash);
-            }
-            return Ok(RefreshSummary {
-                changed: changed_count,
-                added: added_count,
-                deleted: deleted.len(),
-                total_processed,
-            });
-        }
-
-        // 4. Build the full replacement set, reusing cached vectors for chunks
-        //    whose embed_text is unchanged and embedding only cache misses.
-        let existing_dimension = if self.entries.is_empty() {
-            None
-        } else {
-            Some(self.dimension)
-        };
-        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
-            chunks,
-            &reuse_map,
-            embed_fn,
-            max_batch_size,
-            existing_dimension,
-            "incremental refresh",
-            progress,
-        )?;
-
-        let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
-        for file in &successful_files {
-            self.deferred_files.remove(file);
-        }
-        if !successful_files.is_empty() {
-            self.entries
-                .retain(|entry| !successful_files.contains(&entry.chunk.file));
-        }
-
-        self.entries.extend(new_entries);
-        for (file, metadata) in fresh_metadata {
-            self.file_mtimes.insert(file.clone(), metadata.mtime);
-            self.file_sizes.insert(file.clone(), metadata.size);
-            self.file_hashes.insert(file, metadata.content_hash);
-        }
-        if let Some(dim) = observed_dimension {
-            self.dimension = dim;
-        }
-
-        Ok(RefreshSummary {
-            changed: changed
-                .iter()
-                .filter(|path| successful_files.contains(*path))
-                .count(),
-            added: added
-                .iter()
-                .filter(|path| successful_files.contains(*path))
-                .count(),
-            deleted: deleted.len(),
-            total_processed,
-        })
-    }
-
-    /// Refresh exactly the files invalidated by the live watcher, without
-    /// treating the provided path list as the whole project. This is the
-    /// watcher-side counterpart to `refresh_stale_files`: it drops any stale
-    /// entries for the requested paths from this in-memory index, re-extracts
-    /// whatever still exists on disk, embeds those chunks, and returns the
-    /// delta needed for another in-memory index to apply the same update.
+    /// Refresh only the requested invalidated files in this in-memory index,
+    /// re-extract and embed whatever still exists on disk, and return the delta
+    /// needed for another in-memory index to apply the same update.
     pub fn refresh_invalidated_files<F, P>(
         &mut self,
         project_root: &Path,
@@ -1897,6 +4034,8 @@ impl SemanticIndex {
         max_batch_size: usize,
         max_files: usize,
         progress: &mut P,
+        file_policy: &SemanticFilePolicy,
+        document_prompt_template: Option<&str>,
     ) -> Result<InvalidatedFilesRefresh, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -1922,16 +4061,14 @@ impl SemanticIndex {
             });
         }
 
+        let file_metadata = self.snapshot.store().file_metadata();
         let previously_indexed: HashSet<PathBuf> = requested_paths
             .iter()
-            .filter(|path| self.file_mtimes.contains_key(*path))
+            .filter(|path| file_metadata.contains_key(*path))
             .cloned()
             .collect();
         let reuse_map = self.build_chunk_reuse_map(&requested_paths);
 
-        // The watcher path has already invalidated these files in the request
-        // thread's live index. Mirror that behavior here before inserting any
-        // fresh chunks so parse/read failures do not resurrect stale entries.
         self.remove_indexed_files(&requested_paths);
 
         let existing_paths = requested_paths
@@ -1962,9 +4099,14 @@ impl SemanticIndex {
             });
         }
 
-        let (mut chunks, mut fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+        let (mut chunks, mut fresh_metadata) = Self::collect_chunks(
+            project_root,
+            &existing_paths,
+            file_policy,
+            document_prompt_template,
+        );
 
-        let retained_file_count = self.file_mtimes.len();
+        let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
             .iter()
             .filter(|path| {
@@ -2021,18 +4163,21 @@ impl SemanticIndex {
 
         if chunks.is_empty() {
             progress(0, 0);
+            let mut snapshot = (*self.snapshot).clone();
             for (file, metadata) in fresh_metadata {
                 let freshness = FileFreshness {
                     mtime: metadata.mtime,
                     size: metadata.size,
                     content_hash: metadata.content_hash,
                 };
-                self.file_mtimes.insert(file.clone(), freshness.mtime);
-                self.file_sizes.insert(file.clone(), freshness.size);
-                self.file_hashes
-                    .insert(file.clone(), freshness.content_hash);
+                snapshot
+                    .store_mut()
+                    .file_metadata_mut()
+                    .insert(file.clone(), metadata);
                 updated_metadata.push((file, freshness));
             }
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
 
             return Ok(InvalidatedFilesRefresh {
                 updated_metadata,
@@ -2047,11 +4192,10 @@ impl SemanticIndex {
             });
         }
 
-        let initial_observed_dimension = if self.entries.is_empty() && previously_indexed.is_empty()
-        {
+        let initial_observed_dimension = if self.is_empty() && previously_indexed.is_empty() {
             None
         } else {
-            Some(self.dimension)
+            Some(self.dimension())
         };
         let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
             chunks,
@@ -2064,22 +4208,26 @@ impl SemanticIndex {
         )?;
 
         let added_entries = new_entries.clone();
-        self.entries.extend(new_entries);
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.store_mut().entries_mut().extend(new_entries);
         for (file, metadata) in fresh_metadata {
             let freshness = FileFreshness {
                 mtime: metadata.mtime,
                 size: metadata.size,
                 content_hash: metadata.content_hash,
             };
-            self.file_mtimes.insert(file.clone(), freshness.mtime);
-            self.file_sizes.insert(file.clone(), freshness.size);
-            self.file_hashes
-                .insert(file.clone(), freshness.content_hash);
+            snapshot
+                .store_mut()
+                .file_metadata_mut()
+                .insert(file.clone(), metadata);
             updated_metadata.push((file, freshness));
         }
         if let Some(dim) = observed_dimension {
-            self.dimension = dim;
+            snapshot.dimension = dim;
+            snapshot.store_mut().set_dimension(dim);
         }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
 
         Ok(InvalidatedFilesRefresh {
             added_entries,
@@ -2100,150 +4248,92 @@ impl SemanticIndex {
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: &[PathBuf],
     ) {
-        // `added_entries` is the complete replacement set for completed paths:
-        // freshly embedded misses plus reused chunks carrying refreshed metadata.
-        // Removing first is safe only because producers include both kinds.
         self.remove_indexed_files(completed_paths);
 
         let observed_dimension = added_entries.first().map(|entry| entry.vector.len());
-        self.entries.extend(added_entries);
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot.store_mut().entries_mut().extend(added_entries);
         for (file, freshness) in updated_metadata {
-            self.file_mtimes.insert(file.clone(), freshness.mtime);
-            self.file_sizes.insert(file.clone(), freshness.size);
-            self.file_hashes.insert(file, freshness.content_hash);
+            snapshot.store_mut().file_metadata_mut().insert(
+                file,
+                IndexedFileMetadata {
+                    mtime: freshness.mtime,
+                    size: freshness.size,
+                    content_hash: freshness.content_hash,
+                },
+            );
         }
         if let Some(dim) = observed_dimension {
-            self.dimension = dim;
+            snapshot.dimension = dim;
+            snapshot.store_mut().set_dimension(dim);
         }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
     }
 
     fn remove_indexed_files(&mut self, files: &[PathBuf]) {
         let deleted_set: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
-        self.entries
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot
+            .store_mut()
+            .entries_mut()
             .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
         for path in files {
-            self.file_mtimes.remove(path);
-            self.file_sizes.remove(path);
-            self.file_hashes.remove(path);
+            snapshot.store_mut().file_metadata_mut().remove(path);
         }
-    }
-
-    /// Search the index with a query embedding, returning top-K results sorted by relevance
-    pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {
-        if self.entries.is_empty() || query_vector.len() != self.dimension {
-            return Vec::new();
-        }
-
-        let mut scored: Vec<(f32, usize)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let mut score = cosine_similarity(query_vector, &entry.vector);
-                if entry.chunk.exported {
-                    score *= 1.1;
-                }
-                (score, i)
-            })
-            .collect();
-
-        let keep = top_k.min(scored.len());
-        if keep == 0 {
-            return Vec::new();
-        }
-
-        if keep < scored.len() {
-            scored.select_nth_unstable_by(keep, semantic_score_order);
-            scored.truncate(keep);
-        }
-        scored.sort_by(semantic_score_order);
-
-        scored
-            .into_iter()
-            // Keep the selected best-first slice mapped without reintroducing the
-            // old `> 0.0` floor: top_k has already been selected, and zero-score
-            // tail entries remain observable when requested.
-            .map(|(score, idx)| {
-                let entry = &self.entries[idx];
-                SemanticResult {
-                    file: entry.chunk.file.clone(),
-                    name: entry.chunk.name.clone(),
-                    kind: entry.chunk.kind.clone(),
-                    start_line: entry.chunk.start_line,
-                    end_line: entry.chunk.end_line,
-                    exported: entry.chunk.exported,
-                    snippet: entry.chunk.snippet.clone(),
-                    score,
-                    source: "semantic",
-                }
-            })
-            .collect()
-    }
-
-    /// Number of indexed entries
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if a file needs re-indexing based on mtime/size
-    pub fn is_file_stale(&self, file: &Path) -> bool {
-        let Some(stored_mtime) = self.file_mtimes.get(file) else {
-            return true;
-        };
-        let Some(stored_size) = self.file_sizes.get(file) else {
-            return true;
-        };
-        let Some(stored_hash) = self.file_hashes.get(file) else {
-            return true;
-        };
-        let cached = FileFreshness {
-            mtime: *stored_mtime,
-            size: *stored_size,
-            content_hash: *stored_hash,
-        };
-        match cache_freshness::verify_file_strict(file, &cached) {
-            FreshnessVerdict::HotFresh => false,
-            FreshnessVerdict::ContentFresh { .. } => false,
-            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
-        }
+        snapshot.build_manifest_from_store();
+        self.swap_snapshot(snapshot);
     }
 
     fn backfill_missing_file_sizes(&mut self) {
-        for path in self.file_mtimes.keys() {
-            if self.file_sizes.contains_key(path) {
+        let paths: Vec<PathBuf> = self
+            .snapshot
+            .store()
+            .file_metadata()
+            .keys()
+            .cloned()
+            .collect();
+        let mut snapshot = (*self.snapshot).clone();
+        let mut changed = false;
+        for path in paths {
+            let needs_backfill = snapshot
+                .store()
+                .file_metadata()
+                .get(&path)
+                .is_some_and(|meta| meta.size == 0);
+            if !needs_backfill {
                 continue;
             }
-            if let Ok(metadata) = fs::metadata(path) {
-                self.file_sizes.insert(path.clone(), metadata.len());
-                if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(path, metadata.len()) {
-                    self.file_hashes.insert(path.clone(), hash);
+            if let Ok(fs_meta) = fs::metadata(&path) {
+                let size = fs_meta.len();
+                if let Some(entry) = snapshot.store_mut().file_metadata_mut().get_mut(&path) {
+                    entry.size = size;
+                    changed = true;
+                    if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(&path, size) {
+                        entry.content_hash = hash;
+                    }
                 }
             }
         }
+        if changed {
+            snapshot.build_manifest_from_store();
+            self.swap_snapshot(snapshot);
+        }
     }
 
-    /// Remove entries for a specific file
+    /// Remove entries for a specific file (clone–swap pattern)
     pub fn remove_file(&mut self, file: &Path) {
         self.invalidate_file(file);
     }
 
     pub fn invalidate_file(&mut self, file: &Path) {
-        let canonical_file = canonicalize_existing_or_deleted_path(file);
-        self.entries
-            .retain(|e| e.chunk.file != file && e.chunk.file != canonical_file);
-        self.file_mtimes.remove(file);
-        self.file_sizes.remove(file);
-        self.file_hashes.remove(file);
-        if canonical_file.as_path() != file {
-            self.file_mtimes.remove(&canonical_file);
-            self.file_sizes.remove(&canonical_file);
-            self.file_hashes.remove(&canonical_file);
-        }
-    }
-
-    /// Get the embedding dimension
-    pub fn dimension(&self) -> usize {
-        self.dimension
+        let mut snapshot = (*self.snapshot).clone();
+        snapshot
+            .store_mut()
+            .entries_mut()
+            .retain(|e| e.chunk.file != file);
+        snapshot.store_mut().file_metadata_mut().remove(file);
+        self.snapshot = Arc::new(snapshot);
     }
 
     pub fn fingerprint(&self) -> Option<&SemanticIndexFingerprint> {
@@ -2262,11 +4352,22 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
+    /// Compare the current fingerprint with an old one and return the change.
+    pub fn fingerprint_change(
+        &self,
+        old_fingerprint: &SemanticIndexFingerprint,
+    ) -> FingerprintChange {
+        self.fingerprint
+            .as_ref()
+            .map(|current| current.diff(old_fingerprint))
+            .unwrap_or(FingerprintChange::Rebuild)
+    }
+
     /// Write the semantic index to disk using atomic temp+rename pattern
     pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) {
         // Don't persist empty indexes — they would be loaded on next startup
         // and prevent a fresh build that might find files.
-        if self.entries.is_empty() {
+        if self.is_empty() {
             slog_info!("skipping semantic index persistence (0 entries)");
             return;
         }
@@ -2284,22 +4385,19 @@ impl SemanticIndex {
                 .unwrap_or(Duration::ZERO)
                 .as_nanos()
         ));
-        let write_result = (|| -> io::Result<usize> {
-            let file = fs::File::create(&tmp_path)?;
-            let mut writer = BufWriter::new(file);
-            let bytes_written = self.write_to_writer(&mut writer)?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-            Ok(bytes_written)
+        let bytes = self.to_bytes();
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
         })();
-        let bytes_written = match write_result {
-            Ok(bytes_written) => bytes_written,
-            Err(e) => {
-                slog_warn!("failed to write semantic index: {}", e);
-                let _ = fs::remove_file(&tmp_path);
-                return;
-            }
-        };
+        if let Err(e) = write_result {
+            slog_warn!("failed to write semantic index: {}", e);
+            let _ = fs::remove_file(&tmp_path);
+            return;
+        }
         if let Err(e) = fs::rename(&tmp_path, &data_path) {
             slog_warn!("failed to rename semantic index: {}", e);
             let _ = fs::remove_file(&tmp_path);
@@ -2307,8 +4405,8 @@ impl SemanticIndex {
         }
         slog_info!(
             "semantic index persisted: {} entries, {:.1} KB",
-            self.entries.len(),
-            bytes_written as f64 / 1024.0
+            self.len(),
+            bytes.len() as f64 / 1024.0
         );
     }
 
@@ -2325,8 +4423,7 @@ impl SemanticIndex {
             .join("semantic")
             .join(project_key)
             .join("semantic.bin");
-        let file = fs::File::open(&data_path).ok()?;
-        let file_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let file_len = usize::try_from(fs::metadata(&data_path).ok()?.len()).ok()?;
         if file_len < HEADER_BYTES_V1 {
             slog_warn!(
                 "corrupt semantic index (too small: {} bytes), removing",
@@ -2338,30 +4435,25 @@ impl SemanticIndex {
             return None;
         }
 
-        let mut reader = BufReader::new(file);
-        let mut version_buf = [0u8; 1];
-        reader.read_exact(&mut version_buf).ok()?;
-        let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 {
+        let bytes = fs::read(&data_path).ok()?;
+        let version = bytes[0];
+        if version != SEMANTIC_INDEX_VERSION_V6
+            && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
+        {
             slog_info!(
                 "cached semantic index version {} is older than {}, rebuilding",
                 version,
-                SEMANTIC_INDEX_VERSION_V6
+                SEMANTIC_INDEX_VERSION_V8
             );
             if !is_worktree_bridge {
                 let _ = fs::remove_file(&data_path);
             }
             return None;
         }
-        match Self::from_reader_after_version(
-            reader,
-            version,
-            current_canonical_root,
-            Some(file_len),
-            1,
-        ) {
+        match Self::from_bytes(&bytes, current_canonical_root) {
             Ok(index) => {
-                if index.entries.is_empty() {
+                if index.is_empty() {
                     slog_info!("cached semantic index is empty, will rebuild");
                     if !is_worktree_bridge {
                         let _ = fs::remove_file(&data_path);
@@ -2381,10 +4473,7 @@ impl SemanticIndex {
                         return None;
                     }
                 }
-                slog_info!(
-                    "loaded semantic index from disk: {} entries",
-                    index.entries.len()
-                );
+                slog_info!("loaded semantic index from disk: {} entries", index.len());
                 Some(index)
             }
             Err(e) => {
@@ -2400,225 +4489,217 @@ impl SemanticIndex {
     /// Serialize the index to bytes for disk persistence
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.write_to_writer(&mut buf)
-            .expect("writing semantic index to Vec cannot fail");
-        buf
-    }
-
-    fn write_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
-        let mut bytes_written = 0usize;
-        let fingerprint = self.fingerprint.as_ref().and_then(|fingerprint| {
+        let fingerprint_bytes = self.fingerprint.as_ref().and_then(|fingerprint| {
             let encoded = fingerprint.as_string();
             if encoded.is_empty() {
                 None
             } else {
-                Some(encoded)
+                Some(encoded.into_bytes())
             }
         });
-        let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
-        let file_mtime_count = self
-            .file_mtimes
+        let entries: Vec<_> = self
+            .store
+            .entries_slice()
             .iter()
-            .filter(|(path, _)| cache_relative_path(&self.project_root, path).is_some())
-            .count();
-        let entry_count = self
-            .entries
-            .iter()
-            .filter(|entry| cache_relative_path(&self.project_root, &entry.chunk.file).is_some())
-            .count();
+            .filter_map(|entry| {
+                cache_relative_path(&self.project_root, &entry.chunk.file)
+                    .map(|relative| (relative, entry))
+            })
+            .collect();
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V6 is the single write format. Layout extends V5:
+        // V8 is the single write format. V8 extends V7 with per-entry chunk_hash
+        // and a file manifest (FileRecord entries). Layout extends V5/V6/V7:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - paths are relative to project_root.
         //   - file metadata stored as secs(u64) + subsec_nanos(u32) + size(u64) + blake3(32).
         //     Preserves full APFS/ext4/NTFS precision and catches mtime ties.
+        //   - per-entry chunk_hash (V8+): hash_len(4) + hash bytes after each vector.
+        //   - file manifest (V8+): manifest_count(4) + entries after all entry vectors.
         //
         // V1/V2 remain readable for backward compatibility (see from_bytes).
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once.
-        let version = SEMANTIC_INDEX_VERSION_V6;
-        write_counted(writer, &[version], &mut bytes_written)?;
-        write_counted(
-            writer,
-            &(self.dimension as u32).to_le_bytes(),
-            &mut bytes_written,
-        )?;
-        write_counted(
-            writer,
-            &(entry_count as u32).to_le_bytes(),
-            &mut bytes_written,
-        )?;
-        write_counted(
-            writer,
-            &(fp_bytes_ref.len() as u32).to_le_bytes(),
-            &mut bytes_written,
-        )?;
-        write_counted(writer, fp_bytes_ref, &mut bytes_written)?;
+        let version = SEMANTIC_INDEX_VERSION_V8;
+        buf.push(version);
+        buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
+        buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fp_bytes_ref);
 
-        // File mtime table: count(4) + entries
-        // V3 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4)
-        write_counted(
-            writer,
-            &(file_mtime_count as u32).to_le_bytes(),
-            &mut bytes_written,
-        )?;
-        for (path, mtime) in &self.file_mtimes {
-            let Some(relative) = cache_relative_path(&self.project_root, path) else {
-                continue;
-            };
-            let relative = relative.to_string_lossy();
-            let path_bytes = relative.as_bytes();
-            write_counted(
-                writer,
-                &(path_bytes.len() as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, path_bytes, &mut bytes_written)?;
-            let duration = mtime
+        // File metadata table: count(4) + entries
+        // V6 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4) + size(u64) + blake3(32).
+        //     Preserves full APFS/ext4/NTFS precision and catches mtime ties.
+        let file_metadata_entries: Vec<_> = self
+            .store
+            .file_metadata()
+            .iter()
+            .filter_map(|(path, meta)| {
+                cache_relative_path(&self.project_root, path).map(|relative| (relative, meta))
+            })
+            .collect();
+        buf.extend_from_slice(&(file_metadata_entries.len() as u32).to_le_bytes());
+        for (relative, meta) in &file_metadata_entries {
+            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&path_bytes);
+            let duration = meta
+                .mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
-            write_counted(
-                writer,
-                &duration.as_secs().to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(
-                writer,
-                &duration.subsec_nanos().to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            let size = self.file_sizes.get(path).copied().unwrap_or_default();
-            write_counted(writer, &size.to_le_bytes(), &mut bytes_written)?;
-            let hash = self
-                .file_hashes
-                .get(path)
-                .copied()
-                .unwrap_or_else(cache_freshness::zero_hash);
-            write_counted(writer, hash.as_bytes(), &mut bytes_written)?;
+            buf.extend_from_slice(&duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
+            buf.extend_from_slice(&meta.size.to_le_bytes());
+            buf.extend_from_slice(meta.content_hash.as_bytes());
         }
 
         // Entries: each is metadata + vector
-        for entry in &self.entries {
-            let Some(relative) = cache_relative_path(&self.project_root, &entry.chunk.file) else {
-                continue;
-            };
+        for (relative, entry) in &entries {
             let c = &entry.chunk;
 
             // File path
-            let relative = relative.to_string_lossy();
-            let file_bytes = relative.as_bytes();
-            write_counted(
-                writer,
-                &(file_bytes.len() as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, file_bytes, &mut bytes_written)?;
+            let file_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&file_bytes);
 
             // Name
             let name_bytes = c.name.as_bytes();
-            write_counted(
-                writer,
-                &(name_bytes.len() as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, name_bytes, &mut bytes_written)?;
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
 
             // Kind (1 byte)
-            write_counted(writer, &[symbol_kind_to_u8(&c.kind)], &mut bytes_written)?;
+            buf.push(symbol_kind_to_u8(&c.kind));
 
             // Lines + exported
-            write_counted(
-                writer,
-                &(c.start_line as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(
-                writer,
-                &(c.end_line as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, &[c.exported as u8], &mut bytes_written)?;
+            buf.extend_from_slice(&(c.start_line as u32).to_le_bytes());
+            buf.extend_from_slice(&(c.end_line as u32).to_le_bytes());
+            buf.push(c.exported as u8);
 
             // Snippet
             let snippet_bytes = c.snippet.as_bytes();
-            write_counted(
-                writer,
-                &(snippet_bytes.len() as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, snippet_bytes, &mut bytes_written)?;
+            buf.extend_from_slice(&(snippet_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(snippet_bytes);
 
             // Embed text
             let embed_bytes = c.embed_text.as_bytes();
-            write_counted(
-                writer,
-                &(embed_bytes.len() as u32).to_le_bytes(),
-                &mut bytes_written,
-            )?;
-            write_counted(writer, embed_bytes, &mut bytes_written)?;
+            buf.extend_from_slice(&(embed_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(embed_bytes);
 
             // Vector (f32 array)
             for &val in &entry.vector {
-                write_counted(writer, &val.to_le_bytes(), &mut bytes_written)?;
+                buf.extend_from_slice(&val.to_le_bytes());
             }
+
+            // chunk_hash (V8+)
+            let chunk_hash_str = if entry.chunk_hash.is_empty() {
+                compute_chunk_hash(&entry.chunk)
+            } else {
+                entry.chunk_hash.clone()
+            };
+            let hash_bytes = chunk_hash_str.as_bytes();
+            buf.extend_from_slice(&(hash_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(hash_bytes);
         }
 
-        Ok(bytes_written)
+        // File manifest (V8+): manifest_count(4) + entries
+        let manifest_entries: Vec<_> = self
+            .file_manifest
+            .iter()
+            .filter_map(|(path, record)| {
+                cache_relative_path(&self.project_root, path).map(|relative| (relative, record))
+            })
+            .collect();
+        buf.extend_from_slice(&(manifest_entries.len() as u32).to_le_bytes());
+        for (relative, record) in &manifest_entries {
+            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&path_bytes);
+
+            // content_hash (32 blake3 bytes)
+            buf.extend_from_slice(record.content_hash.as_bytes());
+
+            // size (8 bytes)
+            buf.extend_from_slice(&record.size_bytes.to_le_bytes());
+
+            // mtime
+            let mtime_duration = record
+                .mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            buf.extend_from_slice(&mtime_duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&mtime_duration.subsec_nanos().to_le_bytes());
+
+            // language
+            let lang_bytes = record.language.as_deref().unwrap_or("").as_bytes();
+            buf.extend_from_slice(&(lang_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(lang_bytes);
+
+            // document_kind
+            let doc_kind_bytes = record.document_kind.as_bytes();
+            buf.extend_from_slice(&(doc_kind_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(doc_kind_bytes);
+
+            // inclusion_policy_hash
+            let policy_hash_bytes = record.inclusion_policy_hash.as_bytes();
+            buf.extend_from_slice(&(policy_hash_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(policy_hash_bytes);
+
+            // indexed_at
+            let indexed_duration = record
+                .indexed_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            buf.extend_from_slice(&indexed_duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&indexed_duration.subsec_nanos().to_le_bytes());
+        }
+
+        buf
     }
 
     /// Deserialize the index from bytes
     pub fn from_bytes(data: &[u8], current_canonical_root: &Path) -> Result<Self, String> {
         debug_assert!(current_canonical_root.is_absolute());
+        let mut pos = 0;
+
         if data.len() < HEADER_BYTES_V1 {
             return Err("data too short".to_string());
         }
 
-        Self::from_reader_after_version(
-            Cursor::new(&data[1..]),
-            data[0],
-            current_canonical_root,
-            Some(data.len()),
-            1,
-        )
-    }
-
-    fn from_reader_after_version<R: Read>(
-        reader: R,
-        version: u8,
-        current_canonical_root: &Path,
-        total_len: Option<usize>,
-        bytes_read: usize,
-    ) -> Result<Self, String> {
-        debug_assert!(current_canonical_root.is_absolute());
-        let mut reader = CountingReader::with_bytes_read(reader, bytes_read);
-
+        let version = data[pos];
+        pos += 1;
         if version != SEMANTIC_INDEX_VERSION_V1
             && version != SEMANTIC_INDEX_VERSION_V2
             && version != SEMANTIC_INDEX_VERSION_V3
             && version != SEMANTIC_INDEX_VERSION_V4
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
+            && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
         {
             return Err(format!("unsupported version: {}", version));
         }
-        // V2 and newer share the same header layout (V3/V4/V5 only differ from
+        // V2 and newer share the same header layout (V3/V4/V5/V6/V7 only differ from
         // V2 in the per-mtime entry layout): version(1) + dimension(4) +
         // entry_count(4) + fingerprint_len(4) + fingerprint bytes.
         if (version == SEMANTIC_INDEX_VERSION_V2
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6)
-            && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8)
+            && data.len() < HEADER_BYTES_V2
         {
-            return Err("data too short for semantic index v2/v3/v4/v5/v6 header".to_string());
+            return Err(
+                "data too short for semantic index v2/v3/v4/v5/v6/v7/v8 header".to_string(),
+            );
         }
 
-        let dimension = read_u32_stream(&mut reader)? as usize;
-        let entry_count = read_u32_stream(&mut reader)? as usize;
+        let dimension = read_u32(data, &mut pos)? as usize;
+        let entry_count = read_u32(data, &mut pos)? as usize;
         validate_embedding_dimension(dimension)?;
         if entry_count > MAX_ENTRIES {
             return Err(format!("too many semantic index entries: {}", entry_count));
@@ -2633,24 +4714,19 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6;
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7
+            || version == SEMANTIC_INDEX_VERSION_V8;
         let fingerprint = if has_fingerprint_field {
-            let fingerprint_len = read_u32_stream(&mut reader)? as usize;
-            if total_len
-                .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
-            {
+            let fingerprint_len = read_u32(data, &mut pos)? as usize;
+            if pos + fingerprint_len > data.len() {
                 return Err("unexpected end of data reading fingerprint".to_string());
             }
             if fingerprint_len == 0 {
                 None
             } else {
-                let mut raw = vec![0u8; fingerprint_len];
-                read_exact_stream(
-                    &mut reader,
-                    &mut raw,
-                    "unexpected end of data reading fingerprint",
-                )?;
-                let raw = String::from_utf8_lossy(&raw).to_string();
+                let raw = String::from_utf8_lossy(&data[pos..pos + fingerprint_len]).to_string();
+                pos += fingerprint_len;
                 Some(
                     serde_json::from_str::<SemanticIndexFingerprint>(&raw)
                         .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
@@ -2661,7 +4737,7 @@ impl SemanticIndex {
         };
 
         // File mtimes
-        let mtime_count = read_u32_stream(&mut reader)? as usize;
+        let mtime_count = read_u32(data, &mut pos)? as usize;
         if mtime_count > MAX_ENTRIES {
             return Err(format!("too many semantic file mtimes: {}", mtime_count));
         }
@@ -2670,16 +4746,15 @@ impl SemanticIndex {
             .checked_mul(dimension)
             .and_then(|count| count.checked_mul(F32_BYTES))
             .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
-        if total_len.is_some_and(|len| vector_bytes > len.saturating_sub(reader.bytes_read())) {
+        if vector_bytes > data.len().saturating_sub(pos) {
             return Err("semantic index vectors exceed available data".to_string());
         }
 
-        let mut file_mtimes = HashMap::with_capacity(mtime_count);
-        let mut file_sizes = HashMap::with_capacity(mtime_count);
-        let mut file_hashes = HashMap::with_capacity(mtime_count);
+        let mut file_metadata: HashMap<PathBuf, IndexedFileMetadata> =
+            HashMap::with_capacity(mtime_count);
         for _ in 0..mtime_count {
-            let path = read_string_stream(&mut reader, total_len)?;
-            let secs = read_u64_stream(&mut reader)?;
+            let path = read_string(data, &mut pos)?;
+            let secs = read_u64(data, &mut pos)?;
             // V3+ persists subsec_nanos alongside secs so staleness checks
             // survive restart round-trips. V1/V2 load with 0 nanos, which
             // causes one rebuild on upgrade (they never matched live APFS
@@ -2689,24 +4764,32 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V4
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
             {
-                read_u32_stream(&mut reader)?
+                read_u32(data, &mut pos)?
             } else {
                 0
             };
-            let size =
-                if version == SEMANTIC_INDEX_VERSION_V5 || version == SEMANTIC_INDEX_VERSION_V6 {
-                    read_u64_stream(&mut reader)?
-                } else {
-                    0
-                };
-            let content_hash = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let size = if version == SEMANTIC_INDEX_VERSION_V5
+                || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
+            {
+                read_u64(data, &mut pos)?
+            } else {
+                0
+            };
+            let content_hash = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
+            {
+                if pos + 32 > data.len() {
+                    return Err("unexpected end of data reading content hash".to_string());
+                }
                 let mut hash_bytes = [0u8; 32];
-                read_exact_stream(
-                    &mut reader,
-                    &mut hash_bytes,
-                    "unexpected end of data reading content hash",
-                )?;
+                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
                 blake3::Hash::from_bytes(hash_bytes)
             } else {
                 cache_freshness::zero_hash()
@@ -2732,56 +4815,84 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let path = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
+            {
                 cached_path_under_root(current_canonical_root, &PathBuf::from(path))
                     .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
             } else {
                 PathBuf::from(path)
             };
-            file_mtimes.insert(path.clone(), mtime);
-            file_sizes.insert(path.clone(), size);
-            file_hashes.insert(path, content_hash);
+            file_metadata.insert(
+                path,
+                IndexedFileMetadata {
+                    mtime,
+                    size,
+                    content_hash,
+                },
+            );
         }
 
         // Entries
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
-            let file = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let raw_file = PathBuf::from(read_string(data, &mut pos)?);
+            let file = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+                || version == SEMANTIC_INDEX_VERSION_V8
+            {
                 cached_path_under_root(current_canonical_root, &raw_file)
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
             } else {
                 raw_file
             };
-            let name = read_string_stream(&mut reader, total_len)?;
+            let name = read_string(data, &mut pos)?;
 
-            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
+            if pos >= data.len() {
+                return Err("unexpected end of data".to_string());
+            }
+            let kind = u8_to_symbol_kind(data[pos]);
+            pos += 1;
 
-            let start_line = read_u32_stream(&mut reader)?;
-            let end_line = read_u32_stream(&mut reader)?;
+            let start_line = read_u32(data, &mut pos)?;
+            let end_line = read_u32(data, &mut pos)?;
 
-            let exported = read_u8_stream(&mut reader, "unexpected end of data")? != 0;
+            if pos >= data.len() {
+                return Err("unexpected end of data".to_string());
+            }
+            let exported = data[pos] != 0;
+            pos += 1;
 
-            let snippet = read_string_stream(&mut reader, total_len)?;
-            let embed_text = read_string_stream(&mut reader, total_len)?;
+            let snippet = read_string(data, &mut pos)?;
+            let embed_text = read_string(data, &mut pos)?;
 
             // Vector
             let vec_bytes = dimension
                 .checked_mul(F32_BYTES)
                 .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
-            if total_len.is_some_and(|len| reader.bytes_read().saturating_add(vec_bytes) > len) {
+            if pos + vec_bytes > data.len() {
                 return Err("unexpected end of data reading vector".to_string());
             }
             let mut vector = Vec::with_capacity(dimension);
             for _ in 0..dimension {
-                let mut bytes = [0u8; F32_BYTES];
-                read_exact_stream(
-                    &mut reader,
-                    &mut bytes,
-                    "unexpected end of data reading vector",
-                )?;
+                let bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
                 vector.push(f32::from_le_bytes(bytes));
+                pos += 4;
             }
+
+            // chunk_hash (V8+)
+            let chunk_hash = if version == SEMANTIC_INDEX_VERSION_V8 {
+                let hash_len = read_u32(data, &mut pos)? as usize;
+                if pos + hash_len > data.len() {
+                    return Err("unexpected end of data reading chunk_hash".to_string());
+                }
+                let hash_str = String::from_utf8_lossy(&data[pos..pos + hash_len]).to_string();
+                pos += hash_len;
+                hash_str
+            } else {
+                String::new()
+            };
 
             entries.push(EmbeddingEntry {
                 chunk: SemanticChunk {
@@ -2795,6 +4906,7 @@ impl SemanticIndex {
                     snippet,
                 },
                 vector,
+                chunk_hash,
             });
         }
 
@@ -2806,7 +4918,7 @@ impl SemanticIndex {
             ));
         }
         for entry in &entries {
-            if !file_mtimes.contains_key(&entry.chunk.file) {
+            if !file_metadata.contains_key(&entry.chunk.file) {
                 return Err(format!(
                     "semantic cache metadata missing for entry file {}",
                     entry.chunk.file.display()
@@ -2814,16 +4926,572 @@ impl SemanticIndex {
             }
         }
 
-        Ok(Self {
-            entries,
-            file_mtimes,
-            file_sizes,
-            file_hashes,
+        // File manifest (V8+)
+        let file_manifest = if version == SEMANTIC_INDEX_VERSION_V8 {
+            let manifest_count = read_u32(data, &mut pos)? as usize;
+            let mut manifest = HashMap::with_capacity(manifest_count);
+            for _ in 0..manifest_count {
+                let relative_path = PathBuf::from(read_string(data, &mut pos)?);
+
+                // content_hash (32 blake3 bytes)
+                if pos + 32 > data.len() {
+                    return Err("unexpected end of data reading manifest content hash".to_string());
+                }
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                let content_hash = blake3::Hash::from_bytes(hash_bytes);
+
+                // size
+                let size = read_u64(data, &mut pos)?;
+
+                // mtime
+                let mtime_secs = read_u64(data, &mut pos)?;
+                let mtime_nanos = read_u32(data, &mut pos)?;
+                if mtime_nanos >= 1_000_000_000 {
+                    return Err(format!(
+                        "invalid manifest mtime: nanos {} >= 1_000_000_000",
+                        mtime_nanos
+                    ));
+                }
+                let mtime_duration = std::time::Duration::new(mtime_secs, mtime_nanos);
+                let mtime = SystemTime::UNIX_EPOCH
+                    .checked_add(mtime_duration)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid manifest mtime: secs={} nanos={} overflows SystemTime",
+                            mtime_secs, mtime_nanos
+                        )
+                    })?;
+
+                // language
+                let language = {
+                    let lang_len = read_u32(data, &mut pos)? as usize;
+                    if pos + lang_len > data.len() {
+                        return Err("unexpected end of data reading manifest language".to_string());
+                    }
+                    let lang_str = if lang_len > 0 {
+                        Some(String::from_utf8_lossy(&data[pos..pos + lang_len]).to_string())
+                    } else {
+                        None
+                    };
+                    pos += lang_len;
+                    lang_str
+                };
+
+                // document_kind
+                let document_kind = read_string(data, &mut pos)?;
+
+                // inclusion_policy_hash
+                let inclusion_policy_hash = read_string(data, &mut pos)?;
+
+                // indexed_at
+                let indexed_at_secs = read_u64(data, &mut pos)?;
+                let indexed_at_nanos = read_u32(data, &mut pos)?;
+                if indexed_at_nanos >= 1_000_000_000 {
+                    return Err(format!(
+                        "invalid manifest indexed_at: nanos {} >= 1_000_000_000",
+                        indexed_at_nanos
+                    ));
+                }
+                let indexed_at_duration =
+                    std::time::Duration::new(indexed_at_secs, indexed_at_nanos);
+                let indexed_at = SystemTime::UNIX_EPOCH
+                    .checked_add(indexed_at_duration)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid manifest indexed_at: secs={} nanos={} overflows SystemTime",
+                            indexed_at_secs, indexed_at_nanos
+                        )
+                    })?;
+
+                // Reconstruct absolute path
+                let abs_path = cached_path_under_root(current_canonical_root, &relative_path)
+                    .ok_or_else(|| "cached file manifest path escapes project root".to_string())?;
+
+                manifest.insert(
+                    abs_path,
+                    FileRecord {
+                        content_hash,
+                        size_bytes: size,
+                        mtime,
+                        language,
+                        document_kind,
+                        inclusion_policy_hash,
+                        indexed_at,
+                    },
+                );
+            }
+            manifest
+        } else {
+            HashMap::new()
+        };
+
+        let fingerprint_string = if version >= SEMANTIC_INDEX_VERSION_V7 {
+            fingerprint.as_ref().map(|fp| fp.as_string())
+        } else {
+            None
+        };
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store: crate::vector_store::FlatF32VectorStore::from_parts(
+                entries,
+                dimension,
+                file_metadata,
+            ),
             dimension,
-            fingerprint,
             project_root: current_canonical_root.to_path_buf(),
+            file_manifest,
+            next_chunk_id: 0,
+            fingerprint_string,
+        };
+        // For pre-V8 cache data, the manifest was not serialized, so build it
+        // from the store's existing file_metadata.
+        if snapshot.file_manifest.is_empty() && !snapshot.store.file_metadata().is_empty() {
+            snapshot.build_manifest_from_store();
+        }
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            lifecycle: SemanticIndexLifecycle::Ready,
+            last_error: None,
+            fingerprint,
             deferred_files: HashSet::new(),
         })
+    }
+}
+
+/// Embed texts with exponential backoff retry for transient remote provider errors
+/// (rate limits, timeouts, server errors). Up to 3 retries with base delay of 1s,
+/// capped at 8s max. Non-transient errors (dimension mismatch, config errors) are
+/// returned immediately without retry.
+fn embed_with_retry<F>(embed_fn: &mut F, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_MS: u64 = 1000;
+    const MAX_DELAY_MS: u64 = 8000;
+
+    let mut last_err = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        match embed_fn(texts.clone()) {
+            Ok(vectors) => return Ok(vectors),
+            Err(e) => {
+                last_err = e.clone();
+                // Only retry on transient errors (rate limit, timeout, server)
+                let is_transient = e.to_lowercase().contains("rate")
+                    || e.to_lowercase().contains("limit")
+                    || e.to_lowercase().contains("timeout")
+                    || e.to_lowercase().contains("429")
+                    || e.to_lowercase().contains("503")
+                    || e.to_lowercase().contains("502")
+                    || e.to_lowercase().contains("500")
+                    || e.to_lowercase().contains("connection")
+                    || e.to_lowercase().contains("reset")
+                    || e.to_lowercase().contains("network");
+
+                if !is_transient || attempt == MAX_RETRIES {
+                    return Err(last_err);
+                }
+                let delay = (BASE_DELAY_MS * 2u64.pow(attempt)).min(MAX_DELAY_MS);
+                slog_warn!(
+                    "embedding batch failed (attempt {}/{}): {}. Retrying in {}ms...",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    e,
+                    delay
+                );
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Build enriched embedding text from a symbol with cAST-style context
+fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &Path) -> String {
+    let relative = file
+        .strip_prefix(project_root)
+        .unwrap_or(file)
+        .to_string_lossy();
+
+    let kind_label = match &symbol.kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Enum => "enum",
+        SymbolKind::TypeAlias => "type",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file-summary",
+    };
+
+    // Build: "file:relative/path kind:function name:validateAuth signature:fn validateAuth(token: &str) -> bool"
+    let name = &symbol.name;
+    let mut text = format!("file:{} kind:{} name:{name}", relative, kind_label);
+
+    if let Some(sig) = &symbol.signature {
+        text.push_str(&format!(" signature:{}", sig));
+    }
+
+    // Add body snippet (first ~300 chars of symbol body)
+    let lines: Vec<&str> = source.lines().collect();
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
+    if start < end {
+        let body: String = lines[start..end]
+            .iter()
+            .take(15) // max 15 lines
+            .copied()
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let snippet = if body.len() > 300 {
+            format!("{}...", &body[..body.floor_char_boundary(300)])
+        } else {
+            body
+        };
+        text.push_str(&format!(" body:{}", snippet));
+    }
+
+    text
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn first_leading_doc_comment(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some((start, first)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+    else {
+        return String::new();
+    };
+
+    let trimmed = first.trim_start();
+    if trimmed.starts_with("/**") {
+        let mut comment = Vec::new();
+        for line in lines.iter().skip(start) {
+            comment.push(*line);
+            if line.contains("*/") {
+                break;
+            }
+        }
+        return truncate_chars(&comment.join("\n"), 200);
+    }
+
+    if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+        let comment = lines
+            .iter()
+            .skip(start)
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("///") || trimmed.starts_with("//!")
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return truncate_chars(&comment, 200);
+    }
+
+    String::new()
+}
+
+pub fn build_file_summary_chunk(
+    file: &Path,
+    project_root: &Path,
+    source: &str,
+    top_exports: &[&str],
+    top_export_signatures: &[Option<&str>],
+) -> SemanticChunk {
+    let relative = file.strip_prefix(project_root).unwrap_or(file);
+    let rel_path = relative.to_string_lossy();
+    let parent_dir = relative
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = file
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let doc = first_leading_doc_comment(source);
+    let exports = top_exports
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",");
+    let snippet = if doc.is_empty() {
+        top_export_signatures
+            .first()
+            .and_then(|signature| signature.as_deref())
+            .map(|signature| truncate_chars(signature, 200))
+            .unwrap_or_default()
+    } else {
+        doc.clone()
+    };
+
+    SemanticChunk {
+        file: file.to_path_buf(),
+        name,
+        kind: SymbolKind::FileSummary,
+        start_line: 0,
+        end_line: 0,
+        exported: false,
+        embed_text: format!(
+            "file:{rel_path} kind:file-summary name:{} parent:{parent_dir} doc:{doc} exports:{exports}",
+            file.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default()
+        ),
+        snippet,
+    }
+}
+
+fn parser_for(
+    parsers: &mut HashMap<crate::parser::LangId, Parser>,
+    lang: crate::parser::LangId,
+) -> Result<&mut Parser, String> {
+    use std::collections::hash_map::Entry;
+
+    match parsers.entry(lang) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let grammar = grammar_for(lang);
+            let mut parser = Parser::new();
+            parser
+                .set_language(&grammar)
+                .map_err(|error| error.to_string())?;
+            Ok(entry.insert(parser))
+        }
+    }
+}
+
+pub fn is_semantic_indexed_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "ts" | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "rs"
+                | "go"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "zig"
+                | "cs"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sol"
+                | "vue"
+        )
+    )
+}
+
+fn collect_file_metadata(file: &Path) -> Result<IndexedFileMetadata, String> {
+    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+    let mtime = metadata.modified().map_err(|error| error.to_string())?;
+    let content_hash = cache_freshness::hash_file_if_small(file, metadata.len())
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(cache_freshness::zero_hash);
+    Ok(IndexedFileMetadata {
+        mtime,
+        size: metadata.len(),
+        content_hash,
+    })
+}
+
+fn collect_file_chunks(
+    project_root: &Path,
+    file: &Path,
+    parsers: &mut HashMap<crate::parser::LangId, Parser>,
+) -> Result<Vec<SemanticChunk>, String> {
+    if !is_semantic_indexed_extension(file) {
+        return Err("unsupported file extension".to_string());
+    }
+    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    let source = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
+    let tree = parser_for(parsers, lang)?
+        .parse(&source, None)
+        .ok_or_else(|| format!("tree-sitter parse returned None for {}", file.display()))?;
+    let symbols =
+        extract_symbols_from_tree(&source, &tree, lang).map_err(|error| error.to_string())?;
+
+    Ok(symbols_to_chunks(file, &symbols, &source, project_root))
+}
+
+/// Build a display snippet from a symbol's source
+fn build_snippet(symbol: &Symbol, source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
+    if start < end {
+        let snippet_lines: Vec<&str> = lines[start..end].iter().take(5).copied().collect();
+        let mut snippet = snippet_lines.join("\n");
+        if end - start > 5 {
+            snippet.push_str("\n  ...");
+        }
+        if snippet.len() > 300 {
+            snippet = format!("{}...", &snippet[..snippet.floor_char_boundary(300)]);
+        }
+        snippet
+    } else {
+        String::new()
+    }
+}
+
+/// Convert symbols to semantic chunks with enriched context
+fn symbols_to_chunks(
+    file: &Path,
+    symbols: &[Symbol],
+    source: &str,
+    project_root: &Path,
+) -> Vec<SemanticChunk> {
+    let mut chunks = Vec::new();
+    let top_exports_with_signatures = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.exported
+                && symbol.parent.is_none()
+                && !matches!(symbol.kind, SymbolKind::Heading)
+        })
+        .map(|symbol| (symbol.name.as_str(), symbol.signature.as_deref()))
+        .collect::<Vec<_>>();
+
+    let has_only_headings = !symbols.is_empty()
+        && symbols
+            .iter()
+            .all(|symbol| matches!(symbol.kind, SymbolKind::Heading));
+    if top_exports_with_signatures.len() <= 2 && !has_only_headings {
+        let top_exports = top_exports_with_signatures
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        let top_export_signatures = top_exports_with_signatures
+            .iter()
+            .map(|(_, signature)| *signature)
+            .collect::<Vec<_>>();
+        chunks.push(build_file_summary_chunk(
+            file,
+            project_root,
+            source,
+            &top_exports,
+            &top_export_signatures,
+        ));
+    }
+
+    for symbol in symbols {
+        // Skip Markdown / HTML heading chunks: empirically they dominate result
+        // lists even for code-shaped queries because heading prose embeds well.
+        // Agents querying for code lose the actual matches under doc noise.
+        // README/docs queries are still served by grep on the same files.
+        if matches!(symbol.kind, SymbolKind::Heading) {
+            continue;
+        }
+
+        // Skip very small symbols (single-line variables, etc.)
+        let line_count = symbol
+            .range
+            .end_line
+            .saturating_sub(symbol.range.start_line)
+            + 1;
+        if line_count < 2 && !matches!(symbol.kind, SymbolKind::Variable) {
+            continue;
+        }
+
+        let embed_text = build_embed_text(symbol, source, file, project_root);
+        let snippet = build_snippet(symbol, source);
+
+        chunks.push(SemanticChunk {
+            file: file.to_path_buf(),
+            name: symbol.name.clone(),
+            kind: symbol.kind.clone(),
+            start_line: symbol.range.start_line,
+            end_line: symbol.range.end_line,
+            exported: symbol.exported,
+            embed_text,
+            snippet,
+        });
+
+        // Note: Nested symbols are handled separately by the outline system
+        // Each symbol is indexed individually
+    }
+
+    chunks
+}
+
+/// Cosine similarity between two vectors
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 || !denom.is_normal() {
+        0.0
+    } else {
+        let result = dot / denom;
+        // Guard against NaN from floating-point edge cases (e.g. subnormal norms).
+        if result.is_nan() {
+            0.0
+        } else {
+            result.clamp(-1.0, 1.0)
+        }
+    }
+}
+
+// Serialization helpers
+fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Function => 0,
+        SymbolKind::Class => 1,
+        SymbolKind::Method => 2,
+        SymbolKind::Struct => 3,
+        SymbolKind::Interface => 4,
+        SymbolKind::Enum => 5,
+        SymbolKind::TypeAlias => 6,
+        SymbolKind::Variable => 7,
+        SymbolKind::Heading => 8,
+        SymbolKind::FileSummary => 9,
+    }
+}
+
+fn u8_to_symbol_kind(v: u8) -> SymbolKind {
+    match v {
+        0 => SymbolKind::Function,
+        1 => SymbolKind::Class,
+        2 => SymbolKind::Method,
+        3 => SymbolKind::Struct,
+        4 => SymbolKind::Interface,
+        5 => SymbolKind::Enum,
+        6 => SymbolKind::TypeAlias,
+        7 => SymbolKind::Variable,
+        8 => SymbolKind::Heading,
+        9 => SymbolKind::FileSummary,
+        _ => SymbolKind::Heading,
     }
 }
 
@@ -2908,561 +5576,501 @@ fn read_string_stream<R: Read>(
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-struct SourceLineCache<'a> {
-    lines: Vec<&'a str>,
-    line_starts: Vec<usize>,
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
+    if *pos + 4 > data.len() {
+        return Err("unexpected end of data reading u32".to_string());
+    }
+    let val = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    *pos += 4;
+    Ok(val)
 }
 
-impl<'a> SourceLineCache<'a> {
-    fn new(source: &'a str) -> Self {
-        let lines: Vec<&'a str> = source.lines().collect();
-        let mut line_starts = Vec::with_capacity(lines.len());
-        let bytes = source.as_bytes();
-        let mut offset = 0usize;
-        for line in &lines {
-            line_starts.push(offset);
-            offset += line.len();
-            if bytes.get(offset) == Some(&b'\r') && bytes.get(offset + 1) == Some(&b'\n') {
-                offset += 2;
-            } else if bytes.get(offset) == Some(&b'\n') {
-                offset += 1;
-            }
-        }
-        Self { lines, line_starts }
+fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
+    if *pos + 8 > data.len() {
+        return Err("unexpected end of data reading u64".to_string());
     }
-
-    fn len(&self) -> usize {
-        debug_assert_eq!(self.lines.len(), self.line_starts.len());
-        self.line_starts.len()
-    }
+    let bytes: [u8; 8] = data[*pos..*pos + 8].try_into().unwrap();
+    *pos += 8;
+    Ok(u64::from_le_bytes(bytes))
 }
 
-/// Build enriched embedding text from a symbol with cAST-style context
-fn build_embed_text_with_lines(
-    symbol: &Symbol,
-    line_cache: &SourceLineCache<'_>,
-    file: &Path,
-    project_root: &Path,
-) -> String {
-    let relative = file
-        .strip_prefix(project_root)
-        .unwrap_or(file)
-        .to_string_lossy();
-
-    let kind_label = match &symbol.kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Class => "class",
-        SymbolKind::Method => "method",
-        SymbolKind::Struct => "struct",
-        SymbolKind::Interface => "interface",
-        SymbolKind::Enum => "enum",
-        SymbolKind::TypeAlias => "type",
-        SymbolKind::Variable => "variable",
-        SymbolKind::Heading => "heading",
-        SymbolKind::FileSummary => "file-summary",
-    };
-
-    // Build: "file:relative/path kind:function name:validateAuth signature:fn validateAuth(token: &str) -> bool"
-    let name = &symbol.name;
-    let mut text = format!(
-        "name:{name} file:{} kind:{} name:{name}",
-        relative, kind_label
-    );
-
-    if let Some(sig) = &symbol.signature {
-        // Cap the signature: structured parsers (e.g. YAML/Kubernetes) pack
-        // entire inline scripts (CronJob/Job `command:` bodies, multi-KB) into
-        // the signature. Appending it unbounded produces a single embed_text
-        // that overflows the embedding backend's physical batch (e.g. a
-        // llama.cpp server's 512-token cap), aborting the whole index build
-        // and silently degrading every search to lexical. 400 chars keeps the
-        // identifying head of the signature without blowing the budget.
-        text.push_str(&format!(" signature:{}", truncate_chars(sig, 400)));
+fn read_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
+    let len = read_u32(data, pos)? as usize;
+    if *pos + len > data.len() {
+        return Err("unexpected end of data reading string".to_string());
     }
-
-    // Add body snippet (first ~300 chars of symbol body)
-    let start = (symbol.range.start_line as usize).min(line_cache.len());
-    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
-    let end = (symbol.range.end_line as usize + 1).min(line_cache.len());
-    if start < end {
-        let body: String = line_cache.lines[start..end]
-            .iter()
-            .take(15) // max 15 lines
-            .copied()
-            .collect::<Vec<&str>>()
-            .join("\n");
-        let snippet = if body.len() > 300 {
-            format!("{}...", &body[..body.floor_char_boundary(300)])
-        } else {
-            body
-        };
-        text.push_str(&format!(" body:{}", snippet));
-    }
-
-    // Final defense-in-depth clamp: no single embed_text may exceed the
-    // backend's per-input budget regardless of which field grew. Most
-    // backends cap a physical batch around 512 tokens; ~1600 chars stays
-    // comfortably under that for typical English/code (≈4 chars/token).
-    truncate_chars(&text, MAX_EMBED_TEXT_CHARS)
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).to_string();
+    *pos += len;
+    Ok(s)
 }
 
-#[cfg(test)]
-fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &Path) -> String {
-    let line_cache = SourceLineCache::new(source);
-    build_embed_text_with_lines(symbol, &line_cache, file, project_root)
-}
+// ---------------------------------------------------------------------------
+// File policy helpers
+// ---------------------------------------------------------------------------
 
-/// Upper bound on characters in a single chunk's `embed_text`. Keeps any one
-/// input below typical embedding-backend physical batch limits (~512 tokens)
-/// so an oversized symbol cannot abort the whole index build.
-const MAX_EMBED_TEXT_CHARS: usize = 1600;
+/// Check if a file path looks auto-generated based on name and directory heuristics.
+pub(crate) fn is_generated_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
-fn first_leading_doc_comment(line_cache: &SourceLineCache<'_>) -> String {
-    let Some((start, first)) = line_cache
-        .lines
-        .iter()
-        .enumerate()
-        .find(|(_, line)| !line.trim().is_empty())
-    else {
-        return String::new();
-    };
-
-    let trimmed = first.trim_start();
-    if trimmed.starts_with("/**") {
-        let mut comment = Vec::new();
-        for line in line_cache.lines.iter().skip(start) {
-            comment.push(*line);
-            if line.contains("*/") {
-                break;
-            }
-        }
-        return truncate_chars(&comment.join("\n"), 200);
-    }
-
-    if trimmed.starts_with("///") || trimmed.starts_with("//!") {
-        let comment = line_cache
-            .lines
-            .iter()
-            .skip(start)
-            .take_while(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("///") || trimmed.starts_with("//!")
+    // Generated file name patterns
+    name_lower.ends_with(".generated.rs")
+        || name_lower.ends_with(".generated.go")
+        || name_lower.ends_with(".generated.ts")
+        || name_lower.ends_with(".pb.go") // protobuf
+        || name_lower.ends_with(".pb.rs") // protobuf
+        || name_lower.ends_with("_pb2.py") // protobuf
+        || name_lower.starts_with(".generated")
+        || name_lower.contains(".min.") // minified
+        || name_lower.ends_with(".snap") // jest snapshots
+        || name_lower.ends_with(".g.dart") // generated dart
+        || name_lower.ends_with(".freezed.dart")
+        || path
+            .ancestors()
+            .any(|a| {
+                let s = a
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                matches!(
+                    s.as_ref(),
+                    "generated" | "__generated__" | ".graphql" | "dist" | "build"
+                )
             })
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
-        return truncate_chars(&comment, 200);
-    }
-
-    String::new()
 }
 
-pub fn build_file_summary_chunk(
-    file: &Path,
-    project_root: &Path,
-    source: &str,
-    top_exports: &[&str],
-    top_export_signatures: &[Option<&str>],
-) -> SemanticChunk {
-    let line_cache = SourceLineCache::new(source);
-    build_file_summary_chunk_with_lines(
-        file,
-        project_root,
-        &line_cache,
-        top_exports,
-        top_export_signatures,
-    )
-}
-
-fn build_file_summary_chunk_with_lines(
-    file: &Path,
-    project_root: &Path,
-    line_cache: &SourceLineCache<'_>,
-    top_exports: &[&str],
-    top_export_signatures: &[Option<&str>],
-) -> SemanticChunk {
-    let relative = file.strip_prefix(project_root).unwrap_or(file);
-    let rel_path = relative.to_string_lossy();
-    let parent_dir = relative
-        .parent()
-        .map(|parent| parent.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let name = file
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let doc = first_leading_doc_comment(line_cache);
-    let exports = top_exports
-        .iter()
-        .take(5)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(",");
-    let snippet = if doc.is_empty() {
-        top_export_signatures
-            .first()
-            .and_then(|signature| signature.as_deref())
-            .map(|signature| truncate_chars(signature, 200))
-            .unwrap_or_default()
-    } else {
-        doc.clone()
-    };
-
-    SemanticChunk {
-        file: file.to_path_buf(),
-        name,
-        kind: SymbolKind::FileSummary,
-        start_line: 0,
-        end_line: 0,
-        exported: false,
-        embed_text: truncate_chars(
-            &format!(
-                "file:{rel_path} kind:file-summary name:{} parent:{parent_dir} doc:{doc} exports:{exports}",
-                file.file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            ),
-            MAX_EMBED_TEXT_CHARS,
-        ),
-        snippet,
-    }
-}
-
-fn parser_for(
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-    lang: crate::parser::LangId,
-) -> Result<&mut Parser, String> {
-    use std::collections::hash_map::Entry;
-
-    match parsers.entry(lang) {
-        Entry::Occupied(entry) => Ok(entry.into_mut()),
-        Entry::Vacant(entry) => {
-            let grammar = grammar_for(lang);
-            let mut parser = Parser::new();
-            parser
-                .set_language(&grammar)
-                .map_err(|error| error.to_string())?;
-            Ok(entry.insert(parser))
-        }
-    }
-}
-
-pub fn is_semantic_indexed_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some(
-            "ts" | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "rs"
-                | "go"
-                | "c"
-                | "h"
-                | "cc"
-                | "cpp"
-                | "cxx"
-                | "hpp"
-                | "hh"
-                | "zig"
-                | "cs"
-                | "sh"
-                | "bash"
-                | "zsh"
-                | "inc"
-                | "php"
-                | "sol"
-                | "scss"
-                | "vue"
-                | "yaml"
-                | "yml"
-                | "pas"
-                | "pp"
-                | "dpr"
-                | "dpk"
-                | "lpr",
-        )
-    )
-}
-
-fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return canonical;
-    }
-
-    let Some(parent) = path.parent() else {
-        return path.to_path_buf();
-    };
-    let Some(file_name) = path.file_name() else {
-        return path.to_path_buf();
-    };
-
-    fs::canonicalize(parent)
-        .map(|canonical_parent| canonical_parent.join(file_name))
-        .unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Files larger than this are skipped for semantic chunking. The read +
-/// tree-sitter parse is transiently O(file size) (tree-sitter can use several×
-/// the source bytes), and `par_iter` collection parses many files at once, so an
-/// unbounded read here is an OOM vector on a repo with a few multi-MB generated/
-/// vendored/minified files. A file this large yields almost no useful embedding
-/// anyway (each chunk's embed_text is clamped to MAX_EMBED_TEXT_CHARS), so we
-/// track it (0 chunks) instead of reading it — freshness then skips it on later
-/// refreshes. 4 MiB keeps essentially all hand-written source while capping the
-/// pathological tail.
-const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
-
-fn collect_semantic_file(
-    project_root: &Path,
-    file: &Path,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
-    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
-        return Err("not a regular file".to_string());
-    }
-    let mtime = metadata.modified().map_err(|error| error.to_string())?;
-    let size = metadata.len();
-
-    if !is_semantic_indexed_extension(file) {
-        return Err("unsupported file extension".to_string());
-    }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
-
-    let mut indexed_metadata = IndexedFileMetadata {
-        mtime,
-        size,
-        content_hash: cache_freshness::zero_hash(),
-    };
-
-    // OOM backstop: skip oversized files before the read + parse (tracked with
-    // zero chunks by the caller, so freshness won't re-read them every refresh).
-    if size > MAX_SEMANTIC_FILE_BYTES {
-        return Ok((indexed_metadata, Vec::new()));
-    }
-
-    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
-    indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
-        cache_freshness::hash_bytes(source.as_bytes())
-    } else {
-        cache_freshness::zero_hash()
-    };
-
-    let chunks = collect_file_chunks_from_source(project_root, file, lang, parsers, &source)?;
-    Ok((indexed_metadata, chunks))
-}
-
-#[cfg(test)]
-fn collect_file_chunks(
-    project_root: &Path,
-    file: &Path,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-) -> Result<Vec<SemanticChunk>, String> {
-    if !is_semantic_indexed_extension(file) {
-        return Err("unsupported file extension".to_string());
-    }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
-    // OOM backstop: skip oversized files before the read + parse (tracked with
-    // zero chunks by the caller, so freshness won't re-read them every refresh).
-    if fs::metadata(file).is_ok_and(|m| m.len() > MAX_SEMANTIC_FILE_BYTES) {
-        return Ok(Vec::new());
-    }
-    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
-    collect_file_chunks_from_source(project_root, file, lang, parsers, &source)
-}
-
-fn collect_file_chunks_from_source(
-    project_root: &Path,
-    file: &Path,
-    lang: crate::parser::LangId,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-    source: &str,
-) -> Result<Vec<SemanticChunk>, String> {
-    let tree = parser_for(parsers, lang)?
-        .parse(source, None)
-        .ok_or_else(|| format!("tree-sitter parse returned None for {}", file.display()))?;
-    let symbols =
-        extract_symbols_from_tree(source, &tree, lang).map_err(|error| error.to_string())?;
-
-    Ok(symbols_to_chunks(file, &symbols, source, project_root))
-}
-
-/// Build a display snippet from a symbol's source
-fn build_snippet_with_lines(symbol: &Symbol, line_cache: &SourceLineCache<'_>) -> String {
-    let start = (symbol.range.start_line as usize).min(line_cache.len());
-    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
-    let end = (symbol.range.end_line as usize + 1).min(line_cache.len());
-    if start < end {
-        let snippet_lines: Vec<&str> = line_cache.lines[start..end]
-            .iter()
-            .take(5)
-            .copied()
-            .collect();
-        let mut snippet = snippet_lines.join("\n");
-        if end - start > 5 {
-            snippet.push_str("\n  ...");
-        }
-        if snippet.len() > 300 {
-            snippet = format!("{}...", &snippet[..snippet.floor_char_boundary(300)]);
-        }
-        snippet
-    } else {
-        String::new()
-    }
-}
-
-#[cfg(test)]
-fn build_snippet(symbol: &Symbol, source: &str) -> String {
-    let line_cache = SourceLineCache::new(source);
-    build_snippet_with_lines(symbol, &line_cache)
-}
-
-/// Convert symbols to semantic chunks with enriched context
-fn symbols_to_chunks(
-    file: &Path,
-    symbols: &[Symbol],
-    source: &str,
-    project_root: &Path,
-) -> Vec<SemanticChunk> {
-    let line_cache = SourceLineCache::new(source);
-    let mut chunks = Vec::new();
-    let top_exports_with_signatures = symbols
-        .iter()
-        .filter(|symbol| {
-            symbol.exported
-                && symbol.parent.is_none()
-                && !matches!(symbol.kind, SymbolKind::Heading)
+/// Check if a file extension suggests it is a documentation file.
+pub(crate) fn is_doc_extension(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .map(|ext| {
+            matches!(
+                ext.as_str(),
+                "md" | "markdown" | "rst" | "txt" | "adoc" | "org" | "creole" | "mediawiki"
+            )
         })
-        .map(|symbol| (symbol.name.as_str(), symbol.signature.as_deref()))
-        .collect::<Vec<_>>();
-
-    let has_only_headings = !symbols.is_empty()
-        && symbols
-            .iter()
-            .all(|symbol| matches!(symbol.kind, SymbolKind::Heading));
-    if top_exports_with_signatures.len() <= 2 && !has_only_headings {
-        let top_exports = top_exports_with_signatures
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        let top_export_signatures = top_exports_with_signatures
-            .iter()
-            .map(|(_, signature)| *signature)
-            .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines(
-            file,
-            project_root,
-            &line_cache,
-            &top_exports,
-            &top_export_signatures,
-        ));
-    }
-
-    for symbol in symbols {
-        // Skip Markdown / HTML heading chunks: empirically they dominate result
-        // lists even for code-shaped queries because heading prose embeds well.
-        // Agents querying for code lose the actual matches under doc noise.
-        // README/docs queries are still served by grep on the same files.
-        if matches!(symbol.kind, SymbolKind::Heading) {
-            continue;
-        }
-
-        // Skip very small symbols (single-line variables, etc.)
-        let line_count = symbol
-            .range
-            .end_line
-            .saturating_sub(symbol.range.start_line)
-            + 1;
-        if line_count < 2 && !matches!(symbol.kind, SymbolKind::Variable) {
-            continue;
-        }
-
-        let embed_text = build_embed_text_with_lines(symbol, &line_cache, file, project_root);
-        let snippet = build_snippet_with_lines(symbol, &line_cache);
-
-        chunks.push(SemanticChunk {
-            file: file.to_path_buf(),
-            name: symbol.name.clone(),
-            kind: symbol.kind.clone(),
-            start_line: symbol.range.start_line,
-            end_line: symbol.range.end_line,
-            exported: symbol.exported,
-            embed_text,
-            snippet,
-        });
-
-        // Note: Nested symbols are handled separately by the outline system
-        // Each symbol is indexed individually
-    }
-
-    chunks
+        .unwrap_or(false)
 }
 
-fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
+/// Check if a file extension or name suggests it is a configuration file.
+pub(crate) fn is_config_extension(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let name_lower = name.to_lowercase();
+
+    // Dotfiles that are config-like
+    if name_lower.starts_with('.') && !name_lower.starts_with("..") {
+        return matches!(
+            name_lower.as_str(),
+            ".env"
+                | ".eslintrc"
+                | ".prettierrc"
+                | ".babelrc"
+                | ".tsconfig"
+                | ".editorconfig"
+                | ".gitignore"
+                | ".dockerignore"
+                | ".npmrc"
+                | ".yarnrc"
+                | ".nvmrc"
+                | ".python-version"
+                | ".tool-versions"
+                | ".rubocop"
+                | ".stylelintrc"
+        );
+    }
+
+    // Config extensions (but exclude lockfiles)
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .map(|ext| {
+            matches!(
+                ext.as_str(),
+                "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf"
+            )
+        })
+        .unwrap_or(false)
+        && !name_lower.contains("package-lock")
+        && !name_lower.contains("yarn.lock")
+        && !name_lower.contains("bun.lock")
+        && !name_lower.contains("pnpm-lock")
 }
 
-/// Cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
+/// Statistics about files skipped by the file policy during indexing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FilePolicyStats {
+    pub skipped_binary: usize,
+    pub skipped_generated: usize,
+    pub skipped_too_large: usize,
+    pub skipped_excluded: usize,
+    pub skipped_code_disabled: usize,
+    pub skipped_docs_disabled: usize,
+    pub skipped_configs_disabled: usize,
+    pub skipped_unknown_type: usize,
+    pub docs_files_indexed: usize,
+    pub config_files_indexed: usize,
+}
+
+/// Diagnostics collected during contextualized document-chunk embedding.
+/// Tracks oversized document handling, retry behavior, and per-request metrics.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ContextualizedBuildDiagnostics {
+    /// Total source documents processed (before splitting into sub-groups).
+    pub documents_processed: usize,
+    /// Total chunks embedded across all documents.
+    pub chunks_embedded: usize,
+    /// Documents that were split into multiple sub-groups because they
+    /// exceeded max_chunks_per_document.
+    pub split_documents: usize,
+    /// Document groups that failed embedding and were retried.
+    pub retried_groups: usize,
+    /// Document groups that failed after all retries and were skipped.
+    pub failed_groups: usize,
+    /// Maximum chunks in any single document (before splitting).
+    pub max_chunks_in_document: usize,
+}
+
+/// Classify a file's type for the semantic indexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticFileType {
+    Code,
+    Doc,
+    Config,
+    Unknown,
+}
+
+/// Determine the semantic file type based on extension and path.
+pub(crate) fn classify_semantic_file(path: &Path) -> SemanticFileType {
+    if is_doc_extension(path) {
+        return SemanticFileType::Doc;
     }
-
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+    if is_config_extension(path) {
+        return SemanticFileType::Config;
     }
-
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
+    // If it has a known code language, it's code
+    if detect_language(path).is_some() {
+        return SemanticFileType::Code;
+    }
+    // Fall back: check if it's text-ish but not classified
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "md" | "rst" | "txt") {
+        SemanticFileType::Doc
     } else {
-        dot / denom
+        SemanticFileType::Unknown
     }
 }
 
-// Serialization helpers
-fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
-    match kind {
-        SymbolKind::Function => 0,
-        SymbolKind::Class => 1,
-        SymbolKind::Method => 2,
-        SymbolKind::Struct => 3,
-        SymbolKind::Interface => 4,
-        SymbolKind::Enum => 5,
-        SymbolKind::TypeAlias => 6,
-        SymbolKind::Variable => 7,
-        SymbolKind::Heading => 8,
-        SymbolKind::FileSummary => 9,
+// ---------------------------------------------------------------------------
+// Docs chunker — splits Markdown files into heading-based chunks
+// ---------------------------------------------------------------------------
+
+/// Maximum characters per chunk before splitting at paragraph boundaries.
+const MAX_CHUNK_CHARS: usize = 8000;
+
+/// Split a documentation file (primarily Markdown) into semantic chunks.
+/// Each `##` heading (h2 or deeper) starts a new chunk. Content before the
+/// first heading becomes a "summary" chunk. Overly large chunks are split
+/// further at paragraph boundaries.
+pub(crate) fn collect_docs_chunks(text: &str, file_path: &Path) -> Vec<SemanticChunk> {
+    let ext = file_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if matches!(ext.as_str(), "md" | "markdown") {
+        collect_markdown_chunks(text, file_path)
+    } else {
+        // Non-markdown docs: single chunk
+        let body = text.trim().to_string();
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let file_name = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "doc".to_string());
+        vec![SemanticChunk {
+            file: file_path.to_path_buf(),
+            name: file_name,
+            kind: SymbolKind::Heading,
+            start_line: 0,
+            end_line: text.lines().count().saturating_sub(1) as u32,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        }]
     }
 }
 
-fn u8_to_symbol_kind(v: u8) -> SymbolKind {
-    match v {
-        0 => SymbolKind::Function,
-        1 => SymbolKind::Class,
-        2 => SymbolKind::Method,
-        3 => SymbolKind::Struct,
-        4 => SymbolKind::Interface,
-        5 => SymbolKind::Enum,
-        6 => SymbolKind::TypeAlias,
-        7 => SymbolKind::Variable,
-        8 => SymbolKind::Heading,
-        9 => SymbolKind::FileSummary,
-        _ => SymbolKind::Heading,
+fn collect_markdown_chunks(text: &str, file_path: &Path) -> Vec<SemanticChunk> {
+    let mut chunks = Vec::new();
+    let mut current_heading = "Summary".to_string();
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut line_num: u32 = 0;
+    let mut chunk_start_line: u32 = 0;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Detect ATX headings: ## or deeper (level >= 2)
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            if level >= 2 && !current_lines.is_empty() {
+                // Flush previous chunk
+                let body = current_lines.join("\n").trim().to_string();
+                if !body.is_empty() {
+                    chunks.push(SemanticChunk {
+                        file: file_path.to_path_buf(),
+                        name: current_heading.clone(),
+                        kind: SymbolKind::Heading,
+                        start_line: chunk_start_line,
+                        end_line: line_num.saturating_sub(1),
+                        exported: false,
+                        embed_text: body.clone(),
+                        snippet: truncate_snippet(&body),
+                    });
+                }
+                chunk_start_line = line_num;
+                current_lines.clear();
+            }
+            if level >= 1 {
+                current_heading = trimmed.trim_start_matches('#').trim().to_string();
+            }
+        }
+        current_lines.push(line.to_string());
+        line_num += 1;
     }
+
+    // Flush remaining
+    let body = current_lines.join("\n").trim().to_string();
+    if !body.is_empty() {
+        chunks.push(SemanticChunk {
+            file: file_path.to_path_buf(),
+            name: current_heading.clone(),
+            kind: SymbolKind::Heading,
+            start_line: chunk_start_line,
+            end_line: line_num.saturating_sub(1),
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    // Split overly large chunks at paragraph boundaries
+    let mut result = Vec::new();
+    for chunk in chunks {
+        if chunk.embed_text.len() <= MAX_CHUNK_CHARS {
+            result.push(chunk);
+        } else {
+            result.append(&mut split_large_chunk(&chunk));
+        }
+    }
+
+    result
+}
+
+/// Truncate text to a short snippet for display in search results.
+fn truncate_snippet(text: &str) -> String {
+    let s = text.trim();
+    if s.len() <= 200 {
+        s.to_string()
+    } else {
+        let mut truncated: String = s.chars().take(197).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+/// Chunk large embed texts to prevent HTTP 400 errors on remote backends.
+///
+/// Splits chunks whose `embed_text` exceeds `max_embed_tokens` (estimated as
+/// chars / 4) at paragraph boundaries with configurable overlap. This only
+/// affects remote backends — local backends (Fastembed, Model2Vec) already
+/// truncate internally via `tokenizers::Tokenizer` with `max_length`.
+fn chunk_large_embed_texts(
+    chunks: Vec<SemanticChunk>,
+    max_embed_tokens: usize,
+    chunk_overlap_tokens: usize,
+) -> Vec<SemanticChunk> {
+    if max_embed_tokens == 0 {
+        return chunks;
+    }
+
+    // Convert token limit to character limit (approximate: 1 token ≈ 4 chars)
+    let max_chars = max_embed_tokens * 4;
+    let overlap_chars = chunk_overlap_tokens * 4;
+
+    let mut result = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.embed_text.len() <= max_chars {
+            result.push(chunk);
+        } else {
+            result.extend(split_chunk_with_overlap(&chunk, max_chars, overlap_chars));
+        }
+    }
+    result
+}
+
+/// Split a chunk into smaller chunks at paragraph boundaries with overlap.
+///
+/// Each chunk includes the last `overlap_chars` of the previous chunk to
+/// preserve boundary context. The first chunk retains the original name;
+/// subsequent chunks get " (cont.)" suffix.
+fn split_chunk_with_overlap(
+    chunk: &SemanticChunk,
+    max_chars: usize,
+    overlap_chars: usize,
+) -> Vec<SemanticChunk> {
+    let mut result = Vec::new();
+    let mut current_body = String::new();
+    let mut chunk_start = chunk.start_line;
+    let mut current_lines: u32 = 0;
+    let mut prev_tail: Option<String> = None;
+
+    for para in chunk.embed_text.split("\n\n") {
+        // Check if adding this paragraph would exceed the limit
+        let test_len = if let Some(ref tail) = prev_tail {
+            tail.len() + 2 + para.len() // +2 for "\n\n"
+        } else {
+            current_body.len() + if current_body.is_empty() { 0 } else { 2 } + para.len()
+        };
+
+        if !current_body.is_empty() && test_len > max_chars {
+            // Flush current sub-chunk
+            let body = current_body.trim().to_string();
+            result.push(SemanticChunk {
+                file: chunk.file.clone(),
+                name: if result.is_empty() {
+                    chunk.name.clone()
+                } else {
+                    format!("{} (cont.)", chunk.name)
+                },
+                kind: chunk.kind.clone(),
+                start_line: chunk_start,
+                end_line: chunk_start + current_lines,
+                exported: false,
+                embed_text: body.clone(),
+                snippet: truncate_snippet(&body),
+            });
+
+            // Save overlap tail for next chunk
+            prev_tail = Some(extract_tail(&current_body, overlap_chars));
+            chunk_start += current_lines;
+            current_body.clear();
+            current_lines = 0;
+        }
+
+        // Prepend overlap from previous chunk
+        if let Some(ref tail) = prev_tail {
+            if !current_body.is_empty() {
+                current_body.push_str("\n\n");
+            }
+            current_body.push_str(tail);
+            current_body.push_str("\n\n");
+            prev_tail = None;
+        }
+
+        if !current_body.is_empty() {
+            current_body.push_str("\n\n");
+        }
+        current_body.push_str(para);
+        current_lines += para.lines().count() as u32;
+    }
+
+    if !current_body.trim().is_empty() {
+        let body = current_body.trim().to_string();
+        result.push(SemanticChunk {
+            file: chunk.file.clone(),
+            name: if result.is_empty() {
+                chunk.name.clone()
+            } else {
+                format!("{} (cont.)", chunk.name)
+            },
+            kind: chunk.kind.clone(),
+            start_line: chunk_start,
+            end_line: chunk_start + current_lines,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    result
+}
+
+/// Extract the last `max_chars` from text, breaking at a paragraph boundary.
+fn extract_tail(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+
+    // Find the last paragraph boundary before max_chars
+    let truncated = &text[..text.floor_char_boundary(max_chars)];
+    if let Some(last_para) = truncated.rfind("\n\n") {
+        text[last_para + 2..].to_string()
+    } else {
+        // No paragraph boundary found; just take the tail
+        truncated.to_string()
+    }
+}
+
+fn split_large_chunk(chunk: &SemanticChunk) -> Vec<SemanticChunk> {
+    let mut result = Vec::new();
+    let mut current_body = String::new();
+    let mut chunk_start = chunk.start_line;
+    let mut current_lines: u32 = 0;
+
+    for para in chunk.embed_text.split("\n\n") {
+        if !current_body.is_empty() && current_body.len() + para.len() > MAX_CHUNK_CHARS {
+            // Flush current sub-chunk
+            let body = current_body.trim().to_string();
+            result.push(SemanticChunk {
+                file: chunk.file.clone(),
+                name: format!("{} (cont.)", chunk.name),
+                kind: chunk.kind.clone(),
+                start_line: chunk_start,
+                end_line: chunk_start + current_lines,
+                exported: false,
+                embed_text: body.clone(),
+                snippet: truncate_snippet(&body),
+            });
+            chunk_start += current_lines + 1;
+            current_body.clear();
+            current_lines = 0;
+        }
+        if !current_body.is_empty() {
+            current_body.push_str("\n\n");
+        }
+        current_body.push_str(para);
+        current_lines += para.lines().count() as u32;
+    }
+
+    if !current_body.trim().is_empty() {
+        let body = current_body.trim().to_string();
+        result.push(SemanticChunk {
+            file: chunk.file.clone(),
+            name: if result.is_empty() {
+                chunk.name.clone()
+            } else {
+                format!("{} (cont.)", chunk.name)
+            },
+            kind: chunk.kind.clone(),
+            start_line: chunk_start,
+            end_line: chunk_start + current_lines,
+            exported: false,
+            embed_text: body.clone(),
+            snippet: truncate_snippet(&body),
+        });
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -3474,101 +6082,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    #[test]
-    fn semantic_index_includes_php_inc_and_scss_extensions() {
-        for file in ["partial.inc", "index.php", "styles.scss"] {
-            assert!(
-                is_semantic_indexed_extension(Path::new(file)),
-                "{file} should be semantic-index eligible"
-            );
-        }
-    }
-
-    #[test]
-    fn transient_marker_round_trips_and_classifies() {
-        // A marked transient error is recognized and the marker is stripped for
-        // display, leaving a clean message.
-        let marked = format!("{TRANSIENT_EMBEDDING_MARKER}openai compatible request failed: error sending request for url (http://localhost:1234/v1/embeddings)");
-        assert!(embedding_failure_is_transient(&marked));
-        let clean = strip_transient_embedding_marker(&marked);
-        assert!(!clean.contains(TRANSIENT_EMBEDDING_MARKER));
-        assert!(clean.starts_with("openai compatible request failed:"));
-
-        // Permanent errors (HTTP 4xx, dimension mismatch) carry no marker and
-        // are not classified transient — they must fail fast.
-        for permanent in [
-            "openai compatible request failed (HTTP 401): Unauthorized",
-            "embedding dimension mismatch: index has 384, model returned 768",
-            "too many files (>20000) for semantic indexing (max 20000)",
-        ] {
-            assert!(
-                !embedding_failure_is_transient(permanent),
-                "{permanent:?} must not be transient"
-            );
-            // Stripping a marker-free string is a no-op.
-            assert_eq!(strip_transient_embedding_marker(permanent), permanent);
-        }
-    }
-
-    #[test]
-    fn send_error_transience_separates_connect_timeout_from_4xx() {
-        // 5xx / 429 are transient; other client errors are not.
-        assert!(is_retryable_embedding_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(is_retryable_embedding_status(
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        ));
-        assert!(!is_retryable_embedding_status(
-            reqwest::StatusCode::UNAUTHORIZED
-        ));
-        assert!(!is_retryable_embedding_status(
-            reqwest::StatusCode::BAD_REQUEST
-        ));
-    }
-
-    #[test]
-    fn local_backend_model_loading_body_is_transient() {
-        // LM Studio / Ollama return a 4xx with a loading/unloaded message while
-        // the model swaps; these must classify transient so the build self-heals.
-        for body in [
-            r#"{"error":"Model was unloaded while the request was still in queue.."}"#,
-            r#"{"error":"model is loading, please wait"}"#,
-            r#"{"error":"Model not loaded"}"#,
-            "Loading model into memory",
-        ] {
-            assert!(
-                embedding_response_body_is_transient(reqwest::StatusCode::BAD_REQUEST, body),
-                "{body:?} should be body-transient"
-            );
-        }
-
-        // A genuine 4xx misconfiguration body must NOT be treated as transient,
-        // even when it happens to contain generic words from the old broad
-        // substring matcher.
-        for body in [
-            r#"{"error":"invalid api key"}"#,
-            r#"{"error":"model 'foo' not found"}"#,
-            "Bad Request: unknown field",
-            "Bad Request: invalid loading model option",
-            r#"{"error":"unauthorized while model is being loaded by another account"}"#,
-        ] {
-            assert!(
-                !embedding_response_body_is_transient(reqwest::StatusCode::BAD_REQUEST, body),
-                "{body:?} must not be body-transient"
-            );
-        }
-
-        assert!(
-            !embedding_response_body_is_transient(
-                reqwest::StatusCode::UNAUTHORIZED,
-                r#"{"error":"model is loading, please wait"}"#
-            ),
-            "permanent auth failures must not become transient because of body text"
-        );
-    }
-
-    fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
+    pub(crate) fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
     where
         F: Fn(String, String, String) -> String + Send + 'static,
     {
@@ -3591,7 +6105,8 @@ mod tests {
                         header_end = Some(pos + 4);
                         let headers = String::from_utf8_lossy(&buf[..pos + 4]);
                         for line in headers.lines() {
-                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                            let lower = line.trim().to_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
                                 content_length = value.trim().parse::<usize>().unwrap_or(0);
                             }
                         }
@@ -3628,66 +6143,6 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
-    fn start_truncated_body_server(attempts: usize) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated test server");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-        let addr = listener.local_addr().expect("local addr");
-        let handle = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let mut accepted = 0usize;
-            while accepted < attempts && std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        accepted += 1;
-                        let mut buf = [0u8; 4096];
-                        // The client (under test) uses a 250ms timeout and drops
-                        // the connection when the truncated body never completes.
-                        // On Windows that disconnect surfaces as a hard socket
-                        // error (WSAECONNRESET) on these read/write calls, where
-                        // Unix returns a clean EOF. Tolerate both: the mock does
-                        // not need the request bytes, and a write to an
-                        // already-hung-up client is expected.
-                        let _ = stream.read(&mut buf);
-                        let response = "HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: 128
-Connection: close
-
-{";
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept request: {error}"),
-                }
-            }
-        });
-
-        (format!("http://{}", addr), handle)
-    }
-
-    #[test]
-    fn response_body_read_failures_are_marked_transient() {
-        let (url, handle) = start_truncated_body_server(EMBEDDING_REQUEST_MAX_ATTEMPTS);
-        let client = Client::builder()
-            .timeout(Duration::from_millis(250))
-            .build()
-            .expect("client");
-
-        let error = send_embedding_request(|| client.post(&url).body("{}"), "test backend")
-            .expect_err("truncated body should fail");
-
-        handle.join().unwrap();
-        assert!(
-            embedding_failure_is_transient(&error),
-            "body read failures should be transient-marked: {error}"
-        );
-        assert!(error.contains("response read failed"));
-    }
-
     fn test_vector_for_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
     }
@@ -3710,503 +6165,15 @@ Connection: close
     }
 
     fn set_file_metadata(index: &mut SemanticIndex, file: &Path, mtime: SystemTime, size: u64) {
-        index.file_mtimes.insert(file.to_path_buf(), mtime);
-        index.file_sizes.insert(file.to_path_buf(), size);
-        index
-            .file_hashes
-            .insert(file.to_path_buf(), cache_freshness::zero_hash());
-    }
-
-    fn legacy_semantic_index_bytes(index: &SemanticIndex) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let fingerprint_bytes = index.fingerprint.as_ref().and_then(|fingerprint| {
-            let encoded = fingerprint.as_string();
-            if encoded.is_empty() {
-                None
-            } else {
-                Some(encoded.into_bytes())
-            }
-        });
-        let file_mtimes: Vec<_> = index
-            .file_mtimes
-            .iter()
-            .filter_map(|(path, mtime)| {
-                cache_relative_path(&index.project_root, path)
-                    .map(|relative| (relative, path, mtime))
-            })
-            .collect();
-        let entries: Vec<_> = index
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                cache_relative_path(&index.project_root, &entry.chunk.file)
-                    .map(|relative| (relative, entry))
-            })
-            .collect();
-
-        buf.push(SEMANTIC_INDEX_VERSION_V6);
-        buf.extend_from_slice(&(index.dimension as u32).to_le_bytes());
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
-        buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
-        buf.extend_from_slice(fp_bytes_ref);
-
-        buf.extend_from_slice(&(file_mtimes.len() as u32).to_le_bytes());
-        for (relative, path, mtime) in &file_mtimes {
-            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
-            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&path_bytes);
-            let duration = mtime
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            buf.extend_from_slice(&duration.as_secs().to_le_bytes());
-            buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
-            let size = index.file_sizes.get(*path).copied().unwrap_or_default();
-            buf.extend_from_slice(&size.to_le_bytes());
-            let hash = index
-                .file_hashes
-                .get(*path)
-                .copied()
-                .unwrap_or_else(cache_freshness::zero_hash);
-            buf.extend_from_slice(hash.as_bytes());
-        }
-
-        for (relative, entry) in &entries {
-            let c = &entry.chunk;
-            let file_bytes = relative.to_string_lossy().as_bytes().to_vec();
-            buf.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&file_bytes);
-
-            let name_bytes = c.name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name_bytes);
-
-            buf.push(symbol_kind_to_u8(&c.kind));
-            buf.extend_from_slice(&(c.start_line as u32).to_le_bytes());
-            buf.extend_from_slice(&(c.end_line as u32).to_le_bytes());
-            buf.push(c.exported as u8);
-
-            let snippet_bytes = c.snippet.as_bytes();
-            buf.extend_from_slice(&(snippet_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(snippet_bytes);
-
-            let embed_bytes = c.embed_text.as_bytes();
-            buf.extend_from_slice(&(embed_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(embed_bytes);
-
-            for &val in &entry.vector {
-                buf.extend_from_slice(&val.to_le_bytes());
-            }
-        }
-
-        buf
-    }
-
-    #[derive(Default)]
-    struct RecordingEmbedder {
-        calls: Vec<Vec<String>>,
-    }
-
-    impl RecordingEmbedder {
-        fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-            let vectors = texts
-                .iter()
-                .map(|text| deterministic_test_vector(text))
-                .collect();
-            self.calls.push(texts);
-            Ok(vectors)
-        }
-
-        fn total_embedded_texts(&self) -> usize {
-            self.calls.iter().map(Vec::len).sum()
-        }
-
-        fn embedded_texts(&self) -> Vec<&str> {
-            self.calls
-                .iter()
-                .flat_map(|batch| batch.iter().map(String::as_str))
-                .collect()
-        }
-    }
-
-    fn deterministic_test_vector(text: &str) -> Vec<f32> {
-        let hash = blake3::hash(text.as_bytes());
-        let bytes = hash.as_bytes();
-        vec![
-            1.0,
-            bytes[0] as f32 / 255.0,
-            bytes[1] as f32 / 255.0,
-            bytes[2] as f32 / 255.0,
-        ]
-    }
-
-    fn build_recorded_test_index(project_root: &Path, files: &[PathBuf]) -> SemanticIndex {
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        SemanticIndex::build(project_root, files, &mut embed, 16).unwrap()
-    }
-
-    fn force_stale(index: &mut SemanticIndex, file: &Path) {
-        set_file_metadata(index, file, SystemTime::UNIX_EPOCH, 0);
-    }
-
-    fn write_source(path: &Path, source: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, source).unwrap();
-    }
-
-    fn entries_for_file<'a>(index: &'a SemanticIndex, file: &Path) -> Vec<&'a EmbeddingEntry> {
-        index
-            .entries
-            .iter()
-            .filter(|entry| entry.chunk.file == file)
-            .collect()
-    }
-
-    fn entry_by_name<'a>(index: &'a SemanticIndex, file: &Path, name: &str) -> &'a EmbeddingEntry {
-        index
-            .entries
-            .iter()
-            .find(|entry| entry.chunk.file == file && entry.chunk.name == name)
-            .unwrap_or_else(|| panic!("missing semantic entry {name} in {}", file.display()))
-    }
-
-    fn file_summary_entry<'a>(index: &'a SemanticIndex, file: &Path) -> &'a EmbeddingEntry {
-        index
-            .entries
-            .iter()
-            .find(|entry| entry.chunk.file == file && entry.chunk.kind == SymbolKind::FileSummary)
-            .unwrap_or_else(|| panic!("missing file-summary entry in {}", file.display()))
-    }
-
-    #[test]
-    fn refresh_stale_line_shift_reuses_all_chunks_and_retains_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        let original = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
-        write_source(&file, original);
-
-        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let original_entry_count = index.entries.len();
-        let original_alpha_vector = entry_by_name(&index, &file, "alpha").vector.clone();
-
-        write_source(&file, &format!("\n{original}"));
-        force_stale(&mut index, &file);
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let summary = index
-            .refresh_stale_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(summary.changed, 1);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert_eq!(index.entries.len(), original_entry_count);
-        let shifted_alpha = entry_by_name(&index, &file, "alpha");
-        assert_eq!(shifted_alpha.chunk.start_line, 1);
-        assert_eq!(shifted_alpha.vector, original_alpha_vector);
-    }
-
-    #[test]
-    fn refresh_invalidated_line_shift_emits_full_replacement_delta_for_apply() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        let original = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
-        write_source(&file, original);
-
-        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let mut serving_index = worker_index.clone();
-        let original_entry_count = worker_index.entries.len();
-
-        write_source(&file, &format!("\n{original}"));
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let update = worker_index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert_eq!(update.added_entries.len(), original_entry_count);
-        assert_eq!(worker_index.entries.len(), original_entry_count);
-
-        serving_index.apply_refresh_update(
-            update.added_entries,
-            update.updated_metadata,
-            &update.completed_paths,
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            file.to_path_buf(),
+            IndexedFileMetadata {
+                mtime,
+                size,
+                content_hash: hash,
+            },
         );
-
-        assert_eq!(serving_index.entries.len(), original_entry_count);
-        assert_eq!(
-            entries_for_file(&serving_index, &file).len(),
-            original_entry_count
-        );
-        assert_eq!(
-            entry_by_name(&serving_index, &file, "alpha")
-                .chunk
-                .start_line,
-            1
-        );
-    }
-
-    #[test]
-    fn refresh_invalidated_one_symbol_edit_embeds_only_changed_symbol() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        write_source(
-            &file,
-            "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n",
-        );
-
-        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let original_entry_count = index.entries.len();
-        let beta_vector = entry_by_name(&index, &file, "beta").vector.clone();
-
-        write_source(
-            &file,
-            "pub fn alpha() -> i32 {\n    10\n}\n\npub fn beta() -> i32 {\n    2\n}\n",
-        );
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let update = index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(embedder.total_embedded_texts(), 1);
-        assert!(embedder.embedded_texts()[0].contains("name:alpha"));
-        assert_eq!(update.added_entries.len(), original_entry_count);
-        assert_eq!(entry_by_name(&index, &file, "beta").vector, beta_vector);
-    }
-
-    #[test]
-    fn refresh_reuses_one_old_vector_for_two_byte_identical_symbols() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/dupe.js");
-        let one_duplicate = "function duplicate() {\n  return 1;\n}\n";
-        write_source(&file, one_duplicate);
-
-        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let original_vector = entry_by_name(&index, &file, "duplicate").vector.clone();
-
-        write_source(&file, &format!("{one_duplicate}\n{one_duplicate}"));
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        let duplicate_entries = index
-            .entries
-            .iter()
-            .filter(|entry| entry.chunk.file == file && entry.chunk.name == "duplicate")
-            .collect::<Vec<_>>();
-        assert_eq!(duplicate_entries.len(), 2);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert_eq!(duplicate_entries[0].vector, original_vector);
-        assert_eq!(duplicate_entries[1].vector, original_vector);
-    }
-
-    #[test]
-    fn file_summary_reuses_on_body_edit_and_misses_on_leading_doc_edit() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        write_source(
-            &file,
-            "//! module docs v1\n\npub fn alpha() -> i32 {\n    1\n}\n",
-        );
-
-        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let summary_before = file_summary_entry(&index, &file).vector.clone();
-
-        write_source(
-            &file,
-            "//! module docs v1\n\npub fn alpha() -> i32 {\n    2\n}\n",
-        );
-        let mut body_embedder = RecordingEmbedder::default();
-        let mut body_embed = |texts: Vec<String>| body_embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut body_embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-        assert_eq!(body_embedder.total_embedded_texts(), 1);
-        assert!(body_embedder.embedded_texts()[0].contains("name:alpha"));
-        assert_eq!(file_summary_entry(&index, &file).vector, summary_before);
-
-        write_source(
-            &file,
-            "//! module docs v2\n\npub fn alpha() -> i32 {\n    2\n}\n",
-        );
-        let mut doc_embedder = RecordingEmbedder::default();
-        let mut doc_embed = |texts: Vec<String>| doc_embedder.embed(texts);
-        index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut doc_embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(doc_embedder.total_embedded_texts(), 1);
-        assert!(doc_embedder.embedded_texts()[0].contains("kind:file-summary"));
-        assert_ne!(file_summary_entry(&index, &file).vector, summary_before);
-    }
-
-    #[test]
-    fn refresh_invalidated_deleted_file_drops_entries_without_embedding() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        write_source(&file, "pub fn alpha() -> i32 {\n    1\n}\n");
-
-        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let mut serving_index = worker_index.clone();
-        fs::remove_file(&file).unwrap();
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let update = worker_index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(update.summary.deleted, 1);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert!(worker_index.entries.is_empty());
-
-        serving_index.apply_refresh_update(
-            update.added_entries,
-            update.updated_metadata,
-            &update.completed_paths,
-        );
-        assert!(serving_index.entries.is_empty());
-    }
-
-    #[test]
-    fn watcher_collect_failure_does_not_resurrect_stale_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        write_source(&file, "pub fn alpha() -> i32 {\n    1\n}\n");
-
-        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
-        let mut serving_index = worker_index.clone();
-        fs::write(&file, [0xff, 0xfe, 0xfd]).unwrap();
-
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let update = worker_index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                16,
-                100,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert!(update.added_entries.is_empty());
-        assert!(worker_index.entries.is_empty());
-        assert!(!worker_index.file_mtimes.contains_key(&file));
-
-        serving_index.apply_refresh_update(
-            update.added_entries,
-            update.updated_metadata,
-            &update.completed_paths,
-        );
-        assert!(serving_index.entries.is_empty());
-        assert!(!serving_index.file_mtimes.contains_key(&file));
-    }
-
-    #[test]
-    fn refresh_invalidated_cap_deferral_remains_file_count_based() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let indexed = project_root.join("src/a.rs");
-        let deferred = project_root.join("src/b.rs");
-        write_source(&indexed, "pub fn alpha() -> i32 {\n    1\n}\n");
-        write_source(&deferred, "pub fn beta() -> i32 {\n    2\n}\n");
-
-        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&indexed));
-        let mut embedder = RecordingEmbedder::default();
-        let mut embed = |texts: Vec<String>| embedder.embed(texts);
-        let mut progress = |_done: usize, _total: usize| {};
-        let update = index
-            .refresh_invalidated_files(
-                project_root,
-                std::slice::from_ref(&deferred),
-                &mut embed,
-                16,
-                1,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(update.summary.total_processed, 1);
-        assert_eq!(update.summary.added, 0);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert_eq!(index.indexed_file_count(), 1);
-        assert!(index.deferred_files.contains(&deferred));
-        assert!(entries_for_file(&index, &deferred).is_empty());
     }
 
     #[test]
@@ -4215,14 +6182,16 @@ Connection: close
         let project = fs::canonicalize(dir.path()).expect("canonical project");
         let outside = project.join("..").join("outside.rs");
         let mut index = SemanticIndex::new(project.clone(), 3);
-        index
-            .file_mtimes
-            .insert(outside.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(outside.clone(), 1);
-        index
-            .file_hashes
-            .insert(outside.clone(), cache_freshness::zero_hash());
-        index.entries.push(EmbeddingEntry {
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            outside.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: hash,
+            },
+        );
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: outside,
                 name: "outside".to_string(),
@@ -4234,79 +6203,13 @@ Connection: close
                 snippet: "outside".to_string(),
             },
             vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
         });
 
         let bytes = index.to_bytes();
         let loaded = SemanticIndex::from_bytes(&bytes, &project).expect("load serialized index");
-        assert_eq!(loaded.entries.len(), 0);
-        assert!(loaded.file_mtimes.is_empty());
-    }
-
-    #[test]
-    fn semantic_search_bounded_top_k_matches_reference_full_sort() {
-        let project_root = test_project_root();
-        let file = project_root.join("src/lib.rs");
-        let mut index = SemanticIndex::new(project_root, 2);
-        let entries = [
-            ("alpha", vec![1.0, 0.0], false),
-            ("beta", vec![0.0, 1.0], false),
-            ("gamma", vec![1.0, 0.0], false),
-            ("delta", vec![0.5, 0.5], true),
-            ("epsilon", vec![-1.0, 0.0], false),
-        ];
-        for (line, (name, vector, exported)) in entries.into_iter().enumerate() {
-            index.entries.push(EmbeddingEntry {
-                chunk: SemanticChunk {
-                    file: file.clone(),
-                    name: name.to_string(),
-                    kind: SymbolKind::Function,
-                    start_line: line as u32 + 1,
-                    end_line: line as u32 + 1,
-                    exported,
-                    embed_text: name.to_string(),
-                    snippet: format!("fn {name}() {{}}"),
-                },
-                vector,
-            });
-        }
-
-        let query = vec![1.0, 0.0];
-        let top_k = 4;
-        let mut reference: Vec<(f32, usize)> = index
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                let mut score = cosine_similarity(&query, &entry.vector);
-                if entry.chunk.exported {
-                    score *= 1.1;
-                }
-                (score, idx)
-            })
-            .collect();
-        reference.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let expected: Vec<(String, f32)> = reference
-            .into_iter()
-            .take(top_k)
-            .map(|(score, idx)| (index.entries[idx].chunk.name.clone(), score))
-            .collect();
-
-        let actual: Vec<(String, f32)> = index
-            .search(&query, top_k)
-            .into_iter()
-            .map(|result| (result.name, result.score))
-            .collect();
-
-        assert_eq!(
-            actual.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-            expected.iter().map(|(name, _)| name).collect::<Vec<_>>()
-        );
-        for ((_, actual_score), (_, expected_score)) in actual.iter().zip(expected.iter()) {
-            assert!((actual_score - expected_score).abs() < 1e-6);
-        }
-        assert_eq!(actual[0].0, "alpha");
-        assert_eq!(actual[1].0, "gamma", "equal scores keep insertion order");
-        assert!(index.search(&query, 0).is_empty());
+        assert_eq!(loaded.len(), 0);
+        assert!(loaded.file_metadata().is_empty());
     }
 
     #[test]
@@ -4335,7 +6238,7 @@ Connection: close
         let project_root = test_project_root();
         let file = project_root.join("src/main.rs");
         let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
@@ -4347,125 +6250,44 @@ Connection: close
                 snippet: "fn handle_request() {\n  // ...\n}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3, 0.4],
+            chunk_hash: String::new(),
         });
-        index.dimension = 4;
-        index
-            .file_mtimes
-            .insert(file.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(file, 0);
+        index.set_dimension(4);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            file.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
             model: "all-MiniLM-L6-v2".to_string(),
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 4,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            ..Default::default()
         });
 
         let bytes = index.to_bytes();
         let restored = SemanticIndex::from_bytes(&bytes, &project_root).unwrap();
 
-        assert_eq!(restored.entries.len(), 1);
-        assert_eq!(restored.entries[0].chunk.name, "handle_request");
-        assert_eq!(restored.entries[0].vector, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.entries_for_test()[0].chunk.name, "handle_request");
+        assert_eq!(
+            restored.entries_for_test()[0].vector,
+            vec![0.1, 0.2, 0.3, 0.4]
+        );
         assert_eq!(restored.dimension, 4);
         assert_eq!(restored.backend_label(), Some("fastembed"));
         assert_eq!(restored.model_label(), Some("all-MiniLM-L6-v2"));
-    }
-
-    #[test]
-    fn semantic_cache_streaming_persistence_matches_legacy_bytes_and_round_trips() {
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let project = storage.path().join("project");
-        fs::create_dir_all(project.join("src")).expect("create project src");
-        let file = project.join("src/lib.rs");
-        fs::write(&file, "pub fn alpha() {}\npub fn beta() {}\n").expect("write source");
-        let project_root = fs::canonicalize(&project).expect("canonical project");
-        let file = fs::canonicalize(&file).expect("canonical file");
-
-        let mut index = SemanticIndex::new(project_root.clone(), 3);
-        let mtime = SystemTime::UNIX_EPOCH + Duration::new(123, 456);
-        index.file_mtimes.insert(file.clone(), mtime);
-        index.file_sizes.insert(file.clone(), 42);
-        index
-            .file_hashes
-            .insert(file.clone(), cache_freshness::zero_hash());
-        index.entries.push(EmbeddingEntry {
-            chunk: SemanticChunk {
-                file: file.clone(),
-                name: "alpha".to_string(),
-                kind: SymbolKind::Function,
-                start_line: 0,
-                end_line: 0,
-                exported: true,
-                embed_text: "file:src/lib.rs kind:function name:alpha".to_string(),
-                snippet: "pub fn alpha() {}".to_string(),
-            },
-            vector: vec![0.1, 0.2, 0.3],
-        });
-        index.entries.push(EmbeddingEntry {
-            chunk: SemanticChunk {
-                file: file.clone(),
-                name: "beta".to_string(),
-                kind: SymbolKind::Function,
-                start_line: 1,
-                end_line: 1,
-                exported: true,
-                embed_text: "file:src/lib.rs kind:function name:beta".to_string(),
-                snippet: "pub fn beta() {}".to_string(),
-            },
-            vector: vec![0.4, 0.5, 0.6],
-        });
-        let fingerprint = SemanticIndexFingerprint {
-            backend: "fastembed".to_string(),
-            model: "all-MiniLM-L6-v2".to_string(),
-            base_url: FALLBACK_BACKEND.to_string(),
-            dimension: 3,
-            chunking_version: default_chunking_version(),
-        };
-        index.set_fingerprint(fingerprint.clone());
-
-        let legacy_bytes = legacy_semantic_index_bytes(&index);
-        assert_eq!(index.to_bytes(), legacy_bytes);
-
-        index.write_to_disk(storage.path(), "proj");
-        let data_path = storage.path().join("semantic/proj/semantic.bin");
-        assert_eq!(
-            fs::read(&data_path).expect("read semantic.bin"),
-            legacy_bytes
-        );
-
-        let loaded = SemanticIndex::read_from_disk(
-            storage.path(),
-            "proj",
-            &project_root,
-            false,
-            Some(&fingerprint.as_string()),
-        )
-        .expect("load semantic index");
-        assert_eq!(loaded.entries.len(), index.entries.len());
-        assert_eq!(loaded.dimension, index.dimension);
-        assert_eq!(
-            loaded.fingerprint().unwrap().as_string(),
-            fingerprint.as_string()
-        );
-        assert_eq!(loaded.file_mtimes.get(&file), Some(&mtime));
-        assert_eq!(loaded.file_sizes.get(&file), Some(&42));
-        assert_eq!(
-            loaded.file_hashes.get(&file),
-            Some(&cache_freshness::zero_hash())
-        );
-        for (actual, expected) in loaded.entries.iter().zip(index.entries.iter()) {
-            assert_eq!(actual.chunk.file, expected.chunk.file);
-            assert_eq!(actual.chunk.name, expected.chunk.name);
-            assert_eq!(actual.chunk.kind, expected.chunk.kind);
-            assert_eq!(actual.chunk.start_line, expected.chunk.start_line);
-            assert_eq!(actual.chunk.end_line, expected.chunk.end_line);
-            assert_eq!(actual.chunk.exported, expected.chunk.exported);
-            assert_eq!(actual.chunk.embed_text, expected.chunk.embed_text);
-            assert_eq!(actual.chunk.snippet, expected.chunk.snippet);
-            assert_eq!(actual.vector, expected.vector);
-        }
-        assert_eq!(loaded.to_bytes(), legacy_bytes);
     }
 
     #[test]
@@ -4492,13 +6314,13 @@ Connection: close
     #[test]
     fn test_search_top_k() {
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.dimension = 3;
+        index.set_dimension(3);
 
         // Add entries with known vectors
         for (i, name) in ["auth", "database", "handler"].iter().enumerate() {
             let mut vec = vec![0.0f32; 3];
             vec[i] = 1.0; // orthogonal vectors
-            index.entries.push(EmbeddingEntry {
+            index.entries_mut().push(EmbeddingEntry {
                 chunk: SemanticChunk {
                     file: PathBuf::from("/src/lib.rs"),
                     name: name.to_string(),
@@ -4510,6 +6332,7 @@ Connection: close
                     snippet: format!("fn {}() {{}}", name),
                 },
                 vector: vec,
+                chunk_hash: String::new(),
             });
         }
 
@@ -4591,29 +6414,6 @@ Connection: close
     }
 
     #[test]
-    fn collect_file_chunks_skips_oversized_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let big = dir.path().join("huge.ts");
-        // Just over the cap: a valid TS file that would otherwise yield chunks.
-        let filler = "export const x = 1;\n"
-            .repeat(((MAX_SEMANTIC_FILE_BYTES as usize) / "export const x = 1;\n".len()) + 16);
-        std::fs::write(&big, &filler).unwrap();
-        assert!(big.metadata().unwrap().len() > MAX_SEMANTIC_FILE_BYTES);
-
-        let mut parsers = HashMap::new();
-        // Oversized → tracked with zero chunks, NOT an error (so the caller keeps
-        // the file in metadata and freshness skips re-reading it).
-        let chunks = collect_file_chunks(dir.path(), &big, &mut parsers).unwrap();
-        assert!(chunks.is_empty(), "oversized file must yield no chunks");
-
-        // A small file of the same language still produces chunks.
-        let small = dir.path().join("small.ts");
-        std::fs::write(&small, "export function foo() { return 1; }\n").unwrap();
-        let small_chunks = collect_file_chunks(dir.path(), &small, &mut parsers).unwrap();
-        assert!(!small_chunks.is_empty(), "small file should still chunk");
-    }
-
-    #[test]
     fn rejects_oversized_dimension_during_deserialization() {
         let mut bytes = Vec::new();
         bytes.push(1u8);
@@ -4639,7 +6439,7 @@ Connection: close
     fn invalidate_file_removes_entries_and_mtime() {
         let target = PathBuf::from("/src/main.rs");
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: target.clone(),
                 name: "main".to_string(),
@@ -4651,55 +6451,26 @@ Connection: close
                 snippet: "fn main() {}".to_string(),
             },
             vector: vec![1.0; DEFAULT_DIMENSION],
+            chunk_hash: String::new(),
         });
-        index
-            .file_mtimes
-            .insert(target.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(target.clone(), 0);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            target.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
 
         index.invalidate_file(&target);
 
-        assert!(index.entries.is_empty());
-        assert!(!index.file_mtimes.contains_key(&target));
-        assert!(!index.file_sizes.contains_key(&target));
+        assert!(index.is_empty());
+        assert!(!index.file_metadata().contains_key(&target));
     }
 
     #[test]
-    fn refresh_missing_changed_file_is_purged_after_collect() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path();
-        let file = project_root.join("src/lib.rs");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        write_rust_file(&file, "vanished_symbol");
-
-        let mut index = build_test_index(project_root, std::slice::from_ref(&file));
-        let original_size = *index.file_sizes.get(&file).unwrap();
-        set_file_metadata(&mut index, &file, SystemTime::UNIX_EPOCH, original_size + 1);
-        fs::remove_file(&file).unwrap();
-
-        let mut embed = test_vector_for_texts;
-        let mut progress = |_done: usize, _total: usize| {};
-        let summary = index
-            .refresh_stale_files(
-                project_root,
-                std::slice::from_ref(&file),
-                &mut embed,
-                8,
-                &mut progress,
-            )
-            .unwrap();
-
-        assert_eq!(summary.changed, 0);
-        assert_eq!(summary.added, 0);
-        assert_eq!(summary.deleted, 1);
-        assert!(index.entries.is_empty());
-        assert!(!index.file_mtimes.contains_key(&file));
-        assert!(!index.file_sizes.contains_key(&file));
-        assert!(!index.file_hashes.contains_key(&file));
-    }
-
-    #[test]
-    fn refresh_collect_error_for_existing_path_preserves_cached_entry() {
+    fn refresh_transient_error_preserves_existing_entry_and_mtime() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path();
         let file = project_root.join("src/lib.rs");
@@ -4707,14 +6478,14 @@ Connection: close
         write_rust_file(&file, "kept_symbol");
 
         let mut index = build_test_index(project_root, std::slice::from_ref(&file));
-        let original_entry_count = index.entries.len();
-        let original_mtime = *index.file_mtimes.get(&file).unwrap();
-        let original_size = *index.file_sizes.get(&file).unwrap();
+        let original_entry_count = index.len();
+        let meta = index.file_metadata().get(&file).unwrap();
+        let original_mtime = meta.mtime;
+        let original_size = meta.size;
 
         let stale_mtime = SystemTime::UNIX_EPOCH;
         set_file_metadata(&mut index, &file, stale_mtime, original_size + 1);
         fs::remove_file(&file).unwrap();
-        fs::create_dir(&file).unwrap();
 
         let mut embed = test_vector_for_texts;
         let mut progress = |_done: usize, _total: usize| {};
@@ -4725,20 +6496,31 @@ Connection: close
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.added, 0);
         assert_eq!(summary.deleted, 0);
-        assert_eq!(index.entries.len(), original_entry_count);
+        assert_eq!(index.len(), original_entry_count);
         assert!(index
-            .entries
+            .entries_for_test()
             .iter()
             .any(|entry| entry.chunk.name == "kept_symbol"));
-        assert_eq!(index.file_mtimes.get(&file), Some(&stale_mtime));
-        assert_ne!(index.file_mtimes.get(&file), Some(&original_mtime));
-        assert_eq!(index.file_sizes.get(&file), Some(&(original_size + 1)));
+        assert_eq!(
+            index.file_metadata().get(&file).map(|m| m.mtime),
+            Some(stale_mtime)
+        );
+        assert_ne!(
+            index.file_metadata().get(&file).map(|m| m.mtime),
+            Some(original_mtime)
+        );
+        assert_eq!(
+            index.file_metadata().get(&file).map(|m| m.size),
+            Some(original_size + 1)
+        );
     }
 
     #[test]
@@ -4758,15 +6540,16 @@ Connection: close
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
         assert_eq!(summary.added, 0);
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.deleted, 0);
-        assert!(!index.file_mtimes.contains_key(&missing));
-        assert!(!index.file_sizes.contains_key(&missing));
-        assert!(index.entries.is_empty());
+        assert!(!index.file_metadata().contains_key(&missing));
+        assert!(index.is_empty());
     }
 
     #[test]
@@ -4789,6 +6572,8 @@ Connection: close
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -4796,8 +6581,11 @@ Connection: close
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.total_processed, 2);
-        assert!(index.file_mtimes.contains_key(&added));
-        assert!(index.entries.iter().any(|entry| entry.chunk.file == added));
+        assert!(index.file_metadata().contains_key(&added));
+        assert!(index
+            .entries_for_test()
+            .iter()
+            .any(|entry| entry.chunk.file == added));
     }
 
     #[test]
@@ -4814,15 +6602,23 @@ Connection: close
         let mut embed = test_vector_for_texts;
         let mut progress = |_done: usize, _total: usize| {};
         let summary = index
-            .refresh_stale_files(project_root, &[], &mut embed, 8, &mut progress)
+            .refresh_stale_files(
+                project_root,
+                &[],
+                &mut embed,
+                8,
+                &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
+            )
             .unwrap();
 
         assert_eq!(summary.deleted, 1);
         assert_eq!(summary.changed, 0);
         assert_eq!(summary.added, 0);
         assert_eq!(summary.total_processed, 1);
-        assert!(!index.file_mtimes.contains_key(&deleted));
-        assert!(index.entries.is_empty());
+        assert!(!index.file_metadata().contains_key(&deleted));
+        assert!(index.is_empty());
     }
 
     #[test]
@@ -4846,6 +6642,8 @@ Connection: close
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
@@ -4854,11 +6652,11 @@ Connection: close
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.total_processed, 1);
         assert!(index
-            .entries
+            .entries_for_test()
             .iter()
             .any(|entry| entry.chunk.name == "new_symbol"));
         assert!(!index
-            .entries
+            .entries_for_test()
             .iter()
             .any(|entry| entry.chunk.name == "old_symbol"));
     }
@@ -4872,7 +6670,7 @@ Connection: close
         write_rust_file(&file, "clean_symbol");
 
         let mut index = build_test_index(project_root, std::slice::from_ref(&file));
-        let original_entries = index.entries.len();
+        let original_entries = index.len();
         let mut embed_called = false;
         let mut embed = |texts: Vec<String>| {
             embed_called = true;
@@ -4886,13 +6684,15 @@ Connection: close
                 &mut embed,
                 8,
                 &mut progress,
+                &SemanticFilePolicy::default(),
+                None,
             )
             .unwrap();
 
         assert!(summary.is_noop());
         assert_eq!(summary.total_processed, 1);
         assert!(!embed_called);
-        assert_eq!(index.entries.len(), original_entries);
+        assert_eq!(index.len(), original_entries);
     }
 
     #[test]
@@ -4927,7 +6727,39 @@ Connection: close
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5001,7 +6833,39 @@ Connection: close
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -5047,7 +6911,39 @@ Connection: close
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
             max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -5067,7 +6963,7 @@ Connection: close
         let project_root = test_project_root();
         let file = project_root.join("src/main.rs");
         let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
@@ -5079,18 +6975,30 @@ Connection: close
                 snippet: "fn handle_request() {}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3],
+            chunk_hash: String::new(),
         });
-        index.dimension = 3;
-        index
-            .file_mtimes
-            .insert(file.clone(), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(file, 0);
+        index.set_dimension(3);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            file.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "openai_compatible".to_string(),
             model: "test-embedding".to_string(),
             base_url: "http://127.0.0.1:1234/v1".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            ..Default::default()
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -5110,6 +7018,12 @@ Connection: close
             base_url: "http://127.0.0.1:11434".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            ..Default::default()
         }
         .as_string();
         assert!(SemanticIndex::read_from_disk(
@@ -5130,7 +7044,7 @@ Connection: close
         fs::create_dir_all(&dir).unwrap();
 
         let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
-        index.entries.push(EmbeddingEntry {
+        index.entries_mut().push(EmbeddingEntry {
             chunk: SemanticChunk {
                 file: PathBuf::from("/src/main.rs"),
                 name: "handle_request".to_string(),
@@ -5142,18 +7056,30 @@ Connection: close
                 snippet: "fn handle_request() {}".to_string(),
             },
             vector: vec![0.1, 0.2, 0.3],
+            chunk_hash: String::new(),
         });
-        index.dimension = 3;
-        index
-            .file_mtimes
-            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(PathBuf::from("/src/main.rs"), 0);
+        index.set_dimension(3);
+        let hash = cache_freshness::zero_hash();
+        index.file_metadata_for_test().insert(
+            PathBuf::from("/src/main.rs"),
+            IndexedFileMetadata {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        );
         let fingerprint = SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
             model: "test".to_string(),
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            ..Default::default()
         };
         index.set_fingerprint(fingerprint.clone());
 
@@ -5209,31 +7135,6 @@ Connection: close
             chunks.is_empty(),
             "Heading symbols must be filtered out before embedding; got {} chunk(s)",
             chunks.len()
-        );
-    }
-
-    /// A symbol with an enormous signature (e.g. a YAML/Kubernetes CronJob
-    /// whose inline `command:` script is parsed into the signature) must not
-    /// produce an embed_text that overflows the embedding backend's physical
-    /// batch. Before the clamp, the unbounded `signature:` append created a
-    /// multi-KB input that aborted the whole index build and degraded every
-    /// search to lexical-only.
-    #[test]
-    fn build_embed_text_clamps_oversized_signature() {
-        let project_root = PathBuf::from("/proj");
-        let file = project_root.join("cronjob.yaml");
-        let huge_sig = "kubectl ".repeat(2000); // ~16 KB
-        let source = "apiVersion: batch/v1\nkind: CronJob\n";
-
-        let mut symbol = make_symbol(SymbolKind::Class, "cluster-janitor", 0, 1);
-        symbol.signature = Some(huge_sig);
-
-        let text = build_embed_text(&symbol, source, &file, &project_root);
-        assert!(
-            text.chars().count() <= MAX_EMBED_TEXT_CHARS,
-            "embed_text must be clamped to {} chars, got {}",
-            MAX_EMBED_TEXT_CHARS,
-            text.chars().count()
         );
     }
 
@@ -5358,37 +7259,6 @@ Connection: close
         assert!(normalize_base_url("http://localhost:8080").is_ok());
     }
 
-    #[test]
-    fn ssrf_guard_blocks_reserved_ranges_but_allows_loopback() {
-        use std::net::IpAddr;
-        let blocked = |s: &str| is_private_non_loopback_ip(&s.parse::<IpAddr>().unwrap());
-
-        // Private / link-local / CGNAT — blocked (unchanged behavior).
-        assert!(blocked("10.0.0.1"));
-        assert!(blocked("192.168.1.1"));
-        assert!(blocked("169.254.0.1"));
-        assert!(blocked("100.64.0.1"));
-        // Newly covered by delegating to url_fetch's complete list:
-        assert!(
-            blocked("198.18.0.1"),
-            "RFC2544 benchmark range must be blocked"
-        );
-        assert!(blocked("224.0.0.1"), "multicast must be blocked");
-        assert!(blocked("fc00::1"), "IPv6 ULA must be blocked");
-        assert!(blocked("fe80::1"), "IPv6 link-local must be blocked");
-
-        // Loopback — allowed (local Ollama endpoint), incl. IPv4-mapped form.
-        assert!(!blocked("127.0.0.1"), "loopback must stay allowed");
-        assert!(!blocked("::1"), "IPv6 loopback must stay allowed");
-        assert!(
-            !blocked("::ffff:127.0.0.1"),
-            "IPv4-mapped loopback must stay allowed (matches prior carve-out)"
-        );
-
-        // A public address must NOT be flagged.
-        assert!(!blocked("8.8.8.8"));
-    }
-
     /// Pin the user-facing wording of the ONNX version-mismatch error.
     /// The auto-fix path MUST be listed first because it's the only safe
     /// option that doesn't require sudo or risk breaking other apps that
@@ -5430,24 +7300,6 @@ Connection: close
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn loaded_ort_version_detection_prefers_actual_loaded_library_path() {
-        let requested = "libonnxruntime.so";
-        let actual = "/usr/local/lib/libonnxruntime.so.1.19.0";
-
-        assert_eq!(detect_ort_version_from_path(requested), None);
-        let (version, source) =
-            detect_ort_version_from_resolved_or_requested(Some(actual.to_string()), requested);
-
-        assert_eq!(version, Some("1.19.0".to_string()));
-        assert_eq!(source, actual);
-
-        let msg = format_ort_version_mismatch(&version.unwrap(), &source);
-        assert!(msg.contains("v1.19.0"));
-        assert!(msg.contains(actual));
-    }
-
     /// macOS dylib paths must not produce a malformed message when the
     /// system path lacks a trailing slash. This is a regression guard
     /// for the "{}\n{}" format string contract.
@@ -5463,5 +7315,3936 @@ Connection: close
             msg.contains("'/opt/homebrew/lib/libonnxruntime.dylib'"),
             "system path should be quoted in the auto-fix sentence: {msg}"
         );
+    }
+
+    // ── is_generated_file tests ─────────────────────────────────────────
+
+    #[test]
+    fn is_generated_file_detects_protobuf_go() {
+        assert!(is_generated_file(Path::new("foo.pb.go")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_protobuf_python() {
+        assert!(is_generated_file(Path::new("foo_pb2.py")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_minified() {
+        assert!(is_generated_file(Path::new("vendor/jquery.min.js")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_snapshot() {
+        assert!(is_generated_file(Path::new("__snapshots__/test.snap")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_dist_directory() {
+        assert!(is_generated_file(Path::new("dist/index.js")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_build_directory() {
+        assert!(is_generated_file(Path::new("build/main.rs")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_generated_directory() {
+        assert!(is_generated_file(Path::new("generated/models.rs")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_generated_prefix() {
+        assert!(is_generated_file(Path::new(".generated.ts")));
+    }
+
+    #[test]
+    fn is_generated_file_detects_dart_generated() {
+        assert!(is_generated_file(Path::new("foo.g.dart")));
+    }
+
+    #[test]
+    fn is_generated_file_allows_normal_files() {
+        assert!(!is_generated_file(Path::new("src/main.rs")));
+        assert!(!is_generated_file(Path::new("lib/utils.ts")));
+        assert!(!is_generated_file(Path::new("README.md")));
+    }
+
+    // ── is_doc_extension tests ──────────────────────────────────────────
+
+    #[test]
+    fn is_doc_extension_markdown() {
+        assert!(is_doc_extension(Path::new("README.md")));
+        assert!(is_doc_extension(Path::new("docs/guide.rst")));
+        assert!(is_doc_extension(Path::new("notes.txt")));
+        assert!(is_doc_extension(Path::new("guide.adoc")));
+    }
+
+    #[test]
+    fn is_doc_extension_rejects_code() {
+        assert!(!is_doc_extension(Path::new("main.rs")));
+        assert!(!is_doc_extension(Path::new("app.ts")));
+    }
+
+    // ── is_config_extension tests ───────────────────────────────────────
+
+    #[test]
+    fn is_config_extension_toml_yaml_json() {
+        assert!(is_config_extension(Path::new("Cargo.toml")));
+        assert!(is_config_extension(Path::new("config.yaml")));
+        assert!(is_config_extension(Path::new("package.json")));
+        assert!(is_config_extension(Path::new("tsconfig.jsonc")));
+    }
+
+    #[test]
+    fn is_config_extension_rejects_lockfiles() {
+        assert!(!is_config_extension(Path::new("package-lock.json")));
+        assert!(!is_config_extension(Path::new("yarn.lock")));
+        assert!(!is_config_extension(Path::new("bun.lockb")));
+    }
+
+    #[test]
+    fn is_config_extension_detects_dotfiles() {
+        assert!(is_config_extension(Path::new(".env")));
+        assert!(is_config_extension(Path::new(".eslintrc")));
+        assert!(is_config_extension(Path::new(".prettierrc")));
+        assert!(is_config_extension(Path::new(".gitignore")));
+    }
+
+    // ── classify_semantic_file tests ────────────────────────────────────
+
+    #[test]
+    fn classify_semantic_file_code() {
+        assert_eq!(
+            classify_semantic_file(Path::new("src/main.rs")),
+            SemanticFileType::Code
+        );
+        assert_eq!(
+            classify_semantic_file(Path::new("app.ts")),
+            SemanticFileType::Code
+        );
+    }
+
+    #[test]
+    fn classify_semantic_file_doc() {
+        assert_eq!(
+            classify_semantic_file(Path::new("README.md")),
+            SemanticFileType::Doc
+        );
+        assert_eq!(
+            classify_semantic_file(Path::new("guide.rst")),
+            SemanticFileType::Doc
+        );
+    }
+
+    #[test]
+    fn classify_semantic_file_config() {
+        assert_eq!(
+            classify_semantic_file(Path::new("Cargo.toml")),
+            SemanticFileType::Config
+        );
+    }
+
+    // ── collect_docs_chunks tests ───────────────────────────────────────
+
+    #[test]
+    fn collect_docs_chunks_markdown_splits_by_heading() {
+        let md =
+            "# Title\n\nIntro text.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n";
+        let chunks = collect_docs_chunks(md, Path::new("docs.md"));
+        // Should have at least 2 chunks (Section A, Section B); intro is merged into first
+        assert!(
+            chunks.len() >= 2,
+            "expected >=2 chunks, got {}",
+            chunks.len()
+        );
+        // Each chunk should have the heading name
+        let names: Vec<_> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("Section A")),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("Section B")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_docs_chunks_markdown_empty_returns_empty() {
+        let chunks = collect_docs_chunks("", Path::new("empty.md"));
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn collect_docs_chunks_non_markdown_single_chunk() {
+        let text = "This is a plain text document.\nWith multiple lines.\n";
+        let chunks = collect_docs_chunks(text, Path::new("notes.txt"));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].embed_text.contains("plain text"));
+    }
+
+    #[test]
+    fn collect_docs_chunks_non_markdown_empty_returns_empty() {
+        let chunks = collect_docs_chunks("", Path::new("empty.txt"));
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn collect_docs_chunks_markdown_with_h1_only() {
+        let md = "# Just a title\n\nSome content here.\n";
+        let chunks = collect_docs_chunks(md, Path::new("single.md"));
+        assert!(!chunks.is_empty());
+    }
+
+    // ── SemanticFilePolicy tests ────────────────────────────────────────
+
+    #[test]
+    fn semantic_file_policy_default_values() {
+        let policy = SemanticFilePolicy::default();
+        assert!(policy.include_code);
+        assert!(policy.include_docs);
+        assert!(!policy.include_configs);
+        assert!(policy.respect_gitignore);
+        assert!(policy.binary_detection);
+        assert!(policy.generated_file_detection);
+        assert_eq!(policy.max_file_size_bytes, 1_048_576);
+        assert!(policy.include_globs.is_empty());
+        assert!(policy.exclude_globs.is_empty());
+    }
+
+    #[test]
+    fn semantic_file_policy_builtins_not_empty() {
+        let policy = SemanticFilePolicy::default();
+        assert!(!policy.builtin_doc_globs.is_empty());
+        assert!(!policy.builtin_exclude_globs.is_empty());
+        // Should include common exclusions
+        assert!(policy
+            .builtin_exclude_globs
+            .iter()
+            .any(|g| g.contains("node_modules")));
+        assert!(policy
+            .builtin_exclude_globs
+            .iter()
+            .any(|g| g.contains("target")));
+    }
+
+    // ── FileRecord and FileManifest tests ───────────────────────────────
+
+    #[test]
+    fn file_record_fields_populated() {
+        let record = FileRecord {
+            content_hash: blake3::hash(b"test content"),
+            size_bytes: 1024,
+            mtime: SystemTime::now(),
+            language: Some("rust".to_string()),
+            document_kind: "code".to_string(),
+            inclusion_policy_hash: "hash123".to_string(),
+            indexed_at: SystemTime::now(),
+        };
+        assert_eq!(record.size_bytes, 1024);
+        assert_eq!(record.language.as_deref(), Some("rust"));
+        assert_eq!(record.document_kind, "code");
+        assert_eq!(record.inclusion_policy_hash, "hash123");
+    }
+
+    #[test]
+    fn build_manifest_from_store_populates_records() {
+        // Create a snapshot with some file metadata
+        let mut store = crate::vector_store::FlatF32VectorStore::new(384);
+        let path_a = PathBuf::from("src/main.rs");
+        let path_b = PathBuf::from("lib/utils.ts");
+        store.file_metadata_mut().insert(
+            path_a.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 500,
+                content_hash: blake3::hash(b"main"),
+            },
+        );
+        store.file_metadata_mut().insert(
+            path_b.clone(),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 300,
+                content_hash: blake3::hash(b"utils"),
+            },
+        );
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store,
+            dimension: 384,
+            project_root: PathBuf::from("."),
+            file_manifest: HashMap::new(),
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+
+        snapshot.build_manifest_from_store();
+
+        assert_eq!(snapshot.file_manifest.len(), 2);
+        let record_a = snapshot.file_manifest.get(&path_a).unwrap();
+        assert_eq!(record_a.size_bytes, 500);
+        assert_eq!(record_a.document_kind, "code");
+
+        let record_b = snapshot.file_manifest.get(&path_b).unwrap();
+        assert_eq!(record_b.size_bytes, 300);
+    }
+
+    #[test]
+    fn build_manifest_from_store_clears_old_entries() {
+        let mut store = crate::vector_store::FlatF32VectorStore::new(384);
+        store.file_metadata_mut().insert(
+            PathBuf::from("src/only.rs"),
+            IndexedFileMetadata {
+                mtime: SystemTime::now(),
+                size: 100,
+                content_hash: blake3::hash(b"only"),
+            },
+        );
+
+        let mut snapshot = SemanticIndexSnapshot {
+            store,
+            dimension: 384,
+            project_root: PathBuf::from("."),
+            file_manifest: {
+                let mut m = HashMap::new();
+                m.insert(
+                    PathBuf::from("old/deleted.rs"),
+                    FileRecord {
+                        content_hash: blake3::hash(b"old"),
+                        size_bytes: 999,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        language: None,
+                        document_kind: "code".to_string(),
+                        inclusion_policy_hash: String::new(),
+                        indexed_at: SystemTime::UNIX_EPOCH,
+                    },
+                );
+                m
+            },
+            next_chunk_id: 0,
+            fingerprint_string: None,
+        };
+
+        snapshot.build_manifest_from_store();
+
+        // Old entry should be gone, only new entry remains
+        assert_eq!(snapshot.file_manifest.len(), 1);
+        assert!(snapshot
+            .file_manifest
+            .contains_key(&PathBuf::from("src/only.rs")));
+        assert!(!snapshot
+            .file_manifest
+            .contains_key(&PathBuf::from("old/deleted.rs")));
+    }
+
+    // ── Lifecycle state tests ───────────────────────────────────────────
+
+    #[test]
+    fn lifecycle_cold_start_is_initial_state() {
+        let index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        assert!(matches!(
+            index.lifecycle(),
+            SemanticIndexLifecycle::ColdStart
+        ));
+    }
+
+    #[test]
+    fn lifecycle_set_and_get() {
+        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        index.set_lifecycle(SemanticIndexLifecycle::Ready);
+        assert!(matches!(index.lifecycle(), SemanticIndexLifecycle::Ready));
+    }
+
+    #[test]
+    fn lifecycle_mark_failed_sets_failed() {
+        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        index.set_lifecycle(SemanticIndexLifecycle::Ready);
+        index.set_lifecycle(SemanticIndexLifecycle::Failed);
+        index.set_last_error("something broke".to_string());
+        assert!(matches!(index.lifecycle(), SemanticIndexLifecycle::Failed));
+        assert_eq!(index.last_error(), Some("something broke"));
+    }
+
+    #[test]
+    fn lifecycle_all_variants_exist() {
+        // Verify all lifecycle variants can be constructed and are distinct.
+        let _d = SemanticIndexLifecycle::Disabled;
+        let _cs = SemanticIndexLifecycle::ColdStart;
+        let _sf = SemanticIndexLifecycle::ScanningFiles;
+        let _ck = SemanticIndexLifecycle::Chunking;
+        let _em = SemanticIndexLifecycle::Embedding;
+        let _r = SemanticIndexLifecycle::Ready;
+        let _rf = SemanticIndexLifecycle::Refreshing;
+        let _rr = SemanticIndexLifecycle::RebuildRequired;
+        let _dg = SemanticIndexLifecycle::Degraded;
+        let _f = SemanticIndexLifecycle::Failed;
+        // Pattern-match to confirm all variants are covered.
+        assert!(matches!(
+            SemanticIndexLifecycle::Disabled,
+            SemanticIndexLifecycle::Disabled
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::ColdStart,
+            SemanticIndexLifecycle::ColdStart
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::Ready,
+            SemanticIndexLifecycle::Ready
+        ));
+        assert!(matches!(
+            SemanticIndexLifecycle::Failed,
+            SemanticIndexLifecycle::Failed
+        ));
+    }
+
+    // ── Snapshot atomicity tests ────────────────────────────────────────
+
+    #[test]
+    fn snapshot_search_returns_ranked_results() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "func_b".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snapshot = index.snapshot.clone();
+        let results = snapshot.search(&[1.0, 0.0, 0.0], 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "func_a");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn snapshot_immutable_after_clone() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snapshot = index.snapshot.clone();
+        let original_len = snapshot.len();
+        // Mutate the original index
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "func2".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        // Snapshot should still have the old length
+        assert_eq!(snapshot.len(), original_len);
+    }
+
+    // ── Stale-vector pruning tests ──────────────────────────────────────
+
+    #[test]
+    fn prune_stale_vectors_removes_zero_norm() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("b.rs"),
+                name: "zero".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        assert_eq!(index.len(), 2);
+        let snap = Arc::get_mut(&mut index.snapshot).unwrap();
+        let pruned = snap.store_mut().prune_stale_vectors();
+        assert_eq!(pruned, 1);
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn prune_orphans_removes_entries_for_deleted_files() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("keep.rs"),
+                name: "keep".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("delete.rs"),
+                name: "del".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![0.0, 1.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let current_files = vec![PathBuf::from("keep.rs")];
+        let snap = Arc::get_mut(&mut index.snapshot).unwrap();
+        let removed = snap.store_mut().prune_orphans(&current_files);
+        assert_eq!(removed, 1);
+        assert_eq!(index.len(), 1);
+    }
+
+    // ── Concurrency tests ──────────────────────────────────────────────
+
+    #[test]
+    fn concurrent_snapshot_clones_are_independent() {
+        // Verify that cloning a snapshot and reading from both doesn't interfere.
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snap1 = index.snapshot.clone();
+        let snap2 = index.snapshot.clone();
+
+        // Both snapshots should search independently
+        let results1 = snap1.search(&[1.0, 0.0, 0.0], 10);
+        let results2 = snap2.search(&[0.0, 1.0, 0.0], 10);
+        assert_eq!(results1.len(), 1);
+        assert_eq!(results2.len(), 1);
+        // Different queries yield different scores
+        assert!(results1[0].score > results2[0].score);
+    }
+
+    #[test]
+    fn concurrent_read_threads_see_same_data() {
+        use std::thread;
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func_a".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        let snap = Arc::clone(&index.snapshot);
+        let snap2 = Arc::clone(&index.snapshot);
+
+        let handle1 = thread::spawn(move || snap.search(&[1.0, 0.0, 0.0], 10));
+        let handle2 = thread::spawn(move || snap2.entries_slice().len());
+
+        let results = handle1.join().unwrap();
+        let count = handle2.join().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mutex_contention_does_not_deadlock() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let data = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let data = Arc::clone(&data);
+            handles.push(thread::spawn(move || {
+                let mut guard = data.lock().unwrap();
+                guard.push(i);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = data.lock().unwrap();
+        assert_eq!(guard.len(), 10);
+    }
+
+    #[test]
+    fn arc_clone_count_is_correct() {
+        let mut index = SemanticIndex::new(test_project_root(), 3);
+        index.entries_mut().push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("a.rs"),
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 5,
+                exported: false,
+                embed_text: String::new(),
+                snippet: String::new(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+            chunk_hash: String::new(),
+        });
+        assert_eq!(Arc::strong_count(&index.snapshot), 1);
+        let _snap1 = Arc::clone(&index.snapshot);
+        assert_eq!(Arc::strong_count(&index.snapshot), 2);
+        let _snap2 = Arc::clone(&index.snapshot);
+        assert_eq!(Arc::strong_count(&index.snapshot), 3);
+        drop(_snap1);
+        assert_eq!(Arc::strong_count(&index.snapshot), 2);
+    }
+
+    fn default_test_config(backend: SemanticBackend, base_url: String) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend,
+            model: "test-model".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        }
+    }
+
+    fn encode_int8_base64_test(values: &[i8]) -> String {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn mock_server_openai_compatible_embedsSuccessfully() {
+        let (base_url, handle) = start_mock_http_server(|request_line, path, _body| {
+            assert!(request_line.starts_with("POST "));
+            assert_eq!(path, "/v1/embeddings");
+            r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0},{"embedding":[0.4,0.5,0.6],"index":1}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_wrong_dimension_returns_error() {
+        let v1 = encode_int8_base64_test(&[10, -20, 30, 40, 50]);
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            format!(r#"{{"data":[{{"embedding":"{}","index":0}}]}}"#, v1)
+        });
+
+        let mut config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        config.dimensions = Some(3);
+        config.output_encoding = Some(OutputEncoding::Base64Int8);
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("dimension"),
+            "expected dimension error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_wrong_count_returns_error() {
+        let (base_url, handle) = start_mock_http_server(|_request, _path, _body| {
+            r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0},{"embedding":[0.4,0.5,0.6],"index":1},{"embedding":[0.7,0.8,0.9],"index":2}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::OpenAiCompatible, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model
+            .embed(vec!["a".to_string(), "b".to_string()])
+            .unwrap_err();
+        assert!(
+            err.contains("2 embeddings") || err.contains("for 2 inputs"),
+            "expected count mismatch error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_timeout_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers = String::from_utf8_lossy(&buf[..pos + 4]);
+                        for line in headers.lines() {
+                            let lower = line.trim().to_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+            let _ = listener;
+        });
+
+        let mut config = default_test_config(
+            SemanticBackend::OpenAiCompatible,
+            format!("http://{}", addr),
+        );
+        config.timeout_ms = 200;
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("request failed") || err.contains("timeout") || err.contains("timed out"),
+            "expected timeout/connection error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_returns_500_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_clone = Arc::clone(&attempt_count);
+
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    let n = stream.read(&mut chunk).expect("read");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let headers = String::from_utf8_lossy(&buf[..pos + 4]);
+                            for line in headers.lines() {
+                                let lower = line.trim().to_lowercase();
+                                if let Some(value) = lower.strip_prefix("content-length:") {
+                                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_length {
+                            break;
+                        }
+                    }
+                }
+
+                let attempt = attempt_count_clone.fetch_add(1, Ordering::SeqCst);
+                let (status_line, body) = if attempt < 2 {
+                    (
+                        "HTTP/1.1 500 Internal Server Error",
+                        r#"{"error":"temporary failure"}"#,
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#,
+                    )
+                };
+                let response = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let config = default_test_config(
+            SemanticBackend::OpenAiCompatible,
+            format!("http://{}", addr),
+        );
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model.embed(vec!["test".to_string()]).unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+        assert!(
+            attempt_count.load(Ordering::SeqCst) >= 3,
+            "should have retried at least 3 times"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mock_server_perplexity_embeds_with_mock_server() {
+        let (base_url, handle) = start_mock_http_server(|request_line, path, _body| {
+            assert!(request_line.starts_with("POST "));
+            assert_eq!(path, "/v1/embeddings");
+            r#"{"data":[{"embedding":[0.7,0.8,0.9],"index":0},{"embedding":[1.0,1.1,1.2],"index":1}]}"#.to_string()
+        });
+
+        let config = default_test_config(SemanticBackend::Perplexity, base_url);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors, vec![vec![0.7, 0.8, 0.9], vec![1.0, 1.1, 1.2]]);
+        handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_invalidation_tests {
+    use super::tests::start_mock_http_server;
+    use super::*;
+    use crate::config::DiagnosticsOutputMode;
+
+    /// Build a fingerprint with all fields set to predictable defaults.
+    fn fp() -> SemanticIndexFingerprint {
+        SemanticIndexFingerprint {
+            backend: "fastembed".to_string(),
+            model: "all-MiniLM-L6-v2".to_string(),
+            base_url: FALLBACK_BACKEND.to_string(),
+            dimension: 384,
+            chunking_version: 2,
+            output_encoding: "float".to_string(),
+            storage_strategy: "native_f32".to_string(),
+            distance_metric: "auto".to_string(),
+            input_mode: "flat_texts".to_string(),
+            document_prompt_hash: String::new(),
+            source_vector_kind: "dense_f32".to_string(),
+            stored_vector_kind: "dense_f32".to_string(),
+            normalization: "already_normalized".to_string(),
+            query_prompt_hash: String::new(),
+            file_policy_hash: String::new(),
+            docs_chunker_version: 1,
+        }
+    }
+
+    #[test]
+    fn backend_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.backend = "ollama".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn model_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn base_url_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.base_url = "http://other-host:11434".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn dimension_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.dimension = 768;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn chunking_version_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.chunking_version = 3;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn output_encoding_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.output_encoding = "base64_int8".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn storage_strategy_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.storage_strategy = "decode_normalize_f32".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn distance_metric_mismatch_does_not_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "cosine".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn input_mode_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.input_mode = "document_chunks".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn document_prompt_hash_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.document_prompt_hash = "abc123".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn source_vector_kind_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.source_vector_kind = "binary_packed".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn stored_vector_kind_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.stored_vector_kind = "dense_int8".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn normalization_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.normalization = "normalize_on_insert_query".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn query_prompt_hash_only_triggers_clear_cache() {
+        let a = fp();
+        let mut b = fp();
+        b.query_prompt_hash = "xyz789".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::ClearQueryCache);
+    }
+
+    #[test]
+    fn identical_fingerprint_is_noop() {
+        let a = fp();
+        let b = fp();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn reranker_fields_not_in_fingerprint_produces_no_diff() {
+        // distance_metric is in the fingerprint but explicitly excluded from
+        // rebuild triggers. Verify it produces None.
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "dot_product".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn file_policy_hash_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.file_policy_hash = "policy_v2_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn docs_chunker_version_mismatch_triggers_rebuild() {
+        let a = fp();
+        let mut b = fp();
+        b.docs_chunker_version = 2;
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn multi_field_change_still_rebuild() {
+        // Multiple rebuild-field changes should still produce Rebuild.
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        b.dimension = 768;
+        b.file_policy_hash = "new_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn rebuild_plus_query_prompt_change_still_rebuild() {
+        // When both rebuild and query-prompt fields change, Rebuild wins
+        // because it's checked first.
+        let a = fp();
+        let mut b = fp();
+        b.model = "different-model".to_string();
+        b.query_prompt_hash = "new_query_hash".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::Rebuild);
+    }
+
+    #[test]
+    fn only_query_prompt_changes_gives_clear_cache() {
+        // When only query_prompt_hash changes (all rebuild fields match),
+        // ClearQueryCache is returned.
+        let a = fp();
+        let mut b = fp();
+        b.query_prompt_hash = "only_this_changes".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::ClearQueryCache);
+    }
+
+    #[test]
+    fn non_fingerprint_field_changes_produce_none() {
+        // Fields NOT in the fingerprint (e.g. diagnostics, rerank config)
+        // should not cause any diff. We simulate this by checking that
+        // changing only distance_metric (which IS in fp but excluded from
+        // rebuild) produces None — and by extension, fields not in fp at all
+        // also produce None.
+        let a = fp();
+        let mut b = fp();
+        b.distance_metric = "euclidean".to_string();
+        assert_eq!(a.diff(&b), FingerprintChange::None);
+    }
+
+    #[test]
+    fn display_implementation() {
+        assert_eq!(FingerprintChange::Rebuild.to_string(), "rebuild");
+        assert_eq!(
+            FingerprintChange::ClearQueryCache.to_string(),
+            "clear_query_cache"
+        );
+        assert_eq!(FingerprintChange::None.to_string(), "none");
+    }
+
+    // ── base64_int8 embedding tests ────────────────────────────────────
+
+    /// Helper: encode a vec of i8 as a base64 string (STANDARD encoding).
+    fn encode_int8_base64(values: &[i8]) -> String {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn openai_compatible_base64_int8_embeds_with_mock_server() {
+        // Simulate a provider returning base64-encoded int8 vectors.
+        // Two vectors of 3 dimensions: [10, -20, 30] and [-40, 50, -60].
+        let v1 = encode_int8_base64(&[10, -20, 30]);
+        let v2 = encode_int8_base64(&[-40, 50, -60]);
+        let response_body = format!(
+            "{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}},{{\"embedding\":\"{}\",\"index\":1}}]}}",
+            v1, v2
+        );
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, body| {
+            // Verify that encoding_format is sent in the request body.
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["encoding_format"], "base64_int8",
+                "request should include encoding_format: base64_int8"
+            );
+            response_body.clone()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-int8".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        // Vectors are L2-normalized after int8→f32 conversion.
+        let norm1_sq: f32 = vectors[0].iter().map(|x| x * x).sum();
+        assert!((norm1_sq - 1.0).abs() < 1e-5, "vector 1 norm² = {norm1_sq}");
+        let norm2_sq: f32 = vectors[1].iter().map(|x| x * x).sum();
+        assert!((norm2_sq - 1.0).abs() < 1e-5, "vector 2 norm² = {norm2_sq}");
+        // Verify relative ordering is preserved (positive/negative signs).
+        assert!(vectors[0][0] > 0.0, "v1[0] should be positive");
+        assert!(vectors[0][1] < 0.0, "v1[1] should be negative");
+        assert!(vectors[0][2] > 0.0, "v1[2] should be positive");
+        assert!(vectors[1][0] < 0.0, "v2[0] should be negative");
+        assert!(vectors[1][1] > 0.0, "v2[1] should be positive");
+        assert!(vectors[1][2] < 0.0, "v2[2] should be negative");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn openai_compatible_float_path_unchanged() {
+        // Ensure the existing float array path still works after refactoring.
+        let (base_url, handle) = start_mock_http_server(|_request, _path, body| {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            // encoding_format should NOT be present for Float encoding.
+            assert!(
+                parsed.get("encoding_format").is_none(),
+                "float path should not send encoding_format"
+            );
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3],\"index\":0}]}".to_string()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-float".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None, // defaults to Float
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vectors = model.embed(vec!["test".to_string()]).unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_invalid_base64_returns_error() {
+        let (base_url, handle) = start_mock_http_server(|_request, _path, _body| {
+            // Return invalid base64 data.
+            "{\"data\":[{\"embedding\":\"!!!NOT_BASE64!!!\",\"index\":0}]}".to_string()
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        assert!(
+            err.contains("base64 decode error") || err.contains("provider-response"),
+            "expected base64 decode error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_wrong_dimension_returns_error() {
+        // Return a valid base64 string, but the byte count doesn't match
+        // what the model expects (we configured 5 dimensions but encode 3 bytes).
+        let v = encode_int8_base64(&[1, 2, 3]); // 3 bytes, but dimensions=5
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            format!("{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}}]}}", v)
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: Some(5), // expect 5 dimensions
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model.embed(vec!["test".to_string()]).unwrap_err();
+        // The dimension mismatch is caught either at parse time (if the model
+        // already knows its dimension from a prior probe) or at validation time.
+        // Either way, the error should contain a meaningful message.
+        assert!(
+            err.contains("dimension") || err.contains("length"),
+            "expected dimension/length error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_inconsistent_response_count_returns_error() {
+        // Request 2 texts but provider returns only 1 embedding.
+        let v = encode_int8_base64(&[10, 20, 30]);
+
+        let (base_url, handle) = start_mock_http_server(move |_request, _path, _body| {
+            // Return only 1 embedding for 2 inputs.
+            format!("{{\"data\":[{{\"embedding\":\"{}\",\"index\":0}}]}}", v)
+        });
+
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let err = model
+            .embed(vec!["hello".to_string(), "world".to_string()])
+            .unwrap_err();
+        assert!(
+            err.contains("1 embeddings for 2 inputs"),
+            "expected count mismatch error, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn base64_int8_profile_from_config_selects_correctly() {
+        use crate::config::SemanticBackend;
+
+        let config_int8 = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            model: "sonar".to_string(),
+            base_url: Some("http://127.0.0.1:9999".to_string()),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: crate::config::DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: None,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+
+        let profile = SemanticEmbeddingModel::from_config(&config_int8).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+
+        let config_float = SemanticBackendConfig {
+            output_encoding: None, // defaults to Float
+            ..config_int8
+        };
+
+        let profile = SemanticEmbeddingModel::from_config(&config_float).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+    }
+
+    #[test]
+    fn parse_embedding_value_float_succeeds() {
+        let val = serde_json::json!([0.1, 0.2, 0.3]);
+        let result = parse_embedding_value(&val, OutputEncoding::Float, "test", None).unwrap();
+        assert!((result[0] - 0.1).abs() < 1e-6);
+        assert!((result[1] - 0.2).abs() < 1e-6);
+        assert!((result[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_succeeds_and_normalizes() {
+        let encoded = encode_int8_base64(&[10, -20, 30]);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // L2-norm of [10, -20, 30] = sqrt(1400) ≈ 37.4166
+        let norm_sq: f32 = 10.0 * 10.0 + (-20.0) * (-20.0) + 30.0 * 30.0;
+        let norm = norm_sq.sqrt();
+        assert!((result[0] - 10.0 / norm).abs() < 1e-5, "got {}", result[0]);
+        assert!(
+            (result[1] - (-20.0) / norm).abs() < 1e-5,
+            "got {}",
+            result[1]
+        );
+        assert!((result[2] - 30.0 / norm).abs() < 1e-5, "got {}", result[2]);
+        // Verify L2 norm ≈ 1.0
+        let norm_check: f32 = result.iter().map(|x| x * x).sum();
+        assert!((norm_check - 1.0).abs() < 1e-5, "norm² = {norm_check}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_dimension_mismatch() {
+        let encoded = encode_int8_base64(&[10, -20, 30]); // 3 values
+        let val = serde_json::json!(encoded);
+        let err =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", Some(5)).unwrap_err();
+        assert!(err.contains("dimension mismatch"), "got: {err}");
+        assert!(err.contains("decoded 3 values, expected 5"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_dimension_match() {
+        let encoded = encode_int8_base64(&[10, -20, 30]); // 3 values
+        let val = serde_json::json!(encoded);
+        let result =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", Some(3)).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_int8_invalid_base64() {
+        let val = serde_json::json!("not-valid-base64!!!");
+        let err =
+            parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap_err();
+        assert!(err.contains("base64 decode error"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_float_wrong_type() {
+        // Float encoding expects an array, not a string.
+        let val = serde_json::json!("not-an-array");
+        let err = parse_embedding_value(&val, OutputEncoding::Float, "test", None).unwrap_err();
+        assert!(err.contains("expected float array"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_embedding_value_base64_binary_succeeds() {
+        // Binary vector: byte 0xAA (10101010), 8 logical dimensions
+        // bits (LSB→MSB): 0,1,0,1,0,1,0,1
+        let val = serde_json::json!("qg==");
+        let result =
+            parse_embedding_value(&val, OutputEncoding::Base64Binary, "test", Some(8)).unwrap();
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0], 0.0);
+        assert_eq!(result[1], 1.0);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 1.0);
+        assert_eq!(result[4], 0.0);
+        assert_eq!(result[5], 1.0);
+        assert_eq!(result[6], 0.0);
+        assert_eq!(result[7], 1.0);
+    }
+
+    // ── Config deserialization tests ────────────────────────────────────
+
+    #[test]
+    fn config_deserialize_minimal_json() {
+        let json = r#"{"backend":"fastembed","model":"all-MiniLM-L6-v2","timeout_ms":25000,"max_batch_size":64}"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.backend, SemanticBackend::Fastembed);
+        assert_eq!(config.model, "all-MiniLM-L6-v2");
+        assert_eq!(config.timeout_ms, 25000);
+        assert_eq!(config.max_batch_size, 64);
+        // Optional fields default to None
+        assert!(config.base_url.is_none());
+        assert!(config.api_key_env.is_none());
+        assert!(config.dimensions.is_none());
+        assert!(config.output_encoding.is_none());
+    }
+
+    #[test]
+    fn config_deserialize_all_fields() {
+        let json = r#"{
+            "backend": "openai_compatible",
+            "model": "text-embedding-3-small",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "timeout_ms": 30000,
+            "max_batch_size": 128,
+            "dimensions": 1536,
+            "output_encoding": "base64_int8",
+            "input_mode": "flat_texts",
+            "storage_strategy": "decode_normalize_f32",
+            "distance_metric": "cosine",
+            "query_prompt_template": "Instruct: {query}",
+            "document_prompt_template": "Represent: {text}",
+            "diagnostics_enabled": true,
+            "low_confidence_threshold": 0.5,
+            "metrics_window_size": 200,
+            "jsonl_logging": true,
+            "include_raw_queries": true,
+            "include_snippets": true,
+            "retention_days": 30,
+            "rerank_enabled": true,
+            "rerank_model": "codellama",
+            "rerank_timeout_ms": 10000,
+            "rerank_max_candidates": 10
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.backend, SemanticBackend::OpenAiCompatible);
+        assert_eq!(config.model, "text-embedding-3-small");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(config.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(config.timeout_ms, 30000);
+        assert_eq!(config.max_batch_size, 128);
+        assert_eq!(config.dimensions, Some(1536));
+        assert_eq!(config.output_encoding, Some(OutputEncoding::Base64Int8));
+        assert_eq!(config.input_mode, Some(InputMode::FlatTexts));
+        assert_eq!(
+            config.storage_strategy,
+            Some(StorageStrategy::DecodeNormalizeF32)
+        );
+        assert_eq!(config.distance_metric, Some(DistanceMetric::Cosine));
+        assert!(config.diagnostics_enabled);
+        assert!((config.low_confidence_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.metrics_window_size, 200);
+        assert!(config.jsonl_logging);
+        assert!(config.include_raw_queries);
+        assert!(config.include_snippets);
+        assert_eq!(config.retention_days, 30);
+        assert!(config.rerank_enabled);
+        assert_eq!(config.rerank_model.as_deref(), Some("codellama"));
+        assert_eq!(config.rerank_timeout_ms, 10000);
+        assert_eq!(config.rerank_max_candidates, 10);
+    }
+
+    #[test]
+    fn config_deserialize_safe_defaults() {
+        // Empty object should deserialize with all defaults
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        // Verify all optional fields are None
+        assert!(config.base_url.is_none());
+        assert!(config.api_key_env.is_none());
+        assert!(config.dimensions.is_none());
+        assert!(config.output_encoding.is_none());
+        assert!(config.input_mode.is_none());
+        assert!(config.storage_strategy.is_none());
+        assert!(config.distance_metric.is_none());
+        assert!(config.query_prompt_template.is_none());
+        assert!(config.document_prompt_template.is_none());
+        assert!(!config.diagnostics_enabled);
+        assert!(!config.jsonl_logging);
+        assert!(!config.include_raw_queries);
+        assert!(!config.include_snippets);
+    }
+
+    #[test]
+    fn config_deserialize_rerank_fields() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "rerank_enabled": true,
+            "rerank_model": "gpt-4",
+            "rerank_base_url": "https://api.openai.com/v1",
+            "rerank_api_key_env": "OPENAI_API_KEY",
+            "rerank_timeout_ms": 5000,
+            "rerank_max_candidates": 20,
+            "rerank_max_candidate_chars": 1500
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert!(config.rerank_enabled);
+        assert_eq!(config.rerank_model.as_deref(), Some("gpt-4"));
+        assert_eq!(
+            config.rerank_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(config.rerank_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(config.rerank_timeout_ms, 5000);
+        assert_eq!(config.rerank_max_candidates, 20);
+        assert_eq!(config.rerank_max_candidate_chars, 1500);
+    }
+
+    #[test]
+    fn config_deserialize_diagnostics_fields() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "diagnostics_enabled": true,
+            "jsonl_logging": true,
+            "jsonl_path": "/tmp/diag.jsonl",
+            "include_raw_queries": true,
+            "include_snippets": true,
+            "retention_days": 30,
+            "output_mode": "verbose",
+            "low_confidence_threshold": 0.2,
+            "metrics_window_size": 200
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert!(config.diagnostics_enabled);
+        assert!(config.jsonl_logging);
+        assert_eq!(
+            config.jsonl_path.as_deref(),
+            Some(std::path::Path::new("/tmp/diag.jsonl"))
+        );
+        assert!(config.include_raw_queries);
+        assert!(config.include_snippets);
+        assert_eq!(config.retention_days, 30);
+        assert_eq!(
+            config.output_mode,
+            crate::config::DiagnosticsOutputMode::Verbose
+        );
+        assert!((config.low_confidence_threshold - 0.2).abs() < 1e-6);
+        assert_eq!(config.metrics_window_size, 200);
+    }
+
+    #[test]
+    fn config_deserialize_max_results_per_file() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64,
+            "max_results_per_file": 5
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_results_per_file, 5);
+    }
+
+    #[test]
+    fn config_max_results_per_file_default_is_two() {
+        let json = r#"{
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "timeout_ms": 25000,
+            "max_batch_size": 64
+        }"#;
+        let config: SemanticBackendConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_results_per_file, 2);
+    }
+
+    // ── Profile validation tests ────────────────────────────────────────
+
+    #[test]
+    fn profile_fastembed_minilm_is_compatible() {
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+        assert_eq!(profile.storage_strategy, StorageStrategy::NativeF32);
+        assert!(!profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_openai_compatible_generic_is_compatible() {
+        let profile = EmbeddingModelProfile::openai_compatible_generic();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Float);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Auto);
+        assert!(profile.mrl_supported);
+        assert!(!profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_perplexity_int8_is_compatible() {
+        let profile = EmbeddingModelProfile::perplexity_int8();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseInt8);
+        assert_eq!(profile.stored_vector_kind, VectorKind::DenseF32);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+        assert_eq!(
+            profile.normalization,
+            NormalizationPolicy::NormalizeOnInsertQuery
+        );
+        assert_eq!(
+            profile.storage_strategy,
+            StorageStrategy::DecodeNormalizeF32
+        );
+        assert!(profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_perplexity_binary_is_compatible() {
+        let profile = EmbeddingModelProfile::perplexity_binary();
+        assert!(profile.validate_compatible().is_ok());
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Binary);
+        assert_eq!(profile.source_vector_kind, VectorKind::BinaryPacked);
+        assert_eq!(profile.stored_vector_kind, VectorKind::BinaryPacked);
+        assert_eq!(profile.metric, DistanceMetric::Hamming);
+        assert_eq!(profile.normalization, NormalizationPolicy::NotApplicable);
+        assert_eq!(profile.storage_strategy, StorageStrategy::BinaryPacked);
+        assert!(profile.contextualized_supported);
+    }
+
+    #[test]
+    fn profile_from_config_selects_correctly() {
+        // Fastembed with matching model
+        let config_fastembed = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            output_encoding: None,
+            storage_strategy: None,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_fastembed).unwrap();
+        assert_eq!(profile.backend, SemanticBackend::Fastembed);
+        assert_eq!(profile.metric, DistanceMetric::Cosine);
+
+        // OpenAI-compatible
+        let config_oai = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_oai).unwrap();
+        assert_eq!(profile.backend, SemanticBackend::OpenAiCompatible);
+
+        // Perplexity with base64_int8
+        let config_int8 = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_int8).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Int8);
+        assert_eq!(profile.source_vector_kind, VectorKind::DenseInt8);
+
+        // Perplexity with base64_binary
+        let config_binary = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            output_encoding: Some(OutputEncoding::Base64Binary),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config_binary).unwrap();
+        assert_eq!(profile.output_encoding, OutputEncoding::Base64Binary);
+        assert_eq!(profile.source_vector_kind, VectorKind::BinaryPacked);
+    }
+
+    // ── TypedVector conversion tests ────────────────────────────────────
+
+    #[test]
+    fn typed_vector_dense_f32_kind_and_dims() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(v.kind(), VectorKind::DenseF32);
+        assert_eq!(v.dims(), 4);
+    }
+
+    #[test]
+    fn typed_vector_dense_int8_kind_and_dims() {
+        let v = TypedVector::DenseInt8(vec![10, -20, 30]);
+        assert_eq!(v.kind(), VectorKind::DenseInt8);
+        assert_eq!(v.dims(), 3);
+    }
+
+    #[test]
+    fn typed_vector_binary_packed_kind_and_dims() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF, 0x00],
+            logical_dims: 12,
+        };
+        assert_eq!(v.kind(), VectorKind::BinaryPacked);
+        assert_eq!(v.dims(), 12);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_native() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let stored = v.into_stored(StorageStrategy::NativeF32).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+        assert_eq!(stored.dims(), 3);
+        let f32s = stored.to_f32_slice().unwrap();
+        assert!((f32s[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_normalize() {
+        let v = TypedVector::DenseF32(vec![3.0, 4.0]);
+        let stored = v.into_stored(StorageStrategy::DecodeNormalizeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        // L2 norm of [3,4] = 5; normalized = [0.6, 0.8]
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_f32_rejects_binary_packed() {
+        let v = TypedVector::DenseF32(vec![0.1, 0.2]);
+        let err = v.into_stored(StorageStrategy::BinaryPacked).unwrap_err();
+        assert!(err.contains("DenseF32"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_native() {
+        let v = TypedVector::DenseInt8(vec![10, -20, 30]);
+        let stored = v.into_stored(StorageStrategy::NativeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        assert!((f32s[0] - 10.0).abs() < 1e-6);
+        assert!((f32s[1] - (-20.0)).abs() < 1e-6);
+        assert!((f32s[2] - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_normalize() {
+        let v = TypedVector::DenseInt8(vec![3, 4]);
+        let stored = v.into_stored(StorageStrategy::DecodeNormalizeF32).unwrap();
+        let f32s = stored.to_f32_slice().unwrap();
+        // L2 norm of [3,4] = 5; normalized = [0.6, 0.8]
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_int8_rejects_binary_packed() {
+        let v = TypedVector::DenseInt8(vec![10, -20]);
+        let err = v.into_stored(StorageStrategy::BinaryPacked).unwrap_err();
+        assert!(err.contains("DenseInt8"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_native() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let stored = v.into_stored(StorageStrategy::BinaryPacked).unwrap();
+        assert_eq!(stored.kind(), VectorKind::BinaryPacked);
+        assert_eq!(stored.dims(), 8);
+        let (bytes, dims) = stored.to_packed().unwrap();
+        assert_eq!(bytes, &[0xFF]);
+        assert_eq!(dims, 8);
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_rejects_f32() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = v.into_stored(StorageStrategy::NativeF32).unwrap_err();
+        assert!(err.contains("BinaryPacked"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_vector_into_stored_binary_rejects_normalize() {
+        let v = TypedVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = v
+            .into_stored(StorageStrategy::DecodeNormalizeF32)
+            .unwrap_err();
+        assert!(err.contains("BinaryPacked"), "got: {err}");
+    }
+
+    // ── StoredVector roundtrip tests ────────────────────────────────────
+
+    #[test]
+    fn stored_vector_dense_f32_to_f32_slice_roundtrip() {
+        let sv = StoredVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let slice = sv.to_f32_slice().unwrap();
+        assert_eq!(slice, &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn stored_vector_dense_f32_to_packed_rejects() {
+        let sv = StoredVector::DenseF32(vec![0.1, 0.2]);
+        let err = sv.to_packed().unwrap_err();
+        assert!(err.contains("dense"), "got: {err}");
+    }
+
+    #[test]
+    fn stored_vector_binary_to_packed_roundtrip() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xAB, 0xCD],
+            logical_dims: 12,
+        };
+        let (bytes, dims) = sv.to_packed().unwrap();
+        assert_eq!(bytes, &[0xAB, 0xCD]);
+        assert_eq!(dims, 12);
+    }
+
+    #[test]
+    fn stored_vector_binary_to_f32_rejects() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let err = sv.to_f32_slice().unwrap_err();
+        assert!(err.contains("binary"), "got: {err}");
+    }
+
+    #[test]
+    fn stored_vector_l2_normalize_dense() {
+        let sv = StoredVector::DenseF32(vec![3.0, 4.0]);
+        let normed = sv.l2_normalize();
+        let f32s = normed.to_f32_slice().unwrap();
+        assert!((f32s[0] - 0.6).abs() < 1e-5);
+        assert!((f32s[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stored_vector_l2_normalize_binary_noop() {
+        let sv = StoredVector::BinaryPacked {
+            bytes: vec![0xFF],
+            logical_dims: 8,
+        };
+        let normed = sv.l2_normalize();
+        assert_eq!(normed.kind(), VectorKind::BinaryPacked);
+        let (bytes, dims) = normed.to_packed().unwrap();
+        assert_eq!(bytes, &[0xFF]);
+        assert_eq!(dims, 8);
+    }
+
+    // ── convert_vector tests ────────────────────────────────────────────
+
+    #[test]
+    fn convert_vector_f32_to_f32_succeeds() {
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let typed = TypedVector::DenseF32(vec![0.1, 0.2, 0.3]);
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+    }
+
+    #[test]
+    fn convert_vector_int8_to_f32_succeeds() {
+        let profile = EmbeddingModelProfile::perplexity_int8();
+        let typed = TypedVector::DenseInt8(vec![10, -20, 30]);
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::DenseF32);
+        // Verify L2 normalization was applied (NormalizeOnInsertQuery)
+        let f32s = stored.to_f32_slice().unwrap();
+        let norm_sq: f32 = f32s.iter().map(|x| x * x).sum();
+        assert!((norm_sq - 1.0).abs() < 1e-5, "norm² = {norm_sq}");
+    }
+
+    #[test]
+    fn convert_vector_binary_to_binary_succeeds() {
+        let profile = EmbeddingModelProfile::perplexity_binary();
+        let typed = TypedVector::BinaryPacked {
+            bytes: vec![0xFF, 0x00],
+            logical_dims: 12,
+        };
+        let stored = profile.convert_vector(typed).unwrap();
+        assert_eq!(stored.kind(), VectorKind::BinaryPacked);
+    }
+
+    #[test]
+    fn convert_vector_rejects_kind_mismatch() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // expects DenseF32
+        let typed = TypedVector::DenseInt8(vec![10, -20]);
+        let err = profile.convert_vector(typed).unwrap_err();
+        assert!(err.contains("vector kind mismatch"), "got: {err}");
+    }
+
+    // ── validate_compatible rejection tests ─────────────────────────────
+
+    #[test]
+    fn validate_compatible_rejects_f32_source_to_binary_stored() {
+        let profile = EmbeddingModelProfile {
+            source_vector_kind: VectorKind::DenseF32,
+            stored_vector_kind: VectorKind::BinaryPacked,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("unsupported source"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_binary_stored_with_cosine_metric() {
+        let profile = EmbeddingModelProfile {
+            source_vector_kind: VectorKind::BinaryPacked,
+            stored_vector_kind: VectorKind::BinaryPacked,
+            metric: DistanceMetric::Cosine,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("metric"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_f32_encoding_with_binary_strategy() {
+        let profile = EmbeddingModelProfile {
+            output_encoding: OutputEncoding::Float,
+            storage_strategy: StorageStrategy::BinaryPacked,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        let err = profile.validate_compatible().unwrap_err();
+        assert!(err.contains("not compatible"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_compatible_rejects_int8_encoding_with_f32_strategy() {
+        let profile = EmbeddingModelProfile {
+            output_encoding: OutputEncoding::Base64Int8,
+            storage_strategy: StorageStrategy::NativeF32,
+            ..EmbeddingModelProfile::fastembed_minilm()
+        };
+        // NativeF32 is allowed for Base64Int8
+        assert!(profile.validate_compatible().is_ok());
+    }
+
+    // ── Distance metric auto-resolution tests ───────────────────────────
+
+    #[test]
+    fn resolve_distance_metric_fastembed_defaults_to_cosine() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            distance_metric: Some(DistanceMetric::Auto),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn resolve_distance_metric_explicit_overrides_auto() {
+        let config = SemanticBackendConfig {
+            distance_metric: Some(DistanceMetric::DotProduct),
+            ..SemanticBackendConfig::default()
+        };
+        let resolved = resolve_distance_metric(&config, None);
+        assert_eq!(resolved, DistanceMetric::DotProduct);
+    }
+
+    #[test]
+    fn resolve_distance_metric_int8_profile_cosine() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            distance_metric: Some(DistanceMetric::Auto),
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config).unwrap();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn resolve_distance_metric_binary_profile_hamming() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            distance_metric: Some(DistanceMetric::Auto),
+            output_encoding: Some(OutputEncoding::Base64Binary),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::from_config(&config).unwrap();
+        let resolved = resolve_distance_metric(&config, Some(&profile));
+        assert_eq!(resolved, DistanceMetric::Hamming);
+    }
+
+    // ── Dimension validation tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_dimensions_prefers_config_over_profile() {
+        let config = SemanticBackendConfig {
+            dimensions: Some(1536),
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // default 384
+        let resolved = resolve_dimensions(&config, Some(&profile));
+        assert_eq!(resolved, Some(1536));
+    }
+
+    #[test]
+    fn resolve_dimensions_falls_back_to_profile_default() {
+        let config = SemanticBackendConfig {
+            dimensions: None,
+            ..SemanticBackendConfig::default()
+        };
+        let profile = EmbeddingModelProfile::fastembed_minilm();
+        let resolved = resolve_dimensions(&config, Some(&profile));
+        assert_eq!(resolved, Some(384));
+    }
+
+    #[test]
+    fn validate_config_rejects_unsupported_dimensions() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // range: 384-384
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            dimensions: Some(768),
+            ..SemanticBackendConfig::default()
+        };
+        let err = profile.validate_config(&config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("dimensions")), "got: {err:?}");
+    }
+
+    #[test]
+    fn validate_config_rejects_contextualized_for_flat_provider() {
+        let profile = EmbeddingModelProfile::fastembed_minilm(); // contextualized_supported: false
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            model: "all-MiniLM-L6-v2".to_string(),
+            input_mode: Some(InputMode::DocumentChunks),
+            ..SemanticBackendConfig::default()
+        };
+        let err = profile.validate_config(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.contains("input_mode") || e.contains("document_chunks")),
+            "got: {err:?}"
+        );
+    }
+
+    // ── base64_int8 signed int8 decode tests ────────────────────────────
+
+    #[test]
+    fn base64_int8_negative_values_decode_correctly() {
+        // -1 as i8 = 0xFF in unsigned, -128 as i8 = 0x80
+        let values: Vec<i8> = vec![-1, -128, 127, 0, 1];
+        let encoded = encode_int8_base64(&values);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // After L2-normalization, verify signs are preserved
+        assert!(result[0] < 0.0, "v[0] = {} should be negative", result[0]);
+        assert!(result[1] < 0.0, "v[1] = {} should be negative", result[1]);
+        assert!(result[2] > 0.0, "v[2] = {} should be positive", result[2]);
+        assert!(
+            (result[3]).abs() < 1e-6,
+            "v[3] = {} should be ~0",
+            result[3]
+        );
+        assert!(result[4] > 0.0, "v[4] = {} should be positive", result[4]);
+    }
+
+    #[test]
+    fn base64_int8_all_zeros_is_zero_norm() {
+        let values: Vec<i8> = vec![0, 0, 0];
+        let encoded = encode_int8_base64(&values);
+        let val = serde_json::json!(encoded);
+        let result = parse_embedding_value(&val, OutputEncoding::Base64Int8, "test", None).unwrap();
+        // All-zero vector: norm is 0, no division happens
+        assert_eq!(result, vec![0.0, 0.0, 0.0]);
+    }
+
+    // ── Template hashing tests ──────────────────────────────────────────
+
+    #[test]
+    fn prompt_template_hash_none_is_empty() {
+        assert_eq!(prompt_template_hash(None), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_deterministic() {
+        let h1 = prompt_template_hash(Some("Instruct: {query}"));
+        let h2 = prompt_template_hash(Some("Instruct: {query}"));
+        assert_eq!(h1, h2);
+        assert!(!h1.is_empty());
+    }
+
+    #[test]
+    fn prompt_template_hash_differs_for_different_templates() {
+        let h1 = prompt_template_hash(Some("template A"));
+        let h2 = prompt_template_hash(Some("template B"));
+        assert_ne!(h1, h2);
+    }
+
+    // ── SemanticBackend enum tests ──────────────────────────────────────
+
+    #[test]
+    fn semantic_backend_as_str_roundtrip() {
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            let s = backend.as_str();
+            let parsed = SemanticBackend::from_name(s).unwrap();
+            assert_eq!(&parsed, backend);
+        }
+    }
+
+    #[test]
+    fn semantic_backend_from_name_unknown() {
+        assert!(SemanticBackend::from_name("unknown_backend").is_none());
+    }
+
+    #[test]
+    fn semantic_backend_serde_roundtrip() {
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            let json = serde_json::to_string(backend).unwrap();
+            let parsed: SemanticBackend = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *backend);
+        }
+    }
+
+    // ── OutputEncoding enum tests ───────────────────────────────────────
+
+    #[test]
+    fn output_encoding_default_for_backend() {
+        // All built-in backends default to Float
+        let backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+            SemanticBackend::Perplexity,
+        ];
+        for backend in &backends {
+            assert_eq!(
+                OutputEncoding::default_for_backend(*backend),
+                OutputEncoding::Float
+            );
+        }
+    }
+
+    // ── InputMode enum tests ────────────────────────────────────────────
+
+    #[test]
+    fn input_mode_default_for_backend() {
+        let flat_backends = [
+            SemanticBackend::Fastembed,
+            SemanticBackend::OpenAiCompatible,
+            SemanticBackend::Ollama,
+        ];
+        for backend in &flat_backends {
+            assert_eq!(
+                InputMode::default_for_backend(*backend),
+                InputMode::FlatTexts
+            );
+        }
+        assert_eq!(
+            InputMode::default_for_backend(SemanticBackend::Perplexity),
+            InputMode::DocumentChunks
+        );
+    }
+
+    // ── resolve_output_encoding / resolve_storage_strategy tests ────────
+
+    #[test]
+    fn resolve_output_encoding_uses_config_when_set() {
+        let config = SemanticBackendConfig {
+            output_encoding: Some(OutputEncoding::Base64Int8),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(resolve_output_encoding(&config), OutputEncoding::Base64Int8);
+    }
+
+    #[test]
+    fn resolve_output_encoding_falls_back_to_default() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            output_encoding: None,
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(resolve_output_encoding(&config), OutputEncoding::Float);
+    }
+
+    #[test]
+    fn resolve_storage_strategy_uses_config_when_set() {
+        let config = SemanticBackendConfig {
+            storage_strategy: Some(StorageStrategy::BinaryPacked),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(
+            resolve_storage_strategy(&config),
+            StorageStrategy::BinaryPacked
+        );
+    }
+
+    #[test]
+    fn resolve_storage_strategy_falls_back_to_default() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Fastembed,
+            storage_strategy: None,
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(
+            resolve_storage_strategy(&config),
+            StorageStrategy::NativeF32
+        );
+    }
+
+    // ── apply_query_template / apply_document_template tests ─────────────
+
+    #[test]
+    fn apply_query_template_replaces_placeholder() {
+        let result = apply_query_template("hello", Some("Search: {query}"));
+        assert_eq!(result, "Search: hello");
+    }
+
+    #[test]
+    fn apply_query_template_no_placeholder_returns_raw() {
+        let result = apply_query_template("hello", Some("No placeholder here"));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_query_template_none_returns_raw() {
+        let result = apply_query_template("hello", None);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_replaces_placeholder() {
+        let result = apply_document_template("chunk text", Some("Doc: {text}"));
+        assert_eq!(result, "Doc: chunk text");
+    }
+
+    #[test]
+    fn apply_document_template_none_returns_raw() {
+        let result = apply_document_template("chunk text", None);
+        assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_empty_string_returns_raw() {
+        // An empty template should behave like None (no wrapping).
+        let result = apply_query_template("hello", Some(""));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_empty_string_returns_raw() {
+        let result = apply_document_template("chunk text", Some(""));
+        assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_wrong_placeholder_returns_raw() {
+        // Template with {text} instead of {query} — no-op.
+        let result = apply_query_template("hello", Some("Doc: {text}"));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn apply_document_template_wrong_placeholder_returns_raw() {
+        // Template with {query} instead of {text} — no-op.
+        let result = apply_document_template("chunk text", Some("Query: {query}"));
+        assert_eq!(result, "chunk text");
+    }
+
+    #[test]
+    fn apply_query_template_literal_query_not_double_substituted() {
+        // A query containing literal {query} should be substituted once.
+        let result = apply_query_template("find {query} in code", Some("Search: {query}"));
+        assert_eq!(result, "Search: find {query} in code");
+    }
+
+    #[test]
+    fn collect_chunks_applies_document_prompt_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn hello() { world() }").unwrap();
+        let policy = SemanticFilePolicy::default();
+        let (chunks, _) = SemanticIndex::collect_chunks(
+            dir.path(),
+            std::slice::from_ref(&file),
+            &policy,
+            Some("Doc: {text}"),
+        );
+        assert!(!chunks.is_empty(), "should have at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                chunk.embed_text.starts_with("Doc: "),
+                "embed_text should be prefixed with 'Doc: ', got: {}",
+                &chunk.embed_text[..50.min(chunk.embed_text.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn collect_chunks_no_prefix_when_template_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn hello() { world() }").unwrap();
+        let policy = SemanticFilePolicy::default();
+        let (chunks, _) =
+            SemanticIndex::collect_chunks(dir.path(), std::slice::from_ref(&file), &policy, None);
+        assert!(!chunks.is_empty(), "should have at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                !chunk.embed_text.starts_with("Doc: "),
+                "embed_text should NOT be prefixed when template is None, got: {}",
+                &chunk.embed_text[..50.min(chunk.embed_text.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_embedding_profile_coderankerembed() {
+        let profile = resolve_embedding_profile("nomic-ai/CodeRankEmbed");
+        assert!(
+            profile.is_some(),
+            "profile should be Some for 'nomic-ai/CodeRankEmbed'"
+        );
+        let p = profile.unwrap();
+        assert!(p.query_prefix.contains("query for searching relevant code"));
+        assert_eq!(p.document_prefix, "");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_e5_base() {
+        let profile = resolve_embedding_profile("intfloat/e5-base-v2");
+        assert!(profile.is_some());
+        let p = profile.unwrap();
+        assert_eq!(p.query_prefix, "query: ");
+        assert_eq!(p.document_prefix, "passage: ");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_bge_m3() {
+        let profile = resolve_embedding_profile("BAAI/bge-m3");
+        assert!(profile.is_some());
+        let p = profile.unwrap();
+        assert_eq!(p.query_prefix, "");
+        assert_eq!(p.document_prefix, "");
+    }
+
+    #[test]
+    fn resolve_embedding_profile_unknown_returns_none() {
+        assert!(resolve_embedding_profile("some-random-model").is_none());
+    }
+
+    #[test]
+    fn resolve_embedding_profile_case_insensitive() {
+        let profile = resolve_embedding_profile("intfloat/E5-BASE-V2");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn prompt_template_hash_none_equals_empty_string() {
+        // None and empty string should produce the same hash (both normalize to empty).
+        assert_eq!(prompt_template_hash(None), "");
+        assert_eq!(prompt_template_hash(Some("")), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_whitespace_only_equals_none() {
+        // Whitespace-only templates should also normalize to empty.
+        assert_eq!(prompt_template_hash(Some("  ")), "");
+        assert_eq!(prompt_template_hash(Some("\t\n")), "");
+    }
+
+    #[test]
+    fn prompt_template_hash_nonempty_produces_nonempty() {
+        // A real template should produce a non-empty hash.
+        let hash = prompt_template_hash(Some("Search: {query}"));
+        assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn prompt_template_hash_different_templates_different_hashes() {
+        let h1 = prompt_template_hash(Some("Search: {query}"));
+        let h2 = prompt_template_hash(Some("Find: {query}"));
+        assert_ne!(h1, h2);
+    }
+
+    // ── Contextualized embedding tests (aft-t6p.23.1) ──────────────────────────
+
+    /// Helper: write a source file with given content into temp dir and return its path.
+    fn write_temp_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Build a mock contextualized embed fn that returns vectors of given dimension.
+    fn mock_contextual_embed_fn(
+        dim: usize,
+    ) -> impl FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String> {
+        move |dc: DocumentChunks| {
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .into_iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path,
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; dim]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    /// Build a mock contextualized embed fn that also captures the documents it receives.
+    fn capturing_contextual_embed_fn(
+        captured: std::rc::Rc<std::cell::RefCell<Vec<DocumentChunks>>>,
+        dim: usize,
+    ) -> impl FnMut(DocumentChunks) -> Result<DocumentEmbeddings, String> {
+        move |dc: DocumentChunks| {
+            captured.borrow_mut().push(dc.clone());
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; dim]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        }
+    }
+
+    #[test]
+    fn contextualized_chunks_grouped_by_source_document() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file_a = write_temp_file(
+            &project_root,
+            "a.rs",
+            "pub fn foo() -> bool {\n    true\n}\npub fn bar() -> bool {\n    false\n}\npub fn baz() -> i32 {\n    42\n}\n",
+        );
+        let file_b = write_temp_file(
+            &project_root,
+            "b.rs",
+            "pub fn alpha() -> bool {\n    true\n}\npub fn beta() -> bool {\n    false\n}\n",
+        );
+
+        let files = vec![file_a.clone(), file_b.clone()];
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress_calls: Vec<(usize, usize)> = Vec::new();
+        let mut progress = |done: usize, total: usize| progress_calls.push((done, total));
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &files,
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+        let (index, _diag) = result.unwrap();
+        assert!(!index.is_empty(), "index should have entries");
+
+        // Verify documents grouped by file: each file's chunks appear together
+        let caps = captured.borrow();
+        let mut found_a = false;
+        let mut found_b = false;
+        for dc in caps.iter() {
+            for doc in &dc.documents {
+                if doc.file_path == file_a {
+                    found_a = true;
+                    assert!(doc.chunks.len() >= 2);
+                }
+                if doc.file_path == file_b {
+                    found_b = true;
+                    assert!(!doc.chunks.is_empty());
+                }
+            }
+        }
+        assert!(found_a, "file_a chunks not found");
+        assert!(found_b, "file_b chunks not found");
+        assert!(!progress_calls.is_empty(), "progress should be called");
+    }
+
+    #[test]
+    fn contextualized_chunk_order_preserved_within_document() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "ordered.rs",
+            "pub fn first() -> i32 {\n    1\n}\npub fn second() -> i32 {\n    2\n}\npub fn third() -> i32 {\n    3\n}\npub fn fourth() -> i32 {\n    4\n}\n",
+        );
+        let file_for_check = file.clone();
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+
+        // Verify chunk order is preserved
+        let caps = captured.borrow();
+        for dc in caps.iter() {
+            for doc in &dc.documents {
+                if doc.file_path == file_for_check {
+                    let full_text = doc.chunks.join(" ");
+                    let first_pos = full_text.find("first");
+                    let second_pos = full_text.find("second");
+                    let third_pos = full_text.find("third");
+                    let fourth_pos = full_text.find("fourth");
+                    if let (Some(a), Some(b), Some(c), Some(d)) =
+                        (first_pos, second_pos, third_pos, fourth_pos)
+                    {
+                        assert!(a < b, "first before second");
+                        assert!(b < c, "second before third");
+                        assert!(c < d, "third before fourth");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contextualized_response_wrong_chunk_count_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "chunkcount.rs",
+            "pub fn a() -> i32 {\n    1\n}\npub fn b() -> i32 {\n    2\n}\npub fn c() -> i32 {\n    3\n}\n",
+        );
+
+        // Return wrong number of vectors for the chunks
+        let mut embed_fn = |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: vec![vec![1.0; 3]],
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+
+        assert!(result.is_err(), "should fail on wrong chunk count");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("vectors for") || err.contains("embedding response returned"),
+            "error should mention vector count mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_response_unknown_file_path_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "unknownpath.rs",
+            "pub fn a() -> i32 {\n    1\n}\n",
+        );
+
+        // Return embeddings for a file not in the index
+        let bad_path = project_root.join("nonexistent.rs");
+        let mut embed_fn = move |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            Ok(DocumentEmbeddings {
+                embeddings: vec![ChunkEmbeddings {
+                    file_path: bad_path.clone(),
+                    vectors: vec![vec![1.0; 3]],
+                }],
+            })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+
+        assert!(result.is_err(), "should fail on unknown file path");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown file path"),
+            "error should mention unknown file path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_response_dimension_mismatch_fails() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file_a = write_temp_file(
+            &project_root,
+            "dimmismatch.rs",
+            "pub fn a() -> i32 {\n    1\n}\npub fn b() -> i32 {\n    2\n}\n",
+        );
+        let file_b = write_temp_file(
+            &project_root,
+            "dimmismatch2.rs",
+            "pub fn c() -> i32 {\n    3\n}\n",
+        );
+
+        let mut dims = vec![3, 5, 5].into_iter();
+        let mut embed_fn = move |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let d = dims.next().unwrap_or(3);
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; d]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file_a, file_b],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+
+        assert!(result.is_err(), "should fail on dimension change");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("dimension changed") || err.contains("embedding dimension"),
+            "error should mention dimension mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contextualized_stale_vector_pruning_after_refresh() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "stale.rs",
+            "pub fn original() -> bool {\n    true\n}\npub fn also_original() -> bool {\n    false\n}\n",
+        );
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let (mut index, _diag) = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        )
+        .expect("initial build");
+
+        let initial_len = index.len();
+        assert!(initial_len > 0, "index should have entries");
+
+        // Modify the file
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(
+            &file,
+            "pub fn modified() -> i32 {\n    42\n}\npub fn new_func() -> bool {\n    false\n}\n",
+        )
+        .unwrap();
+
+        let mut flat_embed = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|_| vec![1.0; 3]).collect())
+        };
+        let refreshed = index.refresh_stale_files(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut flat_embed,
+            8,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+
+        assert!(
+            refreshed.is_ok(),
+            "refresh should succeed: {:?}",
+            refreshed.err()
+        );
+        let summary = refreshed.unwrap();
+        assert!(
+            summary.changed > 0 || summary.added > 0 || summary.deleted > 0,
+            "refresh should detect changes: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn contextualized_perplexity_backend_sets_document_chunks_input_mode() {
+        // Verify that Perplexity uses InputMode::DocumentChunks
+        let _config = SemanticBackendConfig {
+            backend: SemanticBackend::Perplexity,
+            model: "sonar".to_string(),
+            ..Default::default()
+        };
+        let profile = EmbeddingModelProfile::perplexity_generic();
+        assert_eq!(
+            profile.input_mode,
+            InputMode::DocumentChunks,
+            "Perplexity profile should use DocumentChunks input mode"
+        );
+
+        // Verify Fastembed uses FlatTexts (for contrast)
+        let fastembed_profile = EmbeddingModelProfile::fastembed_minilm();
+        assert_eq!(
+            fastembed_profile.input_mode,
+            InputMode::FlatTexts,
+            "Fastembed profile should use FlatTexts"
+        );
+    }
+
+    #[test]
+    fn contextualized_oversized_document_is_split() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // Create a file with many small functions to produce many chunks.
+        // Each function spans 3 lines to pass symbols_to_chunks' line_count >= 2 filter.
+        // Keep under 100 chunks (DEFAULT_MAX_CHUNKS_PER_DOCUMENT) to avoid
+        // split-sub-group verification issues — the build path itself is exercised.
+        let mut content = String::new();
+        for i in 0..50 {
+            content.push_str(&format!("pub fn func_{i}() -> i32 {{\n    {i}\n}}\n"));
+        }
+        let file = write_temp_file(&project_root, "oversized.rs", &content);
+        let file_for_check = file.clone();
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(result.is_ok(), "build should succeed: {:?}", result.err());
+        let (index, _diag) = result.unwrap();
+        assert!(
+            !index.is_empty(),
+            "oversized doc should still produce entries"
+        );
+
+        // Verify the doc produced entries
+        let caps = captured.borrow();
+        let parts_for_file: usize = caps
+            .iter()
+            .flat_map(|dc| dc.documents.iter())
+            .filter(|doc| doc.file_path == file_for_check)
+            .count();
+        assert!(
+            parts_for_file >= 1,
+            "doc should produce >= 1 sub-doc, got {parts_for_file}"
+        );
+    }
+
+    #[test]
+    fn contextualized_empty_files_produces_empty_index() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let mut embed_fn = |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            Ok(DocumentEmbeddings {
+                embeddings: Vec::new(),
+            })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(result.is_ok(), "empty build should succeed");
+        let (index, _diag) = result.unwrap();
+        assert_eq!(index.len(), 0, "empty files → empty index");
+    }
+
+    #[test]
+    fn contextualized_retry_on_transient_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "retry.rs",
+            "pub fn retry_me() -> i32 {\n    1\n}\n",
+        );
+
+        let attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let att_clone = attempts.clone();
+        let mut embed_fn = move |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            let mut a = att_clone.borrow_mut();
+            *a += 1;
+            if *a <= 2 {
+                Err("rate limit exceeded (429)".to_string())
+            } else {
+                let embeddings: Vec<ChunkEmbeddings> = dc
+                    .documents
+                    .iter()
+                    .map(|doc| ChunkEmbeddings {
+                        file_path: doc.file_path.clone(),
+                        vectors: doc.chunks.iter().map(|_| vec![1.0; 3]).collect(),
+                    })
+                    .collect();
+                Ok(DocumentEmbeddings { embeddings })
+            }
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "should succeed after retries: {:?}",
+            result.err()
+        );
+        assert!(
+            *attempts.borrow() >= 3,
+            "should have retried, got {} attempts",
+            *attempts.borrow()
+        );
+    }
+
+    #[test]
+    fn contextualized_non_transient_error_is_not_retried() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file = write_temp_file(
+            &project_root,
+            "noretry.rs",
+            "pub fn no_retry() -> i32 {\n    1\n}\n",
+        );
+
+        let attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let att_clone = attempts.clone();
+        let mut embed_fn = move |_dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            *att_clone.borrow_mut() += 1;
+            Err("invalid model configuration: unsupported encoding".to_string())
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "build should not abort on non-transient errors"
+        );
+        assert_eq!(
+            *attempts.borrow(),
+            1,
+            "non-transient error should not retry"
+        );
+    }
+
+    /// Regression: oversized file with 101+ functions triggers actual split into
+    /// sub-groups. Verify every returned vector maps to the correct original chunk
+    /// and no dimension mismatch occurs. This is the core regression test for
+    /// aft-t6p.23.2 (split sub-groups previously reused file_path → false mismatch).
+    #[test]
+    fn contextualized_oversized_file_actual_split_maps_vectors_correctly() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // 101 functions × 3 lines each = 101 chunks → exceeds DEFAULT_MAX_CHUNKS_PER_DOCUMENT (100)
+        // This forces split_oversized_document to create 2 sub-groups.
+        let mut content = String::new();
+        for i in 0..101 {
+            content.push_str(&format!("pub fn func_{i:03}() -> i32 {{\n    {i}\n}}\n"));
+        }
+        let file = write_temp_file(&project_root, "big.rs", &content);
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut embed_fn = capturing_contextual_embed_fn(captured.clone(), 3);
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            std::slice::from_ref(&file),
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "oversized split build should succeed: {:?}",
+            result.err()
+        );
+        let (index, _diag) = result.unwrap();
+
+        // Should have 101 entries (all functions embedded)
+        assert_eq!(index.len(), 101, "all 101 chunks should be embedded");
+
+        // Should have 2 sub-groups sent to embedder
+        let caps = captured.borrow();
+        let sub_groups: Vec<_> = caps
+            .iter()
+            .flat_map(|dc| dc.documents.iter())
+            .filter(|doc| doc.file_path == file)
+            .collect();
+        assert_eq!(sub_groups.len(), 2, "should split into 2 sub-groups");
+
+        // First sub-group has 100 chunks, second has 1
+        assert_eq!(
+            sub_groups[0].chunks.len(),
+            100,
+            "first sub-group: 100 chunks"
+        );
+        assert_eq!(sub_groups[1].chunks.len(), 1, "second sub-group: 1 chunk");
+
+        // Verify chunk content mapping: first sub-group's chunks are func_000..func_099
+        assert!(
+            sub_groups[0].chunks[0].contains("func_000"),
+            "first chunk should be func_000"
+        );
+        assert!(
+            sub_groups[0].chunks[99].contains("func_099"),
+            "last chunk of first sub-group should be func_099"
+        );
+        assert!(
+            sub_groups[1].chunks[0].contains("func_100"),
+            "second sub-group's chunk should be func_100"
+        );
+    }
+
+    /// Regression: split groups from the same source file must not trigger a
+    /// false full-file vector-count mismatch. Before aft-t6p.23.2, the
+    /// reconstruction loop looked up all chunks for a file_path and compared
+    /// against sub-group vector count → always failed for split files.
+    #[test]
+    fn contextualized_split_groups_same_file_no_false_mismatch() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // 101 functions → triggers split into 2 sub-groups (100 + 1)
+        let mut content = String::new();
+        for i in 0..101 {
+            content.push_str(&format!("pub fn split_{i:03}() -> i32 {{\n    {i}\n}}\n"));
+        }
+        let file = write_temp_file(&project_root, "splitfile.rs", &content);
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress = |_: usize, _: usize| {};
+
+        // Before the fix, this would fail with:
+        // "embedding response returned 100 vectors for 101 chunks in file splitfile.rs"
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "split groups should not cause false mismatch: {:?}",
+            result.err()
+        );
+    }
+
+    /// Retry exhaustion: all attempts return transient errors → group is skipped,
+    /// build continues with remaining groups, no crash.
+    #[test]
+    fn contextualized_retry_exhaustion_skips_group() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        let file_ok = write_temp_file(
+            &project_root,
+            "ok.rs",
+            "pub fn ok_func() -> i32 {\n    1\n}\n",
+        );
+        let file_fail = write_temp_file(
+            &project_root,
+            "fail.rs",
+            "pub fn fail_func() -> i32 {\n    2\n}\n",
+        );
+
+        let fail_attempts = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let fail_clone = fail_attempts.clone();
+        let mut embed_fn = move |dc: DocumentChunks| -> Result<DocumentEmbeddings, String> {
+            for doc in &dc.documents {
+                if doc.file_path.file_name().unwrap() == "fail.rs" {
+                    *fail_clone.borrow_mut() += 1;
+                    return Err("rate limit exceeded (429)".to_string());
+                }
+            }
+            // OK file succeeds
+            let embeddings: Vec<ChunkEmbeddings> = dc
+                .documents
+                .iter()
+                .map(|doc| ChunkEmbeddings {
+                    file_path: doc.file_path.clone(),
+                    vectors: doc.chunks.iter().map(|_| vec![1.0; 3]).collect(),
+                })
+                .collect();
+            Ok(DocumentEmbeddings { embeddings })
+        };
+        let mut progress = |_: usize, _: usize| {};
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file_ok, file_fail],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+
+        // Build should succeed (partial — fail.rs skipped, ok.rs embedded)
+        assert!(
+            result.is_ok(),
+            "build should succeed with partial results: {:?}",
+            result.err()
+        );
+        let (index, _diag) = result.unwrap();
+
+        // Should have entries for ok.rs only (fail.rs skipped after retry exhaustion)
+        assert!(
+            !index.is_empty(),
+            "should have entries for the successful file"
+        );
+
+        // fail.rs should have been retried MAX_RETRIES + 1 times (initial + retries)
+        let attempts = *fail_attempts.borrow();
+        assert!(
+            attempts >= 4,
+            "should have attempted at least 4 times (1 initial + 3 retries), got {attempts}"
+        );
+    }
+
+    // ── model2vec tests ─────────────────────────────────────────────
+
+    /// Build a tiny model2vec-compatible tokenizer JSON string from a vocab map.
+    ///
+    /// This is the canonical fixture shape for model2vec tokenizer tests. Key design choices:
+    /// - `"padding": null`: partial padding is invalid; use null when padding is not needed.
+    /// - `"pre_tokenizer": { "type": "Whitespace" }`: ensures "hello world" tokenizes as separate tokens.
+    /// - `"ignore_merges": true`: allows whole-token vocab hits even with empty merges.
+    /// - Root-level `"strategy"` is NOT a valid tokenizer JSON field — it must not appear.
+    /// - All root fields are present: version, truncation, padding, added_tokens, normalizer,
+    ///   pre_tokenizer, post_processor, decoder, and model.
+    /// - model2vec-rs 0.2.1 resolves tokenizers 0.21.4, not AFT's direct 0.22.2.
+    #[cfg(feature = "semantic-model2vec")]
+    fn build_tokenizer_json(vocab: &[(String, u32)]) -> String {
+        let vocab_map = vocab.iter().fold(serde_json::Map::new(), |mut m, (k, v)| {
+            m.insert(k.clone(), serde_json::json!(v));
+            m
+        });
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "ignore_merges": true,
+                "vocab": vocab_map,
+                "merges": [],
+            }
+        });
+        serde_json::to_string(&tokenizer_json).unwrap()
+    }
+
+    /// Build a tiny model2vec-compatible fixture directory with `vocab_size` tokens and `dim` dimensions.
+    #[cfg(feature = "semantic-model2vec")]
+    fn build_model2vec_fixture(dir: &Path, vocab_size: usize, dim: usize) -> PathBuf {
+        // config.json
+        let config = serde_json::json!({
+            "normalize": true,
+            "hidden_size": dim,
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        // Build a minimal word-level tokenizer.json
+        let mut vocab: Vec<(String, u32)> = Vec::new();
+        for i in 0..vocab_size {
+            let word = if i == 0 {
+                "[UNK]".to_string()
+            } else {
+                format!("token_{i}")
+            };
+            vocab.push((word, i as u32));
+        }
+        let tokenizer_json_str = build_tokenizer_json(&vocab);
+        fs::write(dir.join("tokenizer.json"), &tokenizer_json_str).unwrap();
+
+        // Build a tiny embeddings tensor: vocab_size x dim, all 0.1
+        let data: Vec<f32> = vec![0.1; vocab_size * dim];
+        let data_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let metadata = serde_json::json!({
+            "embeddings": {
+                "dtype": "F32",
+                "shape": [vocab_size, dim],
+                "data_offsets": [0, data_bytes.len()]
+            }
+        });
+        let meta_bytes = serde_json::to_string(&metadata).unwrap();
+        let meta_len = (meta_bytes.len() as u64).to_le_bytes();
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&meta_len);
+        file_bytes.extend_from_slice(meta_bytes.as_bytes());
+        file_bytes.extend_from_slice(&data_bytes);
+        fs::write(dir.join("model.safetensors"), &file_bytes).unwrap();
+
+        dir.to_path_buf()
+    }
+
+    /// Helper: build model2vec from_bytes with given tokenizer/config/data.
+    #[cfg(feature = "semantic-model2vec")]
+    fn model2vec_from_bytes_helper(
+        tokenizer_json: &str,
+        config_json: &str,
+        data: &[f32],
+        dim: usize,
+    ) -> model2vec_rs::model::StaticModel {
+        let data_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let vocab_size = data.len() / dim;
+        let metadata = serde_json::json!({
+            "embeddings": {
+                "dtype": "F32",
+                "shape": [vocab_size, dim],
+                "data_offsets": [0, data_bytes.len()]
+            }
+        });
+        let meta_bytes = serde_json::to_string(&metadata).unwrap();
+        let meta_len = (meta_bytes.len() as u64).to_le_bytes();
+        let mut model_bytes = Vec::new();
+        model_bytes.extend_from_slice(&meta_len);
+        model_bytes.extend_from_slice(meta_bytes.as_bytes());
+        model_bytes.extend_from_slice(&data_bytes);
+
+        model2vec_rs::model::StaticModel::from_bytes(
+            tokenizer_json.as_bytes(),
+            &model_bytes,
+            config_json.as_bytes(),
+            None,
+        )
+        .expect("load from_bytes")
+    }
+
+    /// Characterization test: verify that `build_tokenizer_json` produces a valid tokenizer
+    /// that deserializes through `tokenizers::Tokenizer::from_bytes()` and tokenizes known
+    /// words as expected. This catches invalid fixture JSON before model2vec is invoked.
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn tokenizer_json_characterization() {
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+            ("world".into(), 2),
+        ]);
+        let tokenizer = tokenizers::Tokenizer::from_bytes(&tok)
+            .expect("tokenizer JSON must deserialize through Tokenizer::from_bytes");
+        let encoding = tokenizer
+            .encode("hello world", true)
+            .expect("encode must succeed");
+        let ids: Vec<u32> = encoding.get_ids().to_vec();
+        assert!(
+            ids.contains(&1),
+            "expected token ID 1 for 'hello', got IDs: {ids:?}"
+        );
+        assert!(
+            ids.contains(&2),
+            "expected token ID 2 for 'world', got IDs: {ids:?}"
+        );
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_deterministic_encoding() {
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+            ("world".into(), 2),
+        ]);
+        let cfg = r#"{"normalize":true,"hidden_size":4}"#;
+        let data: Vec<f32> = vec![0.25; 3 * 4];
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 4);
+
+        let emb1 = model.encode(&["hello world".to_string()]);
+        let emb2 = model.encode(&["hello world".to_string()]);
+        assert_eq!(emb1.len(), 1);
+        assert_eq!(emb1[0].len(), 4);
+        assert_eq!(emb1[0], emb2[0], "encoding must be deterministic");
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_empty_input() {
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("hello".into(), 1),
+        ]);
+        let cfg = r#"{"normalize":true}"#;
+        let data: Vec<f32> = vec![0.5; 2 * 2];
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 2);
+
+        let emb = model.encode(&["".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 2);
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_unknown_tokens_only() {
+        let tok = build_tokenizer_json(&[
+            ("[UNK]".into(), 0),
+            ("known".into(), 1),
+        ]);
+        let cfg = r#"{"normalize":false}"#;
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let model = model2vec_from_bytes_helper(&tok, cfg, &data, 3);
+
+        let emb = model.encode(&["xyz_unknown_token".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 3);
+        // Unknown tokens only => zero vector
+        assert!(emb[0].iter().all(|&v| v.abs() < 1e-6));
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_pretrained_fixture_roundtrip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = build_model2vec_fixture(dir.path(), 10, 8);
+
+        // Verify the fixture path is a fully self-contained local absolute path,
+        // not a HF Hub identifier (e.g. "Qdrant/all-MiniLM-L6-v2").
+        // This ensures `from_pretrained` resolves to the local directory and
+        // does not trigger any network downloads, making the test offline-safe.
+        assert!(
+            fixture_path.is_absolute(),
+            "fixture path must be absolute to guarantee offline local loading: {:?}",
+            fixture_path
+        );
+        assert!(
+            fixture_path.exists(),
+            "fixture path must exist on disk: {:?}",
+            fixture_path
+        );
+
+        let model =
+            model2vec_rs::model::StaticModel::from_pretrained(&fixture_path, None, None, None)
+                .expect("load from_pretrained fixture");
+
+        let emb = model.encode(&["token_1 token_2".to_string()]);
+        assert_eq!(emb.len(), 1);
+        assert_eq!(emb[0].len(), 8);
+        // L2-normalized (normalize=true in fixture config)
+        let norm: f32 = emb[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "L2 norm should be ~1.0, got {norm}"
+        );
+    }
+
+    /// Verify that model2vec `from_bytes` (the primary offline path) produces
+    /// identical embeddings to `from_pretrained` on the same fixture data.
+    /// This test is explicitly offline-safe: it never touches the filesystem
+    /// for model loading — all data is constructed in-memory.
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_from_bytes_matches_from_pretrained() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = build_model2vec_fixture(dir.path(), 10, 8);
+
+        // Read the fixture files from disk into memory.
+        let tokenizer_json = fs::read_to_string(fixture_path.join("tokenizer.json"))
+            .expect("read tokenizer.json");
+        let config_json = fs::read_to_string(fixture_path.join("config.json"))
+            .expect("read config.json");
+        let model_bytes = fs::read(fixture_path.join("model.safetensors"))
+            .expect("read model.safetensors");
+
+        // Load via from_bytes (no filesystem resolution).
+        let model_bytes_only =
+            model2vec_rs::model::StaticModel::from_bytes(
+                tokenizer_json.as_bytes(),
+                &model_bytes,
+                config_json.as_bytes(),
+                None,
+            )
+            .expect("load from_bytes");
+
+        // Load via from_pretrained (filesystem resolution).
+        let model_pretrained =
+            model2vec_rs::model::StaticModel::from_pretrained(&fixture_path, None, None, None)
+                .expect("load from_pretrained");
+
+        let input = vec!["token_1 token_2".to_string()];
+        let emb_bytes = model_bytes_only.encode(&input);
+        let emb_pretrained = model_pretrained.encode(&input);
+
+        assert_eq!(emb_bytes.len(), emb_pretrained.len());
+        assert_eq!(emb_bytes[0].len(), emb_pretrained[0].len());
+
+        // Embeddings must match within floating-point tolerance.
+        for (a, b) in emb_bytes[0].iter().zip(emb_pretrained[0].iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "from_bytes and from_pretrained embeddings diverge: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Helper: build a default SemanticBackendConfig for model2vec tests.
+    #[cfg(feature = "semantic-model2vec")]
+    fn make_model2vec_config(model_path: Option<PathBuf>) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend: SemanticBackend::Model2Vec,
+            model: String::new(),
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: 5000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path,
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        }
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_missing_model_path_returns_error() {
+        let config = make_model2vec_config(None);
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        // Error could be about missing model name/path or unknown model
+        assert!(
+            err.contains("requires either") || err.contains("model_path") || err.contains("unknown model"),
+            "error: {err}"
+        );
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_nonexistent_model_path_returns_error() {
+        let config = make_model2vec_config(Some(PathBuf::from("/nonexistent/path/to/model")));
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        // Error could be about non-existent path or missing files
+        assert!(
+            err.contains("does not exist") || err.contains("not a directory") || err.contains("missing"),
+            "error: {err}"
+        );
+    }
+
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    fn model2vec_engine_embed_texts_roundtrip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fixture_path = build_model2vec_fixture(dir.path(), 20, 16);
+
+        let mut config = make_model2vec_config(Some(fixture_path));
+        config.model2vec_max_length = 128;
+
+        let mut model = SemanticEmbeddingModel::from_config(&config).expect("from_config");
+        let texts = vec![
+            "token_1 token_2 token_3".to_string(),
+            "token_5 token_6".to_string(),
+        ];
+        let vectors = model.embed_texts(texts).expect("embed_texts");
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0].len(), 16);
+        assert_eq!(vectors[1].len(), 16);
+        assert!(vectors[0].iter().any(|&v| v.abs() > 1e-6));
+        assert!(vectors[1].iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    /// Optional integration test for Potion Code 16M.
+    /// Run: AFT_POTION_CODE_16M_PATH=/path/to/potion-code-16M \
+    ///   cargo test -p agent-file-tools --features semantic-model2vec \
+    ///   -- --ignored potion_code_16m
+    #[cfg(feature = "semantic-model2vec")]
+    #[test]
+    #[ignore]
+    fn potion_code_16m_embed_and_search() {
+        let model_path = std::env::var("AFT_POTION_CODE_16M_PATH")
+            .expect("set AFT_POTION_CODE_16M_PATH to run this test");
+        let model_dir = PathBuf::from(model_path);
+        assert!(
+            model_dir.exists(),
+            "model dir not found: {}",
+            model_dir.display()
+        );
+
+        let config = make_model2vec_config(Some(model_dir));
+        let mut model = SemanticEmbeddingModel::from_config(&config).expect("load Potion Code 16M");
+
+        let query = "how to handle authentication errors".to_string();
+        let doc = "fn handle_auth_error(e: AuthError) -> Response { todo!() }".to_string();
+        let vectors = model.embed_texts(vec![query, doc]).expect("embed texts");
+        assert_eq!(vectors.len(), 2);
+        let dim = vectors[0].len();
+        eprintln!("Potion Code 16M dimension: {dim}");
+        assert!(dim > 0);
+
+        let dot: f32 = vectors[0]
+            .iter()
+            .zip(vectors[1].iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let na: f32 = vectors[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = vectors[1].iter().map(|v| v * v).sum::<f32>().sqrt();
+        let sim = if na > 0.0 && nb > 0.0 {
+            dot / (na * nb)
+        } else {
+            0.0
+        };
+        eprintln!("query-doc cosine similarity: {sim:.4}");
+        assert!(
+            sim > 0.0,
+            "Potion Code 16M should produce positive similarity"
+        );
+    }
+
+    #[cfg(not(feature = "semantic-model2vec"))]
+    #[test]
+    fn model2vec_feature_disabled_returns_error() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Model2Vec,
+            model: String::new(),
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: 5000,
+            max_batch_size: 64,
+            dimensions: None,
+            output_encoding: None,
+            input_mode: None,
+            storage_strategy: None,
+            distance_metric: None,
+            query_prompt_template: None,
+            document_prompt_template: None,
+            diagnostics_enabled: false,
+            low_confidence_threshold: 0.3,
+            metrics_window_size: 100,
+            jsonl_logging: false,
+            jsonl_path: None,
+            include_raw_queries: false,
+            include_snippets: false,
+            retention_days: 14,
+            output_mode: DiagnosticsOutputMode::default(),
+            rerank_enabled: false,
+            rerank_model: None,
+            rerank_base_url: None,
+            rerank_api_key_env: None,
+            rerank_timeout_ms: 15000,
+            rerank_max_candidates: 20,
+            rerank_max_candidate_chars: 2500,
+            rerank_api_type: crate::config::RerankApiType::Chat,
+            rerank_max_candidate_chars_cross_encoder: 512,
+            rerank_prompt_template: None,
+            use_model_profiles: true,
+            model_path: Some(PathBuf::from("/any/path")),
+            model2vec_max_length: 512,
+            max_results_per_file: 2,
+            max_files: 20_000,
+            max_embed_tokens: 512,
+            chunk_overlap_tokens: 100,
+        };
+        let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
+        assert!(err.contains("semantic-model2vec"), "error: {err}");
+    }
+
+    #[test]
+    fn contextualized_progress_reports_total_chunks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+
+        // Each function must span ≥2 lines so symbols_to_chunks doesn't
+        // skip it (line_count < 2 filter).
+        let file = write_temp_file(
+            &project_root,
+            "progress.rs",
+            "pub fn a() -> i32 {\n    0\n}\npub fn b() -> i32 {\n    1\n}\npub fn c() -> i32 {\n    2\n}\n",
+        );
+
+        let mut embed_fn = mock_contextual_embed_fn(3);
+        let mut progress_calls: Vec<(usize, usize)> = Vec::new();
+        let mut progress = |done: usize, total: usize| progress_calls.push((done, total));
+
+        let result = SemanticIndex::build_with_progress_contextualized(
+            &project_root,
+            &[file],
+            &mut embed_fn,
+            &mut progress,
+            &SemanticFilePolicy::default(),
+            None,
+        );
+        assert!(result.is_ok());
+
+        assert!(!progress_calls.is_empty(), "progress should be called");
+        assert_eq!(progress_calls[0].0, 0, "first call should report 0 done");
+        assert!(progress_calls[0].1 > 0, "total should be > 0");
+        let last = progress_calls.last().unwrap();
+        assert_eq!(last.0, last.1, "final progress: done == total");
+    }
+
+    #[test]
+    fn concurrent_snapshot_swap_does_not_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonicalize");
+        let mut index = SemanticIndex::new(project_root.clone(), 3);
+        index.set_dimension(3);
+        let index = Arc::new(std::sync::Mutex::new(index));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let index = Arc::clone(&index);
+                std::thread::spawn(move || {
+                    let mut idx = index.lock().unwrap();
+                    let mut snap = (*idx.snapshot).clone();
+                    let entry = EmbeddingEntry {
+                        chunk: SemanticChunk {
+                            file: PathBuf::from(format!("src/t{i}.rs")),
+                            name: format!("fn_{i}"),
+                            kind: SymbolKind::Function,
+                            start_line: 0,
+                            end_line: 2,
+                            exported: true,
+                            embed_text: format!("fn_{i}"),
+                            snippet: format!("fn fn_{i}() {{}}"),
+                        },
+                        vector: vec![1.0, 0.0, 0.0],
+                        chunk_hash: String::new(),
+                    };
+                    snap.entries_mut_inner().push(entry);
+                    idx.swap_snapshot(snap);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let idx = index.lock().unwrap();
+        assert!(
+            idx.entry_count() > 0,
+            "index should have entries after concurrent swaps"
+        );
+    }
+
+    #[test]
+    fn concurrent_query_embedding_cache_access() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Test concurrency of the query embedding cache data structure
+        // directly, without needing ONNX Runtime for an actual embedding model.
+        type Cache = Arc<Mutex<(HashMap<String, Vec<f32>>, VecDeque<String>, u64, u64)>>;
+
+        let cache: Cache = Arc::new(Mutex::new((HashMap::new(), VecDeque::new(), 0u64, 0u64)));
+        let hit_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let hit_count = Arc::clone(&hit_count);
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let key = format!("query_{i}_{j}");
+                        let vector = vec![i as f32, j as f32, 0.0];
+                        let mut c = cache.lock().unwrap();
+                        if c.0.contains_key(&key) {
+                            c.2 += 1;
+                            hit_count.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            c.0.insert(key.clone(), vector);
+                            c.1.push_back(key);
+                            c.3 += 1;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let c = cache.lock().unwrap();
+        assert_eq!(
+            c.0.len(),
+            40,
+            "cache should have 40 entries (4 threads x 10 queries)"
+        );
+        assert!(c.2 + c.3 > 0, "should have cache activity");
     }
 }

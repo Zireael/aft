@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-06-11T19:07:04.109Z",
-  "profile": "b",
-  "profile_label": "model2vec",
-  "k": 10,
+  "timestamp": "2026-06-12T22:19:07.566Z",
+  "profile": "c",
+  "profile_label": "openai-embed",
+  "k": 3,
   "binary": "C:\\Users\\zir\\AppData\\Local\\aft\\bin\\v0.29.1\\aft.exe",
   "openai_stack": {
     "embedding": {
@@ -14,2625 +14,1225 @@
       "model": "GTE-Reranker-Modernbert",
       "base_url": "http://127.0.0.1:8090/v1",
       "port": 8090,
-      "max_candidates": 50
+      "max_candidates": 30
     }
   },
   "results": [
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how axum Handler trait dispatches requests to async handler functions",
       "repo_name": "axum",
       "category": "architecture",
-      "latency_ms": 42.803300000000036,
+      "latency_ms": 19.605100000000675,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
-          "score": 0.7843717336654663
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\response_axum_body.rs",
+          "score": 0.49983853101730347
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\boxed.rs",
-          "score": 0.7550373673439026
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.7284721732139587
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
+          "score": 0.4718110263347626
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
-          "score": 0.6802023649215698
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\service.rs",
-          "score": 0.6626559495925903
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.6466683745384216
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
-          "score": 0.630241870880127
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.6294010877609253
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\handle_error.rs",
-          "score": 0.6229459047317505
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\handle_error.rs",
-          "score": 0.6093392968177795
+          "score": 0.4708426296710968
         }
       ],
       "recall_at_k": 1,
-      "mrr": 1
+      "mrr": 0.3333333333333333
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Router path_router implementation for storing and matching routes",
       "repo_name": "axum",
       "category": "semantic",
-      "latency_ms": 19.664200000000164,
+      "latency_ms": 15.762100000001737,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.9167703986167908
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.8905746340751648
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.6877946257591248
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.8846917152404785
+          "score": 0.6572967767715454
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.8706929087638855
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.8399065732955933
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\matched_path.rs",
-          "score": 0.8382662534713745
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.8073464632034302
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\matched_path.rs",
-          "score": 0.7993161082267761
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.7908901572227478
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\connect_info.rs",
-          "score": 0.7848061323165894
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\boxed.rs",
+          "score": 0.25
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.3333333333333333
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how extractors implement FromRequest and FromRequestParts",
       "repo_name": "axum",
       "category": "architecture",
-      "latency_ms": 19.540500000000065,
+      "latency_ms": 17.9395999999997,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.6186302900314331
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.5800433158874512
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_extractor.rs",
+          "score": 0.7644124627113342
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_extractor.rs",
-          "score": 0.5798039436340332
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_extractor.rs",
-          "score": 0.5641600489616394
+          "score": 0.6839886903762817
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\query.rs",
-          "score": 0.5408309102058411
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\raw_query.rs",
-          "score": 0.5346517562866211
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\original_uri.rs",
-          "score": 0.5257502198219299
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\multipart.rs",
-          "score": 0.5185286402702332
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\path\\mod.rs",
-          "score": 0.5145196914672852
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extension.rs",
-          "score": 0.5135846734046936
+          "score": 0.604450523853302
         }
       ],
       "recall_at_k": 0,
       "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Json extractor and response for deserializing and serializing JSON bodies",
       "repo_name": "axum",
       "category": "semantic",
-      "latency_ms": 17.19979999999987,
+      "latency_ms": 16.183100000000195,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.8437208533287048
+          "score": 0.6141645908355713
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
+          "score": 0.5060573816299438
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\test_helpers\\test_client.rs",
-          "score": 0.7136749029159546
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\test_helpers\\test_client.rs",
-          "score": 0.6641123294830322
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5747742652893066
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5621958374977112
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\sse.rs",
-          "score": 0.5593034625053406
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5437324643135071
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\path\\mod.rs",
-          "score": 0.5314254760742188
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5203664302825928
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5143541097640991
+          "score": 0.43338218331336975
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how IntoResponse converts handler return values to HTTP responses",
       "repo_name": "axum",
       "category": "architecture",
-      "latency_ms": 19.48849999999993,
+      "latency_ms": 16.932699999999386,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
-          "score": 0.6860272884368896
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.6763608455657959
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
-          "score": 0.6752427220344543
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
-          "score": 0.6595617532730103
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.6553373336791992
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.6063968539237976
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.5902690291404724
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extension.rs",
-          "score": 0.5810993909835815
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\redirect.rs",
-          "score": 0.5626443028450012
+          "score": 0.5318031311035156
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\form.rs",
-          "score": 0.5379959344863892
+          "score": 0.510787308216095
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
+          "score": 0.49585309624671936
         }
       ],
       "recall_at_k": 1,
       "mrr": 0.3333333333333333
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
       "repo_name": "axum",
       "category": "architecture",
-      "latency_ms": 18.808500000000095,
+      "latency_ms": 17.889400000000023,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.7082443833351135
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.7013231515884399
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
+          "score": 0.5082800984382629
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.6973137855529785
+          "score": 0.45724236965179443
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.6836012005805969
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.6621595621109009
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\redirect.rs",
-          "score": 0.5966932773590088
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.5388286113739014
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\handle_error.rs",
-          "score": 0.5386104583740234
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_filter.rs",
-          "score": 0.5257412195205688
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_filter.rs",
-          "score": 0.5170961618423462
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\boxed.rs",
+          "score": 0.25
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.3333333333333333
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how axum maps Tower middleware layers onto the router",
       "repo_name": "axum",
       "category": "semantic",
-      "latency_ms": 17.735299999999825,
+      "latency_ms": 16.60570000000007,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.749929666519165
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.7155835032463074
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.622038722038269
+          "score": 0.4956621527671814
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.6209964156150818
+          "score": 0.4954923391342163
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.6125878691673279
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.587294340133667
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.5854629278182983
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.5830091238021851
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.574030339717865
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.5638054609298706
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\response_axum_body.rs",
+          "score": 0.4671918749809265
         }
       ],
       "recall_at_k": 0,
       "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Router",
       "repo_name": "axum",
       "category": "symbol",
-      "latency_ms": 19.5320999999999,
+      "latency_ms": 17.308000000000902,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.9012739062309265
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
+          "score": 0.5004942417144775
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\connect_info.rs",
-          "score": 0.8728491067886353
+          "score": 0.4843413829803467
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.8410120010375977
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\nest.rs",
-          "score": 0.8370549082756042
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\path_router.rs",
-          "score": 0.8283882141113281
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.820569634437561
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\matched_path.rs",
-          "score": 0.8169901967048645
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.8138314485549927
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\route.rs",
-          "score": 0.7489711046218872
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\merge.rs",
-          "score": 0.7330582141876221
+          "score": 0.4733867943286896
         }
       ],
-      "recall_at_k": 1,
-      "mrr": 1
+      "recall_at_k": 0,
+      "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "IntoResponse",
       "repo_name": "axum",
       "category": "symbol",
-      "latency_ms": 18.54210000000012,
+      "latency_ms": 18.080400000000736,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.6851136684417725
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.682259202003479
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\test_helpers\\test_client.rs",
-          "score": 0.6821485161781311
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
+          "score": 0.5342315435409546
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
-          "score": 0.6627004742622375
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\mod.rs",
-          "score": 0.6517595052719116
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\tests\\mod.rs",
-          "score": 0.5657368898391724
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\response\\redirect.rs",
-          "score": 0.558225691318512
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_response.rs",
-          "score": 0.5563727021217346
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\handler\\mod.rs",
-          "score": 0.5464001297950745
+          "score": 0.5224899053573608
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extension.rs",
-          "score": 0.5460641384124756
+          "score": 0.4995722472667694
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.25
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "FromRequest",
       "repo_name": "axum",
       "category": "symbol",
-      "latency_ms": 19.802500000000236,
+      "latency_ms": 14.431800000000294,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.6570159792900085
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\map_request.rs",
-          "score": 0.5696563720703125
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_extractor.rs",
+          "score": 0.5106841325759888
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\form.rs",
-          "score": 0.5414512753486633
+          "score": 0.4841371476650238
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\multipart.rs",
-          "score": 0.5158105492591858
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\raw_form.rs",
-          "score": 0.5143410563468933
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.5000402331352234
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\json.rs",
-          "score": 0.4824572801589966
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\mod.rs",
-          "score": 0.47142651677131653
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\extract\\multipart.rs",
-          "score": 0.45614945888519287
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\routing\\method_routing.rs",
-          "score": 0.4553305506706238
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\axum\\axum\\src\\middleware\\from_extractor.rs",
+          "score": 0.4786335825920105
         }
       ],
       "recall_at_k": 0,
       "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "application initialization and default configuration",
       "repo_name": "express",
       "category": "architecture",
-      "latency_ms": 17.652100000000246,
+      "latency_ms": 26.458300000002055,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.3445412218570709
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.33914443850517273
+          "score": 0.2943321466445923
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.2567583918571472
+          "score": 0.2543400526046753
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.1603120118379593
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.10135915875434875
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.09866204857826233
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.08451377600431442
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.0800086036324501
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.06233660876750946
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.05492217838764191
+          "score": 0.1931052803993225
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.5
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "request API helpers and header access",
       "repo_name": "express",
       "category": "semantic",
-      "latency_ms": 19.830800000000636,
+      "latency_ms": 24.909499999997934,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.36397236585617065
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.35121360421180725
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.3007604777812958
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.2560935914516449
+          "score": 0.2549965977668762
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.2394641637802124
+          "score": 0.24347618222236633
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.21431756019592285
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.20883503556251526
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.18878160417079926
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.17580321431159973
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.17577673494815826
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
+          "score": 0.20437109470367432
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "response sending and content negotiation",
       "repo_name": "express",
       "category": "semantic",
-      "latency_ms": 20.538899999999558,
+      "latency_ms": 27.560800000002928,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.2606390118598938
+          "score": 0.4117834270000458
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.17479094862937927
+          "score": 0.3291892409324646
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.16734564304351807
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.1608448475599289
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.15128789842128754
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.13636499643325806
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.1128375306725502
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.11098724603652954
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.1029844656586647
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.10195290297269821
+          "score": 0.3271636664867401
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "response",
       "repo_name": "express",
       "category": "symbol",
-      "latency_ms": 16.97059999999965,
+      "latency_ms": 31.787000000000262,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.43883320689201355
+          "score": 0.5127938389778137
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.2536057233810425
+          "score": 0.5001189708709717
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.15500502288341522
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.13786786794662476
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.09717539697885513
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.07983008772134781
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.06297637522220612
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.04668077826499939
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.04335551708936691
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.031511079519987106
+          "score": 0.25
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how sub-applications are mounted with use() and path prefix stripping",
       "repo_name": "express",
       "category": "architecture",
-      "latency_ms": 17.178600000000188,
+      "latency_ms": 18.23199999999997,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.3277396857738495
+          "score": 0.3177710771560669
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.2854920029640198
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.26165419816970825
+          "score": 0.251158207654953
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.2200414538383484
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.20328538119792938
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.18293100595474243
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.17168962955474854
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.15446606278419495
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.14441321790218353
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.1345110535621643
+          "score": 0.24218198657035828
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how express creates the app function and attaches prototype methods",
       "repo_name": "express",
       "category": "architecture",
-      "latency_ms": 16.958300000000236,
+      "latency_ms": 21.70209999999861,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.6647593379020691
+          "score": 0.5791850090026855
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.4424726665019989
+          "score": 0.38459381461143494
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.4096379578113556
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.3025716543197632
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.27284976840019226
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.2575887441635132
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.2556869685649872
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.2556396424770355
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.24856214225292206
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.24833275377750397
+          "score": 0.3032705783843994
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "application",
       "repo_name": "express",
       "category": "symbol",
-      "latency_ms": 17.74200000000019,
+      "latency_ms": 14.426900000002206,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.7857256531715393
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.5896165370941162
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.22383852303028107
+          "score": 0.5234163999557495
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.18546918034553528
+          "score": 0.3937361240386963
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.15374690294265747
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.1507657915353775
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.14297816157341003
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.11844898015260696
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.11028297245502472
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.08973732590675354
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
+          "score": 0.3628218472003937
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.5
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "res.send body encoding and ETag generation",
       "repo_name": "express",
       "category": "semantic",
-      "latency_ms": 17.175600000000486,
+      "latency_ms": 19.27969999999914,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.5654600858688354
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.286972314119339
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.25041618943214417
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.2002878189086914
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.190771222114563
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.16116715967655182
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.1449809968471527
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.1257401555776596
+          "score": 0.3839189410209656
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.1105792447924614
+          "score": 0.3718118667602539
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.1036488264799118
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
+          "score": 0.3559724986553192
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.5
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how app.render resolves views and calls the template engine",
       "repo_name": "express",
       "category": "architecture",
-      "latency_ms": 19.401600000000144,
+      "latency_ms": 16.553899999998976,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.5207687020301819
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.38572096824645996
+          "score": 0.4508534371852875
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.3712059259414673
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.3291132152080536
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.24944600462913513
+          "score": 0.3225235044956207
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.23076361417770386
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.19976696372032166
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.1558043360710144
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.15056122839450836
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.10252422094345093
+          "score": 0.2709181010723114
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "view",
       "repo_name": "express",
       "category": "symbol",
-      "latency_ms": 18.364799999999377,
+      "latency_ms": 17.117000000002008,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.5370844602584839
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.375601589679718
+          "score": 0.5507365465164185
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\view.js",
-          "score": 0.322519987821579
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.15510328114032745
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.11231519281864166
+          "score": 0.5100725889205933
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\application.js",
-          "score": 0.10488499701023102
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\express.js",
-          "score": 0.05263175070285797
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\utils.js",
-          "score": 0.042294010519981384
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\response.js",
-          "score": 0.0253601111471653
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\express\\lib\\request.js",
-          "score": 0.009124713949859142
+          "score": 0.27012988924980164
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how is BaseModel defined and instantiated",
       "repo_name": "pydantic",
       "category": "architecture",
-      "latency_ms": 20.269000000000233,
+      "latency_ms": 16.892199999994773,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generics.py",
-          "score": 0.696185290813446
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_model_construction.py",
-          "score": 0.6897963285446167
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_utils.py",
-          "score": 0.6331335306167603
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\main.py",
+          "score": 0.5749577879905701
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
-          "score": 0.6290477514266968
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\generics.py",
-          "score": 0.6273205280303955
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
-          "score": 0.6269280910491943
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\utils.py",
-          "score": 0.6256475448608398
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\generics.py",
-          "score": 0.6120049953460693
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\mypy.py",
-          "score": 0.5960121154785156
+          "score": 0.5675305724143982
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_model_construction.py",
-          "score": 0.5931771993637085
+          "score": 0.4902283251285553
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.25
+      "mrr": 0.5
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how are model fields declared and constrained",
       "repo_name": "pydantic",
       "category": "architecture",
-      "latency_ms": 21.09219999999914,
+      "latency_ms": 16.24659999999858,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.5204969048500061
+          "score": 0.48256823420524597
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\networks.py",
-          "score": 0.5192432999610901
+          "score": 0.4524487555027008
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
-          "score": 0.516935408115387
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\experimental\\pipeline.py",
-          "score": 0.49306994676589966
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\types.py",
-          "score": 0.49304109811782837
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\experimental\\pipeline.py",
-          "score": 0.4917605221271515
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\experimental\\pipeline.py",
-          "score": 0.4903339445590973
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\generics.py",
-          "score": 0.48379525542259216
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\types.py",
-          "score": 0.47124627232551575
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
-          "score": 0.46603909134864807
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_model_construction.py",
+          "score": 0.45108187198638916
         }
       ],
       "recall_at_k": 0,
       "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "JSON schema generation from models",
       "repo_name": "pydantic",
       "category": "semantic",
-      "latency_ms": 19.46010000000024,
+      "latency_ms": 5.5864999999976135,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.8288000822067261
+          "score": 0.639296293258667
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.8028463125228882
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.7962510585784912
+          "score": 0.6361647844314575
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
-          "score": 0.7945966720581055
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.79023677110672
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\tools.py",
-          "score": 0.7893185615539551
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.7713450193405151
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.766353189945221
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\type_adapter.py",
-          "score": 0.7642051577568054
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.7608382105827332
+          "score": 0.626878023147583
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "custom field and model validators",
       "repo_name": "pydantic",
       "category": "semantic",
-      "latency_ms": 20.836999999999534,
+      "latency_ms": 13.125,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.7086203098297119
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.49004074931144714
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.6697371006011963
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.6693897247314453
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.6545923352241516
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.6338945627212524
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.6229109168052673
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\validators.py",
-          "score": 0.620376467704773
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.6086305975914001
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
-          "score": 0.5950980186462402
+          "score": 0.48653504252433777
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.594061553478241
+          "score": 0.4846913516521454
         }
       ],
       "recall_at_k": 0.5,
-      "mrr": 0.5
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "model configuration and settings",
       "repo_name": "pydantic",
       "category": "semantic",
-      "latency_ms": 18.473400000000765,
+      "latency_ms": 14.974200000004203,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.5839989185333252
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\env_settings.py",
-          "score": 0.5593407154083252
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.5513848066329956
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.5425256490707397
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.5340377688407898
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\env_settings.py",
-          "score": 0.5304205417633057
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\env_settings.py",
-          "score": 0.5297754406929016
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
-          "score": 0.5269598364830017
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\mypy.py",
+          "score": 0.45177826285362244
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\mypy.py",
-          "score": 0.52350914478302
+          "score": 0.44929438829421997
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\mypy.py",
-          "score": 0.5229134559631348
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
+          "score": 0.4478220045566559
         }
       ],
       "recall_at_k": 0,
       "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "BaseModel",
       "repo_name": "pydantic",
       "category": "symbol",
-      "latency_ms": 20.143199999998615,
+      "latency_ms": 15.49989999999525,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
-          "score": 0.8416538834571838
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\main.py",
+          "score": 0.5542452931404114
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\schema.py",
-          "score": 0.8298433423042297
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generics.py",
-          "score": 0.8085964918136597
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\utils.py",
-          "score": 0.7963437438011169
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_import_utils.py",
-          "score": 0.7597533464431763
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_utils.py",
-          "score": 0.7500942349433899
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
+          "score": 0.5261531472206116
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\root_model.py",
-          "score": 0.7445785999298096
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\generics.py",
-          "score": 0.734937310218811
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\generics.py",
-          "score": 0.6984457969665527
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\decorator.py",
-          "score": 0.6977771520614624
+          "score": 0.47607776522636414
         }
       ],
-      "recall_at_k": 0,
-      "mrr": 0
+      "recall_at_k": 1,
+      "mrr": 0.5
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "field_validator",
       "repo_name": "pydantic",
       "category": "symbol",
-      "latency_ms": 20.083999999998923,
+      "latency_ms": 19.521199999995588,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.9033971428871155
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.6180331110954285
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_decorators_v1.py",
-          "score": 0.8724732398986816
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.8510028719902039
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
-          "score": 0.8363494873046875
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.6120931506156921
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.8225189447402954
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
-          "score": 0.8047800660133362
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.8027338981628418
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\deprecated\\class_validators.py",
-          "score": 0.7999516129493713
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.7934228777885437
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\validators.py",
-          "score": 0.7933914661407471
+          "score": 0.4759812355041504
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.14285714285714285
+      "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "model_validator",
       "repo_name": "pydantic",
       "category": "symbol",
-      "latency_ms": 20.386000000000422,
+      "latency_ms": 19.689500000000407,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.9042691588401794
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\main.py",
+          "score": 0.6322544813156128
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
-          "score": 0.8598617911338806
+          "score": 0.6213071942329407
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.8544921875
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.8528130054473877
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\class_validators.py",
-          "score": 0.8360458612442017
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\deprecated\\class_validators.py",
-          "score": 0.7691420912742615
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_decorators_v1.py",
-          "score": 0.769126832485199
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
-          "score": 0.764278769493103
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\deprecated\\class_validators.py",
-          "score": 0.7507539987564087
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_decorators.py",
-          "score": 0.7466378808021545
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\functional_validators.py",
+          "score": 0.6209689378738403
         }
       ],
       "recall_at_k": 1,
-      "mrr": 1
+      "mrr": 0.5
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "ConfigDict",
       "repo_name": "pydantic",
       "category": "symbol",
-      "latency_ms": 17.961100000000442,
+      "latency_ms": 16.95119999999588,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
-          "score": 0.9012787342071533
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
-          "score": 0.7906070351600647
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.7605302333831787
+          "score": 0.5625471472740173
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\config.py",
-          "score": 0.6944754719734192
+          "score": 0.5450184345245361
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\config.py",
-          "score": 0.670769989490509
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\mypy.py",
-          "score": 0.668156623840332
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.6588155031204224
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.5814435482025146
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.5788211822509766
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
-          "score": 0.5770905613899231
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_config.py",
+          "score": 0.44313204288482666
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.25
+      "mrr": 0.5
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Field",
       "repo_name": "pydantic",
       "category": "symbol",
-      "latency_ms": 20.03859999999986,
+      "latency_ms": 15.898300000000745,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_generate_schema.py",
-          "score": 0.6985737085342407
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\config.py",
-          "score": 0.6930398344993591
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\env_settings.py",
-          "score": 0.6754339933395386
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\json_schema.py",
-          "score": 0.6702184677124023
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_discriminated_union.py",
-          "score": 0.65718013048172
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\typing.py",
-          "score": 0.6567991375923157
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\_internal\\_signature.py",
-          "score": 0.6512206196784973
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\env_settings.py",
-          "score": 0.6498764753341675
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\validators.py",
-          "score": 0.6487376093864441
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\fields.py",
+          "score": 0.5044761300086975
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\fields.py",
-          "score": 0.645910382270813
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 0.1
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "Serialize and Serializer trait definitions",
-      "repo_name": "serde",
-      "category": "architecture",
-      "latency_ms": 18.299999999999272,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
-          "score": 0.8583226799964905
+          "score": 0.5005797743797302
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.8187772035598755
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7982803583145142
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7905638813972473
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7824668884277344
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7731463313102722
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7728355526924133
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7557263374328613
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.7534849643707275
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.752146303653717
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 0.5
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "Deserialize and Deserializer trait definitions",
-      "repo_name": "serde",
-      "category": "architecture",
-      "latency_ms": 19.898000000001048,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
-          "score": 0.8676093816757202
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.8302067518234253
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.8042944669723511
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.8021295666694641
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.7951915264129639
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.7899022698402405
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.7896155118942261
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.7889360189437866
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.7889360189437866
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.7875910997390747
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 0.5
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "Visitor pattern for deserializer implementations",
-      "repo_name": "serde",
-      "category": "architecture",
-      "latency_ms": 17.281300000000556,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6613078117370605
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6613078117370605
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6613078117370605
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6490298509597778
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6485970616340637
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6483386754989624
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6483386754989624
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6387781500816345
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.6371797323226929
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.6292458772659302
-        }
-      ],
-      "recall_at_k": 0,
-      "mrr": 0
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
-      "repo_name": "serde",
-      "category": "architecture",
-      "latency_ms": 20.250200000000405,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 1.0380605459213257
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 1.0246472358703613
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
-          "score": 0.8804445862770081
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
-          "score": 0.8801109194755554
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
-          "score": 0.8786585927009583
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\with\\incorrect_type.rs",
-          "score": 0.8552404642105103
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.8306896686553955
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
-          "score": 0.8288818001747131
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.8259546756744385
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\name.rs",
-          "score": 0.8161337971687317
-        }
-      ],
-      "recall_at_k": 0,
-      "mrr": 0
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "how derive macros generate Deserialize code for structs and enums",
-      "repo_name": "serde",
-      "category": "architecture",
-      "latency_ms": 19.911799999999857,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\mod.rs",
-          "score": 0.6868284344673157
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\enum_externally.rs",
-          "score": 0.6575725674629211
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
-          "score": 0.647787868976593
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
-          "score": 0.644682765007019
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
-          "score": 0.6342166066169739
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\tuple.rs",
-          "score": 0.6225739121437073
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\tuple.rs",
-          "score": 0.6182886362075806
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\no_std\\src\\main.rs",
-          "score": 0.6164733171463013
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\enum_internally.rs",
-          "score": 0.6144222617149353
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
-          "score": 0.6109650135040283
-        }
-      ],
-      "recall_at_k": 0,
-      "mrr": 0
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "Serialize",
-      "repo_name": "serde",
-      "category": "symbol",
-      "latency_ms": 20.313000000000102,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.9032138586044312
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.8879685997962952
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
-          "score": 0.8587064146995544
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.8464025259017944
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
-          "score": 0.8459166884422302
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.8382479548454285
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
-          "score": 0.837942898273468
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\name.rs",
-          "score": 0.8230311870574951
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\regression\\issue2415.rs",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\borrow\\no_lifetimes.rs",
-          "score": 0.25
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\pydantic\\pydantic\\v1\\fields.py",
+          "score": 0.49540072679519653
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
-      "query": "Deserialize",
+      "mode": "openai-embed",
+      "query": "Serialize and Serializer trait definitions",
       "repo_name": "serde",
-      "category": "symbol",
-      "latency_ms": 18.750300000001516,
+      "category": "architecture",
+      "latency_ms": 18.37659999999596,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.8885048031806946
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "score": 0.5842576622962952
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
-          "score": 0.8675325512886047
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "score": 0.5243884921073914
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
+          "score": 0.5001405477523804
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "openai-embed",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 4.192199999997683,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "score": 0.587069034576416
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.8667957782745361
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\private\\seed.rs",
-          "score": 0.8552883863449097
+          "score": 0.5484796762466431
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.8541885018348694
+          "score": 0.5257982611656189
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "openai-embed",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 15.199099999997998,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.6166396141052246
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.8511612415313721
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.5992506742477417
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
-          "score": 0.8494470119476318
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
-          "score": 0.8465458750724792
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
-          "score": 0.8419314622879028
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\bytes\\mod.rs",
-          "score": 0.8391531109809875
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "score": 0.5974292159080505
         }
       ],
       "recall_at_k": 1,
       "mrr": 0.3333333333333333
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 18.695000000006985,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
+          "score": 0.6702196598052979
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "score": 0.6658145785331726
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de.rs",
+          "score": 0.6601040363311768
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5
+    },
+    {
+      "mode": "openai-embed",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 16.608299999999872,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "score": 0.6470543146133423
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
+          "score": 0.620071530342102
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "score": 0.6114522218704224
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "openai-embed",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 15.364900000000489,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\regression\\issue2844.rs",
+          "score": 0.5375202298164368
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "score": 0.5323352217674255
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "score": 0.5286866426467896
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "openai-embed",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 18.313300000001618,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\regression\\issue2846.rs",
+          "score": 0.5769170522689819
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\regression\\issue2844.rs",
+          "score": 0.5721802115440369
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.5425820350646973
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "openai-embed",
       "query": "Serializer",
       "repo_name": "serde",
       "category": "symbol",
-      "latency_ms": 19.03899999999885,
+      "latency_ms": 13.351999999998952,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.8026782274246216
+          "score": 0.5078936219215393
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
-          "score": 0.7910224795341492
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
-          "score": 0.7886665463447571
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
-          "score": 0.7554815411567688
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7457529902458191
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7441186904907227
+          "score": 0.5065740942955017
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\regression\\issue2415.rs",
           "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\borrow\\no_lifetimes.rs",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\conflict\\from-try-from.rs",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\ui\\default-attribute\\enum.rs",
-          "score": 0.25
         }
       ],
-      "recall_at_k": 1,
-      "mrr": 0.2
+      "recall_at_k": 0,
+      "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Visitor",
       "repo_name": "serde",
       "category": "symbol",
-      "latency_ms": 21.311499999999796,
+      "latency_ms": 14.012699999999313,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
-          "score": 0.735815703868866
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.48396000266075134
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "score": 0.47639480233192444
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.7025079727172852
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
-          "score": 0.7025079131126404
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
-          "score": 0.6584910750389099
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_ignored_any.rs",
-          "score": 0.6484110951423645
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.6082531809806824
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\CONTRIBUTING.md",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\LICENSE-APACHE",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\Cargo.toml",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\lib.rs",
-          "score": 0.25
+          "score": 0.4584183394908905
         }
       ],
-      "recall_at_k": 1,
-      "mrr": 0.16666666666666666
+      "recall_at_k": 0,
+      "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how serde handles sequences and maps during serialization",
       "repo_name": "serde",
       "category": "architecture",
-      "latency_ms": 19.78939999999966,
+      "latency_ms": 17.027000000001863,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.7274967432022095
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5627939105033875
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6923951506614685
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "score": 0.5244029760360718
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.6589064598083496
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6545771360397339
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
-          "score": 0.6518792510032654
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6482512950897217
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6321181654930115
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6226850748062134
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
-          "score": 0.6172935962677002
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
-          "score": 0.6161504983901978
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "score": 0.5152946710586548
         }
       ],
-      "recall_at_k": 1,
-      "mrr": 1
+      "recall_at_k": 0,
+      "mrr": 0
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how routes are grouped and registered",
       "repo_name": "gin",
       "category": "architecture",
-      "latency_ms": 17.92110000000139,
+      "latency_ms": 12.646999999997206,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.6792765259742737
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.5945106148719788
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.5876558423042297
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.5677809715270996
+          "score": 0.5388259291648865
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5643224716186523
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
-          "score": 0.5551849007606506
+          "score": 0.5120143890380859
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5539429783821106
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.553866446018219
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5234672427177429
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5105634331703186
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 1
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "radix tree path matching",
-      "repo_name": "gin",
-      "category": "semantic",
-      "latency_ms": 16.81079999999929,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.4564127027988434
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.4005812406539917
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.39970964193344116
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.3935179114341736
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.3819586932659149
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.3742530047893524
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree.go",
-          "score": 0.3730151355266571
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.3713689148426056
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree.go",
-          "score": 0.36853793263435364
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
-          "score": 0.36335259675979614
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 0.14285714285714285
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "request context lifecycle and helpers",
-      "repo_name": "gin",
-      "category": "semantic",
-      "latency_ms": 19.253500000000713,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.5331538915634155
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.5278592705726624
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.5261243581771851
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.5106523633003235
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
-          "score": 0.5105047225952148
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
-          "score": 0.4951212704181671
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
-          "score": 0.4718402326107025
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.44791048765182495
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.44503334164619446
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
-          "score": 0.4416329860687256
-        }
-      ],
-      "recall_at_k": 1,
-      "mrr": 1
-    },
-    {
-      "mode": "model2vec+rerank",
-      "query": "JSON request binding and validation",
-      "repo_name": "gin",
-      "category": "architecture",
-      "latency_ms": 18.311999999999898,
-      "results": [
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
-          "score": 0.7679491639137268
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
-          "score": 0.7074174880981445
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.672469437122345
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.6516157984733582
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding.go",
-          "score": 0.6331127882003784
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_nomsgpack.go",
-          "score": 0.6122732162475586
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
-          "score": 0.603998601436615
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
-          "score": 0.6019231081008911
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
-          "score": 0.6002495288848877
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
-          "score": 0.592663049697876
+          "score": 0.4868388772010803
         }
       ],
       "recall_at_k": 0.5,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
+      "query": "radix tree path matching",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 18.08310000000347,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.41554197669029236
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.4082305133342743
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\tree_test.go",
+          "score": 0.40807193517684937
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0
+    },
+    {
+      "mode": "openai-embed",
+      "query": "request context lifecycle and helpers",
+      "repo_name": "gin",
+      "category": "semantic",
+      "latency_ms": 16.172000000005937,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.45717883110046387
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
+          "score": 0.4485284984111786
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
+          "score": 0.4205506145954132
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1
+    },
+    {
+      "mode": "openai-embed",
+      "query": "JSON request binding and validation",
+      "repo_name": "gin",
+      "category": "architecture",
+      "latency_ms": 14.287900000010268,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
+          "score": 0.6873303055763245
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\json.go",
+          "score": 0.5446593761444092
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\binding_test.go",
+          "score": 0.5009921193122864
+        }
+      ],
+      "recall_at_k": 0.5,
+      "mrr": 1
+    },
+    {
+      "mode": "openai-embed",
       "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
       "repo_name": "gin",
       "category": "architecture",
-      "latency_ms": 18.625599999999395,
+      "latency_ms": 17.61930000000575,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.7005699872970581
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.672825813293457
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.6578178405761719
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5715393424034119
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.5642143487930298
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.5590109825134277
-        },
-        {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.5025246739387512
+          "score": 0.597702145576477
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
-          "score": 0.47711092233657837
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
+          "score": 0.5955178141593933
         },
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.4696851968765259
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins_test.go",
-          "score": 0.4657858908176422
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
+          "score": 0.551418662071228
         }
       ],
-      "recall_at_k": 1,
-      "mrr": 0.3333333333333333
+      "recall_at_k": 0.3333333333333333,
+      "mrr": 0.5
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Engine",
       "repo_name": "gin",
       "category": "symbol",
-      "latency_ms": 18.64760000000024,
+      "latency_ms": 12.377100000012433,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.7595325112342834
+          "score": 0.6285409331321716
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\binding\\default_validator.go",
+          "score": 0.5425362586975098
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.7202956080436707
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.5096592307090759
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.4983580410480499
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\CHANGELOG.md",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\CONTRIBUTING.md",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\Makefile",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\README.md",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\auth.go",
-          "score": 0.25
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\benchmarks_test.go",
-          "score": 0.25
+          "score": 0.4896911680698395
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "Context",
       "repo_name": "gin",
       "category": "symbol",
-      "latency_ms": 19.48439999999937,
+      "latency_ms": 13.175900000002002,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.8407130241394043
+          "score": 0.6230374574661255
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.8122097849845886
+          "score": 0.4537833034992218
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
-          "score": 0.7918695211410522
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.7690113186836243
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
-          "score": 0.74179607629776
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context_test.go",
-          "score": 0.674903929233551
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\test_helpers.go",
-          "score": 0.6661174893379211
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_integration_test.go",
-          "score": 0.6016070246696472
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.5721580982208252
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.5221339464187622
+          "score": 0.40031054615974426
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "RouterGroup",
       "repo_name": "gin",
       "category": "symbol",
-      "latency_ms": 18.43000000000029,
+      "latency_ms": 13.591400000004796,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.9765868782997131
+          "score": 0.8436353802680969
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.9260860085487366
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.7472864389419556
+          "score": 0.8383029103279114
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
-          "score": 0.739831268787384
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
-          "score": 0.6525182723999023
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.5594044923782349
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins_test.go",
-          "score": 0.5226762890815735
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.5194205641746521
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.5159606337547302
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\.goreleaser.yaml",
-          "score": 0.25
+          "score": 0.6705154180526733
         }
       ],
       "recall_at_k": 1,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "how middleware is applied globally and to route groups",
       "repo_name": "gin",
       "category": "architecture",
-      "latency_ms": 20.102700000001278,
+      "latency_ms": 15.08289999999397,
       "results": [
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.809698760509491
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin.go",
-          "score": 0.7932805418968201
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.780617356300354
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.7497998476028442
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\ginS\\gins.go",
-          "score": 0.7462282776832581
+          "score": 0.5561520457267761
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.7073854804039001
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.7045968770980835
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.6907694339752197
+          "score": 0.5398832559585571
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.6415478587150574
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.6155604720115662
+          "score": 0.47943374514579773
         }
       ],
-      "recall_at_k": 1,
+      "recall_at_k": 0.5,
       "mrr": 1
     },
     {
-      "mode": "model2vec+rerank",
+      "mode": "openai-embed",
       "query": "catching runtime panics in request handlers and returning 500",
       "repo_name": "gin",
       "category": "semantic",
-      "latency_ms": 19.571599999999307,
+      "latency_ms": 15.890499999994063,
       "results": [
         {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.5150955319404602
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup_test.go",
-          "score": 0.49285563826560974
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\utils.go",
-          "score": 0.4775177538394928
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.47010311484336853
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery_test.go",
+          "score": 0.345282644033432
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery.go",
-          "score": 0.46742910146713257
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.46096667647361755
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\routergroup.go",
-          "score": 0.4590591490268707
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\gin_test.go",
-          "score": 0.4545520842075348
+          "score": 0.3436572253704071
         },
         {
           "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\recovery_test.go",
-          "score": 0.4514234960079193
-        },
-        {
-          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\gin\\context.go",
-          "score": 0.44539323449134827
+          "score": 0.3409043252468109
         }
       ],
       "recall_at_k": 1,
-      "mrr": 0.2
+      "mrr": 0.5
     }
   ],
   "aggregate": {
-    "model2vec+rerank": {
-      "recall": 0.8,
-      "mrr": 0.5473809523809523,
+    "openai-embed": {
+      "recall": 0.6666666666666665,
+      "mrr": 0.6,
       "count": 50,
-      "mean_latency_ms": 19.513570000000026
+      "mean_latency_ms": 16.86435800000043
     }
   },
   "by_category": {
     "architecture": {
-      "model2vec+rerank": {
-        "recall": 0.725,
-        "mrr": 0.5375,
+      "openai-embed": {
+        "recall": 0.6416666666666667,
+        "mrr": 0.55,
         "count": 20
       }
     },
     "semantic": {
-      "model2vec+rerank": {
-        "recall": 0.7916666666666666,
-        "mrr": 0.5563492063492064,
+      "openai-embed": {
+        "recall": 0.7083333333333334,
+        "mrr": 0.7083333333333334,
         "count": 12
       }
     },
     "symbol": {
-      "model2vec+rerank": {
-        "recall": 0.8888888888888888,
-        "mrr": 0.5523809523809524,
+      "openai-embed": {
+        "recall": 0.6666666666666666,
+        "mrr": 0.5833333333333334,
         "count": 18
       }
     }
   },
   "by_repo": {
     "axum": {
-      "model2vec+rerank": {
-        "recall": 0.7,
-        "mrr": 0.425,
+      "openai-embed": {
+        "recall": 0.6,
+        "mrr": 0.4666666666666666,
         "count": 10
       }
     },
     "express": {
-      "model2vec+rerank": {
+      "openai-embed": {
         "recall": 1,
-        "mrr": 0.85,
+        "mrr": 1,
         "count": 10
       }
     },
     "pydantic": {
-      "model2vec+rerank": {
-        "recall": 0.65,
-        "mrr": 0.3242857142857143,
+      "openai-embed": {
+        "recall": 0.75,
+        "mrr": 0.6,
         "count": 10
       }
     },
     "serde": {
-      "model2vec+rerank": {
-        "recall": 0.7,
-        "mrr": 0.37,
+      "openai-embed": {
+        "recall": 0.3,
+        "mrr": 0.13333333333333333,
         "count": 10
       }
     },
     "gin": {
-      "model2vec+rerank": {
-        "recall": 0.95,
-        "mrr": 0.7676190476190476,
+      "openai-embed": {
+        "recall": 0.6833333333333333,
+        "mrr": 0.8,
         "count": 10
       }
     }

@@ -875,4 +875,226 @@ mod tests {
         let url = build_rerank_endpoint("http://127.0.0.1:8080/v1/", "rerank");
         assert_eq!(url, "http://127.0.0.1:8080/v1/rerank");
     }
+
+    /// End-to-end integration test: verify that `rerank_max_candidate_chars`
+    /// truncates snippets in the actual HTTP request body sent to the reranker.
+    ///
+    /// Sets up a mock HTTP server that captures the incoming request body,
+    /// configures rerank with `rerank_max_candidate_chars=10`, and asserts
+    /// that the prompt embedded in the HTTP body contains only 10 characters
+    /// of each candidate's snippet — proving truncation reaches the wire,
+    /// not just the config layer.
+    #[test]
+    fn rerank_truncation_reaches_http_body_e2e() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::thread;
+
+        // Spin up a mock reranker that captures the request body and returns
+        // a valid JSON response so `rerank_chat` completes successfully.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock reranker");
+        let addr = listener.local_addr().expect("mock reranker addr");
+        let (tx, rx) = mpsc::channel::<String>();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept rerank request");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read rerank request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        for line in String::from_utf8_lossy(&buf[..pos + 4]).lines() {
+                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            // Extract just the body (after headers).
+            let body_start = header_end.unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+            let _ = tx.send(body);
+
+            // Return a valid rerank response: [1, 0] (reverse order).
+            let resp_body = r#"{"choices":[{"message":{"content":"[1, 0]"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write rerank response");
+        });
+
+        // Configure rerank with max_candidate_chars=10.
+        let config = SemanticBackendConfig {
+            rerank_enabled: true,
+            rerank_base_url: Some(format!("http://{}", addr)),
+            rerank_max_candidate_chars: 10,
+            rerank_timeout_ms: 5_000,
+            ..SemanticBackendConfig::default()
+        };
+
+        // Create two results with 100-char snippets.
+        let mut r0 = make_result(0);
+        r0.snippet = "A".repeat(100);
+        let mut r1 = make_result(1);
+        r1.snippet = "B".repeat(100);
+        let results = vec![r0, r1];
+
+        let outcome = rerank_candidates(&config, "test query", &results);
+
+        // The reranker should succeed and return [1, 0].
+        match outcome {
+            RerankOutcome::ReRanked(indices) => assert_eq!(indices, vec![1, 0]),
+            other => panic!("expected ReRanked([1, 0]), got {other:?}"),
+        }
+
+        handle.join().expect("mock reranker thread");
+
+        // Verify the captured request body contains truncated snippets.
+        let captured_body = rx.recv().expect("should receive request body");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&captured_body).expect("request body should be valid JSON");
+        let prompt = parsed["messages"][0]["content"]
+            .as_str()
+            .expect("prompt should be a string");
+
+        // With max_candidate_chars=10, each candidate's snippet should be
+        // at most 10 characters in the prompt text.
+        // "A".repeat(100) truncated to 10 chars = "AAAAAAAAAA" (10 chars).
+        assert!(
+            prompt.contains(&"A".repeat(10)),
+            "prompt should contain truncated snippet 'AAAAAAAAAA': {prompt}"
+        );
+        // The full 100-char snippet must NOT appear.
+        assert!(
+            !prompt.contains(&"A".repeat(100)),
+            "prompt must NOT contain full 100-char snippet"
+        );
+        assert!(
+            prompt.contains(&"B".repeat(10)),
+            "prompt should contain truncated snippet 'BBBBBBBBBB': {prompt}"
+        );
+        assert!(
+            !prompt.contains(&"B".repeat(100)),
+            "prompt must NOT contain full 100-char snippet"
+        );
+    }
+
+    /// End-to-end integration test: verify that `rerank_max_candidate_chars_cross_encoder`
+    /// truncates document snippets in the cross-encoder `/v1/rerank` request body.
+    #[test]
+    fn cross_encoder_truncation_reaches_http_body_e2e() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock reranker");
+        let addr = listener.local_addr().expect("mock reranker addr");
+        let (tx, rx) = mpsc::channel::<String>();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept rerank request");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read rerank request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        for line in String::from_utf8_lossy(&buf[..pos + 4]).lines() {
+                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+            let body_start = header_end.unwrap_or(buf.len());
+            let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+            let _ = tx.send(body);
+
+            let resp_body = r#"{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.7}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write rerank response");
+        });
+
+        let config = SemanticBackendConfig {
+            rerank_enabled: true,
+            rerank_api_type: RerankApiType::Rerank,
+            rerank_base_url: Some(format!("http://{}", addr)),
+            rerank_max_candidate_chars_cross_encoder: 10,
+            rerank_timeout_ms: 5_000,
+            ..SemanticBackendConfig::default()
+        };
+
+        let mut r0 = make_result(0);
+        r0.snippet = "C".repeat(200);
+        let mut r1 = make_result(1);
+        r1.snippet = "D".repeat(200);
+        let results = vec![r0, r1];
+
+        let outcome = rerank_candidates(&config, "test query", &results);
+        match outcome {
+            RerankOutcome::ReRanked(indices) => assert_eq!(indices, vec![1, 0]),
+            other => panic!("expected ReRanked([1, 0]), got {other:?}"),
+        }
+
+        handle.join().expect("mock reranker thread");
+
+        let captured_body = rx.recv().expect("should receive request body");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&captured_body).expect("request body should be valid JSON");
+        let documents = parsed["documents"].as_array().expect("documents array");
+        assert_eq!(documents.len(), 2);
+
+        for doc in documents {
+            let doc_str = doc.as_str().expect("document should be a string");
+            // Each document should contain at most 10 chars of the snippet.
+            assert!(
+                !doc_str.contains(&"C".repeat(20)),
+                "document must NOT contain 20+ chars of snippet: {doc_str}"
+            );
+            assert!(
+                !doc_str.contains(&"D".repeat(20)),
+                "document must NOT contain 20+ chars of snippet: {doc_str}"
+            );
+        }
+    }
 }
