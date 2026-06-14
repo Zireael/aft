@@ -17,7 +17,7 @@
  *   --binary <path>      AFT binary path (default: auto-detect)
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { aftNdjson } from "./aft-ndjson";
 
@@ -93,7 +93,7 @@ function recallAtK(
   relevant: string[],
   k: number
 ): number {
-  if (relevant.length === 0) return 0;
+  if (!retrieved || relevant.length === 0) return 0;
   const rPaths = new Set(
     retrieved.slice(0, k).map((r) => normalizePath(r.file))
   );
@@ -111,6 +111,7 @@ function recallAtK(
 }
 
 function mrr(retrieved: Fts5Result[], relevant: string[]): number {
+  if (!retrieved) return 0;
   for (let i = 0; i < retrieved.length; i++) {
     const rf = normalizePath(retrieved[i].file);
     for (const r of relevant) {
@@ -219,6 +220,16 @@ async function main() {
   );
 
   const allResults: QueryResult[] = [];
+
+  // Verify binary exists
+  try {
+    statSync(binaryPath);
+  } catch {
+    console.error(`\nERROR: AFT binary not found at: ${binaryPath}`);
+    console.error(`Pass --binary <path> to the aft binary, or build with:`);
+    console.error(`  cargo build --release --features semantic-fts5`);
+    process.exit(1);
+  }
 
   for (const ann of fixture.annotations) {
     const repo = fixture.repos.find((r) => r.name === ann.repo_name);
