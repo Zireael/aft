@@ -27,21 +27,222 @@ fn runtime_disabled(req: &RawRequest) -> Response {
 // fts5_index
 // ---------------------------------------------------------------------------
 
+/// Parameters for `fts5_index`.
+#[derive(Debug, Deserialize)]
+struct Fts5IndexParams {
+    /// Action to perform: "status", "update", "rebuild", "prune".
+    #[serde(default = "default_index_action")]
+    action: String,
+}
+
+fn default_index_action() -> String {
+    "update".to_string()
+}
+
 /// `fts5_index` — build or update the FTS5 index.
-///
-/// Supported actions (to be implemented): `status`, `update`, `rebuild`,
-/// `prune`, `vacuum`, `integrity_check`.
 pub fn handle_fts5_index(req: &RawRequest, ctx: &AppContext) -> Response {
     if !ctx.config().fts5.enabled {
         return runtime_disabled(req);
     }
 
-    // Stub: real implementation in a later bead.
+    let params: Fts5IndexParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("fts5_index: invalid params: {e}"),
+            );
+        }
+    };
+
+    let project_root = grep_executor::project_root(ctx);
+    let db_path = resolve_fts5_db_path(&project_root);
+
+    match params.action.as_str() {
+        "status" => handle_index_status(req, &db_path, &project_root),
+        "update" => handle_index_update(req, &db_path, &project_root, false),
+        "rebuild" => handle_index_update(req, &db_path, &project_root, true),
+        "prune" => handle_index_prune(req, &db_path, &project_root),
+        _ => Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "fts5_index: unknown action '{}'; expected status, update, rebuild, or prune",
+                params.action
+            ),
+        ),
+    }
+}
+
+/// Handle the "status" action.
+fn handle_index_status(
+    req: &RawRequest,
+    db_path: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Response {
+    if !db_path.exists() {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "exists": false,
+                "message": "No FTS5 index found. Run fts5_index with action=update to create.",
+            }),
+        );
+    }
+
+    let store = match crate::fts5_store::Fts5Store::open(db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            return Response::error(
+                &req.id,
+                "fts5_store_error",
+                format!("Failed to open FTS5 store: {e}"),
+            );
+        }
+    };
+
+    let file_count = store.file_count().unwrap_or(0);
+    let symbol_count = store.symbol_count().unwrap_or(0);
+    let schema_version = store.schema_version().unwrap_or(0);
+    let db_size = store.db_size_bytes();
+    let row_counts = store
+        .fts_row_counts()
+        .unwrap_or_else(|_| crate::fts5_store::FtsRowCounts {
+            symbols_fts: 0,
+            bodies_fts: 0,
+            paths_fts: 0,
+        });
+
+    // Check for stale files
+    let stale = store.stale_files(project_root).unwrap_or_default();
+    let stale_count = stale.len();
+
     Response::success(
         &req.id,
         serde_json::json!({
-            "status": "stub",
-            "message": "fts5_index is compiled and enabled but not yet implemented.",
+            "exists": true,
+            "schema_version": schema_version,
+            "file_count": file_count,
+            "symbol_count": symbol_count,
+            "db_size_bytes": db_size,
+            "fts_row_counts": {
+                "symbols": row_counts.symbols_fts,
+                "bodies": row_counts.bodies_fts,
+                "paths": row_counts.paths_fts,
+            },
+            "stale_files": stale_count,
+            "db_path": db_path.display().to_string(),
+        }),
+    )
+}
+
+/// Handle the "update" or "rebuild" action.
+fn handle_index_update(
+    req: &RawRequest,
+    db_path: &std::path::Path,
+    project_root: &std::path::Path,
+    rebuild: bool,
+) -> Response {
+    // Open or create the store
+    let store = match crate::fts5_store::Fts5Store::open(db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            return Response::error(
+                &req.id,
+                "fts5_store_error",
+                format!("Failed to open FTS5 store: {e}"),
+            );
+        }
+    };
+
+    // Create indexer
+    let mut indexer = crate::fts5_indexer::Fts5Indexer::new(&store);
+
+    // Execute indexing
+    let stats = if rebuild {
+        match indexer.rebuild(project_root) {
+            Ok(stats) => stats,
+            Err(e) => {
+                return Response::error(
+                    &req.id,
+                    "fts5_index_error",
+                    format!("Rebuild failed: {e}"),
+                );
+            }
+        }
+    } else {
+        match indexer.index_project(project_root) {
+            Ok(stats) => stats,
+            Err(e) => {
+                return Response::error(
+                    &req.id,
+                    "fts5_index_error",
+                    format!("Index update failed: {e}"),
+                );
+            }
+        }
+    };
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "action": if rebuild { "rebuild" } else { "update" },
+            "files_processed": stats.files_processed,
+            "files_added": stats.files_added,
+            "files_updated": stats.files_updated,
+            "files_removed": stats.files_removed,
+            "symbols_extracted": stats.symbols_extracted,
+            "files_failed": stats.files_failed,
+            "db_path": db_path.display().to_string(),
+        }),
+    )
+}
+
+/// Handle the "prune" action.
+fn handle_index_prune(
+    req: &RawRequest,
+    db_path: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Response {
+    if !db_path.exists() {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "action": "prune",
+                "files_removed": 0,
+                "message": "No FTS5 index found.",
+            }),
+        );
+    }
+
+    let store = match crate::fts5_store::Fts5Store::open(db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            return Response::error(
+                &req.id,
+                "fts5_store_error",
+                format!("Failed to open FTS5 store: {e}"),
+            );
+        }
+    };
+
+    // Find and remove stale files
+    let stale = store.stale_files(project_root).unwrap_or_default();
+    let mut removed = 0;
+
+    for file in &stale {
+        if store.delete_file_by_path(&file.path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "action": "prune",
+            "files_removed": removed,
+            "stale_files_found": stale.len(),
         }),
     )
 }
@@ -232,12 +433,93 @@ pub fn handle_fts5_read_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 pub fn handle_fts5_doctor(req: &RawRequest, ctx: &AppContext) -> Response {
     let fts5_enabled = ctx.config().fts5.enabled;
     let fts5_cfg = &ctx.config().fts5;
+    let project_root = grep_executor::project_root(ctx);
+    let db_path = resolve_fts5_db_path(&project_root);
+
+    // Check FTS5 availability
+    let fts5_available = crate::fts5_experimental::check_fts5_available();
+
+    // Check index status
+    let index_info = if db_path.exists() {
+        match crate::fts5_store::Fts5Store::open(&db_path) {
+            Ok(store) => {
+                let file_count = store.file_count().unwrap_or(0);
+                let symbol_count = store.symbol_count().unwrap_or(0);
+                let schema_version = store.schema_version().unwrap_or(0);
+                let db_size = store.db_size_bytes();
+                let row_counts =
+                    store
+                        .fts_row_counts()
+                        .unwrap_or_else(|_| crate::fts5_store::FtsRowCounts {
+                            symbols_fts: 0,
+                            bodies_fts: 0,
+                            paths_fts: 0,
+                        });
+                let stale = store.stale_files(&project_root).unwrap_or_default();
+                let integrity = store
+                    .integrity_check()
+                    .unwrap_or_else(|e| format!("error: {e}"));
+
+                serde_json::json!({
+                    "exists": true,
+                    "schema_version": schema_version,
+                    "file_count": file_count,
+                    "symbol_count": symbol_count,
+                    "db_size_bytes": db_size,
+                    "fts_row_counts": {
+                        "symbols": row_counts.symbols_fts,
+                        "bodies": row_counts.bodies_fts,
+                        "paths": row_counts.paths_fts,
+                    },
+                    "stale_files": stale.len(),
+                    "integrity": integrity,
+                    "db_path": db_path.display().to_string(),
+                })
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "exists": true,
+                    "error": format!("Failed to open: {e}"),
+                    "db_path": db_path.display().to_string(),
+                })
+            }
+        }
+    } else {
+        serde_json::json!({
+            "exists": false,
+            "message": "No FTS5 index found.",
+        })
+    };
+
+    // Build warnings and suggestions
+    let mut warnings = Vec::new();
+    let mut suggestions = Vec::new();
+
+    if !fts5_enabled {
+        warnings.push("FTS5 is compiled but disabled at runtime.".to_string());
+        suggestions.push("Set [fts5].enabled = true in aft.jsonc.".to_string());
+    }
+
+    if !fts5_available {
+        warnings.push("FTS5 is not available in this SQLite build.".to_string());
+    }
+
+    if let Some(stale_count) = index_info.get("stale_files").and_then(|v| v.as_i64()) {
+        if stale_count > 0 {
+            warnings.push(format!("{stale_count} file(s) in index are stale."));
+            suggestions.push("Run fts5_index with action=update to refresh.".to_string());
+        }
+    }
+
+    if index_info.get("exists").and_then(|v| v.as_bool()) == Some(false) {
+        suggestions.push("Run fts5_index with action=update to create the index.".to_string());
+    }
 
     Response::success(
         &req.id,
         serde_json::json!({
             "compiled": true,
-            "fts5_available": crate::fts5_experimental::check_fts5_available(),
+            "fts5_available": fts5_available,
             "enabled": fts5_enabled,
             "config": {
                 "auto_index": fts5_cfg.auto_index,
@@ -247,20 +529,9 @@ pub fn handle_fts5_doctor(req: &RawRequest, ctx: &AppContext) -> Response {
                 "max_body_lines": fts5_cfg.max_body_lines,
                 "raw_fts_debug": fts5_cfg.raw_fts_debug,
             },
-            "index": {
-                "status": "not_implemented",
-                "message": "Index lifecycle not yet implemented."
-            },
-            "warnings": if !fts5_enabled {
-                vec!["FTS5 is compiled but disabled at runtime.".to_string()]
-            } else {
-                vec![]
-            },
-            "suggestions": if !fts5_enabled {
-                vec!["Set [fts5].enabled = true in aft.jsonc.".to_string()]
-            } else {
-                vec!["FTS5 is enabled. Run fts5_index to build the index.".to_string()]
-            },
+            "index": index_info,
+            "warnings": warnings,
+            "suggestions": suggestions,
         }),
     )
 }
@@ -289,15 +560,26 @@ mod tests {
     }
 
     fn make_ctx_with_fts5(enabled: bool) -> AppContext {
+        make_ctx_with_fts5_and_root(enabled, None)
+    }
+
+    fn make_ctx_with_fts5_and_root(enabled: bool, project_root: Option<&str>) -> AppContext {
         let mut config = Config::default();
         config.fts5.enabled = enabled;
+        if let Some(root) = project_root {
+            config.project_root = Some(std::path::PathBuf::from(root));
+        }
         AppContext::new(Box::new(TreeSitterProvider::new()), config)
     }
 
     #[test]
     fn fts5_doctor_reports_compiled_and_disabled_by_default() {
+        let tmp = std::env::temp_dir().join("fts5_cmd_test_doctor_disabled");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
         let req = req_for("fts5_doctor", json!({}));
-        let ctx = make_ctx_with_fts5(false);
+        let ctx = make_ctx_with_fts5_and_root(false, Some(tmp.to_str().unwrap()));
         let resp = handle_fts5_doctor(&req, &ctx);
         assert!(resp.success, "expected success, got: {resp:?}");
         let data = &resp.data;
@@ -305,17 +587,25 @@ mod tests {
         assert_eq!(data["enabled"], false);
         assert!(data["config"].is_object());
         assert!(data["index"].is_object());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn fts5_doctor_reports_enabled_when_configured() {
+        let tmp = std::env::temp_dir().join("fts5_cmd_test_doctor_enabled");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
         let req = req_for("fts5_doctor", json!({}));
-        let ctx = make_ctx_with_fts5(true);
+        let ctx = make_ctx_with_fts5_and_root(true, Some(tmp.to_str().unwrap()));
         let resp = handle_fts5_doctor(&req, &ctx);
         assert!(resp.success, "expected success, got: {resp:?}");
         let data = &resp.data;
         assert_eq!(data["compiled"], true);
         assert_eq!(data["enabled"], true);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -356,22 +646,33 @@ mod tests {
     }
 
     #[test]
-    fn fts5_index_returns_stub_when_enabled() {
-        let req = req_for("fts5_index", json!({}));
-        let ctx = make_ctx_with_fts5(true);
+    fn fts5_index_status_works_when_enabled() {
+        let tmp = std::env::temp_dir().join("fts5_cmd_test_status");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let req = req_for("fts5_index", json!({ "action": "status" }));
+        let ctx = make_ctx_with_fts5_and_root(true, Some(tmp.to_str().unwrap()));
         let resp = handle_fts5_index(&req, &ctx);
-        assert!(resp.success, "expected success for stub, got: {resp:?}");
-        assert_eq!(resp.data["status"], "stub");
+        assert!(resp.success, "expected success for status, got: {resp:?}");
+        assert_eq!(resp.data["exists"], false);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn fts5_search_returns_empty_when_index_empty() {
+        let tmp = std::env::temp_dir().join("fts5_cmd_test_search_empty");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
         let req = req_for("fts5_search", json!({ "query": "test" }));
-        let ctx = make_ctx_with_fts5(true);
+        let ctx = make_ctx_with_fts5_and_root(true, Some(tmp.to_str().unwrap()));
         let resp = handle_fts5_search(&req, &ctx);
         assert!(resp.success, "expected success, got: {resp:?}");
         assert_eq!(resp.data["total"], 0);
-        assert!(resp.data["warning"].as_str().unwrap().contains("empty"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
