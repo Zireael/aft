@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  commandLeadsWithCodeSearch,
+  commandInvokesCodeSearch,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
 } from "../bash-hints.js";
@@ -53,7 +53,7 @@ describe("maybeAppendConflictsHint", () => {
   });
 });
 
-describe("commandLeadsWithCodeSearch", () => {
+describe("commandInvokesCodeSearch", () => {
   const positives = [
     'grep -nE "x" src/',
     "grep foo file.ts | head",
@@ -63,6 +63,11 @@ describe("commandLeadsWithCodeSearch", () => {
     '"grep" -n pat file',
     "grep pat file || true",
     'grep "a|b" file | head',
+    // grep leading a non-first statement must still nudge (the reported bug):
+    "cd x; grep foo",
+    "false || grep pat",
+    "cd ~/proj && echo '=== marker ===' && grep -rn foo src/ | head -20",
+    "cd ~/proj\necho '=== marker ==='\ngrep -rn foo src/ | head -20",
   ];
 
   const negatives = [
@@ -71,27 +76,30 @@ describe("commandLeadsWithCodeSearch", () => {
     "echo hi | grep h",
     "make test | grep -i pass",
     "ls -la",
-    "cd x; grep foo",
     "FOO=1 grep pat file",
     "2>&1 grep pat",
-    "false || grep pat",
     'cd "unclosed && grep foo',
+    // grep only as a downstream filter across statements must not nudge:
+    "cd x && bun test | grep fail",
+    "echo 'grep is mentioned here' && ls",
   ];
 
   for (const command of positives) {
     test(`positive: ${command}`, () => {
-      expect(commandLeadsWithCodeSearch(command)).toBe(true);
+      expect(commandInvokesCodeSearch(command)).toBe(true);
     });
   }
 
   for (const command of negatives) {
     test(`negative: ${command}`, () => {
-      expect(commandLeadsWithCodeSearch(command)).toBe(false);
+      expect(commandInvokesCodeSearch(command)).toBe(false);
     });
   }
 });
 
 describe("maybeAppendGrepSearchHint", () => {
+  const projectRoot = "/some/proj";
+
   test("appends aft_search hint for a leading grep when aft_search is registered", () => {
     const result = maybeAppendGrepSearchHint("matches", "grep foo file.ts", true);
     expect(result).toBe(`matches\n\n${AFT_SEARCH_HINT}`);
@@ -115,5 +123,63 @@ describe("maybeAppendGrepSearchHint", () => {
   test("does NOT double-append an existing grep search hint", () => {
     const output = `matches\n\n${AFT_SEARCH_HINT}`;
     expect(maybeAppendGrepSearchHint(output, "grep foo file.ts", true)).toBe(output);
+  });
+
+  test("does NOT append when grep targets only paths outside projectRoot", () => {
+    const output = "config line";
+    expect(
+      maybeAppendGrepSearchHint(
+        output,
+        "grep -A6 '\"semantic\"' ~/.pi/agent/aft.jsonc",
+        true,
+        projectRoot,
+      ),
+    ).toBe(output);
+    expect(
+      maybeAppendGrepSearchHint(output, "grep x ~/.config/opencode/aft.jsonc", true, projectRoot),
+    ).toBe(output);
+    expect(maybeAppendGrepSearchHint(output, "grep foo /etc/hosts", true, projectRoot)).toBe(
+      output,
+    );
+  });
+
+  test("appends when grep has no explicit path operand (searches project cwd)", () => {
+    const result = maybeAppendGrepSearchHint("hits", "grep -rn foo", true, projectRoot);
+    expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
+  });
+
+  test("appends when grep includes an in-project relative path", () => {
+    const result = maybeAppendGrepSearchHint("hits", "grep foo ./src/file.ts", true, projectRoot);
+    expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
+  });
+
+  test("does NOT append when grep is buried after other statements and paths are outside", () => {
+    const output = "ok";
+    expect(
+      maybeAppendGrepSearchHint(output, "cd x && echo y && grep z ~/outside/f", true, projectRoot),
+    ).toBe(output);
+  });
+
+  test("appends when mixed operands include an in-project path", () => {
+    const result = maybeAppendGrepSearchHint(
+      "hits",
+      "grep -f ~/pat.txt foo src/",
+      true,
+      projectRoot,
+    );
+    expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
+  });
+
+  test("preserves always-nudge behavior when projectRoot is empty or undefined", () => {
+    const output = "hits";
+    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true)).toBe(
+      `${output}\n\n${AFT_SEARCH_HINT}`,
+    );
+    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true, "")).toBe(
+      `${output}\n\n${AFT_SEARCH_HINT}`,
+    );
+    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true, "   ")).toBe(
+      `${output}\n\n${AFT_SEARCH_HINT}`,
+    );
   });
 });

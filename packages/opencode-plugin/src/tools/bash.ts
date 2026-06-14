@@ -1,8 +1,13 @@
 import {
+  appendPipeStripNote,
   type BridgeRequestOptions,
+  formatForegroundResult,
+  formatSeconds,
+  isTerminalStatus,
   maybeAppendGrepSearchHint,
   maybeStripCompressorPipe,
   resolveBashKillTimeout,
+  sleep,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -339,6 +344,7 @@ export function createBashTool(
               appendPipeStripNote(formatForegroundResult(status), pipeStrip.note),
               command,
               aftSearchRegistered,
+              projectRootFor(context),
             );
             const metadataPayload = foregroundMetadata(description, status, rendered);
             metadata?.(metadataPayload);
@@ -408,10 +414,6 @@ export function createBashTool(
       };
     },
   };
-}
-
-function appendPipeStripNote(output: string, note: string | undefined): string {
-  return note ? `${output}\n\n${note}` : output;
 }
 
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
@@ -557,12 +559,6 @@ function preview(output: string): string {
   return output.length <= METADATA_PREVIEW_LIMIT ? output : output.slice(-METADATA_PREVIEW_LIMIT);
 }
 
-function isTerminalStatus(status: unknown): boolean {
-  return (
-    status === "completed" || status === "failed" || status === "killed" || status === "timed_out"
-  );
-}
-
 function subagentGuidance(taskId: string): string {
   return `
 
@@ -592,30 +588,6 @@ function formatPromotionMessage(
   return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
 }
 
-/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
-function formatSeconds(ms: number): string {
-  return `${Number((ms / 1000).toFixed(1))}s`;
-}
-
-function formatForegroundResult(data: Record<string, unknown>): string {
-  const output = (data.output_preview as string | undefined) ?? "";
-  const outputPath = data.output_path as string | undefined;
-  const truncated = data.output_truncated === true;
-  const status = data.status as string | undefined;
-  const exit = data.exit_code as number | undefined;
-  let rendered = output;
-  if (truncated && outputPath) {
-    rendered += `\n[output truncated; full output at ${outputPath}]`;
-  }
-  if (status === "timed_out") {
-    rendered += `\n[command timed out]`;
-  }
-  if (typeof exit === "number" && exit !== 0) {
-    rendered += `\n[exit code: ${exit}]`;
-  }
-  return rendered;
-}
-
 function foregroundMetadata(
   description: string | undefined,
   data: Record<string, unknown>,
@@ -629,10 +601,6 @@ function foregroundMetadata(
     truncated: data.output_truncated as boolean | undefined,
     ...(outputPath ? { outputPath } : {}),
   };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getCallID(ctx: unknown): string | undefined {

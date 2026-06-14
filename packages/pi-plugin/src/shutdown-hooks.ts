@@ -53,6 +53,25 @@ async function runCleanups(reason: string): Promise<void> {
   );
 }
 
+/** Conventional exit codes for fatal signals (128 + signal number). */
+export const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 } as const;
+
+/** Cap on cleanup time once WE own process termination for a signal. */
+const SIGNAL_CLEANUP_TIMEOUT_MS = 5_000;
+
+/**
+ * Registering ANY listener for SIGINT/SIGTERM/SIGHUP disables Node/Bun's
+ * default terminate-on-signal behavior. If AFT's listener is the only one,
+ * the default was suppressed solely by us, so we must exit or the host hangs
+ * forever. If the host or another extension also listens, terminating is
+ * their call. Mirror of the OpenCode plugin's shutdown-hooks contract.
+ */
+export function shouldForceExit(otherListenerCount: number): boolean {
+  return otherListenerCount === 0;
+}
+
+let signalShutdownStarted = false;
+
 function installProcessHandlers(): void {
   const state = getState();
   if (state.installed) return;
@@ -60,9 +79,40 @@ function installProcessHandlers(): void {
 
   const signals = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
   for (const sig of signals) {
-    process.on(sig, () => {
-      void runCleanups(sig);
-    });
+    const handler = () => {
+      const others = process.listenerCount(sig) - 1;
+      if (!shouldForceExit(others)) {
+        // Named deferral: a shutdown hang is then attributable to the OTHER
+        // listener from the log alone.
+        const names = process
+          .listeners(sig)
+          .filter((fn) => fn !== handler)
+          .map((fn) => fn.name || fn.toString().slice(0, 80).replace(/\s+/g, " "))
+          .join(" | ");
+        log(
+          `${sig}: deferring termination to ${others} other listener(s); cleanup only. Others: ${names}`,
+        );
+        void runCleanups(sig);
+        return;
+      }
+      if (signalShutdownStarted) {
+        process.exit(SIGNAL_EXIT_CODES[sig]);
+      }
+      signalShutdownStarted = true;
+      // Record the intended code immediately so even an unexpected early exit
+      // (event loop drains mid-cleanup) reports the signal, not 0.
+      process.exitCode = SIGNAL_EXIT_CODES[sig];
+      // Deliberately ref'd: we own termination here, so keeping the process
+      // alive for at most the cap is the point — an unref'd timer would let
+      // the loop drain and exit before the race settles.
+      const timeout = new Promise<void>((resolve) => {
+        setTimeout(resolve, SIGNAL_CLEANUP_TIMEOUT_MS);
+      });
+      void Promise.race([runCleanups(sig), timeout]).finally(() => {
+        process.exit(SIGNAL_EXIT_CODES[sig]);
+      });
+    };
+    process.on(sig, handler);
   }
   process.on("beforeExit", () => {
     void runCleanups("beforeExit");

@@ -25,6 +25,7 @@ const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
 const INDEX_VERSION: u32 = 4;
 const PREVIEW_BYTES: usize = 8 * 1024;
+const PARALLEL_INGEST_CHUNK_SIZE: usize = 256;
 const EOF_SENTINEL: u8 = 0;
 const MAX_ENTRIES: usize = 10_000_000;
 const MIN_FILE_ENTRY_BYTES: usize = 57;
@@ -242,6 +243,24 @@ pub(crate) struct PostingFilter {
     loc_mask: u8,
 }
 
+#[derive(Clone, Copy)]
+struct SearchFileMetadata {
+    size: u64,
+    modified: SystemTime,
+}
+
+struct PreparedIndexedFile {
+    metadata: SearchFileMetadata,
+    content_hash: blake3::Hash,
+    trigram_map: BTreeMap<u32, PostingFilter>,
+}
+
+enum PreparedSearchPath {
+    Indexed(PreparedIndexedFile),
+    Unindexed(SearchFileMetadata),
+    Skipped,
+}
+
 #[derive(Clone, Debug, Default)]
 struct QueryBuild {
     and_runs: Vec<Vec<u8>>,
@@ -342,73 +361,84 @@ impl SearchIndex {
 
     fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {
         let max_file_size = self.max_file_size;
-
-        let parallel_read = || -> Vec<(PathBuf, Vec<u8>)> {
-            paths
-                .par_iter()
-                .filter_map(|path| {
-                    let metadata = fs::metadata(path).ok()?;
-                    if !metadata.is_file() {
-                        return None;
-                    }
-                    if is_binary_path(path, metadata.len()) || metadata.len() > max_file_size {
-                        return None;
-                    }
-                    let content = fs::read(path).ok()?;
-                    if is_binary_bytes(&content) {
-                        return None;
-                    }
-                    Some((path.clone(), content))
-                })
-                .collect()
-        };
-
-        let readable: Vec<(PathBuf, Vec<u8>)> = match rayon::ThreadPoolBuilder::new()
+        let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(search_index_build_pool_size())
             .thread_name(|index| format!("aft-search-build-{index}"))
             .stack_size(8 * 1024 * 1024)
             .build()
         {
-            Ok(pool) => pool.install(parallel_read),
+            Ok(pool) => Some(pool),
             Err(error) => {
                 log::warn!(
                     "search index: bounded build pool unavailable ({error}); using global pool"
                 );
-                parallel_read()
+                None
             }
         };
 
-        let mut readable_by_path: HashMap<PathBuf, Vec<u8>> = readable.into_iter().collect();
         let mut indexed = 0usize;
-        for path in paths {
-            if let Some(content) = readable_by_path.remove(path) {
-                self.index_file(path, &content);
-                indexed += 1;
-            } else {
-                self.update_file(path);
-                if self.path_to_id.contains_key(path) {
+        for chunk in paths.chunks(PARALLEL_INGEST_CHUNK_SIZE) {
+            let prepare_chunk = || -> Vec<PreparedSearchPath> {
+                chunk
+                    .par_iter()
+                    .map(|path| prepare_search_path(path, max_file_size))
+                    .collect()
+            };
+            let prepared = match &pool {
+                Some(pool) => pool.install(prepare_chunk),
+                None => prepare_chunk(),
+            };
+
+            for (path, prepared) in chunk.iter().zip(prepared) {
+                let inserted = match prepared {
+                    PreparedSearchPath::Indexed(file) => self.index_prepared_new_file(path, file),
+                    PreparedSearchPath::Unindexed(metadata) => {
+                        self.track_unindexed_file_with_metadata(path, metadata)
+                    }
+                    PreparedSearchPath::Skipped => false,
+                };
+                if inserted {
                     indexed += 1;
                 }
             }
         }
+
         indexed
     }
 
     pub fn index_file(&mut self, path: &Path, content: &[u8]) {
         self.remove_file(path);
+        let metadata = metadata_for_indexed_content(path, content.len() as u64);
+        self.index_file_with_metadata(path, content, metadata);
+    }
 
-        let file_id = match self.allocate_file_id(path, content.len() as u64) {
+    fn index_file_with_metadata(
+        &mut self,
+        path: &Path,
+        content: &[u8],
+        metadata: SearchFileMetadata,
+    ) -> bool {
+        self.index_prepared_new_file(
+            path,
+            PreparedIndexedFile {
+                metadata,
+                content_hash: cache_freshness::hash_bytes(content),
+                trigram_map: trigram_filter_map(content, true),
+            },
+        )
+    }
+
+    fn index_prepared_new_file(&mut self, path: &Path, file: PreparedIndexedFile) -> bool {
+        let file_id = match self.allocate_file_id_with_metadata(path, file.metadata) {
             Some(file_id) => file_id,
-            None => return,
+            None => return false,
         };
-        if let Some(file) = self.files.get_mut(file_id as usize) {
-            file.content_hash = cache_freshness::hash_bytes(content);
+        if let Some(entry) = self.files.get_mut(file_id as usize) {
+            entry.content_hash = file.content_hash;
         }
 
-        let trigram_map = trigram_filter_map(content, true);
-
-        let mut file_trigrams = Vec::with_capacity(trigram_map.len());
-        for (trigram, filter) in trigram_map {
+        let mut file_trigrams = Vec::with_capacity(file.trigram_map.len());
+        for (trigram, filter) in file.trigram_map {
             let postings = self.postings.entry(trigram).or_default();
             postings.push(Posting {
                 file_id,
@@ -428,6 +458,7 @@ impl SearchIndex {
 
         self.file_trigrams.insert(file_id, file_trigrams);
         self.unindexed_files.remove(&file_id);
+        true
     }
 
     pub fn remove_file(&mut self, path: &Path) {
@@ -475,13 +506,15 @@ impl SearchIndex {
             _ => return,
         };
 
-        if is_binary_path(path, metadata.len()) {
-            self.track_unindexed_file(path, &metadata);
+        let metadata = search_file_metadata(&metadata);
+
+        if is_binary_path(path, metadata.size) {
+            self.track_unindexed_file_with_metadata(path, metadata);
             return;
         }
 
-        if metadata.len() > self.max_file_size {
-            self.track_unindexed_file(path, &metadata);
+        if metadata.size > self.max_file_size {
+            self.track_unindexed_file_with_metadata(path, metadata);
             return;
         }
 
@@ -491,11 +524,11 @@ impl SearchIndex {
         };
 
         if is_binary_bytes(&content) {
-            self.track_unindexed_file(path, &metadata);
+            self.track_unindexed_file_with_metadata(path, metadata);
             return;
         }
 
-        self.index_file(path, &content);
+        self.index_file_with_metadata(path, &content, metadata);
     }
 
     pub fn grep(
@@ -1197,32 +1230,33 @@ impl SearchIndex {
         SearchIndex::build_with_limit(root, max_file_size)
     }
 
-    fn allocate_file_id(&mut self, path: &Path, size_hint: u64) -> Option<u32> {
+    fn allocate_file_id_with_metadata(
+        &mut self,
+        path: &Path,
+        metadata: SearchFileMetadata,
+    ) -> Option<u32> {
         let file_id = u32::try_from(self.files.len()).ok()?;
-        let metadata = fs::metadata(path).ok();
-        let size = metadata
-            .as_ref()
-            .map_or(size_hint, |metadata| metadata.len());
-        let modified = metadata
-            .and_then(|metadata| metadata.modified().ok())
-            .unwrap_or(UNIX_EPOCH);
-
         self.files.push(FileEntry {
             path: path.to_path_buf(),
-            size,
-            modified,
+            size: metadata.size,
+            modified: metadata.modified,
             content_hash: cache_freshness::zero_hash(),
         });
         self.path_to_id.insert(path.to_path_buf(), file_id);
         Some(file_id)
     }
 
-    fn track_unindexed_file(&mut self, path: &Path, metadata: &fs::Metadata) {
-        let Some(file_id) = self.allocate_file_id(path, metadata.len()) else {
-            return;
+    fn track_unindexed_file_with_metadata(
+        &mut self,
+        path: &Path,
+        metadata: SearchFileMetadata,
+    ) -> bool {
+        let Some(file_id) = self.allocate_file_id_with_metadata(path, metadata) else {
+            return false;
         };
         self.unindexed_files.insert(file_id);
         self.file_trigrams.insert(file_id, Vec::new());
+        true
     }
 
     fn active_file_ids(&self) -> Vec<u32> {
@@ -1450,6 +1484,49 @@ fn signal_grep_scan_cap(
             flag.store(true, Ordering::Relaxed);
         }
     }
+}
+
+fn search_file_metadata(metadata: &fs::Metadata) -> SearchFileMetadata {
+    SearchFileMetadata {
+        size: metadata.len(),
+        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+    }
+}
+
+fn metadata_for_indexed_content(path: &Path, size_hint: u64) -> SearchFileMetadata {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| search_file_metadata(&metadata))
+        .unwrap_or(SearchFileMetadata {
+            size: size_hint,
+            modified: UNIX_EPOCH,
+        })
+}
+
+fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
+        _ => return PreparedSearchPath::Skipped,
+    };
+
+    if is_binary_path(path, metadata.size) || metadata.size > max_file_size {
+        return PreparedSearchPath::Unindexed(metadata);
+    }
+
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(_) => return PreparedSearchPath::Skipped,
+    };
+
+    if is_binary_bytes(&content) {
+        return PreparedSearchPath::Unindexed(metadata);
+    }
+
+    PreparedSearchPath::Indexed(PreparedIndexedFile {
+        metadata,
+        content_hash: cache_freshness::hash_bytes(&content),
+        trigram_map: trigram_filter_map(&content, true),
+    })
 }
 
 /// Bound cold search-index ingestion to half the cores (cap 8), matching callgraph store.
@@ -3304,9 +3381,27 @@ mod tests {
         assert_eq!(serial.file_count(), parallel.file_count());
         assert_eq!(serial.trigram_count(), parallel.trigram_count());
         assert_eq!(serial.path_to_id.len(), parallel.path_to_id.len());
+        assert_eq!(serial.postings, parallel.postings);
+        assert_eq!(serial.file_trigrams, parallel.file_trigrams);
         for (path, id) in &serial.path_to_id {
             assert_eq!(parallel.path_to_id.get(path), Some(id));
         }
+        for (serial_file, parallel_file) in serial.files.iter().zip(&parallel.files) {
+            assert_eq!(serial_file.path, parallel_file.path);
+            assert_eq!(serial_file.size, parallel_file.size);
+            assert_eq!(serial_file.modified, parallel_file.modified);
+            assert_eq!(serial_file.content_hash, parallel_file.content_hash);
+        }
+
+        let serial_grep = serial.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
+        let parallel_grep = parallel.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
+        assert_eq!(serial_grep.matches, parallel_grep.matches);
+        assert_eq!(serial_grep.total_matches, parallel_grep.total_matches);
+        assert_eq!(serial_grep.files_searched, parallel_grep.files_searched);
+        assert_eq!(
+            serial_grep.files_with_matches,
+            parallel_grep.files_with_matches
+        );
     }
 
     #[test]

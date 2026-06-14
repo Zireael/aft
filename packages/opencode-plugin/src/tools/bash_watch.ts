@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import type { BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import { type BridgeRequestOptions, isTerminalStatus, sleep } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
@@ -464,17 +464,9 @@ export function __trimWaitScanBufferForTests(
 function withWaited(data: Record<string, unknown>, waited: BashStatusWaited): BashStatusWithWait {
   return { ...data, waited };
 }
-function isTerminalStatus(status: unknown): boolean {
-  return (
-    status === "completed" || status === "failed" || status === "killed" || status === "timed_out"
-  );
-}
 function ptyCacheKey(runtime: ToolContext, taskId: string): string {
   return `${projectRootFor(runtime)}::${runtime.sessionID ?? "__default__"}::${taskId}`;
 }
 function watchPtyCacheKey(runtime: ToolContext, taskId: string): string {
   return `${ptyCacheKey(runtime, taskId)}::watch`;
-}
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

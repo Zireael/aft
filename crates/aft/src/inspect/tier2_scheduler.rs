@@ -1,7 +1,11 @@
 use std::time::{Duration, Instant};
 
 pub const TIER2_REFRESH_DEBOUNCE: Duration = Duration::from_secs(45);
-pub const TIER2_REFRESH_MAX_STALENESS: Duration = Duration::from_secs(10 * 60);
+// Ceiling that forces a Tier-2 refresh during CONTINUOUS editing (when the
+// debounce never gets its quiet window). Set high: mid-session refreshes show
+// churning, half-applied numbers and cost a scan with no value until changes
+// land — a normal continuous-coding stretch should not trigger one.
+pub const TIER2_REFRESH_MAX_STALENESS: Duration = Duration::from_secs(30 * 60);
 pub const TIER2_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const TIER2_REFRESH_COLD_CACHE_DELAY: Duration = Duration::from_secs(90);
 pub const TIER2_REFRESH_STORM_DEBOUNCE: Duration = Duration::from_secs(120);

@@ -201,12 +201,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.37.0";
+const ANNOUNCEMENT_VERSION = "0.39.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Much lower background CPU: idle bridges shut down after 30 minutes, deleted project roots stop the watcher instead of spinning it, and background scans reuse warm caches on a bounded thread pool.",
-  "`aft_transform` removed: usage data showed agents never called it — `edit` covers everything it did, and every request now carries a smaller tool surface.",
-  "Leaner tools: `bash`, `write`, `edit`, `apply_patch`, `aft_search`, and `aft_refactor` descriptions trimmed and config-aware; system-prompt guidance rewritten around what to do instead of what to avoid.",
-  "Background bash reminders are right-sized: failures keep head + tail context, successes show a short tail, and compressors never print a success summary for a non-zero exit.",
+  "Accurate Rust dead code: constructors and associated functions reached through receiver-type inference are no longer mis-reported as dead.",
+  "Code Health scans reparse only the file you changed instead of the whole project on every edit — a single-file edit dropped from ~3s of scan work to ~130ms on this repo, byte-identical results.",
+  "R language support in outline, zoom, and the AST tools.",
+  "Edit approval prompts now show the pending diff instead of 'No diff provided', so you can review a change before approving it.",
 ];
 
 /**

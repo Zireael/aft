@@ -4,7 +4,11 @@
  */
 
 import { stat } from "node:fs/promises";
-import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
+import {
+  formatZoomMultiTargetResult,
+  formatZoomText,
+  unwrapRustZoomBatchEnvelope,
+} from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -559,6 +563,15 @@ export function registerReadingTools(
           );
           if (symbolsArray.length === 1) {
             const response = results[0] ?? { success: false, message: "missing zoom response" };
+            const rustBatch = unwrapRustZoomBatchEnvelope(response as Record<string, unknown>);
+            if (rustBatch) {
+              const batch = formatZoomBatchResult(
+                targetLabel,
+                rustBatch.names,
+                rustBatch.responses,
+              );
+              return textResult(batch.text, batch);
+            }
             if ((response as { success?: boolean }).success === false) {
               throw new Error(
                 ((response as { message?: string }).message as string) || "zoom failed",

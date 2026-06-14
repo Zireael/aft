@@ -73,8 +73,9 @@ fn resolve_file_or_url(
 
 /// Handle a `zoom` request.
 ///
-/// Expects `file`, `symbol` in request params, optional `context_lines` (default 3).
+/// Expects `file`, `symbol` (or `symbols`) in request params, optional `context_lines` (default 3).
 /// Resolves the symbol, extracts body + context, walks AST for call annotations.
+/// For code files, a whitespace-separated `symbol`/`symbols` string is split into multiple lookups.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req
         .params
@@ -139,7 +140,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     // Line-range mode: read arbitrary lines without requiring a symbol.
     match (start_line, end_line) {
         (Some(start), Some(end)) => {
-            if req.params.get("symbol").is_some() {
+            if zoom_symbol_param(&req.params).is_some() {
                 return Response::error(
                     &req.id,
                     "invalid_request",
@@ -237,25 +238,173 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         (None, None) => {}
     }
 
-    let symbol_name = match req.params.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                "zoom: missing required param 'symbol' (or use 'start_line' and 'end_line')",
-            );
-        }
+    let lang = detect_language(&path);
+    let symbol_names = match parse_zoom_symbol_names(&req.params, lang) {
+        Ok(names) => names,
+        Err(resp) => return resp,
     };
 
+    if symbol_names.is_empty() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: missing required param 'symbol' (or use 'start_line' and 'end_line')",
+        );
+    }
+
+    if symbol_names.len() == 1 {
+        return zoom_one_symbol(
+            req,
+            ctx,
+            &path,
+            file,
+            &source,
+            &lines,
+            &symbol_names[0],
+            context_lines,
+            include_callgraph,
+        );
+    }
+
+    zoom_batch_symbols(
+        req,
+        ctx,
+        &path,
+        file,
+        &source,
+        &lines,
+        &symbol_names,
+        context_lines,
+        include_callgraph,
+    )
+}
+
+/// Raw `symbol` or `symbols` param before language-aware splitting.
+fn zoom_symbol_param(params: &serde_json::Value) -> Option<&str> {
+    params
+        .get("symbol")
+        .or_else(|| params.get("symbols"))
+        .and_then(|v| v.as_str())
+}
+
+fn is_heading_zoom_language(lang: Option<LangId>) -> bool {
+    matches!(lang, Some(LangId::Markdown | LangId::Html))
+}
+
+/// Normalize `symbol` / `symbols` into one or more lookup names.
+///
+/// For code files, a single string containing internal whitespace is split on `\s+`.
+/// Markdown/HTML headings keep the full string (headings may contain spaces).
+fn parse_zoom_symbol_names(
+    params: &serde_json::Value,
+    lang: Option<LangId>,
+) -> Result<Vec<String>, Response> {
+    if let Some(arr) = params.get("symbols").and_then(|v| v.as_array()) {
+        let names: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::trim))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        return Ok(names);
+    }
+
+    let Some(raw) = zoom_symbol_param(params) else {
+        return Ok(Vec::new());
+    };
+
+    if is_heading_zoom_language(lang) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![trimmed.to_string()]);
+    }
+
+    if raw.split_whitespace().count() <= 1 {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![trimmed.to_string()]);
+    }
+
+    Ok(raw.split_whitespace().map(str::to_string).collect())
+}
+
+fn zoom_batch_symbols(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    file: &str,
+    source: &str,
+    lines: &[String],
+    symbol_names: &[String],
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
+    let mut entries = Vec::with_capacity(symbol_names.len());
+    let mut all_ok = true;
+
+    for name in symbol_names {
+        let resp = zoom_one_symbol(
+            req,
+            ctx,
+            path,
+            file,
+            source,
+            lines,
+            name,
+            context_lines,
+            include_callgraph,
+        );
+        let json = match serde_json::to_value(&resp) {
+            Ok(v) => v,
+            Err(err) => {
+                return Response::error(
+                    &req.id,
+                    "internal_error",
+                    format!("zoom: failed to serialize batch entry: {err}"),
+                );
+            }
+        };
+        if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            all_ok = false;
+        }
+        entries.push(serde_json::json!({
+            "name": name,
+            "response": json,
+        }));
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "complete": all_ok,
+            "symbols": entries,
+        }),
+    )
+}
+
+fn zoom_one_symbol(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    _file: &str,
+    source: &str,
+    lines: &[String],
+    symbol_name: &str,
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
     // Resolve the target symbol. Markdown/HTML headings are often copied from outline output
     // with a visible level prefix (e.g. "## Basic usage" or "<h2>Features"); normalize only
     // that heading lookup path so code-symbol resolution keeps exact matching semantics.
-    let lookup_name = match detect_language(&path) {
+    let lookup_name = match detect_language(path) {
         Some(LangId::Markdown | LangId::Html) => normalize_heading_query(symbol_name),
         _ => symbol_name,
     };
-    let matches = match ctx.provider().resolve_symbol(&path, lookup_name) {
+    let matches = match ctx.provider().resolve_symbol(path, lookup_name) {
         Ok(m) => m,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -306,6 +455,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if matches.is_empty() {
+        return Response::error(
+            &req.id,
+            "symbol_not_found",
+            format!("symbol '{}' not found", symbol_name),
+        );
+    }
+
     let target = &matches[0].symbol;
     let start = target.range.start_line as usize;
     let end = target.range.end_line as usize;
@@ -316,11 +473,11 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     let effective_lines: &[String] = if resolved_file_path != path {
         resolved_lines = match std::fs::read_to_string(resolved_file_path) {
             Ok(src) => src.lines().map(|l| l.to_string()).collect(),
-            Err(_) => lines.clone(),
+            Err(_) => lines.to_vec(),
         };
         &resolved_lines
     } else {
-        &lines
+        lines
     };
 
     // Extract symbol body (0-based line indices)
@@ -374,9 +531,9 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // calls_out: calls within the target symbol's byte range
         let resolved_source = if resolved_file_path != path {
-            std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.clone())
+            std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
         } else {
-            source.clone()
+            source.to_string()
         };
         let signature_byte_start = line_col_to_byte(
             &resolved_source,
@@ -611,6 +768,41 @@ mod tests {
 
     fn make_ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_splits_whitespace_for_code() {
+        let params = serde_json::json!({ "symbol": "InspectCategory active is_active" });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::Rust)).expect("parse");
+        assert_eq!(names, vec!["InspectCategory", "active", "is_active"]);
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_does_not_split_markdown_headings() {
+        let params = serde_json::json!({ "symbols": "Getting Started" });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::Markdown)).expect("parse");
+        assert_eq!(names, vec!["Getting Started"]);
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_does_not_split_html_headings() {
+        let params = serde_json::json!({ "symbol": "Last Heading" });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::Html)).expect("parse");
+        assert_eq!(names, vec!["Last Heading"]);
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_single_token_unchanged() {
+        let params = serde_json::json!({ "symbol": "compute" });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::TypeScript)).expect("parse");
+        assert_eq!(names, vec!["compute"]);
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_symbols_array_unchanged() {
+        let params = serde_json::json!({ "symbols": ["A", "B", "C"] });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::Rust)).expect("parse");
+        assert_eq!(names, vec!["A", "B", "C"]);
     }
 
     // --- Call extraction tests ---

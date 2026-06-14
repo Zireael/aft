@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use aft::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
 use aft::config::Config;
+use aft::inspect::oxc_engine::{analyze_files, AnalyzeOptions, LivenessVerdict, OxcEngineResult};
 use aft::inspect::scanners::dead_code::run_dead_code_scan;
 use aft::inspect::{
     CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, InspectCategory, InspectJob,
@@ -99,6 +101,101 @@ fn target(root: &Path, file: &str, symbol: &str) -> String {
 
 fn scan(job: InspectJob) -> InspectScanSuccess {
     run_dead_code_scan(&job).outcome.expect("scan succeeds")
+}
+
+fn projected_snapshot_from_store(
+    root: &Path,
+    files: &[PathBuf],
+    store_dir: &str,
+) -> CallgraphSnapshot {
+    let store = CallGraphStore::open(root.join(store_dir), root.to_path_buf()).expect("open store");
+    store.cold_build(files).expect("cold build store");
+    project_dead_code_snapshot(store.sqlite_path()).expect("project dead-code snapshot")
+}
+
+fn outbound_call_set_bytes(snapshot: &CallgraphSnapshot) -> String {
+    let mut rows = snapshot
+        .outbound_calls
+        .iter()
+        .map(|call| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                call.caller_file.display(),
+                call.caller_symbol,
+                call.target,
+                call.line,
+                call.provenance
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    serde_json::to_string(&rows).expect("serialize outbound rows")
+}
+
+fn aggregate_has_item(success: &InspectScanSuccess, file: &str, symbol: &str) -> bool {
+    success.aggregate["items"]
+        .as_array()
+        .expect("dead-code items")
+        .iter()
+        .any(|item| item["file"] == file && item["symbol"] == symbol)
+}
+
+fn assert_oxc_verdict(
+    result: &OxcEngineResult,
+    file: &str,
+    symbol: &str,
+    expected: LivenessVerdict,
+) {
+    let export = result
+        .files
+        .iter()
+        .find(|item| item.relative_file == file)
+        .unwrap_or_else(|| panic!("missing file verdicts for {file}: {:#?}", result.files))
+        .exports
+        .iter()
+        .find(|export| export.symbol == symbol)
+        .unwrap_or_else(|| panic!("missing export {file}:{symbol}: {:#?}", result.files));
+    assert_eq!(
+        export.verdict, expected,
+        "unexpected verdict for {file}:{symbol}: {export:#?}"
+    );
+}
+
+fn dispatched_target(target: &str, full_callee: &str) -> String {
+    format!("{target}\u{1f}{full_callee}")
+}
+
+fn contribution_bytes(success: &InspectScanSuccess) -> String {
+    let mut rows = success
+        .contributions
+        .iter()
+        .map(|contribution| {
+            (
+                contribution.contribution["file"]
+                    .as_str()
+                    .expect("contribution file")
+                    .to_string(),
+                contribution.contribution.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    serde_json::to_string(&rows).expect("serialize contribution rows")
+}
+
+fn type_match_fixture_exports(root: &Path) -> Vec<CallgraphExport> {
+    vec![
+        export(root, "src/factory.rs", "make_live", "function", 3),
+        export(root, "src/live_widget.rs", "new", "method", 4),
+        export(
+            root,
+            "src/planted_dead.rs",
+            "orphan_function",
+            "function",
+            1,
+        ),
+        export(root, "src/planted_dead.rs", "new", "method", 6),
+    ]
 }
 
 #[test]
@@ -298,6 +395,75 @@ fn inspect_dead_code_flags_binary_export_but_suppresses_library_public_api() {
         success.aggregate["items"][0],
         json!({"file": "src/main.rs", "symbol": "unused_internal", "kind": "function", "line": 1})
     );
+}
+
+#[test]
+fn inspect_dead_code_keeps_outbound_contributions_identical_when_grouped_by_caller_file() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/app.ts",
+            "import { helper } from './helper';\nexport function main(service: Service) { helper(); service.render(); }\n",
+        ),
+        (
+            "src/service.ts",
+            "export class Service { render() { finish(); } dormant() { orphan(); } }\n",
+        ),
+        ("src/helper.ts", "export function helper() {}\n"),
+        ("src/finish.ts", "export function finish() {}\n"),
+        ("src/orphan.ts", "export function orphan() {}\n"),
+    ]);
+    let normalized_app_caller = root.join("src").join("nested").join("..").join("app.ts");
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/app.ts", "main", "function", 2),
+            export(&root, "src/service.ts", "render", "method", 1),
+            export(&root, "src/service.ts", "dormant", "method", 1),
+            export(&root, "src/helper.ts", "helper", "function", 1),
+            export(&root, "src/finish.ts", "finish", "function", 1),
+            export(&root, "src/orphan.ts", "orphan", "function", 1),
+        ],
+        vec![
+            CallgraphOutboundCall {
+                caller_file: normalized_app_caller.clone(),
+                caller_symbol: "main".to_string(),
+                target: target(&root, "src/helper.ts", "helper"),
+                line: 2,
+                provenance: "treesitter".to_string(),
+            },
+            CallgraphOutboundCall {
+                caller_file: normalized_app_caller,
+                caller_symbol: "main".to_string(),
+                target: dispatched_target("render", "service.render"),
+                line: 3,
+                provenance: "treesitter".to_string(),
+            },
+            outbound(
+                &root,
+                "src/service.ts",
+                "Service::render",
+                &target(&root, "src/finish.ts", "finish"),
+                6,
+            ),
+            outbound(
+                &root,
+                "src/service.ts",
+                "Service::dormant",
+                &target(&root, "src/orphan.ts", "orphan"),
+                7,
+            ),
+        ],
+        vec![root.join("src/app.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 2);
+    assert!(aggregate_has_item(&success, "src/service.ts", "dormant"));
+    assert!(aggregate_has_item(&success, "src/orphan.ts", "orphan"));
+    assert!(!aggregate_has_item(&success, "src/service.ts", "render"));
+    assert!(!aggregate_has_item(&success, "src/finish.ts", "finish"));
+    assert!(!aggregate_has_item(&success, "src/helper.ts", "helper"));
 }
 
 #[test]
@@ -709,6 +875,38 @@ fn inspect_dead_code_keeps_relative_named_import_live_from_reachable_file() {
 }
 
 #[test]
+fn inspect_dead_code_executes_side_effect_imports_without_marking_exports_used() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        ("src/main.ts", "import './setup';\n"),
+        (
+            "src/setup.ts",
+            "import { used } from './dep';\nexport function init() { return 1; }\nexport function unusedHelper() { return 2; }\ninit();\nused();\n",
+        ),
+        ("src/dep.ts", "export function used() { return 1; }\n"),
+    ]);
+
+    let result = analyze_files(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/main.ts")],
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    )
+    .expect("oxc analyze succeeds");
+
+    assert_oxc_verdict(&result, "src/setup.ts", "init", LivenessVerdict::Used);
+    assert_oxc_verdict(
+        &result,
+        "src/setup.ts",
+        "unusedHelper",
+        LivenessVerdict::Unused,
+    );
+    assert_oxc_verdict(&result, "src/dep.ts", "used", LivenessVerdict::Used);
+}
+
+#[test]
 fn inspect_dead_code_does_not_keep_relative_named_import_live_from_dead_file() {
     let (_temp_dir, root, paths) = fixture_project(&[
         (
@@ -849,6 +1047,94 @@ fn inspect_dead_code_parses_rust_scoped_targets_after_file_separator() {
 }
 
 #[test]
+fn inspect_dead_code_keeps_type_match_constructor_live_without_rescuing_dead_new_symbols() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/main.rs",
+            r#"mod factory;
+mod live_widget;
+mod planted_dead;
+
+fn main() {
+    let _ = factory::make_live();
+}
+"#,
+        ),
+        (
+            "src/factory.rs",
+            r#"use crate::live_widget::LiveWidget;
+
+pub fn make_live() -> LiveWidget {
+    LiveWidget::new()
+}
+"#,
+        ),
+        (
+            "src/live_widget.rs",
+            r#"pub struct LiveWidget;
+
+impl LiveWidget {
+    pub fn new() -> Self { Self }
+}
+"#,
+        ),
+        (
+            "src/planted_dead.rs",
+            r#"pub fn orphan_function() {}
+
+struct NeverConstructed;
+
+impl NeverConstructed {
+    pub fn new() -> Self { Self }
+}
+"#,
+        ),
+    ]);
+    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+
+    let mut first_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-one");
+    first_snapshot.exported_symbols = type_match_fixture_exports(&project_root);
+    let first_outbound = outbound_call_set_bytes(&first_snapshot);
+    let first_scope_files = first_snapshot.files.clone();
+    let first_success = scan(job(&project_root, first_scope_files, Some(first_snapshot)));
+
+    let mut second_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-two");
+    second_snapshot.exported_symbols = type_match_fixture_exports(&project_root);
+    let second_outbound = outbound_call_set_bytes(&second_snapshot);
+    let second_scope_files = second_snapshot.files.clone();
+    let second_success = scan(job(
+        &project_root,
+        second_scope_files,
+        Some(second_snapshot),
+    ));
+
+    assert_eq!(
+        first_outbound, second_outbound,
+        "projected outbound-call set must be byte-identical across cold builds"
+    );
+    assert_eq!(
+        first_success.aggregate["count"], second_success.aggregate["count"],
+        "dead-code count must be deterministic across cold builds"
+    );
+
+    assert!(
+        !aggregate_has_item(&first_success, "src/live_widget.rs", "new"),
+        "LiveWidget::new is reached only through a type_match edge and must not be dead: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/planted_dead.rs", "orphan_function"),
+        "genuinely-dead pub fn should remain reported: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/planted_dead.rs", "new"),
+        "genuinely-dead constructor should remain reported: {:#}",
+        first_success.aggregate
+    );
+}
+
+#[test]
 fn inspect_dead_code_ignored_manifest_does_not_suppress_fallback_entry_points() {
     let (_temp_dir, root, _paths) = fixture_project(&[
         (".gitignore", "fixtures/\n"),
@@ -906,6 +1192,122 @@ fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
 }
 
 #[test]
+fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/app.ts",
+            "import { Service } from './service';\nexport function main(service: Service) { service.render(); }\n",
+        ),
+        (
+            "src/service.ts",
+            "export class Service { render(): Result { return {} as Result; } }\nexport interface Result { ok: boolean; }\n",
+        ),
+        ("src/barrel.ts", "export { Result } from './service';\n"),
+        (
+            "src/lib.rs",
+            "pub use foo::Foo;\nmod foo;\npub fn use_foo(value: Foo) {}\n",
+        ),
+        ("src/foo.rs", "pub struct Foo;\npub struct Dead;\n"),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/app.ts", "main", "function", 2),
+            export(&root, "src/service.ts", "Service", "class", 1),
+            export(&root, "src/service.ts", "render", "method", 1),
+            export(&root, "src/service.ts", "Result", "interface", 2),
+            export(&root, "src/barrel.ts", "Result", "re_export", 1),
+            export(&root, "src/lib.rs", "Foo", "struct", 1),
+            export(&root, "src/lib.rs", "use_foo", "function", 3),
+            export(&root, "src/foo.rs", "Foo", "struct", 1),
+            export(&root, "src/foo.rs", "Dead", "struct", 2),
+        ],
+        vec![outbound(
+            &root,
+            "src/app.ts",
+            "main",
+            &dispatched_target("render", "service.render"),
+            2,
+        )],
+        vec![root.join("src/app.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+    let actual = contribution_bytes(&success);
+    let expected = serde_json::to_string(&vec![
+        (
+            "src/app.ts".to_string(),
+            json!({
+                "file": "src/app.ts",
+                "facts_format_version": 1,
+                "exports": [
+                    {"symbol": "main", "kind": "function", "line": 2}
+                ],
+                "raw_imports": [
+                    {"source": "./service", "names": ["Service"], "default_import": null, "namespace_import": null}
+                ],
+                "type_ref_names": ["Service"]
+            }),
+        ),
+        (
+            "src/barrel.ts".to_string(),
+            json!({
+                "file": "src/barrel.ts",
+                "facts_format_version": 1,
+                "exports": [
+                    {"symbol": "Result", "kind": "re_export", "line": 1}
+                ],
+                "raw_reexports": [
+                    {"language": "ts", "source": "./service", "kind": "named", "imported": "Result", "exported": "Result", "line": 1}
+                ]
+            }),
+        ),
+        (
+            "src/foo.rs".to_string(),
+            json!({
+                "file": "src/foo.rs",
+                "facts_format_version": 1,
+                "exports": [
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
+                    {"symbol": "Dead", "kind": "struct", "line": 2, "is_type_like": true}
+                ]
+            }),
+        ),
+        (
+            "src/lib.rs".to_string(),
+            json!({
+                "file": "src/lib.rs",
+                "facts_format_version": 1,
+                "exports": [
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
+                    {"symbol": "use_foo", "kind": "function", "line": 3}
+                ],
+                "raw_reexports": [
+                    {"language": "rust", "source": "foo", "kind": "named", "imported": "Foo", "exported": "Foo", "line": 1}
+                ],
+                "type_ref_names": ["Foo"]
+            }),
+        ),
+        (
+            "src/service.ts".to_string(),
+            json!({
+                "file": "src/service.ts",
+                "facts_format_version": 1,
+                "exports": [
+                    {"symbol": "Service", "kind": "class", "line": 1},
+                    {"symbol": "render", "kind": "method", "line": 1},
+                    {"symbol": "Result", "kind": "interface", "line": 2, "is_type_like": true}
+                ],
+                "type_ref_names": ["Result"]
+            }),
+        ),
+    ])
+    .expect("serialize expected contribution rows");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn inspect_dead_code_contribution_shape_matches_contract() {
     let (_temp_dir, root, paths) = fixture_project(&[
         (
@@ -945,14 +1347,11 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
         contribution.contribution,
         json!({
             "file": "src/foo.ts",
+            "facts_format_version": 1,
             "exports": [
-                {"symbol": "Foo", "kind": "class", "line": 1, "is_entry_point": false},
-                {"symbol": "helper", "kind": "function", "line": 2, "is_entry_point": false}
-            ],
-            "internal_calls": [
-                {"caller_symbol": "helper", "file": "src/bar.ts", "symbol": "Bar", "line": 2, "provenance": "treesitter"}
-            ],
-            "liveness_roots": []
+                {"symbol": "Foo", "kind": "class", "line": 1},
+                {"symbol": "helper", "kind": "function", "line": 2}
+            ]
         })
     );
 }

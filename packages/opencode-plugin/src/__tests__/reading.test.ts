@@ -304,6 +304,102 @@ describe("reading tool adapters", () => {
     expect(sendCalls).toHaveLength(1);
   });
 
+  test("aft_zoom string symbols renders Rust batch envelope from one bridge call", async () => {
+    const root = await tempProject();
+    const { sendCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      complete: true,
+      symbols: [
+        {
+          name: "a",
+          response: {
+            success: true,
+            name: "a",
+            kind: "function",
+            range: { start_line: 1, end_line: 2 },
+            content: "function a() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+        {
+          name: "b",
+          response: {
+            success: true,
+            name: "b",
+            kind: "function",
+            range: { start_line: 5, end_line: 6 },
+            content: "function b() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+      ],
+    }));
+
+    const text = toolResultText(
+      await tools.aft_zoom.execute(
+        { filePath: "src/job.rs", symbols: "a b" },
+        createMockSdkContext(root),
+      ),
+    );
+
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]?.params).toMatchObject({
+      file: join(root, "src/job.rs"),
+      symbol: "a b",
+    });
+    expect(text).toContain("[function a]");
+    expect(text).toContain("function a() {}");
+    expect(text).toContain("[function b]");
+    expect(text).toContain("function b() {}");
+    expect(text).not.toContain("Incomplete zoom results");
+  });
+
+  test("aft_zoom string symbols shows incomplete framing when Rust batch has a failure", async () => {
+    const root = await tempProject();
+    const { tools } = createMockReadingHarness(() => ({
+      success: true,
+      complete: false,
+      symbols: [
+        {
+          name: "a",
+          response: {
+            success: true,
+            name: "a",
+            kind: "function",
+            range: { start_line: 1, end_line: 1 },
+            content: "function a() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+        {
+          name: "missing",
+          response: {
+            success: false,
+            code: "symbol_not_found",
+            message: "symbol 'missing' not found",
+          },
+        },
+      ],
+    }));
+
+    const text = toolResultText(
+      await tools.aft_zoom.execute(
+        { filePath: "src/job.rs", symbols: "a missing" },
+        createMockSdkContext(root),
+      ),
+    );
+
+    expect(text).toContain("Incomplete zoom results");
+    expect(text).toContain("function a() {}");
+    expect(text).toContain('Symbol "missing" not found:');
+  });
+
   test("aft_zoom targets rejects empty filePath/symbol entries", async () => {
     const root = await tempProject();
     const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));

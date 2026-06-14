@@ -2446,9 +2446,9 @@ fn callgraph_impact_ignores_legacy_project_size_cap() {
     aft.shutdown();
 }
 
-/// `trace_data` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `trace_data` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_trace_data_project_too_large() {
+fn callgraph_trace_data_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
@@ -2464,8 +2464,12 @@ fn callgraph_trace_data_project_too_large() {
         crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed trace_data should succeed despite cap=1: {resp:?}"
+    );
+    assert_eq!(resp["origin_symbol"], "transformData");
+    assert!(resp["hops"].as_array().is_some());
 
     aft.shutdown();
 }
@@ -2607,20 +2611,28 @@ fn callgraph_ops_return_building_then_ready_async() {
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
-    // First op kicks off the background cold build and must NOT block: it
-    // returns the transient `callgraph_building` signal.
+    // Configure eagerly warms the store in the background. The first op must
+    // never block on that build: it either returns the transient
+    // `callgraph_building` signal (build still in flight) or a correct
+    // synchronous result (eager build already landed — common on fast runners
+    // with this small fixture). Both are valid; what is forbidden is a silent
+    // empty/clean result while the build is in flight.
     let first = aft.send(&format!(
         r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
         crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
-    assert_eq!(
-        first["success"], false,
-        "first async op should report building, not a synchronous result: {first:?}"
-    );
-    assert_eq!(
-        first["code"], "callgraph_building",
-        "first async op should report callgraph_building: {first:?}"
-    );
+    if first["success"] == true {
+        assert_eq!(first["symbol"], "validate");
+        assert!(
+            first["total_callers"].as_u64().unwrap() > 0,
+            "eagerly-built store should serve real callers: {first:?}"
+        );
+    } else {
+        assert_eq!(
+            first["code"], "callgraph_building",
+            "first async op should report callgraph_building or succeed: {first:?}"
+        );
+    }
 
     // Retry until the background build lands and the store is installed via the
     // drain loop. Deadline-bounded so a genuine regression still fails the test,

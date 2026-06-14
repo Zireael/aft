@@ -208,9 +208,91 @@ describe("AFT RPC auth", () => {
       expect(second.ok).toBe(true);
       expect(second.rpcCalls).toBe(2);
       expect(second.echoed.value).toBe("second");
-      expect(existsSync(stalePath)).toBe(false);
+      // Issue #110 contract: a pid-less file cannot be PROVEN dead, so repeated
+      // health-check failures must NOT delete it — a slow/blocked live server
+      // would be permanently orphaned (its file is written once at startup).
+      expect(existsSync(stalePath)).toBe(true);
     } finally {
       await new Promise<void>((resolve) => legacyServer.close(() => resolve()));
+    }
+  });
+
+  test("client never deletes a live-pid port file on repeated health-check failures", async () => {
+    const fixture = makeFixture();
+    const { createServer } = await import("node:http");
+
+    // Live server the client should end up using.
+    const goodServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk: string) => {
+        body += chunk;
+      });
+      req.on("end", () => {
+        if (req.url === "/health") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, pid: process.pid }));
+          return;
+        }
+        if (req.url?.startsWith("/rpc/")) {
+          const params = JSON.parse(body) as Record<string, unknown>;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, echoed: params }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => goodServer.listen(0, "127.0.0.1", resolve));
+    const goodAddress = goodServer.address();
+    const goodPort = typeof goodAddress === "object" && goodAddress ? goodAddress.port : 0;
+
+    // Port that fails health checks (closed) but whose recorded owner pid is
+    // ALIVE — models a live server whose health endpoint times out under host
+    // load (issue #110). The client must never unlink its port file.
+    const closedProbe = createServer((_req, res) => {
+      res.writeHead(500);
+      res.end();
+    });
+    await new Promise<void>((resolve) => closedProbe.listen(0, "127.0.0.1", resolve));
+    const closedAddress = closedProbe.address();
+    const closedPort = typeof closedAddress === "object" && closedAddress ? closedAddress.port : 0;
+    await new Promise<void>((resolve) => closedProbe.close(() => resolve()));
+
+    try {
+      const portsDir = rpcPortFileDir(fixture.storageDir, fixture.directory);
+      mkdirSync(portsDir, { recursive: true });
+      const livePidStalePath = join(portsDir, "live-pid-unreachable.json");
+      writeFileSync(
+        livePidStalePath,
+        JSON.stringify({
+          port: closedPort,
+          token: "live-token",
+          pid: process.pid,
+          started_at: Date.now() - 1000,
+        }),
+        "utf-8",
+      );
+      writeFileSync(
+        join(portsDir, "good.json"),
+        JSON.stringify({
+          port: goodPort,
+          token: "good-token",
+          pid: process.pid,
+          started_at: Date.now(),
+        }),
+        "utf-8",
+      );
+
+      const client = new AftRpcClient(fixture.storageDir, fixture.directory);
+      for (let i = 0; i < 3; i++) {
+        const result = await client.call<{ ok: boolean }>("echo", { value: i });
+        expect(result.ok).toBe(true);
+        client.reset(); // force a fresh port scan (and health checks) each call
+      }
+      expect(existsSync(livePidStalePath)).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => goodServer.close(() => resolve()));
     }
   });
 

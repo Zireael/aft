@@ -66,11 +66,9 @@ describe("shared status helpers", () => {
     const dialog = formatStatusDialogMessage(status);
     expect(dialog).toContain("Code Health (~ stale)");
     expect(dialog).toContain("duplicates: 1,167");
-    // dead_code / unused_exports are parsed from the snapshot but intentionally
-    // NOT rendered until the oxc resolver lands (over-reporting on real TS/JS).
     expect(status.status_bar?.dead_code).toBe(334);
-    expect(dialog).not.toContain("dead code: 334");
-    expect(dialog).not.toContain("unused exports: 222");
+    expect(dialog).toContain("dead code: 334");
+    expect(dialog).toContain("unused exports: 222");
   });
 
   test("pi_status_snapshot_status_bar_undefined_when_null", () => {

@@ -10,7 +10,7 @@ use crate::imports::{ImportKind, ImportStatement};
 use crate::parser::LangId;
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, Transaction};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -148,6 +148,22 @@ pub struct CallGraphStore {
     /// drop its connection and reopen (see `current_generation`).
     generation: Option<String>,
     conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenRootRepair {
+    None,
+    ReRooted,
+    NeedsRebuild {
+        previous_roots: Vec<String>,
+        current_root: String,
+        reason: String,
+    },
+}
+
+struct OpenedStore {
+    store: CallGraphStore,
+    root_repair: OpenRootRepair,
 }
 
 #[derive(Debug, Clone)]
@@ -468,7 +484,24 @@ impl CallGraphStore {
         // path so a brand-new store still gets a writable DB + schema.
         let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)
             .unwrap_or_else(|| (legacy_sqlite_path(&callgraph_dir, &project_key), None));
-        Self::open_at_path(project_root, project_key, sqlite_path, generation, true)
+        let OpenedStore { store, root_repair } = Self::open_at_path(
+            project_root.clone(),
+            project_key,
+            sqlite_path,
+            generation,
+            true,
+        )?;
+        match root_repair {
+            OpenRootRepair::NeedsRebuild { .. } => {
+                log_root_repair_rebuild(&root_repair);
+                drop(store);
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                Ok(store)
+            }
+            OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(store),
+        }
     }
 
     pub fn open_readonly(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
@@ -489,6 +522,40 @@ impl CallGraphStore {
             generation,
             conn,
         )))
+    }
+
+    /// Open the currently-published ready store with write access so moved-root
+    /// metadata can be repaired before projection readers consume it. Unlike
+    /// [`open`], this preserves the read path's cold/mid-build behavior: if no
+    /// ready generation exists, it returns `Ok(None)` instead of creating an
+    /// empty legacy database. Worktree bridges must keep using [`open_readonly`].
+    pub fn open_ready_repairing(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<Self>> {
+        let project_key = crate::search_index::project_cache_key(&project_root);
+        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        else {
+            return Ok(None);
+        };
+        let OpenedStore { store, root_repair } = Self::open_at_path(
+            project_root.clone(),
+            project_key,
+            sqlite_path,
+            generation,
+            true,
+        )?;
+        match root_repair {
+            OpenRootRepair::NeedsRebuild { .. } => {
+                log_root_repair_rebuild(&root_repair);
+                drop(store);
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                Ok(Some(store))
+            }
+            OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
+        }
     }
 
     pub fn cold_build_with_lease(
@@ -516,9 +583,42 @@ impl CallGraphStore {
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
         // Another process may have published a ready generation while we waited
-        // for the lock — open it instead of rebuilding.
-        if !Self::needs_cold_build(&callgraph_dir, &project_root)? {
-            return Ok((Self::open(callgraph_dir, project_root)?, None));
+        // for the lock — open it instead of rebuilding. If that generation is
+        // from this same project at an older filesystem root, repair the root
+        // metadata in-place while still holding the build lease. If data rows
+        // contain absolute paths, publish a fresh generation under this lease
+        // rather than recursively reacquiring the same lock.
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        {
+            let OpenedStore { store, root_repair } = Self::open_at_path(
+                project_root.clone(),
+                project_key.clone(),
+                sqlite_path,
+                generation,
+                true,
+            )?;
+            match root_repair {
+                OpenRootRepair::NeedsRebuild { .. } => {
+                    log_root_repair_rebuild(&root_repair);
+                    drop(store);
+                    let (stats, generation) = Self::cold_build_publish_locked(
+                        &callgraph_dir,
+                        &project_root,
+                        &project_key,
+                        files,
+                    )?;
+                    let store = Self::open_generation(
+                        &callgraph_dir,
+                        project_root,
+                        project_key,
+                        generation,
+                    )?;
+                    return Ok((store, Some(stats)));
+                }
+                OpenRootRepair::None | OpenRootRepair::ReRooted => {
+                    return Ok((store, None));
+                }
+            }
         }
         let (stats, generation) =
             Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files)?;
@@ -558,7 +658,8 @@ impl CallGraphStore {
                 temp_path.clone(),
                 None,
                 false,
-            )?;
+            )?
+            .store;
             let stats = temp_store.cold_build(files)?;
             temp_store.prepare_for_atomic_swap()?;
             stats
@@ -587,7 +688,7 @@ impl CallGraphStore {
         generation: String,
     ) -> Result<Self> {
         let gen_path = callgraph_dir.join(&generation);
-        Self::open_at_path(project_root, project_key, gen_path, Some(generation), true)
+        Ok(Self::open_at_path(project_root, project_key, gen_path, Some(generation), true)?.store)
     }
 
     pub fn needs_cold_build(callgraph_dir: &Path, project_root: &Path) -> Result<bool> {
@@ -603,24 +704,20 @@ impl CallGraphStore {
         sqlite_path: PathBuf,
         generation: Option<String>,
         use_wal: bool,
-    ) -> Result<Self> {
+    ) -> Result<OpenedStore> {
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&sqlite_path)?;
+        let mut conn = Connection::open(&sqlite_path)?;
         if use_wal {
             configure_connection(&conn)?;
         } else {
             configure_build_connection(&conn)?;
         }
         initialize_schema(&conn)?;
-        Ok(Self::from_connection(
-            project_root,
-            project_key,
-            sqlite_path,
-            generation,
-            conn,
-        ))
+        let root_repair = reconcile_workspace_roots(&mut conn, &project_root)?;
+        let store = Self::from_connection(project_root, project_key, sqlite_path, generation, conn);
+        Ok(OpenedStore { store, root_repair })
     }
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
@@ -717,24 +814,30 @@ impl CallGraphStore {
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
         insert_meta(&tx)?;
-        for extract in &extracts {
-            insert_file_extract(&tx, &self.project_root, extract)?;
+        drop_cold_build_secondary_indexes(&tx)?;
+        {
+            let workspace_root = self.project_root.display().to_string();
+            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+            for extract in &extracts {
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+            }
+            for failure in &failures {
+                insert_backend_state_prepared(
+                    &mut inserts.backend_state,
+                    &workspace_root,
+                    &failure.rel_path,
+                    failure
+                        .freshness
+                        .as_ref()
+                        .map(|freshness| &freshness.content_hash),
+                    "stale",
+                )?;
+            }
+            for resolved in &resolved_refs {
+                insert_resolved_ref_prepared(&mut inserts, resolved)?;
+            }
         }
-        for failure in &failures {
-            mark_backend_state(
-                &tx,
-                &self.project_root,
-                &failure.rel_path,
-                failure
-                    .freshness
-                    .as_ref()
-                    .map(|freshness| &freshness.content_hash),
-                "stale",
-            )?;
-        }
-        for resolved in &resolved_refs {
-            insert_resolved_ref(&tx, resolved)?;
-        }
+        create_cold_build_secondary_indexes(&tx)?;
         let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
@@ -776,6 +879,7 @@ impl CallGraphStore {
         let mut deleted = BTreeSet::new();
         let mut own_refresh = BTreeSet::new();
         let mut selected_ref_ids = BTreeSet::new();
+        let mut selected_refs_by_caller = BTreeMap::new();
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
 
         for input in changed_files {
@@ -787,13 +891,13 @@ impl CallGraphStore {
                 if old_row.is_some() {
                     surface_changed.insert(rel_path.clone());
                     deleted.insert(rel_path.clone());
-                    selected_ref_ids.extend(ref_ids_depending_on(
-                        &tx,
-                        &self.project_root,
-                        &rel_path,
-                    )?);
+                    record_dependent_refs(
+                        &mut selected_ref_ids,
+                        &mut selected_refs_by_caller,
+                        ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                    );
                     delete_file_rows(&tx, &rel_path)?;
-                    mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
+                    clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                 }
                 continue;
             }
@@ -817,13 +921,13 @@ impl CallGraphStore {
                     FreshnessVerdict::Deleted => {
                         surface_changed.insert(rel_path.clone());
                         deleted.insert(rel_path.clone());
-                        selected_ref_ids.extend(ref_ids_depending_on(
-                            &tx,
-                            &self.project_root,
-                            &rel_path,
-                        )?);
+                        record_dependent_refs(
+                            &mut selected_ref_ids,
+                            &mut selected_refs_by_caller,
+                            ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                        );
                         delete_file_rows(&tx, &rel_path)?;
-                        mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
+                        clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                         continue;
                     }
                     FreshnessVerdict::Stale => {}
@@ -837,7 +941,11 @@ impl CallGraphStore {
                 .unwrap_or(true);
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
-                selected_ref_ids.extend(ref_ids_depending_on(&tx, &self.project_root, &rel_path)?);
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                );
             }
             own_refresh.insert(rel_path.clone());
             delete_file_rows(&tx, &rel_path)?;
@@ -846,7 +954,6 @@ impl CallGraphStore {
         }
 
         let dependency_selected_refs = selected_ref_ids.len();
-        let selected_refs_by_caller = refs_by_caller_for_ref_ids(&tx, &selected_ref_ids)?;
         let mut touched_callers: BTreeSet<String> =
             selected_refs_by_caller.keys().cloned().collect();
         touched_callers.extend(own_refresh.iter().cloned());
@@ -865,6 +972,24 @@ impl CallGraphStore {
                 let extract = build_file_extract(&self.project_root, &abs_path)?;
                 caller_extracts.insert(rel_path.clone(), extract);
             }
+        }
+
+        let dependency_callers = touched_callers
+            .iter()
+            .filter(|rel_path| !deleted.contains(*rel_path) && !own_refresh.contains(*rel_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for rel_path in dependency_callers {
+            let Some(extract) = caller_extracts.get(&rel_path) else {
+                continue;
+            };
+            if stored_node_ids_match_extract(&tx, &rel_path, extract)? {
+                continue;
+            }
+
+            own_refresh.insert(rel_path.clone());
+            delete_file_rows(&tx, &rel_path)?;
+            insert_file_extract(&tx, &self.project_root, extract)?;
         }
 
         let index = ProjectIndex::from_db_and_callers(&tx, &self.project_root, &caller_extracts)?;
@@ -1068,6 +1193,14 @@ impl CallGraphStore {
             .as_deref()
             .map(|signature| callgraph::extract_parameters(signature, callers.target.lang))
             .unwrap_or_default();
+        let mut source_lines_by_file: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        for site in &callers.callers {
+            source_lines_by_file
+                .entry(site.caller.file.clone())
+                .or_insert_with(|| {
+                    read_trimmed_source_lines(&self.project_root.join(&site.caller.file))
+                });
+        }
         let enriched = callers
             .callers
             .iter()
@@ -1075,10 +1208,11 @@ impl CallGraphStore {
                 site: site.clone(),
                 signature: site.caller.signature.clone(),
                 is_entry_point: site.caller.is_entry_point,
-                call_expression: read_source_line(
-                    &self.project_root.join(&site.caller.file),
-                    site.line,
-                ),
+                call_expression: source_lines_by_file
+                    .get(&site.caller.file)
+                    .and_then(|lines| lines.as_ref())
+                    .and_then(|lines| lines.get(site.line.saturating_sub(1) as usize))
+                    .cloned(),
                 parameters: site
                     .caller
                     .signature
@@ -1100,6 +1234,13 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         outgoing_calls_for_node(&conn, node)
+    }
+
+    /// Return resolved direct self-call refs suppressed from the general edge table.
+    pub fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        resolved_self_calls_for_node(&conn, node)
     }
 
     pub fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
@@ -1418,36 +1559,38 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
         .map_err(Into::into)
 }
 
-fn load_node_by_id(conn: &Connection, node_id: &str) -> Result<Option<StoreNode>> {
-    conn.query_row(
-        "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
-                n.signature, n.exported, n.is_callgraph_entry_point, f.lang
-         FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.id = ?1",
-        params![node_id],
-        store_node_from_row,
-    )
-    .optional()
-    .map_err(Into::into)
+fn store_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreNode> {
+    store_node_from_row_at(row, 0)
 }
 
-fn store_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreNode> {
-    let start_line: u32 = row.get::<_, i64>(5)?.max(0) as u32;
-    let end_line: u32 = row.get::<_, i64>(6)?.max(0) as u32;
-    let lang_label_value: String = row.get(10)?;
+fn store_node_from_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<StoreNode> {
+    let start_line: u32 = row.get::<_, i64>(offset + 5)?.max(0) as u32;
+    let end_line: u32 = row.get::<_, i64>(offset + 6)?.max(0) as u32;
+    let lang_label_value: String = row.get(offset + 10)?;
     Ok(StoreNode {
-        node_id: row.get(0)?,
-        file: row.get(1)?,
-        symbol: row.get(2)?,
-        name: row.get(3)?,
-        kind: row.get(4)?,
+        node_id: row.get(offset)?,
+        file: row.get(offset + 1)?,
+        symbol: row.get(offset + 2)?,
+        name: row.get(offset + 3)?,
+        kind: row.get(offset + 4)?,
         line: start_line.saturating_add(1),
         end_line: end_line.saturating_add(1),
-        signature: row.get(7)?,
-        exported: row.get::<_, i64>(8)? != 0,
-        is_entry_point: row.get::<_, i64>(9)? != 0,
+        signature: row.get(offset + 7)?,
+        exported: row.get::<_, i64>(offset + 8)? != 0,
+        is_entry_point: row.get::<_, i64>(offset + 9)? != 0,
         lang: lang_from_label(&lang_label_value).unwrap_or(LangId::TypeScript),
     })
+}
+
+fn optional_store_node_from_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<Option<StoreNode>> {
+    if row.get::<_, Option<String>>(offset)?.is_some() {
+        store_node_from_row_at(row, offset).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1463,7 +1606,7 @@ fn collect_callers_recursive(
     truncated: &mut usize,
 ) -> Result<()> {
     if current_depth >= max_depth {
-        let omitted = direct_callers_for_tuple(conn, file, symbol)?.len();
+        let omitted = direct_caller_count_for_tuple(conn, file, symbol)?;
         if omitted > 0 {
             *depth_limited = true;
             *truncated += omitted;
@@ -1492,7 +1635,7 @@ fn collect_callers_recursive(
             )?;
         } else {
             let omitted =
-                direct_callers_for_tuple(conn, &site.caller.file, &site.caller.symbol)?.len();
+                direct_caller_count_for_tuple(conn, &site.caller.file, &site.caller.symbol)?;
             if omitted > 0 {
                 *depth_limited = true;
                 *truncated += omitted;
@@ -1502,119 +1645,143 @@ fn collect_callers_recursive(
     Ok(())
 }
 
+fn direct_caller_count_for_tuple(
+    conn: &Connection,
+    target_file: &str,
+    target_symbol: &str,
+) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2",
+        params![target_file, target_symbol],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
 fn direct_callers_for_tuple(
     conn: &Connection,
     target_file: &str,
     target_symbol: &str,
 ) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
-        "SELECT e.source_node, e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status, e.provenance
-         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+        "SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
+                src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
+                src_file.lang,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(params![target_file, target_symbol], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-        ))
-    })?;
-
-    let mut sites = Vec::new();
-    for row in rows {
-        let (
-            source_node,
-            target_node,
-            target_file,
-            target_symbol,
-            line,
-            byte_start,
-            byte_end,
-            status,
-            provenance,
-        ) = row?;
-        let Some(caller) = load_node_by_id(conn, &source_node)? else {
-            continue;
-        };
-        let target = target_node
-            .as_deref()
-            .map(|node_id| load_node_by_id(conn, node_id))
-            .transpose()?
-            .flatten();
-        sites.push(StoreCallSite {
+        let caller = store_node_from_row_at(row, 7)?;
+        let target = optional_store_node_from_row_at(row, 18)?;
+        Ok(StoreCallSite {
             caller,
-            target_file,
-            target_symbol,
+            target_file: row.get(0)?,
+            target_symbol: row.get(1)?,
             target,
-            line: line.max(0) as u32,
-            byte_start: byte_start.max(0) as usize,
-            byte_end: byte_end.max(0) as usize,
-            resolved: status == "resolved",
-            provenance,
-        });
-    }
-    Ok(sites)
+            line: row.get::<_, i64>(2)?.max(0) as u32,
+            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            resolved: row.get::<_, String>(5)? == "resolved",
+            provenance: row.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
-        "SELECT e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status, e.provenance
-         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+        "SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.source_node = ?1
          ORDER BY r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(params![node.node_id], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-        ))
-    })?;
-
-    let mut calls = Vec::new();
-    for row in rows {
-        let (
-            target_node,
-            target_file,
-            target_symbol,
-            line,
-            byte_start,
-            byte_end,
-            status,
-            provenance,
-        ) = row?;
-        let target = target_node
-            .as_deref()
-            .map(|node_id| load_node_by_id(conn, node_id))
-            .transpose()?
-            .flatten();
-        calls.push(StoreCallSite {
+        let target = optional_store_node_from_row_at(row, 7)?;
+        Ok(StoreCallSite {
             caller: node.clone(),
-            target_file,
-            target_symbol,
+            target_file: row.get(0)?,
+            target_symbol: row.get(1)?,
             target,
-            line: line.max(0) as u32,
-            byte_start: byte_start.max(0) as usize,
-            byte_end: byte_end.max(0) as usize,
-            resolved: status == "resolved",
-            provenance,
-        });
-    }
-    Ok(calls)
+            line: row.get::<_, i64>(2)?.max(0) as u32,
+            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            resolved: row.get::<_, String>(5)? == "resolved",
+            provenance: row.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.target_file, r.target_symbol, r.line,
+                r.byte_start, r.byte_end, r.status, r.provenance,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
+         FROM refs r
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = r.target_node
+         WHERE r.caller_node = ?1
+           AND r.kind = 'call'
+           AND r.status <> 'unresolved'
+           AND r.target_file = ?2
+           AND r.target_symbol = ?3
+           AND r.provenance = ?4
+           AND NOT EXISTS (
+               SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call'
+           )
+         ORDER BY r.byte_start, r.line, r.ref_id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            &node.node_id,
+            &node.file,
+            &node.symbol,
+            PROVENANCE_TREESITTER
+        ],
+        |row| {
+            let target = optional_store_node_from_row_at(row, 7)?;
+            Ok(StoreCallSite {
+                caller: node.clone(),
+                target_file: row.get(0)?,
+                target_symbol: row.get(1)?,
+                target,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+                resolved: row.get::<_, String>(5)? == "resolved",
+                provenance: row.get(6)?,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn unresolved_calls_for_node(
@@ -1666,6 +1833,31 @@ fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<Sto
     Ok(calls)
 }
 
+fn forward_call_count_for_node(conn: &Connection, node: &StoreNode) -> Result<usize> {
+    let resolved_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         WHERE e.kind = 'call' AND e.source_node = ?1",
+        params![&node.node_id],
+        |row| row.get(0),
+    )?;
+    let unresolved_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM refs
+         WHERE caller_node = ?1
+           AND kind = 'call'
+           AND status = 'unresolved'
+           AND NOT EXISTS (
+               SELECT 1 FROM edges e WHERE e.ref_id = refs.ref_id AND e.kind = 'call'
+           )",
+        params![&node.node_id],
+        |row| row.get(0),
+    )?;
+    let total = resolved_count.saturating_add(unresolved_count);
+    Ok(usize::try_from(total).unwrap_or(usize::MAX))
+}
+
 fn call_tree_inner(
     conn: &Connection,
     node: &StoreNode,
@@ -1688,12 +1880,12 @@ fn call_tree_inner(
     }
     visited.insert(visit_key.clone());
 
-    let calls = forward_calls_for_node(conn, node)?;
     let mut children = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
+        let calls = forward_calls_for_node(conn, node)?;
         for call in calls {
             match call {
                 StoreForwardCall::Resolved(site) => {
@@ -1730,9 +1922,9 @@ fn call_tree_inner(
                 }
             }
         }
-    } else if !calls.is_empty() {
-        depth_limited = true;
-        truncated = calls.len();
+    } else {
+        truncated = forward_call_count_for_node(conn, node)?;
+        depth_limited = truncated > 0;
     }
 
     visited.remove(&visit_key);
@@ -1774,12 +1966,9 @@ fn symbol_query_matches(symbol: &str, query: &str) -> bool {
     symbol == query || unqualified_name(symbol) == query
 }
 
-fn read_source_line(path: &Path, line: u32) -> Option<String> {
+fn read_trimmed_source_lines(path: &Path) -> Option<Vec<String>> {
     let source = std::fs::read_to_string(path).ok()?;
-    source
-        .lines()
-        .nth(line.saturating_sub(1) as usize)
-        .map(|line| line.trim().to_string())
+    Some(source.lines().map(|line| line.trim().to_string()).collect())
 }
 
 #[doc(hidden)]
@@ -2049,6 +2238,184 @@ fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_nodes_file;
+         DROP INDEX IF EXISTS idx_nodes_name;
+         DROP INDEX IF EXISTS idx_nodes_scoped;
+         DROP INDEX IF EXISTS idx_refs_short_name;
+         DROP INDEX IF EXISTS idx_refs_caller_file;
+         DROP INDEX IF EXISTS idx_refs_caller_node_kind;
+         DROP INDEX IF EXISTS idx_refs_target_file;
+         DROP INDEX IF EXISTS idx_file_dependencies_dep_file;
+         DROP INDEX IF EXISTS idx_edges_source_kind;
+         DROP INDEX IF EXISTS idx_edges_target_kind;
+         DROP INDEX IF EXISTS idx_edges_target_file_symbol;
+         DROP INDEX IF EXISTS idx_edges_ref_id;
+         DROP INDEX IF EXISTS idx_dispatch_hints_method;
+         DROP INDEX IF EXISTS idx_backend_file_state_file;",
+    )?;
+    Ok(())
+}
+
+fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
+         CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+         CREATE INDEX IF NOT EXISTS idx_nodes_scoped ON nodes(scoped_name);
+         CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
+         CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
+         CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
+         CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
+         CREATE INDEX IF NOT EXISTS idx_file_dependencies_dep_file ON file_dependencies(dep_file);
+         CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_node, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_node, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
+         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
+         CREATE INDEX IF NOT EXISTS idx_backend_file_state_file ON backend_file_state(file_path, backend);",
+    )?;
+    Ok(())
+}
+
+const STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
+    ("files", "path"),
+    ("nodes", "file_path"),
+    ("refs", "caller_file"),
+    ("refs", "target_file"),
+    ("file_dependencies", "file_path"),
+    ("file_dependencies", "dep_file"),
+    ("edges", "target_file"),
+    ("dispatch_hints", "file"),
+    ("backend_file_state", "file_path"),
+];
+
+/// Reconcile `backend_file_state.workspace_root` when the opener's project root
+/// differs from what is stored. The store key is the git-root commit hash, so
+/// multiple live checkouts/clones share one on-disk generation.
+///
+/// Cheap in-place re-root is only safe when every previously stored root path is
+/// gone from disk (true move/rename). If any stale root still exists, another
+/// clone is still alive and rewriting metadata would ping-pong relative rows
+/// between trees (possibly on different branches). We then return
+/// [`OpenRootRepair::NeedsRebuild`] so the caller cold-builds for the current
+/// opener. That can make each clone rebuild on open when they alternate — bounded
+/// by open frequency — but each rebuild is correct for its opener, unlike silent
+/// cross-clone corruption.
+fn reconcile_workspace_roots(conn: &mut Connection, project_root: &Path) -> Result<OpenRootRepair> {
+    let roots = stored_workspace_roots(conn)?;
+    let current_root = project_root.display().to_string();
+    if roots.is_empty() || (roots.len() == 1 && roots[0] == current_root) {
+        return Ok(OpenRootRepair::None);
+    }
+
+    if let Some(sample) = sample_absolute_data_path(conn)? {
+        return Ok(OpenRootRepair::NeedsRebuild {
+            previous_roots: roots,
+            current_root,
+            reason: format!("absolute store data path row {sample}"),
+        });
+    }
+
+    for stored_root in roots.iter() {
+        if stored_root == &current_root {
+            continue;
+        }
+        if Path::new(stored_root).exists() {
+            let reason = format!(
+                "previous root {stored_root} still exists — concurrent clone, rebuilding per-root"
+            );
+            return Ok(OpenRootRepair::NeedsRebuild {
+                previous_roots: roots,
+                current_root,
+                reason,
+            });
+        }
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE OR IGNORE backend_file_state
+         SET workspace_root = ?1
+         WHERE workspace_root <> ?1",
+        params![&current_root],
+    )?;
+    tx.execute(
+        "DELETE FROM backend_file_state WHERE workspace_root <> ?1",
+        params![&current_root],
+    )?;
+    tx.commit()?;
+
+    crate::slog_info!(
+        "callgraph store re-rooted from {} to {}",
+        roots.join(", "),
+        current_root
+    );
+    Ok(OpenRootRepair::ReRooted)
+}
+
+fn stored_workspace_roots(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT workspace_root
+         FROM backend_file_state
+         ORDER BY workspace_root",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn sample_absolute_data_path(conn: &Connection) -> Result<Option<String>> {
+    for (table, column) in STORE_DATA_PATH_COLUMNS {
+        let sql = format!(
+            "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL AND {column} <> ''"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            if stored_path_is_absolute(&value) {
+                return Ok(Some(format!("{table}.{column}={value}")));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn stored_path_is_absolute(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if Path::new(value).is_absolute() || value.starts_with('/') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+        && bytes[0].is_ascii_alphabetic()
+    {
+        return true;
+    }
+    value.starts_with("\\\\") || value.starts_with("//")
+}
+
+fn log_root_repair_rebuild(repair: &OpenRootRepair) {
+    if let OpenRootRepair::NeedsRebuild {
+        previous_roots,
+        current_root,
+        reason,
+    } = repair
+    {
+        crate::slog_info!(
+            "callgraph store root mismatch from {} to {} requires cold rebuild: {}",
+            previous_roots.join(", "),
+            current_root,
+            reason
+        );
+    }
+}
+
 /// Nanosecond clock used to make temp/generation file names unique.
 fn now_nanos() -> u128 {
     SystemTime::now()
@@ -2299,12 +2666,29 @@ fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtra
     BuildExtractsResult { extracts, failures }
 }
 
+fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
+    let metadata = std::fs::metadata(path)?;
+    let size = metadata.len();
+    let content_hash = if size > cache_freshness::CONTENT_HASH_SIZE_CAP {
+        cache_freshness::zero_hash()
+    } else if source.len() as u64 == size {
+        cache_freshness::hash_bytes(source.as_bytes())
+    } else {
+        cache_freshness::hash_file_if_small(path, size)?.unwrap_or_else(cache_freshness::zero_hash)
+    };
+    Ok(FileFreshness {
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        size,
+        content_hash,
+    })
+}
+
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
-    let freshness = cache_freshness::collect(&abs_path)?;
-    let data = callgraph::build_file_data(&abs_path)?;
+    let freshness = collect_source_freshness(&abs_path, &source)?;
+    let data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     let mut nodes = build_node_records(&rel_path, &source, &data)?;
     let node_by_scoped: HashMap<String, String> = nodes
@@ -2322,11 +2706,13 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
+    let line_index = LineIndex::new(&source);
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
         &rel_path,
         &data.import_block.imports,
+        &line_index,
     ));
     let mut surface_parts = reexports.surface_parts;
     surface_parts.extend(source_less_exports.surface_parts);
@@ -2504,6 +2890,7 @@ fn build_import_refs(
     abs_path: &Path,
     rel_path: &str,
     imports: &[ImportStatement],
+    line_index: &LineIndex,
 ) -> Vec<RawRef> {
     let mut refs = Vec::new();
     for (index, import) in imports.iter().enumerate() {
@@ -2532,7 +2919,7 @@ fn build_import_refs(
             requested_name: empty_to_none(requested_name),
             namespace_alias: import.namespace_import.clone(),
             wildcard: import_is_wildcard(import),
-            line: byte_to_line(abs_path, import.byte_range.start).unwrap_or(1),
+            line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
             dependencies: module_dependencies(project_root, abs_path, &import.module_path),
@@ -3533,6 +3920,195 @@ fn load_db_file_indexes(
     }
 
     Ok(files)
+}
+
+struct ColdBuildInsertStatements<'stmt> {
+    file: Statement<'stmt>,
+    node: Statement<'stmt>,
+    file_dependency: Statement<'stmt>,
+    dispatch_hint: Statement<'stmt>,
+    backend_state: Statement<'stmt>,
+    reference: Statement<'stmt>,
+    edge: Statement<'stmt>,
+}
+
+impl<'stmt> ColdBuildInsertStatements<'stmt> {
+    fn new(tx: &'stmt Transaction<'_>) -> Result<Self> {
+        Ok(Self {
+            file: tx.prepare(
+                "INSERT OR REPLACE INTO files(
+                    path, content_hash, mtime_ns, size, lang, is_dead_code_root,
+                    is_public_api, surface_fingerprint, indexed_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)",
+            )?,
+            node: tx.prepare(
+                "INSERT OR REPLACE INTO nodes(
+                    id, file_path, name, scoped_name, kind, start_line, start_col,
+                    end_line, end_col, range_ordinal, signature, exported,
+                    is_default_export, is_type_like, is_callgraph_entry_point, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            )?,
+            file_dependency: tx.prepare(
+                "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+            )?,
+            dispatch_hint: tx.prepare(
+                "INSERT OR REPLACE INTO dispatch_hints(
+                    id, method_name, caller_node, file, line, byte_start, byte_end, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?,
+            backend_state: tx.prepare(
+                "INSERT OR REPLACE INTO backend_file_state(
+                    backend, workspace_root, file_path, content_hash, status, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?,
+            reference: tx.prepare(
+                "INSERT OR REPLACE INTO refs(
+                    ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
+                    import_kind, local_name, requested_name, namespace_alias, wildcard, line,
+                    byte_start, byte_end, status, target_node, target_file, target_symbol,
+                    provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?,
+            edge: tx.prepare(
+                "INSERT OR REPLACE INTO edges(
+                    edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                    kind, line, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?,
+        })
+    }
+}
+
+fn insert_file_extract_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    workspace_root: &str,
+    extract: &FileExtract,
+) -> Result<()> {
+    statements.file.execute(params![
+        extract.rel_path,
+        hash_to_hex(extract.freshness.content_hash),
+        system_time_to_ns(extract.freshness.mtime),
+        extract.freshness.size as i64,
+        lang_label(extract.lang),
+        extract.surface_fingerprint,
+        unix_seconds_now(),
+    ])?;
+    for node in &extract.nodes {
+        statements.node.execute(params![
+            node.id,
+            node.file_path,
+            node.name,
+            node.scoped_name,
+            node.kind,
+            node.range.start_line as i64,
+            node.range.start_col as i64,
+            node.range.end_line as i64,
+            node.range.end_col as i64,
+            node.range_ordinal as i64,
+            node.signature,
+            bool_int(node.exported),
+            bool_int(node.is_default_export),
+            bool_int(node.is_type_like),
+            bool_int(node.is_callgraph_entry_point),
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+
+    let mut dependencies = BTreeSet::new();
+    for raw_ref in &extract.raw_refs {
+        dependencies.extend(raw_ref.dependencies.iter().cloned());
+    }
+    for dep_file in &dependencies {
+        statements
+            .file_dependency
+            .execute(params![extract.rel_path, dep_file])?;
+    }
+
+    for hint in &extract.dispatch_hints {
+        statements.dispatch_hint.execute(params![
+            hint.id,
+            hint.method_name,
+            hint.caller_node,
+            hint.file,
+            hint.line as i64,
+            hint.byte_start as i64,
+            hint.byte_end as i64,
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+    insert_backend_state_prepared(
+        &mut statements.backend_state,
+        workspace_root,
+        &extract.rel_path,
+        Some(&extract.freshness.content_hash),
+        "fresh",
+    )?;
+    Ok(())
+}
+
+fn insert_backend_state_prepared(
+    stmt: &mut Statement<'_>,
+    workspace_root: &str,
+    rel_path: &str,
+    content_hash: Option<&blake3::Hash>,
+    status: &str,
+) -> Result<()> {
+    let hash = content_hash
+        .map(|hash| hash_to_hex(*hash))
+        .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
+    stmt.execute(params![
+        BACKEND_TREESITTER,
+        workspace_root,
+        rel_path,
+        hash,
+        status,
+        unix_seconds_now(),
+    ])?;
+    Ok(())
+}
+
+fn insert_resolved_ref_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    resolved: &ResolvedRef,
+) -> Result<()> {
+    let raw = &resolved.raw;
+    debug_assert!(resolved.dependencies.is_superset(&raw.dependencies));
+    statements.reference.execute(params![
+        raw.ref_id,
+        raw.caller_node,
+        raw.caller_file,
+        raw.kind,
+        raw.short_name,
+        raw.full_ref,
+        raw.module_path,
+        raw.import_kind,
+        raw.local_name,
+        raw.requested_name,
+        raw.namespace_alias,
+        bool_int(raw.wildcard),
+        raw.line as i64,
+        raw.byte_start as i64,
+        raw.byte_end as i64,
+        resolved.status,
+        resolved.target_node,
+        resolved.target_file,
+        resolved.target_symbol,
+        PROVENANCE_TREESITTER,
+    ])?;
+    if let Some(edge) = &resolved.edge {
+        statements.edge.execute(params![
+            edge.edge_id,
+            raw.ref_id,
+            edge.source_node,
+            edge.target_node,
+            edge.target_file,
+            edge.target_symbol,
+            edge.kind,
+            edge.line as i64,
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+    Ok(())
 }
 
 fn insert_file_extract(
@@ -5302,6 +5878,7 @@ fn mark_backend_state(
     content_hash: Option<&blake3::Hash>,
     status: &str,
 ) -> Result<()> {
+    clear_backend_state_for_file(tx, project_root, rel_path)?;
     let hash = content_hash
         .map(|hash| hash_to_hex(*hash))
         .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
@@ -5316,6 +5893,23 @@ fn mark_backend_state(
             hash,
             status,
             unix_seconds_now(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_backend_state_for_file(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
+        params![
+            BACKEND_TREESITTER,
+            project_root.display().to_string(),
+            rel_path
         ],
     )?;
     Ok(())
@@ -5340,6 +5934,25 @@ fn load_file_row(tx: &Transaction<'_>, rel_path: &str) -> Result<Option<FileRow>
     )
     .optional()
     .map_err(CallGraphStoreError::from)
+}
+
+fn stored_node_ids_match_extract(
+    tx: &Transaction<'_>,
+    rel_path: &str,
+    extract: &FileExtract,
+) -> Result<bool> {
+    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE file_path = ?1")?;
+    let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
+    let mut stored = BTreeSet::new();
+    for row in rows {
+        stored.insert(row?);
+    }
+    let extracted = extract
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(stored == extracted)
 }
 
 fn update_file_fresh_metadata(
@@ -5371,11 +5984,17 @@ fn update_file_fresh_metadata(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependentRefSelection {
+    ref_id: String,
+    caller_file: String,
+}
+
 fn ref_ids_depending_on(
     tx: &Transaction<'_>,
     project_root: &Path,
     rel_path: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DependentRefSelection>> {
     let mut stmt = tx.prepare(
         "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
          FROM refs r
@@ -5398,12 +6017,34 @@ fn ref_ids_depending_on(
     for row in rows {
         let row = row?;
         if ref_dependency_row_depends_on(project_root, &row, rel_path) {
-            ids.push(row.ref_id);
+            ids.push(DependentRefSelection {
+                ref_id: row.ref_id,
+                caller_file: row.caller_file,
+            });
         }
     }
     Ok(ids)
 }
 
+fn record_dependent_refs(
+    selected_ref_ids: &mut BTreeSet<String>,
+    selected_refs_by_caller: &mut BTreeMap<String, BTreeSet<String>>,
+    dependent_refs: Vec<DependentRefSelection>,
+) {
+    for dependent_ref in dependent_refs {
+        let DependentRefSelection {
+            ref_id,
+            caller_file,
+        } = dependent_ref;
+        selected_ref_ids.insert(ref_id.clone());
+        selected_refs_by_caller
+            .entry(caller_file)
+            .or_default()
+            .insert(ref_id);
+    }
+}
+
+#[cfg(test)]
 fn refs_by_caller_for_ref_ids(
     tx: &Transaction<'_>,
     ref_ids: &BTreeSet<String>,
@@ -5768,6 +6409,8 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Lua => "lua",
         LangId::Perl => "perl",
         LangId::Yaml => "yaml",
+        LangId::Pascal => "pascal",
+        LangId::R => "r",
     }
 }
 
@@ -5799,6 +6442,8 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "lua" => Some(LangId::Lua),
         "perl" => Some(LangId::Perl),
         "yaml" => Some(LangId::Yaml),
+        "pascal" => Some(LangId::Pascal),
+        "r" => Some(LangId::R),
         _ => None,
     }
 }
@@ -5885,15 +6530,30 @@ fn hex_to_bytes(value: &str) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
-fn byte_to_line(path: &Path, byte_offset: usize) -> Option<u32> {
-    let source = std::fs::read_to_string(path).ok()?;
-    Some(
-        source[..byte_offset.min(source.len())]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1,
-    )
+#[derive(Debug, Clone)]
+struct LineIndex {
+    newline_offsets: Vec<usize>,
+    source_len: usize,
+}
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        Self {
+            newline_offsets: source
+                .bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
+                .collect(),
+            source_len: source.len(),
+        }
+    }
+
+    fn byte_to_line(&self, byte_offset: usize) -> u32 {
+        let byte_offset = byte_offset.min(self.source_len);
+        self.newline_offsets
+            .partition_point(|offset| *offset < byte_offset) as u32
+            + 1
+    }
 }
 
 fn empty_to_none(value: String) -> Option<String> {
@@ -5928,6 +6588,536 @@ fn unix_seconds_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod cold_build_insert_tests {
+    use super::*;
+    use crate::imports::ImportBlock;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn depth_boundary_counts_match_full_fetch_lengths_with_dangling_edges() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        fs::write(
+            &file,
+            r#"export function topA() {
+  root();
+}
+
+export function topB() {
+  root();
+}
+
+export function root() {
+  leaf();
+  missing();
+}
+
+export function leaf() {}
+"#,
+        )
+        .expect("write fixture");
+
+        let store = CallGraphStore::open(
+            dir.path().join(".store-depth-boundary-counts"),
+            dir.path().to_path_buf(),
+        )
+        .expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&file))
+            .expect("cold build");
+
+        let root = store
+            .node_for(Path::new("main.ts"), "root")
+            .expect("root node");
+        let leaf = store
+            .node_for(Path::new("main.ts"), "leaf")
+            .expect("leaf node");
+
+        let (full_forward_len, full_direct_len) = {
+            let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.execute(
+                "INSERT INTO edges (
+                    edge_id, ref_id, source_node, target_node, target_file,
+                    target_symbol, kind, line, provenance
+                 ) VALUES (
+                    'dangling-forward-boundary', 'missing-forward-ref', ?1, NULL,
+                    ?2, ?3, 'call', 98, ?4
+                 )",
+                rusqlite::params![
+                    &root.node_id,
+                    &leaf.file,
+                    &leaf.symbol,
+                    PROVENANCE_TREESITTER
+                ],
+            )
+            .expect("insert dangling forward edge");
+            conn.execute(
+                "INSERT INTO edges (
+                    edge_id, ref_id, source_node, target_node, target_file,
+                    target_symbol, kind, line, provenance
+                 ) VALUES (
+                    'dangling-direct-boundary', 'missing-direct-ref', 'missing-source-node',
+                    ?1, ?2, ?3, 'call', 99, ?4
+                 )",
+                rusqlite::params![
+                    &root.node_id,
+                    &root.file,
+                    &root.symbol,
+                    PROVENANCE_TREESITTER
+                ],
+            )
+            .expect("insert dangling direct-caller edge");
+
+            let full_forward_len = forward_calls_for_node(&conn, &root)
+                .expect("full forward calls")
+                .len();
+            let counted_forward_len =
+                forward_call_count_for_node(&conn, &root).expect("counted forward calls");
+            assert_eq!(
+                counted_forward_len, full_forward_len,
+                "forward boundary COUNT must mirror outgoing_calls_for_node + unresolved_calls_for_node"
+            );
+
+            let full_direct_len = direct_callers_for_tuple(&conn, &root.file, &root.symbol)
+                .expect("full direct callers")
+                .len();
+            let counted_direct_len = direct_caller_count_for_tuple(&conn, &root.file, &root.symbol)
+                .expect("counted direct callers");
+            assert_eq!(
+                counted_direct_len, full_direct_len,
+                "direct-caller boundary COUNT must mirror direct_callers_for_tuple"
+            );
+
+            (full_forward_len, full_direct_len)
+        };
+
+        assert_eq!(
+            full_forward_len, 2,
+            "fixture root should have one resolved and one unresolved outgoing call"
+        );
+        assert_eq!(
+            full_direct_len, 2,
+            "fixture root should have two real direct callers"
+        );
+
+        let tree = store
+            .call_tree(Path::new("main.ts"), "root", 0)
+            .expect("call tree");
+        assert!(tree.depth_limited);
+        assert_eq!(tree.children.len(), 0);
+        assert_eq!(
+            tree.truncated, full_forward_len,
+            "call_tree depth boundary must report the full forward-call list length"
+        );
+
+        let callers = store
+            .callers_of(Path::new("main.ts"), "leaf", 0)
+            .expect("callers");
+        assert!(callers.depth_limited);
+        assert_eq!(callers.callers.len(), 1);
+        assert_eq!(callers.callers[0].caller.symbol, "root");
+        assert_eq!(
+            callers.truncated, full_direct_len,
+            "callers depth boundary must report the full direct-caller list length"
+        );
+    }
+
+    #[test]
+    fn source_freshness_matches_cache_collect_for_same_bytes() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("fixture.ts");
+        let source = "export function main() { return helper(); }\n";
+        fs::write(&path, source).expect("write fixture");
+
+        let expected = cache_freshness::collect(&path).expect("collect freshness from file");
+        let actual =
+            collect_source_freshness(&path, source).expect("collect freshness from source");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cold_build_prepared_bulk_insert_matches_reference_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path();
+        let extract = fixture_extract(project_root);
+        let resolved = fixture_resolved(&extract);
+
+        let reference = build_reference_connection(project_root, &extract, &resolved);
+        let optimized = build_optimized_connection(project_root, &extract, &resolved);
+
+        for table in [
+            "files",
+            "nodes",
+            "file_dependencies",
+            "dispatch_hints",
+            "refs",
+            "edges",
+        ] {
+            assert_eq!(table_rows(&reference, table), table_rows(&optimized, table),);
+        }
+        assert_eq!(
+            backend_state_rows(&reference),
+            backend_state_rows(&optimized),
+            "backend freshness rows must match apart from updated_at"
+        );
+        assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
+    }
+
+    #[test]
+    fn incremental_barrel_refresh_matches_per_ref_lookup_and_cold_rebuild() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path();
+        let files =
+            write_barrel_refresh_fixture(project_root, "export { target } from \"./target\";\n");
+        let index_path = project_root.join("src/index.ts");
+
+        let store = CallGraphStore::open(
+            project_root.join(".store-incremental-barrel"),
+            project_root.to_path_buf(),
+        )
+        .expect("open incremental store");
+        store.cold_build(&files).expect("initial cold build");
+
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            let tx = conn.transaction().expect("dependency transaction");
+            let dependent_refs = ref_ids_depending_on(&tx, project_root, "src/index.ts")
+                .expect("dependent refs for barrel");
+            let selected_ref_ids = dependent_refs
+                .iter()
+                .map(|dependent_ref| dependent_ref.ref_id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut threaded_ref_ids = BTreeSet::new();
+            let mut threaded_by_caller = BTreeMap::new();
+            record_dependent_refs(
+                &mut threaded_ref_ids,
+                &mut threaded_by_caller,
+                dependent_refs,
+            );
+            let old_by_caller = refs_by_caller_for_ref_ids(&tx, &selected_ref_ids)
+                .expect("old per-ref caller lookup");
+
+            assert_eq!(threaded_ref_ids, selected_ref_ids);
+            assert_eq!(threaded_by_caller, old_by_caller);
+            for consumer in [
+                "src/consumer_a.ts",
+                "src/consumer_b.ts",
+                "src/consumer_c.ts",
+            ] {
+                assert!(
+                    threaded_by_caller.contains_key(consumer),
+                    "barrel edit should select dependent refs from {consumer}"
+                );
+            }
+        }
+
+        fs::write(
+            &index_path,
+            "export { target } from \"./target\";\nexport function extra() { return 1; }\n",
+        )
+        .expect("edit barrel");
+        let stats = store
+            .refresh_files(std::slice::from_ref(&index_path))
+            .expect("incremental refresh");
+        assert_eq!(stats.surface_changed, vec!["src/index.ts".to_string()]);
+        assert!(
+            stats.dependency_selected_refs > 0,
+            "barrel surface edit should select dependent refs"
+        );
+
+        let cold_store = CallGraphStore::open(
+            project_root.join(".store-cold-barrel"),
+            project_root.to_path_buf(),
+        )
+        .expect("open cold rebuild store");
+        cold_store
+            .cold_build(&files)
+            .expect("comparison cold build");
+
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+        ] {
+            assert_eq!(
+                graph_table_rows(&store, table),
+                graph_table_rows(&cold_store, table),
+                "incremental refresh {table} rows must match cold rebuild"
+            );
+        }
+    }
+
+    fn build_reference_connection(
+        project_root: &Path,
+        extract: &FileExtract,
+        resolved: &ResolvedRef,
+    ) -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open reference db");
+        configure_build_connection(&conn).expect("configure reference db");
+        initialize_schema(&conn).expect("initialize reference schema");
+        {
+            let tx = conn.transaction().expect("reference transaction");
+            clear_tables(&tx).expect("reference clear");
+            insert_meta(&tx).expect("reference meta");
+            insert_file_extract(&tx, project_root, extract).expect("reference file extract");
+            insert_resolved_ref(&tx, resolved).expect("reference resolved ref");
+            let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
+                .expect("reference dispatch edges");
+            assert_eq!(supplemental, 0);
+            tx.commit().expect("reference commit");
+        }
+        conn
+    }
+
+    fn build_optimized_connection(
+        project_root: &Path,
+        extract: &FileExtract,
+        resolved: &ResolvedRef,
+    ) -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open optimized db");
+        configure_build_connection(&conn).expect("configure optimized db");
+        initialize_schema(&conn).expect("initialize optimized schema");
+        {
+            let tx = conn.transaction().expect("optimized transaction");
+            clear_tables(&tx).expect("optimized clear");
+            insert_meta(&tx).expect("optimized meta");
+            drop_cold_build_secondary_indexes(&tx).expect("drop secondary indexes");
+            {
+                let workspace_root = project_root.display().to_string();
+                let mut inserts = ColdBuildInsertStatements::new(&tx).expect("prepare inserts");
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)
+                    .expect("optimized file extract");
+                insert_resolved_ref_prepared(&mut inserts, resolved)
+                    .expect("optimized resolved ref");
+            }
+            create_cold_build_secondary_indexes(&tx).expect("create secondary indexes");
+            let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
+                .expect("optimized dispatch edges");
+            assert_eq!(supplemental, 0);
+            tx.commit().expect("optimized commit");
+        }
+        conn
+    }
+
+    fn fixture_extract(project_root: &Path) -> FileExtract {
+        let rel_path = "src/main.ts".to_string();
+        let target_path = "src/helper.ts".to_string();
+        let node = NodeRecord {
+            id: "node-main".to_string(),
+            file_path: rel_path.clone(),
+            name: "main".to_string(),
+            scoped_name: "main".to_string(),
+            kind: "function".to_string(),
+            range: Range {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 32,
+            },
+            range_ordinal: 0,
+            signature: Some("export function main()".to_string()),
+            exported: true,
+            is_default_export: false,
+            is_type_like: false,
+            is_callgraph_entry_point: true,
+        };
+        let mut dependencies = BTreeSet::new();
+        dependencies.insert(target_path.clone());
+        let raw_ref = RawRef {
+            ref_id: "ref-main-helper".to_string(),
+            caller_node: Some(node.id.clone()),
+            caller_symbol: Some(node.scoped_name.clone()),
+            caller_file: rel_path.clone(),
+            kind: "call".to_string(),
+            short_name: Some("helper".to_string()),
+            full_ref: Some("helper".to_string()),
+            module_path: None,
+            import_kind: None,
+            local_name: Some("helper".to_string()),
+            requested_name: Some("helper".to_string()),
+            namespace_alias: None,
+            wildcard: false,
+            line: 1,
+            byte_start: 24,
+            byte_end: 32,
+            dependencies,
+        };
+        FileExtract {
+            abs_path: project_root.join(&rel_path),
+            rel_path,
+            freshness: FileFreshness {
+                mtime: UNIX_EPOCH + Duration::from_secs(123),
+                size: 40,
+                content_hash: cache_freshness::hash_bytes(b"fixture source"),
+            },
+            lang: LangId::TypeScript,
+            data: FileCallData {
+                calls_by_symbol: HashMap::new(),
+                exported_symbols: Vec::new(),
+                symbol_metadata: HashMap::new(),
+                default_export_symbol: None,
+                import_block: ImportBlock::empty(),
+                lang: LangId::TypeScript,
+            },
+            nodes: vec![node.clone()],
+            raw_refs: vec![raw_ref],
+            dispatch_hints: vec![DispatchHint {
+                id: "dispatch-main-helper".to_string(),
+                method_name: "helper".to_string(),
+                caller_node: node.id,
+                file: "src/main.ts".to_string(),
+                line: 1,
+                byte_start: 24,
+                byte_end: 32,
+            }],
+            surface_fingerprint: "surface".to_string(),
+        }
+    }
+
+    fn fixture_resolved(extract: &FileExtract) -> ResolvedRef {
+        let raw = extract.raw_refs[0].clone();
+        let mut dependencies = raw.dependencies.clone();
+        dependencies.insert("src/helper.ts".to_string());
+        ResolvedRef {
+            edge: Some(EdgeRecord {
+                edge_id: "edge-main-helper".to_string(),
+                source_node: raw.caller_node.clone().expect("caller node"),
+                target_node: Some("node-helper".to_string()),
+                target_file: "src/helper.ts".to_string(),
+                target_symbol: "helper".to_string(),
+                kind: "call".to_string(),
+                line: raw.line,
+            }),
+            raw,
+            status: "resolved".to_string(),
+            target_node: Some("node-helper".to_string()),
+            target_file: Some("src/helper.ts".to_string()),
+            target_symbol: Some("helper".to_string()),
+            dependencies,
+        }
+    }
+
+    fn write_barrel_refresh_fixture(project_root: &Path, barrel_source: &str) -> Vec<PathBuf> {
+        let src_dir = project_root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let target_path = src_dir.join("target.ts");
+        fs::write(&target_path, "export function target() {\n  return 1;\n}\n")
+            .expect("write target");
+
+        let index_path = src_dir.join("index.ts");
+        fs::write(&index_path, barrel_source).expect("write barrel");
+
+        let mut files = vec![target_path, index_path];
+        for (file_name, function_name) in [
+            ("consumer_a.ts", "consumerA"),
+            ("consumer_b.ts", "consumerB"),
+            ("consumer_c.ts", "consumerC"),
+        ] {
+            let path = src_dir.join(file_name);
+            fs::write(
+                &path,
+                format!(
+                    "import {{ target }} from \"./index\";\n\nexport function {function_name}() {{\n  return target();\n}}\n"
+                ),
+            )
+            .expect("write consumer");
+            files.push(path);
+        }
+        files
+    }
+
+    fn graph_table_rows(store: &CallGraphStore, table: &str) -> Vec<String> {
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        table_rows(&conn, table)
+    }
+
+    fn table_rows(conn: &Connection, table: &str) -> Vec<String> {
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect columns");
+        let sql = format!(
+            "SELECT {} FROM {table} ORDER BY {}",
+            columns.join(", "),
+            columns.join(", ")
+        );
+        conn.prepare(&sql)
+            .expect("prepare table rows")
+            .query_map([], |row| row_to_strings(row, columns.len()))
+            .expect("query table rows")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect table rows")
+    }
+
+    fn backend_state_rows(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT backend, workspace_root, file_path, content_hash, status
+             FROM backend_file_state
+             ORDER BY backend, workspace_root, file_path, content_hash, status",
+        )
+        .expect("prepare backend rows")
+        .query_map([], |row| row_to_strings(row, 5))
+        .expect("query backend rows")
+        .collect::<std::result::Result<_, _>>()
+        .expect("collect backend rows")
+    }
+
+    fn secondary_indexes(conn: &Connection) -> Vec<String> {
+        let mut indexes = Vec::new();
+        for table in [
+            "files",
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+            "type_ref_names",
+            "backend_file_state",
+            "meta",
+        ] {
+            let sql = format!("PRAGMA index_list({table})");
+            let mut stmt = conn.prepare(&sql).expect("prepare index list");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query index list");
+            for name in rows {
+                let name = name.expect("index name");
+                if name.starts_with("idx_") {
+                    indexes.push(format!("{table}:{name}"));
+                }
+            }
+        }
+        indexes.sort();
+        indexes
+    }
+
+    fn row_to_strings(row: &rusqlite::Row<'_>, len: usize) -> rusqlite::Result<String> {
+        let mut values = Vec::with_capacity(len);
+        for index in 0..len {
+            let value = row.get_ref(index)?;
+            values.push(match value {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+                rusqlite::types::ValueRef::Real(value) => value.to_string(),
+                rusqlite::types::ValueRef::Text(value) => {
+                    String::from_utf8_lossy(value).into_owned()
+                }
+                rusqlite::types::ValueRef::Blob(value) => format!("{value:?}"),
+            });
+        }
+        Ok(values.join("\u{1f}"))
+    }
 }
 
 #[cfg(test)]

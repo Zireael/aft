@@ -281,6 +281,13 @@ export class AftRpcClient {
     }
 
     this.stalePortFailures.delete(key);
+    // Deletion requires a provably-dead owner. Health checks time out under
+    // host load (blocked event loop during builds/streaming), and unlinking a
+    // LIVE server's port file is permanent: the server only wrote it at
+    // startup, so the sidebar could never reconnect until host restart
+    // (issue #110). Live-pid and pid-less files are skipped this round and
+    // retried on the next poll instead.
+    if (info.pid === undefined || isPidAlive(info.pid)) return;
     try {
       // Do not unlink a replacement written after the failed health checks.
       const current = this.parsePortFile(info.path);

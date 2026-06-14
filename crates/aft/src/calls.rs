@@ -58,7 +58,9 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         | LangId::Html
         | LangId::Markdown
         | LangId::Json
-        | LangId::Yaml => vec![],
+        | LangId::Yaml
+        | LangId::Pascal
+        | LangId::R => vec![],
     }
 }
 

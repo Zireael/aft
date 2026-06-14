@@ -391,6 +391,43 @@ const SOL_QUERY: &str = r#"
   name: (identifier) @var.name) @var.def
 "#;
 
+const PASCAL_QUERY: &str = r#"
+;; program / unit
+(program (moduleName (identifier) @program.name)) @program.def
+(unit (moduleName (identifier) @unit.name)) @unit.def
+
+;; type declarations
+(declType (identifier) @type.name) @type.def
+
+;; const / var declarations
+(declConst (identifier) @const.name) @const.def
+(declVar (identifier) @var.name) @var.def
+
+;; procedure / function definitions (implementation)
+(defProc
+  (declProc
+    [
+      (identifier) @proc.name
+      (genericDot) @proc.name
+    ])) @proc.def
+
+;; procedure / function declarations (interface / class)
+(declProc
+  [
+    (identifier) @proc.name
+    (genericDot) @proc.name
+  ]) @proc.def
+"#;
+
+const R_QUERY: &str = r#"
+;; R represents assignments as binary operators. The extractor filters these
+;; broad captures down to top-level assignment operators and classifies
+;; function-valued assignments as functions. Rightward function
+;; assignment parses as a function_definition whose body is a binary_operator.
+(binary_operator) @assign.def
+(function_definition) @function.def
+"#;
+
 const SCSS_QUERY: &str = r#"
 ;; SCSS definitions
 (mixin_statement
@@ -603,6 +640,8 @@ pub enum LangId {
     Lua,
     Perl,
     Yaml,
+    Pascal,
+    R,
 }
 
 /// Maps file extension to language identifier.
@@ -635,6 +674,8 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "lua" => Some(LangId::Lua),
         "pl" | "pm" | "t" => Some(LangId::Perl),
         "yaml" | "yml" => Some(LangId::Yaml),
+        "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(LangId::Pascal),
+        "R" | "r" => Some(LangId::R),
         _ => None,
     }
 }
@@ -668,6 +709,8 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Lua => tree_sitter_lua::LANGUAGE.into(),
         LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
         LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        LangId::Pascal => tree_sitter_pascal::LANGUAGE.into(),
+        LangId::R => tree_sitter_r::LANGUAGE.into(),
     }
 }
 
@@ -699,6 +742,8 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Lua => Some(LUA_QUERY),
         LangId::Perl => Some(PERL_QUERY),
         LangId::Yaml => None, // YAML uses direct tree walking like JSON
+        LangId::Pascal => Some(PASCAL_QUERY),
+        LangId::R => Some(R_QUERY),
     }
 }
 
@@ -743,6 +788,9 @@ static LUA_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Lua));
 static PERL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Perl));
+static PASCAL_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Pascal));
+static R_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::R));
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
@@ -774,6 +822,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Php => Some(&*PHP_QUERY_CACHE),
         LangId::Lua => Some(&*LUA_QUERY_CACHE),
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
+        LangId::Pascal => Some(&*PASCAL_QUERY_CACHE),
+        LangId::R => Some(&*R_QUERY_CACHE),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
 
@@ -1389,6 +1439,8 @@ pub fn extract_symbols_from_tree(
         LangId::Php => extract_php_symbols(source, &root, query),
         LangId::Lua => extract_lua_symbols(source, &root, query),
         LangId::Perl => extract_perl_symbols(source, &root, query),
+        LangId::Pascal => extract_pascal_symbols(source, &root, query),
+        LangId::R => extract_r_symbols(source, &root, query),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
         }
@@ -1468,7 +1520,13 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                         && node_text(source, &prev).starts_with("/**")
                         && is_adjacent_line(&prev, &current, source))
             }
-            LangId::Go | LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
+            LangId::Go
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Zig
+            | LangId::CSharp
+            | LangId::Bash
+            | LangId::Pascal => {
                 // Include doc comments only if immediately above (no blank line gap)
                 kind == "comment" && is_adjacent_line(&prev, &current, source)
             }
@@ -1485,7 +1543,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                     && (text.starts_with("///") || text.starts_with("/**"))
                     && is_adjacent_line(&prev, &current, source)
             }
-            LangId::Ruby | LangId::Lua => {
+            LangId::Ruby | LangId::Lua | LangId::R => {
                 // Include adjacent `#`/`---` style comments used as documentation.
                 let text = node_text(source, &prev);
                 kind == "comment"
@@ -3558,6 +3616,220 @@ fn extract_bash_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<
     Ok(symbols)
 }
 
+fn extract_pascal_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Pascal;
+    let capture_names = query.capture_names();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut program_name_node = None;
+        let mut program_def_node = None;
+        let mut unit_name_node = None;
+        let mut unit_def_node = None;
+        let mut type_name_node = None;
+        let mut type_def_node = None;
+        let mut const_name_node = None;
+        let mut const_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut proc_name_node = None;
+        let mut proc_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "program.name" => program_name_node = Some(cap.node),
+                "program.def" => program_def_node = Some(cap.node),
+                "unit.name" => unit_name_node = Some(cap.node),
+                "unit.def" => unit_def_node = Some(cap.node),
+                "type.name" => type_name_node = Some(cap.node),
+                "type.def" => type_def_node = Some(cap.node),
+                "const.name" => const_name_node = Some(cap.node),
+                "const.def" => const_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "proc.name" => proc_name_node = Some(cap.node),
+                "proc.def" => proc_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (program_name_node, program_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Class,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (unit_name_node, unit_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Class,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (type_name_node, type_def_node) {
+            let kind = pascal_type_kind(&def_node, source);
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (const_name_node, const_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Variable,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Variable,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (proc_name_node, proc_def_node) {
+            if def_node.kind() == "declProc" {
+                if let Some(parent) = def_node.parent() {
+                    if parent.kind() == "defProc" {
+                        continue;
+                    }
+                }
+            }
+
+            let (name, scope_chain) = extract_pascal_name_and_scope(&name_node, &def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+
+            symbols.push(Symbol {
+                name,
+                kind,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn pascal_type_kind(node: &Node, _source: &str) -> SymbolKind {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "declClass" {
+            let mut child_cursor = child.walk();
+            for grandchild in child.children(&mut child_cursor) {
+                if grandchild.kind() == "kRecord" {
+                    return SymbolKind::Struct;
+                }
+            }
+            return SymbolKind::Class;
+        }
+        if child.kind() == "declIntf" {
+            return SymbolKind::Interface;
+        }
+        if child.kind() == "type" {
+            let mut child_cursor = child.walk();
+            for grandchild in child.children(&mut child_cursor) {
+                if grandchild.kind() == "declEnum" {
+                    return SymbolKind::Enum;
+                }
+            }
+        }
+    }
+    SymbolKind::TypeAlias
+}
+
+fn extract_pascal_name_and_scope(
+    name_node: &Node,
+    def_node: &Node,
+    source: &str,
+) -> (String, Vec<String>) {
+    let mut scope_chain = Vec::new();
+    let mut name = node_text(source, name_node).to_string();
+
+    if name_node.kind() == "genericDot" {
+        let mut cursor = name_node.walk();
+        let idents: Vec<Node> = name_node
+            .children(&mut cursor)
+            .filter(|c| c.kind() == "identifier")
+            .collect();
+        if idents.len() >= 2 {
+            let class_name = node_text(source, &idents[0]).to_string();
+            scope_chain.push(class_name);
+            name = node_text(source, &idents[1]).to_string();
+        }
+    }
+
+    let mut current = def_node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "declType" {
+            if let Some(type_name_node) = parent.child_by_field_name("name").or_else(|| {
+                let mut cursor = parent.walk();
+                let mut found = None;
+                for child in parent.children(&mut cursor) {
+                    if child.kind() == "identifier" {
+                        found = Some(child);
+                        break;
+                    }
+                }
+                found
+            }) {
+                scope_chain.insert(0, node_text(source, &type_name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    (name, scope_chain)
+}
+
 /// Walk up from `node` and collect the names of any enclosing
 /// contract / library / interface, outermost first.
 fn solidity_scope_chain(node: &Node, source: &str) -> Vec<String> {
@@ -3829,6 +4101,217 @@ fn extract_solidity_symbols(
 
     dedup_symbols(&mut symbols);
     Ok(symbols)
+}
+
+fn extract_r_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::R;
+    let capture_names = query.capture_names();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut assign_node = None;
+        let mut function_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "assign.def" => assign_node = Some(cap.node),
+                "function.def" => function_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let Some(def_node) = function_node {
+            if let Some(symbol) = r_rightward_function_assignment_symbol(source, &def_node, lang) {
+                symbols.push(symbol);
+            }
+            continue;
+        }
+
+        let Some(def_node) = assign_node else {
+            continue;
+        };
+        let Some(assignment) = r_assignment_parts(source, &def_node) else {
+            continue;
+        };
+        let Some(name_node) = r_assignment_name_node(&assignment) else {
+            continue;
+        };
+        if name_node.kind() != "identifier" {
+            continue;
+        }
+
+        let value_is_function = r_node_contains_kind(&assignment.value, "function_definition");
+        if !value_is_function && !r_is_top_level_assignment(&def_node) {
+            continue;
+        }
+
+        symbols.push(Symbol {
+            name: node_text(source, &name_node).to_string(),
+            kind: if value_is_function {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Variable
+            },
+            range: node_range_with_decorators(&def_node, source, lang),
+            signature: Some(extract_signature(source, &def_node)),
+            scope_chain: vec![],
+            exported: true,
+            parent: None,
+        });
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn r_rightward_function_assignment_symbol(
+    source: &str,
+    function_node: &Node,
+    lang: LangId,
+) -> Option<Symbol> {
+    let body = function_node.child_by_field_name("body")?;
+    let assignment = r_assignment_parts(source, &body)?;
+    if !matches!(assignment.operator.as_str(), "->" | "->>") {
+        return None;
+    }
+    let function_text = node_text(source, function_node);
+    let name = r_rightward_assignment_name_from_text(function_text).or_else(|| {
+        let name_node = assignment.right;
+        (name_node.kind() == "identifier").then(|| node_text(source, &name_node).to_string())
+    })?;
+
+    let signature = r_rightward_function_signature(source, function_node, &name);
+
+    Some(Symbol {
+        name,
+        kind: SymbolKind::Function,
+        range: node_range_with_decorators(function_node, source, lang),
+        signature: Some(signature),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+fn r_rightward_function_signature(source: &str, function_node: &Node, name: &str) -> String {
+    let signature = extract_signature(source, function_node);
+    if signature.contains(name) {
+        signature
+    } else {
+        format!("{signature} -> {name}")
+    }
+}
+
+fn r_rightward_assignment_name_from_text(text: &str) -> Option<String> {
+    let (_, after) = text.rsplit_once("->>").or_else(|| text.rsplit_once("->"))?;
+    let trimmed = after.trim_start();
+    let name: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '.')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+struct RAssignmentParts<'tree> {
+    operator: String,
+    left: Node<'tree>,
+    right: Node<'tree>,
+    value: Node<'tree>,
+}
+
+fn r_assignment_name_node<'tree>(assignment: &RAssignmentParts<'tree>) -> Option<Node<'tree>> {
+    match assignment.operator.as_str() {
+        "<-" | "=" | "<<-" => Some(assignment.left),
+        "->" | "->>" => Some(assignment.right),
+        _ => None,
+    }
+}
+
+fn r_assignment_parts<'tree>(source: &str, node: &Node<'tree>) -> Option<RAssignmentParts<'tree>> {
+    if node.kind() != "binary_operator" {
+        return None;
+    }
+
+    let mut operator = None;
+    let mut operator_index = None;
+    for index in 0..node.child_count() {
+        let child = node.child(index as u32)?;
+        let text = node_text(source, &child).trim();
+        if matches!(text, "<-" | "=" | "<<-" | "->" | "->>") {
+            operator = Some(text.to_string());
+            operator_index = Some(index);
+            break;
+        }
+    }
+
+    let operator = operator?;
+    let operator_index = operator_index?;
+
+    let left = r_nearest_named_child_before(node, operator_index)
+        .or_else(|| node.child_by_field_name("lhs"))
+        .or_else(|| node.child_by_field_name("left"))?;
+    let right = r_nearest_named_child_after(node, operator_index)
+        .or_else(|| node.child_by_field_name("rhs"))
+        .or_else(|| node.child_by_field_name("right"))?;
+
+    let value = match operator.as_str() {
+        "<-" | "=" | "<<-" => right,
+        "->" | "->>" => left,
+        _ => return None,
+    };
+
+    Some(RAssignmentParts {
+        operator,
+        left,
+        right,
+        value,
+    })
+}
+
+fn r_nearest_named_child_before<'tree>(node: &Node<'tree>, index: usize) -> Option<Node<'tree>> {
+    (0..index)
+        .rev()
+        .filter_map(|child_index| node.child(child_index as u32))
+        .find(|child| child.is_named())
+}
+
+fn r_nearest_named_child_after<'tree>(node: &Node<'tree>, index: usize) -> Option<Node<'tree>> {
+    ((index + 1)..node.child_count())
+        .filter_map(|child_index| node.child(child_index as u32))
+        .find(|child| child.is_named())
+}
+
+fn r_node_contains_kind(node: &Node, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| r_node_contains_kind(&child, kind));
+    found
+}
+
+fn r_is_top_level_assignment(node: &Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "program" => return true,
+            "braced_expression" | "function_definition" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
 }
 
 fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
@@ -6021,12 +6504,21 @@ impl TreeSitterProvider {
     }
 
     fn read_parsed_file(&self, file: &Path) -> Result<(String, Tree, LangId), AftError> {
+        let current_mtime = std::fs::metadata(file)
+            .and_then(|m| m.modified())
+            .map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", file.display(), e),
+            })?;
         let source = std::fs::read_to_string(file).map_err(|e| AftError::FileNotFound {
             path: format!("{}: {}", file.display(), e),
         })?;
+        let size = source.len() as u64;
+        let content_hash = content_hash_for_source(&source);
         let (tree, lang) = {
             let mut parser = self.parser.borrow_mut();
-            parser.parse_cloned(file)?
+            let (tree, lang) =
+                parser.parse_with_source(file, &source, current_mtime, size, content_hash)?;
+            (tree.clone(), lang)
         };
         Ok((source, tree, lang))
     }
@@ -6318,6 +6810,11 @@ mod tests {
             detect_language(Path::new("styles.scss")),
             Some(LangId::Scss)
         );
+        assert_eq!(detect_language(Path::new("main.pas")), Some(LangId::Pascal));
+        assert_eq!(detect_language(Path::new("main.pp")), Some(LangId::Pascal));
+        assert_eq!(detect_language(Path::new("main.dpr")), Some(LangId::Pascal));
+        assert_eq!(detect_language(Path::new("main.dpk")), Some(LangId::Pascal));
+        assert_eq!(detect_language(Path::new("main.lpr")), Some(LangId::Pascal));
         assert_eq!(detect_language(Path::new("template.tpl")), None);
     }
 
@@ -7985,5 +8482,165 @@ spec:
             sym.name.contains("hello-"),
             "Symbol name should contain generateName fallback 'hello-'"
         );
+    }
+
+    #[test]
+    fn detect_r_extensions_are_case_sensitive() {
+        assert_eq!(detect_language(Path::new("analysis.R")), Some(LangId::R));
+        assert_eq!(detect_language(Path::new("script.r")), Some(LangId::R));
+    }
+
+    #[test]
+    fn extract_r_symbols_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("analysis.R");
+        std::fs::write(
+            &file,
+            r#"
+# summary function
+summarise <- function(data, column) {
+  total <- sum(data[[column]])
+  total
+}
+
+normalise = function(x) {
+  x / max(x)
+}
+
+function(y) {
+  y + 1
+} -> transform_values
+
+threshold <- 10
+"done" -> status
+
+outer <- function(values) {
+  local_value <- 1
+  local_value
+}
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("summarise").kind, SymbolKind::Function);
+        assert_eq!(get("normalise").kind, SymbolKind::Function);
+        assert_eq!(get("transform_values").kind, SymbolKind::Function);
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !symbol.name.starts_with("function(")),
+            "rightward function assignments should use the RHS identifier: {symbols:?}"
+        );
+        assert_eq!(get("outer").kind, SymbolKind::Function);
+        assert_eq!(get("threshold").kind, SymbolKind::Variable);
+        assert_eq!(get("status").kind, SymbolKind::Variable);
+        assert!(
+            symbols.iter().all(|symbol| symbol.name != "local_value"),
+            "nested assignments should not surface as top-level variables: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn extract_pascal_symbols_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("MyUnit.pas");
+        std::fs::write(
+            &file,
+            r#"
+unit MyUnit;
+
+interface
+
+uses SysUtils;
+
+type
+  TMyClass = class
+  private
+    FValue: Integer;
+  public
+    constructor Create;
+    procedure DoSomething; virtual;
+  end;
+
+  TMyRecord = record
+    X, Y: Integer;
+  end;
+
+  IMyInterface = interface
+    procedure DoSomethingElse;
+  end;
+
+  TMyEnum = (Red, Green, Blue);
+
+const
+  UNIT_CONST = 42;
+
+var
+  UnitVar: string;
+
+implementation
+
+constructor TMyClass.Create;
+begin
+  FValue := 0;
+end;
+
+procedure TMyClass.DoSomething;
+begin
+end;
+
+procedure StandaloneProc;
+begin
+end;
+
+end.
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("MyUnit").kind, SymbolKind::Class);
+        assert_eq!(get("TMyClass").kind, SymbolKind::Class);
+        assert_eq!(get("TMyRecord").kind, SymbolKind::Struct);
+        assert_eq!(get("IMyInterface").kind, SymbolKind::Interface);
+        assert_eq!(get("TMyEnum").kind, SymbolKind::Enum);
+        assert_eq!(get("UNIT_CONST").kind, SymbolKind::Variable);
+        assert_eq!(get("UnitVar").kind, SymbolKind::Variable);
+        assert_eq!(get("StandaloneProc").kind, SymbolKind::Function);
+
+        // Methods inside TMyClass
+        let create_methods: Vec<&Symbol> = symbols.iter().filter(|s| s.name == "Create").collect();
+        assert_eq!(create_methods.len(), 2); // one in interface, one in implementation
+        for m in create_methods {
+            assert_eq!(m.kind, SymbolKind::Method);
+            assert_eq!(m.scope_chain, vec!["TMyClass".to_string()]);
+        }
+
+        let do_something_methods: Vec<&Symbol> =
+            symbols.iter().filter(|s| s.name == "DoSomething").collect();
+        assert_eq!(do_something_methods.len(), 2); // one in interface, one in implementation
+        for m in do_something_methods {
+            assert_eq!(m.kind, SymbolKind::Method);
+            assert_eq!(m.scope_chain, vec!["TMyClass".to_string()]);
+        }
     }
 }

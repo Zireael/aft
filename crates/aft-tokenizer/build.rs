@@ -75,7 +75,14 @@ fn main() {
     );
 
     let dest = manifest_dir.join("src/claude_data.rs");
-    let mut out = fs::File::create(&dest).expect("create vendored Claude data");
+
+    // Build the whole file in memory, then publish it with an atomic
+    // temp-in-same-dir + rename. A non-atomic in-place `File::create` here once
+    // let an orphaned concurrent build truncate claude_data.rs mid-write, which
+    // a release chain's `git add` then snapshotted (v0.38.0 first retag). The
+    // rename makes any reader (cargo, git) see either the old or new file whole,
+    // never a partial one.
+    let mut out: Vec<u8> = Vec::new();
 
     writeln!(
         out,
@@ -111,6 +118,12 @@ fn main() {
         writeln!(out, "    (&[{bytes}], {rank}),").unwrap();
     }
     writeln!(out, "];").unwrap();
+
+    // Publish atomically: write to a pid-tagged temp in the SAME directory
+    // (rename is only atomic within a filesystem) then rename over dest.
+    let tmp = dest.with_extension(format!("rs.tmp.{}", std::process::id()));
+    fs::write(&tmp, &out).expect("write temp Claude data");
+    fs::rename(&tmp, &dest).expect("atomically publish Claude data");
 
     println!(
         "cargo:warning=regenerated {} from {}",

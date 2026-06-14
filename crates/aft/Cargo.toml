@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.37.1"
+version = "0.39.0"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -20,11 +20,6 @@ path = "src/main.rs"
 [[bin]]
 name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
-
-[features]
-default = ["semantic-model2vec", "semantic-fts5"]
-semantic-model2vec = ["dep:model2vec-rs"]
-semantic-fts5 = []
 
 [dependencies]
 log = "0.4"
@@ -60,6 +55,8 @@ tree-sitter-swift = "0.7"
 tree-sitter-php = "0.24"
 tree-sitter-lua = "0.5"
 tree-sitter-perl = "1.1"
+tree-sitter-pascal = "0.10.2"
+tree-sitter-r = "1.2.0"
 tree-sitter-yaml = "0.7"
 similar = "2"
 ast-grep-core = "0.41"
@@ -73,8 +70,17 @@ globset = "0.4"
 sha2 = "0.10"
 crc32fast = "1"
 blake3 = "1"
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_ast_visit = "0.126"
+oxc_parser = "0.126"
+oxc_resolver = "11"
+oxc_semantic = "0.126"
+oxc_span = "0.126"
+oxc_str = "0.126"
+rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.37.1" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.39.0" }
 
 glob = "0.3"
 which = "7"
@@ -83,9 +89,7 @@ content_inspector = "0.2.4"
 memchr = "2"
 rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-base64 = "0.22"
 tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
-model2vec-rs = { version = "0.2.1", default-features = false, features = ["fancy-regex", "local-only"], optional = true }
 # Local embedding backend (all-MiniLM-L6-v2) driven directly through ort, so we
 # control intra-op thread count (fastembed hardcoded all-cores). hf-hub fetches
 # the model on fresh installs; ureq feature = sync + rustls (no native-tls, for

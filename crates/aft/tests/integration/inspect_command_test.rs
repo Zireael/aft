@@ -645,6 +645,62 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     assert_eq!(success.aggregate["count"], 0);
 }
 
+#[test]
+fn inspect_dead_code_unavailable_renders_honestly_and_preserves_status_bar_count() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }
+",
+    );
+    let ctx = configured_context(&root);
+    ctx.update_status_bar_tier2(Some(7), Some(2), Some(3), Some(0), false);
+
+    let inspect_dir = ctx.inspect_dir();
+    let success = ctx
+        .inspect_manager()
+        .tier2_run_with_reuse_result(
+            dead_code_tier2_snapshot(&root, &inspect_dir),
+            InspectCategory::DeadCode,
+            None,
+        )
+        .outcome
+        .expect("dead_code unavailable aggregate succeeds");
+    assert_eq!(success.aggregate["callgraph_available"], false);
+
+    let (dead_code, _, _) = ctx
+        .inspect_manager()
+        .latest_tier2_counts(inspect_dir, root.clone());
+    assert_eq!(dead_code, None, "unavailable dead_code must not publish D0");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-code-unavailable-text",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["dead_code"]["status"], "unavailable");
+    assert_eq!(
+        response["summary"]["dead_code"]["reason"],
+        "call graph building/retrying"
+    );
+    let text = response["text"].as_str().expect("inspect text");
+    assert!(
+        text.contains("Dead code: unavailable (call graph building/retrying)"),
+        "unavailable callgraph should not render as zero: {text}"
+    );
+    assert!(!text.contains("Dead code: 0"));
+
+    let status_bar = ctx
+        .status_bar_counts()
+        .expect("seeded status bar remains visible");
+    assert_eq!(status_bar.dead_code, 7);
+}
+
 fn run_duplicates_reuse(
     manager: &InspectManager,
     project_root: &Path,
@@ -1048,6 +1104,118 @@ fn unused_export_items(response: &Value) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+#[test]
+fn inspect_command_oxc_unused_exports_workspace_reports_dead_export_despite_dynamic_import() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    );
+    write_file(
+        &root,
+        "packages/lib/package.json",
+        r#"{"name":"@scope/lib","exports":"./src/index.ts"}"#,
+    );
+    write_file(
+        &root,
+        "packages/lib/src/index.ts",
+        "export { consumed } from './api';\n",
+    );
+    write_file(
+        &root,
+        "packages/lib/src/api.ts",
+        "export function consumed() { return 1; }\nexport function genuinelyDead() { return 2; }\n",
+    );
+    write_file(&root, "packages/app/package.json", r#"{"name":"app"}"#);
+    write_file(
+        &root,
+        "packages/app/src/consumer.ts",
+        "import { consumed } from '@scope/lib';\nconsole.log(consumed());\n",
+    );
+    write_file(
+        &root,
+        "packages/app/src/dynamic.ts",
+        "const name = './optional-plugin';\nexport async function loadOptional() { return import(name); }\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+
+    tier2_run(&ctx, &["unused_exports"]);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-oxc-workspace",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let items = unused_export_items(&response);
+
+    assert!(
+        !items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "consumed".to_string()
+        )),
+        "barrel-export imported through a workspace package should be live: {response:#}",
+    );
+    assert!(
+        items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "genuinelyDead".to_string()
+        )),
+        "genuinely dead export should still be reported: {response:#}",
+    );
+    let dead_item = response["details"]["unused_exports"]
+        .as_array()
+        .expect("unused export details")
+        .iter()
+        .find(|item| item["file"] == "packages/lib/src/api.ts" && item["symbol"] == "genuinelyDead")
+        .expect("dead export detail");
+    assert_eq!(dead_item["provenance"], "oxc");
+}
+
+#[test]
+fn inspect_command_oxc_dead_code_keeps_same_file_schema_composition_live() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "import { UserSchema } from './schema';\nconsole.log(UserSchema);\n",
+    );
+    write_file(
+        &root,
+        "src/schema.ts",
+        "const z = { object: () => ({ extend: () => ({}) }) };\nexport const BaseSchema = z.object({});\nexport const UserSchema = BaseSchema.extend({});\nexport const TrulyDeadSchema = z.object({});\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+
+    tier2_run(&ctx, &["dead_code"]);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-oxc-same-file",
+            "command": "inspect",
+            "sections": "dead_code",
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let items = dead_code_items(&response);
+
+    assert!(
+        !items.contains(&("src/schema.ts".to_string(), "BaseSchema".to_string())),
+        "schema composed via same-file value reference should not be dead: {response:#}",
+    );
+    assert!(
+        items.contains(&("src/schema.ts".to_string(), "TrulyDeadSchema".to_string())),
+        "genuinely dead schema export should still be reported: {response:#}",
+    );
 }
 
 #[test]

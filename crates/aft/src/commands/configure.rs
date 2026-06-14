@@ -2,7 +2,7 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -28,6 +28,7 @@ use crate::search_index::{
     walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
+use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -85,51 +86,79 @@ fn install_project_watcher_with<W, E, F>(
     root_path: &Path,
     extra_watch_paths: Vec<PathBuf>,
     attach: F,
-) -> thread::JoinHandle<()>
-where
+) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
     F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
         + Send
         + 'static,
 {
-    // Drop old synchronous watcher/receiver before replacing them (re-configure).
-    *ctx.watcher().borrow_mut() = None;
-    *ctx.watcher_rx().borrow_mut() = None;
+    // Stop the previous watcher/filter runtime before replacing it
+    // (re-configure). The OS watcher itself is owned by that runtime thread, so
+    // shutting it down here drops the recursive watch and prevents stale filter
+    // threads from accumulating across reconfigures.
+    ctx.stop_watcher_runtime();
 
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
-    let (tx, rx) = mpsc::channel();
-    *ctx.watcher_rx().borrow_mut() = Some(rx);
+    let (dispatch_tx, dispatch_rx) = watcher_filter::watcher_dispatch_channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = Arc::clone(&shutdown);
 
     let root_path = root_path.to_path_buf();
+    let filter_config = WatcherFilterConfig::new(root_path.clone(), ctx.git_common_dir());
+    let shared_gitignore = ctx.shared_gitignore();
+    let gitignore_generation = ctx.gitignore_generation();
     let session_id_for_bg = log_ctx::current_session();
-    thread::spawn(move || {
+    let sync_start = file_watcher_sync_start_for_test();
+    let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
+    let start_tx = sync_start.then_some(start_tx);
+
+    let join = thread::spawn(move || {
         log_ctx::with_session(session_id_for_bg, || {
-            match attach(root_path.clone(), extra_watch_paths, tx.clone()) {
-                Ok(_watcher) => {
-                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                        slog_info!("watcher started: {}", root_path.display());
-                    }
-                    while WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
-                Err(error) => {
-                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                        log::debug!(
-                            "watcher init failed: {} — callers will work with stale data",
-                            error
+            let attach_with_start =
+                move |root: PathBuf,
+                      extra_watch_paths: Vec<PathBuf>,
+                      tx: mpsc::Sender<notify::Result<notify::Event>>| {
+                    let result = attach(root, extra_watch_paths, tx);
+                    if let Some(start_tx) = start_tx {
+                        let _ = start_tx.send(
+                            result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|error| format!("watcher init failed: {error}")),
                         );
-                        let _ = tx.send(Err(notify::Error::generic(&format!(
-                            "watcher init failed: {error}"
-                        ))));
                     }
-                }
-            }
+                    result
+                };
+            watcher_filter::run_watcher_thread(
+                filter_config,
+                extra_watch_paths,
+                shared_gitignore,
+                gitignore_generation,
+                dispatch_tx,
+                thread_shutdown,
+                attach_with_start,
+            );
         });
-    })
+    });
+
+    ctx.install_watcher_runtime(dispatch_rx, WatcherThreadHandle::new(shutdown, join));
+
+    if sync_start {
+        match start_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => slog_warn!("{error}"),
+            Err(error) => slog_warn!(
+                "timed out waiting for watcher startup for generation {generation}: {error}"
+            ),
+        }
+    }
+}
+
+fn file_watcher_sync_start_for_test() -> bool {
+    std::env::var("AFT_TEST_SYNC_FILE_WATCHER_START").is_ok_and(|value| value == "1")
 }
 
 /// Harness-only seam: when `AFT_TEST_DISABLE_FILE_WATCHER=1`, `configure` skips
@@ -148,10 +177,11 @@ fn file_watcher_disabled_for_test() -> bool {
 
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
     if file_watcher_disabled_for_test() {
+        ctx.stop_watcher_runtime();
         return;
     }
     let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
-    let _ = install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
+    install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
 }
 
 /// Backoff for build-level retries when the embedding backend is unreachable.
@@ -1209,6 +1239,8 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Html => "html",
         LangId::Markdown => "markdown",
         LangId::Yaml => "yaml",
+        LangId::Pascal => "pascal",
+        LangId::R => "r",
     }
 }
 
@@ -1357,7 +1389,9 @@ fn formatter_candidates(
         | LangId::Swift
         | LangId::Php
         | LangId::Lua
-        | LangId::Perl => Vec::new(),
+        | LangId::Perl
+        | LangId::Pascal
+        | LangId::R => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -1424,7 +1458,9 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::Swift
         | LangId::Php
         | LangId::Lua
-        | LangId::Perl => Vec::new(),
+        | LangId::Perl
+        | LangId::Pascal
+        | LangId::R => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -2859,6 +2895,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // configure should return while the watcher attaches in the background.
     if !home_match {
         install_project_watcher(ctx, &canonical_cache_root);
+    } else {
+        ctx.stop_watcher_runtime();
     }
 
     slog_info!("project root set: {}", root_path.display());
@@ -2956,13 +2994,13 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use std::path::PathBuf;
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::Ordering;
+    use std::sync::{mpsc, Arc, Barrier};
     use std::time::{Duration, Instant};
 
     use super::{
         external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
         parse_semantic_config, semantic_build_retry_backoff, validate_storage_dir,
-        WATCHER_GENERATION,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -3250,13 +3288,9 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    /// Shared mutex serializing the watcher tests below. They share the
-    /// process-global `WATCHER_GENERATION` atomic: each test bumps it to tear
-    /// down its spawned thread, and the install path gates its event/error send
-    /// on a generation match. Run in parallel, one test's bump invalidates
-    /// another's in-flight generation check, so a legitimate error send is
-    /// skipped and the receiver observes `Disconnected` instead. Serializing
-    /// them keeps the global stable for the duration of each test.
+    /// Shared mutex serializing the watcher tests below. They install watcher
+    /// runtimes on an `AppContext`, and each test must stop its runtime before
+    /// the next one starts.
     fn watcher_test_mutex() -> &'static std::sync::Mutex<()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
@@ -3545,14 +3579,16 @@ mod tests {
 
     #[test]
     fn watcher_attach_runs_off_configure_foreground_when_slow() {
-        let _guard = watcher_test_mutex().lock().unwrap();
+        let _guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let attach_started = Arc::new(Barrier::new(2));
         let attach_started_for_thread = Arc::clone(&attach_started);
 
         let started = Instant::now();
-        let handle = install_project_watcher_with(
+        install_project_watcher_with(
             &ctx,
             root.path(),
             Vec::new(),
@@ -3571,17 +3607,18 @@ mod tests {
         assert!(ctx.watcher().borrow().is_none());
 
         attach_started.wait();
-        WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        handle.join().unwrap();
+        ctx.stop_watcher_runtime();
     }
 
     #[test]
     fn watcher_attach_failure_reports_error_on_receiver() {
-        let _guard = watcher_test_mutex().lock().unwrap();
+        let _guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
 
-        let handle = install_project_watcher_with(
+        install_project_watcher_with(
             &ctx,
             root.path(),
             Vec::new(),
@@ -3595,12 +3632,93 @@ mod tests {
             .expect("watcher receiver installed")
             .recv_timeout(Duration::from_secs(2))
             .expect("watcher error event");
-        assert!(event
-            .unwrap_err()
-            .to_string()
-            .contains("no watcher backend"));
-        WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        handle.join().unwrap();
+        match event {
+            crate::watcher_filter::WatcherDispatchEvent::Error(error) => {
+                assert!(error.contains("no watcher backend"));
+            }
+            other => panic!("unexpected watcher event: {other:?}"),
+        }
+        ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn watcher_reconfigure_does_not_leak_filter_threads() {
+        let _guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct FakeWatcher {
+            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+            drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Drop for FakeWatcher {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let root1 = tempfile::tempdir().unwrap();
+        let root2 = tempfile::tempdir().unwrap();
+        let root3 = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let drops_for_watcher = Arc::clone(&drops);
+        install_project_watcher_with(
+            &ctx,
+            root1.path(),
+            Vec::new(),
+            move |_root, _extra_watch_paths, tx| {
+                Ok::<_, &'static str>(FakeWatcher {
+                    _tx: tx,
+                    drops: drops_for_watcher,
+                })
+            },
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        let drops_for_watcher = Arc::clone(&drops);
+        install_project_watcher_with(
+            &ctx,
+            root2.path(),
+            Vec::new(),
+            move |_root, _extra_watch_paths, tx| {
+                Ok::<_, &'static str>(FakeWatcher {
+                    _tx: tx,
+                    drops: drops_for_watcher,
+                })
+            },
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "first watcher should be dropped on reconfigure"
+        );
+
+        let drops_for_watcher = Arc::clone(&drops);
+        install_project_watcher_with(
+            &ctx,
+            root3.path(),
+            Vec::new(),
+            move |_root, _extra_watch_paths, tx| {
+                Ok::<_, &'static str>(FakeWatcher {
+                    _tx: tx,
+                    drops: drops_for_watcher,
+                })
+            },
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "second watcher should be dropped on reconfigure"
+        );
+
+        ctx.stop_watcher_runtime();
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "final watcher should be dropped on explicit shutdown"
+        );
     }
 
     #[test]

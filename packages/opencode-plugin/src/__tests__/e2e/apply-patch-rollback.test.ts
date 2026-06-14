@@ -5,6 +5,7 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { callBridge } from "../../tools/_shared.js";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk, toolResultText } from "../test-helpers";
@@ -65,6 +66,7 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
 
   async function toolHarness(): Promise<{
     h: E2EHarness;
+    ctx: PluginContext;
     tools: ReturnType<typeof hoistedTools>;
     sdkCtx: ToolContext;
   }> {
@@ -76,9 +78,11 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
       { storage_dir: join(h.tempDir, ".storage"), harness: "opencode" },
     );
     pools.push(pool);
+    const ctx = createPluginContext(pool, join(h.tempDir, ".storage"));
     return {
       h,
-      tools: hoistedTools(createPluginContext(pool, join(h.tempDir, ".storage"))),
+      ctx,
+      tools: hoistedTools(ctx),
       sdkCtx: createSdkContext(h.tempDir),
     };
   }
@@ -172,14 +176,16 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
     }
   });
 
-  test("add hunk to existing path should fail without rolling back unrelated successful file", async () => {
+  test("add hunk to existing path fails during preview without applying earlier hunks", async () => {
     const { h, tools, sdkCtx } = await toolHarness();
     await writeFile(h.path("kept.txt"), "before\n", "utf8");
     await writeFile(h.path("exists.txt"), "already here\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+    let caught: unknown;
+    try {
+      await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Update File: kept.txt
 @@
 -before
@@ -187,14 +193,64 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
 *** Add File: exists.txt
 +new content
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
+    } catch (e) {
+      caught = e;
+    }
 
-    expect(toolResultText(output)).toContain("Updated kept.txt");
-    expect(toolResultText(output)).toContain("Failed to create exists.txt");
-    expect(toolResultText(output)).toContain("Patch partially applied");
-    expect(await readTextFile(h.path("kept.txt"))).toBe("after\n");
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("Failed to create exists.txt");
+    expect(await readTextFile(h.path("kept.txt"))).toBe("before\n");
     expect(await readTextFile(h.path("exists.txt"))).toBe("already here\n");
+  });
+
+  test("delete then add of an existing path remains restorable from partial checkpoint", async () => {
+    const { h, ctx, tools, sdkCtx } = await toolHarness();
+    const existing = h.path("existing.ts");
+    const lockedDir = h.path("locked");
+    await writeFile(existing, 'export const value = "original";\n', "utf8");
+    await mkdir(lockedDir, { recursive: true });
+    await writeFile(h.path("locked", "fail.ts"), "export const locked = true;\n", "utf8");
+
+    const output = await (async () => {
+      await chmod(lockedDir, 0o555);
+      try {
+        return await tools.apply_patch.execute(
+          {
+            patchText: `*** Begin Patch
+*** Delete File: existing.ts
+*** Add File: existing.ts
++export const value = "replacement";
+*** Delete File: locked/fail.ts
+*** End Patch`,
+          },
+          sdkCtx,
+        );
+      } finally {
+        await chmod(lockedDir, 0o755).catch(() => {});
+      }
+    })();
+
+    const text = toolResultText(output);
+    expect(text).toContain("Deleted existing.ts");
+    expect(text).toContain("Created existing.ts");
+    expect(text).toContain("Failed to delete locked/fail.ts");
+    expect(text).toContain("Patch partially applied");
+    expect(await readTextFile(existing)).toBe('export const value = "replacement";\n');
+
+    const list = await callBridge(ctx, sdkCtx, "list_checkpoints");
+    expect(list.success).toBe(true);
+    const checkpointName = (list.checkpoints as Array<Record<string, unknown>>)
+      .map((checkpoint) => checkpoint.name)
+      .filter((name): name is string => typeof name === "string" && name.startsWith("apply_patch_"))
+      .sort()
+      .at(-1);
+    expect(checkpointName).toBeDefined();
+
+    const restore = await callBridge(ctx, sdkCtx, "restore_checkpoint", { name: checkpointName });
+    expect(restore.success).toBe(true);
+    expect(await readTextFile(existing)).toBe('export const value = "original";\n');
   });
 });

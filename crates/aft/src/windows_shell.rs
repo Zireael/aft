@@ -83,13 +83,6 @@ impl WindowsShell {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn command(&self, command: &str) -> Command {
-        let mut cmd = Command::new(self.binary().as_ref());
-        cmd.args(self.args(command));
-        cmd
-    }
-
     /// Args for invoking a wrapper file under a PTY-attached shell.
     /// Returns owned strings so callers can pass temporary wrapper paths.
     pub(crate) fn pty_wrapper_args(&self, wrapper_path: &Path) -> Vec<String> {
@@ -105,18 +98,12 @@ impl WindowsShell {
         }
     }
 
-    /// Build a `Command` that runs the background wrapper script.
+    /// Build a `Command` that runs an inline background wrapper script.
     ///
-    /// Production background bash now writes cmd wrappers to `.bat` files and
-    /// invokes them without delayed expansion, so paths containing `!` remain
-    /// literal. This helper is retained for tests around legacy inline shapes.
-    ///
-    /// For foreground bash, callers should use [`Self::command`] instead;
-    /// `/V:ON` would change the semantics of user commands containing `!`
-    /// (which would otherwise be passed through literally to the user).
-    // No longer called by production bg-bash (which writes the wrapper
-    // to a temp file and invokes via `-File` / `cmd /C path`), but kept
-    // for tests that exercise the shell-arg shape directly.
+    /// Production background bash now writes wrappers to `.bat` / `.ps1` temp
+    /// files and invokes those files directly, so paths containing `!` remain
+    /// literal and cmd.exe does not have to parse a long inline wrapper. This
+    /// helper is retained for tests that exercise the legacy shell-arg shape.
     #[allow(dead_code)]
     pub(crate) fn bg_command(&self, wrapper: &str) -> Command {
         let binary = self.binary();
@@ -249,30 +236,6 @@ impl WindowsShell {
             WindowsShell::Cmd | WindowsShell::Posix(_) => script.into_bytes(),
         }
     }
-}
-
-/// Resolve which Windows shell to use for `bash` invocations.
-///
-/// Cached after the first resolve to avoid repeated PATH probes — the user's
-/// installed shells don't change mid-session, so a static cache is safe and
-/// keeps bash dispatch fast.
-///
-/// **Note:** PATH probe via `which::which` can disagree with what
-/// `Command::spawn` actually sees at runtime — antivirus / AppLocker rules,
-/// PATH inheritance gaps in the spawning host, or sandbox flags can make
-/// a binary "exist" to `which` but fail to spawn with NotFound. Foreground
-/// bash uses [`shell_candidates`] + runtime retry to defend against this;
-/// callers that take this single-result API are accepting the cached
-/// outcome at face value.
-// No longer called by production bg-bash (the new path uses
-// `shell_candidates()` with retry directly). Kept for potential future
-// use and for parity with the foreground spawn loop.
-#[allow(dead_code)]
-pub(crate) fn resolve_windows_shell() -> WindowsShell {
-    shell_candidates()
-        .first()
-        .cloned()
-        .unwrap_or(WindowsShell::Cmd)
 }
 
 /// All Windows shells that the PATH probe believes are reachable, returned

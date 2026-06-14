@@ -35,6 +35,10 @@ impl EntryPointSet {
             .collect()
     }
 
+    pub(crate) fn public_api_files(&self) -> Vec<PathBuf> {
+        self.public_api_files.iter().cloned().collect()
+    }
+
     pub(crate) fn warnings(&self) -> &[String] {
         &self.warnings
     }

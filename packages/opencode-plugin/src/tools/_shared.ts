@@ -59,174 +59,21 @@ const z = tool.schema;
 export const optionalInt = (min: number, max: number): any =>
   z.number().int().min(min).max(max).optional();
 
-/**
- * Runtime coercion for agent-friendly sentinel handling.
- *
- * Some agents emit null / "" / 0 when they mean "param not provided".
- * Use this inside tool handlers BEFORE relying on the value. Returns
- * `undefined` for all empty sentinels; rejects out-of-bounds with a
- * clear message.
- *
- * Tool handlers that want sentinel tolerance must pass args through
- * this AFTER Zod validation has accepted the value (or for fields
- * declared as `z.unknown().optional()` that bypass type validation).
- * With `optionalInt`'s bounded `z.number().int()` schema, Zod already
- * rejects the sentinels — call this for defense in depth or for fields
- * declared more permissively.
- */
-export function coerceOptionalInt(
-  v: unknown,
-  paramName: string,
-  min: number,
-  max: number,
-): number | undefined {
-  if (v === undefined || v === null || v === "") return undefined;
-  if (typeof v === "number" && (v === 0 || !Number.isFinite(v))) return undefined;
-  const n = typeof v === "string" ? Number(v) : v;
-  if (typeof n !== "number" || !Number.isInteger(n)) {
-    throw new Error(`${paramName} must be an integer between ${min} and ${max}`);
-  }
-  if (n < min || n > max) {
-    throw new Error(`${paramName} must be between ${min} and ${max}`);
-  }
-  return n;
-}
-
-/**
- * True when a value represents "agent did not provide this param".
- *
- * GPT-family models send empty strings / empty arrays / null instead of
- * omitting optional params entirely. Use this BEFORE mutual-exclusion
- * checks so an empty `targets: []` or `url: ""` doesn't get counted as
- * present and trigger a misleading "X is mutually exclusive with Y" error.
- *
- * Treats undefined / null / "" / [] / {} as empty. Booleans and numbers
- * (including 0 and false) are NOT empty by themselves — only string and
- * collection sentinels qualify.
- */
-export function isEmptyParam(value: unknown): boolean {
-  if (value === undefined || value === null) return true;
-  if (typeof value === "string") return value.length === 0;
-  if (Array.isArray(value)) return value.length === 0;
-  if (typeof value === "object") return Object.keys(value as object).length === 0;
-  return false;
-}
-
 // Bridge transport budget for bash-family calls. Rust bash returns `running`
 // promptly and plugin-side polling handles task lifetime, so transport only
 // covers spawn/control RPC round-trips. Keep this centralized so every
 // bash-family RPC also keeps the shared bridge alive on transport timeout.
 export const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
-// Re-exported from @cortexkit/aft-bridge — the table lives next to the
-// bridge's semantic-timeout clamp so the two can never drift apart.
-export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "@cortexkit/aft-bridge";
-
-function asPlainObject(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-function candidateLocation(candidate: Record<string, unknown>): string | undefined {
-  const file =
-    typeof candidate.file === "string" && candidate.file.length > 0 ? candidate.file : undefined;
-  if (!file) return undefined;
-  const line =
-    typeof candidate.line === "number" && Number.isFinite(candidate.line)
-      ? candidate.line
-      : undefined;
-  return line === undefined ? file : `${file}:${line}`;
-}
-
-function stringifyData(data: unknown): string | undefined {
-  if (data === undefined) return undefined;
-  try {
-    return JSON.stringify(data, null, 2);
-  } catch {
-    return String(data);
-  }
-}
-
-/** Format bridge failure envelopes without dropping structured error data. */
-export function formatBridgeErrorMessage(
-  command: string,
-  response: Record<string, unknown>,
-  params: Record<string, unknown> = {},
-): string {
-  const code =
-    typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
-  const message =
-    typeof response.message === "string" && response.message.length > 0
-      ? response.message
-      : `${command} failed`;
-  // Rust merges error_with_data() extras into the top-level response, NOT under
-  // a nested `data` field. Read structured fields at top-level first; fall back
-  // to `response.data` for forward-compat with any handler that uses nesting.
-  const data = asPlainObject(response.data);
-  const rawCandidates = Array.isArray(response.candidates)
-    ? response.candidates
-    : Array.isArray(data?.candidates)
-      ? data.candidates
-      : undefined;
-  const rawSymbol =
-    typeof response.symbol === "string" && response.symbol.length > 0
-      ? response.symbol
-      : typeof data?.symbol === "string" && data.symbol.length > 0
-        ? data.symbol
-        : undefined;
-
-  if (code === "ambiguous_target" || code === "target_symbol_not_in_file") {
-    const candidates = (rawCandidates ?? [])
-      .map(asPlainObject)
-      .filter((candidate): candidate is Record<string, unknown> => candidate !== undefined)
-      .map(candidateLocation)
-      .filter((candidate): candidate is string => candidate !== undefined);
-
-    if (candidates.length > 0) {
-      const symbol =
-        typeof params.toSymbol === "string" && params.toSymbol.length > 0
-          ? params.toSymbol
-          : rawSymbol;
-      const target = symbol ? `multiple symbols named "${symbol}"` : message.replace(/[.!?]+$/, "");
-      const action =
-        code === "ambiguous_target"
-          ? "Pass toFile to disambiguate"
-          : "Try one of these files for toFile";
-      return `${command}: ${code} — ${target}. ${action}:\n${candidates
-        .map((candidate) => `  - ${candidate}`)
-        .join("\n")}`;
-    }
-  }
-
-  if (!code) return message;
-
-  const lines = [`${command}: ${code} — ${message}`];
-  // For unhandled structured error codes, surface any extra fields beyond
-  // code/message/success/id so agents see the full context (not just data.*).
-  const extras = collectStructuredExtras(response);
-  if (extras) lines.push(`data: ${extras}`);
-  return lines.join("\n");
-}
-
-/**
- * Capture any structured fields a Rust error_with_data() merged into the top-level
- * response, excluding the well-known envelope keys (id/success/code/message) and
- * already-shown nested `data` (handled separately when present).
- */
-function collectStructuredExtras(response: Record<string, unknown>): string | undefined {
-  const reserved = new Set(["id", "success", "code", "message", "data"]);
-  const extras: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(response)) {
-    if (reserved.has(key)) continue;
-    extras[key] = value;
-  }
-  if (Object.keys(extras).length === 0) {
-    return stringifyData(response.data);
-  }
-  // Prefer top-level extras; fold any nested data fields beneath.
-  if (response.data !== undefined) extras.data = response.data;
-  return stringifyData(extras);
-}
+// Re-exported from @cortexkit/aft-bridge — shared runtime coercion,
+// formatting, and timeout tables live in the host-neutral bridge package.
+export {
+  coerceOptionalInt,
+  formatBridgeErrorMessage,
+  isEmptyParam,
+  LONG_RUNNING_COMMAND_TIMEOUT_MS,
+  timeoutForCommand,
+} from "@cortexkit/aft-bridge";
 
 /**
  * Minimum shape of the per-tool-call context provided by the OpenCode SDK.

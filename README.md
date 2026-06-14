@@ -153,6 +153,8 @@ _Coming soon._
 | YAML (incl. Kubernetes) | ✓ | ✓ | | ✓ | | |
 | JSON | ✓ | ✓ | ✓ | | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Pascal | ✓ | ✓ | ✓ | ✓ | | |
+| R | ✓ | ✓ | ✓ | | | |
 | Vue | ✓ | ✓ | ✓ | ✓ | ✓ | |
 
 Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`, and trigram-indexed `grep`/`glob` covers every text file regardless of language. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Semantic** is `aft_search` embedding coverage. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
@@ -185,7 +187,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (24 lang)│
+                   │ • tree-sitter (25 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │

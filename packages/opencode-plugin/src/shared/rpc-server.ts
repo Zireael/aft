@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -14,6 +15,8 @@ import { isPidAlive, parseRpcPortRecord, rpcPortFileDir } from "./rpc-utils";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
+const PORT_FILE_HEARTBEAT_MS = 15_000;
+
 export class AftRpcServer {
   private server: Server | null = null;
   private port = 0;
@@ -21,6 +24,7 @@ export class AftRpcServer {
   private handlers = new Map<string, RpcHandler>();
   private portFilePath: string;
   private portsDir: string;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /** Unique per-instance ID — distinguishes our entry from duplicate plugin loads. */
   private instanceId: string;
 
@@ -75,6 +79,14 @@ export class AftRpcServer {
           );
           renameSync(tmpPath, this.portFilePath);
           log(`RPC server listening on 127.0.0.1:${this.port}`);
+          // Self-heal: the port file is this server's only discoverability
+          // record, and historically it was written exactly once — anything
+          // that deleted it (a client misjudging a load-induced health-check
+          // timeout as staleness, cache cleanup, manual sweeps) silently
+          // orphaned the server until host restart (issue #110: sidebar stuck
+          // on the lazy placeholder forever). Recreate it if it goes missing.
+          this.heartbeatTimer = setInterval(() => this.ensurePortFile(), PORT_FILE_HEARTBEAT_MS);
+          this.heartbeatTimer.unref?.();
           // Hygiene: sweep dead siblings while we're here. The client only
           // reclaims dead-pid files on a cold port scan, and it caches the
           // first warm port afterwards — so crash/restart leftovers piled up
@@ -129,8 +141,35 @@ export class AftRpcServer {
     }
   }
 
+  /** Rewrite the port file if it disappeared (wrongful deletion recovery). */
+  private ensurePortFile(): void {
+    if (!this.server || this.token === null) return;
+    try {
+      if (existsSync(this.portFilePath)) return;
+      const tmpPath = `${this.portFilePath}.tmp`;
+      writeFileSync(
+        tmpPath,
+        JSON.stringify({
+          port: this.port,
+          token: this.token,
+          pid: process.pid,
+          started_at: Date.now(),
+        }),
+        { encoding: "utf-8", mode: 0o600 },
+      );
+      renameSync(tmpPath, this.portFilePath);
+      log(`RPC port file was missing; rewrote ${this.portFilePath}`);
+    } catch {
+      // best-effort; retried on the next heartbeat
+    }
+  }
+
   /** Stop the server and clean up port file. */
   stop(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     if (this.server) {
       this.server.close();
       this.server = null;

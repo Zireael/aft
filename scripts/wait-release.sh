@@ -26,7 +26,10 @@
 set -euo pipefail
 
 TAG=""
-MAX_WAIT="${MAX_WAIT_SECONDS:-2100}"
+# Full release span = test matrix + 7 platform builds + npm/crates/GitHub
+# publishes, which runs 60-90 min. 2100s (35m) expired mid-build during the
+# v0.38.0 release; 5400s (90m) covers a normal run with headroom.
+MAX_WAIT="${MAX_WAIT_SECONDS:-5400}"
 REPO="cortexkit/aft"
 INTERVAL=5
 FAIL_FAST=1
@@ -91,8 +94,11 @@ MAX_GH_API_FAILURES=3
 # state into a tab-separated string and grep it. Format: "<name>\t<state>\n"
 PRINTED_STATES=""
 
+# Runs created before this moment (minus skew slack) are stale — see gh_run_list.
+RUN_CUTOFF_ISO=$(date -u -v-120S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '-120 seconds' +%Y-%m-%dT%H:%M:%SZ)
+
 gh_run_list() {
-  gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 1 --json status,conclusion,databaseId
+  gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 5 --json status,conclusion,databaseId,createdAt
 }
 
 gh_run_jobs() {
@@ -201,9 +207,14 @@ while true; do
   fi
   GH_API_FAILURES=0
 
-  STATUS=$(echo "$RUN_JSON" | jq -r '.[0].status // "not_found"')
-  CONCLUSION=$(echo "$RUN_JSON" | jq -r '.[0].conclusion // ""')
-  RUN_ID=$(echo "$RUN_JSON" | jq -r '.[0].databaseId // ""')
+  # A deleted+repushed tag leaves the previous run attached to the same tag
+  # ref. Watching that stale run reports its old failure instantly (bit us on
+  # the v0.37.2 retag). Only consider runs created after this script started,
+  # minus slack for clock skew; runs are newest-first so take the first match.
+  FRESH_JSON=$(echo "$RUN_JSON" | jq --arg cutoff "$RUN_CUTOFF_ISO" '[.[] | select(.createdAt >= $cutoff)]')
+  STATUS=$(echo "$FRESH_JSON" | jq -r '.[0].status // "not_found"')
+  CONCLUSION=$(echo "$FRESH_JSON" | jq -r '.[0].conclusion // ""')
+  RUN_ID=$(echo "$FRESH_JSON" | jq -r '.[0].databaseId // ""')
 
   if [ "$STATUS" = "not_found" ]; then
     echo "  [+${ELAPSED}s] Workflow not started yet..."

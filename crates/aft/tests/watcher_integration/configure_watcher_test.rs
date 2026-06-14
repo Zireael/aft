@@ -106,6 +106,69 @@ fn configure_ignore_change_purges_indexed_file_from_grep() {
     );
 }
 
+#[test]
+fn dispatch_stays_responsive_under_ignored_event_flood() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    let source = dir.path().join("src/main.ts");
+    fs::write(&source, "export function main() { return 1; }\n").unwrap();
+    fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+    let ignored_dir = dir.path().join("ignored");
+    fs::create_dir_all(&ignored_dir).unwrap();
+
+    let mut aft = AftProcess::spawn_with_real_watcher();
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-responsive-flood",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let writer_dir = ignored_dir.clone();
+    let writer = thread::spawn(move || {
+        for i in 0..8_000 {
+            fs::write(writer_dir.join(format!("event-{i}.tmp")), b"ignored flood").unwrap();
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let response = aft.send_with_timeout(
+        &json!({
+            "id": "outline-during-flood",
+            "command": "outline",
+            "file": source,
+        })
+        .to_string(),
+        Duration::from_secs(5),
+    );
+    let elapsed = started.elapsed();
+    writer.join().unwrap();
+
+    assert_eq!(
+        response["success"], true,
+        "outline should succeed during ignored event flood: {response:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "outline took {elapsed:?} behind ignored watcher flood"
+    );
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn watcher_replays_search_edit_seen_during_in_flight_build() {

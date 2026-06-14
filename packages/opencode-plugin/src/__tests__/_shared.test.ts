@@ -64,6 +64,13 @@ describe("coerceOptionalInt", () => {
     expect(coerceOptionalInt("24", "x", 1, 100)).toBe(24);
   });
 
+  test("0 is a real value when min is 0 (edit occurrence regression)", () => {
+    // occurrence: 0 selects the FIRST match — dropping it as a sentinel sent
+    // agents into an ambiguous_match loop suggesting the param they just sent.
+    expect(coerceOptionalInt(0, "occurrence", 0, Number.MAX_SAFE_INTEGER)).toBe(0);
+    expect(coerceOptionalInt("0", "occurrence", 0, Number.MAX_SAFE_INTEGER)).toBe(0);
+  });
+
   test("rejects out-of-bounds and non-integers with named errors", () => {
     expect(() => coerceOptionalInt(999, "x", 1, 100)).toThrow("x must be between 1 and 100");
     expect(() => coerceOptionalInt("abc", "x", 1, 100)).toThrow(

@@ -252,6 +252,99 @@ describe("reading tool adapters", () => {
     expect(result.content[0].text).toContain("src.ts");
   });
 
+  test("aft_zoom string symbols renders Rust batch envelope from one bridge call", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      complete: true,
+      symbols: [
+        {
+          name: "a",
+          response: {
+            success: true,
+            name: "a",
+            kind: "function",
+            range: { start_line: 1, end_line: 2 },
+            content: "function a() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+        {
+          name: "b",
+          response: {
+            success: true,
+            name: "b",
+            kind: "function",
+            range: { start_line: 5, end_line: 6 },
+            content: "function b() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+      ],
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src/job.rs",
+      symbols: "a b",
+    })) as { content: Array<{ text: string }> };
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).toMatchObject({ file: "src/job.rs", symbol: "a b" });
+    const text = result.content[0].text;
+    expect(text).toContain("[function a]");
+    expect(text).toContain("function a() {}");
+    expect(text).toContain("[function b]");
+    expect(text).toContain("function b() {}");
+    expect(text).not.toContain("Incomplete zoom results");
+  });
+
+  test("aft_zoom string symbols shows incomplete framing when Rust batch has a failure", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      complete: false,
+      symbols: [
+        {
+          name: "a",
+          response: {
+            success: true,
+            name: "a",
+            kind: "function",
+            range: { start_line: 1, end_line: 1 },
+            content: "function a() {}\n",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
+        },
+        {
+          name: "missing",
+          response: {
+            success: false,
+            code: "symbol_not_found",
+            message: "symbol 'missing' not found",
+          },
+        },
+      ],
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src/job.rs",
+      symbols: "a missing",
+    })) as { content: Array<{ text: string }> };
+
+    const text = result.content[0].text;
+    expect(text).toContain("Incomplete zoom results");
+    expect(text).toContain("function a() {}");
+    expect(text).toContain('Symbol "missing" not found:');
+  });
+
   test("aft_zoom targets accepts single object form for one-target lookup", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((_command, params) => ({

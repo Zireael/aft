@@ -42,3 +42,59 @@ export function coerceStringArray(value: unknown): string[] {
   }
   return [];
 }
+
+/**
+ * Runtime coercion for agent-friendly sentinel handling.
+ *
+ * Some agents emit null / "" / 0 when they mean "param not provided".
+ * Use this inside tool handlers BEFORE relying on the value. Returns
+ * `undefined` for all empty sentinels; rejects out-of-bounds with a
+ * clear message.
+ *
+ * Tool handlers that want sentinel tolerance must pass args through
+ * this AFTER schema validation has accepted the value (or for fields
+ * declared as `unknown`/`any` that bypass type validation). Host-specific
+ * optional-integer schemas stay local to each plugin; this helper is the
+ * shared runtime coercion.
+ */
+export function coerceOptionalInt(
+  v: unknown,
+  paramName: string,
+  min: number,
+  max: number,
+): number | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  // 0 is an empty-param sentinel ONLY when 0 is out of bounds anyway. For
+  // 0-indexed params (edit's `occurrence`, min=0) it is the most common legal
+  // value — dropping it sent agents into an ambiguous_match loop that told
+  // them to pass the param they had just passed.
+  if (typeof v === "number" && (!Number.isFinite(v) || (v === 0 && min > 0))) return undefined;
+  const n = typeof v === "string" ? Number(v) : v;
+  if (typeof n !== "number" || !Number.isInteger(n)) {
+    throw new Error(`${paramName} must be an integer between ${min} and ${max}`);
+  }
+  if (n < min || n > max) {
+    throw new Error(`${paramName} must be between ${min} and ${max}`);
+  }
+  return n;
+}
+
+/**
+ * True when a value represents "agent did not provide this param".
+ *
+ * GPT-family models send empty strings / empty arrays / null instead of
+ * omitting optional params entirely. Use this BEFORE mutual-exclusion
+ * checks so an empty `targets: []` or `url: ""` doesn't get counted as
+ * present and trigger a misleading "X is mutually exclusive with Y" error.
+ *
+ * Treats undefined / null / "" / [] / {} as empty. Booleans and numbers
+ * (including 0 and false) are NOT empty by themselves — only string and
+ * collection sentinels qualify.
+ */
+export function isEmptyParam(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "string") return value.length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}

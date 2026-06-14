@@ -489,6 +489,9 @@ fn severity_counts(diagnostics: &[StoredDiagnostic]) -> (usize, usize, usize, us
     let mut hints = 0;
 
     for diagnostic in diagnostics {
+        if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+            continue;
+        }
         match diagnostic.severity {
             DiagnosticSeverity::Error => errors += 1,
             DiagnosticSeverity::Warning => warnings += 1,
@@ -500,13 +503,23 @@ fn severity_counts(diagnostics: &[StoredDiagnostic]) -> (usize, usize, usize, us
     (errors, warnings, info, hints)
 }
 
+/// Detail-row message for `aft_inspect` items (file:line:col severity message).
+/// Environmental diagnostics are tagged so summary counts and listed rows agree.
+fn diagnostic_detail_message(diagnostic: &StoredDiagnostic) -> String {
+    let mut message = diagnostic.message.clone();
+    if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+        message.push_str(" [environmental]");
+    }
+    message
+}
+
 fn diagnostic_item(snapshot: &InspectSnapshot, diagnostic: &StoredDiagnostic) -> Value {
     serde_json::json!({
         "file": display_path(snapshot, &diagnostic.file),
         "line": diagnostic.line,
         "column": diagnostic.column,
         "severity": diagnostic.severity.as_str(),
-        "message": diagnostic.message,
+        "message": diagnostic_detail_message(diagnostic),
         "source": diagnostic.source.as_deref().unwrap_or("lsp"),
     })
 }
@@ -520,4 +533,96 @@ fn display_path(snapshot: &InspectSnapshot, path: &Path) -> String {
 
 fn server_id(key: &ServerKey) -> String {
     key.kind.id_str().to_string()
+}
+
+#[cfg(test)]
+mod environmental_count_tests {
+    use std::path::PathBuf;
+
+    use super::severity_counts;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+
+    fn diag(line: u32, message: &str) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: PathBuf::from("/repo/src/mixed.ts"),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: message.into(),
+            code: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn severity_counts_exclude_environmental_on_same_file() {
+        let diagnostics = vec![
+            diag(1, "Cannot find name 'x'."),
+            diag(
+                2,
+                "Failed to load schema from https://example.com/schema.json",
+            ),
+        ];
+        let (errors, warnings, _, _) = severity_counts(&diagnostics);
+        assert_eq!(
+            errors, 1,
+            "inspect summary must count only non-environmental errors"
+        );
+        assert_eq!(warnings, 0);
+    }
+}
+
+#[cfg(test)]
+mod environmental_render_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    use super::diagnostic_item;
+    use crate::config::Config;
+    use crate::inspect::job::InspectSnapshot;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::parser::SymbolCache;
+
+    fn snapshot() -> InspectSnapshot {
+        InspectSnapshot::new(
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/.aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        )
+    }
+
+    fn stored(message: &str) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: PathBuf::from("/repo/package.json"),
+            line: 2,
+            column: 5,
+            end_line: 2,
+            end_column: 6,
+            severity: DiagnosticSeverity::Error,
+            message: message.into(),
+            code: None,
+            source: Some("json".into()),
+        }
+    }
+
+    #[test]
+    fn detail_row_tags_environmental_message() {
+        let item = diagnostic_item(
+            &snapshot(),
+            &stored("Failed to load schema from https://example.com/schema.json"),
+        );
+        assert_eq!(
+            item["message"].as_str(),
+            Some("Failed to load schema from https://example.com/schema.json [environmental]")
+        );
+    }
+
+    #[test]
+    fn detail_row_leaves_real_errors_untagged() {
+        let item = diagnostic_item(&snapshot(), &stored("Cannot find name 'typo'."));
+        assert_eq!(item["message"].as_str(), Some("Cannot find name 'typo'."));
+    }
 }

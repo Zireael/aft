@@ -303,13 +303,14 @@ impl DiagnosticsStore {
         (errors, warnings)
     }
 
-    /// Error/warning counts after applying a per-file `keep` predicate and
-    /// de-duplicating diagnostics that multiple servers reported for the same
-    /// location. This matches `aft_inspect`'s warm semantics
+    /// Error/warning counts after applying a per-file `keep` predicate,
+    /// excluding environmental/setup diagnostics (see `environmental.rs`),
+    /// and de-duplicating diagnostics that multiple servers reported for the
+    /// same location. This matches `aft_inspect`'s warm semantics
     /// (`inspect/diagnostics_category.rs`: project-root filter +
-    /// tsconfig-membership skip + `sort_and_dedup`) so the agent status bar's
-    /// E/W agree with `aft_inspect`/`tsc` instead of counting build-excluded
-    /// files and double-counting multi-server overlaps.
+    /// tsconfig-membership skip + environmental filter + `sort_and_dedup`) so
+    /// the agent status bar's E/W agree with `aft_inspect`/`tsc` instead of
+    /// counting build-excluded files and double-counting multi-server overlaps.
     ///
     /// The store itself holds no tsconfig/project policy — the caller encodes
     /// it in `keep` (see `LspManager::filtered_error_warning_counts`). `keep`
@@ -341,6 +342,9 @@ impl DiagnosticsStore {
                 continue;
             }
             for diagnostic in &entry.diagnostics {
+                if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+                    continue;
+                }
                 let dedup_key = (
                     diagnostic.file.as_path(),
                     diagnostic.line,
@@ -950,5 +954,93 @@ mod tests {
             vec![diag(file, 12, "lint warn", DiagnosticSeverity::Warning)],
         );
         assert_eq!(store.filtered_error_warning_counts(|_| true), (1, 1));
+    }
+
+    #[test]
+    fn filtered_counts_exclude_environmental_diagnostics() {
+        let mut store = DiagnosticsStore::new();
+        let file = "/repo/src/app.ts";
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from(file),
+            vec![
+                diag(
+                    file,
+                    1,
+                    "Cannot find name 'foo'.",
+                    DiagnosticSeverity::Error,
+                ),
+                diag(
+                    file,
+                    2,
+                    "Failed to load schema from https://cdn.example/pkg/schema.json",
+                    DiagnosticSeverity::Error,
+                ),
+            ],
+        );
+        assert_eq!(store.error_warning_counts(), (2, 0));
+        assert_eq!(
+            store.filtered_error_warning_counts(|_| true),
+            (1, 0),
+            "environmental schema-fetch must not inflate E count"
+        );
+    }
+
+    #[test]
+    fn environmental_flap_does_not_change_filtered_counts() {
+        let mut store = DiagnosticsStore::new();
+        let file = "/repo/package.json";
+        let key = server_key(ServerKind::TypeScript);
+        let env_msg =
+            "Failed to fetch schema from https://json.schemastore.org/package.json: network";
+
+        assert_eq!(store.filtered_error_warning_counts(|_| true), (0, 0));
+
+        store.publish(
+            key.clone(),
+            PathBuf::from(file),
+            vec![diag(file, 1, env_msg, DiagnosticSeverity::Error)],
+        );
+        assert_eq!(
+            store.filtered_error_warning_counts(|_| true),
+            (0, 0),
+            "publish environmental diagnostic must not change filtered E/W"
+        );
+
+        store.publish(key, PathBuf::from(file), vec![]);
+        assert_eq!(
+            store.filtered_error_warning_counts(|_| true),
+            (0, 0),
+            "removing environmental diagnostic must not change filtered E/W"
+        );
+    }
+
+    #[test]
+    fn mixed_syntax_and_schema_fetch_counts_one_error() {
+        let mut store = DiagnosticsStore::new();
+        let file = "/repo/src/mixed.ts";
+        store.publish(
+            server_key(ServerKind::TypeScript),
+            PathBuf::from(file),
+            vec![
+                diag(
+                    file,
+                    3,
+                    "Cannot find name 'bar'.",
+                    DiagnosticSeverity::Error,
+                ),
+                diag(
+                    file,
+                    1,
+                    "Failed to resolve schema https://example.com/x.json",
+                    DiagnosticSeverity::Error,
+                ),
+            ],
+        );
+        assert_eq!(
+            store.filtered_error_warning_counts(|_| true),
+            (1, 0),
+            "classifier is per-diagnostic: one real syntax error => E1"
+        );
     }
 }

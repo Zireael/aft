@@ -1,6 +1,6 @@
 /**
  * ast_grep_search + ast_grep_replace — AST-aware pattern search/rewrite.
- * 6 languages: typescript, tsx, javascript, python, rust, go.
+ * 8 languages: typescript, tsx, javascript, python, rust, go, pascal, r.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -31,9 +31,12 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
-const AstLang = StringEnum(["typescript", "tsx", "javascript", "python", "rust", "go"] as const, {
-  description: "Target language",
-});
+const AstLang = StringEnum(
+  ["typescript", "tsx", "javascript", "python", "rust", "go", "pascal", "r"] as const,
+  {
+    description: "Target language",
+  },
+);
 
 const SearchParams = Type.Object({
   pattern: Type.String({

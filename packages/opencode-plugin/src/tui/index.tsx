@@ -507,9 +507,7 @@ const StatusDialog = (props: StatusDialogProps) => {
             value={formatCountShort(status()!.status_bar!.warnings)}
             tone={status()!.status_bar!.warnings > 0 ? "warn" : "muted"}
           />
-          {/* Dead Code / Unused Exports hidden until the oxc resolver lands
-          (current scanner over-reports on barrel re-exports). Restore both. */}
-          {/* <R
+          <R
             theme={t()}
             label="Dead Code"
             value={formatCountShort(status()!.status_bar!.dead_code)}
@@ -520,7 +518,7 @@ const StatusDialog = (props: StatusDialogProps) => {
             label="Unused Exports"
             value={formatCountShort(status()!.status_bar!.unused_exports)}
             tone="muted"
-          /> */}
+          />
           <R
             theme={t()}
             label="Duplicates"
@@ -729,7 +727,7 @@ const tui: TuiPlugin = async (api) => {
   // command palette entry so the sidebar is available immediately when the
   // user opens their first session.
   try {
-    api.slots.register(createAftSidebarSlot(api, packageVersion));
+    api.slots.register(await createAftSidebarSlot(api, packageVersion));
   } catch {
     // Older OpenCode TUI hosts may not implement api.slots; fall through
     // and keep the slash command working.

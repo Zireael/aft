@@ -28,10 +28,30 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from "../pool.js";
+
+// One test needs a real subdirectory of $HOME (the home-subdir spawn guard
+// canonicalizes the root, so the path must exist). It can't use tmpdir(). This
+// prefix lets us both name the created dir and sweep any leaked ones so a
+// crashed prior run doesn't litter the user's home folder forever.
+const HOME_GUARD_TEST_PREFIX = ".aft-pool-home-guard-test-";
+
+function cleanupHomeGuardTestDirs(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(homedir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.startsWith(HOME_GUARD_TEST_PREFIX)) {
+      rmSync(join(homedir(), entry), { recursive: true, force: true });
+    }
+  }
+}
 
 describe("isHomeDirectoryRoot", () => {
   test("returns true for the user's home directory", () => {
@@ -79,7 +99,7 @@ describe("BridgePool.getBridge — $HOME spawn behavior", () => {
   });
 
   test("spawns a bridge for a subdirectory of $HOME", () => {
-    const sub = mkdtempSync(join(homedir(), ".aft-pool-home-guard-test-"));
+    const sub = mkdtempSync(join(homedir(), HOME_GUARD_TEST_PREFIX));
     const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
     const bridge = pool.getBridge(sub);
     expect(bridge).toBeDefined();
@@ -104,6 +124,12 @@ describe("HomeProjectRootError (legacy export)", () => {
 });
 
 // Hooks: keep the test file lifecycle quiet — no real spawns, no real
-// network. Guard against accidental side-effects.
-beforeAll(() => {});
-afterAll(() => {});
+// network. Sweep home-guard temp dirs on both ends so this suite never leaves
+// `.aft-pool-home-guard-test-*` folders in the user's home directory (and
+// cleans up any leaked by an earlier crashed run).
+beforeAll(() => {
+  cleanupHomeGuardTestDirs();
+});
+afterAll(() => {
+  cleanupHomeGuardTestDirs();
+});

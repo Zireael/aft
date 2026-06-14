@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
@@ -10,10 +10,16 @@ use serde_json::{json, Value};
 
 use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
-use super::freshness::ContributionFreshness;
+use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
     normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+};
+use super::oxc_engine::LivenessVerdict;
+use super::oxc_engine::{
+    analyze_file_facts, analyze_files_with_cache, AnalyzeOptions, DynamicImportFact, ExportFact,
+    FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache, ReExportFact,
+    FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
@@ -36,13 +42,6 @@ struct CachedContributionFreshness {
 struct InspectCacheIdentity {
     sqlite_path: PathBuf,
     project_root: PathBuf,
-}
-
-#[derive(PartialEq, Eq)]
-struct ContributionFingerprint {
-    count: usize,
-    set_hash: String,
-    hash_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +70,7 @@ pub struct InspectManager {
     pool: Arc<rayon::ThreadPool>,
     in_flight: Mutex<HashMap<JobKey, Vec<Waiter>>>,
     caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+    oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
     /// Monotonic count of Tier-2 completions delivered via the reuse path
@@ -94,6 +94,7 @@ impl InspectManager {
             pool: handles.pool,
             in_flight: Mutex::new(HashMap::new()),
             caches: Mutex::new(HashMap::new()),
+            oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
             next_job_id: AtomicU64::new(1),
             reuse_completions: AtomicU64::new(0),
@@ -328,6 +329,14 @@ impl InspectManager {
                 .ok()
                 .flatten()
                 .and_then(|payload| {
+                    if category == InspectCategory::DeadCode
+                        && payload
+                            .get("callgraph_available")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                    {
+                        return None;
+                    }
                     payload
                         .get("count")
                         .and_then(serde_json::Value::as_u64)
@@ -365,6 +374,44 @@ impl InspectManager {
         );
         caches.insert(identity, Arc::clone(&cache));
         Ok(cache)
+    }
+
+    fn oxc_result_for_scan(
+        &self,
+        job: &InspectJob,
+        files: &[PathBuf],
+        force_reparse_files: &[PathBuf],
+    ) -> Result<Option<OxcEngineResult>, String> {
+        if !category_uses_oxc(job.category) {
+            return Ok(None);
+        }
+        if job.category == InspectCategory::DeadCode && job.callgraph_snapshot.is_none() {
+            return Ok(None);
+        }
+
+        let public_api_entries = super::entry_points::resolve_entry_points(&job.project_root);
+        let entry_points = if job.category == InspectCategory::DeadCode {
+            job.callgraph_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.entry_points.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let options = AnalyzeOptions {
+            entry_points,
+            public_api_files: public_api_entries.public_api_files(),
+            force_reparse_files: force_reparse_files.to_vec(),
+            entry_reachability: job.category == InspectCategory::DeadCode,
+        };
+
+        let mut cache = self
+            .oxc_facts_cache
+            .lock()
+            .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
+        analyze_files_with_cache(&job.project_root, files, options, &mut cache)
+            .map(Some)
+            .map_err(|message| format!("oxc analyze failed: {message}"))
     }
 
     pub fn tier2_run_with_reuse(
@@ -638,17 +685,38 @@ impl InspectManager {
         job: &InspectJob,
         cache: &InspectCache,
     ) -> Result<Option<InspectScanSuccess>, String> {
+        let cached_records = load_contribution_freshness(cache, job.category)?;
+        let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
+        if cached_records.len() != current_by_relative.len() {
+            return Ok(None);
+        }
+        for record in &cached_records {
+            let relative = freshness_record_relative_key(record);
+            let Some(current_file) = current_by_relative.get(&relative) else {
+                return Ok(None);
+            };
+            match cache_freshness::metadata_matches(current_file, &record.freshness) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "failed to stat {} for tier2 quick reuse: {error}",
+                        current_file.display()
+                    ));
+                }
+            }
+        }
+
+        let contribution_set_hash = cache
+            .contribution_set_hash(job.category)
+            .map_err(|error| error.to_string())?;
         let Some(aggregate) = cache
-            .get_aggregated(&job.key)
+            .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
-        let cached = load_contribution_fingerprint(cache, job.category)?;
-        let current = current_file_fingerprint(&job.project_root, &job.scope_files)?;
-        if !cached.hash_complete || !current.hash_complete || cached != current {
-            return Ok(None);
-        }
 
         cache
             .touch_tier2_last_full_run(job.category)
@@ -660,11 +728,14 @@ impl InspectManager {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tier2_run_with_reuse_job(
         &self,
         job: &InspectJob,
         cache: &InspectCache,
     ) -> Result<InspectScanSuccess, String> {
+        let mut phases = Tier2PhaseTimings::default();
+        let phase_started = Instant::now();
         let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
         let cached_relative = cached_records
@@ -687,7 +758,7 @@ impl InspectManager {
             };
 
             let absolute = job.project_root.join(&record.file_path);
-            match verify_contribution_file_strict(&absolute, &record.freshness) {
+            match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh {
                     metadata_changed,
                     freshness,
@@ -711,8 +782,10 @@ impl InspectManager {
                 scan_by_relative.insert(relative.clone(), file.clone());
             }
         }
+        phases.freshness = phase_started.elapsed();
 
         let mut scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
+        let force_reparse_files = scan_files.clone();
         if !scan_files.is_empty() {
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -720,14 +793,21 @@ impl InspectManager {
             if scan_job.category == InspectCategory::DeadCode
                 && scan_job.callgraph_snapshot.is_none()
             {
+                let snapshot_started = Instant::now();
                 scan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&scan_job);
+                phases.snapshot += snapshot_started.elapsed();
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
             if cold_cache {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let scan_result = run_tier2_scan(&scan_job);
+            let scan_started = Instant::now();
+            let oxc_result =
+                self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
+            let scan_result = run_tier2_scan(&scan_job, oxc_result.as_ref());
+            phases.scan += scan_started.elapsed();
+            phases.scanned_files += scan_files.len();
             let scan_success = scan_result.outcome.map_err(|message| {
                 format!("{} incremental scan failed: {message}", job.category)
             })?;
@@ -745,6 +825,7 @@ impl InspectManager {
                 cache
                     .touch_tier2_last_full_run(job.category)
                     .map_err(|error| error.to_string())?;
+                phases.log(job.category);
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
                     contributions: Vec::new(),
@@ -753,6 +834,7 @@ impl InspectManager {
             }
         }
 
+        let db_started = Instant::now();
         let mut contribution_set_hash = if has_updates {
             cache
                 .apply_contribution_updates(job.category, updates)
@@ -762,6 +844,7 @@ impl InspectManager {
                 .contribution_set_hash(job.category)
                 .map_err(|error| error.to_string())?
         };
+        phases.db = db_started.elapsed();
 
         if let Some(aggregate) = cache
             .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
@@ -771,6 +854,7 @@ impl InspectManager {
                 .touch_tier2_last_full_run(job.category)
                 .map_err(|error| error.to_string())?;
             let contributions = load_contributions(cache, job)?;
+            phases.log(job.category);
             return Ok(InspectScanSuccess {
                 scanned_files: scan_files,
                 contributions,
@@ -778,11 +862,21 @@ impl InspectManager {
             });
         }
 
-        if category_contributions_depend_on_entry_points(job.category) {
-            // Manifest edits can change entry/public roots without touching any
-            // source file. Dead-code and unused-export file contributions embed
-            // those roots, so an aggregate hash miss for these categories must
-            // refresh every current contribution before rolling up again.
+        let refresh_dead_code_facts = if job.category == InspectCategory::DeadCode {
+            dead_code_contributions_need_fact_refresh(cache, job)?
+        } else {
+            false
+        };
+        let refresh_unused_exports_facts = if job.category == InspectCategory::UnusedExports {
+            unused_exports_contributions_need_fact_refresh(cache, job)?
+        } else {
+            false
+        };
+        if refresh_dead_code_facts || refresh_unused_exports_facts {
+            // Raw-facts contributions can be rolled up after manifest/resolver
+            // edits without re-reading source. Only legacy verdict-bearing or
+            // facts-version-mismatched caches need a one-time full refresh before
+            // verdicts/roots can be recomputed globally.
             let full_scan_files = current_by_relative.into_values().collect::<Vec<_>>();
             if !full_scan_files.is_empty() {
                 let mut rescan_job = job.clone();
@@ -791,9 +885,19 @@ impl InspectManager {
                 if rescan_job.category == InspectCategory::DeadCode
                     && rescan_job.callgraph_snapshot.is_none()
                 {
+                    let snapshot_started = Instant::now();
                     rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&rescan_job);
+                    phases.snapshot += snapshot_started.elapsed();
                 }
-                let scan_result = run_tier2_scan(&rescan_job);
+                let scan_started = Instant::now();
+                let oxc_result = self.oxc_result_for_scan(
+                    &rescan_job,
+                    &rescan_job.scope_files,
+                    &force_reparse_files,
+                )?;
+                let scan_result = run_tier2_scan(&rescan_job, oxc_result.as_ref());
+                phases.scan += scan_started.elapsed();
+                phases.scanned_files += full_scan_files.len();
                 let scan_success = scan_result.outcome.map_err(|message| {
                     format!(
                         "{} full rescan after entry-point cache miss failed: {message}",
@@ -804,9 +908,11 @@ impl InspectManager {
                     upserts: scan_success.contributions,
                     ..Tier2ContributionUpdates::default()
                 };
+                let db_started = Instant::now();
                 contribution_set_hash = cache
                     .apply_contribution_updates(job.category, rescan_updates)
                     .map_err(|error| error.to_string())?;
+                phases.db += db_started.elapsed();
                 aggregate_job.callgraph_snapshot = rescan_job.callgraph_snapshot.clone();
                 scan_files = full_scan_files;
 
@@ -818,6 +924,7 @@ impl InspectManager {
                         .touch_tier2_last_full_run(job.category)
                         .map_err(|error| error.to_string())?;
                     let contributions = load_contributions(cache, job)?;
+                    phases.log(job.category);
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
                         contributions,
@@ -830,13 +937,18 @@ impl InspectManager {
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
+            let snapshot_started = Instant::now();
             aggregate_job.callgraph_snapshot = build_tier2_callgraph_snapshot(&aggregate_job);
+            phases.snapshot += snapshot_started.elapsed();
         }
+        let rollup_started = Instant::now();
         let contributions = load_contributions(cache, &aggregate_job)?;
         let aggregate = roll_up_tier2_contributions(&aggregate_job, &contributions);
         cache
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
+        phases.rollup = rollup_started.elapsed();
+        phases.log(job.category);
 
         Ok(InspectScanSuccess {
             scanned_files: scan_files,
@@ -1103,6 +1215,46 @@ fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutc
     Ok(())
 }
 
+/// Phase-level wall-time attribution for one Tier-2 reuse=miss pass.
+///
+/// Exists to self-attribute pathological scans (note #263 class: a 100ms
+/// unused_exports pass once took 677s under release-gate machine load) without
+/// needing a lucky live `sample`. Logged as ONE info line per pass, only when
+/// real work happened (freshness/scan/snapshot/rollup/db), so quiet reuse passes stay silent.
+#[derive(Default)]
+struct Tier2PhaseTimings {
+    /// Freshness verification of cached contributions (file stat + hash reads).
+    freshness: Duration,
+    /// Callgraph store snapshot projection (dead_code only).
+    snapshot: Duration,
+    /// Scanner compute over files needing (re)scan.
+    scan: Duration,
+    /// SQLite contribution upserts/deletes (busy-wait contention shows here).
+    db: Duration,
+    /// Aggregate roll-up + store.
+    rollup: Duration,
+    scanned_files: usize,
+}
+
+impl Tier2PhaseTimings {
+    fn log(&self, category: InspectCategory) {
+        let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
+        if worked < Duration::from_millis(50) {
+            return;
+        }
+        crate::slog_info!(
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms rollup={}ms",
+            category,
+            self.freshness.as_millis(),
+            self.snapshot.as_millis(),
+            self.scan.as_millis(),
+            self.scanned_files,
+            self.db.as_millis(),
+            self.rollup.as_millis()
+        );
+    }
+}
+
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
     let mut files = crate::callgraph::walk_project_files(project_root)
         .filter(|path| scope.contains(path))
@@ -1184,8 +1336,15 @@ fn build_tier2_callgraph_snapshot(job: &InspectJob) -> Option<Arc<CallgraphSnaps
         return None;
     };
 
-    let store = match CallGraphStore::open_readonly(callgraph_dir.clone(), job.project_root.clone())
-    {
+    // Tier-2 refresh is skipped before jobs are submitted from worktree
+    // bridges, so this non-readonly open may repair moved-root metadata (or
+    // publish a one-time cold rebuild) for the main checkout. Worktree bridges
+    // keep their read-only posture by using CallGraphStore::open_readonly via
+    // AppContext and never queueing Tier-2 refresh jobs.
+    let store = match CallGraphStore::open_ready_repairing(
+        callgraph_dir.clone(),
+        job.project_root.clone(),
+    ) {
         Ok(Some(store)) => store,
         Ok(None) => {
             crate::slog_info!(
@@ -1245,76 +1404,6 @@ fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
-fn load_contribution_fingerprint(
-    cache: &InspectCache,
-    category: InspectCategory,
-) -> Result<ContributionFingerprint, String> {
-    let (count, set_hash, hash_complete) = cache
-        .contribution_fingerprint(category)
-        .map_err(|error| error.to_string())?;
-    Ok(ContributionFingerprint {
-        count,
-        set_hash,
-        hash_complete,
-    })
-}
-
-fn current_file_fingerprint(
-    project_root: &Path,
-    files: &[PathBuf],
-) -> Result<ContributionFingerprint, String> {
-    let mut entries = Vec::with_capacity(files.len());
-    let mut hash_complete = true;
-    for file in files {
-        let freshness = cache_freshness::collect(file)
-            .map_err(|error| format!("failed to fingerprint {}: {error}", file.display()))?;
-        let relative_path = relative_cache_key(project_root, file);
-        let mtime_ns = system_time_to_ns_i64(freshness.mtime);
-        if freshness.content_hash == cache_freshness::zero_hash() {
-            hash_complete = false;
-        }
-        entries.push((
-            relative_path,
-            mtime_ns,
-            freshness.size,
-            freshness.content_hash.to_hex().to_string(),
-        ));
-    }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut hasher = blake3::Hasher::new();
-    for (relative_path, mtime_ns, file_size, file_hash) in &entries {
-        update_contribution_fingerprint_hash(
-            &mut hasher,
-            relative_path,
-            *mtime_ns,
-            *file_size,
-            file_hash,
-        );
-    }
-
-    Ok(ContributionFingerprint {
-        count: entries.len(),
-        set_hash: hasher.finalize().to_hex().to_string(),
-        hash_complete,
-    })
-}
-
-fn update_contribution_fingerprint_hash(
-    hasher: &mut blake3::Hasher,
-    relative_path: &str,
-    mtime_ns: i64,
-    file_size: u64,
-    file_hash: &str,
-) {
-    hasher.update(relative_path.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&mtime_ns.to_le_bytes());
-    hasher.update(&file_size.to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(file_hash.as_bytes());
-}
-
 fn verify_contribution_file_strict(path: &Path, cached: &FileFreshness) -> ContributionFreshness {
     match cache_freshness::verify_file_strict(path, cached) {
         FreshnessVerdict::HotFresh => ContributionFreshness::Fresh {
@@ -1359,14 +1448,6 @@ fn freshness_record_relative_key(record: &CachedContributionFreshness) -> String
     record.file_path.to_string_lossy().to_string()
 }
 
-fn system_time_to_ns_i64(time: SystemTime) -> i64 {
-    let nanos = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_nanos();
-    nanos.min(i64::MAX as u128) as i64
-}
-
 fn relative_cache_key(project_root: &Path, path: &Path) -> String {
     path.strip_prefix(project_root)
         .unwrap_or(path)
@@ -1389,6 +1470,68 @@ fn load_contributions(
         })
 }
 
+fn dead_code_contributions_need_fact_refresh(
+    cache: &InspectCache,
+    job: &InspectJob,
+) -> Result<bool, String> {
+    let contributions = load_contributions(cache, job)?;
+    Ok(contributions
+        .iter()
+        .any(dead_code_contribution_needs_fact_refresh))
+}
+
+fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+    let Ok(parsed) =
+        serde_json::from_value::<DeadCodeRefreshContribution>(contribution.contribution.clone())
+    else {
+        return true;
+    };
+
+    if parsed.facts_format_version
+        != Some(super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION)
+    {
+        return true;
+    }
+
+    matches!(
+        parsed.oxc_facts,
+        Some(facts) if facts.format_version != FACTS_FORMAT_VERSION
+    )
+}
+
+fn unused_exports_contributions_need_fact_refresh(
+    cache: &InspectCache,
+    job: &InspectJob,
+) -> Result<bool, String> {
+    let contributions = load_contributions(cache, job)?;
+    Ok(contributions
+        .iter()
+        .any(unused_exports_contribution_needs_fact_refresh))
+}
+
+fn unused_exports_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+    let top_level_oxc = contribution
+        .contribution
+        .get("provenance")
+        .and_then(Value::as_str)
+        == Some(OXC_PROVENANCE);
+    let Ok(parsed) =
+        serde_json::from_value::<UnusedExportsContribution>(contribution.contribution.clone())
+    else {
+        return false;
+    };
+    let uses_oxc =
+        top_level_oxc || parsed.oxc_facts.is_some() || parsed.exports.iter().any(export_uses_oxc);
+    if !uses_oxc {
+        return false;
+    }
+
+    !matches!(
+        parsed.oxc_facts,
+        Some(facts) if facts.format_version == FACTS_FORMAT_VERSION
+    )
+}
+
 fn contribution_from_record(
     project_root: &Path,
     record: super::cache::ContributionRecord,
@@ -1402,12 +1545,16 @@ fn contribution_from_record(
     .with_type_ref_names(record.type_ref_names)
 }
 
-fn run_tier2_scan(job: &InspectJob) -> InspectResult {
+fn run_tier2_scan(job: &InspectJob, oxc_result: Option<&OxcEngineResult>) -> InspectResult {
     use super::scanners;
 
     match job.category {
-        InspectCategory::DeadCode => scanners::dead_code::run_dead_code_scan(job),
-        InspectCategory::UnusedExports => scanners::unused_exports::run_unused_exports_scan(job),
+        InspectCategory::DeadCode => {
+            scanners::dead_code::run_dead_code_scan_with_oxc(job, oxc_result)
+        }
+        InspectCategory::UnusedExports => {
+            scanners::unused_exports::run_unused_exports_scan_with_oxc(job, oxc_result)
+        }
         InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(job),
         other => InspectResult::failed(
             job,
@@ -1487,13 +1634,15 @@ fn roll_up_dead_code_contributions(
     contributions: &[FileContribution],
     drill_down_limit: Option<usize>,
 ) -> Value {
-    if job.callgraph_snapshot.is_none() {
+    let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
         return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
-    }
+    };
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
     let roles = super::entry_points::resolve_project_roles(&job.project_root);
-    super::scanners::dead_code::aggregate_dead_code_contributions_with_limit(
+    super::scanners::dead_code::aggregate_dead_code_contributions_with_snapshot(
+        &job.project_root,
+        snapshot,
         contributions,
         &public_api_files,
         &roles,
@@ -1513,6 +1662,10 @@ fn roll_up_unused_exports_contributions(
                 .ok()
         })
         .collect::<Vec<_>>();
+
+    if parsed.iter().any(|scan| scan.oxc_facts.is_some()) {
+        return roll_up_unused_exports_oxc_contributions(job, &parsed, drill_down_limit);
+    }
 
     let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
     let mut imported_by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -1553,46 +1706,196 @@ fn roll_up_unused_exports_contributions(
         }
 
         for export in &scan.exports {
-            let imported = imported_by
-                .get(&(scan.file.clone(), export.symbol.clone()))
-                .map(|files| !files.is_empty())
-                .unwrap_or(false);
-            let uncertain = uncertain_by
-                .get(&scan.file)
-                .map(|files| !files.is_empty())
-                .unwrap_or(false);
-
-            if imported {
-                continue;
-            }
-            if uncertain {
-                uncertain_count += 1;
-                if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
-                    uncertain_items.push(json!({
-                        "file": scan.file,
-                        "symbol": export.symbol,
-                        "kind": export.kind,
-                        "line": export.line,
-                        "reason": "wildcard_import",
-                    }));
+            if export_uses_oxc(export) {
+                match export.verdict.unwrap_or(LivenessVerdict::Unused) {
+                    LivenessVerdict::Used => continue,
+                    LivenessVerdict::Uncertain => {
+                        uncertain_count += 1;
+                        if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                            uncertain_items.push(json!({
+                                "file": scan.file,
+                                "symbol": export.symbol,
+                                "kind": export.kind,
+                                "line": export.line,
+                                "reason": export.reason.as_deref().unwrap_or("oxc_uncertain"),
+                                "provenance": export.provenance.as_deref().unwrap_or(OXC_PROVENANCE),
+                            }));
+                        }
+                        continue;
+                    }
+                    LivenessVerdict::Unused => {}
                 }
-                continue;
+            } else {
+                let imported = imported_by
+                    .get(&(scan.file.clone(), export.symbol.clone()))
+                    .map(|files| !files.is_empty())
+                    .unwrap_or(false);
+                let uncertain = uncertain_by
+                    .get(&scan.file)
+                    .map(|files| !files.is_empty())
+                    .unwrap_or(false);
+
+                if imported {
+                    continue;
+                }
+                if uncertain {
+                    uncertain_count += 1;
+                    if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                        uncertain_items.push(json!({
+                            "file": scan.file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "reason": "wildcard_import",
+                        }));
+                    }
+                    continue;
+                }
             }
 
             count += 1;
             // Collect uncapped; rank by signal tier and truncate below.
-            items.push(json!({
+            let mut item = json!({
                 "file": scan.file,
                 "symbol": export.symbol,
                 "kind": export.kind,
                 "line": export.line,
-            }));
+            });
+            if let Some(provenance) = &export.provenance {
+                item["provenance"] = json!(provenance);
+            }
+            items.push(item);
         }
     }
 
     let roles = super::entry_points::resolve_project_roles(&job.project_root);
     let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
     let top = super::entry_points::top_preview_symbols(&items);
+
+    let (parse_errors, skipped_files) = unused_exports_honesty_fields(&parsed);
+    let mut aggregate = json!({
+        "count": count,
+        "items": items,
+        "top": top,
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "scanned_files": parsed.len(),
+        "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
+        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
+    });
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
+    if !package_warnings.is_empty() {
+        aggregate["note"] = Value::String(package_warnings.join("; "));
+    }
+    aggregate
+}
+
+fn roll_up_unused_exports_oxc_contributions(
+    job: &InspectJob,
+    parsed: &[UnusedExportsContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
+    let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
+    let facts = parsed
+        .iter()
+        .filter_map(|scan| {
+            let oxc_facts = scan.oxc_facts.as_ref()?;
+            let path = normalize_path(&job.project_root.join(&scan.file));
+            Some(FileFacts {
+                file_id: FileId(0),
+                path,
+                content_hash: oxc_facts.content_hash.clone(),
+                exports: oxc_facts.exports.clone(),
+                imports: oxc_facts.imports.clone(),
+                re_exports: oxc_facts.re_exports.clone(),
+                dynamic_imports: oxc_facts.dynamic_imports.clone(),
+                same_file_value_references: oxc_facts.same_file_value_references.clone(),
+                used_import_bindings: oxc_facts.used_import_bindings.clone(),
+                type_referenced_import_bindings: oxc_facts.type_referenced_import_bindings.clone(),
+                value_referenced_import_bindings: oxc_facts
+                    .value_referenced_import_bindings
+                    .clone(),
+                parse_error: oxc_facts.parse_error.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let oxc_result = analyze_file_facts(
+        &job.project_root,
+        facts,
+        AnalyzeOptions {
+            entry_points: Vec::new(),
+            public_api_files: super::entry_points::resolve_entry_points(&job.project_root)
+                .public_api_files(),
+            force_reparse_files: Vec::new(),
+            entry_reachability: false,
+        },
+        Vec::new(),
+    );
+    let roles = super::entry_points::resolve_project_roles(&job.project_root);
+
+    let mut count = 0usize;
+    let mut items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
+    for file in &oxc_result.files {
+        if public_api_entries.contains(&file.relative_file)
+            || super::job::is_test_support_file(&file.relative_file)
+        {
+            continue;
+        }
+
+        for export in &file.exports {
+            match export.verdict {
+                LivenessVerdict::Used => {}
+                LivenessVerdict::Uncertain => {
+                    uncertain_count += 1;
+                    if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                        uncertain_items.push(json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "reason": export.reason,
+                            "provenance": export.provenance,
+                        }));
+                    }
+                }
+                LivenessVerdict::Unused => {
+                    count += 1;
+                    items.push(json!({
+                        "file": file.relative_file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "provenance": export.provenance,
+                    }));
+                }
+            }
+        }
+    }
+
+    let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
+    let top = super::entry_points::top_preview_symbols(&items);
+    let (mut parse_errors, skipped_files) = unused_exports_honesty_fields(parsed);
+    for scan in parsed {
+        if let Some(oxc_facts) = &scan.oxc_facts {
+            if oxc_facts.format_version != FACTS_FORMAT_VERSION {
+                parse_errors.push(json!({
+                    "file": scan.file,
+                    "message": format!(
+                        "unsupported oxc facts format {}; expected {}",
+                        oxc_facts.format_version, FACTS_FORMAT_VERSION
+                    ),
+                }));
+            }
+        }
+    }
 
     let mut aggregate = json!({
         "count": count,
@@ -1603,11 +1906,40 @@ fn roll_up_unused_exports_contributions(
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
+        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
     aggregate
+}
+
+fn unused_exports_honesty_fields(parsed: &[UnusedExportsContribution]) -> (Vec<Value>, Vec<Value>) {
+    let mut parse_error_keys = BTreeSet::new();
+    let mut parse_errors = Vec::new();
+    let mut skipped_file_keys = BTreeSet::new();
+    let mut skipped_files = Vec::new();
+    for contribution in parsed {
+        for value in &contribution.parse_errors {
+            let key = value.to_string();
+            if parse_error_keys.insert(key) {
+                parse_errors.push(value.clone());
+            }
+        }
+        for value in &contribution.skipped_files {
+            let key = value.to_string();
+            if skipped_file_keys.insert(key) {
+                skipped_files.push(value.clone());
+            }
+        }
+    }
+    (parse_errors, skipped_files)
 }
 
 fn roll_up_duplicate_contributions(
@@ -1645,13 +1977,38 @@ struct ExportContribution {
     symbol: String,
     kind: String,
     line: u32,
+    #[serde(default)]
+    verdict: Option<LivenessVerdict>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    provenance: Option<String>,
+}
+
+fn export_uses_oxc(export: &ExportContribution) -> bool {
+    export.verdict.is_some() || export.provenance.as_deref() == Some(OXC_PROVENANCE)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeadCodeRefreshContribution {
+    #[serde(default)]
+    facts_format_version: Option<u32>,
+    #[serde(default)]
+    oxc_facts: Option<OxcFactsContribution>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct UnusedExportsContribution {
     file: String,
     exports: Vec<ExportContribution>,
+    #[serde(default)]
     imports: Vec<ImportContribution>,
+    #[serde(default)]
+    oxc_facts: Option<OxcFactsContribution>,
+    #[serde(default)]
+    parse_errors: Vec<Value>,
+    #[serde(default)]
+    skipped_files: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1660,13 +2017,29 @@ struct ImportContribution {
     named: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct OxcFactsContribution {
+    format_version: u32,
+    content_hash: String,
+    exports: Vec<ExportFact>,
+    imports: Vec<ImportFact>,
+    re_exports: Vec<ReExportFact>,
+    dynamic_imports: Vec<DynamicImportFact>,
+    same_file_value_references: BTreeSet<String>,
+    used_import_bindings: BTreeSet<String>,
+    type_referenced_import_bindings: BTreeSet<String>,
+    value_referenced_import_bindings: BTreeSet<String>,
+    #[serde(default)]
+    parse_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LanguageSkipMode {
     Duplicates,
     UnusedExports,
 }
 
-fn category_contributions_depend_on_entry_points(category: InspectCategory) -> bool {
+fn category_uses_oxc(category: InspectCategory) -> bool {
     matches!(
         category,
         InspectCategory::DeadCode | InspectCategory::UnusedExports
@@ -1715,6 +2088,8 @@ fn duplicates_supports_language(language: crate::parser::LangId) -> bool {
             | crate::parser::LangId::Php
             | crate::parser::LangId::Lua
             | crate::parser::LangId::Perl
+            | crate::parser::LangId::Pascal
+            | crate::parser::LangId::R
     )
 }
 
@@ -1755,6 +2130,8 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Php => "php",
         crate::parser::LangId::Lua => "lua",
         crate::parser::LangId::Perl => "perl",
+        crate::parser::LangId::Pascal => "pascal",
+        crate::parser::LangId::R => "r",
     }
 }
 
@@ -1949,11 +2326,6 @@ fn display_file_from_occurrence(value: &str) -> &str {
     } else {
         value
     }
-}
-
-#[allow(dead_code)]
-fn normalize_scope_root(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 #[cfg(test)]

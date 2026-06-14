@@ -624,6 +624,8 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Html => "html",
         LangId::Markdown => "markdown",
         LangId::Yaml => "yaml",
+        LangId::Pascal => "pascal",
+        LangId::R => "r",
     }
 }
 
@@ -782,7 +784,9 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::Swift
         | LangId::Php
         | LangId::Lua
-        | LangId::Perl => Vec::new(),
+        | LangId::Perl
+        | LangId::Pascal
+        | LangId::R => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -898,7 +902,9 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Swift
         | LangId::Php
         | LangId::Lua
-        | LangId::Perl => Vec::new(),
+        | LangId::Perl
+        | LangId::Pascal
+        | LangId::R => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1131,6 +1137,8 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
         LangId::Yaml => "aft-tool-detection.yaml",
+        LangId::Pascal => "aft-tool-detection.pas",
+        LangId::R => "aft-tool-detection.R",
     };
     project_root.join(filename)
 }

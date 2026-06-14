@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -6,7 +6,10 @@ use std::time::{Duration, SystemTime};
 use crate::inspect::job::{CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot};
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 
-use super::{database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER};
+use super::{
+    database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER, PROVENANCE_NAME_MATCH,
+    PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
+};
 
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     if !db_path.is_file() {
@@ -25,6 +28,11 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     }
 
     let project_root = project_root_from_backend_state(&conn)?;
+    if stale_backend_file_count(&conn, &project_root)? > 0 {
+        return Err(CallGraphStoreError::Unavailable(
+            "callgraph has stale files pending refresh".to_string(),
+        ));
+    }
     let mut paths = SnapshotPathResolver::new(&project_root);
     let files = project_files_from_store(&conn, &mut paths)?;
     let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
@@ -61,6 +69,16 @@ fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
             roots.join(", ")
         ))),
     }
+}
+
+fn stale_backend_file_count(conn: &Connection, project_root: &Path) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND status = 'stale'",
+        params![BACKEND_TREESITTER, project_root.display().to_string()],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn project_files_from_store(
@@ -125,8 +143,8 @@ fn outbound_calls_from_store(
     paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
     let mut statement = conn.prepare(
-        "SELECT r.ref_id,
-                r.caller_file,
+        "SELECT r.caller_file,
+                r.caller_node,
                 n.name,
                 r.short_name,
                 r.full_ref,
@@ -144,8 +162,8 @@ fn outbound_calls_from_store(
     )?;
     let rows = statement.query_map([], |row| {
         Ok(OutboundRow {
-            ref_id: row.get(0)?,
-            caller_file: row.get(1)?,
+            caller_file: row.get(0)?,
+            caller_node: row.get(1)?,
             caller_symbol: row.get(2)?,
             short_name: row.get(3)?,
             full_ref: row.get(4)?,
@@ -158,10 +176,14 @@ fn outbound_calls_from_store(
     })?;
 
     let mut calls = Vec::new();
+    let mut stale_caller_nodes = 0usize;
     for row in rows {
         let row = row?;
         let caller_file = paths.resolve(&row.caller_file);
-        let caller_symbol = caller_symbol_from_row(&row)?;
+        let (caller_symbol, stale_caller_node) = caller_symbol_from_row(&row);
+        if stale_caller_node {
+            stale_caller_nodes += 1;
+        }
         let short_name = row
             .short_name
             .as_deref()
@@ -196,6 +218,12 @@ fn outbound_calls_from_store(
             provenance: row.provenance,
         });
     }
+    if stale_caller_nodes > 0 {
+        crate::slog_info!(
+            "dead_code projection: {} refs had stale caller nodes (fell back to <top-level>)",
+            stale_caller_nodes
+        );
+    }
     Ok(calls)
 }
 
@@ -208,20 +236,24 @@ fn entry_points_for_files(project_root: &Path, files: &[PathBuf]) -> BTreeSet<Pa
         .collect()
 }
 
-fn caller_symbol_from_row(row: &OutboundRow) -> Result<String> {
-    row.caller_symbol.clone().ok_or_else(|| {
-        CallGraphStoreError::Unavailable(format!(
-            "call ref {} is missing caller symbol",
-            row.ref_id
-        ))
-    })
+fn caller_symbol_from_row(row: &OutboundRow) -> (String, bool) {
+    if let Some(symbol) = &row.caller_symbol {
+        return (symbol.clone(), false);
+    }
+
+    // Legacy CallGraph treats top-level calls as coming from the synthetic
+    // `<top-level>` caller. A stale store row can point at a caller_node that no
+    // longer exists in `nodes` (refs and nodes are refreshed by different
+    // passes), so preserve the edge rather than failing the whole projection.
+    (TOP_LEVEL_SYMBOL.to_string(), row.caller_node.is_some())
 }
 
 fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
         || provenance.is_some_and(|provenance| {
-            provenance != "name_match"
-                && (provenance.contains("treesitter") || provenance.contains("resolver"))
+            provenance == PROVENANCE_TYPE_MATCH
+                || (provenance != PROVENANCE_NAME_MATCH
+                    && (provenance.contains("treesitter") || provenance.contains("resolver")))
         })
 }
 
@@ -286,8 +318,8 @@ struct ExportRow {
 
 #[derive(Debug)]
 struct OutboundRow {
-    ref_id: String,
     caller_file: String,
+    caller_node: Option<String>,
     caller_symbol: Option<String>,
     short_name: Option<String>,
     full_ref: Option<String>,
@@ -311,6 +343,109 @@ mod tests {
     #[test]
     fn projection_result_is_send() {
         assert_send::<Result<CallgraphSnapshot>>();
+    }
+
+    #[test]
+    fn dead_code_projection_rejects_stale_backend_rows_after_fresh_control() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.ts");
+        fs::write(
+            &source,
+            r#"export function used(): number {
+  return 1;
+}
+"#,
+        )
+        .expect("write fixture");
+        let root = fs::canonicalize(&root).expect("canonical project root");
+        let source = fs::canonicalize(&source).expect("canonical source");
+
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path())
+            .expect("fresh backend rows should project");
+        assert_eq!(snapshot.files.len(), 1);
+
+        let marked = store
+            .mark_files_stale(std::slice::from_ref(&source))
+            .expect("mark source stale");
+        assert_eq!(marked, vec!["src/lib.ts".to_string()]);
+        let error = project_dead_code_snapshot(store.sqlite_path())
+            .expect_err("stale backend rows should block projection");
+        match error {
+            CallGraphStoreError::Unavailable(message) => assert_eq!(
+                message, "callgraph has stale files pending refresh",
+                "stale projection should report a clear unavailable reason"
+            ),
+            other => panic!("expected Unavailable for stale backend rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_match_constructor_target_is_file_qualified_for_dead_code() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.rs");
+        let target_source = src_dir.join("other.rs");
+        fs::write(
+            &source,
+            r#"mod other;
+use other::OtherType;
+
+fn run() {
+    let _ = OtherType::new();
+}
+"#,
+        )
+        .expect("write type-match caller fixture");
+        fs::write(
+            &target_source,
+            r#"pub struct OtherType;
+impl OtherType {
+    pub fn new() -> Self { Self }
+}
+"#,
+        )
+        .expect("write type-match constructor fixture");
+
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        store
+            .cold_build(&[source.clone(), target_source.clone()])
+            .expect("cold build type-match constructor fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let expected_target = format!(
+            "{}::new",
+            std::fs::canonicalize(&target_source)
+                .expect("canonical target source")
+                .display()
+        );
+        let type_match_calls = snapshot
+            .outbound_calls
+            .iter()
+            .filter(|call| call.provenance == PROVENANCE_TYPE_MATCH)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            type_match_calls.len(),
+            1,
+            "expected one type_match constructor call; calls: {:#?}",
+            snapshot.outbound_calls
+        );
+        assert_eq!(type_match_calls[0].target, expected_target);
+        assert_ne!(type_match_calls[0].target, "new");
+        assert!(
+            !type_match_calls[0].target.ends_with("OtherType::new"),
+            "dead_code nodes use bare symbol names, not scoped method names: {:#?}",
+            type_match_calls[0]
+        );
     }
 
     #[test]

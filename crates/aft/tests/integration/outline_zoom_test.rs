@@ -461,3 +461,167 @@ fn zoom_follows_reexport_chains_to_the_resolved_symbol_source() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn zoom_whitespace_separated_symbol_string_resolves_multiple_code_symbols() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "calls.ts",
+        r#"function helper(x: number): number {
+  return x * 2;
+}
+
+function compute(a: number, b: number): number {
+  const doubled = helper(a);
+  return doubled + b;
+}
+
+function orchestrate(): number {
+  const x = compute(1, 2);
+  const y = helper(3);
+  return x + y;
+}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-multi-ws",
+            "command": "zoom",
+            "file": file,
+            "symbols": "helper compute orchestrate",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "batch zoom should succeed: {resp:?}");
+    assert_eq!(resp["complete"], true);
+    let entries = resp["symbols"].as_array().expect("symbols batch");
+    assert_eq!(entries.len(), 3);
+    for (name, expected) in [
+        ("helper", "function helper"),
+        ("compute", "function compute"),
+        ("orchestrate", "function orchestrate"),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("missing entry for {name}: {entries:?}"));
+        assert_eq!(entry["response"]["success"], true, "{name}: {entry:?}");
+        assert!(
+            entry["response"]["content"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{name} body: {entry:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_whitespace_separated_symbol_reports_per_symbol_not_found() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "calls.ts",
+        "function helper(x: number): number { return x * 2; }\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-multi-partial",
+            "command": "zoom",
+            "file": file,
+            "symbol": "helper missingSymbol",
+        }),
+    );
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["complete"], false);
+    let entries = resp["symbols"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let helper = entries.iter().find(|e| e["name"] == "helper").unwrap();
+    let missing = entries
+        .iter()
+        .find(|e| e["name"] == "missingSymbol")
+        .unwrap();
+    assert_eq!(helper["response"]["success"], true);
+    assert_eq!(missing["response"]["success"], false);
+    assert_eq!(missing["response"]["code"], "symbol_not_found");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_markdown_heading_with_spaces_not_split() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "readme.md",
+        "# Project Title\n\n## Getting Started\n\nIntro here.\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-md-heading",
+            "command": "zoom",
+            "file": file,
+            "symbols": "Getting Started",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "single heading zoom: {resp:?}");
+    assert_eq!(resp["name"], "Getting Started");
+    assert!(
+        resp["content"].as_str().unwrap().contains("Intro here"),
+        "{resp:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_html_heading_with_spaces_not_split() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "page.html",
+        "<html><body><h2>Getting Started</h2><p>Body text</p></body></html>\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-html-heading",
+            "command": "zoom",
+            "file": file,
+            "symbol": "Getting Started",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "html heading zoom: {resp:?}");
+    assert_eq!(resp["name"], "Getting Started");
+    assert!(
+        resp["content"].as_str().unwrap().contains("Body text"),
+        "{resp:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}

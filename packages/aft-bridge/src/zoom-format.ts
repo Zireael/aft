@@ -209,3 +209,46 @@ export function formatZoomMultiTargetResult(
   }
   return { complete, entries: rendered, text: sections.join("\n\n") };
 }
+
+/** One entry in a Rust-side multi-symbol zoom batch (`zoom_batch_symbols`). */
+export interface RustZoomBatchEntry {
+  name: string;
+  response: { success?: boolean; message?: unknown } & Record<string, unknown>;
+}
+
+/**
+ * True when the bridge returned the Rust batch envelope from a single zoom request
+ * (e.g. whitespace-split `symbol` on a code file).
+ */
+export function isRustZoomBatchEnvelope(
+  response: Record<string, unknown>,
+): response is Record<string, unknown> & { symbols: RustZoomBatchEntry[] } {
+  if (!Array.isArray(response.symbols) || response.symbols.length === 0) {
+    return false;
+  }
+  return response.symbols.every((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const row = entry as Record<string, unknown>;
+    return typeof row.name === "string" && row.response !== undefined && row.response !== null;
+  });
+}
+
+/**
+ * Unwrap a Rust batch envelope into parallel name/response arrays for
+ * {@link formatZoomBatchResult} (plugin-local) or the same shaping in hosts.
+ */
+export function unwrapRustZoomBatchEnvelope(response: Record<string, unknown>): {
+  names: string[];
+  responses: Record<string, unknown>[];
+} | null {
+  if (!isRustZoomBatchEnvelope(response)) {
+    return null;
+  }
+  const names: string[] = [];
+  const responses: Record<string, unknown>[] = [];
+  for (const entry of response.symbols) {
+    names.push(entry.name);
+    responses.push(entry.response as Record<string, unknown>);
+  }
+  return { names, responses };
+}

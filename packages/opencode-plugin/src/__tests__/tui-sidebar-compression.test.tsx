@@ -212,10 +212,9 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
     expect(collapsedHealthLights(bar({ duplicates: 1167 }))?.code).toBe("warn");
   });
 
-  test("code light: dead_code / unused_exports do NOT drive the light (hidden until oxc engine)", () => {
-    // Until the oxc resolver lands, dead_code/unused_exports are excluded from
-    // the user-facing health signal because the tree-sitter scanner over-reports.
-    expect(collapsedHealthLights(bar({ dead_code: 999, unused_exports: 999 }))?.code).toBe("ok");
+  test("code light: dead_code / unused_exports drive the light", () => {
+    expect(collapsedHealthLights(bar({ dead_code: 999 }))?.code).toBe("warn");
+    expect(collapsedHealthLights(bar({ unused_exports: 999 }))?.code).toBe("warn");
   });
 
   test("todos light: yellow when any todos, green otherwise", () => {

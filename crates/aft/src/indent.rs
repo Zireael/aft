@@ -57,6 +57,7 @@ impl IndentStyle {
             | LangId::Perl => IndentStyle::Spaces(4),
             LangId::Html => IndentStyle::Spaces(2),
             LangId::Markdown => IndentStyle::Spaces(4),
+            LangId::Pascal | LangId::R => IndentStyle::Spaces(2),
         }
     }
 }

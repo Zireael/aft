@@ -4,12 +4,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tree_sitter::{Node, Tree};
 
 use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
 use crate::inspect::job::is_test_support_file;
+use crate::inspect::oxc_engine::{
+    ExportFact, FileFacts, LivenessVerdict, OxcEngineError, OxcEngineResult, FACTS_FORMAT_VERSION,
+    OXC_PROVENANCE,
+};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -42,8 +47,44 @@ struct FileScan {
     skipped_language: Option<&'static str>,
 }
 
+#[derive(Debug, Serialize)]
+struct OxcUnusedExportsFactsPayload<'a> {
+    format_version: u32,
+    content_hash: &'a str,
+    exports: &'a [ExportFact],
+    imports: &'a [crate::inspect::oxc_engine::ImportFact],
+    re_exports: &'a [crate::inspect::oxc_engine::ReExportFact],
+    dynamic_imports: &'a [crate::inspect::oxc_engine::DynamicImportFact],
+    same_file_value_references: &'a std::collections::BTreeSet<String>,
+    used_import_bindings: &'a std::collections::BTreeSet<String>,
+    type_referenced_import_bindings: &'a std::collections::BTreeSet<String>,
+    value_referenced_import_bindings: &'a std::collections::BTreeSet<String>,
+    parse_error: &'a Option<String>,
+}
+
 pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
-    let started = Instant::now();
+    run_unused_exports_legacy_scan(job, Instant::now())
+}
+
+pub(crate) fn run_unused_exports_scan_with_oxc(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+) -> InspectResult {
+    run_unused_exports_scan_with_oxc_started(job, oxc_result, Instant::now())
+}
+
+fn run_unused_exports_scan_with_oxc_started(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    started: Instant,
+) -> InspectResult {
+    if let Some(oxc_result) = oxc_result {
+        return run_unused_exports_oxc_scan(job, oxc_result, started);
+    }
+    run_unused_exports_legacy_scan(job, started)
+}
+
+fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> InspectResult {
     let ctx = job.worker_ctx();
     let project_root = normalize_path(&ctx.project_root);
     let public_api_entries = crate::inspect::entry_points::resolve_entry_points(&project_root);
@@ -168,6 +209,325 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
         aggregate,
     };
     InspectResult::success(job, success, started.elapsed())
+}
+
+fn run_unused_exports_oxc_scan(
+    job: &InspectJob,
+    oxc_result: &OxcEngineResult,
+    started: Instant,
+) -> InspectResult {
+    let project_root = normalize_path(&job.project_root);
+    let public_api_entries = crate::inspect::entry_points::resolve_entry_points(&project_root);
+    let package_warnings = public_api_entries.warnings().to_vec();
+    let roles = crate::inspect::entry_points::resolve_project_roles(&project_root);
+
+    let oxc_paths = oxc_result
+        .files
+        .iter()
+        .map(|file| normalize_path(&file.file))
+        .collect::<BTreeSet<_>>();
+    let parse_errors_by_file = oxc_result.errors.iter().fold(
+        BTreeMap::<PathBuf, Vec<String>>::new(),
+        |mut errors, error| {
+            errors
+                .entry(normalize_path(&error.file))
+                .or_default()
+                .push(error.message.clone());
+            errors
+        },
+    );
+    let skipped_files_payload = oxc_skipped_files_payload(&project_root, oxc_result);
+    let facts_by_file = oxc_result
+        .facts
+        .iter()
+        .map(|facts| (normalize_path(&facts.path), facts))
+        .collect::<BTreeMap<_, _>>();
+    let mut contributions = Vec::new();
+    let mut count = 0usize;
+    let mut items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
+
+    for file in &oxc_result.files {
+        if let Some(facts) = facts_by_file.get(&normalize_path(&file.file)) {
+            if let Some(contribution) = oxc_unused_exports_contribution(
+                &project_root,
+                facts,
+                parse_errors_by_file.get(&normalize_path(&file.file)),
+                &skipped_files_payload,
+            ) {
+                contributions.push(contribution);
+            }
+        }
+
+        if public_api_entries.is_public_api_file(&file.file)
+            || is_test_support_file(&file.relative_file)
+        {
+            continue;
+        }
+
+        for export in &file.exports {
+            match export.verdict {
+                LivenessVerdict::Used => {}
+                LivenessVerdict::Uncertain => {
+                    uncertain_count += 1;
+                    if uncertain_items.len() < DRILL_DOWN_LIMIT {
+                        uncertain_items.push(json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "reason": export.reason,
+                            "provenance": export.provenance,
+                        }));
+                    }
+                }
+                LivenessVerdict::Unused => {
+                    count += 1;
+                    items.push(json!({
+                        "file": file.relative_file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "provenance": export.provenance,
+                    }));
+                }
+            }
+        }
+    }
+
+    for error in &oxc_result.errors {
+        if facts_by_file.contains_key(&normalize_path(&error.file)) {
+            continue;
+        }
+        if let Some(contribution) = oxc_read_error_contribution(&project_root, error) {
+            contributions.push(contribution);
+        }
+    }
+
+    let non_js_scans = job
+        .scope_files
+        .iter()
+        .filter(|path| !oxc_paths.contains(&normalize_path(path)))
+        .filter_map(|path| scan_non_js_empty_file(path, &project_root))
+        .collect::<Vec<_>>();
+    let languages_skipped = non_js_scans
+        .iter()
+        .filter_map(|scan| scan.skipped_language)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
+
+    let items = crate::inspect::entry_points::rank_and_truncate_items(
+        items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let top = crate::inspect::entry_points::top_preview_symbols(&items);
+    let mut aggregate = json!({
+        "count": count,
+        "items": items,
+        "top": top,
+        "drill_down_capped": count > DRILL_DOWN_LIMIT,
+        "scanned_files": contributions.len(),
+        "languages_skipped": languages_skipped,
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
+        "complete": oxc_result.errors.is_empty() && oxc_result.skipped_outside_root.is_empty(),
+    });
+    if !package_warnings.is_empty() {
+        aggregate["note"] = Value::String(package_warnings.join("; "));
+    }
+    add_oxc_honesty_fields(&mut aggregate, &project_root, oxc_result);
+
+    let success = InspectScanSuccess {
+        scanned_files: contributions
+            .iter()
+            .map(|contribution| contribution.file_path.clone())
+            .collect(),
+        contributions,
+        aggregate,
+    };
+    InspectResult::success(job, success, started.elapsed())
+}
+
+fn oxc_unused_exports_contribution(
+    project_root: &Path,
+    facts: &FileFacts,
+    parse_errors: Option<&Vec<String>>,
+    skipped_files: &[Value],
+) -> Option<FileContribution> {
+    let freshness = cache_freshness::collect(&facts.path).ok()?;
+    let exports = facts
+        .exports
+        .iter()
+        .map(|export| {
+            json!({
+                "symbol": export.name.as_symbol(),
+                "kind": export.kind,
+                "line": export.line,
+            })
+        })
+        .collect::<Vec<_>>();
+    let facts_payload = OxcUnusedExportsFactsPayload {
+        format_version: FACTS_FORMAT_VERSION,
+        content_hash: &facts.content_hash,
+        exports: &facts.exports,
+        imports: &facts.imports,
+        re_exports: &facts.re_exports,
+        dynamic_imports: &facts.dynamic_imports,
+        same_file_value_references: &facts.same_file_value_references,
+        used_import_bindings: &facts.used_import_bindings,
+        type_referenced_import_bindings: &facts.type_referenced_import_bindings,
+        value_referenced_import_bindings: &facts.value_referenced_import_bindings,
+        parse_error: &facts.parse_error,
+    };
+    let mut contribution = json!({
+        "file": relative_string(project_root, &facts.path),
+        "exports": exports,
+        "imports": [],
+        "provenance": OXC_PROVENANCE,
+        "oxc_facts": facts_payload,
+    });
+    if let Value::Object(object) = &mut contribution {
+        if let Some(parse_errors) = parse_errors {
+            object.insert(
+                "parse_errors".to_string(),
+                Value::Array(
+                    parse_errors
+                        .iter()
+                        .map(|message| {
+                            json!({
+                                "file": relative_string(project_root, &facts.path),
+                                "message": message,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if !skipped_files.is_empty() {
+            object.insert(
+                "skipped_files".to_string(),
+                Value::Array(skipped_files.to_vec()),
+            );
+        }
+    }
+    Some(FileContribution::new(
+        InspectCategory::UnusedExports,
+        facts.path.clone(),
+        freshness,
+        contribution_with_relative_file(project_root, contribution, &facts.path),
+    ))
+}
+
+fn oxc_read_error_contribution(
+    project_root: &Path,
+    error: &OxcEngineError,
+) -> Option<FileContribution> {
+    let error_file_path = absolute_path(project_root, &error.file);
+    let relative_file = relative_string(project_root, &error_file_path);
+    let file_path = if Path::new(&relative_file).is_absolute() {
+        error_file_path
+    } else {
+        normalize_path(&project_root.join(&relative_file))
+    };
+    let freshness = freshness_for_oxc_error_file(&file_path)?;
+    let contribution = json!({
+        "file": relative_file,
+        "exports": [],
+        "imports": [],
+        "parse_errors": [{
+            "file": relative_file,
+            "message": error.message,
+        }],
+    });
+    Some(FileContribution::new(
+        InspectCategory::UnusedExports,
+        file_path,
+        freshness,
+        contribution,
+    ))
+}
+
+fn freshness_for_oxc_error_file(path: &Path) -> Option<cache_freshness::FileFreshness> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(cache_freshness::FileFreshness {
+        mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash: cache_freshness::zero_hash(),
+    })
+}
+
+fn contribution_with_relative_file(
+    project_root: &Path,
+    mut contribution: Value,
+    file_path: &Path,
+) -> Value {
+    if let Value::Object(object) = &mut contribution {
+        object.insert(
+            "file".to_string(),
+            Value::String(relative_string(project_root, file_path)),
+        );
+    }
+    contribution
+}
+
+fn scan_non_js_empty_file(path: &Path, project_root: &Path) -> Option<FileScan> {
+    let file_path = absolute_path(project_root, path);
+    if !file_path.is_file() {
+        return None;
+    }
+    if is_js_ts_path(&file_path) {
+        return None;
+    }
+    let relative_file = relative_string(project_root, &file_path);
+    let freshness = cache_freshness::collect(&file_path).ok()?;
+    let skipped_language = detect_language(&file_path).map(language_name);
+    Some(empty_file_scan(
+        file_path,
+        relative_file,
+        freshness,
+        skipped_language,
+    ))
+}
+
+fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) -> Vec<Value> {
+    oxc_result
+        .skipped_outside_root
+        .iter()
+        .map(|path| {
+            json!({
+                "file": relative_string(project_root, path),
+                "reason": "outside_project_root",
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+fn add_oxc_honesty_fields(
+    aggregate: &mut Value,
+    project_root: &Path,
+    oxc_result: &OxcEngineResult,
+) {
+    let skipped_files = oxc_skipped_files_payload(project_root, oxc_result);
+    let parse_errors = oxc_result
+        .errors
+        .iter()
+        .map(|error| {
+            json!({
+                "file": relative_string(project_root, &error.file),
+                "message": error.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
 }
 
 fn suppress_public_api_exports(
@@ -914,6 +1274,12 @@ fn is_js_ts(lang: LangId) -> bool {
     matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
 }
 
+fn is_js_ts_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| JS_MODULE_EXTENSIONS.contains(&ext))
+}
+
 fn language_name(lang: LangId) -> &'static str {
     match lang {
         LangId::TypeScript => "typescript",
@@ -942,6 +1308,8 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Perl => "perl",
+        LangId::Pascal => "pascal",
+        LangId::R => "r",
     }
 }
 
@@ -970,11 +1338,27 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
-    normalize_path(path)
-        .strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    let normalized_root = normalize_path(project_root);
+    let normalized_path = normalize_path(path);
+    if let Ok(relative) = normalized_path.strip_prefix(&normalized_root) {
+        return slash_path(relative);
+    }
+
+    if let (Ok(canonical_root), Ok(canonical_path)) =
+        (fs::canonicalize(project_root), fs::canonicalize(path))
+    {
+        let canonical_root = normalize_path(&canonical_root);
+        let canonical_path = normalize_path(&canonical_path);
+        if let Ok(relative) = canonical_path.strip_prefix(&canonical_root) {
+            return slash_path(relative);
+        }
+    }
+
+    slash_path(&normalized_path)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn strip_quotes(text: &str) -> &str {

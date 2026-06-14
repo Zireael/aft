@@ -385,7 +385,9 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Perl
         | LangId::Html
         | LangId::Markdown
-        | LangId::Yaml => false,
+        | LangId::Yaml
+        | LangId::Pascal
+        | LangId::R => false,
     }
 }
 
@@ -2852,6 +2854,24 @@ pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         path: format!("{}: {}", path.display(), e),
     })?;
 
+    build_file_data_from_source_with_lang(path, &source, lang)
+}
+
+pub(crate) fn build_file_data_from_source(
+    path: &Path,
+    source: &str,
+) -> Result<FileCallData, AftError> {
+    let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
+        message: format!("unsupported file for call graph: {}", path.display()),
+    })?;
+    build_file_data_from_source_with_lang(path, source, lang)
+}
+
+fn build_file_data_from_source_with_lang(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+) -> Result<FileCallData, AftError> {
     let grammar = grammar_for(lang);
     let mut parser = Parser::new();
     parser

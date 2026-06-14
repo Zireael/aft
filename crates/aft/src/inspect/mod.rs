@@ -5,6 +5,7 @@ mod entry_points;
 pub mod freshness;
 pub mod job;
 mod manager;
+pub mod oxc_engine;
 pub mod scanners;
 pub mod tier2_scheduler;
 

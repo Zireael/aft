@@ -1,4 +1,8 @@
-import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
+import {
+  formatZoomMultiTargetResult,
+  formatZoomText,
+  unwrapRustZoomBatchEnvelope,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -403,6 +407,15 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           );
           if (symbolsArray.length === 1) {
             const response = results[0] ?? { success: false, message: "missing zoom response" };
+            const rustBatch = unwrapRustZoomBatchEnvelope(response as Record<string, unknown>);
+            if (rustBatch) {
+              const batch = formatZoomBatchResult(
+                targetLabel,
+                rustBatch.names,
+                rustBatch.responses,
+              );
+              return withMeta(batch.text);
+            }
             if ((response as { success?: boolean }).success === false) {
               throw new Error(
                 ((response as { message?: string }).message as string) || "zoom failed",

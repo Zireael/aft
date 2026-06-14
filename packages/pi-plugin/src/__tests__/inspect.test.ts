@@ -73,6 +73,29 @@ describe("Pi aft_inspect adapter", () => {
     expect(counted).toContain("diagnostics 2 errors/1 warnings/0 info/0 hints");
     expect(counted).toContain("src/app.ts:4 error bad type");
 
+    const environmental = buildInspectSections(
+      {
+        summary: {
+          diagnostics: { errors: 0, warnings: 0, info: 0, hints: 0 },
+        },
+        details: {
+          diagnostics: [
+            {
+              file: "package.json",
+              line: 1,
+              severity: "error",
+              message: "Failed to load schema from https://example.com/schema.json [environmental]",
+            },
+          ],
+        },
+      },
+      { fg: (_name: string, text: string) => text } as never,
+    ).join("\n");
+    expect(environmental).toContain("diagnostics 0 errors");
+    expect(environmental).toContain(
+      "package.json:1 error Failed to load schema from https://example.com/schema.json [environmental]",
+    );
+
     const pending = buildInspectSections(
       {
         summary: {

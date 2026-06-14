@@ -45,11 +45,6 @@ use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
 use super::watches::{PatternMatch, WatchPattern, WatchRegistry};
 use super::{BgTaskInfo, BgTaskStatus};
-// Note: `resolve_windows_shell` is no longer imported at module scope —
-// production code in `spawn_detached_child` uses `shell_candidates()`
-// with retry instead, and the function remains in `windows_shell.rs`
-// for tests and as a future helper.
-
 /// Default timeout for background bash tasks: 30 minutes.
 /// Agents can override per-call via the `timeout` parameter (in ms).
 const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -5511,9 +5506,8 @@ mod tests {
         );
     }
 
-    /// PowerShell variants don't need `/V:ON`-style flags; their args
-    /// are the same for foreground (`command()`) and background
-    /// (`bg_command()`).
+    /// PowerShell variants don't need `/V:ON`-style flags; their
+    /// `bg_command()` args stay on the standard `-Command` path.
     #[cfg(windows)]
     #[test]
     fn windows_shell_pwsh_bg_command_uses_standard_args() {
@@ -5530,38 +5524,4 @@ mod tests {
             "Pwsh::bg_command must include the user command body"
         );
     }
-
-    /// Issue #27 Oracle review P1 + P2 test gap: end-to-end proof that the
-    /// **cmd.exe-specific** wrapper path captures the user command's
-    /// run-time exit code correctly. The existing
-    /// `windows_spawn_writes_exit_marker_for_nonzero_exit` test would also
-    /// pass with the buggy `%ERRORLEVEL%` wrapper if the Windows machine
-    /// had pwsh.exe or powershell.exe on PATH (which is typical) — the
-    /// outer wrapper would be PowerShell, not cmd, and PowerShell's
-    /// `$LASTEXITCODE` captures the inner `cmd /c exit 42` correctly.
-    ///
-    /// This test directly spawns via `WindowsShell::Cmd.bg_command()` to
-    /// force the cmd-wrapper code path, then writes the exit marker and
-    /// asserts it contains "42" not "0". With the pre-fix `%ERRORLEVEL%`
-    /// wrapper, this test would fail because `%ERRORLEVEL%` parse-time
-    /// expansion would record cmd's startup ERRORLEVEL (typically 0)
-    /// regardless of what the user command returned.
-    /// **Disabled.** This test exercises `WindowsShell::Cmd.bg_command()` —
-    /// the inline command-line wrapper helper that production code does
-    /// NOT use anymore. v0.19.4 switched bg-bash to a file-based wrapper
-    /// (`<task>.bat` / `<task>.ps1`) because the inline cmd-line quoting
-    /// produced silent failures on Windows 11 (move /Y could not parse
-    /// path arguments through cmd's /C parser). The `bg_command` helper
-    /// is kept only for parity with `WindowsShell::Cmd.command()` shape;
-    /// the production spawn path goes through `detached_shell_command_for`
-    /// which writes the wrapper to disk and invokes `cmd /V:ON /D /C
-    /// <bat-path>`.
-    ///
-    /// The `!ERRORLEVEL!` correctness this test was meant to verify is
-    /// covered live by the Windows e2e harness scenario 2d
-    /// (`bg bash records non-zero exit code (cmd /c exit 42)`), which
-    /// exercises the real file-based wrapper end-to-end via the protocol.
-    #[allow(dead_code)]
-    #[cfg(any())] // disabled on all targets
-    fn windows_cmd_wrapper_records_real_exit_code_disabled() {}
 }

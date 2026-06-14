@@ -9,6 +9,7 @@ use aft::log_ctx;
 use aft::lsp::client::LspEvent;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
+use aft::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -591,8 +592,6 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 aft::commands::semantic_search::handle_semantic_search(&req, ctx)
             }
         }
-        "semantic_eval" => aft::commands::semantic_eval::handle_semantic_eval(&req, ctx),
-        "semantic_doctor" => aft::commands::semantic_doctor::handle_semantic_doctor(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {
@@ -678,7 +677,6 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
 
         match ctx.semantic_index_status().borrow().clone() {
             SemanticIndexStatus::Ready { .. }
-            | SemanticIndexStatus::Partial { .. }
             | SemanticIndexStatus::Disabled
             | SemanticIndexStatus::Failed(_) => return None,
             SemanticIndexStatus::Building { stage, .. } => {
@@ -746,57 +744,6 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "pyi", "rs", "go",
 ];
 
-/// Drain pending file watcher events and invalidate changed source files
-/// in the call graph.
-///
-/// Decide whether a `notify::Event` represents a real content change worth
-/// invalidating cached state for. Pulled out as a free function so unit
-/// tests can exercise every notify event variant without setting up a
-/// watcher pipeline.
-///
-/// The filter rejects:
-/// - `Access(_)` (read syscalls; cause feedback loops on atime)
-/// - `Modify(Metadata(AccessTime|Permissions|Ownership|Extended))`
-///   (no content change — biome-lint reproducer)
-/// - Anything that's not Create/Remove/Modify
-///
-/// And accepts:
-/// - `Create(_)`, `Remove(_)`, `Modify(Name(_))` (rename)
-/// - `Modify(Data(_))`, `Modify(Other)`, `Modify(Any)`
-/// - `Modify(Metadata(WriteTime|Any|Other))` (real or unknown content change)
-pub(crate) fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
-    use notify::event::{MetadataKind, ModifyKind};
-    use notify::EventKind;
-    match kind {
-        EventKind::Create(_) | EventKind::Remove(_) => true,
-        EventKind::Modify(ModifyKind::Metadata(meta)) => !matches!(
-            meta,
-            MetadataKind::AccessTime
-                | MetadataKind::Permissions
-                | MetadataKind::Ownership
-                | MetadataKind::Extended
-        ),
-        EventKind::Modify(_) => true,
-        _ => false,
-    }
-}
-
-fn watcher_path_is_infra_skip(path: &std::path::Path) -> bool {
-    use std::path::Component;
-    path.components().any(|c| {
-        matches!(c, Component::Normal(name) if matches!(
-            name.to_str().unwrap_or(""),
-            ".git" | ".opencode" | ".alfonso" | ".gsd" | "node_modules" | "target"
-        ))
-    })
-}
-
-fn watcher_path_is_ignore_file(path: &std::path::Path) -> bool {
-    path.file_name()
-        .map(|n| n == ".gitignore" || n == ".aftignore")
-        .unwrap_or(false)
-}
-
 /// A `tsconfig.json` / `jsconfig.json` (including variant names like
 /// `tsconfig.base.json`). A change to any of these can shift TypeScript build
 /// membership (which files `tsc` checks), so the status-bar membership cache
@@ -831,151 +778,6 @@ fn watcher_path_is_source(path: &std::path::Path) -> bool {
 /// coverage.
 fn watcher_path_is_callgraph_indexed(path: &std::path::Path) -> bool {
     aft::parser::detect_language(path).is_some()
-}
-
-fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
-    let configured_root = ctx.config().project_root.clone();
-    ctx.canonical_cache_root_opt()
-        .or_else(|| configured_root.map(canonicalize_watcher_path))
-}
-
-/// Returns true only when the canonical cache root has been configured
-/// (via set_canonical_cache_root) to a path that no longer exists on disk.
-/// This is the guard used by drain_watcher_events to avoid processing
-/// a delete-storm after the project root (e.g. a worktree) has been
-/// force-removed from underneath the bridge.
-fn project_root_was_deleted(ctx: &AppContext) -> bool {
-    matches!(ctx.canonical_cache_root_opt(), Some(root) if !root.exists())
-}
-
-fn watcher_same_path(path: &std::path::Path, target: &std::path::Path) -> bool {
-    if path == target {
-        return true;
-    }
-
-    std::fs::canonicalize(target)
-        .map(|target| path == target)
-        .unwrap_or(false)
-}
-
-fn watcher_git_info_exclude_path(
-    ctx: &AppContext,
-    project_root: &std::path::Path,
-) -> std::path::PathBuf {
-    ctx.git_common_dir()
-        .unwrap_or_else(|| project_root.join(".git"))
-        .join("info")
-        .join("exclude")
-}
-
-fn watcher_path_is_git_info_exclude(
-    ctx: &AppContext,
-    project_root: &std::path::Path,
-    path: &std::path::Path,
-) -> bool {
-    watcher_same_path(path, &watcher_git_info_exclude_path(ctx, project_root))
-}
-
-fn watcher_path_is_global_gitignore(path: &std::path::Path) -> bool {
-    ignore::gitignore::gitconfig_excludes_path()
-        .as_deref()
-        .is_some_and(|global_ignore| watcher_same_path(path, global_ignore))
-}
-
-fn watcher_path_can_change_corpus_ignore(
-    ctx: &AppContext,
-    project_root: Option<&std::path::Path>,
-    path: &std::path::Path,
-) -> bool {
-    if watcher_path_is_global_gitignore(path) {
-        return true;
-    }
-    if let Some(project_root) = project_root {
-        if watcher_path_is_git_info_exclude(ctx, project_root, path) {
-            return true;
-        }
-    }
-
-    let Some(project_root) = project_root else {
-        return false;
-    };
-    if !path.starts_with(project_root) {
-        return false;
-    }
-
-    watcher_path_is_ignore_file(path) && !watcher_path_is_infra_skip(path)
-}
-
-fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(&path) {
-        return canonical;
-    }
-
-    let parent = path.parent().map(std::path::Path::to_path_buf);
-    let file_name = path.file_name().map(std::ffi::OsStr::to_os_string);
-    match (parent, file_name) {
-        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
-            .map(|canonical_parent| canonical_parent.join(file_name))
-            .unwrap_or(path),
-        _ => path,
-    }
-}
-
-struct FilteredWatcherPaths {
-    changed: HashSet<std::path::PathBuf>,
-    ignore_file_changed: bool,
-}
-
-fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> FilteredWatcherPaths
-where
-    I: IntoIterator<Item = std::path::PathBuf>,
-{
-    let raw_paths: Vec<std::path::PathBuf> = raw_paths
-        .into_iter()
-        .map(canonicalize_watcher_path)
-        .collect();
-    let project_root = watcher_project_root(ctx);
-
-    // If any corpus-affecting ignore file changed, rebuild the matcher before
-    // filtering this same batch so sibling events are checked against fresh
-    // rules. The caller also needs this fact even if the ignore file itself is
-    // filtered out: changing ignore rules changes the corpus shape, not just a
-    // single path. Infra ignore files (for example, node_modules/.gitignore) do
-    // not affect AFT's project corpus and should not trigger a corpus refresh.
-    let ignore_file_changed = raw_paths
-        .iter()
-        .any(|path| watcher_path_can_change_corpus_ignore(ctx, project_root.as_deref(), path));
-    if ignore_file_changed {
-        log::debug!("watcher: project ignore file changed, rebuilding matcher before filter");
-        ctx.rebuild_gitignore();
-    }
-
-    let changed = raw_paths
-        .into_iter()
-        .filter(|path| {
-            if watcher_path_is_infra_skip(path) {
-                return false;
-            }
-
-            if watcher_path_is_global_gitignore(path)
-                || project_root
-                    .as_deref()
-                    .is_some_and(|root| watcher_path_is_git_info_exclude(ctx, root, path))
-            {
-                return false;
-            }
-
-            if watcher_path_is_ignored_by_current_matcher(ctx, path) {
-                return false;
-            }
-            true
-        })
-        .collect();
-
-    FilteredWatcherPaths {
-        changed,
-        ignore_file_changed,
-    }
 }
 
 fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &std::path::Path) -> bool {
@@ -1356,16 +1158,18 @@ fn spawn_search_corpus_refresh(
     });
 }
 
-fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
+fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_paths: bool) -> bool {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
     let config = ctx.config().clone();
     let mut status_changed = false;
 
-    if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
-        graph.invalidate_file(&root.join(".gitignore"));
-        graph.invalidate_file(&root.join(".aftignore"));
+    if invalidate_ignore_paths {
+        if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
+            graph.invalidate_file(&root.join(".gitignore"));
+            graph.invalidate_file(&root.join(".aftignore"));
+        }
     }
 
     if !ctx.is_worktree_bridge() {
@@ -1374,7 +1178,8 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
             match store.refresh_corpus(&current_files) {
                 Ok(stats) => {
                     aft::slog_info!(
-                        "callgraph store corpus refresh after ignore-rule change: {} files, {} edges",
+                        "callgraph store corpus refresh after {}: {} files, {} edges",
+                        reason,
                         stats.files,
                         stats.edges
                     );
@@ -1382,7 +1187,8 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
                 }
                 Err(error) => {
                     aft::slog_warn!(
-                        "callgraph store corpus refresh after ignore-rule change failed: {}",
+                        "callgraph store corpus refresh after {} failed: {}",
+                        reason,
                         error
                     );
                     if let Err(mark_error) = store.mark_files_stale(&current_files) {
@@ -1399,7 +1205,7 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     if config.search_index {
         spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
         status_changed = true;
-        aft::slog_info!("started search index refresh after ignore-rule change");
+        aft::slog_info!("started search index refresh after {}", reason);
     }
 
     if config.semantic_search {
@@ -1426,6 +1232,28 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
         }
     }
 
+    status_changed
+}
+
+fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
+    refresh_project_corpus(ctx, "ignore-rule change", true)
+}
+
+fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return false;
+    };
+    ctx.clear_pending_index_updates();
+    ctx.reset_symbol_cache();
+    let _ = ctx.mark_status_bar_tier2_stale();
+    ctx.clear_tsconfig_membership_cache();
+    let mut status_changed = true;
+
+    if ctx.callgraph().borrow().is_some() {
+        *ctx.callgraph().borrow_mut() = Some(aft::callgraph::CallGraph::new(root));
+    }
+
+    status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
     status_changed
 }
 
@@ -1472,31 +1300,19 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
     }
 }
 
-/// Borrows the watcher receiver and callgraph in separate phases to avoid
-/// RefCell borrow conflicts. Events are deduplicated by PathBuf — notify
-/// fires multiple events per file write (Create, Modify, etc.).
+/// Drain pre-filtered watcher events and apply cache invalidations on the
+/// dispatch thread. The watcher filter thread owns notify receive/decode,
+/// metadata filtering, ignore matching, root-deleted detection, and path
+/// coalescing; this drain only reacts to compact control events and surviving
+/// paths because the cache/index state below is not Send.
 fn drain_watcher_events(ctx: &AppContext) {
-    // Root-gone guard: if the project root has been deleted (e.g. rm -rf of
-    // an Alfonso worktree), drop the watcher immediately so the OS stops
-    // delivering the delete-storm, record degraded, log once, and return
-    // without draining/processing any pending events. This prevents the
-    // CPU pin observed when hundreds of thousands of delete events drive
-    // per-file cache invalidation.
-    if ctx.watcher_rx().borrow().is_some() && project_root_was_deleted(ctx) {
-        *ctx.watcher().borrow_mut() = None;
-        *ctx.watcher_rx().borrow_mut() = None;
-        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
-        aft::slog_warn!(
-            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
-            ctx.canonical_cache_root_opt()
-        );
-        return;
-    }
+    let mut changed: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut ignore_file_changed = false;
+    let mut rescan_required = false;
+    let mut watcher_failed = None;
+    let mut root_deleted = false;
 
-    // Phase 1: collect changed paths from the receiver without applying the
-    // gitignore matcher yet; .gitignore writes in this same batch must rebuild
-    // the matcher before any sibling path is filtered.
-    let (filtered, watcher_failed) = {
+    {
         let rx_ref = ctx.watcher_rx().borrow();
         let rx = match rx_ref.as_ref() {
             Some(rx) => rx,
@@ -1506,73 +1322,76 @@ fn drain_watcher_events(ctx: &AppContext) {
             }
         };
 
-        let mut raw_paths = Vec::new();
-        let mut watcher_failed = None;
         loop {
-            let event_result = match rx.try_recv() {
-                Ok(event_result) => event_result,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    watcher_failed = Some("watcher channel disconnected".to_string());
+            match rx.try_recv() {
+                Ok(WatcherDispatchEvent::Paths(paths)) => {
+                    if !rescan_required {
+                        changed.extend(paths);
+                    }
+                }
+                Ok(WatcherDispatchEvent::RescanRequired) => {
+                    rescan_required = true;
+                    changed.clear();
+                }
+                Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
+                    ignore_file_changed = true;
+                    log::debug!(
+                        "watcher: ignore rules changed at {}, rebuilding matcher",
+                        path.display()
+                    );
+                    if !rescan_required {
+                        ctx.rebuild_gitignore();
+                    }
+                }
+                Ok(WatcherDispatchEvent::RootDeleted) => {
+                    root_deleted = true;
                     break;
                 }
-            };
-            match event_result {
-                Ok(event) => {
-                    // Only process events that indicate actual file content changes.
-                    //
-                    // Skip Access events — on Linux with atime enabled, reading a file
-                    // during update_file triggers an access event, creating a feedback
-                    // loop.
-                    //
-                    // Skip Modify(Metadata(...)) events that don't imply content
-                    // changes: AccessTime, Permissions, Ownership, Extended.
-                    // The biome-lint case is the canonical reproducer — running
-                    // `biome check` opens every TS file for read, which on Linux
-                    // (and on macOS in some configurations) updates atime and fires
-                    // notify `Modify(Metadata(AccessTime))` events. Without this
-                    // filter, every read-only lint pass invalidates the entire
-                    // symbol cache, search index, and semantic index — completely
-                    // unnecessary work.
-                    //
-                    // We KEEP `Modify(Metadata(WriteTime))` because mtime change
-                    // does indicate a real content modification on every supported
-                    // platform. We KEEP `Modify(Metadata(Any))` and
-                    // `Modify(Metadata(Other))` as catch-all "we can't tell what
-                    // metadata changed" cases — better to over-invalidate than to
-                    // miss a real edit.
-                    if !watcher_event_invalidates(&event.kind) {
-                        continue;
-                    }
-                    for path in event.paths {
-                        raw_paths.push(path);
-                    }
+                Ok(WatcherDispatchEvent::Error(error)) => {
+                    watcher_failed = Some(error);
+                    break;
                 }
-                Err(error) => {
-                    watcher_failed = Some(error.to_string());
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    watcher_failed = Some("watcher channel disconnected".to_string());
                     break;
                 }
             }
         }
-        (filter_watcher_raw_paths(ctx, raw_paths), watcher_failed)
-    }; // receiver borrow dropped here
+    }
 
     let mut watcher_status_changed = false;
-    if let Some(error) = watcher_failed {
-        *ctx.watcher_rx().borrow_mut() = None;
+    if root_deleted {
+        ctx.stop_watcher_runtime();
+        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
+        aft::slog_warn!(
+            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
+            ctx.canonical_cache_root_opt()
+        );
+        watcher_status_changed = true;
+        changed.clear();
+        rescan_required = false;
+    } else if let Some(error) = watcher_failed {
+        ctx.stop_watcher_runtime();
         let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
         aft::slog_warn!("watcher unavailable: {}", error);
         watcher_status_changed = true;
+        rescan_required = false;
     }
 
-    let ignore_file_changed = filtered.ignore_file_changed;
     let mut status_changed = watcher_status_changed;
-    if ignore_file_changed {
+    if rescan_required {
+        aft::slog_warn!("watcher overflow: forcing project rescan");
+        ctx.rebuild_gitignore();
+        status_changed |= refresh_project_after_watcher_rescan(ctx);
+        changed.clear();
+    } else if ignore_file_changed {
         status_changed |= refresh_corpus_after_ignore_change(ctx);
     }
 
-    let changed = filtered.changed;
-    let scheduler_changed_path_count = if ignore_file_changed {
+    let scheduler_changed_path_count = if rescan_required {
+        aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1
+    } else if ignore_file_changed {
         changed.len().max(1)
     } else {
         changed.len()
@@ -2249,13 +2068,11 @@ mod watcher_filter_tests {
     use super::{
         attach_status_bar, dispatch_panic_response, drain_configure_warning_events,
         drain_semantic_index_events, drain_semantic_refresh_events, drain_watcher_events,
-        filter_watcher_raw_paths, project_root_was_deleted,
         reset_semantic_refresh_retry_state_for_test, reset_status_bar_emission_for_test,
         schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
         semantic_refresh_probe_is_scheduled_for_test,
-        semantic_refresh_transient_failure_count_for_test, watcher_event_invalidates,
-        watcher_path_is_callgraph_indexed, write_push_frame_or_request_shutdown,
-        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
+        semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
+        write_push_frame_or_request_shutdown, BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
     };
     use aft::config::Config;
     use aft::context::{
@@ -2269,6 +2086,9 @@ mod watcher_filter_tests {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, Response};
     use aft::semantic_index::SemanticIndex;
+    use aft::watcher_filter::{
+        watcher_event_invalidates, FilteredWatcherPaths, WatcherDispatchEvent, WatcherFilterConfig,
+    };
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,
@@ -2298,20 +2118,31 @@ mod watcher_filter_tests {
         )
     }
 
-    fn install_watcher_rx(
-        ctx: &AppContext,
-    ) -> std::sync::mpsc::Sender<notify::Result<notify::Event>> {
-        let (tx, rx) = std::sync::mpsc::channel();
+    fn install_watcher_rx(ctx: &AppContext) -> crossbeam_channel::Sender<WatcherDispatchEvent> {
+        let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().borrow_mut() = Some(rx);
         tx
     }
 
-    fn watcher_modify_event(path: std::path::PathBuf) -> notify::Event {
-        notify::Event {
-            kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
-            paths: vec![path],
-            attrs: Default::default(),
-        }
+    fn watcher_paths_event(path: std::path::PathBuf) -> WatcherDispatchEvent {
+        WatcherDispatchEvent::Paths(vec![path])
+    }
+
+    fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> FilteredWatcherPaths
+    where
+        I: IntoIterator<Item = std::path::PathBuf>,
+    {
+        let root = ctx
+            .canonical_cache_root_opt()
+            .or_else(|| ctx.config().project_root.clone())
+            .expect("test context has project root");
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let config = WatcherFilterConfig::new(root, ctx.git_common_dir());
+        aft::watcher_filter::filter_watcher_raw_paths_for_test(
+            &config,
+            &ctx.shared_gitignore(),
+            raw_paths,
+        )
     }
 
     // The callgraph store indexes every detected language (not just the trigram
@@ -2544,7 +2375,7 @@ mod watcher_filter_tests {
             "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
         )
         .unwrap();
-        tx.send(Ok(watcher_modify_event(source))).unwrap();
+        tx.send(watcher_paths_event(source)).unwrap();
         drain_watcher_events(&ctx);
 
         let store_ref = ctx.callgraph_store().borrow();
@@ -2779,6 +2610,7 @@ mod watcher_filter_tests {
         assert!(ctx.gitignore().is_none());
 
         std::fs::write(&gitignore, "foo.txt\n").unwrap();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
         let changed =
             filter_watcher_raw_paths(&ctx, vec![gitignore.clone(), ignored.clone(), kept.clone()]);
 
@@ -2907,7 +2739,9 @@ mod watcher_filter_tests {
         let ctx = make_ctx_with_root(&root);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
-            .send(Err(notify::Error::generic("watcher init failed")))
+            .send(WatcherDispatchEvent::Error(
+                "watcher init failed".to_string(),
+            ))
             .unwrap();
 
         drain_watcher_events(&ctx);
@@ -2919,25 +2753,15 @@ mod watcher_filter_tests {
     }
 
     #[test]
-    fn project_root_deleted_drops_watcher_rx_and_marks_degraded() {
+    fn project_root_deleted_control_drops_watcher_rx_and_marks_degraded() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let ctx = make_ctx_with_root(&root);
-        ctx.set_canonical_cache_root(root.clone());
+        ctx.set_canonical_cache_root(root);
 
-        // Happy path: root exists → no deletion detected.
-        assert!(!project_root_was_deleted(&ctx));
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(WatcherDispatchEvent::RootDeleted).unwrap();
 
-        // Simulate the worktree root being force-removed (rm -rf).
-        std::fs::remove_dir_all(&root).unwrap();
-        assert!(project_root_was_deleted(&ctx));
-
-        // Watcher rx present (as if a watcher was configured for this bridge).
-        let _watcher_tx = install_watcher_rx(&ctx);
-        assert!(ctx.watcher_rx().borrow().is_some());
-
-        // Drain must early-exit, drop both watcher and rx, record the specific
-        // degraded reason, and not process any (delete-storm) events.
         drain_watcher_events(&ctx);
 
         assert!(ctx.watcher_rx().borrow().is_none());
@@ -2958,9 +2782,7 @@ mod watcher_filter_tests {
         *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
-        watcher_tx
-            .send(Ok(watcher_modify_event(file.clone())))
-            .unwrap();
+        watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
 
         drain_watcher_events(&ctx);
 
@@ -2971,6 +2793,52 @@ mod watcher_filter_tests {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
             SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
+    }
+
+    #[test]
+    fn watcher_rescan_required_coalesces_and_requests_one_corpus_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.rebuild_gitignore();
+        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root, 3));
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired)
+            .unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired)
+            .unwrap();
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic corpus refresh request")
+        {
+            SemanticRefreshRequest::Corpus => {}
+            SemanticRefreshRequest::Files { paths } => {
+                panic!("expected corpus refresh, got file refresh for {paths:?}")
+            }
+        }
+        assert!(request_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]
@@ -3227,7 +3095,7 @@ mod watcher_filter_tests {
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
         let rx = status_frame_rx(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
-        watcher_tx.send(Ok(watcher_modify_event(file))).unwrap();
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
 
         drain_watcher_events(&ctx);
 
@@ -3261,7 +3129,7 @@ mod watcher_filter_tests {
         std::fs::remove_file(&file).unwrap();
         let rx = status_frame_rx(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
-        watcher_tx.send(Ok(watcher_modify_event(file))).unwrap();
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
 
         drain_watcher_events(&ctx);
 
