@@ -24,6 +24,133 @@ fn runtime_disabled(req: &RawRequest) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Text rendering helpers (agent-facing plain text)
+// ---------------------------------------------------------------------------
+
+fn render_search_text(query: &str, scope: &str, results: &[serde_json::Value]) -> String {
+    if results.is_empty() {
+        return format!("FTS5 Search: \"{query}\"\nscope={scope} results=0\nNo results found.");
+    }
+    let total = results.len();
+    let mut lines = vec![format!("FTS5 Search: \"{query}\"")];
+    lines.push(format!("scope={scope} results={total}"));
+    lines.push(String::new());
+    for (i, r) in results.iter().enumerate() {
+        let name = r["symbol_name"].as_str().unwrap_or("?");
+        let kind = r["symbol_kind"].as_str().unwrap_or("?");
+        let file = r["file_path"].as_str().unwrap_or("?");
+        let start = r["start_line"].as_i64().unwrap_or(0);
+        let end = r["end_line"].as_i64().unwrap_or(0);
+        let score = r["score"].as_f64().unwrap_or(0.0);
+        let lane = r["lane"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "[{}] {kind} {name}  {file}:{start}-{end}  score={score:.2}  lane={lane}",
+            i + 1
+        ));
+        if let Some(snippet) = r["snippet"].as_str() {
+            let s: String = snippet.chars().take(80).collect();
+            lines.push(format!("    snippet: {s}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_find_symbol_text(name: &str, mode: &str, results: &[serde_json::Value]) -> String {
+    if results.is_empty() {
+        return format!("FTS5 Find Symbol: \"{name}\"  mode={mode}\nNo matches found.");
+    }
+    let total = results.len();
+    let mut lines = vec![format!("FTS5 Find Symbol: \"{name}\"  mode={mode}")];
+    lines.push(format!("results={total}"));
+    lines.push(String::new());
+    for (i, r) in results.iter().enumerate() {
+        let sym_name = r["symbol_name"].as_str().unwrap_or("?");
+        let kind = r["symbol_kind"].as_str().unwrap_or("?");
+        let file = r["file_path"].as_str().unwrap_or("?");
+        let start = r["start_line"].as_i64().unwrap_or(0);
+        let end = r["end_line"].as_i64().unwrap_or(0);
+        let lane = r["lane"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "[{}] {kind} {sym_name}  {file}:{start}-{end}  lane={lane}",
+            i + 1
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_read_symbol_text(
+    name: &str,
+    file_path: &str,
+    start_line: u32,
+    end_line: u32,
+    body: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "FTS5 Read Symbol: \"{name}\"  {file_path}:{start_line}-{end_line}"
+    )];
+    lines.push(body.to_string());
+    lines.join("\n")
+}
+
+fn render_index_status_text(
+    exists: bool,
+    file_count: usize,
+    symbol_count: usize,
+    db_size: u64,
+    stale_count: usize,
+) -> String {
+    if !exists {
+        return "FTS5 Index: not found\nRun fts5_index with action=update to create.".to_string();
+    }
+    let size_mb = db_size as f64 / (1024.0 * 1024.0);
+    let mut lines = vec![format!(
+        "FTS5 Index: {file_count} files, {symbol_count} symbols, {size_mb:.1} MiB"
+    )];
+    if stale_count > 0 {
+        lines.push(format!("  stale files: {stale_count}"));
+    }
+    lines.join("\n")
+}
+
+fn render_index_action_text(action: &str, stats_json: &serde_json::Value) -> String {
+    let processed = stats_json["files_processed"].as_i64().unwrap_or(0);
+    let added = stats_json["files_added"].as_i64().unwrap_or(0);
+    let updated = stats_json["files_updated"].as_i64().unwrap_or(0);
+    let removed = stats_json["files_removed"].as_i64().unwrap_or(0);
+    let symbols = stats_json["symbols_extracted"].as_i64().unwrap_or(0);
+    format!("FTS5 {action}: processed={processed} added={added} updated={updated} removed={removed} symbols={symbols}")
+}
+
+fn render_doctor_text(
+    enabled: bool,
+    fts5_available: bool,
+    index_json: &serde_json::Value,
+    warnings: &[String],
+) -> String {
+    let mut lines = vec!["FTS5 Doctor".to_string()];
+    lines.push(format!(
+        "  compiled=true  available={fts5_available}  enabled={enabled}"
+    ));
+    if let Some(exists) = index_json.get("exists").and_then(|v| v.as_bool()) {
+        if exists {
+            let files = index_json["file_count"].as_i64().unwrap_or(0);
+            let symbols = index_json["symbol_count"].as_i64().unwrap_or(0);
+            let db_size = index_json["db_size_bytes"].as_i64().unwrap_or(0);
+            let size_mb = db_size as f64 / (1024.0 * 1024.0);
+            lines.push(format!(
+                "  index: {files} files, {symbols} symbols, {size_mb:.1} MiB"
+            ));
+        } else {
+            lines.push("  index: not found".to_string());
+        }
+    }
+    for w in warnings {
+        lines.push(format!("  ⚠ {w}"));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // fts5_index
 // ---------------------------------------------------------------------------
 
@@ -82,11 +209,13 @@ fn handle_index_status(
     project_root: &std::path::Path,
 ) -> Response {
     if !db_path.exists() {
+        let text = render_index_status_text(false, 0, 0, 0, 0);
         return Response::success(
             &req.id,
             serde_json::json!({
                 "exists": false,
                 "message": "No FTS5 index found. Run fts5_index with action=update to create.",
+                "text": text,
             }),
         );
     }
@@ -114,9 +243,10 @@ fn handle_index_status(
             paths_fts: 0,
         });
 
-    // Check for stale files
     let stale = store.stale_files(project_root).unwrap_or_default();
     let stale_count = stale.len();
+
+    let text = render_index_status_text(true, file_count, symbol_count, db_size, stale_count);
 
     Response::success(
         &req.id,
@@ -133,6 +263,7 @@ fn handle_index_status(
             },
             "stale_files": stale_count,
             "db_path": db_path.display().to_string(),
+            "text": text,
         }),
     )
 }
@@ -184,10 +315,21 @@ fn handle_index_update(
         }
     };
 
+    let action_label = if rebuild { "rebuild" } else { "update" };
+    let stats_json = serde_json::json!({
+        "files_processed": stats.files_processed,
+        "files_added": stats.files_added,
+        "files_updated": stats.files_updated,
+        "files_removed": stats.files_removed,
+        "symbols_extracted": stats.symbols_extracted,
+        "files_failed": stats.files_failed,
+    });
+    let text = render_index_action_text(action_label, &stats_json);
+
     Response::success(
         &req.id,
         serde_json::json!({
-            "action": if rebuild { "rebuild" } else { "update" },
+            "action": action_label,
             "files_processed": stats.files_processed,
             "files_added": stats.files_added,
             "files_updated": stats.files_updated,
@@ -195,6 +337,7 @@ fn handle_index_update(
             "symbols_extracted": stats.symbols_extracted,
             "files_failed": stats.files_failed,
             "db_path": db_path.display().to_string(),
+            "text": text,
         }),
     )
 }
@@ -375,6 +518,8 @@ pub fn handle_fts5_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let total = json_results.len();
 
+    let text = render_search_text(&params.query, &params.scope, &json_results);
+
     Response::success(
         &req.id,
         serde_json::json!({
@@ -383,6 +528,7 @@ pub fn handle_fts5_search(req: &RawRequest, ctx: &AppContext) -> Response {
             "query": params.query,
             "scope": params.scope,
             "complete": true,
+            "text": text,
         }),
     )
 }
@@ -529,6 +675,7 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let total = results.len();
+    let text = render_find_symbol_text(&params.name, &params.mode, &results);
 
     Response::success(
         &req.id,
@@ -538,6 +685,7 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "name": params.name,
             "mode": params.mode,
             "complete": true,
+            "text": text,
         }),
     )
 }
@@ -736,6 +884,14 @@ pub fn handle_fts5_read_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let body = body_lines.join("\n");
 
+    let text = render_read_symbol_text(
+        &symbol.name,
+        &file.path,
+        symbol.start_line,
+        symbol.end_line,
+        &body,
+    );
+
     Response::success(
         &req.id,
         serde_json::json!({
@@ -748,6 +904,7 @@ pub fn handle_fts5_read_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "end_line": symbol.end_line,
             "body": body,
             "line_count": symbol.end_line - symbol.start_line + 1,
+            "text": text,
         }),
     )
 }
@@ -842,6 +999,8 @@ pub fn handle_fts5_doctor(req: &RawRequest, ctx: &AppContext) -> Response {
         suggestions.push("Run fts5_index with action=update to create the index.".to_string());
     }
 
+    let text = render_doctor_text(fts5_enabled, fts5_available, &index_info, &warnings);
+
     Response::success(
         &req.id,
         serde_json::json!({
@@ -859,6 +1018,7 @@ pub fn handle_fts5_doctor(req: &RawRequest, ctx: &AppContext) -> Response {
             "index": index_info,
             "warnings": warnings,
             "suggestions": suggestions,
+            "text": text,
         }),
     )
 }
