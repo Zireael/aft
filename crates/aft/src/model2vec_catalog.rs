@@ -92,7 +92,8 @@ pub const MODEL2VEC_CATALOG: &[Model2VecModelInfo] = &[
         param_count: "16M",
         task: Model2VecTask::Code,
         required_files: MODEL2VEC_REQUIRED_FILES,
-        description: "Code embedding distilled from nomic-ai/CodeRankEmbed, optimized for code retrieval",
+        description:
+            "Code embedding distilled from nomic-ai/CodeRankEmbed, optimized for code retrieval",
     },
     Model2VecModelInfo {
         repo_id: "minishlab/potion-base-8M",
@@ -101,7 +102,8 @@ pub const MODEL2VEC_CATALOG: &[Model2VecModelInfo] = &[
         param_count: "8M",
         task: Model2VecTask::General,
         required_files: MODEL2VEC_REQUIRED_FILES,
-        description: "Compact English general-purpose embedding distilled from BAAI/bge-base-en-v1.5",
+        description:
+            "Compact English general-purpose embedding distilled from BAAI/bge-base-en-v1.5",
     },
     Model2VecModelInfo {
         repo_id: "minishlab/potion-base-4M",
@@ -110,7 +112,8 @@ pub const MODEL2VEC_CATALOG: &[Model2VecModelInfo] = &[
         param_count: "4M",
         task: Model2VecTask::General,
         required_files: MODEL2VEC_REQUIRED_FILES,
-        description: "Minimal English general-purpose embedding distilled from BAAI/bge-base-en-v1.5",
+        description:
+            "Minimal English general-purpose embedding distilled from BAAI/bge-base-en-v1.5",
     },
     Model2VecModelInfo {
         repo_id: "minishlab/potion-base-2M",
@@ -127,9 +130,7 @@ pub const MODEL2VEC_CATALOG: &[Model2VecModelInfo] = &[
 ///
 /// Returns `None` if the model is not in the catalog.
 pub fn lookup_model(repo_id: &str) -> Option<&'static Model2VecModelInfo> {
-    MODEL2VEC_CATALOG
-        .iter()
-        .find(|m| m.repo_id == repo_id)
+    MODEL2VEC_CATALOG.iter().find(|m| m.repo_id == repo_id)
 }
 
 /// Check if a string looks like a known model2vec model repo ID.

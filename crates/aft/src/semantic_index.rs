@@ -1711,10 +1711,8 @@ impl SemanticEmbeddingModel {
                 {
                     use crate::model2vec_download::resolve_model2vec_files;
 
-                    let model_dir = resolve_model2vec_files(
-                        Some(&config.model),
-                        config.model_path.as_deref(),
-                    )?;
+                    let model_dir =
+                        resolve_model2vec_files(Some(&config.model), config.model_path.as_deref())?;
 
                     let static_model = Model2VecStaticModel::from_pretrained(
                         model_dir
@@ -10819,10 +10817,7 @@ mod fingerprint_invalidation_tests {
     #[cfg(feature = "semantic-model2vec")]
     #[test]
     fn model2vec_from_bytes_empty_input() {
-        let tok = build_tokenizer_json(&[
-            ("[UNK]".into(), 0),
-            ("hello".into(), 1),
-        ]);
+        let tok = build_tokenizer_json(&[("[UNK]".into(), 0), ("hello".into(), 1)]);
         let cfg = r#"{"normalize":true}"#;
         let data: Vec<f32> = vec![0.5; 2 * 2];
         let model = model2vec_from_bytes_helper(&tok, cfg, &data, 2);
@@ -10835,10 +10830,7 @@ mod fingerprint_invalidation_tests {
     #[cfg(feature = "semantic-model2vec")]
     #[test]
     fn model2vec_from_bytes_unknown_tokens_only() {
-        let tok = build_tokenizer_json(&[
-            ("[UNK]".into(), 0),
-            ("known".into(), 1),
-        ]);
+        let tok = build_tokenizer_json(&[("[UNK]".into(), 0), ("known".into(), 1)]);
         let cfg = r#"{"normalize":false}"#;
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
         let model = model2vec_from_bytes_helper(&tok, cfg, &data, 3);
@@ -10897,22 +10889,21 @@ mod fingerprint_invalidation_tests {
         let fixture_path = build_model2vec_fixture(dir.path(), 10, 8);
 
         // Read the fixture files from disk into memory.
-        let tokenizer_json = fs::read_to_string(fixture_path.join("tokenizer.json"))
-            .expect("read tokenizer.json");
-        let config_json = fs::read_to_string(fixture_path.join("config.json"))
-            .expect("read config.json");
-        let model_bytes = fs::read(fixture_path.join("model.safetensors"))
-            .expect("read model.safetensors");
+        let tokenizer_json =
+            fs::read_to_string(fixture_path.join("tokenizer.json")).expect("read tokenizer.json");
+        let config_json =
+            fs::read_to_string(fixture_path.join("config.json")).expect("read config.json");
+        let model_bytes =
+            fs::read(fixture_path.join("model.safetensors")).expect("read model.safetensors");
 
         // Load via from_bytes (no filesystem resolution).
-        let model_bytes_only =
-            model2vec_rs::model::StaticModel::from_bytes(
-                tokenizer_json.as_bytes(),
-                &model_bytes,
-                config_json.as_bytes(),
-                None,
-            )
-            .expect("load from_bytes");
+        let model_bytes_only = model2vec_rs::model::StaticModel::from_bytes(
+            tokenizer_json.as_bytes(),
+            &model_bytes,
+            config_json.as_bytes(),
+            None,
+        )
+        .expect("load from_bytes");
 
         // Load via from_pretrained (filesystem resolution).
         let model_pretrained =
@@ -10988,7 +10979,9 @@ mod fingerprint_invalidation_tests {
         let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
         // Error could be about missing model name/path or unknown model
         assert!(
-            err.contains("requires either") || err.contains("model_path") || err.contains("unknown model"),
+            err.contains("requires either")
+                || err.contains("model_path")
+                || err.contains("unknown model"),
             "error: {err}"
         );
     }
@@ -11000,7 +10993,9 @@ mod fingerprint_invalidation_tests {
         let err = SemanticEmbeddingModel::from_config(&config).err().unwrap();
         // Error could be about non-existent path or missing files
         assert!(
-            err.contains("does not exist") || err.contains("not a directory") || err.contains("missing"),
+            err.contains("does not exist")
+                || err.contains("not a directory")
+                || err.contains("missing"),
             "error: {err}"
         );
     }

@@ -86,18 +86,13 @@ fn model_name_to_dir_name(name: &str) -> String {
 
 /// Check if a model directory has all required files cached.
 fn is_model_cached(model_dir: &Path) -> bool {
-    MODEL2VEC_FILES
-        .iter()
-        .all(|f| model_dir.join(f).is_file())
+    MODEL2VEC_FILES.iter().all(|f| model_dir.join(f).is_file())
 }
 
 /// Validate that a directory contains all required model2vec files.
 fn validate_model_dir(path: &Path) -> Result<(), String> {
     if !path.is_dir() {
-        return Err(format!(
-            "model_path is not a directory: {}",
-            path.display()
-        ));
+        return Err(format!("model_path is not a directory: {}", path.display()));
     }
 
     let mut missing = Vec::new();
@@ -192,8 +187,12 @@ fn download_model(repo_id: &str, target_dir: &Path) -> Result<PathBuf, String> {
     );
 
     // Create target directory
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| format!("failed to create model directory {}: {e}", target_dir.display()))?;
+    std::fs::create_dir_all(target_dir).map_err(|e| {
+        format!(
+            "failed to create model directory {}: {e}",
+            target_dir.display()
+        )
+    })?;
 
     let cache_dir = model2vec_cache_dir();
     let api = ApiBuilder::new()
@@ -211,12 +210,8 @@ fn download_model(repo_id: &str, target_dir: &Path) -> Result<PathBuf, String> {
 
         // Copy from HF cache to our target directory
         let target_path = target_dir.join(file);
-        std::fs::copy(&cached_path, &target_path).map_err(|e| {
-            format!(
-                "failed to copy {file} to {}: {e}",
-                target_path.display()
-            )
-        })?;
+        std::fs::copy(&cached_path, &target_path)
+            .map_err(|e| format!("failed to copy {file} to {}: {e}", target_path.display()))?;
     }
 
     slog_info!("model2vec model {} downloaded successfully", repo_id);
@@ -228,12 +223,8 @@ pub fn model_dir_size(path: &Path) -> Result<u64, String> {
     let mut total = 0u64;
     for file in MODEL2VEC_FILES {
         let file_path = path.join(file);
-        let metadata = std::fs::metadata(&file_path).map_err(|e| {
-            format!(
-                "failed to read metadata for {}: {e}",
-                file_path.display()
-            )
-        })?;
+        let metadata = std::fs::metadata(&file_path)
+            .map_err(|e| format!("failed to read metadata for {}: {e}", file_path.display()))?;
         total += metadata.len();
     }
     Ok(total)
@@ -473,12 +464,18 @@ mod tests {
     fn validate_config_json_missing_hidden_size() {
         let dir = std::env::temp_dir().join("test_model2vec_no_hidden");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::File::create(dir.join("config.json")).unwrap()
-            .write_all(b"{\"normalize\": true}").unwrap();
-        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
-            .write_all(b"{}").unwrap();
-        std::fs::File::create(dir.join("model.safetensors")).unwrap()
-            .write_all(b"fake").unwrap();
+        std::fs::File::create(dir.join("config.json"))
+            .unwrap()
+            .write_all(b"{\"normalize\": true}")
+            .unwrap();
+        std::fs::File::create(dir.join("tokenizer.json"))
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        std::fs::File::create(dir.join("model.safetensors"))
+            .unwrap()
+            .write_all(b"fake")
+            .unwrap();
 
         let result = validate_model_dir(&dir);
         assert!(result.is_err());
@@ -490,12 +487,18 @@ mod tests {
     fn validate_config_json_invalid_json() {
         let dir = std::env::temp_dir().join("test_model2vec_bad_json");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::File::create(dir.join("config.json")).unwrap()
-            .write_all(b"not json").unwrap();
-        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
-            .write_all(b"{}").unwrap();
-        std::fs::File::create(dir.join("model.safetensors")).unwrap()
-            .write_all(b"fake").unwrap();
+        std::fs::File::create(dir.join("config.json"))
+            .unwrap()
+            .write_all(b"not json")
+            .unwrap();
+        std::fs::File::create(dir.join("tokenizer.json"))
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        std::fs::File::create(dir.join("model.safetensors"))
+            .unwrap()
+            .write_all(b"fake")
+            .unwrap();
 
         let result = validate_model_dir(&dir);
         assert!(result.is_err());
@@ -517,18 +520,32 @@ mod tests {
     fn validate_dimensions_mismatch() {
         let dir = std::env::temp_dir().join("test_model2vec_dims_bad");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::File::create(dir.join("config.json")).unwrap()
-            .write_all(b"{\"normalize\": true, \"hidden_size\": 128}").unwrap();
-        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
-            .write_all(b"{}").unwrap();
-        std::fs::File::create(dir.join("model.safetensors")).unwrap()
-            .write_all(b"fake").unwrap();
+        std::fs::File::create(dir.join("config.json"))
+            .unwrap()
+            .write_all(b"{\"normalize\": true, \"hidden_size\": 128}")
+            .unwrap();
+        std::fs::File::create(dir.join("tokenizer.json"))
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        std::fs::File::create(dir.join("model.safetensors"))
+            .unwrap()
+            .write_all(b"fake")
+            .unwrap();
 
         let result = validate_model_dimensions(&dir, "minishlab/potion-code-16M");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("128"), "error should mention actual dims: {}", err);
-        assert!(err.contains("256"), "error should mention expected dims: {}", err);
+        assert!(
+            err.contains("128"),
+            "error should mention actual dims: {}",
+            err
+        );
+        assert!(
+            err.contains("256"),
+            "error should mention expected dims: {}",
+            err
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -536,12 +553,18 @@ mod tests {
     fn validate_hidden_size_out_of_range() {
         let dir = std::env::temp_dir().join("test_model2vec_hidden_range");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::File::create(dir.join("config.json")).unwrap()
-            .write_all(b"{\"normalize\": true, \"hidden_size\": 0}").unwrap();
-        std::fs::File::create(dir.join("tokenizer.json")).unwrap()
-            .write_all(b"{}").unwrap();
-        std::fs::File::create(dir.join("model.safetensors")).unwrap()
-            .write_all(b"fake").unwrap();
+        std::fs::File::create(dir.join("config.json"))
+            .unwrap()
+            .write_all(b"{\"normalize\": true, \"hidden_size\": 0}")
+            .unwrap();
+        std::fs::File::create(dir.join("tokenizer.json"))
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        std::fs::File::create(dir.join("model.safetensors"))
+            .unwrap()
+            .write_all(b"fake")
+            .unwrap();
 
         let result = validate_model_dir(&dir);
         assert!(result.is_err());
@@ -566,10 +589,7 @@ mod tests {
         let path_dir = std::env::temp_dir().join("test_model2vec_path_priority");
         create_test_model_dir(&path_dir);
         // Even if we provide a name, the explicit path should be used
-        let result = resolve_model2vec_files(
-            Some("unknown-model"),
-            Some(&path_dir),
-        );
+        let result = resolve_model2vec_files(Some("unknown-model"), Some(&path_dir));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), path_dir);
         std::fs::remove_dir_all(&path_dir).ok();
