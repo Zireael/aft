@@ -153,7 +153,8 @@ pub struct Fts5SearchResult {
 /// multi-table FTS5 schema. Each project root gets its own SQLite database
 /// file.
 pub struct Fts5Store {
-    conn: Connection,
+    /// The SQLite connection (exposed for query planner access).
+    pub conn: Connection,
     db_path: PathBuf,
 }
 
