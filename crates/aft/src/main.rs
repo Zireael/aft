@@ -627,6 +627,16 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             aft::commands::lsp_prepare_rename::handle_lsp_prepare_rename(&req, ctx)
         }
         "lsp_rename" => aft::commands::lsp_rename::handle_lsp_rename(&req, ctx),
+        #[cfg(feature = "semantic-fts5")]
+        "fts5_index" => aft::commands::fts5::handle_fts5_index(&req, ctx),
+        #[cfg(feature = "semantic-fts5")]
+        "fts5_search" => aft::commands::fts5::handle_fts5_search(&req, ctx),
+        #[cfg(feature = "semantic-fts5")]
+        "fts5_find_symbol" => aft::commands::fts5::handle_fts5_find_symbol(&req, ctx),
+        #[cfg(feature = "semantic-fts5")]
+        "fts5_read_symbol" => aft::commands::fts5::handle_fts5_read_symbol(&req, ctx),
+        #[cfg(feature = "semantic-fts5")]
+        "fts5_doctor" => aft::commands::fts5::handle_fts5_doctor(&req, ctx),
         // NOTE: "snapshot" must remain in the production binary because integration tests in
         // crates/aft/tests/integration/ spawn the compiled binary as a subprocess and send
         // "snapshot" commands through the stdin/stdout protocol. A #[cfg(test)] gate would

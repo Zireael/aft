@@ -21,6 +21,8 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
+#[cfg(feature = "semantic-fts5")]
+pub mod fts5;
 pub mod glob;
 pub mod grep;
 pub mod impact;

@@ -528,6 +528,62 @@ fn parse_inspect_config(
     Ok(inspect)
 }
 
+fn parse_fts5_config(
+    value: &serde_json::Value,
+    current: &crate::config::Fts5Config,
+) -> Result<crate::config::Fts5Config, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: fts5 must be an object".to_string());
+    };
+
+    let mut fts5 = current.clone();
+
+    if let Some(raw) = obj.get("enabled") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: fts5.enabled must be a boolean".to_string());
+        };
+        fts5.enabled = value;
+    }
+    if let Some(raw) = obj.get("auto_index") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: fts5.auto_index must be a boolean".to_string());
+        };
+        fts5.auto_index = value;
+    }
+    if let Some(raw) = obj.get("index_on_start") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: fts5.index_on_start must be a boolean".to_string());
+        };
+        fts5.index_on_start = value;
+    }
+    if let Some(raw) = obj.get("max_results") {
+        let Some(v) = raw.as_u64() else {
+            return Err("configure: fts5.max_results must be an unsigned integer".to_string());
+        };
+        fts5.max_results = v as usize;
+    }
+    if let Some(raw) = obj.get("max_body_chars") {
+        let Some(v) = raw.as_u64() else {
+            return Err("configure: fts5.max_body_chars must be an unsigned integer".to_string());
+        };
+        fts5.max_body_chars = v as usize;
+    }
+    if let Some(raw) = obj.get("max_body_lines") {
+        let Some(v) = raw.as_u64() else {
+            return Err("configure: fts5.max_body_lines must be an unsigned integer".to_string());
+        };
+        fts5.max_body_lines = v as usize;
+    }
+    if let Some(raw) = obj.get("raw_fts_debug") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: fts5.raw_fts_debug must be a boolean".to_string());
+        };
+        fts5.raw_fts_debug = value;
+    }
+
+    Ok(fts5)
+}
+
 fn parse_semantic_config(
     value: &serde_json::Value,
     current: &SemanticBackendConfig,
@@ -2099,6 +2155,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     if let Some(v) = params.get("inspect") {
         next_config.inspect = match parse_inspect_config(v, &next_config.inspect) {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
+    if let Some(v) = params.get("fts5") {
+        next_config.fts5 = match parse_fts5_config(v, &next_config.fts5) {
             Ok(config) => config,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };

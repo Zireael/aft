@@ -655,6 +655,48 @@ impl Default for InspectConfig {
     }
 }
 
+/// Runtime configuration for the opt-in FTS5 side feature.
+///
+/// This config lives under `[fts5]` in `aft.jsonc`. The feature is disabled by
+/// default at both compile time (`semantic-fts5` feature) and runtime
+/// (`enabled: false`). All fields are safe defaults that make FTS5 invisible
+/// unless explicitly opted in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fts5Config {
+    /// Enable the FTS5 side feature at runtime (default: false).
+    /// Even when compiled behind `semantic-fts5`, the feature is off until this
+    /// is explicitly set to true.
+    pub enabled: bool,
+    /// Automatically build/update the FTS5 index on configure (default: false).
+    pub auto_index: bool,
+    /// Build the FTS5 index on process startup (default: false).
+    pub index_on_start: bool,
+    /// Maximum number of results returned per search (default: 20).
+    pub max_results: usize,
+    /// Maximum characters stored per symbol body (default: 2000).
+    pub max_body_chars: usize,
+    /// Maximum lines stored per symbol body (default: 60).
+    pub max_body_lines: usize,
+    /// Enable raw FTS5 debug output in search results (default: false).
+    /// When true, includes the generated FTS5 query string in diagnostics.
+    pub raw_fts_debug: bool,
+}
+
+impl Default for Fts5Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_index: false,
+            index_on_start: false,
+            max_results: 20,
+            max_body_chars: 2000,
+            max_body_lines: 60,
+            raw_fts_debug: false,
+        }
+    }
+}
+
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {
@@ -728,6 +770,8 @@ pub struct Config {
     /// File inclusion/exclusion policy for semantic indexing.
     pub semantic_files: SemanticFilePolicy,
     pub inspect: InspectConfig,
+    /// Opt-in FTS5 side feature configuration. Disabled by default.
+    pub fts5: Fts5Config,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -819,6 +863,7 @@ impl Default for Config {
             semantic: SemanticBackendConfig::default(),
             semantic_files: SemanticFilePolicy::default(),
             inspect: InspectConfig::default(),
+            fts5: Fts5Config::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),
@@ -909,5 +954,23 @@ mod tests {
                 .any(|g| g.contains("node_modules")),
             "builtin excludes should contain node_modules"
         );
+    }
+
+    #[test]
+    fn fts5_config_defaults_are_disabled() {
+        let config = Fts5Config::default();
+        assert!(!config.enabled);
+        assert!(!config.auto_index);
+        assert!(!config.index_on_start);
+        assert_eq!(config.max_results, 20);
+        assert_eq!(config.max_body_chars, 2000);
+        assert_eq!(config.max_body_lines, 60);
+        assert!(!config.raw_fts_debug);
+    }
+
+    #[test]
+    fn fts5_config_not_in_default_config() {
+        let config = Config::default();
+        assert!(!config.fts5.enabled);
     }
 }
