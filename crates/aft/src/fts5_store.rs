@@ -57,10 +57,7 @@ pub enum Fts5StoreError {
     /// FTS5 not available in this SQLite build.
     Fts5Unavailable,
     /// Schema version mismatch — requires rebuild.
-    SchemaMismatch {
-        expected: i64,
-        found: i64,
-    },
+    SchemaMismatch { expected: i64, found: i64 },
     /// Generic error message.
     Other(String),
 }
@@ -221,9 +218,9 @@ impl Fts5Store {
             [],
             |row| row.get(0),
         )?;
-        value.parse::<i64>().map_err(|e| {
-            Fts5StoreError::Other(format!("invalid schema version in database: {e}"))
-        })
+        value
+            .parse::<i64>()
+            .map_err(|e| Fts5StoreError::Other(format!("invalid schema version in database: {e}")))
     }
 
     /// Get the database file path.
@@ -504,6 +501,41 @@ impl Fts5Store {
         Ok(count as usize)
     }
 
+    /// Get file paths with stale mtime (file on disk is newer than indexed).
+    /// Returns (path, indexed_mtime, current_mtime) for each stale file.
+    pub fn stale_files(&self, project_root: &Path) -> Result<Vec<StaleFileInfo>, Fts5StoreError> {
+        let files = self.get_all_files()?;
+        let mut stale = Vec::new();
+
+        for file in &files {
+            let abs_path = project_root.join(&file.path);
+            if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                if let Ok(current_mtime) = metadata.modified() {
+                    let current_secs = current_mtime
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if current_secs != file.mtime_secs {
+                        stale.push(StaleFileInfo {
+                            path: file.path.clone(),
+                            indexed_mtime: file.mtime_secs,
+                            current_mtime: current_secs,
+                        });
+                    }
+                }
+            } else {
+                // File no longer exists on disk
+                stale.push(StaleFileInfo {
+                    path: file.path.clone(),
+                    indexed_mtime: file.mtime_secs,
+                    current_mtime: -1, // Sentinel: file deleted
+                });
+            }
+        }
+
+        Ok(stale)
+    }
+
     // -----------------------------------------------------------------------
     // Symbol operations
     // -----------------------------------------------------------------------
@@ -583,10 +615,7 @@ impl Fts5Store {
     }
 
     /// Get a symbol record by name (exact match).
-    pub fn get_symbol_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Vec<SymbolRecord>, Fts5StoreError> {
+    pub fn get_symbol_by_name(&self, name: &str) -> Result<Vec<SymbolRecord>, Fts5StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_id, name, kind, start_line, end_line, body, indexed_at
              FROM fts5_symbols WHERE name = ?1 ORDER BY file_id",
@@ -630,21 +659,19 @@ impl Fts5Store {
 
     /// Get FTS5 row counts for diagnostics.
     pub fn fts_row_counts(&self) -> Result<FtsRowCounts, Fts5StoreError> {
-        let symbols_fts: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM fts5_symbols_fts",
-            [],
-            |row| row.get(0),
-        )?;
-        let bodies_fts: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM fts5_symbol_bodies_fts",
-            [],
-            |row| row.get(0),
-        )?;
-        let paths_fts: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM fts5_paths_fts",
-            [],
-            |row| row.get(0),
-        )?;
+        let symbols_fts: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM fts5_symbols_fts", [], |row| {
+                    row.get(0)
+                })?;
+        let bodies_fts: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM fts5_symbol_bodies_fts", [], |row| {
+                    row.get(0)
+                })?;
+        let paths_fts: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM fts5_paths_fts", [], |row| row.get(0))?;
         Ok(FtsRowCounts {
             symbols_fts: symbols_fts as usize,
             bodies_fts: bodies_fts as usize,
@@ -654,9 +681,9 @@ impl Fts5Store {
 
     /// Run integrity check on the database.
     pub fn integrity_check(&self) -> Result<String, Fts5StoreError> {
-        let result: String = self.conn.query_row("PRAGMA integrity_check", [], |row| {
-            row.get(0)
-        })?;
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(result)
     }
 }
@@ -671,6 +698,17 @@ pub struct FtsRowCounts {
     pub symbols_fts: usize,
     pub bodies_fts: usize,
     pub paths_fts: usize,
+}
+
+/// Information about a stale file in the index.
+#[derive(Debug, Clone)]
+pub struct StaleFileInfo {
+    /// Relative path of the file.
+    pub path: String,
+    /// When the file was last indexed (seconds since epoch).
+    pub indexed_mtime: i64,
+    /// Current mtime on disk (-1 if file was deleted).
+    pub current_mtime: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,9 +771,7 @@ mod tests {
     fn upsert_and_get_file() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store
-            .upsert_file("src/main.rs", "abc123", 1000)
-            .unwrap();
+        let file_id = store.upsert_file("src/main.rs", "abc123", 1000).unwrap();
         assert!(file_id > 0);
 
         let file = store.get_file_by_path("src/main.rs").unwrap();
@@ -855,5 +891,30 @@ mod tests {
         assert_eq!(store.file_count().unwrap(), 0);
         assert_eq!(store.symbol_count().unwrap(), 0);
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn stale_files_detects_mtime_mismatch() {
+        let tmp = std::env::temp_dir().join("fts5_store_stale_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let file_path = tmp.join("test.rs");
+        std::fs::write(&file_path, "fn test() {}\n").unwrap();
+
+        let db_path = tmp.join("test.sqlite");
+        let store = Fts5Store::open(&db_path).unwrap();
+
+        // Index with mtime=1000 (stale)
+        store.upsert_file("test.rs", "abc", 1000).unwrap();
+
+        // Current file has different mtime
+        let stale = store.stale_files(&tmp).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].path, "test.rs");
+        assert_eq!(stale[0].indexed_mtime, 1000);
+        assert_ne!(stale[0].current_mtime, 1000);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
