@@ -2,6 +2,12 @@
 //!
 //! These tests exercise the full command-loop: spawn aft → configure with
 //! FTS5 enabled → index → search → find → read → doctor.
+//!
+//! All tests in this module require the `semantic-fts5` feature to be enabled,
+//! because the FTS5 commands are only registered in the protocol dispatcher
+//! when the feature is compiled in.
+
+#![cfg(feature = "semantic-fts5")]
 
 use std::fs;
 use std::path::Path;

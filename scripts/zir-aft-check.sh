@@ -617,7 +617,11 @@ task_clippy() { run_rust "clippy" "cargo clippy --workspace --all-targets --lock
 task_nextest() {
   local install_nextest
   install_nextest="$(install_cargo_tool_cmd cargo-nextest cargo-nextest)"
-  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked $(cargo_features_flag)"
+  local fail_flag=""
+  if (( KEEP_GOING )); then
+    fail_flag="--no-fail-fast"
+  fi
+  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked $(cargo_features_flag) $fail_flag"
 }
 task_doctest() { run_rust "doctest" "cargo test --doc --workspace --locked $(cargo_features_flag)"; }
 task_coverage() {

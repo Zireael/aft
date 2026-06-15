@@ -258,11 +258,13 @@ impl<'a> QueryPlanner<'a> {
         let symbols = self.store.get_symbol_by_name(name)?;
 
         for sym in symbols {
-            let file = self.store.get_file_by_path("")?.unwrap_or_else(|| {
-                // Fallback: get file by ID from the symbol's file_id
+            // Look up the file by the symbol's file_id, not by empty path.
+            // The previous code used get_file_by_path("") which always returned
+            // None, then fell back to a FileRecord with an empty path.
+            let file = self.store.get_file_by_id(sym.file_id)?.unwrap_or_else(|| {
                 crate::fts5_store::FileRecord {
                     id: sym.file_id,
-                    path: String::new(),
+                    path: format!("<unknown file_id={}>", sym.file_id),
                     hash: String::new(),
                     mtime_secs: 0,
                     indexed_at: 0,
@@ -733,6 +735,31 @@ mod tests {
         let q = AnalyzedQuery::analyze("id");
         let lanes = LaneSelection::for_query(&q);
         assert!(lanes.short_token_fallback);
+    }
+
+    #[test]
+    fn exact_symbol_sql_returns_correct_file_path() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        // Insert a file with a known path
+        let file_id = store.upsert_file("src/lib.rs", "abc", 1000).unwrap();
+
+        // Insert a symbol referencing that file
+        store
+            .upsert_symbol(file_id, "MyFunc", "function", 5, 15, "fn MyFunc() {}")
+            .unwrap();
+
+        // Search for the exact symbol
+        let planner = QueryPlanner::new(&store);
+        let results = planner.search("MyFunc", 10).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol_name, "MyFunc");
+        // The file path must be the real path, not empty or unknown
+        assert_eq!(
+            results[0].file_path, "src/lib.rs",
+            "exact symbol lookup must return the correct file path"
+        );
     }
 
     #[test]

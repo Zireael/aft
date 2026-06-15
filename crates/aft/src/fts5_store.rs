@@ -421,6 +421,10 @@ impl Fts5Store {
     // -----------------------------------------------------------------------
 
     /// Upsert a file record. Returns the file ID.
+    ///
+    /// Uses `RETURNING id` to get the correct row ID for both INSERT and
+    /// UPDATE paths. The previous `last_insert_rowid()` approach returned a
+    /// stale value when `ON CONFLICT` triggered an UPDATE.
     pub fn upsert_file(
         &self,
         path: &str,
@@ -428,16 +432,17 @@ impl Fts5Store {
         mtime_secs: i64,
     ) -> Result<i64, Fts5StoreError> {
         let now = now_secs();
-        self.conn.execute(
+        let file_id: i64 = self.conn.query_row(
             "INSERT INTO fts5_files (path, hash, mtime_secs, indexed_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
                hash = excluded.hash,
                mtime_secs = excluded.mtime_secs,
-               indexed_at = excluded.indexed_at",
+               indexed_at = excluded.indexed_at
+             RETURNING id",
             params![path, hash, mtime_secs, now],
+            |row| row.get(0),
         )?;
-        let file_id = self.conn.last_insert_rowid();
         Ok(file_id)
     }
 
@@ -913,6 +918,52 @@ mod tests {
         assert_eq!(store.file_count().unwrap(), 0);
         assert_eq!(store.symbol_count().unwrap(), 0);
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upsert_file_returns_correct_id_on_conflict_update() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        // Insert a file
+        let id1 = store.upsert_file("src/main.rs", "hash1", 1000).unwrap();
+        assert!(id1 > 0);
+
+        // Upsert with same path but different hash (conflict update)
+        let id2 = store.upsert_file("src/main.rs", "hash2", 2000).unwrap();
+
+        // The returned ID must match the original row ID
+        assert_eq!(
+            id1, id2,
+            "upsert_file must return the same ID on conflict update"
+        );
+
+        // Verify the file is correctly updated
+        let file = store.get_file_by_path("src/main.rs").unwrap().unwrap();
+        assert_eq!(file.id, id1);
+        assert_eq!(file.hash, "hash2");
+        assert_eq!(file.mtime_secs, 2000);
+    }
+
+    #[test]
+    fn exact_symbol_lookup_returns_correct_file_path() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store.upsert_file("src/lib.rs", "abc", 1000).unwrap();
+        store
+            .upsert_symbol(file_id, "MyStruct", "struct", 10, 20, "struct MyStruct {}")
+            .unwrap();
+
+        // Exact symbol lookup by name
+        let results = store.get_symbol_by_name("MyStruct").unwrap();
+        assert_eq!(results.len(), 1);
+
+        // The symbol's file_id must reference the correct file
+        let sym = &results[0];
+        assert_eq!(sym.file_id, file_id);
+
+        // Loading the file by ID must return the correct path
+        let file = store.get_file_by_id(sym.file_id).unwrap().unwrap();
+        assert_eq!(file.path, "src/lib.rs");
     }
 
     #[test]
