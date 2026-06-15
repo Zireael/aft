@@ -23,6 +23,7 @@ pub mod bun;
 pub mod caps;
 pub mod cargo;
 pub mod eslint;
+pub mod failure_classifier;
 pub mod generic;
 pub mod git;
 pub mod go;
