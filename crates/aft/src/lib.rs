@@ -85,6 +85,7 @@ pub mod parser;
 pub mod pattern_compile;
 pub mod protocol;
 pub mod query_shape;
+pub mod ril_indexer;
 pub mod search_index;
 pub mod semantic_diagnostics;
 pub mod semantic_doctor;
