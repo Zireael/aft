@@ -30,9 +30,10 @@ fn is_binary(content: &[u8]) -> bool {
 ///   - `start_line` (u32, optional) — 1-based start line (default: 1)
 ///   - `end_line` (u32, optional) — 1-based end line (default: start_line + limit - 1)
 ///   - `limit` (u32, optional) — max lines to return (default: 2000)
+///   - `sidecar` (string, optional) — "outline" | "imports" | "tests" | "all" for orientation sidecar
 ///
 /// Returns for files:
-///   `{ content, complete, total_lines?, lines_read, start_line, end_line, truncated, byte_size }`
+///   `{ content, complete, total_lines?, lines_read, start_line, end_line, truncated, byte_size, sidecar? }`
 ///
 /// `complete` is false whenever the returned content is a slice/truncated. Full
 /// reads report exact `total_lines`; explicit ranged reads omit `total_lines`
@@ -249,19 +250,233 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
     let has_more = (start_idx > 0) || (end_idx as u32) < total_lines || truncated_by_size;
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "content": output,
-            "complete": !has_more,
-            "total_lines": total_lines,
-            "lines_read": lines_read,
-            "start_line": start_line,
-            "end_line": actual_end,
-            "truncated": has_more,
-            "byte_size": byte_size,
-        }),
-    )
+    // Build response with optional sidecar
+    let mut response = serde_json::json!({
+        "content": output,
+        "complete": !has_more,
+        "total_lines": total_lines,
+        "lines_read": lines_read,
+        "start_line": start_line,
+        "end_line": actual_end,
+        "truncated": has_more,
+        "byte_size": byte_size,
+    });
+
+    // Add sidecar if requested
+    if let Some(sidecar_type) = req.params.get("sidecar").and_then(|v| v.as_str()) {
+        let sidecar = generate_sidecar(&path, &content, sidecar_type);
+        if let Some(sc) = sidecar {
+            response["sidecar"] = sc;
+        }
+    }
+
+    Response::success(&req.id, response)
+}
+
+/// Generate a sidecar for orientation context.
+///
+/// Sidecars provide compact orientation without replacing exact content:
+/// - "outline": symbol outline (name, kind, line range)
+/// - "imports": import statements at top of file
+/// - "tests": test functions/modules in the file
+/// - "all": all of the above
+fn generate_sidecar(_path: &Path, content: &str, sidecar_type: &str) -> Option<serde_json::Value> {
+    let mut sidecar = serde_json::Map::new();
+
+    let include_outline = matches!(sidecar_type, "outline" | "all");
+    let include_imports = matches!(sidecar_type, "imports" | "all");
+    let include_tests = matches!(sidecar_type, "tests" | "all");
+
+    if include_outline {
+        // Extract top-level symbols (simple regex-free approach)
+        let outline = extract_outline(content);
+        if !outline.is_empty() {
+            sidecar.insert("outline".to_string(), serde_json::json!(outline));
+        }
+    }
+
+    if include_imports {
+        // Extract import/use statements
+        let imports = extract_imports(content);
+        if !imports.is_empty() {
+            sidecar.insert("imports".to_string(), serde_json::json!(imports));
+        }
+    }
+
+    if include_tests {
+        // Extract test functions/modules
+        let tests = extract_tests(content);
+        if !tests.is_empty() {
+            sidecar.insert("tests".to_string(), serde_json::json!(tests));
+        }
+    }
+
+    if sidecar.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(sidecar))
+    }
+}
+
+/// Extract top-level symbol outline from source content.
+fn extract_outline(content: &str) -> Vec<serde_json::Value> {
+    let mut outline = Vec::new();
+    let mut in_comment = false;
+
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+
+        // Track block comments
+        if trimmed.contains("/*") && !trimmed.contains("*/") {
+            in_comment = true;
+            continue;
+        }
+        if in_comment {
+            if trimmed.contains("*/") {
+                in_comment = false;
+            }
+            continue;
+        }
+
+        // Skip single-line comments
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("///") {
+            continue;
+        }
+
+        // Detect top-level definitions (simplified heuristics)
+        let is_definition = trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub struct ")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("pub enum ")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("pub trait ")
+            || trimmed.starts_with("trait ")
+            || trimmed.starts_with("pub type ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("pub mod ")
+            || trimmed.starts_with("mod ")
+            || trimmed.starts_with("pub const ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("export ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("interface ")
+            || trimmed.starts_with("impl ");
+
+        if is_definition {
+            // Extract name (simple: take first word after keywords)
+            let _name = trimmed
+                .split_whitespace()
+                .nth(2)
+                .or_else(|| trimmed.split_whitespace().nth(1))
+                .unwrap_or("?");
+
+            outline.push(serde_json::json!({
+                "line": i + 1,
+                "text": if trimmed.len() > 80 {
+                    format!("{}...", &trimmed[..77])
+                } else {
+                    trimmed.to_string()
+                },
+            }));
+        }
+    }
+
+    outline
+}
+
+/// Extract import/use statements from source content.
+fn extract_imports(content: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let mut in_import_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Rust
+        if trimmed.starts_with("use ") && trimmed.contains(';') {
+            imports.push(trimmed.trim_end_matches(';').to_string());
+            continue;
+        }
+
+        // TypeScript/JavaScript
+        if trimmed.starts_with("import ") {
+            imports.push(trimmed.to_string());
+            continue;
+        }
+
+        // Python
+        if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+            imports.push(trimmed.to_string());
+            continue;
+        }
+
+        // Handle multi-line imports (simplified)
+        if trimmed.contains("import {") || trimmed.contains("use {") {
+            in_import_block = true;
+            imports.push(trimmed.to_string());
+            continue;
+        }
+        if in_import_block {
+            imports.push(trimmed.to_string());
+            if trimmed.contains("};") || trimmed.contains('}') {
+                in_import_block = false;
+            }
+        }
+    }
+
+    imports
+}
+
+/// Extract test functions/modules from source content.
+fn extract_tests(content: &str) -> Vec<serde_json::Value> {
+    let mut tests = Vec::new();
+    let mut in_test_module = false;
+    let mut brace_depth = 0;
+
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+
+        // Detect test modules
+        if trimmed.contains("#[cfg(test)]") || trimmed.contains("mod tests") {
+            in_test_module = true;
+            brace_depth = 0;
+            continue;
+        }
+
+        if in_test_module {
+            // Track brace depth
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth -= 1;
+                        if brace_depth == 0 {
+                            in_test_module = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Detect test functions
+            if trimmed.starts_with("#[test]")
+                || trimmed.starts_with("fn test_")
+                || trimmed.starts_with("pub fn test_")
+            {
+                tests.push(serde_json::json!({
+                    "line": i + 1,
+                    "text": if trimmed.len() > 80 {
+                        format!("{}...", &trimmed[..77])
+                    } else {
+                        trimmed.to_string()
+                    },
+                }));
+            }
+        }
+    }
+
+    tests
 }
 
 fn handle_streaming_range_read(
