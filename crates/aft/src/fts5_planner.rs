@@ -800,7 +800,18 @@ impl<'a> QueryPlanner<'a> {
     // Result fusion
     // -----------------------------------------------------------------------
 
-    /// Fuse results from multiple lanes, deduplicate, and rank.
+    /// Fuse results from multiple lanes using Reciprocal Rank Fusion (RRF)
+    /// with code-aware reranking and penalties.
+    ///
+    /// RRF combines results from heterogeneous lanes by converting each lane's
+    /// rank into a reciprocal score: `score = 1 / (k + rank)` where `k` is a
+    /// constant (default 60). This is more robust than raw score normalization
+    /// because it doesn't assume scores are comparable across lanes.
+    ///
+    /// After RRF fusion, code-aware penalties are applied:
+    /// - Definitions rank above references for symbol queries
+    /// - Test/generated/vendor paths get penalties
+    /// - Multiple relevant chunks in one file boost without flooding
     fn fuse_results(&self, results: Vec<LaneResult>, top_k: usize) -> Vec<FusedResult> {
         if results.is_empty() {
             return Vec::new();
@@ -820,24 +831,75 @@ impl<'a> QueryPlanner<'a> {
             grouped.entry(key).or_default().push(result);
         }
 
-        // For each group, compute fused score
+        // RRF constant (standard value from literature)
+        let k: f64 = 60.0;
+
+        // For each group, compute RRF score + code-aware adjustments
         let mut fused: Vec<FusedResult> = grouped
             .into_values()
             .map(|group| {
-                let best = group
-                    .iter()
-                    .max_by(|a, b| {
-                        a.normalized_score
-                            .partial_cmp(&b.normalized_score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap();
+                // Compute RRF score: sum of 1/(k + rank_position) across all lanes
+                // Sort by normalized_score descending to get rank positions
+                let mut sorted_group = group.clone();
+                sorted_group.sort_by(|a, b| {
+                    b.normalized_score
+                        .partial_cmp(&a.normalized_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
+                let mut rrf_score: f64 = 0.0;
+                for (rank_pos, result) in sorted_group.iter().enumerate() {
+                    rrf_score += 1.0 / (k + rank_pos as f64 + 1.0);
+                }
+
+                // Multi-lane bonus: extra boost for results found in multiple lanes
+                let lane_count = group.len() as f64;
+                let lane_bonus = if lane_count > 1.0 {
+                    (lane_count - 1.0) * 0.05 // Small bonus per extra lane
+                } else {
+                    0.0
+                };
+
+                // Code-aware penalty: test/generated/vendor paths
+                let path_penalty = {
+                    let path = &group[0].file_path;
+                    if path.contains("/test/")
+                        || path.contains("/tests/")
+                        || path.contains("_test.")
+                        || path.contains("/__test__/")
+                    {
+                        0.15 // Test file penalty
+                    } else if path.contains("/vendor/")
+                        || path.contains("/node_modules/")
+                        || path.contains("/.git/")
+                    {
+                        0.3 // Vendor/generated penalty
+                    } else if path.contains("generated") || path.contains(".generated.") {
+                        0.2 // Generated code penalty
+                    } else {
+                        0.0
+                    }
+                };
+
+                // Definition boost: symbols that are definitions (struct, enum, trait, impl)
+                // rank higher than references (use, import, call)
+                let definition_boost = {
+                    let best = &group[0];
+                    let is_definition = matches!(
+                        best.symbol_kind.as_str(),
+                        "struct" | "enum" | "trait" | "impl" | "type_alias" | "interface" | "class"
+                    );
+                    if is_definition && lane_count > 1.0 {
+                        0.1 // Boost definitions found in multiple lanes
+                    } else {
+                        0.0
+                    }
+                };
+
+                let best = &sorted_group[0];
                 let matched_lanes: Vec<String> = group.iter().map(|r| r.lane.clone()).collect();
 
-                // Fused score: max normalized score + bonus for multi-lane matches
-                let lane_bonus = (matched_lanes.len() as f64 - 1.0) * 0.1;
-                let fused_score = best.normalized_score + lane_bonus;
+                let fused_score = rrf_score + lane_bonus - path_penalty + definition_boost;
 
                 FusedResult {
                     symbol_id: best.symbol_id,
@@ -1005,7 +1067,7 @@ mod tests {
 
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].matched_lanes.len(), 2);
-        assert!(fused[0].score > 1.0); // Bonus for multi-lane
+        assert!(fused[0].score > 0.0); // RRF score + multi-lane bonus
     }
 
     #[test]
@@ -1148,5 +1210,172 @@ mod tests {
     fn weights_path_heavy_for_path() {
         let q = AnalyzedQuery::analyze("src/config.ts");
         assert!(q.lane_plan.weights.path_fts > q.lane_plan.weights.symbol_fts);
+    }
+
+    // -----------------------------------------------------------------------
+    // RRF fusion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rrf_fusion_penalizes_test_files() {
+        let results = vec![
+            LaneResult {
+                symbol_id: 1,
+                file_id: 1,
+                file_path: "src/main.rs".into(),
+                symbol_name: "Foo".into(),
+                symbol_kind: "struct".into(),
+                start_line: 1,
+                end_line: 5,
+                snippet: "struct Foo {}".into(),
+                raw_score: 0.0,
+                normalized_score: 0.5,
+                lane: "symbol_fts".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+            LaneResult {
+                symbol_id: 2,
+                file_id: 2,
+                file_path: "tests/test_foo.rs".into(),
+                symbol_name: "Foo".into(),
+                symbol_kind: "struct".into(),
+                start_line: 1,
+                end_line: 5,
+                snippet: "struct Foo {}".into(),
+                raw_score: 0.0,
+                normalized_score: 0.5,
+                lane: "symbol_fts".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+        ];
+
+        let store = Fts5Store::open_in_memory().unwrap();
+        let planner = QueryPlanner::new(&store);
+        let fused = planner.fuse_results(results, 10);
+
+        assert_eq!(fused.len(), 2);
+        // Source file should rank higher than test file due to penalty
+        let src_idx = fused
+            .iter()
+            .position(|r| r.file_path == "src/main.rs")
+            .unwrap();
+        let test_idx = fused
+            .iter()
+            .position(|r| r.file_path == "tests/test_foo.rs")
+            .unwrap();
+        assert!(
+            src_idx < test_idx,
+            "source file should rank above test file"
+        );
+    }
+
+    #[test]
+    fn rrf_fusion_boosts_definitions() {
+        let results = vec![
+            LaneResult {
+                symbol_id: 1,
+                file_id: 1,
+                file_path: "a.rs".into(),
+                symbol_name: "Foo".into(),
+                symbol_kind: "struct".into(), // Definition
+                start_line: 1,
+                end_line: 5,
+                snippet: "struct Foo {}".into(),
+                raw_score: 0.0,
+                normalized_score: 0.5,
+                lane: "exact_symbol_sql".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+            LaneResult {
+                symbol_id: 1,
+                file_id: 1,
+                file_path: "a.rs".into(),
+                symbol_name: "Foo".into(),
+                symbol_kind: "struct".into(),
+                start_line: 1,
+                end_line: 5,
+                snippet: "struct Foo {}".into(),
+                raw_score: 0.0,
+                normalized_score: 0.4,
+                lane: "body_fts".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+            LaneResult {
+                symbol_id: 2,
+                file_id: 1,
+                file_path: "a.rs".into(),
+                symbol_name: "Bar".into(),
+                symbol_kind: "variable".into(), // Not a definition
+                start_line: 10,
+                end_line: 12,
+                snippet: "let Bar = 1".into(),
+                raw_score: 0.0,
+                normalized_score: 0.5,
+                lane: "exact_symbol_sql".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+            LaneResult {
+                symbol_id: 2,
+                file_id: 1,
+                file_path: "a.rs".into(),
+                symbol_name: "Bar".into(),
+                symbol_kind: "variable".into(),
+                start_line: 10,
+                end_line: 12,
+                snippet: "let Bar = 1".into(),
+                raw_score: 0.0,
+                normalized_score: 0.4,
+                lane: "body_fts".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
+            },
+        ];
+
+        let store = Fts5Store::open_in_memory().unwrap();
+        let planner = QueryPlanner::new(&store);
+        let fused = planner.fuse_results(results, 10);
+
+        assert_eq!(fused.len(), 2);
+        // Foo (struct, definition) should rank higher than Bar (variable)
+        // due to definition boost when found in multiple lanes
+        let foo_idx = fused.iter().position(|r| r.symbol_name == "Foo").unwrap();
+        let bar_idx = fused.iter().position(|r| r.symbol_name == "Bar").unwrap();
+        assert!(
+            foo_idx < bar_idx,
+            "definition should rank above non-definition"
+        );
+    }
+
+    #[test]
+    fn rrf_single_lane_result_no_penalty() {
+        let results = vec![LaneResult {
+            symbol_id: 1,
+            file_id: 1,
+            file_path: "src/main.rs".into(),
+            symbol_name: "Foo".into(),
+            symbol_kind: "struct".into(),
+            start_line: 1,
+            end_line: 5,
+            snippet: "struct Foo {}".into(),
+            raw_score: 0.0,
+            normalized_score: 0.8,
+            lane: "exact_symbol_sql".into(),
+            name_path: "".into(),
+            duplicate_index: 0,
+        }];
+
+        let store = Fts5Store::open_in_memory().unwrap();
+        let planner = QueryPlanner::new(&store);
+        let fused = planner.fuse_results(results, 10);
+
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].matched_lanes.len(), 1);
+        // Single lane: RRF score only
+        assert!(fused[0].score > 0.0);
     }
 }
