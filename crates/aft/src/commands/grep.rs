@@ -96,23 +96,32 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let result = grep_executor::execute(ctx, &compiled, &scope, &params);
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
-    let text = format_grep_text(&result, &project_root);
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": text,
-            "complete": true,
-            "no_files_matched_scope": !scope_has_files,
-            "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
-            "total_matches": result.total_matches,
-            "files_searched": result.files_searched,
-            "files_with_matches": result.files_with_matches,
-            "index_status": result.index_status.as_str(),
-            "truncated": result.truncated,
-            "search_ms": (search_ms * 1000.0).round() / 1000.0,
-        }),
-    )
+    // Generate profile if requested
+    let profile = req.params.get("profile").and_then(|v| v.as_str());
+    let profile_guidance = profile.map(|p| generate_grep_profile(p, pattern, &result));
+
+    // Build response with optional profile
+    let mut response = serde_json::json!({
+        "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
+        "total_matches": result.total_matches,
+        "files_searched": result.files_searched,
+        "files_with_matches": result.files_with_matches,
+        "truncated": result.truncated,
+        "index_status": result.index_status.as_str(),
+        "search_ms": (search_ms * 1000.0).round() / 1000.0,
+        "complete": true,
+        "no_files_matched_scope": !scope_has_files,
+    });
+
+    if let Some(guidance) = profile_guidance {
+        response["profile"] = guidance;
+    }
+
+    let text = format_grep_text(&result, &project_root);
+    response["text"] = serde_json::json!(text);
+
+    Response::success(&req.id, response)
 }
 
 pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> String {
@@ -246,6 +255,170 @@ fn string_array_param(params: &serde_json::Value, key: &str) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+/// Generate intent-oriented profile guidance based on query pattern and matches.
+///
+/// Profiles:
+/// - "symbol": Identifies likely definition/usages, suggests zoom for details
+/// - "concept": Provides orientation for conceptual queries, suggests related files
+/// - "debug": Helps trace error patterns, suggests related code paths
+/// - "edit-target": Prepares for editing, shows file structure and context
+fn generate_grep_profile(
+    profile_type: &str,
+    pattern: &str,
+    result: &GrepResult,
+) -> serde_json::Value {
+    match profile_type {
+        "symbol" => {
+            // Symbol profile: identify definitions vs usages
+            let mut definitions = Vec::new();
+            let mut usages = Vec::new();
+
+            for m in &result.matches {
+                let text = m.line_text.trim();
+                let is_definition = text.contains("fn ")
+                    || text.contains("struct ")
+                    || text.contains("enum ")
+                    || text.contains("trait ")
+                    || text.contains("type ")
+                    || text.contains("const ")
+                    || text.contains("class ")
+                    || text.contains("interface ")
+                    || text.contains("function ");
+
+                if is_definition {
+                    definitions.push(serde_json::json!({
+                        "file": m.file.display().to_string(),
+                        "line": m.line,
+                        "text": truncate_line_text(&m.line_text),
+                    }));
+                } else {
+                    usages.push(serde_json::json!({
+                        "file": m.file.display().to_string(),
+                        "line": m.line,
+                        "text": truncate_line_text(&m.line_text),
+                    }));
+                }
+            }
+
+            let mut guidance = serde_json::json!({
+                "intent": "symbol",
+                "pattern": pattern,
+                "definitions": definitions,
+                "usages": usages,
+                "total_definitions": definitions.len(),
+                "total_usages": usages.len(),
+            });
+
+            if !definitions.is_empty() {
+                guidance["suggestion"] = serde_json::json!(
+                    "Use zoom on definition line for full context and call graph"
+                );
+            } else if !usages.is_empty() {
+                guidance["suggestion"] = serde_json::json!(
+                    "No definitions found; check if symbol is imported from another module"
+                );
+            } else {
+                guidance["suggestion"] =
+                    serde_json::json!("No symbol matches found; try a broader pattern");
+            }
+
+            guidance
+        }
+
+        "concept" => {
+            // Concept profile: orientation for conceptual queries
+            let files: Vec<String> = result
+                .matches
+                .iter()
+                .map(|m| m.file.display().to_string())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let file_types: std::collections::HashMap<String, usize> = files
+                .iter()
+                .filter_map(|f| {
+                    std::path::Path::new(f)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_string())
+                })
+                .fold(std::collections::HashMap::new(), |mut acc, ext| {
+                    *acc.entry(ext).or_insert(0) += 1;
+                    acc
+                });
+
+            serde_json::json!({
+                "intent": "concept",
+                "pattern": pattern,
+                "files_found": files.len(),
+                "file_types": file_types,
+                "suggestion": "Review matches to understand implementation; use read for detailed context",
+            })
+        }
+
+        "debug" => {
+            // Debug profile: trace error patterns
+            let error_lines: Vec<serde_json::Value> = result
+                .matches
+                .iter()
+                .filter(|m| {
+                    let text = m.line_text.to_lowercase();
+                    text.contains("error")
+                        || text.contains("panic")
+                        || text.contains("unwrap")
+                        || text.contains("expect")
+                        || text.contains("catch")
+                        || text.contains("throw")
+                        || text.contains("err")
+                })
+                .map(|m| {
+                    serde_json::json!({
+                        "file": m.file.display().to_string(),
+                        "line": m.line,
+                        "text": truncate_line_text(&m.line_text),
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "intent": "debug",
+                "pattern": pattern,
+                "error_patterns": error_lines,
+                "total_error_lines": error_lines.len(),
+                "suggestion": "Focus on error handling paths; check stack traces for root cause",
+            })
+        }
+
+        "edit-target" => {
+            // Edit-target profile: prepare for editing
+            let files: Vec<String> = result
+                .matches
+                .iter()
+                .map(|m| m.file.display().to_string())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            serde_json::json!({
+                "intent": "edit-target",
+                "pattern": pattern,
+                "files_to_edit": files,
+                "total_files": files.len(),
+                "suggestion": "Use read with sidecar='outline' to understand file structure before editing",
+            })
+        }
+
+        _ => {
+            serde_json::json!({
+                "intent": "unknown",
+                "pattern": pattern,
+                "suggestion": format!("Unknown profile type: {}", profile_type),
+            })
+        }
+    }
 }
 
 /// Split a comma-separated glob string into multiple globs while preserving
