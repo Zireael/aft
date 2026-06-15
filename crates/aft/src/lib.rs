@@ -74,6 +74,7 @@ pub mod harness;
 pub mod imports;
 pub mod indent;
 pub mod inspect;
+pub mod intelligence_config;
 pub mod language;
 pub mod local_embed;
 pub mod log_ctx;
