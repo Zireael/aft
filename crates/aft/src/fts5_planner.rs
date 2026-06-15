@@ -28,13 +28,109 @@ const MIN_FTS_TOKEN_LEN: usize = 3;
 // Query analysis
 // ---------------------------------------------------------------------------
 
-/// Analyzed query with extracted components.
+/// Query intent — the classified purpose of a user query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Exact symbol name (e.g., "MyStruct", "main").
+    ExactSymbol,
+    /// Symbol prefix (e.g., "get" matches "get_user", "get_config").
+    SymbolPrefix,
+    /// File path (e.g., "src/main.rs", "./config.yaml").
+    FilePath,
+    /// Natural language or multi-word query (e.g., "error handling", "database connection").
+    NaturalLanguage,
+    /// Error/debug string (e.g., "E0433", "panic", "unwrap failed").
+    ErrorString,
+    /// Short token (< 3 chars) that needs special handling.
+    ShortToken,
+    /// Regex pattern (contains regex metacharacters).
+    Regex,
+    /// Exact literal (contains quotes or special FTS operators).
+    ExactLiteral,
+}
+
+/// Lane contract — which lanes an intent should use and their weights.
+#[derive(Debug, Clone)]
+pub struct LanePlan {
+    pub intent: Intent,
+    pub exact_symbol_sql: bool,
+    pub prefix_symbol_sql: bool,
+    pub symbol_fts: bool,
+    pub path_fts: bool,
+    pub body_fts: bool,
+    pub short_token_fallback: bool,
+    /// Score multipliers per lane (0.0 = disabled, >1.0 = boosted).
+    pub weights: LaneWeights,
+}
+
+/// Score weights for each lane.
+#[derive(Debug, Clone)]
+pub struct LaneWeights {
+    pub exact_symbol_sql: f64,
+    pub prefix_symbol_sql: f64,
+    pub symbol_fts: f64,
+    pub path_fts: f64,
+    pub body_fts: f64,
+    pub short_token_fallback: f64,
+}
+
+impl LaneWeights {
+    fn symbol_heavy() -> Self {
+        Self {
+            exact_symbol_sql: 1.0,
+            prefix_symbol_sql: 0.8,
+            symbol_fts: 0.6,
+            path_fts: 0.1,
+            body_fts: 0.3,
+            short_token_fallback: 0.2,
+        }
+    }
+
+    fn path_heavy() -> Self {
+        Self {
+            exact_symbol_sql: 0.0,
+            prefix_symbol_sql: 0.0,
+            symbol_fts: 0.1,
+            path_fts: 1.0,
+            body_fts: 0.1,
+            short_token_fallback: 0.1,
+        }
+    }
+
+    fn lexical_heavy() -> Self {
+        Self {
+            exact_symbol_sql: 0.5,
+            prefix_symbol_sql: 0.5,
+            symbol_fts: 0.8,
+            path_fts: 0.3,
+            body_fts: 0.8,
+            short_token_fallback: 0.5,
+        }
+    }
+
+    fn hybrid() -> Self {
+        Self {
+            exact_symbol_sql: 0.7,
+            prefix_symbol_sql: 0.6,
+            symbol_fts: 0.6,
+            path_fts: 0.4,
+            body_fts: 0.5,
+            short_token_fallback: 0.3,
+        }
+    }
+}
+
+/// Analyzed query with extracted components and intent classification.
 #[derive(Debug, Clone)]
 pub struct AnalyzedQuery {
     /// Original query string.
     pub raw: String,
     /// Tokenized query tokens.
     pub tokens: Vec<String>,
+    /// Classified intent.
+    pub intent: Intent,
+    /// Lane plan for this intent.
+    pub lane_plan: LanePlan,
     /// Whether the query looks like an exact symbol (single identifier).
     pub is_exact_symbol: bool,
     /// Whether the query looks like a file path.
@@ -46,7 +142,7 @@ pub struct AnalyzedQuery {
 }
 
 impl AnalyzedQuery {
-    /// Analyze a user query.
+    /// Analyze a user query and classify its intent.
     pub fn analyze(query: &str) -> Self {
         let tokens = tokenize_code_symbol(query);
         let min_token_len = tokens.iter().map(|t| t.len()).min().unwrap_or(0);
@@ -65,9 +161,76 @@ impl AnalyzedQuery {
             .chars()
             .any(|c| matches!(c, '"' | '*' | '(' | ')' | ':' | '^' | '{' | '}'));
 
+        // Check for regex metacharacters
+        let has_regex = query.chars().any(|c| {
+            matches!(
+                c,
+                '^' | '$' | '+' | '?' | '{' | '}' | '[' | ']' | '(' | ')' | '|'
+            )
+        });
+
+        // Check for exact literal (quoted strings)
+        let has_quotes = query.contains('"') || query.contains('\'');
+
+        // Check for error/debug patterns
+        let is_error = query.starts_with('E')
+            && query.len() >= 4
+            && query[1..].chars().all(|c| c.is_ascii_digit())
+            || query.contains("error")
+            || query.contains("panic")
+            || query.contains("unwrap")
+            || query.contains("fail");
+
+        // Classify intent
+        let (intent, weights) = if has_quotes {
+            (Intent::ExactLiteral, LaneWeights::lexical_heavy())
+        } else if is_path {
+            (Intent::FilePath, LaneWeights::path_heavy())
+        } else if is_exact_symbol && !has_fts_special_chars {
+            (Intent::ExactSymbol, LaneWeights::symbol_heavy())
+        } else if min_token_len < MIN_FTS_TOKEN_LEN && tokens.len() <= 2 {
+            (Intent::ShortToken, LaneWeights::symbol_heavy())
+        } else if is_error {
+            (Intent::ErrorString, LaneWeights::lexical_heavy())
+        } else if has_regex {
+            (Intent::Regex, LaneWeights::lexical_heavy())
+        } else if tokens.len() == 1 && !has_fts_special_chars {
+            // Single token that's not exact symbol (e.g., multi-word camelCase split)
+            (Intent::SymbolPrefix, LaneWeights::symbol_heavy())
+        } else if tokens.len() >= 2 {
+            (Intent::NaturalLanguage, LaneWeights::hybrid())
+        } else {
+            (Intent::SymbolPrefix, LaneWeights::symbol_heavy())
+        };
+
+        let lane_plan = LanePlan {
+            intent,
+            exact_symbol_sql: matches!(
+                intent,
+                Intent::ExactSymbol | Intent::SymbolPrefix | Intent::ErrorString
+            ),
+            prefix_symbol_sql: matches!(
+                intent,
+                Intent::ExactSymbol
+                    | Intent::SymbolPrefix
+                    | Intent::NaturalLanguage
+                    | Intent::ErrorString
+            ),
+            symbol_fts: !matches!(intent, Intent::FilePath),
+            path_fts: matches!(
+                intent,
+                Intent::FilePath | Intent::NaturalLanguage | Intent::ExactLiteral
+            ),
+            body_fts: !matches!(intent, Intent::FilePath | Intent::ExactSymbol),
+            short_token_fallback: matches!(intent, Intent::ShortToken),
+            weights,
+        };
+
         Self {
             raw: query.to_string(),
             tokens,
+            intent,
+            lane_plan,
             is_exact_symbol,
             is_path,
             has_fts_special_chars,
@@ -93,22 +256,18 @@ pub struct LaneSelection {
 
 impl LaneSelection {
     /// Determine which lanes to execute for the analyzed query.
+    ///
+    /// Uses the intent-based `LanePlan` from `AnalyzedQuery` for deterministic
+    /// routing instead of ad-hoc heuristics.
     pub fn for_query(query: &AnalyzedQuery) -> Self {
-        let has_short_tokens = query.min_token_len < MIN_FTS_TOKEN_LEN && !query.tokens.is_empty();
-
+        let plan = &query.lane_plan;
         Self {
-            // Exact symbol SQL: always try if query looks like a single identifier
-            exact_symbol_sql: query.is_exact_symbol,
-            // Prefix symbol SQL: try if query is a single token (prefix match)
-            prefix_symbol_sql: query.is_exact_symbol || query.tokens.len() == 1,
-            // Symbol FTS: try if we have enough tokens
-            symbol_fts: !query.tokens.is_empty(),
-            // Path FTS: try if query looks like a path
-            path_fts: query.is_path,
-            // Body FTS: always try if we have tokens
-            body_fts: !query.tokens.is_empty(),
-            // Short token fallback: use when tokens are too short for FTS
-            short_token_fallback: has_short_tokens,
+            exact_symbol_sql: plan.exact_symbol_sql,
+            prefix_symbol_sql: plan.prefix_symbol_sql,
+            symbol_fts: plan.symbol_fts,
+            path_fts: plan.path_fts,
+            body_fts: plan.body_fts,
+            short_token_fallback: plan.short_token_fallback,
         }
     }
 
@@ -919,5 +1078,75 @@ mod tests {
         let sym2 = store.get_symbol(id2).unwrap().unwrap();
 
         assert_ne!(sym1.duplicate_index, sym2.duplicate_index);
+    }
+
+    // -----------------------------------------------------------------------
+    // Intent classification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn intent_exact_symbol() {
+        let q = AnalyzedQuery::analyze("MyStruct");
+        assert_eq!(q.intent, Intent::ExactSymbol);
+        assert!(q.lane_plan.exact_symbol_sql);
+        assert!(q.lane_plan.prefix_symbol_sql);
+    }
+
+    #[test]
+    fn intent_file_path() {
+        let q = AnalyzedQuery::analyze("src/main.rs");
+        assert_eq!(q.intent, Intent::FilePath);
+        assert!(!q.lane_plan.exact_symbol_sql);
+        assert!(q.lane_plan.path_fts);
+    }
+
+    #[test]
+    fn intent_natural_language() {
+        let q = AnalyzedQuery::analyze("error handling in database");
+        assert_eq!(q.intent, Intent::NaturalLanguage);
+        assert!(q.lane_plan.symbol_fts);
+        assert!(q.lane_plan.body_fts);
+    }
+
+    #[test]
+    fn intent_error_string() {
+        let q = AnalyzedQuery::analyze("E0433");
+        assert_eq!(q.intent, Intent::ErrorString);
+        assert!(q.lane_plan.exact_symbol_sql);
+        assert!(q.lane_plan.symbol_fts);
+    }
+
+    #[test]
+    fn intent_short_token() {
+        let q = AnalyzedQuery::analyze("id");
+        assert_eq!(q.intent, Intent::ShortToken);
+        assert!(q.lane_plan.short_token_fallback);
+    }
+
+    #[test]
+    fn intent_exact_literal() {
+        let q = AnalyzedQuery::analyze("\"hello world\"");
+        assert_eq!(q.intent, Intent::ExactLiteral);
+        assert!(q.lane_plan.symbol_fts);
+    }
+
+    #[test]
+    fn intent_symbol_prefix() {
+        let q = AnalyzedQuery::analyze("get");
+        assert_eq!(q.intent, Intent::SymbolPrefix);
+        assert!(q.lane_plan.exact_symbol_sql);
+        assert!(q.lane_plan.prefix_symbol_sql);
+    }
+
+    #[test]
+    fn weights_symbol_heavy_for_exact() {
+        let q = AnalyzedQuery::analyze("MyFunc");
+        assert!(q.lane_plan.weights.exact_symbol_sql > q.lane_plan.weights.body_fts);
+    }
+
+    #[test]
+    fn weights_path_heavy_for_path() {
+        let q = AnalyzedQuery::analyze("src/config.ts");
+        assert!(q.lane_plan.weights.path_fts > q.lane_plan.weights.symbol_fts);
     }
 }
