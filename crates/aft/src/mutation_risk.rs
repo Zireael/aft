@@ -352,6 +352,75 @@ pub fn classify_mutation_risk(
     }
 }
 
+/// Create a compact risk sidecar for inclusion in mutation tool responses.
+///
+/// Returns a JSON object with:
+/// - `level`: "low" | "medium" | "high" | "critical"
+/// - `score`: 0.0–1.0
+/// - `reasons`: array of {code, message}
+/// - `file_kind`: "source" | "test" | "config" | ...
+/// - `requires_confirmation`: bool
+pub fn risk_sidecar(risk: &MutationRisk) -> serde_json::Value {
+    let reasons: Vec<serde_json::Value> = risk
+        .reasons
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "code": r.code,
+                "message": r.message,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "level": risk.level.label(),
+        "score": risk.score,
+        "reasons": reasons,
+        "file_kind": format!("{:?}", risk.file_kind).to_lowercase(),
+        "requires_confirmation": risk.level.requires_confirmation(),
+        "graph_available": risk.graph_available,
+    })
+}
+
+/// Compute mutation risk and return it as a sidecar value.
+///
+/// Convenience wrapper for command handlers that don't need the full MutationRisk.
+pub fn compute_risk_sidecar(path: &str, graph_enabled: bool) -> serde_json::Value {
+    let risk = classify_mutation_risk(path, None, graph_enabled);
+    risk_sidecar(&risk)
+}
+
+/// Enrich a response JSON value with mutation risk data.
+///
+/// Adds a "risk" field to the response if `mutation_risk` param is true (default: true).
+/// Graph state is determined from `graph_enabled` (default: false).
+/// The mutation always proceeds (fail-open); risk is informational.
+pub fn enrich_response_with_risk(
+    response_data: serde_json::Value,
+    file_path: &str,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let show_risk = params
+        .get("mutation_risk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    if !show_risk {
+        return response_data;
+    }
+
+    let graph_enabled = params
+        .get("graph_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let risk = compute_risk_sidecar(file_path, graph_enabled);
+
+    let mut enriched = response_data;
+    enriched["risk"] = risk;
+    enriched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

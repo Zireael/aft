@@ -348,6 +348,11 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    // Capture first file path for risk sidecar before the loop consumes changes_to_apply
+    let first_file_for_risk = changes_to_apply
+        .first()
+        .map(|(c, _, _)| c.file_path.display().to_string());
+
     if !dry_run {
         for (change, validated_path, _) in &changes_to_apply {
             if let Err(e) = std::fs::OpenOptions::new()
@@ -440,6 +445,12 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
             payload["hint"] = serde_json::Value::String(hint);
         }
+    }
+
+    // Enrich with mutation risk sidecar for the first file (if any)
+    if let Some(first_path) = &first_file_for_risk {
+        let risk = crate::mutation_risk::compute_risk_sidecar(first_path, false);
+        payload["risk"] = risk;
     }
 
     Response::success(&req.id, payload)

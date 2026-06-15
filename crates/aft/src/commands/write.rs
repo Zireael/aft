@@ -193,5 +193,8 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         result["diff"] = edit::compute_diff_for_response(&req.params, &original, &final_content);
     }
 
+    // Enrich with mutation risk sidecar
+    let result = crate::mutation_risk::enrich_response_with_risk(result, file, &req.params);
+
     Response::success(&req.id, result)
 }

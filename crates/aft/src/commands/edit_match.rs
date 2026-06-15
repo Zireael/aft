@@ -355,6 +355,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         write_result.append_lsp_diagnostics_to(&mut result);
     }
 
+    // Enrich with mutation risk sidecar
+    let result = crate::mutation_risk::enrich_response_with_risk(result, file, &req.params);
+
     Response::success(&req.id, result)
 }
 
@@ -1220,6 +1223,9 @@ fn handle_single_file_edit_match(
     if edit::wants_diff(&req.params) {
         result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
+
+    // Enrich with mutation risk sidecar
+    let result = crate::mutation_risk::enrich_response_with_risk(result, file, &req.params);
 
     Response::success(&req.id, result)
 }
