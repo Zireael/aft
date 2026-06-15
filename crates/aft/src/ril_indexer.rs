@@ -1,20 +1,218 @@
 //! Repository Intelligence Layer (RIL) graph indexer.
 //!
 //! Indexes files, symbols, imports, and reverse importers into the RIL database.
-//! Supports incremental updates for changed files.
+//! Supports incremental updates for changed files and health state tracking.
 
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Graph health states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GraphHealth {
+    /// Graph feature is disabled in config.
+    Disabled,
+    /// Graph exists but has never been indexed.
+    Cold,
+    /// Initial or incremental indexing is in progress.
+    Indexing,
+    /// Graph is up to date and healthy.
+    Healthy,
+    /// Graph data exists but is older than the staleness threshold.
+    Stale,
+    /// Graph is being rebuilt from scratch.
+    Rebuilding,
+    /// Graph has partial data due to errors during indexing.
+    Degraded,
+    /// Graph database is corrupt or unreadable.
+    Corrupt,
+}
+
+impl GraphHealth {
+    /// Whether exact tools can safely use graph facts.
+    pub fn usable(&self) -> bool {
+        matches!(
+            self,
+            GraphHealth::Healthy | GraphHealth::Stale | GraphHealth::Degraded
+        )
+    }
+
+    /// Human-readable label for diagnostics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            GraphHealth::Disabled => "disabled",
+            GraphHealth::Cold => "cold",
+            GraphHealth::Indexing => "indexing",
+            GraphHealth::Healthy => "healthy",
+            GraphHealth::Stale => "stale",
+            GraphHealth::Rebuilding => "rebuilding",
+            GraphHealth::Degraded => "degraded",
+            GraphHealth::Corrupt => "corrupt",
+        }
+    }
+}
+
+/// Circuit breaker for repeated graph failures.
+#[derive(Debug, Clone)]
+pub struct GraphCircuitBreaker {
+    /// Number of consecutive failures.
+    failure_count: u32,
+    /// Threshold to trip the breaker.
+    failure_threshold: u32,
+    /// Whether the breaker is currently tripped.
+    tripped: bool,
+    /// Timestamp when the breaker tripped (epoch seconds).
+    tripped_at: Option<i64>,
+    /// Cooldown period in seconds before retry.
+    cooldown_secs: i64,
+}
+
+impl GraphCircuitBreaker {
+    /// Create a new circuit breaker with default thresholds.
+    pub fn new() -> Self {
+        Self {
+            failure_count: 0,
+            failure_threshold: 3,
+            tripped: false,
+            tripped_at: None,
+            cooldown_secs: 300, // 5 minutes
+        }
+    }
+
+    /// Record a successful operation — resets the failure count.
+    pub fn record_success(&mut self) {
+        self.failure_count = 0;
+        self.tripped = false;
+        self.tripped_at = None;
+    }
+
+    /// Record a failure — may trip the breaker.
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        if self.failure_count >= self.failure_threshold {
+            self.tripped = true;
+            self.tripped_at = Some(now_secs());
+        }
+    }
+
+    /// Check if the breaker is currently tripped.
+    pub fn is_tripped(&self) -> bool {
+        if !self.tripped {
+            return false;
+        }
+        // Check if cooldown has elapsed
+        if let Some(tripped_at) = self.tripped_at {
+            now_secs() - tripped_at >= self.cooldown_secs
+        } else {
+            true
+        }
+    }
+
+    /// Get the current state for diagnostics.
+    pub fn state(&self) -> CircuitBreakerState {
+        CircuitBreakerState {
+            failure_count: self.failure_count,
+            tripped: self.tripped,
+            tripped_at: self.tripped_at,
+        }
+    }
+}
+
+impl Default for GraphCircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Circuit breaker state for diagnostics output.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CircuitBreakerState {
+    pub failure_count: u32,
+    pub tripped: bool,
+    pub tripped_at: Option<i64>,
+}
+
+/// Graph health report for diagnostics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphHealthReport {
+    pub health: GraphHealth,
+    pub file_count: i64,
+    pub symbol_count: i64,
+    pub edge_count: i64,
+    pub unresolved_count: i64,
+    pub reference_count: i64,
+    pub circuit_breaker: CircuitBreakerState,
+    /// Freshness in seconds since last index operation.
+    pub freshness_secs: Option<i64>,
+}
+
 /// Graph indexer for the Repository Intelligence Layer.
 pub struct RilIndexer {
     conn: Connection,
+    circuit_breaker: GraphCircuitBreaker,
 }
 
 impl RilIndexer {
     /// Create a new indexer with the given database connection.
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            circuit_breaker: GraphCircuitBreaker::new(),
+        }
+    }
+
+    /// Get the circuit breaker reference.
+    pub fn circuit_breaker(&self) -> &GraphCircuitBreaker {
+        &self.circuit_breaker
+    }
+
+    /// Get a mutable circuit breaker reference.
+    pub fn circuit_breaker_mut(&mut self) -> &mut GraphCircuitBreaker {
+        &mut self.circuit_breaker
+    }
+
+    /// Compute current graph health state.
+    pub fn health(&self, enabled: bool) -> GraphHealth {
+        if !enabled {
+            return GraphHealth::Disabled;
+        }
+        if self.circuit_breaker.is_tripped() {
+            return GraphHealth::Degraded;
+        }
+        match self.stats() {
+            Ok(stats) => {
+                if stats.file_count == 0 {
+                    GraphHealth::Cold
+                } else if stats.unresolved_count as f64 / (stats.edge_count as f64 + 1.0) > 0.5 {
+                    GraphHealth::Degraded
+                } else {
+                    GraphHealth::Healthy
+                }
+            }
+            Err(_) => GraphHealth::Corrupt,
+        }
+    }
+
+    /// Generate a full health report.
+    pub fn health_report(&self, enabled: bool) -> GraphHealthReport {
+        let health = self.health(enabled);
+        let stats = self.stats().unwrap_or(IndexStats {
+            file_count: 0,
+            symbol_count: 0,
+            edge_count: 0,
+            unresolved_count: 0,
+            reference_count: 0,
+        });
+
+        GraphHealthReport {
+            health,
+            file_count: stats.file_count,
+            symbol_count: stats.symbol_count,
+            edge_count: stats.edge_count,
+            unresolved_count: stats.unresolved_count,
+            reference_count: stats.reference_count,
+            circuit_breaker: self.circuit_breaker.state(),
+            freshness_secs: None,
+        }
     }
 
     /// Index a file into the RIL database.
