@@ -742,7 +742,9 @@ mod tests {
         let store = Fts5Store::open_in_memory().unwrap();
 
         // Insert a file with a known path
-        let file_id = store.upsert_file("src/lib.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
 
         // Insert a symbol referencing that file
         store

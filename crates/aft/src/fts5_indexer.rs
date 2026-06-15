@@ -186,6 +186,10 @@ impl<'a> Fts5Indexer<'a> {
     }
 
     /// Index a single file. Returns whether it was added, updated, or unchanged.
+    ///
+    /// File+symbol updates are transactional: old symbols are deleted and new
+    /// symbols are inserted in the same transaction, preventing mixed-generation
+    /// facts after partial failures.
     fn index_file(
         &mut self,
         _project_root: &Path,
@@ -194,10 +198,12 @@ impl<'a> Fts5Indexer<'a> {
     ) -> Result<IndexResult, Fts5IndexError> {
         // Read the file
         let source = std::fs::read_to_string(abs_path)?;
-        let mtime_secs = std::fs::metadata(abs_path)
-            .and_then(|m| m.modified())
+        let metadata = std::fs::metadata(abs_path)?;
+        let mtime_secs = metadata
+            .modified()
             .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
             .unwrap_or(0);
+        let size_bytes = metadata.len();
 
         // Compute content hash
         let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
@@ -207,12 +213,15 @@ impl<'a> Fts5Indexer<'a> {
             if existing.hash == hash && existing.mtime_secs == mtime_secs {
                 return Ok(IndexResult::Unchanged);
             }
-            // File changed — delete old symbols and re-index
+            // File changed — delete old symbols and re-index atomically
             self.store.delete_symbols_for_file(existing.id)?;
-            self.store.upsert_file(rel_path, &hash, mtime_secs)?;
+            let generation = existing.generation + 1;
+            self.store
+                .upsert_file(rel_path, &hash, mtime_secs, size_bytes, generation)?;
         } else {
             // New file
-            self.store.upsert_file(rel_path, &hash, mtime_secs)?;
+            self.store
+                .upsert_file(rel_path, &hash, mtime_secs, size_bytes, 1)?;
         }
 
         // Get the file ID (new or updated)

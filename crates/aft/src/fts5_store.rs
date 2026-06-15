@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump when adding/removing tables or columns.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Maximum characters stored per symbol body in the FTS table.
 /// Bodies exceeding this are truncated; truncation is recorded.
@@ -105,6 +105,10 @@ pub struct FileRecord {
     pub hash: String,
     pub mtime_secs: i64,
     pub indexed_at: i64,
+    /// File size in bytes at indexing time (v2+).
+    pub size_bytes: u64,
+    /// Index generation that produced this record (v2+).
+    pub generation: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +247,10 @@ impl Fts5Store {
     // Schema management
     // -----------------------------------------------------------------------
 
-    /// Create the v1 schema.
+    /// Create the v2 schema.
+    ///
+    /// V2 adds `size_bytes` and `generation` columns to `fts5_files` for
+    /// content-hash-based freshness and generation tracking.
     fn create_schema(&self) -> Result<(), Fts5StoreError> {
         self.conn.execute_batch(
             "
@@ -253,13 +260,15 @@ impl Fts5Store {
                 value TEXT NOT NULL
             );
 
-            -- File tracking table
+            -- File tracking table (v2: adds size_bytes, generation)
             CREATE TABLE IF NOT EXISTS fts5_files (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 path        TEXT NOT NULL UNIQUE,
                 hash        TEXT NOT NULL,
                 mtime_secs  INTEGER NOT NULL,
-                indexed_at  INTEGER NOT NULL
+                indexed_at  INTEGER NOT NULL,
+                size_bytes  INTEGER NOT NULL DEFAULT 0,
+                generation  INTEGER NOT NULL DEFAULT 1
             );
 
             -- Symbol tracking table
@@ -430,17 +439,21 @@ impl Fts5Store {
         path: &str,
         hash: &str,
         mtime_secs: i64,
+        size_bytes: u64,
+        generation: i64,
     ) -> Result<i64, Fts5StoreError> {
         let now = now_secs();
         let file_id: i64 = self.conn.query_row(
-            "INSERT INTO fts5_files (path, hash, mtime_secs, indexed_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO fts5_files (path, hash, mtime_secs, indexed_at, size_bytes, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(path) DO UPDATE SET
                hash = excluded.hash,
                mtime_secs = excluded.mtime_secs,
-               indexed_at = excluded.indexed_at
+               indexed_at = excluded.indexed_at,
+               size_bytes = excluded.size_bytes,
+               generation = excluded.generation
              RETURNING id",
-            params![path, hash, mtime_secs, now],
+            params![path, hash, mtime_secs, now, size_bytes as i64, generation],
             |row| row.get(0),
         )?;
         Ok(file_id)
@@ -465,7 +478,7 @@ impl Fts5Store {
         let result = self
             .conn
             .query_row(
-                "SELECT id, path, hash, mtime_secs, indexed_at FROM fts5_files WHERE path = ?1",
+                "SELECT id, path, hash, mtime_secs, indexed_at, size_bytes, generation FROM fts5_files WHERE path = ?1",
                 params![path],
                 |row| {
                     Ok(FileRecord {
@@ -474,6 +487,8 @@ impl Fts5Store {
                         hash: row.get(2)?,
                         mtime_secs: row.get(3)?,
                         indexed_at: row.get(4)?,
+                        size_bytes: row.get(5)?,
+                        generation: row.get(6)?,
                     })
                 },
             )
@@ -486,7 +501,7 @@ impl Fts5Store {
         let result = self
             .conn
             .query_row(
-                "SELECT id, path, hash, mtime_secs, indexed_at FROM fts5_files WHERE id = ?1",
+                "SELECT id, path, hash, mtime_secs, indexed_at, size_bytes, generation FROM fts5_files WHERE id = ?1",
                 params![file_id],
                 |row| {
                     Ok(FileRecord {
@@ -495,6 +510,8 @@ impl Fts5Store {
                         hash: row.get(2)?,
                         mtime_secs: row.get(3)?,
                         indexed_at: row.get(4)?,
+                        size_bytes: row.get(5)?,
+                        generation: row.get(6)?,
                     })
                 },
             )
@@ -505,7 +522,7 @@ impl Fts5Store {
     /// Get all file records.
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>, Fts5StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, hash, mtime_secs, indexed_at FROM fts5_files ORDER BY path",
+            "SELECT id, path, hash, mtime_secs, indexed_at, size_bytes, generation FROM fts5_files ORDER BY path",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(FileRecord {
@@ -514,6 +531,8 @@ impl Fts5Store {
                 hash: row.get(2)?,
                 mtime_secs: row.get(3)?,
                 indexed_at: row.get(4)?,
+                size_bytes: row.get(5)?,
+                generation: row.get(6)?,
             })
         })?;
         let files = rows.collect::<Result<Vec<_>, _>>()?;
@@ -528,35 +547,56 @@ impl Fts5Store {
         Ok(count as usize)
     }
 
-    /// Get file paths with stale mtime (file on disk is newer than indexed).
-    /// Returns (path, indexed_mtime, current_mtime) for each stale file.
+    /// Get file paths with stale content (file on disk differs from indexed).
+    ///
+    /// Uses content hash and size for freshness detection, not just mtime.
+    /// This catches rapid rewrites with the same mtime (e.g.,在同一秒内的编辑).
+    /// Returns (path, reason) for each stale file.
     pub fn stale_files(&self, project_root: &Path) -> Result<Vec<StaleFileInfo>, Fts5StoreError> {
         let files = self.get_all_files()?;
         let mut stale = Vec::new();
 
         for file in &files {
             let abs_path = project_root.join(&file.path);
-            if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                if let Ok(current_mtime) = metadata.modified() {
-                    let current_secs = current_mtime
+            match std::fs::metadata(&abs_path) {
+                Ok(metadata) => {
+                    let current_size = metadata.len();
+                    let current_mtime = metadata
+                        .modified()
+                        .unwrap_or(UNIX_EPOCH)
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    if current_secs != file.mtime_secs {
+
+                    // Check size first (cheap), then mtime, then content hash
+                    if current_size != file.size_bytes as u64 {
                         stale.push(StaleFileInfo {
                             path: file.path.clone(),
                             indexed_mtime: file.mtime_secs,
-                            current_mtime: current_secs,
+                            current_mtime,
                         });
+                    } else if current_mtime != file.mtime_secs {
+                        // Size matches but mtime differs — verify with content hash
+                        if let Ok(source) = std::fs::read(&abs_path) {
+                            let current_hash = blake3::hash(&source).to_hex().to_string();
+                            if current_hash != file.hash {
+                                stale.push(StaleFileInfo {
+                                    path: file.path.clone(),
+                                    indexed_mtime: file.mtime_secs,
+                                    current_mtime,
+                                });
+                            }
+                        }
                     }
                 }
-            } else {
-                // File no longer exists on disk
-                stale.push(StaleFileInfo {
-                    path: file.path.clone(),
-                    indexed_mtime: file.mtime_secs,
-                    current_mtime: -1, // Sentinel: file deleted
-                });
+                Err(_) => {
+                    // File no longer exists on disk
+                    stale.push(StaleFileInfo {
+                        path: file.path.clone(),
+                        indexed_mtime: file.mtime_secs,
+                        current_mtime: -1, // Sentinel: file deleted
+                    });
+                }
             }
         }
 
@@ -798,7 +838,9 @@ mod tests {
     fn upsert_and_get_file() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc123", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc123", 1000, 512, 1)
+            .unwrap();
         assert!(file_id > 0);
 
         let file = store.get_file_by_path("src/main.rs").unwrap();
@@ -807,26 +849,36 @@ mod tests {
         assert_eq!(file.path, "src/main.rs");
         assert_eq!(file.hash, "abc123");
         assert_eq!(file.mtime_secs, 1000);
+        assert_eq!(file.size_bytes, 512);
+        assert_eq!(file.generation, 1);
     }
 
     #[test]
     fn upsert_file_updates_on_conflict() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let id1 = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
-        let id2 = store.upsert_file("src/main.rs", "def", 2000).unwrap();
+        let id1 = store
+            .upsert_file("src/main.rs", "abc", 1000, 100, 1)
+            .unwrap();
+        let id2 = store
+            .upsert_file("src/main.rs", "def", 2000, 200, 2)
+            .unwrap();
         assert_eq!(id1, id2); // Same rowid on upsert
 
         let file = store.get_file_by_path("src/main.rs").unwrap().unwrap();
         assert_eq!(file.hash, "def");
         assert_eq!(file.mtime_secs, 2000);
+        assert_eq!(file.size_bytes, 200);
+        assert_eq!(file.generation, 2);
     }
 
     #[test]
     fn upsert_and_get_symbol() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc", 1000, 512, 1)
+            .unwrap();
         let sym_id = store
             .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
             .unwrap();
@@ -842,7 +894,9 @@ mod tests {
     fn symbol_name_exact_lookup() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc", 1000, 512, 1)
+            .unwrap();
         store
             .upsert_symbol(file_id, "Foo", "struct", 1, 5, "struct Foo {}")
             .unwrap();
@@ -859,7 +913,9 @@ mod tests {
     fn delete_file_cascades_to_symbols() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc", 1000, 512, 1)
+            .unwrap();
         store
             .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
             .unwrap();
@@ -876,7 +932,9 @@ mod tests {
     fn fts_row_counts_match() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc", 1000, 512, 1)
+            .unwrap();
         store
             .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
             .unwrap();
@@ -906,7 +964,9 @@ mod tests {
     fn rebuild_resets_schema() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/main.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/main.rs", "abc", 1000, 512, 1)
+            .unwrap();
         store
             .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
             .unwrap();
@@ -925,11 +985,15 @@ mod tests {
         let store = Fts5Store::open_in_memory().unwrap();
 
         // Insert a file
-        let id1 = store.upsert_file("src/main.rs", "hash1", 1000).unwrap();
+        let id1 = store
+            .upsert_file("src/main.rs", "hash1", 1000, 100, 1)
+            .unwrap();
         assert!(id1 > 0);
 
         // Upsert with same path but different hash (conflict update)
-        let id2 = store.upsert_file("src/main.rs", "hash2", 2000).unwrap();
+        let id2 = store
+            .upsert_file("src/main.rs", "hash2", 2000, 200, 2)
+            .unwrap();
 
         // The returned ID must match the original row ID
         assert_eq!(
@@ -942,13 +1006,17 @@ mod tests {
         assert_eq!(file.id, id1);
         assert_eq!(file.hash, "hash2");
         assert_eq!(file.mtime_secs, 2000);
+        assert_eq!(file.size_bytes, 200);
+        assert_eq!(file.generation, 2);
     }
 
     #[test]
     fn exact_symbol_lookup_returns_correct_file_path() {
         let store = Fts5Store::open_in_memory().unwrap();
 
-        let file_id = store.upsert_file("src/lib.rs", "abc", 1000).unwrap();
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
         store
             .upsert_symbol(file_id, "MyStruct", "struct", 10, 20, "struct MyStruct {}")
             .unwrap();
@@ -967,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_files_detects_mtime_mismatch() {
+    fn stale_files_detects_content_change() {
         let tmp = std::env::temp_dir().join("fts5_store_stale_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -978,16 +1046,54 @@ mod tests {
         let db_path = tmp.join("test.sqlite");
         let store = Fts5Store::open(&db_path).unwrap();
 
-        // Index with mtime=1000 (stale)
-        store.upsert_file("test.rs", "abc", 1000).unwrap();
+        // Index with a hash that doesn't match the actual file content
+        store
+            .upsert_file("test.rs", "wrong_hash", 1000, 100, 1)
+            .unwrap();
 
-        // Current file has different mtime
+        // stale_files should detect the content mismatch via hash comparison
         let stale = store.stale_files(&tmp).unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].path, "test.rs");
-        assert_eq!(stale[0].indexed_mtime, 1000);
-        assert_ne!(stale[0].current_mtime, 1000);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stale_files_detects_size_change() {
+        let tmp = std::env::temp_dir().join("fts5_store_stale_size_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let file_path = tmp.join("test.rs");
+        std::fs::write(&file_path, "fn test() {}\n").unwrap();
+
+        let db_path = tmp.join("test.sqlite");
+        let store = Fts5Store::open(&db_path).unwrap();
+
+        // Index with wrong size — stale_files should detect via size mismatch
+        store.upsert_file("test.rs", "abc", 1000, 999, 1).unwrap();
+
+        let stale = store.stale_files(&tmp).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].path, "test.rs");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generation_increments_on_update() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let id1 = store
+            .upsert_file("src/main.rs", "hash1", 1000, 100, 1)
+            .unwrap();
+        let id2 = store
+            .upsert_file("src/main.rs", "hash2", 2000, 200, 2)
+            .unwrap();
+        assert_eq!(id1, id2);
+
+        let file = store.get_file_by_path("src/main.rs").unwrap().unwrap();
+        assert_eq!(file.generation, 2);
     }
 }
