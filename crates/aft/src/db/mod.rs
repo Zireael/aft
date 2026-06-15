@@ -8,7 +8,7 @@ pub mod bash_tasks;
 pub mod compression_events;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -116,6 +116,88 @@ ON compression_events (
   project_key,
   tool,
   COALESCE(task_id, char(0))
+);
+"#;
+
+/// Repository Intelligence Layer (RIL) schema.
+///
+/// Provides persistent graph storage for:
+/// - Files: path, hash, language, size, modification time
+/// - Symbols: name, kind, file, line range, body hash
+/// - Edges: imports, references, source-test links
+/// - Metadata: generation, freshness, index status
+///
+/// All tables are behind feature/config gate and degrade gracefully.
+const MIGRATION_V3_RIL: &str = r#"
+-- RIL files table: tracks indexed files with freshness metadata
+CREATE TABLE IF NOT EXISTS ril_files (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  path          TEXT NOT NULL UNIQUE,
+  content_hash  TEXT NOT NULL,
+  language      TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  mtime_secs    INTEGER NOT NULL,
+  generation    INTEGER NOT NULL DEFAULT 1,
+  indexed_at    INTEGER NOT NULL,
+  FOREIGN KEY (path) REFERENCES ril_files(path) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ril_files_language ON ril_files(language);
+CREATE INDEX IF NOT EXISTS idx_ril_files_generation ON ril_files(generation);
+
+-- RIL symbols table: tracks symbols within indexed files
+CREATE TABLE IF NOT EXISTS ril_symbols (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id       INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  start_line    INTEGER NOT NULL,
+  end_line      INTEGER NOT NULL,
+  body_hash     TEXT,
+  name_path     TEXT,
+  generation    INTEGER NOT NULL DEFAULT 1,
+  FOREIGN KEY (file_id) REFERENCES ril_files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ril_symbols_file ON ril_symbols(file_id);
+CREATE INDEX IF NOT EXISTS idx_ril_symbols_name ON ril_symbols(name);
+CREATE INDEX IF NOT EXISTS idx_ril_symbols_kind ON ril_symbols(kind);
+
+-- RIL edges table: tracks relationships between symbols/files
+CREATE TABLE IF NOT EXISTS ril_edges (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id     INTEGER NOT NULL,
+  source_type   TEXT NOT NULL,
+  target_id     INTEGER NOT NULL,
+  target_type   TEXT NOT NULL,
+  edge_type     TEXT NOT NULL,
+  metadata      TEXT,
+  created_at    INTEGER NOT NULL,
+  FOREIGN KEY (source_id) REFERENCES ril_files(id) ON DELETE CASCADE,
+  FOREIGN KEY (target_id) REFERENCES ril_files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ril_edges_source ON ril_edges(source_id, source_type);
+CREATE INDEX IF NOT EXISTS idx_ril_edges_target ON ril_edges(target_id, target_type);
+CREATE INDEX IF NOT EXISTS idx_ril_edges_type ON ril_edges(edge_type);
+
+-- RIL source-test links: pairs source files with their test files
+CREATE TABLE IF NOT EXISTS ril_source_test_links (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id     INTEGER NOT NULL,
+  test_id       INTEGER NOT NULL,
+  link_type     TEXT NOT NULL,
+  confidence    REAL NOT NULL DEFAULT 1.0,
+  created_at    INTEGER NOT NULL,
+  FOREIGN KEY (source_id) REFERENCES ril_files(id) ON DELETE CASCADE,
+  FOREIGN KEY (test_id) REFERENCES ril_files(id) ON DELETE CASCADE,
+  UNIQUE(source_id, test_id, link_type)
+);
+CREATE INDEX IF NOT EXISTS idx_ril_source_test_source ON ril_source_test_links(source_id);
+CREATE INDEX IF NOT EXISTS idx_ril_source_test_test ON ril_source_test_links(test_id);
+
+-- RIL metadata table: stores generation and freshness information
+CREATE TABLE IF NOT EXISTS ril_metadata (
+  key           TEXT NOT NULL PRIMARY KEY,
+  value         TEXT NOT NULL,
+  updated_at    INTEGER NOT NULL
 );
 "#;
 
@@ -239,6 +321,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
     let result = match version {
         1 => tx.execute_batch(MIGRATION_V1),
         2 => tx.execute_batch(MIGRATION_V2),
+        3 => tx.execute_batch(MIGRATION_V3_RIL),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -270,6 +353,11 @@ mod tests {
         "backups",
         "harness_state",
         "host_state",
+        "ril_files",
+        "ril_symbols",
+        "ril_edges",
+        "ril_source_test_links",
+        "ril_metadata",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[
@@ -284,6 +372,16 @@ mod tests {
         "idx_backups_session_op",
         "idx_backups_session_order",
         "idx_backups_session_path_order",
+        "idx_ril_files_language",
+        "idx_ril_files_generation",
+        "idx_ril_symbols_file",
+        "idx_ril_symbols_name",
+        "idx_ril_symbols_kind",
+        "idx_ril_edges_source",
+        "idx_ril_edges_target",
+        "idx_ril_edges_type",
+        "idx_ril_source_test_source",
+        "idx_ril_source_test_test",
     ];
 
     #[test]
@@ -649,5 +747,201 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn ril_tables_created_on_migration() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+
+        // Verify RIL tables exist
+        let tables = sqlite_names(&conn, "table");
+        assert!(
+            tables.contains(&"ril_files".to_string()),
+            "missing ril_files table"
+        );
+        assert!(
+            tables.contains(&"ril_symbols".to_string()),
+            "missing ril_symbols table"
+        );
+        assert!(
+            tables.contains(&"ril_edges".to_string()),
+            "missing ril_edges table"
+        );
+        assert!(
+            tables.contains(&"ril_source_test_links".to_string()),
+            "missing ril_source_test_links table"
+        );
+        assert!(
+            tables.contains(&"ril_metadata".to_string()),
+            "missing ril_metadata table"
+        );
+    }
+
+    #[test]
+    fn ril_files_crud() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+
+        // Insert a file
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["src/main.rs", "abc123", "rust", 1024, 1000, 1, 1000],
+        )
+        .unwrap();
+
+        // Query the file
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM ril_files WHERE path = ?1",
+                params!["src/main.rs"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "src/main.rs");
+
+        // Update the file
+        conn.execute(
+            "UPDATE ril_files SET content_hash = ?1, generation = ?2 WHERE path = ?3",
+            params!["def456", 2, "src/main.rs"],
+        )
+        .unwrap();
+
+        let hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM ril_files WHERE path = ?1",
+                params!["src/main.rs"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash, "def456");
+
+        // Delete the file
+        conn.execute(
+            "DELETE FROM ril_files WHERE path = ?1",
+            params!["src/main.rs"],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ril_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn ril_symbols_crud() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+
+        // Insert a file first
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["src/main.rs", "abc123", "rust", 1024, 1000, 1, 1000],
+        )
+        .unwrap();
+
+        let file_id: i64 = conn.last_insert_rowid();
+
+        // Insert a symbol
+        conn.execute(
+            "INSERT INTO ril_symbols (file_id, name, kind, start_line, end_line, body_hash, name_path, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![file_id, "main", "function", 1, 10, "hash123", "", 1],
+        )
+        .unwrap();
+
+        // Query the symbol
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM ril_symbols WHERE file_id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "main");
+    }
+
+    #[test]
+    fn ril_edges_crud() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+
+        // Insert two files
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["src/a.rs", "abc", "rust", 100, 1000, 1, 1000],
+        )
+        .unwrap();
+        let file_a: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["src/b.rs", "def", "rust", 200, 1000, 1, 1000],
+        )
+        .unwrap();
+        let file_b: i64 = conn.last_insert_rowid();
+
+        // Insert an edge
+        conn.execute(
+            "INSERT INTO ril_edges (source_id, source_type, target_id, target_type, edge_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![file_a, "file", file_b, "file", "import", 1000],
+        )
+        .unwrap();
+
+        // Query the edge
+        let edge_type: String = conn
+            .query_row(
+                "SELECT edge_type FROM ril_edges WHERE source_id = ?1",
+                params![file_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_type, "import");
+    }
+
+    #[test]
+    fn ril_source_test_links_crud() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+
+        // Insert source and test files
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["src/main.rs", "abc", "rust", 100, 1000, 1, 1000],
+        )
+        .unwrap();
+        let source_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO ril_files (path, content_hash, language, size_bytes, mtime_secs, generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["tests/main_test.rs", "def", "rust", 200, 1000, 1, 1000],
+        )
+        .unwrap();
+        let test_id: i64 = conn.last_insert_rowid();
+
+        // Insert source-test link
+        conn.execute(
+            "INSERT INTO ril_source_test_links (source_id, test_id, link_type, confidence, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source_id, test_id, "naming_convention", 0.9, 1000],
+        )
+        .unwrap();
+
+        // Query the link
+        let confidence: f64 = conn
+            .query_row(
+                "SELECT confidence FROM ril_source_test_links WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((confidence - 0.9).abs() < 0.001);
     }
 }
