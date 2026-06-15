@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump when adding/removing tables or columns.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Maximum characters stored per symbol body in the FTS table.
 /// Bodies exceeding this are truncated; truncation is recorded.
@@ -134,6 +134,42 @@ pub struct SymbolRecord {
     /// Duplicate index within same file/name/kind (v3+).
     /// 0 for unique symbols, 1+ for duplicates.
     pub duplicate_index: i32,
+}
+
+/// A chunk record — a stable, addressable span of source content.
+///
+/// Chunks are the atomic unit for search, enrichment, and read sidecars.
+/// Each chunk carries enough metadata for precise retrieval and deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRecord {
+    pub id: i64,
+    pub file_id: i64,
+    /// Start line (1-based, inclusive).
+    pub start_line: u32,
+    /// End line (1-based, inclusive).
+    pub end_line: u32,
+    /// Content type: "symbol", "block", "paragraph", "config", "heading", "summary".
+    pub chunk_kind: String,
+    /// Symbol name if this chunk came from a tree-sitter symbol, empty otherwise.
+    pub symbol_name: String,
+    /// Symbol kind if applicable (function, class, struct, etc.), empty otherwise.
+    pub symbol_kind: String,
+    /// Content hash of the chunk body.
+    pub content_hash: String,
+    /// Truncated body text.
+    pub body: String,
+    /// Indexed at timestamp (epoch seconds).
+    pub indexed_at: i64,
+}
+
+/// Chunk kind constants.
+pub mod chunk_kind {
+    pub const SYMBOL: &str = "symbol";
+    pub const BLOCK: &str = "block";
+    pub const PARAGRAPH: &str = "paragraph";
+    pub const CONFIG: &str = "config";
+    pub const HEADING: &str = "heading";
+    pub const SUMMARY: &str = "summary";
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +338,25 @@ impl Fts5Store {
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON fts5_symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON fts5_symbols(file_id);
             CREATE INDEX IF NOT EXISTS idx_symbols_kind ON fts5_symbols(kind);
+
+            -- Chunk tracking table (v4): stable addressable spans of source content
+            CREATE TABLE IF NOT EXISTS fts5_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id     INTEGER NOT NULL REFERENCES fts5_files(id) ON DELETE CASCADE,
+                start_line  INTEGER NOT NULL,
+                end_line    INTEGER NOT NULL,
+                chunk_kind  TEXT NOT NULL,
+                symbol_name TEXT NOT NULL DEFAULT '',
+                symbol_kind TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                indexed_at  INTEGER NOT NULL
+            );
+
+            -- Indexes for chunk lookup
+            CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON fts5_chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_chunk_kind ON fts5_chunks(chunk_kind);
+            CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name ON fts5_chunks(symbol_name);
 
             -- FTS5 virtual table for symbol name search (unicode61 tokenizer)
             CREATE VIRTUAL TABLE IF NOT EXISTS fts5_symbols_fts USING fts5(
@@ -474,8 +529,12 @@ impl Fts5Store {
         Ok(file_id)
     }
 
-    /// Delete a file and all its symbols (cascade).
+    /// Delete a file and all its symbols and chunks (cascade).
     pub fn delete_file(&self, file_id: i64) -> Result<(), Fts5StoreError> {
+        self.conn.execute(
+            "DELETE FROM fts5_chunks WHERE file_id = ?1",
+            params![file_id],
+        )?;
         self.conn
             .execute("DELETE FROM fts5_files WHERE id = ?1", params![file_id])?;
         Ok(())
@@ -752,6 +811,130 @@ impl Fts5Store {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM fts5_symbols", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk operations
+    // -----------------------------------------------------------------------
+
+    /// Upsert a chunk record. Returns the chunk ID.
+    pub fn upsert_chunk(
+        &self,
+        file_id: i64,
+        start_line: u32,
+        end_line: u32,
+        chunk_kind: &str,
+        symbol_name: &str,
+        symbol_kind: &str,
+        content_hash: &str,
+        body: &str,
+    ) -> Result<i64, Fts5StoreError> {
+        let now = now_secs();
+        let truncated_body = truncate_body(body, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_BODY_LINES);
+
+        // Check if a chunk with this file_id and line range already exists
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM fts5_chunks WHERE file_id = ?1 AND start_line = ?2 AND end_line = ?3",
+                params![file_id, start_line, end_line],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE fts5_chunks SET chunk_kind = ?1, symbol_name = ?2, symbol_kind = ?3,
+                 content_hash = ?4, body = ?5, indexed_at = ?6 WHERE id = ?7",
+                params![
+                    chunk_kind,
+                    symbol_name,
+                    symbol_kind,
+                    content_hash,
+                    truncated_body,
+                    now,
+                    id
+                ],
+            )?;
+            Ok(id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO fts5_chunks (file_id, start_line, end_line, chunk_kind, symbol_name, symbol_kind, content_hash, body, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![file_id, start_line, end_line, chunk_kind, symbol_name, symbol_kind, content_hash, truncated_body, now],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        }
+    }
+
+    /// Get all chunks for a file.
+    pub fn get_chunks_for_file(&self, file_id: i64) -> Result<Vec<ChunkRecord>, Fts5StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, start_line, end_line, chunk_kind, symbol_name, symbol_kind,
+                    content_hash, body, indexed_at
+             FROM fts5_chunks WHERE file_id = ?1 ORDER BY start_line",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                start_line: row.get(2)?,
+                end_line: row.get(3)?,
+                chunk_kind: row.get(4)?,
+                symbol_name: row.get(5)?,
+                symbol_kind: row.get(6)?,
+                content_hash: row.get(7)?,
+                body: row.get(8)?,
+                indexed_at: row.get(9)?,
+            })
+        })?;
+        let chunks = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(chunks)
+    }
+
+    /// Get a chunk by ID.
+    pub fn get_chunk(&self, chunk_id: i64) -> Result<Option<ChunkRecord>, Fts5StoreError> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT id, file_id, start_line, end_line, chunk_kind, symbol_name, symbol_kind,
+                        content_hash, body, indexed_at
+                 FROM fts5_chunks WHERE id = ?1",
+                params![chunk_id],
+                |row| {
+                    Ok(ChunkRecord {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        start_line: row.get(2)?,
+                        end_line: row.get(3)?,
+                        chunk_kind: row.get(4)?,
+                        symbol_name: row.get(5)?,
+                        symbol_kind: row.get(6)?,
+                        content_hash: row.get(7)?,
+                        body: row.get(8)?,
+                        indexed_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Delete all chunks for a file.
+    pub fn delete_chunks_for_file(&self, file_id: i64) -> Result<(), Fts5StoreError> {
+        self.conn.execute(
+            "DELETE FROM fts5_chunks WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count chunks in the index.
+    pub fn chunk_count(&self) -> Result<usize, Fts5StoreError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts5_chunks", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -1148,5 +1331,144 @@ mod tests {
 
         let file = store.get_file_by_path("src/main.rs").unwrap().unwrap();
         assert_eq!(file.generation, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upsert_and_get_chunk() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("docs/readme.md", "abc", 1000, 512, 1)
+            .unwrap();
+        let chunk_id = store
+            .upsert_chunk(
+                file_id,
+                1,
+                10,
+                chunk_kind::PARAGRAPH,
+                "",
+                "",
+                "hash123",
+                "Hello world",
+            )
+            .unwrap();
+        assert!(chunk_id > 0);
+
+        let chunk = store.get_chunk(chunk_id).unwrap().unwrap();
+        assert_eq!(chunk.file_id, file_id);
+        assert_eq!(chunk.start_line, 1);
+        assert_eq!(chunk.end_line, 10);
+        assert_eq!(chunk.chunk_kind, chunk_kind::PARAGRAPH);
+        assert_eq!(chunk.content_hash, "hash123");
+        assert_eq!(chunk.body, "Hello world");
+    }
+
+    #[test]
+    fn chunk_upsert_updates_on_conflict() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("docs/readme.md", "abc", 1000, 512, 1)
+            .unwrap();
+        let id1 = store
+            .upsert_chunk(file_id, 1, 10, chunk_kind::PARAGRAPH, "", "", "h1", "body1")
+            .unwrap();
+        let id2 = store
+            .upsert_chunk(file_id, 1, 10, chunk_kind::HEADING, "", "", "h2", "body2")
+            .unwrap();
+        assert_eq!(id1, id2); // Same line range = same chunk
+
+        let chunk = store.get_chunk(id1).unwrap().unwrap();
+        assert_eq!(chunk.chunk_kind, chunk_kind::HEADING);
+        assert_eq!(chunk.body, "body2");
+    }
+
+    #[test]
+    fn get_chunks_for_file() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("docs/readme.md", "abc", 1000, 512, 1)
+            .unwrap();
+        store
+            .upsert_chunk(file_id, 1, 10, chunk_kind::HEADING, "", "", "h1", "body1")
+            .unwrap();
+        store
+            .upsert_chunk(
+                file_id,
+                12,
+                25,
+                chunk_kind::PARAGRAPH,
+                "",
+                "",
+                "h2",
+                "body2",
+            )
+            .unwrap();
+
+        let chunks = store.get_chunks_for_file(file_id).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[1].start_line, 12);
+    }
+
+    #[test]
+    fn chunk_count() {
+        let store = Fts5Store::open_in_memory().unwrap();
+        assert_eq!(store.chunk_count().unwrap(), 0);
+
+        let file_id = store.upsert_file("test.md", "abc", 1000, 512, 1).unwrap();
+        store
+            .upsert_chunk(file_id, 1, 5, chunk_kind::PARAGRAPH, "", "", "h1", "body")
+            .unwrap();
+        assert_eq!(store.chunk_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_file_cascades_to_chunks() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("docs/readme.md", "abc", 1000, 512, 1)
+            .unwrap();
+        store
+            .upsert_chunk(file_id, 1, 10, chunk_kind::PARAGRAPH, "", "", "h1", "body")
+            .unwrap();
+
+        assert_eq!(store.chunk_count().unwrap(), 1);
+
+        store.delete_file(file_id).unwrap();
+
+        assert_eq!(store.chunk_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn chunk_symbol_metadata() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
+        store
+            .upsert_chunk(
+                file_id,
+                5,
+                15,
+                chunk_kind::SYMBOL,
+                "my_function",
+                "function",
+                "hash123",
+                "fn my_function() {}",
+            )
+            .unwrap();
+
+        let chunks = store.get_chunks_for_file(file_id).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbol_name, "my_function");
+        assert_eq!(chunks[0].symbol_kind, "function");
     }
 }

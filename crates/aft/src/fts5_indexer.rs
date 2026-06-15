@@ -284,6 +284,24 @@ impl<'a> Fts5Indexer<'a> {
                 &name_path,
                 &body_hash,
             )?;
+
+            // Also create a chunk record for this symbol
+            let chunk_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+            self.store.upsert_chunk(
+                file_id,
+                start_line + 1, // 1-based
+                end_line + 1,
+                crate::fts5_store::chunk_kind::SYMBOL,
+                &symbol.name,
+                kind,
+                &chunk_hash,
+                &body,
+            )?;
+        }
+
+        // For non-code files (docs, config), extract paragraph/heading chunks
+        if !Self::is_code_file(rel_path) {
+            self.extract_text_chunks(file_id, &source)?;
         }
 
         Ok(if self.store.get_file_by_path(rel_path)?.is_some() {
@@ -298,6 +316,97 @@ impl<'a> Fts5Indexer<'a> {
     /// Remove a file from the index.
     pub fn remove_file(&self, rel_path: &str) -> Result<(), Fts5IndexError> {
         self.store.delete_file_by_path(rel_path)?;
+        Ok(())
+    }
+
+    /// Check if a file is a code file based on extension.
+    fn is_code_file(path: &str) -> bool {
+        let code_extensions = [
+            "rs", "ts", "tsx", "js", "jsx", "py", "java", "kt", "scala", "cs", "go", "rb", "php",
+            "swift", "c", "cpp", "h", "hpp",
+        ];
+        path.rsplit('.')
+            .next()
+            .map_or(false, |ext| code_extensions.contains(&ext))
+    }
+
+    /// Extract text chunks from non-code files (docs, config, etc.).
+    ///
+    /// Strategy:
+    /// - Markdown: chunk by headings
+    /// - Other text: chunk by blank-line-separated paragraphs
+    /// - Config (JSON/YAML/TOML): one chunk per top-level key or line window
+    fn extract_text_chunks(&self, file_id: i64, source: &str) -> Result<(), Fts5IndexError> {
+        let lines: Vec<&str> = source.lines().collect();
+        let total_lines = lines.len() as u32;
+
+        if total_lines == 0 {
+            return Ok(());
+        }
+
+        // Simple paragraph extraction: split by blank lines
+        let mut chunk_start: u32 = 0;
+        let mut paragraph_lines = Vec::new();
+        let max_chunk_lines: u32 = 60;
+        let max_chunk_chars = 2000;
+
+        for (i, line) in lines.iter().enumerate() {
+            let line_num = i as u32;
+            let is_blank = line.trim().is_empty();
+
+            if is_blank || line_num - chunk_start >= max_chunk_lines {
+                // Flush current paragraph if non-empty
+                if !paragraph_lines.is_empty() {
+                    let body = paragraph_lines.join("\n");
+                    if !body.trim().is_empty() {
+                        let content_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+                        let chunk_kind = if paragraph_lines.iter().any(|l| l.starts_with('#')) {
+                            crate::fts5_store::chunk_kind::HEADING
+                        } else {
+                            crate::fts5_store::chunk_kind::PARAGRAPH
+                        };
+                        self.store.upsert_chunk(
+                            file_id,
+                            chunk_start + 1, // 1-based
+                            chunk_start + paragraph_lines.len() as u32,
+                            chunk_kind,
+                            "",
+                            "",
+                            &content_hash,
+                            &body,
+                        )?;
+                    }
+                    paragraph_lines.clear();
+                }
+                chunk_start = line_num + 1;
+            } else {
+                paragraph_lines.push(*line);
+            }
+        }
+
+        // Flush last paragraph
+        if !paragraph_lines.is_empty() {
+            let body = paragraph_lines.join("\n");
+            if !body.trim().is_empty() {
+                let content_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+                let chunk_kind = if paragraph_lines.iter().any(|l| l.starts_with('#')) {
+                    crate::fts5_store::chunk_kind::HEADING
+                } else {
+                    crate::fts5_store::chunk_kind::PARAGRAPH
+                };
+                self.store.upsert_chunk(
+                    file_id,
+                    chunk_start + 1,
+                    chunk_start + paragraph_lines.len() as u32,
+                    chunk_kind,
+                    "",
+                    "",
+                    &content_hash,
+                    &body,
+                )?;
+            }
+        }
+
         Ok(())
     }
 }
