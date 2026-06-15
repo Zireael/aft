@@ -341,12 +341,216 @@ impl RilIndexer {
             |row| row.get(0),
         )?;
 
+        let reference_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM ril_source_test_links", [], |row| {
+                    row.get(0)
+                })?;
+
         Ok(IndexStats {
             file_count,
             symbol_count,
             edge_count,
             unresolved_count,
+            reference_count,
         })
+    }
+
+    // ── Symbol References ──────────────────────────────────────────────
+
+    /// Add a symbol reference record.
+    pub fn add_reference(
+        &self,
+        target_symbol_id: i64,
+        referencing_file_id: i64,
+        line: u32,
+        column: u32,
+        _containing_symbol_id: Option<i64>,
+        confidence: f64,
+        ref_kind: &str,
+    ) -> Result<i64, IndexError> {
+        self.conn.execute(
+            "INSERT INTO ril_source_test_links 
+             (source_file_id, target_file_id, link_type, confidence, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                referencing_file_id,
+                target_symbol_id,
+                ref_kind,
+                confidence,
+                format!("ref:{line}:{column}"),
+                now_secs(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all references to a target symbol, grouped by referencing file.
+    pub fn get_references_to_symbol(
+        &self,
+        target_symbol_id: i64,
+    ) -> Result<Vec<ReferenceGroup>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_file_id, f.path, confidence, reason
+             FROM ril_source_test_links l
+             JOIN ril_files f ON l.source_file_id = f.id
+             WHERE l.target_file_id = ?1 AND l.link_type != 'source_test'
+             ORDER BY confidence DESC",
+        )?;
+
+        let groups = stmt
+            .query_map(params![target_symbol_id], |row| {
+                Ok(ReferenceGroup {
+                    file_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    detail: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(groups)
+    }
+
+    /// Get all references originating from a file.
+    pub fn get_references_from_file(&self, file_id: i64) -> Result<Vec<ReferenceInfo>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.target_file_id, f.path, l.confidence, l.link_type, l.reason
+             FROM ril_source_test_links l
+             JOIN ril_files f ON l.target_file_id = f.id
+             WHERE l.source_file_id = ?1 AND l.link_type != 'source_test'
+             ORDER BY l.confidence DESC",
+        )?;
+
+        let refs = stmt
+            .query_map(params![file_id], |row| {
+                Ok(ReferenceInfo {
+                    target_file_id: row.get(0)?,
+                    target_file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    ref_kind: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(refs)
+    }
+
+    // ── Source-Test Links ──────────────────────────────────────────────
+
+    /// Create a source-test link between a source file and its likely test file.
+    pub fn add_source_test_link(
+        &self,
+        source_file_id: i64,
+        test_file_id: i64,
+        confidence: f64,
+        reason: &str,
+    ) -> Result<i64, IndexError> {
+        self.conn.execute(
+            "INSERT INTO ril_source_test_links 
+             (source_file_id, target_file_id, link_type, confidence, reason, created_at)
+             VALUES (?1, ?2, 'source_test', ?3, ?4, ?5)",
+            params![source_file_id, test_file_id, confidence, reason, now_secs()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get likely test files for a source file, ordered by confidence.
+    pub fn get_test_files_for_source(
+        &self,
+        source_file_id: i64,
+        min_confidence: f64,
+    ) -> Result<Vec<SourceTestLink>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.target_file_id, f.path, l.confidence, l.reason
+             FROM ril_source_test_links l
+             JOIN ril_files f ON l.target_file_id = f.id
+             WHERE l.source_file_id = ?1 AND l.link_type = 'source_test' AND l.confidence >= ?2
+             ORDER BY l.confidence DESC",
+        )?;
+
+        let links = stmt
+            .query_map(params![source_file_id, min_confidence], |row| {
+                Ok(SourceTestLink {
+                    test_file_id: row.get(0)?,
+                    test_file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    reason: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(links)
+    }
+
+    /// Get likely source files for a test file, ordered by confidence.
+    pub fn get_source_files_for_test(
+        &self,
+        test_file_id: i64,
+        min_confidence: f64,
+    ) -> Result<Vec<SourceTestLink>, IndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.source_file_id, f.path, l.confidence, l.reason
+             FROM ril_source_test_links l
+             JOIN ril_files f ON l.source_file_id = f.id
+             WHERE l.target_file_id = ?1 AND l.link_type = 'source_test' AND l.confidence >= ?2
+             ORDER BY l.confidence DESC",
+        )?;
+
+        let links = stmt
+            .query_map(params![test_file_id, min_confidence], |row| {
+                Ok(SourceTestLink {
+                    test_file_id: row.get(0)?,
+                    test_file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    reason: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(links)
+    }
+
+    /// Create source-test links for a file using naming heuristics.
+    pub fn auto_link_source_tests(
+        &self,
+        source_file_id: i64,
+        source_path: &str,
+    ) -> Result<usize, IndexError> {
+        let test_patterns = generate_test_patterns(source_path);
+        let mut count = 0;
+
+        for (pattern, reason) in &test_patterns {
+            let matching_files: Vec<(i64, String)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id, path FROM ril_files WHERE path LIKE ?1")?;
+
+                let results: Vec<(i64, String)> = stmt
+                    .query_map(params![format!("%{pattern}")], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                results
+            };
+
+            for (test_file_id, _test_path) in matching_files {
+                let exists: bool = self.conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM ril_source_test_links 
+                     WHERE source_file_id = ?1 AND target_file_id = ?2 AND link_type = 'source_test'",
+                    params![source_file_id, test_file_id],
+                    |row| row.get(0),
+                )?;
+
+                if !exists {
+                    self.add_source_test_link(source_file_id, test_file_id, 0.8, reason)?;
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
     }
 }
 
@@ -459,6 +663,122 @@ pub struct IndexStats {
     pub symbol_count: i64,
     pub edge_count: i64,
     pub unresolved_count: i64,
+    pub reference_count: i64,
+}
+
+/// Reference group — references to a symbol grouped by file.
+#[derive(Debug, Clone)]
+pub struct ReferenceGroup {
+    pub file_id: i64,
+    pub file_path: String,
+    pub confidence: f64,
+    pub detail: String,
+}
+
+/// Reference information.
+#[derive(Debug, Clone)]
+pub struct ReferenceInfo {
+    pub target_file_id: i64,
+    pub target_file_path: String,
+    pub confidence: f64,
+    pub ref_kind: String,
+    pub detail: String,
+}
+
+/// Source-test link.
+#[derive(Debug, Clone)]
+pub struct SourceTestLink {
+    pub test_file_id: i64,
+    pub test_file_path: String,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+/// Generate test file patterns for a source file.
+fn generate_test_patterns(source_path: &str) -> Vec<(String, String)> {
+    let mut patterns = Vec::new();
+
+    // Get the base name without extension
+    let path = std::path::Path::new(source_path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let _dir = path.parent().and_then(|s| s.to_str()).unwrap_or("");
+
+    match ext {
+        "rs" => {
+            // foo.rs → foo_test.rs
+            patterns.push((
+                format!("{stem}_test.rs"),
+                "naming_convention:rust_test_file".to_string(),
+            ));
+            // foo.rs → tests/foo_test.rs
+            patterns.push((
+                format!("tests/{stem}_test.rs"),
+                "naming_convention:rust_test_dir".to_string(),
+            ));
+            // foo.rs → tests/integration/foo_test.rs
+            patterns.push((
+                format!("tests/integration/{stem}_test.rs"),
+                "naming_convention:rust_integration_test".to_string(),
+            ));
+        }
+        "ts" | "tsx" => {
+            // foo.ts → foo.test.ts
+            patterns.push((
+                format!("{stem}.test.{ext}"),
+                "naming_convention:js_test_file".to_string(),
+            ));
+            // foo.ts → foo.spec.ts
+            patterns.push((
+                format!("{stem}.spec.{ext}"),
+                "naming_convention:js_spec_file".to_string(),
+            ));
+            // foo.ts → __tests__/foo.test.ts
+            patterns.push((
+                format!("__tests__/{stem}.test.{ext}"),
+                "naming_convention:js_test_dir".to_string(),
+            ));
+        }
+        "js" | "jsx" => {
+            // foo.js → foo.test.js
+            patterns.push((
+                format!("{stem}.test.{ext}"),
+                "naming_convention:js_test_file".to_string(),
+            ));
+            // foo.js → foo.spec.js
+            patterns.push((
+                format!("{stem}.spec.{ext}"),
+                "naming_convention:js_spec_file".to_string(),
+            ));
+            // foo.js → __tests__/foo.test.js
+            patterns.push((
+                format!("__tests__/{stem}.test.{ext}"),
+                "naming_convention:js_test_dir".to_string(),
+            ));
+        }
+        "py" => {
+            // foo.py → test_foo.py
+            patterns.push((
+                format!("test_{stem}.py"),
+                "naming_convention:python_test_file".to_string(),
+            ));
+            // foo.py → tests/test_foo.py
+            patterns.push((
+                format!("tests/test_{stem}.py"),
+                "naming_convention:python_test_dir".to_string(),
+            ));
+        }
+        "go" => {
+            // foo.go → foo_test.go
+            patterns.push((
+                format!("{stem}_test.go"),
+                "naming_convention:go_test_file".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    patterns
 }
 
 /// Detect the language of a file based on its extension.
