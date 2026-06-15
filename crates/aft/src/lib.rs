@@ -112,6 +112,8 @@ pub mod fts5_planner;
 #[cfg(feature = "semantic-fts5")]
 pub mod fts5_store;
 
+pub mod lint_tool_schemas;
+
 #[cfg(test)]
 mod tests {
     use super::*;
