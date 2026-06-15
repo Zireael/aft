@@ -57,5 +57,6 @@ pub mod trace_to_symbol;
 pub mod trust_filter_project;
 pub mod undo;
 pub mod untrust_filter_project;
+pub mod verify;
 pub mod write;
 pub mod zoom;
