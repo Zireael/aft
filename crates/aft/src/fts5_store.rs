@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump when adding/removing tables or columns.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Maximum characters stored per symbol body in the FTS table.
 /// Bodies exceeding this are truncated; truncation is recorded.
@@ -126,6 +126,14 @@ pub struct SymbolRecord {
     pub end_line: u32,
     pub body: String,
     pub indexed_at: i64,
+    /// Qualified name path (v3+), e.g. "MyClass::my_method".
+    /// Empty string for top-level symbols.
+    pub name_path: String,
+    /// Body content hash (v3+), for content identity without re-reading source.
+    pub body_hash: String,
+    /// Duplicate index within same file/name/kind (v3+).
+    /// 0 for unique symbols, 1+ for duplicates.
+    pub duplicate_index: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +153,10 @@ pub struct Fts5SearchResult {
     pub snippet: String,
     pub rank: f64,
     pub lane: String,
+    /// Qualified name path (v3+).
+    pub name_path: String,
+    /// Duplicate index within same file/name/kind (v3+).
+    pub duplicate_index: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,16 +283,19 @@ impl Fts5Store {
                 generation  INTEGER NOT NULL DEFAULT 1
             );
 
-            -- Symbol tracking table
+            -- Symbol tracking table (v3: adds name_path, body_hash, duplicate_index)
             CREATE TABLE IF NOT EXISTS fts5_symbols (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id     INTEGER NOT NULL REFERENCES fts5_files(id) ON DELETE CASCADE,
-                name        TEXT NOT NULL,
-                kind        TEXT NOT NULL,
-                start_line  INTEGER NOT NULL,
-                end_line    INTEGER NOT NULL,
-                body        TEXT NOT NULL,
-                indexed_at  INTEGER NOT NULL
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id         INTEGER NOT NULL REFERENCES fts5_files(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                kind            TEXT NOT NULL,
+                start_line      INTEGER NOT NULL,
+                end_line        INTEGER NOT NULL,
+                body            TEXT NOT NULL,
+                indexed_at      INTEGER NOT NULL,
+                name_path       TEXT NOT NULL DEFAULT '',
+                body_hash       TEXT NOT NULL DEFAULT '',
+                duplicate_index INTEGER NOT NULL DEFAULT 0
             );
 
             -- Indexes for exact/prefix symbol lookup
@@ -616,6 +631,8 @@ impl Fts5Store {
         start_line: u32,
         end_line: u32,
         body: &str,
+        name_path: &str,
+        body_hash: &str,
     ) -> Result<i64, Fts5StoreError> {
         let now = now_secs();
         let truncated_body = truncate_body(body, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_BODY_LINES);
@@ -633,15 +650,34 @@ impl Fts5Store {
         if let Some(id) = existing {
             self.conn.execute(
                 "UPDATE fts5_symbols SET kind = ?1, start_line = ?2, end_line = ?3,
-                 body = ?4, indexed_at = ?5 WHERE id = ?6",
-                params![kind, start_line, end_line, truncated_body, now, id],
+                 body = ?4, indexed_at = ?5, name_path = ?6, body_hash = ?7 WHERE id = ?8",
+                params![
+                    kind,
+                    start_line,
+                    end_line,
+                    truncated_body,
+                    now,
+                    name_path,
+                    body_hash,
+                    id
+                ],
             )?;
             Ok(id)
         } else {
+            // Compute duplicate_index: count existing symbols with same name+file
+            let dup_count: i32 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fts5_symbols WHERE file_id = ?1 AND name = ?2",
+                    params![file_id, name],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
             self.conn.execute(
-                "INSERT INTO fts5_symbols (file_id, name, kind, start_line, end_line, body, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![file_id, name, kind, start_line, end_line, truncated_body, now],
+                "INSERT INTO fts5_symbols (file_id, name, kind, start_line, end_line, body, indexed_at, name_path, body_hash, duplicate_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![file_id, name, kind, start_line, end_line, truncated_body, now, name_path, body_hash, dup_count],
             )?;
             Ok(self.conn.last_insert_rowid())
         }
@@ -661,7 +697,8 @@ impl Fts5Store {
         let result = self
             .conn
             .query_row(
-                "SELECT id, file_id, name, kind, start_line, end_line, body, indexed_at
+                "SELECT id, file_id, name, kind, start_line, end_line, body, indexed_at,
+                        name_path, body_hash, duplicate_index
                  FROM fts5_symbols WHERE id = ?1",
                 params![symbol_id],
                 |row| {
@@ -674,6 +711,9 @@ impl Fts5Store {
                         end_line: row.get(5)?,
                         body: row.get(6)?,
                         indexed_at: row.get(7)?,
+                        name_path: row.get(8)?,
+                        body_hash: row.get(9)?,
+                        duplicate_index: row.get(10)?,
                     })
                 },
             )
@@ -684,8 +724,9 @@ impl Fts5Store {
     /// Get a symbol record by name (exact match).
     pub fn get_symbol_by_name(&self, name: &str) -> Result<Vec<SymbolRecord>, Fts5StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, name, kind, start_line, end_line, body, indexed_at
-             FROM fts5_symbols WHERE name = ?1 ORDER BY file_id",
+            "SELECT id, file_id, name, kind, start_line, end_line, body, indexed_at,
+                    name_path, body_hash, duplicate_index
+             FROM fts5_symbols WHERE name = ?1 ORDER BY file_id, duplicate_index",
         )?;
         let rows = stmt.query_map(params![name], |row| {
             Ok(SymbolRecord {
@@ -697,6 +738,9 @@ impl Fts5Store {
                 end_line: row.get(5)?,
                 body: row.get(6)?,
                 indexed_at: row.get(7)?,
+                name_path: row.get(8)?,
+                body_hash: row.get(9)?,
+                duplicate_index: row.get(10)?,
             })
         })?;
         let symbols = rows.collect::<Result<Vec<_>, _>>()?;
@@ -880,7 +924,7 @@ mod tests {
             .upsert_file("src/main.rs", "abc", 1000, 512, 1)
             .unwrap();
         let sym_id = store
-            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
+            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}", "", "")
             .unwrap();
         assert!(sym_id > 0);
 
@@ -898,10 +942,10 @@ mod tests {
             .upsert_file("src/main.rs", "abc", 1000, 512, 1)
             .unwrap();
         store
-            .upsert_symbol(file_id, "Foo", "struct", 1, 5, "struct Foo {}")
+            .upsert_symbol(file_id, "Foo", "struct", 1, 5, "struct Foo {}", "", "")
             .unwrap();
         store
-            .upsert_symbol(file_id, "Bar", "struct", 6, 10, "struct Bar {}")
+            .upsert_symbol(file_id, "Bar", "struct", 6, 10, "struct Bar {}", "", "")
             .unwrap();
 
         let results = store.get_symbol_by_name("Foo").unwrap();
@@ -917,7 +961,7 @@ mod tests {
             .upsert_file("src/main.rs", "abc", 1000, 512, 1)
             .unwrap();
         store
-            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
+            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}", "", "")
             .unwrap();
 
         assert_eq!(store.symbol_count().unwrap(), 1);
@@ -936,7 +980,7 @@ mod tests {
             .upsert_file("src/main.rs", "abc", 1000, 512, 1)
             .unwrap();
         store
-            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
+            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}", "", "")
             .unwrap();
 
         let counts = store.fts_row_counts().unwrap();
@@ -968,7 +1012,7 @@ mod tests {
             .upsert_file("src/main.rs", "abc", 1000, 512, 1)
             .unwrap();
         store
-            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}")
+            .upsert_symbol(file_id, "main", "function", 1, 10, "fn main() {}", "", "")
             .unwrap();
 
         assert_eq!(store.file_count().unwrap(), 1);
@@ -1018,7 +1062,16 @@ mod tests {
             .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
             .unwrap();
         store
-            .upsert_symbol(file_id, "MyStruct", "struct", 10, 20, "struct MyStruct {}")
+            .upsert_symbol(
+                file_id,
+                "MyStruct",
+                "struct",
+                10,
+                20,
+                "struct MyStruct {}",
+                "",
+                "",
+            )
             .unwrap();
 
         // Exact symbol lookup by name

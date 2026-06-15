@@ -500,7 +500,7 @@ pub fn handle_fts5_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let json_results: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut val = serde_json::json!({
                 "symbol_id": r.symbol_id,
                 "file_id": r.file_id,
                 "file_path": r.file_path,
@@ -512,7 +512,14 @@ pub fn handle_fts5_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 "score": r.score,
                 "lane": r.best_lane,
                 "matched_lanes": r.matched_lanes,
-            })
+                "name_path": r.name_path,
+                "duplicate_index": r.duplicate_index,
+            });
+            // Include name_path only when non-empty
+            if r.name_path.is_empty() {
+                val.as_object_mut().unwrap().remove("name_path");
+            }
+            val
         })
         .collect();
 
@@ -612,7 +619,7 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             let mut results: Vec<serde_json::Value> = sql_results
                 .iter()
                 .map(|s| {
-                    serde_json::json!({
+                    let mut val = serde_json::json!({
                         "symbol_id": s.id,
                         "file_id": s.file_id,
                         "symbol_name": s.name,
@@ -621,7 +628,13 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                         "end_line": s.end_line,
                         "snippet": s.body,
                         "lane": "exact_symbol_sql",
-                    })
+                        "name_path": s.name_path,
+                        "duplicate_index": s.duplicate_index,
+                    });
+                    if s.name_path.is_empty() {
+                        val.as_object_mut().unwrap().remove("name_path");
+                    }
+                    val
                 })
                 .collect();
 
@@ -636,7 +649,7 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 fts_results
                     .iter()
                     .map(|r| {
-                        serde_json::json!({
+                        let mut val = serde_json::json!({
                             "symbol_id": r.symbol_id,
                             "file_id": r.file_id,
                             "file_path": r.file_path,
@@ -646,7 +659,13 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                             "end_line": r.end_line,
                             "snippet": r.snippet,
                             "lane": r.best_lane,
-                        })
+                            "name_path": r.name_path,
+                            "duplicate_index": r.duplicate_index,
+                        });
+                        if r.name_path.is_empty() {
+                            val.as_object_mut().unwrap().remove("name_path");
+                        }
+                        val
                     })
                     .collect()
             }
@@ -658,7 +677,7 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             fts_results
                 .iter()
                 .map(|r| {
-                    serde_json::json!({
+                    let mut val = serde_json::json!({
                         "symbol_id": r.symbol_id,
                         "file_id": r.file_id,
                         "file_path": r.file_path,
@@ -668,7 +687,13 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                         "end_line": r.end_line,
                         "snippet": r.snippet,
                         "lane": r.best_lane,
-                    })
+                        "name_path": r.name_path,
+                        "duplicate_index": r.duplicate_index,
+                    });
+                    if r.name_path.is_empty() {
+                        val.as_object_mut().unwrap().remove("name_path");
+                    }
+                    val
                 })
                 .collect()
         }
@@ -805,18 +830,24 @@ pub fn handle_fts5_read_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
 
         if filtered.len() > 1 {
-            // Ambiguous — return candidates
+            // Ambiguous — return candidates with identity fields
             let candidate_list: Vec<serde_json::Value> = filtered
                 .iter()
                 .map(|s| {
-                    serde_json::json!({
+                    let mut val = serde_json::json!({
                         "symbol_id": s.id,
                         "file_id": s.file_id,
                         "symbol_name": s.name,
                         "symbol_kind": s.kind,
                         "start_line": s.start_line,
                         "end_line": s.end_line,
-                    })
+                        "name_path": s.name_path,
+                        "duplicate_index": s.duplicate_index,
+                    });
+                    if s.name_path.is_empty() {
+                        val.as_object_mut().unwrap().remove("name_path");
+                    }
+                    val
                 })
                 .collect();
 
@@ -904,6 +935,8 @@ pub fn handle_fts5_read_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "end_line": symbol.end_line,
             "body": body,
             "line_count": symbol.end_line - symbol.start_line + 1,
+            "name_path": if symbol.name_path.is_empty() { serde_json::Value::Null } else { serde_json::json!(symbol.name_path) },
+            "duplicate_index": symbol.duplicate_index,
             "text": text,
         }),
     )

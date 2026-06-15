@@ -158,6 +158,10 @@ pub struct LaneResult {
     pub normalized_score: f64,
     /// Lane that produced this result.
     pub lane: String,
+    /// Qualified name path (v3+).
+    pub name_path: String,
+    /// Duplicate index within same file/name/kind (v3+).
+    pub duplicate_index: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +185,10 @@ pub struct FusedResult {
     pub best_lane: String,
     /// All lanes that matched this result.
     pub matched_lanes: Vec<String>,
+    /// Qualified name path (v3+).
+    pub name_path: String,
+    /// Duplicate index within same file/name/kind (v3+).
+    pub duplicate_index: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +276,8 @@ impl<'a> QueryPlanner<'a> {
                     hash: String::new(),
                     mtime_secs: 0,
                     indexed_at: 0,
+                    size_bytes: 0,
+                    generation: 0,
                 }
             });
 
@@ -283,6 +293,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: 0.0, // Exact match = best score
                 normalized_score: 1.0,
                 lane: "exact_symbol_sql".to_string(),
+                name_path: sym.name_path.clone(),
+                duplicate_index: sym.duplicate_index,
             });
         }
 
@@ -302,7 +314,8 @@ impl<'a> QueryPlanner<'a> {
         let prefix = &query.tokens[0];
 
         // Use SQL LIKE for prefix match
-        let sql = "SELECT id, file_id, name, kind, start_line, end_line, body
+        let sql =
+            "SELECT id, file_id, name, kind, start_line, end_line, body, name_path, duplicate_index
                    FROM fts5_symbols
                    WHERE name LIKE ?1
                    ORDER BY name
@@ -323,12 +336,14 @@ impl<'a> QueryPlanner<'a> {
                     row.get::<_, u32>(4)?,
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i32>(8)?,
                 ))
             })
             .map_err(|e| crate::fts5_store::Fts5StoreError::Other(format!("query failed: {e}")))?;
 
         for row in rows.flatten() {
-            let (sym_id, file_id, name, kind, start, end, body) = row;
+            let (sym_id, file_id, name, kind, start, end, body, name_path, dup_idx) = row;
             // Skip if already found by exact match
             if results.iter().any(|r| r.symbol_id == sym_id) {
                 continue;
@@ -349,6 +364,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: prefix_ratio,
                 normalized_score: prefix_ratio * 0.8, // Weight down from exact
                 lane: "prefix_symbol_sql".to_string(),
+                name_path,
+                duplicate_index: dup_idx,
             });
         }
 
@@ -369,7 +386,7 @@ impl<'a> QueryPlanner<'a> {
         let fts_query = build_fts5_query(&query.raw, false);
 
         let sql = "SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.body,
-                          rank
+                          s.name_path, s.duplicate_index, rank
                    FROM fts5_symbols_fts fts
                    JOIN fts5_symbols s ON s.id = fts.rowid
                    WHERE fts5_symbols_fts MATCH ?1
@@ -390,13 +407,15 @@ impl<'a> QueryPlanner<'a> {
                     row.get::<_, u32>(4)?,
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, f64>(7)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i32>(8)?,
+                    row.get::<_, f64>(9)?,
                 ))
             })
             .map_err(|e| crate::fts5_store::Fts5StoreError::Other(format!("query failed: {e}")))?;
 
         for row in rows.flatten() {
-            let (sym_id, file_id, name, kind, start, end, body, rank) = row;
+            let (sym_id, file_id, name, kind, start, end, body, name_path, dup_idx, rank) = row;
             // Skip if already found by exact/prefix
             if results.iter().any(|r| r.symbol_id == sym_id) {
                 continue;
@@ -417,6 +436,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: rank,
                 normalized_score: normalized * 0.6, // Weight
                 lane: "symbol_fts".to_string(),
+                name_path,
+                duplicate_index: dup_idx,
             });
         }
 
@@ -494,7 +515,7 @@ impl<'a> QueryPlanner<'a> {
         let fts_query = escape_fts5_query(&query.raw);
 
         let sql = "SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.body,
-                          rank
+                          s.name_path, s.duplicate_index, rank
                    FROM fts5_symbol_bodies_fts fts
                    JOIN fts5_symbols s ON s.id = fts.rowid
                    WHERE fts5_symbol_bodies_fts MATCH ?1
@@ -515,13 +536,15 @@ impl<'a> QueryPlanner<'a> {
                     row.get::<_, u32>(4)?,
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, f64>(7)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i32>(8)?,
+                    row.get::<_, f64>(9)?,
                 ))
             })
             .map_err(|e| crate::fts5_store::Fts5StoreError::Other(format!("query failed: {e}")))?;
 
         for row in rows.flatten() {
-            let (sym_id, file_id, name, kind, start, end, body, rank) = row;
+            let (sym_id, file_id, name, kind, start, end, body, name_path, dup_idx, rank) = row;
             // Skip if already found by higher-priority lane
             if results.iter().any(|r| r.symbol_id == sym_id) {
                 continue;
@@ -541,6 +564,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: rank,
                 normalized_score: normalized * 0.3, // Lowest weight for body
                 lane: "body_fts".to_string(),
+                name_path,
+                duplicate_index: dup_idx,
             });
         }
 
@@ -555,7 +580,8 @@ impl<'a> QueryPlanner<'a> {
         results: &mut Vec<LaneResult>,
     ) -> Result<(), crate::fts5_store::Fts5StoreError> {
         // Use LIKE for short tokens that can't use FTS effectively
-        let sql = "SELECT id, file_id, name, kind, start_line, end_line, body
+        let sql = "SELECT id, file_id, name, kind, start_line, end_line, body,
+                          name_path, duplicate_index
                    FROM fts5_symbols
                    WHERE name LIKE ?1 OR body LIKE ?2
                    ORDER BY
@@ -578,12 +604,14 @@ impl<'a> QueryPlanner<'a> {
                     row.get::<_, u32>(4)?,
                     row.get::<_, u32>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i32>(8)?,
                 ))
             })
             .map_err(|e| crate::fts5_store::Fts5StoreError::Other(format!("query failed: {e}")))?;
 
         for row in rows.flatten() {
-            let (sym_id, file_id, name, kind, start, end, body) = row;
+            let (sym_id, file_id, name, kind, start, end, body, name_path, dup_idx) = row;
             // Skip if already found
             if results.iter().any(|r| r.symbol_id == sym_id) {
                 continue;
@@ -601,6 +629,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: 0.5,
                 normalized_score: 0.2, // Low weight for fallback
                 lane: "short_token_fallback".to_string(),
+                name_path,
+                duplicate_index: dup_idx,
             });
         }
 
@@ -662,6 +692,8 @@ impl<'a> QueryPlanner<'a> {
                     score: fused_score,
                     best_lane: best.lane.clone(),
                     matched_lanes,
+                    name_path: best.name_path.clone(),
+                    duplicate_index: best.duplicate_index,
                 }
             })
             .collect();
@@ -748,7 +780,16 @@ mod tests {
 
         // Insert a symbol referencing that file
         store
-            .upsert_symbol(file_id, "MyFunc", "function", 5, 15, "fn MyFunc() {}")
+            .upsert_symbol(
+                file_id,
+                "MyFunc",
+                "function",
+                5,
+                15,
+                "fn MyFunc() {}",
+                "",
+                "",
+            )
             .unwrap();
 
         // Search for the exact symbol
@@ -779,6 +820,8 @@ mod tests {
                 raw_score: 0.0,
                 normalized_score: 1.0,
                 lane: "exact_symbol_sql".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
             },
             LaneResult {
                 symbol_id: 1,
@@ -792,6 +835,8 @@ mod tests {
                 raw_score: -2.0,
                 normalized_score: 0.33,
                 lane: "body_fts".into(),
+                name_path: "".into(),
+                duplicate_index: 0,
             },
         ];
 
@@ -802,5 +847,77 @@ mod tests {
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].matched_lanes.len(), 2);
         assert!(fused[0].score > 1.0); // Bonus for multi-lane
+    }
+
+    #[test]
+    fn name_path_included_in_search_results() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
+
+        // Insert a nested symbol with name_path
+        store
+            .upsert_symbol(
+                file_id,
+                "inner",
+                "function",
+                5,
+                10,
+                "fn inner() {}",
+                "MyClass::inner",
+                "abc123",
+            )
+            .unwrap();
+
+        let planner = QueryPlanner::new(&store);
+        let results = planner.search("inner", 10).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name_path, "MyClass::inner");
+    }
+
+    #[test]
+    fn duplicate_index_disambiguates_same_name_symbols() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
+
+        // Insert two symbols with same name (different kinds)
+        let id1 = store
+            .upsert_symbol(
+                file_id,
+                "overloaded",
+                "function",
+                1,
+                5,
+                "fn overloaded(a: i32) {}",
+                "",
+                "hash1",
+            )
+            .unwrap();
+
+        let id2 = store
+            .upsert_symbol(
+                file_id,
+                "overloaded",
+                "function",
+                7,
+                11,
+                "fn overloaded(a: i32, b: i32) {}",
+                "",
+                "hash2",
+            )
+            .unwrap();
+
+        assert_ne!(id1, id2);
+
+        let sym1 = store.get_symbol(id1).unwrap().unwrap();
+        let sym2 = store.get_symbol(id2).unwrap().unwrap();
+
+        assert_ne!(sym1.duplicate_index, sym2.duplicate_index);
     }
 }

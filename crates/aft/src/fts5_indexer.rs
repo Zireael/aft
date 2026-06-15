@@ -262,6 +262,18 @@ impl<'a> Fts5Indexer<'a> {
                 .collect::<Vec<_>>()
                 .join("\n");
 
+            // Compute name_path from scope_chain: "Parent::Child" format
+            let name_path = if symbol.scope_chain.is_empty() {
+                String::new()
+            } else {
+                let mut parts = symbol.scope_chain.clone();
+                parts.push(symbol.name.clone());
+                parts.join("::")
+            };
+
+            // Compute body_hash for content identity
+            let body_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+
             self.store.upsert_symbol(
                 file_id,
                 &symbol.name,
@@ -269,6 +281,8 @@ impl<'a> Fts5Indexer<'a> {
                 start_line + 1, // Convert to 1-based for storage
                 end_line + 1,
                 &body,
+                &name_path,
+                &body_hash,
             )?;
         }
 
