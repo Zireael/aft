@@ -20,6 +20,15 @@ const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
 const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
+/// Handle a `glob` request.
+///
+/// Params:
+///   - `pattern` (string, required) — glob pattern to match files
+///   - `path` (string, optional) — directory to search within
+///   - `classify` (bool, optional) — enable file classification and source-test pairing
+///
+/// Returns:
+///   `{ files, total, truncated, text, complete, no_files_matched_scope, classification? }`
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
         Some(pattern) => pattern,
@@ -97,22 +106,211 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         files.truncate(MAX_GLOB_RESULTS);
     }
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": format_glob_text(&files, pattern, &project_root, truncated),
-            "complete": true,
-            "no_files_matched_scope": !scope_has_files,
-            "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-            "total": total,
-            "truncated": truncated,
-        }),
-    )
+    // Build response with optional classification
+    let mut response = serde_json::json!({
+        "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "total": total,
+        "truncated": truncated,
+        "complete": true,
+        "no_files_matched_scope": !scope_has_files,
+    });
+
+    // Add classification if requested
+    let classify = req
+        .params
+        .get("classify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if classify {
+        let classification = classify_files(&files, &project_root);
+        response["classification"] = classification;
+    }
+
+    let text = format_glob_text(&files, pattern, &project_root, truncated);
+    response["text"] = serde_json::json!(text);
+
+    Response::success(&req.id, response)
 }
 
 fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
     let catch_all = build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
     has_any_project_file_from(project_root, search_root, &catch_all)
+}
+
+/// Classify files by type and pair source files with their test files.
+///
+/// File categories:
+/// - "source": Source code files (not tests, not config, not generated)
+/// - "test": Test files (matching test patterns)
+/// - "config": Configuration files (package.json, tsconfig, etc.)
+/// - "docs": Documentation files (README, docs/, etc.)
+/// - "generated": Generated files (dist/, build/, node_modules/, etc.)
+/// - "vendor": Vendor files (third-party dependencies)
+fn classify_files(files: &[PathBuf], project_root: &Path) -> serde_json::Value {
+    let mut classification = serde_json::json!({
+        "source": Vec::<String>::new(),
+        "test": Vec::<String>::new(),
+        "config": Vec::<String>::new(),
+        "docs": Vec::<String>::new(),
+        "generated": Vec::<String>::new(),
+        "vendor": Vec::<String>::new(),
+    });
+
+    let mut source_files = Vec::new();
+    let mut test_files = Vec::new();
+
+    for file in files {
+        let relative = file.strip_prefix(project_root).unwrap_or(file);
+        let path_str = relative.display().to_string();
+        let category = categorize_file(relative);
+
+        // Add to appropriate category
+        if let Some(arr) = classification[category].as_array_mut() {
+            arr.push(serde_json::json!(path_str));
+        }
+
+        // Track source and test files for pairing
+        if category == "source" {
+            source_files.push(path_str);
+        } else if category == "test" {
+            test_files.push(path_str);
+        }
+    }
+
+    // Add source-test pairings
+    let pairings = find_source_test_pairings(&source_files, &test_files);
+    if !pairings.is_empty() {
+        classification["pairings"] = serde_json::json!(pairings);
+    }
+
+    // Add summary
+    classification["summary"] = serde_json::json!({
+        "total_files": files.len(),
+        "source_count": source_files.len(),
+        "test_count": test_files.len(),
+        "has_pairings": !pairings.is_empty(),
+    });
+
+    classification
+}
+
+/// Categorize a file based on its path and extension.
+fn categorize_file(path: &Path) -> &'static str {
+    let path_str = path.display().to_string().to_lowercase();
+
+    // Generated/vendor directories
+    if path_str.contains("node_modules/")
+        || path_str.contains("dist/")
+        || path_str.contains("build/")
+        || path_str.contains(".next/")
+        || path_str.contains("target/")
+        || path_str.contains("__pycache__/")
+    {
+        return "generated";
+    }
+
+    // Vendor directories
+    if path_str.contains("vendor/")
+        || path_str.contains("third_party/")
+        || path_str.contains("extern/")
+    {
+        return "vendor";
+    }
+
+    // Documentation
+    if path_str.contains("readme")
+        || path_str.contains("changelog")
+        || path_str.contains("license")
+        || path_str.contains("docs/")
+        || path_str.contains("doc/")
+        || path_str.ends_with(".md")
+        || path_str.ends_with(".rst")
+        || path_str.ends_with(".txt")
+    {
+        return "docs";
+    }
+
+    // Configuration files
+    if path_str.contains("package.json")
+        || path_str.contains("tsconfig")
+        || path_str.contains("webpack")
+        || path_str.contains("vite.config")
+        || path_str.contains("jest.config")
+        || path_str.contains("vitest.config")
+        || path_str.contains("eslint")
+        || path_str.contains("prettier")
+        || path_str.contains("rustfmt")
+        || path_str.contains("clippy")
+        || path_str.contains("cargo.toml")
+        || path_str.contains("pyproject.toml")
+        || path_str.contains("setup.py")
+        || path_str.contains("dockerfile")
+        || path_str.contains("docker-compose")
+        || path_str.contains(".env")
+        || path_str.ends_with(".toml")
+        || path_str.ends_with(".yaml")
+        || path_str.ends_with(".yml")
+        || path_str.ends_with(".json")
+    {
+        return "config";
+    }
+
+    // Test files
+    if path_str.contains("_test.")
+        || path_str.contains(".test.")
+        || path_str.contains("_spec.")
+        || path_str.contains(".spec.")
+        || path_str.contains("test_")
+        || path_str.contains("__tests__/")
+        || path_str.contains("tests/")
+        || path_str.contains("test/")
+        || path_str.contains("spec/")
+    {
+        return "test";
+    }
+
+    // Default: source code
+    "source"
+}
+
+/// Find source-test pairings based on naming conventions.
+fn find_source_test_pairings(
+    source_files: &[String],
+    test_files: &[String],
+) -> Vec<serde_json::Value> {
+    let mut pairings = Vec::new();
+
+    for source in source_files {
+        let source_path = std::path::Path::new(source);
+        let source_stem = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // Look for matching test files
+        for test in test_files {
+            let test_path = std::path::Path::new(test);
+            let test_stem = test_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+            // Check various naming patterns
+            let is_match = test_stem == source_stem
+                || test_stem == format!("test_{}", source_stem)
+                || test_stem == format!("{}_test", source_stem)
+                || test_stem == format!("{}_spec", source_stem)
+                || test_stem == format!("{}.test", source_stem)
+                || test_stem == format!("{}.spec", source_stem);
+
+            if is_match {
+                pairings.push(serde_json::json!({
+                    "source": source,
+                    "test": test,
+                }));
+                break; // Only pair with first matching test
+            }
+        }
+    }
+
+    pairings
 }
 
 fn glob_root(
