@@ -64,6 +64,7 @@ pub mod context;
 pub mod db;
 pub mod edit;
 pub mod error;
+pub mod export_detection;
 pub mod extract;
 pub mod format;
 pub mod fs_lock;
