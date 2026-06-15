@@ -1,0 +1,118 @@
+[
+  {
+    "query": "Fts5Store",
+    "shape": "symbol",
+    "intent": "ExactSymbol",
+    "expected_top_files": [
+      "crates/aft/src/fts5_store.rs"
+    ],
+    "expected_symbol_name": "Fts5Store",
+    "notes": "FTS5 store struct — exact symbol lookup should find the definition"
+  },
+  {
+    "query": "upsert_file",
+    "shape": "symbol",
+    "intent": "SymbolPrefix",
+    "expected_top_files": [
+      "crates/aft/src/fts5_store.rs"
+    ],
+    "expected_symbol_name": "upsert_file",
+    "notes": "FTS5 upsert function — prefix match should find the definition"
+  },
+  {
+    "query": "SemanticChunk",
+    "shape": "symbol",
+    "intent": "ExactSymbol",
+    "expected_top_files": [
+      "crates/aft/src/semantic_index.rs"
+    ],
+    "expected_symbol_name": "SemanticChunk",
+    "notes": "Semantic chunk struct — cross-module symbol lookup"
+  },
+  {
+    "query": "error handling in database",
+    "shape": "natural_language",
+    "intent": "NaturalLanguage",
+    "expected_top_files": [
+      "crates/aft/src/context.rs",
+      "crates/aft/src/commands/mod.rs"
+    ],
+    "notes": "Natural language query about error handling — should find relevant modules"
+  },
+  {
+    "query": "E0433",
+    "shape": "error_string",
+    "intent": "ErrorString",
+    "expected_top_files": [
+      "crates/aft/src/edit.rs"
+    ],
+    "notes": "Rust compiler error code — should find error handling code"
+  },
+  {
+    "query": "src/main.rs",
+    "shape": "file_path",
+    "intent": "FilePath",
+    "expected_top_files": [
+      "crates/aft/src/main.rs"
+    ],
+    "notes": "File path query — should find the exact file"
+  },
+  {
+    "query": "id",
+    "shape": "short_token",
+    "intent": "ShortToken",
+    "expected_top_files": [
+      "crates/aft/src/fts5_store.rs",
+      "crates/aft/src/callgraph.rs"
+    ],
+    "notes": "Short token — should use fallback and find symbols with 'id' in name"
+  },
+  {
+    "query": "\"fn main\"",
+    "shape": "exact_literal",
+    "intent": "ExactLiteral",
+    "expected_top_files": [
+      "crates/aft/src/main.rs"
+    ],
+    "notes": "Exact literal string — should find files containing the literal"
+  },
+  {
+    "query": "config parser",
+    "shape": "natural_language",
+    "intent": "NaturalLanguage",
+    "expected_top_files": [
+      "crates/aft/src/config.rs",
+      "packages/opencode-plugin/src/config.ts"
+    ],
+    "notes": "Config parsing — should find config modules"
+  },
+  {
+    "query": "BridgePool",
+    "shape": "symbol",
+    "intent": "ExactSymbol",
+    "expected_top_files": [
+      "packages/aft-bridge/src/pool.ts"
+    ],
+    "expected_symbol_name": "BridgePool",
+    "notes": "TypeScript bridge pool — cross-language symbol lookup"
+  },
+  {
+    "query": "aft_search",
+    "shape": "symbol",
+    "intent": "SymbolPrefix",
+    "expected_top_files": [
+      "crates/aft/src/commands/semantic_search.rs"
+    ],
+    "notes": "Search command handler — should find the command implementation"
+  },
+  {
+    "query": "CallGraph",
+    "shape": "symbol",
+    "intent": "ExactSymbol",
+    "expected_top_files": [
+      "crates/aft/src/callgraph.rs"
+    ],
+    "expected_symbol_name": "CallGraph",
+    "notes": "Core callgraph struct — important symbol in the codebase"
+  }
+]

@@ -1378,4 +1378,43 @@ mod tests {
         // Single lane: RRF score only
         assert!(fused[0].score > 0.0);
     }
+
+    #[test]
+    fn exact_symbol_ranks_above_fuzzy() {
+        let store = Fts5Store::open_in_memory().unwrap();
+
+        let file_id = store
+            .upsert_file("src/lib.rs", "abc", 1000, 512, 1)
+            .unwrap();
+
+        // Insert exact symbol "Foo"
+        store
+            .upsert_symbol(file_id, "Foo", "struct", 1, 5, "struct Foo {}", "", "")
+            .unwrap();
+
+        // Insert a symbol that contains "Foo" in its body but isn't the symbol itself
+        store
+            .upsert_symbol(
+                file_id,
+                "process_data",
+                "function",
+                10,
+                20,
+                "fn process_data() { let foo = Foo::new(); }",
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Search for "Foo" — exact match should rank above body match
+        let planner = QueryPlanner::new(&store);
+        let results = planner.search("Foo", 10).unwrap();
+
+        assert!(results.len() >= 2, "should find both symbols");
+        // First result should be the exact symbol "Foo", not "process_data"
+        assert_eq!(
+            results[0].symbol_name, "Foo",
+            "exact symbol should rank above body match"
+        );
+    }
 }
