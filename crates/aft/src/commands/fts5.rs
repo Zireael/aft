@@ -27,6 +27,122 @@ fn runtime_disabled(req: &RawRequest) -> Response {
 // Text rendering helpers (agent-facing plain text)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Output envelope helpers
+// ---------------------------------------------------------------------------
+
+/// Output state — indicates the health of the result set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputState {
+    /// All results are complete and fresh.
+    Complete,
+    /// Some results were truncated due to limits.
+    Truncated,
+    /// The index is stale (some files changed since last index).
+    Stale,
+    /// The index is disabled or unavailable.
+    Degraded,
+    /// No results found.
+    Empty,
+}
+
+impl OutputState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            OutputState::Complete => "complete",
+            OutputState::Truncated => "truncated",
+            OutputState::Stale => "stale",
+            OutputState::Degraded => "degraded",
+            OutputState::Empty => "empty",
+        }
+    }
+}
+
+/// Progressive shortening levels for high-cardinality outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortenLevel {
+    /// Full snippets and details.
+    Full,
+    /// References without snippets.
+    ReferencesOnly,
+    /// Per-file counts only.
+    FileCounts,
+    /// Summary with refinement suggestion.
+    Summary,
+}
+
+/// Build the standard output envelope with evidence, state, and enrichment.
+fn build_envelope(
+    query: &str,
+    state: OutputState,
+    evidence: Vec<serde_json::Value>,
+    enrichment: serde_json::Value,
+    text: String,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "state": state.as_str(),
+        "evidence": evidence,
+        "enrichment": enrichment,
+        "text": text,
+    });
+    if state == OutputState::Empty {
+        envelope["message"] = serde_json::json!(format!("No results found for \"{query}\""));
+    }
+    envelope
+}
+
+/// Shorten results progressively based on level.
+fn shorten_results(results: &[serde_json::Value], level: ShortenLevel) -> Vec<serde_json::Value> {
+    match level {
+        ShortenLevel::Full => results.to_vec(),
+        ShortenLevel::ReferencesOnly => results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "symbol_id": r["symbol_id"],
+                    "file_path": r["file_path"],
+                    "symbol_name": r["symbol_name"],
+                    "symbol_kind": r["symbol_kind"],
+                    "start_line": r["start_line"],
+                    "end_line": r["end_line"],
+                    "score": r["score"],
+                    "name_path": r.get("name_path"),
+                })
+            })
+            .collect(),
+        ShortenLevel::FileCounts => {
+            let mut file_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for r in results {
+                let file = r["file_path"].as_str().unwrap_or("?");
+                *file_counts.entry(file.to_string()).or_insert(0) += 1;
+            }
+            file_counts
+                .into_iter()
+                .map(|(file, count)| {
+                    serde_json::json!({
+                        "file_path": file,
+                        "match_count": count,
+                    })
+                })
+                .collect()
+        }
+        ShortenLevel::Summary => {
+            let total = results.len();
+            let unique_files = results
+                .iter()
+                .filter_map(|r| r["file_path"].as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            vec![serde_json::json!({
+                "total_matches": total,
+                "unique_files": unique_files,
+                "suggestion": "Use --top_k to limit results or refine your query.",
+            })]
+        }
+    }
+}
+
 fn render_search_text(query: &str, scope: &str, results: &[serde_json::Value]) -> String {
     if results.is_empty() {
         return format!("FTS5 Search: \"{query}\"\nscope={scope} results=0\nNo results found.");
@@ -525,19 +641,37 @@ pub fn handle_fts5_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let total = json_results.len();
 
+    // Determine output state
+    let state = if total == 0 {
+        OutputState::Empty
+    } else if total >= top_k {
+        OutputState::Truncated
+    } else {
+        OutputState::Complete
+    };
+
+    // Progressive shortening: use full for small result sets, references for larger
+    let shorten_level = if total <= 10 {
+        ShortenLevel::Full
+    } else if total <= 50 {
+        ShortenLevel::ReferencesOnly
+    } else {
+        ShortenLevel::FileCounts
+    };
+
+    let shortened = shorten_results(&json_results, shorten_level);
     let text = render_search_text(&params.query, &params.scope, &json_results);
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "results": json_results,
-            "total": total,
-            "query": params.query,
-            "scope": params.scope,
-            "complete": true,
-            "text": text,
-        }),
-    )
+    // Build enrichment metadata
+    let enrichment = serde_json::json!({
+        "query_intent": format!("{:?}", crate::fts5_planner::AnalyzedQuery::analyze(&params.query).intent),
+        "result_count": total,
+        "shorten_level": format!("{:?}", shorten_level),
+    });
+
+    let envelope = build_envelope(&params.query, state, shortened, enrichment, text);
+
+    Response::success(&req.id, envelope)
 }
 
 // ---------------------------------------------------------------------------
@@ -700,19 +834,35 @@ pub fn handle_fts5_find_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let total = results.len();
+
+    // Determine output state
+    let state = if total == 0 {
+        OutputState::Empty
+    } else if total >= top_k {
+        OutputState::Truncated
+    } else {
+        OutputState::Complete
+    };
+
+    // Progressive shortening for find_symbol
+    let shorten_level = if total <= 10 {
+        ShortenLevel::Full
+    } else {
+        ShortenLevel::ReferencesOnly
+    };
+
+    let shortened = shorten_results(&results, shorten_level);
     let text = render_find_symbol_text(&params.name, &params.mode, &results);
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "results": results,
-            "total": total,
-            "name": params.name,
-            "mode": params.mode,
-            "complete": true,
-            "text": text,
-        }),
-    )
+    let enrichment = serde_json::json!({
+        "query_intent": format!("{:?}", crate::fts5_planner::AnalyzedQuery::analyze(&params.name).intent),
+        "result_count": total,
+        "mode": params.mode,
+    });
+
+    let envelope = build_envelope(&params.name, state, shortened, enrichment, text);
+
+    Response::success(&req.id, envelope)
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,5 +1351,83 @@ mod tests {
         let ctx = make_ctx_with_fts5(true);
         let resp = handle_fts5_search(&req, &ctx);
         assert!(!resp.success, "expected error for empty query");
+    }
+
+    // -----------------------------------------------------------------------
+    // Output envelope tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn output_state_as_str() {
+        assert_eq!(OutputState::Complete.as_str(), "complete");
+        assert_eq!(OutputState::Truncated.as_str(), "truncated");
+        assert_eq!(OutputState::Stale.as_str(), "stale");
+        assert_eq!(OutputState::Degraded.as_str(), "degraded");
+        assert_eq!(OutputState::Empty.as_str(), "empty");
+    }
+
+    #[test]
+    fn build_envelope_empty() {
+        let envelope = build_envelope(
+            "test",
+            OutputState::Empty,
+            vec![],
+            json!({}),
+            "no results".into(),
+        );
+        assert_eq!(envelope["state"], "empty");
+        assert!(envelope["message"].as_str().unwrap().contains("No results"));
+    }
+
+    #[test]
+    fn build_envelope_complete() {
+        let evidence = vec![json!({"symbol_name": "Foo"})];
+        let envelope = build_envelope(
+            "Foo",
+            OutputState::Complete,
+            evidence,
+            json!({}),
+            "found Foo".into(),
+        );
+        assert_eq!(envelope["state"], "complete");
+        assert_eq!(envelope["evidence"][0]["symbol_name"], "Foo");
+    }
+
+    #[test]
+    fn shorten_results_full() {
+        let results = vec![json!({"symbol_name": "Foo", "snippet": "struct Foo {}"})];
+        let shortened = shorten_results(&results, ShortenLevel::Full);
+        assert_eq!(shortened.len(), 1);
+        assert!(shortened[0].get("snippet").is_some());
+    }
+
+    #[test]
+    fn shorten_results_references_only() {
+        let results =
+            vec![json!({"symbol_name": "Foo", "snippet": "struct Foo {}", "file_path": "a.rs"})];
+        let shortened = shorten_results(&results, ShortenLevel::ReferencesOnly);
+        assert_eq!(shortened.len(), 1);
+        assert!(shortened[0].get("snippet").is_none());
+        assert!(shortened[0].get("file_path").is_some());
+    }
+
+    #[test]
+    fn shorten_results_file_counts() {
+        let results = vec![
+            json!({"file_path": "a.rs"}),
+            json!({"file_path": "a.rs"}),
+            json!({"file_path": "b.rs"}),
+        ];
+        let shortened = shorten_results(&results, ShortenLevel::FileCounts);
+        assert_eq!(shortened.len(), 2); // 2 unique files
+    }
+
+    #[test]
+    fn shorten_results_summary() {
+        let results = vec![json!({"file_path": "a.rs"}), json!({"file_path": "b.rs"})];
+        let shortened = shorten_results(&results, ShortenLevel::Summary);
+        assert_eq!(shortened.len(), 1);
+        assert_eq!(shortened[0]["total_matches"], 2);
+        assert_eq!(shortened[0]["unique_files"], 2);
     }
 }
