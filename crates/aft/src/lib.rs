@@ -96,6 +96,7 @@ pub mod semantic_eval;
 pub mod semantic_index;
 pub mod semantic_rerank;
 pub mod symbol_cache_disk;
+pub mod symbol_resolution;
 pub mod symbols;
 pub mod tool_path;
 pub mod url_fetch;
