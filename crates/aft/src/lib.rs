@@ -103,6 +103,7 @@ pub mod watcher_filter;
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only
 // uses portable APIs; only its callers are Windows-gated.
+pub mod symbol_diagnostics;
 pub mod vector_store;
 pub mod windows_shell;
 
