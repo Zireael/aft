@@ -81,6 +81,7 @@ pub mod lsp_hints;
 pub mod migrate_storage;
 pub mod model2vec_catalog;
 pub mod model2vec_download;
+pub mod mutation_risk;
 pub mod parser;
 pub mod pattern_compile;
 pub mod protocol;
