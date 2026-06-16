@@ -228,10 +228,10 @@ async function fts5Search(
     const responses = await aftNdjson(bin, commands, 60000);
 
     for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches;
+      const items = parsed.results || parsed.matches || parsed.evidence;
       if (items && Array.isArray(items)) {
         results = (items as any[]).map((r: any) => ({
-          file: r.file_path || r.path || "",
+          file: r.file_path || r.path || r.file || "",
           line: r.start_line || r.line,
           score: r.score,
         }));
@@ -279,7 +279,7 @@ async function aftGrepSearch(
     const responses = await aftNdjson(bin, commands, 60000);
 
     for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches;
+      const items = parsed.results || parsed.matches || parsed.evidence;
       if (items && Array.isArray(items)) {
         results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || r.file || "",
@@ -332,6 +332,8 @@ async function main() {
   );
 
   const allResults: ModeResult[] = [];
+  let fts5EmptyCount = 0;
+  let aftGrepEmptyCount = 0;
 
   // Verify binary exists (pilot always runs fts5 + aft-grep modes)
   if (binaryPath) {
@@ -398,6 +400,8 @@ async function main() {
         mrr: mrr(fts5Results, allRelevant),
         ndcg_at_k: ndcgAtK(fts5Results, allRelevant, k),
       });
+    } else {
+      fts5EmptyCount++;
     }
 
     // AFT grep mode (trigram-indexed)
@@ -421,6 +425,8 @@ async function main() {
         mrr: mrr(aftResults, allRelevant),
         ndcg_at_k: ndcgAtK(aftResults, allRelevant, k),
       });
+    } else {
+      aftGrepEmptyCount++;
     }
   }
 
@@ -482,10 +488,21 @@ async function main() {
   writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
 
   console.log(`\n=== Pilot Report ===`);
-  for (const [mode, data] of Object.entries(aggregate)) {
-    console.log(
-      `  ${mode}: recall=${(data.mean_recall * 100).toFixed(1)}% mrr=${data.mean_mrr.toFixed(3)} ndcg=${data.mean_ndcg.toFixed(3)} latency=${data.mean_latency_ms.toFixed(1)}ms`
-    );
+  const modes = ["lexical", "fts5", "aft-grep"];
+  for (const mode of modes) {
+    const data = aggregate[mode];
+    if (data) {
+      console.log(
+        `  ${mode}: recall=${(data.mean_recall * 100).toFixed(1)}% mrr=${data.mean_mrr.toFixed(3)} ndcg=${data.mean_ndcg.toFixed(3)} latency=${data.mean_latency_ms.toFixed(1)}ms (${data.query_count} queries)`
+      );
+    } else {
+      console.log(`  ${mode}: NO RESULTS`);
+    }
+  }
+
+  // Report empty mode counts
+  if (fts5EmptyCount > 0 || aftGrepEmptyCount > 0) {
+    console.log(`\n  ⚠ Empty results: fts5=${fts5EmptyCount}/${fixture.annotations.length} aft-grep=${aftGrepEmptyCount}/${fixture.annotations.length}`);
   }
 }
 

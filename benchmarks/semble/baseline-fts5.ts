@@ -164,7 +164,7 @@ async function fts5Search(
     const responses = await aftNdjson(binaryPath, commands, 60000);
 
     for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches;
+      const items = parsed.results || parsed.matches || parsed.evidence;
       if (items && Array.isArray(items)) {
         results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || "",

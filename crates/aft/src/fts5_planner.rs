@@ -903,10 +903,22 @@ impl<'a> QueryPlanner<'a> {
 
                 let fused_score = rrf_score + lane_bonus - path_penalty + definition_boost;
 
+                // Resolve file_path from file_id if empty (symbol lanes don't populate it)
+                let file_path = if best.file_path.is_empty() {
+                    self.store
+                        .get_file_by_id(best.file_id)
+                        .ok()
+                        .flatten()
+                        .map(|f| f.path)
+                        .unwrap_or_default()
+                } else {
+                    best.file_path.clone()
+                };
+
                 FusedResult {
                     symbol_id: best.symbol_id,
                     file_id: best.file_id,
-                    file_path: best.file_path.clone(),
+                    file_path,
                     symbol_name: best.symbol_name.clone(),
                     symbol_kind: best.symbol_kind.clone(),
                     start_line: best.start_line,
