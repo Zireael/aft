@@ -194,64 +194,60 @@ function rgSearch(
 }
 
 // ---------------------------------------------------------------------------
-// FTS5 mode
+// FTS5 mode — persistent session per repo
 // ---------------------------------------------------------------------------
 
-async function fts5Search(
-  query: string,
-  searchDir: string,
-  benchmarkRoot: string | null,
-  k: number,
-  binaryPath: string | null,
-  verbose = false
-): Promise<{ results: SearchResult[]; latency_ms: number }> {
-  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
-  const bin = binaryPath || "aft";
-  const start = performance.now();
-  let results: SearchResult[] = [];
-
+async function initFts5Session(
+  bin: string,
+  targetDir: string,
+  verbose: boolean
+): Promise<AftSession | null> {
+  const session = new AftSession(bin);
   try {
-    const commands: Record<string, unknown>[] = [
-      {
-        id: "cfg-fts5",
-        command: "configure",
-        harness: "opencode",
-        project_root: targetDir,
-        storage_dir: join(targetDir, ".aft-bench"),
-        fts5: { enabled: true },
-      },
-      {
-        id: "idx-fts5",
-        command: "fts5_index",
-        action: "update",
-      },
-      {
-        id: "search-fts5",
-        command: "fts5_search",
-        query,
-        scope: "all",
-        top_k: k,
-      },
-    ];
+    await session.call({
+      command: "configure",
+      harness: "opencode",
+      project_root: targetDir,
+      storage_dir: join(targetDir, ".aft-bench-fts5"),
+      fts5: { enabled: true },
+    }, 30_000);
+    // Build/update the FTS5 index once
+    const idxResp = await session.call({ command: "fts5_index", action: "update" }, 60_000);
+    if (verbose) console.log(`    FTS5 index: ${idxResp.success ? 'ok' : 'failed'}`);
+    return session;
+  } catch (e) {
+    if (verbose) console.log(`    FTS5 init ERROR: ${e}`);
+    session.close();
+    return null;
+  }
+}
 
-    const responses = await aftNdjson(bin, commands, 60000);
-    if (verbose) console.log(`    FTS5 responses: ${responses.length}/${commands.length}`);
-
-    for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches || parsed.evidence;
-      if (verbose) console.log(`    FTS5 [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
-      if (items && Array.isArray(items)) {
-        results = (items as any[]).map((r: any) => ({
-          file: r.file_path || r.path || r.file || "",
-          line: r.start_line || r.line,
-          score: r.score,
-        }));
-        break;
-      }
+async function fts5Query(
+  session: AftSession,
+  query: string,
+  k: number,
+  verbose: boolean
+): Promise<SearchResult[]> {
+  try {
+    const resp = await session.call({
+      command: "fts5_search",
+      query,
+      scope: "all",
+      top_k: k,
+    }, 30_000);
+    const items = (resp as any).evidence || (resp as any).results || (resp as any).matches;
+    if (verbose) console.log(`    FTS5 [search]: ${items ? `${items.length} items` : `success=${resp.success}`}`);
+    if (items && Array.isArray(items)) {
+      return (items as any[]).map((r: any) => ({
+        file: r.file_path || r.path || r.file || "",
+        line: r.start_line || r.line,
+        score: r.score,
+      }));
     }
-  } catch {}
-
-  return { results, latency_ms: performance.now() - start };
+  } catch (e) {
+    if (verbose) console.log(`    FTS5 search ERROR: ${e}`);
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -339,57 +335,55 @@ async function semanticQuery(
 }
 
 // ---------------------------------------------------------------------------
-// AFT grep mode (trigram-indexed)
+// AFT grep mode (trigram-indexed) — persistent session per repo
 // ---------------------------------------------------------------------------
 
-async function aftGrepSearch(
-  query: string,
-  searchDir: string,
-  benchmarkRoot: string | null,
-  k: number,
-  binaryPath: string | null,
-  verbose = false
-): Promise<{ results: SearchResult[]; latency_ms: number }> {
-  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
-  const bin = binaryPath || "aft";
-  const start = performance.now();
-  let results: SearchResult[] = [];
-
+async function initGrepSession(
+  bin: string,
+  targetDir: string,
+  verbose: boolean
+): Promise<AftSession | null> {
+  const session = new AftSession(bin);
   try {
-    const commands: Record<string, unknown>[] = [
-      {
-        id: "cfg-aft",
-        command: "configure",
-        harness: "opencode",
-        project_root: targetDir,
-        storage_dir: join(targetDir, ".aft-bench"),
-      },
-      {
-        id: "search-aft",
-        command: "grep",
-        pattern: query,
-        max_results: k,
-      },
-    ];
+    await session.call({
+      command: "configure",
+      harness: "opencode",
+      project_root: targetDir,
+      storage_dir: join(targetDir, ".aft-bench-grep"),
+    }, 30_000);
+    return session;
+  } catch (e) {
+    if (verbose) console.log(`    GREP init ERROR: ${e}`);
+    session.close();
+    return null;
+  }
+}
 
-    const responses = await aftNdjson(bin, commands, 60000);
-    if (verbose) console.log(`    GREP responses: ${responses.length}/${commands.length}`);
-
-    for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches || parsed.evidence;
-      if (verbose) console.log(`    GREP [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
-      if (items && Array.isArray(items)) {
-        results = (items as any[]).map((r: any) => ({
-          file: r.file_path || r.path || r.file || "",
-          line: r.start_line || r.line,
-          score: r.score,
-        }));
-        break;
-      }
+async function grepQuery(
+  session: AftSession,
+  query: string,
+  k: number,
+  verbose: boolean
+): Promise<SearchResult[]> {
+  try {
+    const resp = await session.call({
+      command: "grep",
+      pattern: query,
+      max_results: k,
+    }, 30_000);
+    const items = (resp as any).results || (resp as any).matches || (resp as any).evidence;
+    if (verbose) console.log(`    GREP [search]: ${items ? `${items.length} items` : `success=${resp.success}`}`);
+    if (items && Array.isArray(items)) {
+      return (items as any[]).map((r: any) => ({
+        file: r.file || r.file_path || r.path || "",
+        line: r.start_line || r.line,
+        score: r.score,
+      }));
     }
-  } catch {}
-
-  return { results, latency_ms: performance.now() - start };
+  } catch (e) {
+    if (verbose) console.log(`    GREP search ERROR: ${e}`);
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -444,10 +438,12 @@ async function main() {
   let m2vEmptyCount = 0;
   let feEmptyCount = 0;
 
-  // Semantic sessions — created once per repo, reused across queries
+  // Sessions — created once per repo, reused across queries
   const bin = binaryPath || "aft";
   let currentRepoName = "";
   const semSessions: Record<string, AftSession | null> = {};
+  let fts5Session: AftSession | null = null;
+  let grepSession: AftSession | null = null;
 
   // Verify binary exists (pilot always runs fts5 + aft-grep modes)
   if (binaryPath) {
@@ -468,27 +464,31 @@ async function main() {
     const repoDir = join(resolve(cacheDir), repo.name);
     if (!existsSync(repoDir)) continue;
 
-    // When repo changes, close old semantic sessions and init new ones
+    // When repo changes, close old sessions and init new ones
     if (ann.repo_name !== currentRepoName) {
       // Close old sessions
       for (const s of Object.values(semSessions)) s?.close();
       for (const k of Object.keys(semSessions)) delete semSessions[k];
+      fts5Session?.close();
+      grepSession?.close();
 
       currentRepoName = ann.repo_name;
       const targetDir = repo.benchmark_root ? join(repoDir, repo.benchmark_root) : repoDir;
-      console.log(`\n  Initializing semantic sessions for ${ann.repo_name}...`);
+      console.log(`\n  Initializing sessions for ${ann.repo_name}...`);
 
-      // Init sessions for each requested backend
+      // Init semantic sessions for each requested backend
       const backends = semanticBackend === "skip" ? []
         : semanticBackend === "both" ? ["model2vec", "fastembed"]
         : [semanticBackend];
       for (const be of backends) {
-        // Each backend gets its own storage_dir to avoid SQLite lock conflicts
         const storageDir = join(targetDir, `.aft-bench-${be}`);
-        // fastembed only supports all-MiniLM-L6-v2; model2vec uses --model flag
         const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : semanticModel;
         semSessions[be] = await initSemanticSession(bin, targetDir, beModel, be, verbose, storageDir);
       }
+
+      // Init FTS5 and grep sessions
+      fts5Session = await initFts5Session(bin, targetDir, verbose);
+      grepSession = await initGrepSession(bin, targetDir, verbose);
     }
 
     const allRelevant = [
@@ -517,14 +517,9 @@ async function main() {
     });
 
     // FTS5 mode
-    const { results: fts5Results, latency_ms: fts5Latency } = await fts5Search(
-      ann.query,
-      repoDir,
-      repo.benchmark_root,
-      k,
-      binaryPath,
-      verbose
-    );
+    const fts5Start = performance.now();
+    const fts5Results = fts5Session ? await fts5Query(fts5Session, ann.query, k, verbose) : [];
+    const fts5Latency = performance.now() - fts5Start;
 
     if (fts5Results.length > 0) {
       allResults.push({
@@ -544,14 +539,9 @@ async function main() {
     }
 
     // AFT grep mode (trigram-indexed)
-    const { results: aftResults, latency_ms: aftLatency } = await aftGrepSearch(
-      ann.query,
-      repoDir,
-      repo.benchmark_root,
-      k,
-      binaryPath,
-      verbose
-    );
+    const grepStart = performance.now();
+    const aftResults = grepSession ? await grepQuery(grepSession, ann.query, k, verbose) : [];
+    const aftLatency = performance.now() - grepStart;
 
     if (aftResults.length > 0) {
       allResults.push({
@@ -655,8 +645,10 @@ async function main() {
 
   writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
 
-  // Close all semantic sessions
+  // Close all sessions
   for (const s of Object.values(semSessions)) s?.close();
+  fts5Session?.close();
+  grepSession?.close();
 
   console.log(`\n=== Pilot Report ===`);
   const modes = ["lexical", "fts5", "semantic-m2v", "semantic-fe", "aft-grep"];
