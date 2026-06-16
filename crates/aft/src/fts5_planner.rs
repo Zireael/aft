@@ -654,6 +654,8 @@ impl<'a> QueryPlanner<'a> {
                 raw_score: rank,
                 normalized_score: normalized * 0.4, // Lower weight for paths
                 lane: "path_fts".to_string(),
+                name_path: String::new(),
+                duplicate_index: 0,
             });
         }
 
@@ -848,7 +850,7 @@ impl<'a> QueryPlanner<'a> {
                 });
 
                 let mut rrf_score: f64 = 0.0;
-                for (rank_pos, result) in sorted_group.iter().enumerate() {
+                for (rank_pos, _result) in sorted_group.iter().enumerate() {
                     rrf_score += 1.0 / (k + rank_pos as f64 + 1.0);
                 }
 

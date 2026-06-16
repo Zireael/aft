@@ -348,7 +348,7 @@ impl<'a> Fts5Indexer<'a> {
         let mut chunk_start: u32 = 0;
         let mut paragraph_lines = Vec::new();
         let max_chunk_lines: u32 = 60;
-        let max_chunk_chars = 2000;
+        let _max_chunk_chars = 2000;
 
         for (i, line) in lines.iter().enumerate() {
             let line_num = i as u32;
@@ -360,11 +360,12 @@ impl<'a> Fts5Indexer<'a> {
                     let body = paragraph_lines.join("\n");
                     if !body.trim().is_empty() {
                         let content_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
-                        let chunk_kind = if paragraph_lines.iter().any(|l| l.starts_with('#')) {
-                            crate::fts5_store::chunk_kind::HEADING
-                        } else {
-                            crate::fts5_store::chunk_kind::PARAGRAPH
-                        };
+                        let chunk_kind =
+                            if paragraph_lines.iter().any(|l: &&str| l.starts_with('#')) {
+                                crate::fts5_store::chunk_kind::HEADING
+                            } else {
+                                crate::fts5_store::chunk_kind::PARAGRAPH
+                            };
                         self.store.upsert_chunk(
                             file_id,
                             chunk_start + 1, // 1-based
