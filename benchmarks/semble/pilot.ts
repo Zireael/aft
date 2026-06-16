@@ -266,7 +266,8 @@ async function initSemanticSession(
   targetDir: string,
   model: string,
   backend: string,
-  verbose: boolean
+  verbose: boolean,
+  storageDir?: string
 ): Promise<AftSession | null> {
   const session = new AftSession(bin);
   try {
@@ -274,7 +275,7 @@ async function initSemanticSession(
       command: "configure",
       harness: "opencode",
       project_root: targetDir,
-      storage_dir: join(targetDir, ".aft-bench"),
+      storage_dir: storageDir || join(targetDir, ".aft-bench"),
       semantic_search: true,
       semantic: { backend, model },
     }, 30000);
@@ -481,7 +482,9 @@ async function main() {
         : semanticBackend === "both" ? ["model2vec", "fastembed"]
         : [semanticBackend];
       for (const be of backends) {
-        semSessions[be] = await initSemanticSession(bin, targetDir, semanticModel, be, verbose);
+        // Each backend gets its own storage_dir to avoid SQLite lock conflicts
+        const storageDir = join(targetDir, `.aft-bench-${be}`);
+        semSessions[be] = await initSemanticSession(bin, targetDir, semanticModel, be, verbose, storageDir);
       }
     }
 
