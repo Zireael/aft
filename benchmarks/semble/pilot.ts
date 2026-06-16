@@ -291,7 +291,8 @@ async function initSemanticSession(
         return session;
       }
       if (semStatus === "failed" || semStatus === "disabled") {
-        if (verbose) process.stdout.write(`    SEM-${backend} status: ${semStatus}     \n`);
+        const err = (status as any).semantic_index?.error || "unknown";
+        if (verbose) process.stdout.write(`    SEM-${backend} status: ${semStatus} error=${err}     \n`);
         session.close();
         return null;
       }
@@ -484,7 +485,9 @@ async function main() {
       for (const be of backends) {
         // Each backend gets its own storage_dir to avoid SQLite lock conflicts
         const storageDir = join(targetDir, `.aft-bench-${be}`);
-        semSessions[be] = await initSemanticSession(bin, targetDir, semanticModel, be, verbose, storageDir);
+        // fastembed only supports all-MiniLM-L6-v2; model2vec uses --model flag
+        const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : semanticModel;
+        semSessions[be] = await initSemanticSession(bin, targetDir, beModel, be, verbose, storageDir);
       }
     }
 
