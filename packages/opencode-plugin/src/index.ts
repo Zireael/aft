@@ -82,6 +82,7 @@ import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import { semanticDoctorTools } from "./tools/semantic-doctor.js";
+import { semanticEvalTools } from "./tools/semantic-eval.js";
 import { fts5Tools } from "./tools/fts5.js";
 import { verifyTools } from "./tools/verify.js";
 import type { PluginContext } from "./types.js";
@@ -899,6 +900,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...(surface !== "minimal" && astTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticDoctorTools(ctx)),
+    ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticEvalTools(ctx)),
     ...(surface !== "minimal" && aftConfig.fts5?.enabled === true && fts5Tools(ctx)),
     ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
     ...(surface !== "minimal" && verifyTools(ctx)),

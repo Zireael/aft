@@ -614,6 +614,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
         "verify" => aft::commands::verify::handle_verify(&req, ctx),
         "semantic_doctor" => aft::commands::semantic_doctor::handle_semantic_doctor(&req, ctx),
+        "semantic_eval" => aft::commands::semantic_eval::handle_semantic_eval(&req, ctx),
         "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),

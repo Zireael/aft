@@ -95,6 +95,7 @@ import { registerRefactorTool } from "./tools/refactor.js";
 import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
 import { registerSemanticDoctorTool } from "./tools/semantic-doctor.js";
+import { registerSemanticEvalTool } from "./tools/semantic-eval.js";
 import { registerFts5Tool } from "./tools/fts5.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
@@ -758,6 +759,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (surface.semantic) {
     registerSemanticTool(pi, ctx);
     registerSemanticDoctorTool(pi, ctx);
+    registerSemanticEvalTool(pi, ctx);
   }
   if (config.fts5?.enabled) {
     registerFts5Tool(pi, ctx);
