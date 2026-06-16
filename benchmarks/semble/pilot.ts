@@ -13,6 +13,9 @@
  *   --input <file>       Fixture file (default: fixtures.json)
  *   --k <n>              Top-k for evaluation (default: 10)
  *   --output <file>      Output report (default: pilot-report.json)
+ *   --binary <path>      Path to aft binary (for FTS5/grep/semantic modes)
+ *   --model <name>       model2vec model for semantic mode (default: minishlab/potion-code-16M)
+ *   --verbose, -v        Show per-query debug output
  */
 
 import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
@@ -247,6 +250,67 @@ async function fts5Search(
 }
 
 // ---------------------------------------------------------------------------
+// Semantic search mode (model2vec + built-in ONNX)
+// ---------------------------------------------------------------------------
+
+async function semanticSearch(
+  query: string,
+  searchDir: string,
+  benchmarkRoot: string | null,
+  k: number,
+  binaryPath: string | null,
+  model: string,
+  verbose = false
+): Promise<{ results: SearchResult[]; latency_ms: number }> {
+  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
+  const bin = binaryPath || "aft";
+  const start = performance.now();
+  let results: SearchResult[] = [];
+
+  try {
+    const commands: Record<string, unknown>[] = [
+      {
+        id: "cfg-sem",
+        command: "configure",
+        harness: "opencode",
+        project_root: targetDir,
+        storage_dir: join(targetDir, ".aft-bench"),
+        semantic_search: true,
+        semantic: {
+          backend: "model2vec",
+          model,
+        },
+      },
+      {
+        id: "search-sem",
+        command: "semantic_search",
+        query,
+        topK: k,
+      },
+    ];
+
+    // Semantic needs longer timeout — first query loads model + builds index
+    const responses = await aftNdjson(bin, commands, 120000);
+    if (verbose) console.log(`    SEM responses: ${responses.length}/${commands.length}`);
+
+    for (const parsed of [...responses].reverse()) {
+      const items = parsed.results || parsed.matches || parsed.evidence;
+      if (verbose) console.log(`    SEM [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
+      if (items && Array.isArray(items)) {
+        results = (items as any[]).map((r: any) => ({
+          file: r.file || r.file_path || r.path || "",
+          line: r.start_line || r.line,
+          score: r.score,
+        }));
+        break;
+      }
+    }
+  } catch {}
+
+  return { results, latency_ms: performance.now() - start };
+}
+
+// ---------------------------------------------------------------------------
 // AFT grep mode (trigram-indexed)
 // ---------------------------------------------------------------------------
 
@@ -312,6 +376,7 @@ async function main() {
   let outputFile = "pilot-report.json";
     let binaryPath: string | null = null;
     let verbose = false;
+    let semanticModel = "minishlab/potion-code-16M";
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -332,7 +397,8 @@ async function main() {
       case "--verbose":
       case "-v":
         verbose = true; break;
-        break;
+      case "--model":
+        semanticModel = args[++i]; break;
     }
   }
 
@@ -344,6 +410,7 @@ async function main() {
   const allResults: ModeResult[] = [];
   let fts5EmptyCount = 0;
   let aftGrepEmptyCount = 0;
+  let semanticEmptyCount = 0;
 
   // Verify binary exists (pilot always runs fts5 + aft-grep modes)
   if (binaryPath) {
@@ -442,6 +509,34 @@ async function main() {
       aftGrepEmptyCount++;
       if (verbose) console.log(`  GREP EMPTY: "${ann.query}" [${ann.repo_name}]`);
     }
+
+    // Semantic search mode (model2vec + ONNX)
+    const { results: semResults, latency_ms: semLatency } = await semanticSearch(
+      ann.query,
+      repoDir,
+      repo.benchmark_root,
+      k,
+      binaryPath,
+      semanticModel,
+      verbose
+    );
+
+    if (semResults.length > 0) {
+      allResults.push({
+        mode: "semantic",
+        query: ann.query,
+        repo_name: ann.repo_name,
+        category: ann.category,
+        latency_ms: semLatency,
+        results: semResults,
+        recall_at_k: recallAtK(semResults, allRelevant, k),
+        mrr: mrr(semResults, allRelevant),
+        ndcg_at_k: ndcgAtK(semResults, allRelevant, k),
+      });
+    } else {
+      semanticEmptyCount++;
+      if (verbose) console.log(`  SEM EMPTY: "${ann.query}" [${ann.repo_name}]`);
+    }
   }
 
   // Aggregate by mode
@@ -502,7 +597,7 @@ async function main() {
   writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
 
   console.log(`\n=== Pilot Report ===`);
-  const modes = ["lexical", "fts5", "aft-grep"];
+  const modes = ["lexical", "fts5", "semantic", "aft-grep"];
   for (const mode of modes) {
     const data = aggregate[mode];
     if (data) {
@@ -515,8 +610,12 @@ async function main() {
   }
 
   // Report empty mode counts
-  if (fts5EmptyCount > 0 || aftGrepEmptyCount > 0) {
-    console.log(`\n  ⚠ Empty results: fts5=${fts5EmptyCount}/${fixture.annotations.length} aft-grep=${aftGrepEmptyCount}/${fixture.annotations.length}`);
+  const emptyParts: string[] = [];
+  if (fts5EmptyCount > 0) emptyParts.push(`fts5=${fts5EmptyCount}/${fixture.annotations.length}`);
+  if (semanticEmptyCount > 0) emptyParts.push(`semantic=${semanticEmptyCount}/${fixture.annotations.length}`);
+  if (aftGrepEmptyCount > 0) emptyParts.push(`aft-grep=${aftGrepEmptyCount}/${fixture.annotations.length}`);
+  if (emptyParts.length > 0) {
+    console.log(`\n  ⚠ Empty results: ${emptyParts.join(' ')}`);
   }
 }
 
