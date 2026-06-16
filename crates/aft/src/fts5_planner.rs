@@ -221,7 +221,7 @@ impl AnalyzedQuery {
                 intent,
                 Intent::FilePath | Intent::NaturalLanguage | Intent::ExactLiteral
             ),
-            body_fts: !matches!(intent, Intent::FilePath | Intent::ExactSymbol),
+            body_fts: !matches!(intent, Intent::FilePath),
             short_token_fallback: matches!(intent, Intent::ShortToken),
             weights,
         };
