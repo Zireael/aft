@@ -239,7 +239,20 @@ impl Fts5Store {
         if is_new {
             store.create_schema()?;
         } else {
-            store.check_schema_version()?;
+            match store.check_schema_version() {
+                Ok(()) => {}
+                Err(Fts5StoreError::SchemaMismatch { expected, found }) => {
+                    // Schema version mismatch — rebuild from scratch.
+                    // This is safe because the FTS5 index is fully rebuildable from
+                    // source files; no user data is lost.
+                    log::info!(
+                        "fts5_store: schema version mismatch (expected v{expected}, found v{found}), rebuilding"
+                    );
+                    store.rebuild()?;
+                    store.create_schema()?;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(store)
