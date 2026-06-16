@@ -313,10 +313,16 @@ fn embedding_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // On Windows, USERPROFILE is always the correct user profile directory.
+    // HOME may point to an MSYS2/Cygwin path (e.g., /home/user -> C:\msys64\home\user)
+    // which doesn't exist or is the wrong location for model caches.
+    let home = if cfg!(target_os = "windows") {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    }
+    .map(PathBuf::from)
+    .unwrap_or_else(std::env::temp_dir);
     home.join(".cache").join("fastembed")
 }
 
