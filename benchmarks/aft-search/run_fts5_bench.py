@@ -19,11 +19,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
-
-# Add parent directory to path for metrics
-sys.path.insert(0, str(Path(__file__).parent))
-from metrics import compute_retrieval_metrics
 
 
 def start_aft(binary: str, project_root: str, storage_dir: str) -> subprocess.Popen:

@@ -18,7 +18,6 @@
  *   --mode <mode>        Search mode: grep (default) | semantic | hybrid
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
 import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { aftNdjson } from "./aft-ndjson";

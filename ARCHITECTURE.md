@@ -58,21 +58,49 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests and route each command to a focused handler.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
-- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/bash_notify/bash_watch/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/callgraph_store/semantic_doctor/semantic_eval/state
-- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/compress/`, `crates/aft/src/inspect/`
+- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/bash_notify/bash_watch/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/callgraph_store/semantic_doctor/semantic_eval/state/fts5/verify/edit_symbol/move_symbol/inline_symbol/extract_function
+- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/compress/`, `crates/aft/src/inspect/`, `crates/aft/src/fts5_store.rs`, `crates/aft/src/fts5_planner.rs`, `crates/aft/src/symbol_resolution.rs`, `crates/aft/src/mutation_risk.rs`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
-- Purpose: Parse code, compute call graphs, persist callgraph state, apply edits, format files, manage imports, index code semantically and with trigrams, rerank search results (chat-based or cross-encoder), generate embeddings locally, chunk large symbols for embedding overflow, and provide AST-grep integration.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_eval.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, callgraph computation and persistence (SQLite-backed with generational snapshots), semantic embedding index with overflow chunking for large symbols, trigram search index, dual-mode search reranker (chat-based LLM and cross-encoder `/v1/rerank` endpoints), local ONNX embedding (ort-driven, replacing fastembed), pluggable vector storage (flat f32 / binary Hamming), search diagnostics and health reports, disk-backed symbol cache, AST-grep integration, grep scope resolution and execution pipeline
+- Purpose: Parse code, compute call graphs, persist callgraph state, apply edits, format files, manage imports, index code semantically and with trigrams, rerank search results (chat-based or cross-encoder), generate embeddings locally, chunk large symbols for embedding overflow, provide AST-grep integration, perform symbol-level operations (resolution, insert, diagnostics), and validate tool schemas.
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/semantic_rerank.rs`, `crates/aft/src/semantic_diagnostics.rs`, `crates/aft/src/semantic_eval.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/local_embed.rs`, `crates/aft/src/vector_store.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`, `crates/aft/src/symbol_resolution.rs`, `crates/aft/src/symbol_insert.rs`, `crates/aft/src/symbol_diagnostics.rs`, `crates/aft/src/lint_tool_schemas.rs`
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, callgraph computation and persistence (SQLite-backed with generational snapshots), semantic embedding index with overflow chunking for large symbols, trigram search index, dual-mode search reranker (chat-based LLM and cross-encoder `/v1/rerank` endpoints), local ONNX embedding (ort-driven, replacing fastembed), pluggable vector storage (flat f32 / binary Hamming), search diagnostics and health reports, disk-backed symbol cache, AST-grep integration, grep scope resolution and execution pipeline, confidence-weighted declaration resolution, insert-before/after operations, symbol-scoped diagnostic grouping, tool schema linting
 - Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (via `ort`), OpenAI-compatible chat and rerank endpoints (reranker), SQLite (callgraph store), the `tokenizers` crate (local embed)
 - Used by: `crates/aft/src/commands/*.rs`
 
+**FTS5 search engine layer:**
+- Purpose: Provide production-ready full-text search using SQLite FTS5 with multi-lane query routing, versioned schema, and transactional updates.
+- Location: `crates/aft/src/fts5_store.rs`, `crates/aft/src/fts5_planner.rs`, `crates/aft/src/fts5_indexer.rs`, `crates/aft/src/fts5_experimental.rs`
+- Contains: Versioned FTS5 schema (v4), symbol/body/path FTS tables, multi-lane query planner (exact, prefix, FTS, fallback), incremental indexing with staleness tracking, health diagnostics, and `fts5_search`/`fts5_index`/`fts5_find_symbol`/`fts5_read_symbol` commands
+- Depends on: SQLite with FTS5 extension, tree-sitter symbols, callgraph index
+- Used by: `crates/aft/src/commands/fts5.rs`, `packages/opencode-plugin/src/tools/fts5.ts`, `packages/pi-plugin/src/tools/fts5.ts`
+
+**Symbol intelligence layer:**
+- Purpose: Provide native declaration resolution, symbol references, implementations, insert-before/after operations, and symbol-scoped diagnostics.
+- Location: `crates/aft/src/symbol_resolution.rs`, `crates/aft/src/symbol_insert.rs`, `crates/aft/src/symbol_diagnostics.rs`
+- Contains: `Confidence` enum (Exact/High/Medium/Low/None), declaration-at-usage resolution via FTS5 and syntax heuristics, symbol reference lookup, implementation edge discovery, insert-before/after operations that avoid fragile line numbers, diagnostic grouping and prioritization by containing symbol
+- Depends on: FTS5 store, symbol identity, imports, references, syntax heuristics
+- Used by: `crates/aft/src/commands/edit_symbol.rs`, `crates/aft/src/commands/verify.rs`, OpenCode/Pi tool definitions
+
+**Mutation risk layer:**
+- Purpose: Compute pre-mutation risk based on graph health, symbol facts, and file classification to warn about high-risk edits before they happen.
+- Location: `crates/aft/src/mutation_risk.rs`, `crates/aft/src/export_detection.rs`, `crates/aft/src/ril_indexer.rs`
+- Contains: `RiskLevel` enum (Low/Medium/High/Critical), `RiskReason` with weight-based scoring, `FileKind` classification, export change detection (removed/added/signature-changed), RIL graph indexer with health states (Disabled/Cold/Indexing/Healthy/Stale/Rebuilding/Degraded/Corrupt)
+- Depends on: RIL graph index, symbol facts, file classification
+- Used by: `crates/aft/src/commands/verify.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/commands/write.rs`
+
+**Intelligence configuration layer:**
+- Purpose: Expose safe configuration toggles for all new intelligence subsystems with defaults that preserve exact behavior.
+- Location: `crates/aft/src/intelligence_config.rs`
+- Contains: `IntelligenceConfig` struct with sub-configs for FTS5, hybrid ranking, chunk retrieval, graph, mutation risk, verify, context economy, and symbolic refactor; each subsystem has `enabled` toggle and behavior-preserving defaults
+- Depends on: Serde serialization
+- Used by: `crates/aft/src/config.rs`, `packages/opencode-plugin/src/config.ts`, `packages/pi-plugin/src/config.ts`
+
 **State and diagnostics layer:**
-- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, callgraph persistence, codebase-health scanning, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/inspect/`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`
-- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, `CallGraph` (in-memory), `CallGraphStore` (SQLite-backed, generational), `InspectManager` (Tier 1/2 background scanner workers), `Tier2RefreshScheduler` (debounced background refresh), `InspectCache` (persistent inspection results), `WorkerCtx` (per-scanner state), LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, bash output watch patterns
+- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, callgraph persistence, codebase-health scanning, LSP state, database storage, bash background tasks, cache freshness tracking, file-system locking, intelligence subsystem configuration, and observability metrics.
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/`, `crates/aft/src/calls.rs`, `crates/aft/src/inspect/`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/intelligence_config.rs`, `crates/aft/src/observability_ledger.rs`
+- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, `CallGraph` (in-memory), `CallGraphStore` (SQLite-backed, generational), `InspectManager` (Tier 1/2 background scanner workers), `Tier2RefreshScheduler` (debounced background refresh), `InspectCache` (persistent inspection results), `WorkerCtx` (per-scanner state), LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, bash output watch patterns, `IntelligenceConfig` (FTS5, hybrid ranking, chunk retrieval, graph, mutation risk, verify, context economy, symbolic refactor toggles), `MetricsLedger` (local enrichment, compression, cache hit, and output size metrics)
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `callgraph_store/` and `db/`), `serde`, `rayon` (inspect parallel scanning)
 - Used by: All command handlers through `AppContext`
 
@@ -105,6 +133,22 @@
 5. For remote backends, chunk large symbol embeddings that exceed `max_embed_tokens` to prevent HTTP 400 errors -- `crates/aft/src/semantic_index.rs`
 6. Track search pipeline decisions for diagnostics -- `crates/aft/src/semantic_diagnostics.rs`
 
+**FTS5 full-text search flow:**
+
+1. Build/update versioned FTS5 schema with symbol/body/path virtual tables -- `crates/aft/src/fts5_store.rs`
+2. Classify query intent (exact symbol, prefix, FTS, natural language, error string, short token, regex, literal) -- `crates/aft/src/fts5_planner.rs`
+3. Execute multi-lane search (exact SQL, prefix SQL, symbol FTS, path FTS, body FTS, short-token fallback) -- `crates/aft/src/fts5_planner.rs`
+4. Fuse results with score normalization and deduplication -- `crates/aft/src/fts5_planner.rs`
+5. Serve `fts5_search`, `fts5_index`, `fts5_find_symbol`, `fts5_read_symbol` commands -- `crates/aft/src/commands/fts5.rs`
+
+**Mutation risk and verification flow:**
+
+1. Classify mutation risk using graph health, symbol facts, and file classification -- `crates/aft/src/mutation_risk.rs`
+2. Detect export changes (removed/added/signature-changed) before and after mutation -- `crates/aft/src/export_detection.rs`
+3. Track graph health states via RIL indexer -- `crates/aft/src/ril_indexer.rs`
+4. Group and prioritize diagnostics by containing symbol -- `crates/aft/src/symbol_diagnostics.rs`
+5. Suggest verification actions (tests, lint, diagnostics) for changed files -- `crates/aft/src/commands/verify.rs`
+
 **Bash execution flow:**
 
 1. Rewrite high-level commands (cat to read, grep to grep tool) -- `crates/aft/src/bash_rewrite/`
@@ -132,19 +176,19 @@
 
 **Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.
-- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/bash_watch.ts`, `packages/opencode-plugin/src/tools/bash_write.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/permissions.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`
+- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/bash_watch.ts`, `packages/opencode-plugin/src/tools/bash_write.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/permissions.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`, `packages/opencode-plugin/src/tools/fts5.ts`
 - Pattern: Thin TypeScript adapters over shared bridge transport
 
 **Tool groups (Pi):**
 - Purpose: Group related Pi tool definitions by capability surface.
-- Location: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/structure.ts`, `packages/pi-plugin/src/tools/navigate.ts`, `packages/pi-plugin/src/tools/refactor.ts`, `packages/pi-plugin/src/tools/safety.ts`, `packages/pi-plugin/src/tools/conflicts.ts`, `packages/pi-plugin/src/tools/ast.ts`, `packages/pi-plugin/src/tools/bash.ts`, `packages/pi-plugin/src/tools/semantic.ts`, `packages/pi-plugin/src/tools/inspect.ts`, `packages/pi-plugin/src/tools/fs.ts`, `packages/pi-plugin/src/tools/diff-format.ts`, `packages/pi-plugin/src/tools/render-helpers.ts`
+- Location: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/structure.ts`, `packages/pi-plugin/src/tools/navigate.ts`, `packages/pi-plugin/src/tools/refactor.ts`, `packages/pi-plugin/src/tools/safety.ts`, `packages/pi-plugin/src/tools/conflicts.ts`, `packages/pi-plugin/src/tools/ast.ts`, `packages/pi-plugin/src/tools/bash.ts`, `packages/pi-plugin/src/tools/semantic.ts`, `packages/pi-plugin/src/tools/inspect.ts`, `packages/pi-plugin/src/tools/fs.ts`, `packages/pi-plugin/src/tools/diff-format.ts`, `packages/pi-plugin/src/tools/render-helpers.ts`, `packages/pi-plugin/src/tools/fts5.ts`
 - Pattern: Thin TypeScript adapters over shared bridge transport with Pi-specific argument mapping
 
 **AppContext:**
 - Purpose: Centralize runtime state for commands inside the Rust worker.
 - Location: `crates/aft/src/context.rs`
 - Pattern: Interior-mutable service container for a single-threaded request loop
-- Contains: `CallGraph`, `SearchIndex`, `SemanticIndex`, `BgTaskRegistry`, `FilterRegistry`, database connections, LSP manager, undo history
+- Contains: `CallGraph`, `SearchIndex`, `SemanticIndex`, `Fts5Store`, `BgTaskRegistry`, `FilterRegistry`, `IntelligenceConfig`, database connections, LSP manager, undo history
 
 **CallGraph:**
 - Purpose: Cache per-file call data in memory and answer callers, call-tree, impact, and trace queries.
@@ -180,6 +224,46 @@
 - Purpose: Re-rank semantic search results using an OpenAI-compatible endpoint for improved relevance. Supports two API formats: `chat` (LLM-based, `/v1/chat/completions` with a ranking prompt) and `rerank` (cross-encoder, `/v1/rerank` for models like GTE-Reranker-Modernbert served via vLLM, TEI, or llama.cpp).
 - Location: `crates/aft/src/semantic_rerank.rs`
 - Pattern: Dispatches based on `RerankApiType` (config field `rerank_api_type`). Chat mode sends candidate chunks with a ranking prompt; cross-encoder mode sends `{model, query, documents, top_n}`. Falls back to original order on any error. Cross-encoder mode uses shorter snippets (`rerank_max_candidate_chars_cross_encoder`, default 512). The `SearchPipeline` diagnostic module (`crates/aft/src/semantic_diagnostics.rs`) tracks which pipeline path (lexical, semantic, hybrid, rerank, lexical-fallback) served each query.
+
+**Fts5Store:**
+- Purpose: Provide production-ready full-text search using SQLite FTS5 with versioned schema and transactional updates.
+- Location: `crates/aft/src/fts5_store.rs`
+- Pattern: Versioned multi-table schema (v4) with separate `fts5_symbols`, `fts5_symbol_bodies_fts`, `fts5_paths_fts` virtual tables; transactional consistency between regular and FTS tables; health diagnostics and staleness tracking
+
+**Fts5Planner:**
+- Purpose: Analyze queries and route to optimal search lanes with result fusion.
+- Location: `crates/aft/src/fts5_planner.rs`
+- Pattern: Multi-lane dispatch (exact SQL, prefix SQL, symbol FTS, path FTS, body FTS, short-token fallback) with score normalization and deduplication; intent classification for natural language, error strings, regex, and exact literals
+
+**SymbolResolution:**
+- Purpose: Provide native declaration resolution, symbol references, and implementation edges.
+- Location: `crates/aft/src/symbol_resolution.rs`
+- Pattern: Confidence-weighted resolution (Exact/High/Medium/Low/None) using FTS5, syntax heuristics, imports, and references; results carry degraded metadata for fallback paths
+
+**SymbolInsert:**
+- Purpose: Insert content before or after a symbol without calculating fragile line numbers.
+- Location: `crates/aft/src/symbol_insert.rs`
+- Pattern: Unique symbol resolution required; ambiguous symbols return candidates without mutating; `InsertPosition::Before`/`After` enum drives placement
+
+**SymbolDiagnostics:**
+- Purpose: Group and prioritize diagnostics by containing symbol for edit context.
+- Location: `crates/aft/src/symbol_diagnostics.rs`
+- Pattern: Map diagnostic ranges to containing symbols; prioritize by severity (Error/Warning/Info/Hint); distinguish "no errors" from "diagnostics unavailable"
+
+**MutationRisk:**
+- Purpose: Compute pre-mutation risk based on graph health, symbol facts, and file classification.
+- Location: `crates/aft/src/mutation_risk.rs`
+- Pattern: `RiskLevel` enum (Low/Medium/High/Critical) with `RiskReason` weight-based scoring; `FileKind` classification (source, test, config, documentation); Critical level requires explicit confirmation
+
+**ExportDetection:**
+- Purpose: Detect removed/added/changed public symbols before and after mutation.
+- Location: `crates/aft/src/export_detection.rs`
+- Pattern: Compare pre/post mutation exported symbols; report `ExportChangeKind` (Removed/Added/SignatureChanged) with file path and context
+
+**RilIndexer:**
+- Purpose: Index files, symbols, imports, and reverse importers into the Repository Intelligence Layer database.
+- Location: `crates/aft/src/ril_indexer.rs`
+- Pattern: Incremental updates for changed files; `GraphHealth` states (Disabled/Cold/Indexing/Healthy/Stale/Rebuilding/Degraded/Corrupt); `usable()` gate for mutation risk
 
 **BgTaskRegistry:**
 - Purpose: Manage background bash tasks, PTY sessions, and output watch patterns.
@@ -324,6 +408,6 @@ These types exist and are tested so the migration can happen incrementally witho
 
 **Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` or `packages/pi-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.
 
-**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, persist callgraph data to SQLite (generational snapshots) via `crates/aft/src/callgraph_store/`, cache inspection results persistently via `crates/aft/src/inspect/cache.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
+**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, persist callgraph data to SQLite (generational snapshots) via `crates/aft/src/callgraph_store/`, cache inspection results persistently via `crates/aft/src/inspect/cache.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`, cache FTS5 index in versioned SQLite schema via `crates/aft/src/fts5_store.rs`, and persist RIL graph data via `crates/aft/src/ril_indexer.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state) in `crates/aft/src/db/`, FTS5 search index in versioned SQLite schema via `crates/aft/src/fts5_store.rs`, RIL graph data via `crates/aft/src/ril_indexer.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.

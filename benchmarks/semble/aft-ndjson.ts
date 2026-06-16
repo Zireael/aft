@@ -29,7 +29,7 @@ export function aftNdjson(
   binaryPath: string,
   commands: Record<string, unknown>[],
   timeoutMs = 30000
-): AftResponse[] {
+): Promise<AftResponse[]> {
   return new Promise<AftResponse[]>((resolve, reject) => {
     const child = spawn(binaryPath, [], {
       stdio: ["pipe", "pipe", "pipe"],
