@@ -15,7 +15,7 @@
  *   --output <file>      Output report (default: pilot-report.json)
  *   --binary <path>      Path to aft binary (for FTS5/grep/semantic modes)
  *   --model <name>       model2vec model for semantic mode (default: minishlab/potion-code-16M)
- *   --backend <name>     Semantic backend: model2vec (default) or fastembed
+ *   --backend <name>     Semantic backend(s): 'both' (default), 'model2vec', 'fastembed', or 'skip'
  *   --verbose, -v        Show per-query debug output
  */
 
@@ -397,7 +397,7 @@ async function main() {
     let binaryPath: string | null = null;
     let verbose = false;
     let semanticModel = "minishlab/potion-code-16M";
-    let semanticBackend = "model2vec";
+    let semanticBackend = "both";
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -433,7 +433,8 @@ async function main() {
   const allResults: ModeResult[] = [];
   let fts5EmptyCount = 0;
   let aftGrepEmptyCount = 0;
-  let semanticEmptyCount = 0;
+  let m2vEmptyCount = 0;
+  let feEmptyCount = 0;
 
   // Verify binary exists (pilot always runs fts5 + aft-grep modes)
   if (binaryPath) {
@@ -533,33 +534,43 @@ async function main() {
       if (verbose) console.log(`  GREP EMPTY: "${ann.query}" [${ann.repo_name}]`);
     }
 
-    // Semantic search mode (model2vec + ONNX)
-    const { results: semResults, latency_ms: semLatency } = await semanticSearch(
-      ann.query,
-      repoDir,
-      repo.benchmark_root,
-      k,
-      binaryPath,
-      semanticModel,
-      semanticBackend,
-      verbose
-    );
+    // Semantic search — run backends based on --backend flag
+    const semanticBackends = semanticBackend === "skip"
+      ? []
+      : semanticBackend === "both"
+        ? ["model2vec", "fastembed"]
+        : [semanticBackend];
 
-    if (semResults.length > 0) {
-      allResults.push({
-        mode: "semantic",
-        query: ann.query,
-        repo_name: ann.repo_name,
-        category: ann.category,
-        latency_ms: semLatency,
-        results: semResults,
-        recall_at_k: recallAtK(semResults, allRelevant, k),
-        mrr: mrr(semResults, allRelevant),
-        ndcg_at_k: ndcgAtK(semResults, allRelevant, k),
-      });
-    } else {
-      semanticEmptyCount++;
-      if (verbose) console.log(`  SEM EMPTY: "${ann.query}" [${ann.repo_name}]`);
+    for (const backend of semanticBackends) {
+      const modeName = backend === "model2vec" ? "semantic-m2v" : "semantic-fe";
+      const { results: semResults, latency_ms: semLatency } = await semanticSearch(
+        ann.query,
+        repoDir,
+        repo.benchmark_root,
+        k,
+        binaryPath,
+        semanticModel,
+        backend,
+        verbose
+      );
+
+      if (semResults.length > 0) {
+        allResults.push({
+          mode: modeName,
+          query: ann.query,
+          repo_name: ann.repo_name,
+          category: ann.category,
+          latency_ms: semLatency,
+          results: semResults,
+          recall_at_k: recallAtK(semResults, allRelevant, k),
+          mrr: mrr(semResults, allRelevant),
+          ndcg_at_k: ndcgAtK(semResults, allRelevant, k),
+        });
+      } else {
+        if (modeName === "semantic-m2v") m2vEmptyCount++;
+        else feEmptyCount++;
+        if (verbose) console.log(`  ${modeName.toUpperCase()} EMPTY: "${ann.query}" [${ann.repo_name}]`);
+      }
     }
   }
 
@@ -621,7 +632,7 @@ async function main() {
   writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
 
   console.log(`\n=== Pilot Report ===`);
-  const modes = ["lexical", "fts5", "semantic", "aft-grep"];
+  const modes = ["lexical", "fts5", "semantic-m2v", "semantic-fe", "aft-grep"];
   for (const mode of modes) {
     const data = aggregate[mode];
     if (data) {
@@ -636,7 +647,8 @@ async function main() {
   // Report empty mode counts
   const emptyParts: string[] = [];
   if (fts5EmptyCount > 0) emptyParts.push(`fts5=${fts5EmptyCount}/${fixture.annotations.length}`);
-  if (semanticEmptyCount > 0) emptyParts.push(`semantic=${semanticEmptyCount}/${fixture.annotations.length}`);
+  if (m2vEmptyCount > 0) emptyParts.push(`semantic-m2v=${m2vEmptyCount}/${fixture.annotations.length}`);
+  if (feEmptyCount > 0) emptyParts.push(`semantic-fe=${feEmptyCount}/${fixture.annotations.length}`);
   if (aftGrepEmptyCount > 0) emptyParts.push(`aft-grep=${aftGrepEmptyCount}/${fixture.annotations.length}`);
   if (emptyParts.length > 0) {
     console.log(`\n  ⚠ Empty results: ${emptyParts.join(' ')}`);
