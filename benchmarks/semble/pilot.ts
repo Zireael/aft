@@ -174,7 +174,7 @@ const LEXICAL_REPOS = [
 let RERANK_MODEL = "GTE-Reranker-Modernbert";
 let RERANK_URL = "http://127.0.0.1:8090/v1/rerank";
 
-async function rerankResults(
+async function applyRerank(
   query: string,
   results: SearchResult[],
   k: number,
@@ -574,16 +574,31 @@ async function main() {
     repos: [...allRepos],
   });
 
-  // Check which repos are available
+  // Check which repos are available, auto-clone missing ones
   const availableRepos = new Set<string>();
+  const allRepoDefs = [...fixture.repos, ...LEXICAL_REPOS];
   for (const repoName of allRepos) {
     const repoDir = join(resolve(cacheDir), repoName);
-    if (existsSync(repoDir)) availableRepos.add(repoName);
+    if (existsSync(repoDir)) {
+      availableRepos.add(repoName);
+    } else {
+      // Auto-clone
+      const def = allRepoDefs.find((r) => r.name === repoName);
+      if (def && "url" in def) {
+        console.log(`  Cloning ${repoName}...`);
+        try {
+          execSync(`git clone --depth 1 ${def.url} ${repoDir}`, { stdio: "pipe", timeout: 120_000 });
+          availableRepos.add(repoName);
+          console.log(`  ✓ ${repoName} cloned`);
+        } catch (e) {
+          console.warn(`  ✗ Failed to clone ${repoName}: ${e}`);
+        }
+      }
+    }
   }
-  const missingRepos = [...allRepos].filter((r) => !availableRepos.has(r));
-  if (missingRepos.length > 0) {
-    console.log(`  Missing repos (skipping): ${missingRepos.join(", ")}`);
-    console.log(`  Clone with: cd .bench-cache && git clone --depth 1 <url> <name>`);
+  const skippedRepos = [...allRepos].filter((r) => !availableRepos.has(r));
+  if (skippedRepos.length > 0) {
+    console.log(`  Skipping (unavailable): ${skippedRepos.join(", ")}`);
   }
 
   // Run semantic NL queries
@@ -677,7 +692,7 @@ async function main() {
         if (semResults.length === 0) continue;
 
         const preRecall = recallAtK(semResults, allRelevant, k * 5);
-        const { results: reranked, latency_ms: rerankLat } = await rerankResults(ann.query, semResults, k, repoDir, verbose);
+        const { results: reranked, latency_ms: rerankLat } = await applyRerank(ann.query, semResults, k, repoDir, verbose);
         const postRecall = recallAtK(reranked, allRelevant, k);
         const postMrr = mrr(reranked, allRelevant);
         const postNdcg = ndcgAtK(reranked, allRelevant, k);
@@ -690,6 +705,77 @@ async function main() {
         // We'll aggregate below
       }
     }
+  }
+
+  // Run lexical identifier queries
+  if (includeLexical) {
+    const lexicalSessions: Record<string, AftSession | null> = {};
+    let lexCurrentRepo = "";
+
+    for (const lq of LEXICAL_QUERIES) {
+      for (const repoName of lq.repos) {
+        if (!availableRepos.has(repoName)) continue;
+        const repoDir = join(resolve(cacheDir), repoName);
+
+        // Init sessions when repo changes
+        if (repoName !== lexCurrentRepo) {
+          for (const s of Object.values(lexicalSessions)) s?.close();
+          for (const k of Object.keys(lexicalSessions)) delete lexicalSessions[k];
+          lexCurrentRepo = repoName;
+          console.log(`\n  Initializing lexical sessions for ${repoName}...`);
+
+          // Init grep + fts5 sessions
+          lexicalSessions["aft-grep"] = await initGrepSession(bin, repoDir, verbose);
+          lexicalSessions["fts5"] = await initFts5Session(bin, repoDir, verbose);
+
+          // Init semantic sessions for lexical queries
+          for (const be of backends) {
+            const storageDir = join(repoDir, `.aft-bench-${be}-lex`);
+            const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : be === "semantic-api" ? apiModel : semanticModel;
+            lexicalSessions[be] = await initSemanticSession(bin, repoDir, beModel, be, verbose, storageDir);
+          }
+        }
+
+        const relevant = [lq.query]; // For identifier queries, the query itself is the relevant "path"
+        // We need actual file-level relevance — use rgSearch to find ground truth
+        const rg = rgSearch(lq.query, repoDir, null, k);
+        const allRelevant = rg.results.map((r) => r.file);
+        if (allRelevant.length === 0) {
+          // If rg finds nothing, skip this query
+          continue;
+        }
+
+        // Ripgrep
+        allResults.push({ mode: "lexical (rg)", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: rg.latency_ms, results: rg.results, recall_at_k: recallAtK(rg.results, allRelevant, k), mrr: mrr(rg.results, allRelevant), ndcg_at_k: ndcgAtK(rg.results, allRelevant, k) });
+
+        // AFT grep
+        const grepS = lexicalSessions["aft-grep"];
+        if (grepS) {
+          const gs = performance.now();
+          const gr = await grepQuery(grepS, lq.query, k, verbose);
+          allResults.push({ mode: "aft-grep", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - gs, results: gr, recall_at_k: recallAtK(gr, allRelevant, k), mrr: mrr(gr, allRelevant), ndcg_at_k: ndcgAtK(gr, allRelevant, k) });
+        }
+
+        // FTS5
+        const f5S = lexicalSessions["fts5"];
+        if (f5S) {
+          const fs = performance.now();
+          const f5r = await fts5Query(f5S, lq.query, k, verbose);
+          if (f5r.length > 0) allResults.push({ mode: "fts5", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - fs, results: f5r, recall_at_k: recallAtK(f5r, allRelevant, k), mrr: mrr(f5r, allRelevant), ndcg_at_k: ndcgAtK(f5r, allRelevant, k) });
+        }
+
+        // Semantic backends
+        for (const [be, session] of Object.entries(lexicalSessions)) {
+          if (!session || be === "aft-grep" || be === "fts5") continue;
+          const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
+          const ss = performance.now();
+          const sr = await semanticQuery(session, lq.query, k, be, verbose);
+          if (sr.length > 0) allResults.push({ mode: modeName, query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - ss, results: sr, recall_at_k: recallAtK(sr, allRelevant, k), mrr: mrr(sr, allRelevant), ndcg_at_k: ndcgAtK(sr, allRelevant, k) });
+        }
+      }
+    }
+    // Close lexical sessions
+    for (const s of Object.values(lexicalSessions)) s?.close();
   }
 
   // Aggregate results
