@@ -256,28 +256,20 @@ async function fts5Search(
 
 // ---------------------------------------------------------------------------
 // Semantic search mode (model2vec + built-in ONNX)
-// Uses a persistent AFT session so the model loads once and stays in memory
-// across all queries on the same repo.
+// Uses a persistent AFT session per backend so the model loads once and stays
+// in memory across all queries on the same repo.
 // ---------------------------------------------------------------------------
 
-async function semanticSearch(
-  query: string,
-  searchDir: string,
-  benchmarkRoot: string | null,
-  k: number,
-  binaryPath: string | null,
+/** Initialize a semantic session for a repo: configure + wait for index ready. */
+async function initSemanticSession(
+  bin: string,
+  targetDir: string,
   model: string,
-  backend = "model2vec",
-  verbose = false
-): Promise<{ results: SearchResult[]; latency_ms: number }> {
-  const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
-  const bin = binaryPath || "aft";
-  const start = performance.now();
-  let results: SearchResult[] = [];
-
+  backend: string,
+  verbose: boolean
+): Promise<AftSession | null> {
   const session = new AftSession(bin);
   try {
-    // Step 1: Configure with semantic search enabled
     await session.call({
       command: "configure",
       harness: "opencode",
@@ -287,25 +279,42 @@ async function semanticSearch(
       semantic: { backend, model },
     }, 30000);
 
-    // Step 2: Poll status until semantic index is ready (max 90s)
-    const readyDeadline = Date.now() + 90_000;
-    let semanticReady = false;
+    // Poll status until ready (max 180s)
+    const readyDeadline = Date.now() + 180_000;
     while (Date.now() < readyDeadline) {
       const status = await session.call({ command: "status" }, 10_000);
       const semStatus = (status as any).semantic_index?.status;
-      if (verbose) process.stdout.write(`    SEM status: ${semStatus}\r`);
+      if (verbose) process.stdout.write(`    SEM-${backend} status: ${semStatus}\r`);
       if (semStatus === "ready" || semStatus === "partial") {
-        semanticReady = true;
-        break;
+        if (verbose) process.stdout.write(`    SEM-${backend} status: ready     \n`);
+        return session;
       }
-      if (semStatus === "failed" || semStatus === "disabled") break;
-      // Wait 1s before polling again
+      if (semStatus === "failed" || semStatus === "disabled") {
+        if (verbose) process.stdout.write(`    SEM-${backend} status: ${semStatus}     \n`);
+        session.close();
+        return null;
+      }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    if (verbose && semanticReady) process.stdout.write("    SEM status: ready    \n");
-    else if (verbose) process.stdout.write("    SEM status: timeout   \n");
+    if (verbose) process.stdout.write(`    SEM-${backend} status: timeout   \n`);
+    session.close();
+    return null;
+  } catch (e) {
+    if (verbose) console.log(`    SEM-${backend} init ERROR: ${e}`);
+    session.close();
+    return null;
+  }
+}
 
-    // Step 3: Search
+/** Run a semantic search query on an already-initialized session. */
+async function semanticQuery(
+  session: AftSession,
+  query: string,
+  k: number,
+  backend: string,
+  verbose: boolean
+): Promise<SearchResult[]> {
+  try {
     const searchResp = await session.call({
       command: "semantic_search",
       query,
@@ -313,21 +322,18 @@ async function semanticSearch(
     }, 30_000);
 
     const items = (searchResp as any).results;
-    if (verbose) console.log(`    SEM [search]: ${items ? `${items.length} items` : `success=${searchResp.success} keys=${Object.keys(searchResp).join(',')}`}`);
+    if (verbose) console.log(`    SEM-${backend} [search]: ${items ? `${items.length} items` : `success=${searchResp.success}`}`);
     if (items && Array.isArray(items)) {
-      results = (items as any[]).map((r: any) => ({
+      return (items as any[]).map((r: any) => ({
         file: r.file || r.file_path || r.path || "",
         line: r.start_line || r.line,
         score: r.score,
       }));
     }
   } catch (e) {
-    if (verbose) console.log(`    SEM ERROR: ${e}`);
-  } finally {
-    session.close();
+    if (verbose) console.log(`    SEM-${backend} search ERROR: ${e}`);
   }
-
-  return { results, latency_ms: performance.now() - start };
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +442,11 @@ async function main() {
   let m2vEmptyCount = 0;
   let feEmptyCount = 0;
 
+  // Semantic sessions — created once per repo, reused across queries
+  const bin = binaryPath || "aft";
+  let currentRepoName = "";
+  const semSessions: Record<string, AftSession | null> = {};
+
   // Verify binary exists (pilot always runs fts5 + aft-grep modes)
   if (binaryPath) {
     try {
@@ -454,6 +465,25 @@ async function main() {
 
     const repoDir = join(resolve(cacheDir), repo.name);
     if (!existsSync(repoDir)) continue;
+
+    // When repo changes, close old semantic sessions and init new ones
+    if (ann.repo_name !== currentRepoName) {
+      // Close old sessions
+      for (const s of Object.values(semSessions)) s?.close();
+      for (const k of Object.keys(semSessions)) delete semSessions[k];
+
+      currentRepoName = ann.repo_name;
+      const targetDir = repo.benchmark_root ? join(repoDir, repo.benchmark_root) : repoDir;
+      console.log(`\n  Initializing semantic sessions for ${ann.repo_name}...`);
+
+      // Init sessions for each requested backend
+      const backends = semanticBackend === "skip" ? []
+        : semanticBackend === "both" ? ["model2vec", "fastembed"]
+        : [semanticBackend];
+      for (const be of backends) {
+        semSessions[be] = await initSemanticSession(bin, targetDir, semanticModel, be, verbose);
+      }
+    }
 
     const allRelevant = [
       ...ann.relevant.map((r) => r.path),
@@ -534,25 +564,13 @@ async function main() {
       if (verbose) console.log(`  GREP EMPTY: "${ann.query}" [${ann.repo_name}]`);
     }
 
-    // Semantic search — run backends based on --backend flag
-    const semanticBackends = semanticBackend === "skip"
-      ? []
-      : semanticBackend === "both"
-        ? ["model2vec", "fastembed"]
-        : [semanticBackend];
-
-    for (const backend of semanticBackends) {
+    // Semantic search — query on persistent sessions
+    for (const [backend, session] of Object.entries(semSessions)) {
+      if (!session) continue;
       const modeName = backend === "model2vec" ? "semantic-m2v" : "semantic-fe";
-      const { results: semResults, latency_ms: semLatency } = await semanticSearch(
-        ann.query,
-        repoDir,
-        repo.benchmark_root,
-        k,
-        binaryPath,
-        semanticModel,
-        backend,
-        verbose
-      );
+      const start = performance.now();
+      const semResults = await semanticQuery(session, ann.query, k, backend, verbose);
+      const semLatency = performance.now() - start;
 
       if (semResults.length > 0) {
         allResults.push({
@@ -630,6 +648,9 @@ async function main() {
   };
 
   writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
+
+  // Close all semantic sessions
+  for (const s of Object.values(semSessions)) s?.close();
 
   console.log(`\n=== Pilot Report ===`);
   const modes = ["lexical", "fts5", "semantic-m2v", "semantic-fe", "aft-grep"];
