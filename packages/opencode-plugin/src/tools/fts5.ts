@@ -20,30 +20,38 @@ export function fts5Tools(ctx: PluginContext): Record<string, ToolDefinition> {
     ].join("\n"),
     args: {
       query: arg(
-        z
-          .string()
-          .describe("Search query string (supports exact, prefix, phrase, terms)")
+        z.string().describe("Search query string (supports exact, prefix, phrase, terms)"),
       ),
-      top_k: arg(
-        z
-          .number()
-          .optional()
-          .describe("Maximum number of results (default: 20)")
-      ),
+      top_k: arg(z.number().optional().describe("Maximum number of results (default: 20)")),
       scope: arg(
         z
           .enum(["all", "symbols", "bodies", "paths"])
           .optional()
-          .describe("Search scope (default: all)")
+          .describe("Search scope (default: all)"),
       ),
     },
-    execute: async (args) => {
-      const resp = await callBridge(ctx, "fts5_search", {
+    execute: async (args, _context): Promise<string> => {
+      const response = await callBridge(ctx, _context, "fts5_search", {
         query: args.query as string,
         top_k: args.top_k as number | undefined,
         scope: args.scope as string | undefined,
       });
-      return resp;
+
+      if (response.success === false) {
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "fts5_search failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `fts5_search: ${code} — ${message}` : message);
+      }
+
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return response.text;
+      }
+
+      return JSON.stringify(response, null, 2);
     },
   };
 
@@ -60,14 +68,29 @@ export function fts5Tools(ctx: PluginContext): Record<string, ToolDefinition> {
         z
           .enum(["status", "update", "rebuild", "prune"])
           .optional()
-          .describe("Action to perform (default: update)")
+          .describe("Action to perform (default: update)"),
       ),
     },
-    execute: async (args) => {
-      const resp = await callBridge(ctx, "fts5_index", {
+    execute: async (args, _context): Promise<string> => {
+      const response = await callBridge(ctx, _context, "fts5_index", {
         action: args.action as string | undefined,
       });
-      return resp;
+
+      if (response.success === false) {
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "fts5_index failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `fts5_index: ${code} — ${message}` : message);
+      }
+
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return response.text;
+      }
+
+      return JSON.stringify(response, null, 2);
     },
   };
 
@@ -79,29 +102,32 @@ export function fts5Tools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use mode='prefix' for prefix matching (default).",
     ].join("\n"),
     args: {
-      name: arg(
-        z.string().describe("Symbol name to find (exact or prefix match)")
-      ),
-      mode: arg(
-        z
-          .enum(["exact", "prefix"])
-          .optional()
-          .describe("Match mode (default: prefix)")
-      ),
-      top_k: arg(
-        z
-          .number()
-          .optional()
-          .describe("Maximum number of results (default: 20)")
-      ),
+      name: arg(z.string().describe("Symbol name to find (exact or prefix match)")),
+      mode: arg(z.enum(["exact", "prefix"]).optional().describe("Match mode (default: prefix)")),
+      top_k: arg(z.number().optional().describe("Maximum number of results (default: 20)")),
     },
-    execute: async (args) => {
-      const resp = await callBridge(ctx, "fts5_find_symbol", {
+    execute: async (args, _context): Promise<string> => {
+      const response = await callBridge(ctx, _context, "fts5_find_symbol", {
         name: args.name as string,
         mode: args.mode as string | undefined,
         top_k: args.top_k as number | undefined,
       });
-      return resp;
+
+      if (response.success === false) {
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "fts5_find_symbol failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `fts5_find_symbol: ${code} — ${message}` : message);
+      }
+
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return response.text;
+      }
+
+      return JSON.stringify(response, null, 2);
     },
   };
 
@@ -113,36 +139,41 @@ export function fts5Tools(ctx: PluginContext): Record<string, ToolDefinition> {
       "If name matches multiple symbols, returns candidates for disambiguation.",
     ].join("\n"),
     args: {
-      symbol_id: arg(
-        z
-          .number()
-          .optional()
-          .describe("Symbol ID from a find/search result")
-      ),
-      name: arg(
-        z.string().optional().describe("Exact symbol name to read")
-      ),
+      symbol_id: arg(z.number().optional().describe("Symbol ID from a find/search result")),
+      name: arg(z.string().optional().describe("Exact symbol name to read")),
       file: arg(
         z
           .string()
           .optional()
-          .describe("File path to disambiguate when name matches multiple symbols")
+          .describe("File path to disambiguate when name matches multiple symbols"),
       ),
       context_lines: arg(
-        z
-          .number()
-          .optional()
-          .describe("Number of context lines around the symbol (default: 0)")
+        z.number().optional().describe("Number of context lines around the symbol (default: 0)"),
       ),
     },
-    execute: async (args) => {
-      const resp = await callBridge(ctx, "fts5_read_symbol", {
+    execute: async (args, _context): Promise<string> => {
+      const response = await callBridge(ctx, _context, "fts5_read_symbol", {
         symbol_id: args.symbol_id as number | undefined,
         name: args.name as string | undefined,
         file: args.file as string | undefined,
         context_lines: args.context_lines as number | undefined,
       });
-      return resp;
+
+      if (response.success === false) {
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "fts5_read_symbol failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `fts5_read_symbol: ${code} — ${message}` : message);
+      }
+
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return response.text;
+      }
+
+      return JSON.stringify(response, null, 2);
     },
   };
 
@@ -152,9 +183,24 @@ export function fts5Tools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Reports compiled status, FTS5 availability, runtime config, index stats, and warnings.",
     ].join("\n"),
     args: {},
-    execute: async () => {
-      const resp = await callBridge(ctx, "fts5_doctor", {});
-      return resp;
+    execute: async (_args, _context): Promise<string> => {
+      const response = await callBridge(ctx, _context, "fts5_doctor", {});
+
+      if (response.success === false) {
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "fts5_doctor failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `fts5_doctor: ${code} — ${message}` : message);
+      }
+
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return response.text;
+      }
+
+      return JSON.stringify(response, null, 2);
     },
   };
 
