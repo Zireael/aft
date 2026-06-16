@@ -15,6 +15,7 @@
  *   --output <file>      Output report (default: pilot-report.json)
  *   --binary <path>      Path to aft binary (for FTS5/grep/semantic modes)
  *   --model <name>       model2vec model for semantic mode (default: minishlab/potion-code-16M)
+ *   --backend <name>     Semantic backend: model2vec (default) or fastembed
  *   --verbose, -v        Show per-query debug output
  */
 
@@ -137,14 +138,18 @@ function ndcgAtK(
 ): number {
   if (!retrieved) return 0;
   const relSet = new Set(relevant.map(normalizePath));
-  // DCG
+  // DCG — track matched relevant paths to avoid double-counting
   let dcg = 0;
+  const matched = new Set<string>();
   for (let i = 0; i < Math.min(k, retrieved.length); i++) {
     const rf = normalizePath(retrieved[i].file);
-    const isRelevant = [...relSet].some(
-      (r) => rf.endsWith(r) || r.endsWith(rf)
-    );
-    if (isRelevant) dcg += 1 / Math.log2(i + 2);
+    for (const r of relSet) {
+      if (!matched.has(r) && (rf.endsWith(r) || r.endsWith(rf))) {
+        matched.add(r);
+        dcg += 1 / Math.log2(i + 2);
+        break;
+      }
+    }
   }
   // Ideal DCG
   const idealHits = Math.min(relSet.size, k);
@@ -262,6 +267,7 @@ async function semanticSearch(
   k: number,
   binaryPath: string | null,
   model: string,
+  backend = "model2vec",
   verbose = false
 ): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
@@ -278,7 +284,7 @@ async function semanticSearch(
       project_root: targetDir,
       storage_dir: join(targetDir, ".aft-bench"),
       semantic_search: true,
-      semantic: { backend: "model2vec", model },
+      semantic: { backend, model },
     }, 30000);
 
     // Step 2: Poll status until semantic index is ready (max 90s)
@@ -391,6 +397,7 @@ async function main() {
     let binaryPath: string | null = null;
     let verbose = false;
     let semanticModel = "minishlab/potion-code-16M";
+    let semanticBackend = "model2vec";
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -413,6 +420,8 @@ async function main() {
         verbose = true; break;
       case "--model":
         semanticModel = args[++i]; break;
+      case "--backend":
+        semanticBackend = args[++i]; break;
     }
   }
 
@@ -532,6 +541,7 @@ async function main() {
       k,
       binaryPath,
       semanticModel,
+      semanticBackend,
       verbose
     );
 
