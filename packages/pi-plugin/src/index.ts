@@ -88,6 +88,7 @@ import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
+import { registerVerifyTool } from "./tools/verify.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
@@ -761,6 +762,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.inspect) {
     registerInspectTool(pi, ctx);
+  }
+  if (surface.inspect) {
+    registerVerifyTool(pi, ctx);
   }
   if (surface.navigate) {
     registerNavigateTool(pi, ctx);

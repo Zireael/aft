@@ -82,6 +82,7 @@ import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import { fts5Tools } from "./tools/fts5.js";
+import { verifyTools } from "./tools/verify.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
 
@@ -898,6 +899,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
     ...(surface !== "minimal" && aftConfig.fts5?.enabled === true && fts5Tools(ctx)),
     ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
+    ...(surface !== "minimal" && verifyTools(ctx)),
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
