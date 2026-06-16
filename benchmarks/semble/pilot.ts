@@ -194,7 +194,8 @@ async function fts5Search(
   searchDir: string,
   benchmarkRoot: string | null,
   k: number,
-  binaryPath: string | null
+  binaryPath: string | null,
+  verbose = false
 ): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
   const bin = binaryPath || "aft";
@@ -226,9 +227,11 @@ async function fts5Search(
     ];
 
     const responses = await aftNdjson(bin, commands, 60000);
+    if (verbose) console.log(`    FTS5 responses: ${responses.length}/${commands.length}`);
 
     for (const parsed of [...responses].reverse()) {
       const items = parsed.results || parsed.matches || parsed.evidence;
+      if (verbose) console.log(`    FTS5 [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
       if (items && Array.isArray(items)) {
         results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || r.file || "",
@@ -252,7 +255,8 @@ async function aftGrepSearch(
   searchDir: string,
   benchmarkRoot: string | null,
   k: number,
-  binaryPath: string | null
+  binaryPath: string | null,
+  verbose = false
 ): Promise<{ results: SearchResult[]; latency_ms: number }> {
   const targetDir = benchmarkRoot ? join(searchDir, benchmarkRoot) : searchDir;
   const bin = binaryPath || "aft";
@@ -277,9 +281,11 @@ async function aftGrepSearch(
     ];
 
     const responses = await aftNdjson(bin, commands, 60000);
+    if (verbose) console.log(`    GREP responses: ${responses.length}/${commands.length}`);
 
     for (const parsed of [...responses].reverse()) {
       const items = parsed.results || parsed.matches || parsed.evidence;
+      if (verbose) console.log(`    GREP [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
       if (items && Array.isArray(items)) {
         results = (items as any[]).map((r: any) => ({
           file: r.file_path || r.path || r.file || "",
@@ -304,7 +310,8 @@ async function main() {
   let inputFile = "benchmarks/semble/fixtures.json";
   let k = 10;
   let outputFile = "pilot-report.json";
-  let binaryPath: string | null = null;
+    let binaryPath: string | null = null;
+    let verbose = false;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -321,7 +328,10 @@ async function main() {
         outputFile = args[++i];
         break;
       case "--binary":
-        binaryPath = args[++i];
+        binaryPath = args[++i]; break;
+      case "--verbose":
+      case "-v":
+        verbose = true; break;
         break;
     }
   }
@@ -385,7 +395,8 @@ async function main() {
       repoDir,
       repo.benchmark_root,
       k,
-      binaryPath
+      binaryPath,
+      verbose
     );
 
     if (fts5Results.length > 0) {
@@ -402,6 +413,7 @@ async function main() {
       });
     } else {
       fts5EmptyCount++;
+      if (verbose) console.log(`  FTS5 EMPTY: "${ann.query}" [${ann.repo_name}]`);
     }
 
     // AFT grep mode (trigram-indexed)
@@ -410,7 +422,8 @@ async function main() {
       repoDir,
       repo.benchmark_root,
       k,
-      binaryPath
+      binaryPath,
+      verbose
     );
 
     if (aftResults.length > 0) {
@@ -427,6 +440,7 @@ async function main() {
       });
     } else {
       aftGrepEmptyCount++;
+      if (verbose) console.log(`  GREP EMPTY: "${ann.query}" [${ann.repo_name}]`);
     }
   }
 
