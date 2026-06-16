@@ -77,6 +77,7 @@ interface RerankMetrics {
 // ---------------------------------------------------------------------------
 
 function normalizePath(p: string): string {
+  if (!p) return "";
   return p.replace(/\\/g, "/").replace(/^\/\?\//, "").replace(/^\.\//, "").toLowerCase();
 }
 
@@ -546,12 +547,18 @@ async function main() {
     for (const ann of anns) allAnnotations.push({ ...ann, repo_name: repo.name, _type: "semantic" });
   }
 
-  // Build backends list
-  const backends: string[] = semanticBackend === "skip" ? []
-    : semanticBackend === "both" ? ["model2vec", "fastembed"]
-    : [semanticBackend];
-  if (apiUrl && (semanticBackend === "semantic-api" || semanticBackend === "both")) {
-    backends.push("semantic-api");
+  // Build backends list (split comma-separated)
+  const backends: string[] = [];
+  for (const b of semanticBackend.split(',')) {
+    const trimmed = b.trim();
+    if (trimmed === "skip") continue;
+    if (trimmed === "both") { backends.push("model2vec", "fastembed"); continue; }
+    if (trimmed === "semantic-api") {
+      if (apiUrl) backends.push("semantic-api");
+      else console.warn("  WARNING: semantic-api requested but --semantic-api-url not set");
+      continue;
+    }
+    backends.push(trimmed);
   }
 
   // Collect all repos
@@ -616,7 +623,10 @@ async function main() {
       grepSession = await initGrepSession(bin, targetDir, verbose);
     }
 
-    const allRelevant = [...(ann.relevant || []).map((r: any) => r.path), ...(ann.secondary || []).map((r: any) => r.path)];
+    const allRelevant = [
+      ...(ann.relevant || []).map((r: any) => typeof r === "string" ? r : r.path || ""),
+      ...(ann.secondary || []).map((r: any) => typeof r === "string" ? r : r.path || ""),
+    ].filter(Boolean);
 
     // Ripgrep
     const rg = rgSearch(ann.query, repoDir, repo.benchmark_root, k);
@@ -695,7 +705,16 @@ async function main() {
 
   for (const [mode, rows] of byMode) {
     const agg = aggregateMetrics(rows, totalSemantic);
-    if (mode.includes("identifier") || mode === "lexical (rg)" || mode === "fts5" || mode === "aft-grep") {
+    // Classify by query category: NL queries → semantic table, identifier queries → lexical table
+    const hasIdentifier = rows.some((r) => r.category === "identifier");
+    const hasSemantic = rows.some((r) => r.category !== "identifier");
+    if (hasIdentifier && !hasSemantic) {
+      lexicalAgg.push(agg);
+    } else if (hasSemantic && !hasIdentifier) {
+      semanticAgg.push(agg);
+    } else if (hasIdentifier && hasSemantic) {
+      // Mixed: show in both tables
+      semanticAgg.push(agg);
       lexicalAgg.push(agg);
     } else {
       semanticAgg.push(agg);
