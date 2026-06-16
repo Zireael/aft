@@ -133,3 +133,67 @@ export function aftNdjsonSync(
   }
   return responses;
 }
+
+// ---------------------------------------------------------------------------
+// Persistent AFT session — keeps one process alive across multiple calls.
+// Required for semantic search where the model loads asynchronously after
+// configure and queries must reuse the same in-process index.
+// ---------------------------------------------------------------------------
+
+export class AftSession {
+  private child: ReturnType<typeof spawn>;
+  private rl: ReturnType<typeof createInterface>;
+  private buf: AftResponse[] = [];
+  private id = 0;
+  private closed = false;
+
+  constructor(binaryPath: string) {
+    this.child = spawn(binaryPath, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    this.rl = createInterface({ input: this.child.stdout! });
+    this.rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      try {
+        const parsed = JSON.parse(trimmed) as AftResponse;
+        // Skip push frames
+        if (!parsed.id || parsed.type) return;
+        this.buf.push(parsed);
+      } catch {}
+    });
+  }
+
+  /** Send a command and wait for its response. */
+  call(command: Record<string, unknown>, timeoutMs = 60000): Promise<AftResponse> {
+    return new Promise<AftResponse>((resolve, reject) => {
+      this.id++;
+      const id = String(this.id);
+      const msg = { ...command, id };
+
+      const deadline = Date.now() + timeoutMs;
+      const timer = setInterval(() => {
+        const idx = this.buf.findIndex((r) => r.id === id);
+        if (idx >= 0) {
+          clearInterval(timer);
+          resolve(this.buf.splice(idx, 1)[0]);
+        } else if (Date.now() > deadline) {
+          clearInterval(timer);
+          reject(new Error(`aft session call ${id} timeout after ${timeoutMs}ms`));
+        }
+      }, 50);
+
+      this.child.stdin!.write(JSON.stringify(msg) + "\n");
+    });
+  }
+
+  /** Kill the underlying process. */
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.rl.close();
+    this.child.stdin!.end();
+    this.child.kill();
+  }
+}

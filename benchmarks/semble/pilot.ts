@@ -21,7 +21,7 @@
 import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
-import { aftNdjson } from "./aft-ndjson";
+import { aftNdjson, AftSession } from "./aft-ndjson";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -251,6 +251,8 @@ async function fts5Search(
 
 // ---------------------------------------------------------------------------
 // Semantic search mode (model2vec + built-in ONNX)
+// Uses a persistent AFT session so the model loads once and stays in memory
+// across all queries on the same repo.
 // ---------------------------------------------------------------------------
 
 async function semanticSearch(
@@ -267,45 +269,57 @@ async function semanticSearch(
   const start = performance.now();
   let results: SearchResult[] = [];
 
+  const session = new AftSession(bin);
   try {
-    const commands: Record<string, unknown>[] = [
-      {
-        id: "cfg-sem",
-        command: "configure",
-        harness: "opencode",
-        project_root: targetDir,
-        storage_dir: join(targetDir, ".aft-bench"),
-        semantic_search: true,
-        semantic: {
-          backend: "model2vec",
-          model,
-        },
-      },
-      {
-        id: "search-sem",
-        command: "semantic_search",
-        query,
-        topK: k,
-      },
-    ];
+    // Step 1: Configure with semantic search enabled
+    await session.call({
+      command: "configure",
+      harness: "opencode",
+      project_root: targetDir,
+      storage_dir: join(targetDir, ".aft-bench"),
+      semantic_search: true,
+      semantic: { backend: "model2vec", model },
+    }, 30000);
 
-    // Semantic needs longer timeout — first query loads model + builds index
-    const responses = await aftNdjson(bin, commands, 120000);
-    if (verbose) console.log(`    SEM responses: ${responses.length}/${commands.length}`);
-
-    for (const parsed of [...responses].reverse()) {
-      const items = parsed.results || parsed.matches || parsed.evidence;
-      if (verbose) console.log(`    SEM [${parsed.id}]: ${items ? `${items.length} items` : `success=${parsed.success} keys=${Object.keys(parsed).join(',')}`}`);
-      if (items && Array.isArray(items)) {
-        results = (items as any[]).map((r: any) => ({
-          file: r.file || r.file_path || r.path || "",
-          line: r.start_line || r.line,
-          score: r.score,
-        }));
+    // Step 2: Poll status until semantic index is ready (max 90s)
+    const readyDeadline = Date.now() + 90_000;
+    let semanticReady = false;
+    while (Date.now() < readyDeadline) {
+      const status = await session.call({ command: "status" }, 10_000);
+      const semStatus = (status as any).semantic_index?.status;
+      if (verbose) process.stdout.write(`    SEM status: ${semStatus}\r`);
+      if (semStatus === "ready" || semStatus === "partial") {
+        semanticReady = true;
         break;
       }
+      if (semStatus === "failed" || semStatus === "disabled") break;
+      // Wait 1s before polling again
+      await new Promise((r) => setTimeout(r, 1000));
     }
-  } catch {}
+    if (verbose && semanticReady) process.stdout.write("    SEM status: ready    \n");
+    else if (verbose) process.stdout.write("    SEM status: timeout   \n");
+
+    // Step 3: Search
+    const searchResp = await session.call({
+      command: "semantic_search",
+      query,
+      topK: k,
+    }, 30_000);
+
+    const items = (searchResp as any).results;
+    if (verbose) console.log(`    SEM [search]: ${items ? `${items.length} items` : `success=${searchResp.success} keys=${Object.keys(searchResp).join(',')}`}`);
+    if (items && Array.isArray(items)) {
+      results = (items as any[]).map((r: any) => ({
+        file: r.file || r.file_path || r.path || "",
+        line: r.start_line || r.line,
+        score: r.score,
+      }));
+    }
+  } catch (e) {
+    if (verbose) console.log(`    SEM ERROR: ${e}`);
+  } finally {
+    session.close();
+  }
 
   return { results, latency_ms: performance.now() - start };
 }
