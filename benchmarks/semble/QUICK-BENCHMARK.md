@@ -5,6 +5,40 @@ Decision-grade benchmark for comparing AFT retrieval modes. Measures retrieval q
 ## Quick start
 
 ```bash
+
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft \
+  --profile extended \
+  --suite all \
+  --mode rg,aft-grep,fts5_search,fts5_find_symbol_exact,fts5_find_symbol_prefix,glob,ast_search,semantic_m2v,semantic_fe,semantic_api,hybrid,rerank \
+  --semantic-api-url http://localhost:8090 \
+  --rerank \
+  --rerank-url http://localhost:8090 \
+  --allow-degrade \
+  --allow-seed-canon \
+  --report-json bench-report.json \
+  --report-md bench-report.md \
+  --verbose
+
+# Key flags:
+# - --rerank enables the reranker pass (5x oversampling by default)
+# - --rerank-url points to your reranker endpoint (e.g., GTE-Reranker via vLLM/TEI)
+# - --allow-degrade emits status: unavailable for missing modes instead of failing
+# - --allow-seed-canon includes seed-status canon rows (all 84 are currently seeds)
+# - --profile extended runs all canon queries with 3 repetitions for latency stability
+
+# Quick smoke:
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft \
+  --profile smoke \
+  --suite all \
+  --semantic-api-url http://localhost:8090 \
+  --rerank \
+  --rerank-url http://localhost:8090 \
+  --allow-degrade \
+  --report-json smoke.json
+
+
 # Smoke test (fastest, 2 queries per suite)
 bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile smoke --suite all --mode rg,aft-grep --allow-degrade --report-json smoke.json --report-md smoke.md
 
@@ -38,20 +72,20 @@ Benchmark suites are **segregated by query type**. Modes are not mixed into one 
 
 ## Modes
 
-| Mode | Command | Notes |
-|------|---------|-------|
-| `rg` | ripgrep | Baseline only, never generates ground truth |
-| `aft-grep` | `grep` | Trigram-indexed lexical search |
-| `fts5_search` | `fts5_search` | FTS5 full-text search |
-| `fts5_find_symbol_exact` | `fts5_find_symbol` (mode=exact) | Exact symbol lookup |
-| `fts5_find_symbol_prefix` | `fts5_find_symbol` (mode=prefix) | Prefix symbol lookup |
-| `glob` | `glob` | File path pattern matching |
-| `ast_search` | `ast_search` | Structural AST pattern search |
-| `semantic_m2v` | `semantic_search` | Model2Vec embeddings |
-| `semantic_fe` | `semantic_search` | FastEmbed embeddings |
-| `semantic_api` | `semantic_search` | OpenAI-compatible API |
-| `hybrid` | FTS5 + semantic RRF | Hybrid fusion |
-| `rerank` | Post-retrieval reranking | Requires `--rerank` flag |
+| Benchmark Mode | AFT Tool (OpenCode/Pi) | Rust Command | Notes |
+|----------------|----------------------|--------------|-------|
+| `rg` | `bash` → ripgrep | — | Baseline only, never generates ground truth |
+| `aft-grep` | `grep` | `grep` | Trigram-indexed lexical search |
+| `fts5_search` | `aft_fts5_search` | `fts5_search` | FTS5 full-text search |
+| `fts5_find_symbol_exact` | `aft_find_symbol` (mode=exact) | `fts5_find_symbol` | Exact symbol lookup |
+| `fts5_find_symbol_prefix` | `aft_find_symbol` (mode=prefix) | `fts5_find_symbol` | Prefix symbol lookup |
+| `glob` | `glob` | `glob` | File path pattern matching |
+| `ast_search` | `ast_grep_search` | `ast_search` | Structural AST pattern search |
+| `semantic_m2v` | `aft_search` | `semantic_search` | Model2Vec embeddings |
+| `semantic_fe` | `aft_search` | `semantic_search` | FastEmbed embeddings |
+| `semantic_api` | `aft_search` | `semantic_search` | OpenAI-compatible API |
+| `hybrid` | `aft_search` + `aft_fts5_search` | `semantic_search` + `fts5_search` | RRF fusion of lexical + semantic |
+| `rerank` | `aft_search` + rerank endpoint | `semantic_search` + `/v1/rerank` | Post-retrieval reranking |
 
 ## Metric model
 

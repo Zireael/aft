@@ -26,6 +26,7 @@ export interface BenchmarkReport {
     binary_path: string;
     backends: string[];
   };
+  mode_mapping: Record<string, { aft_tool: string; rust_command: string; description: string }>;
   environment: {
     aft_version?: string;
     node_version: string;
@@ -69,6 +70,25 @@ export interface BenchmarkReport {
     modes_run: string[];
   };
 }
+
+// ---------------------------------------------------------------------------
+// Mode-to-tool mapping (for report metadata)
+// ---------------------------------------------------------------------------
+
+export const MODE_MAPPING: Record<string, { aft_tool: string; rust_command: string; description: string }> = {
+  rg: { aft_tool: "bash (ripgrep)", rust_command: "(external)", description: "Baseline lexical search via ripgrep" },
+  "aft-grep": { aft_tool: "grep", rust_command: "grep", description: "Trigram-indexed lexical search" },
+  fts5_search: { aft_tool: "aft_fts5_search", rust_command: "fts5_search", description: "FTS5 full-text search" },
+  fts5_find_symbol_exact: { aft_tool: "aft_find_symbol (exact)", rust_command: "fts5_find_symbol", description: "Exact symbol lookup via FTS5" },
+  fts5_find_symbol_prefix: { aft_tool: "aft_find_symbol (prefix)", rust_command: "fts5_find_symbol", description: "Prefix symbol lookup via FTS5" },
+  glob: { aft_tool: "glob", rust_command: "glob", description: "File path pattern matching" },
+  ast_search: { aft_tool: "ast_grep_search", rust_command: "ast_search", description: "Structural AST pattern search" },
+  semantic_m2v: { aft_tool: "aft_search", rust_command: "semantic_search", description: "Dense embedding search (Model2Vec)" },
+  semantic_fe: { aft_tool: "aft_search", rust_command: "semantic_search", description: "Dense embedding search (FastEmbed)" },
+  semantic_api: { aft_tool: "aft_search", rust_command: "semantic_search", description: "Dense embedding search (OpenAI-compatible API)" },
+  hybrid: { aft_tool: "aft_search + aft_fts5_search", rust_command: "semantic_search + fts5_search", description: "RRF fusion of lexical + semantic" },
+  rerank: { aft_tool: "aft_search + /v1/rerank", rust_command: "semantic_search + rerank endpoint", description: "Post-retrieval reranking" },
+};
 
 // ---------------------------------------------------------------------------
 // Report writer
@@ -139,6 +159,7 @@ export function writeJsonReport(
     generated_at: new Date().toISOString(),
     command: process.argv.join(" "),
     config,
+    mode_mapping: MODE_MAPPING,
     environment: {
       node_version: process.version,
       platform: process.platform,
@@ -181,6 +202,16 @@ export function writeMarkdownReport(
   lines.push("# AFT Benchmark Report");
   lines.push("");
   lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push("");
+
+  // Mode-tool mapping reference
+  lines.push("## Mode → AFT Tool → Rust Command");
+  lines.push("");
+  lines.push("| Benchmark Mode | AFT Tool (OpenCode/Pi) | Rust Command | Description |");
+  lines.push("|----------------|----------------------|--------------|-------------|");
+  for (const [mode, mapping] of Object.entries(MODE_MAPPING)) {
+    lines.push(`| ${mode} | ${mapping.aft_tool} | ${mapping.rust_command} | ${mapping.description} |`);
+  }
   lines.push("");
 
   // Group by suite

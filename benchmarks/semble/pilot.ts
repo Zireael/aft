@@ -451,6 +451,18 @@ function printHeader(opts: {
     if (opts.backends.includes("semantic-api") && opts.apiUrl) console.log(`${D}    semantic-api: ${opts.apiModel || "?"} @ ${opts.apiUrl}${N}`);
     if (opts.rerank) console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
   }
+
+  // Tool-command mapping reference
+  console.log(`\n${D}  Mode → AFT Tool → Rust Command:${N}`);
+  console.log(`${D}    rg                    → bash (ripgrep)       → (external)${N}`);
+  console.log(`${D}    aft-grep              → grep                 → grep${N}`);
+  console.log(`${D}    fts5_search           → aft_fts5_search       → fts5_search${N}`);
+  console.log(`${D}    fts5_find_symbol_*    → aft_find_symbol       → fts5_find_symbol${N}`);
+  console.log(`${D}    glob                  → glob                  → glob${N}`);
+  console.log(`${D}    ast_search            → ast_grep_search       → ast_search${N}`);
+  console.log(`${D}    semantic_*            → aft_search            → semantic_search${N}`);
+  console.log(`${D}    hybrid                → aft_search + fts5     → semantic_search + fts5_search (RRF)${N}`);
+  console.log(`${D}    rerank                → aft_search + /v1/rerank → semantic_search + rerank endpoint${N}`);
   console.log("");
 }
 
