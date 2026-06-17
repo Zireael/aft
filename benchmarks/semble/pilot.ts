@@ -40,6 +40,9 @@ interface SearchResult {
   line?: number;
   score?: number;
   content?: string;
+  snippet?: string;
+  start_line?: number;
+  end_line?: number;
 }
 
 interface ModeResult {
@@ -188,24 +191,38 @@ async function applyRerank(
   if (candidates.length <= 1) return { results: candidates, latency_ms: 0 };
 
   const readStart = performance.now();
-  // Read file content snippets for reranker
+  // Use snippet from search results when available, else read file span, else read file
   const documents = candidates.map((r) => {
+    // Prefer snippet from semantic search results (already extracted by AFT)
+    if (r.snippet && r.snippet.length > 10) return r.snippet;
+
     const rawFile = r.file || "";
-    // Strip Windows UNC prefix
     const normalized = rawFile.replace(/^\\\\\?\\/, "");
-    // Determine if path is absolute
     const maybeAbsolute = /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("/");
     const resolved = maybeAbsolute ? normalized : join(repoDir, normalized);
+
+    // If we have line range, read only that span
+    const startLine = r.start_line || r.line;
+    const endLine = r.end_line;
+    if (startLine && endLine && endLine > startLine) {
+      try {
+        const content = readFileSync(resolved, "utf-8");
+        const lines = content.split("\n");
+        const span = lines.slice(Math.max(0, startLine - 1), endLine).join("\n");
+        if (span.length > 10) return span;
+      } catch { /* fall through */ }
+    }
+
+    // Fallback: read file (capped)
     try {
       const content = readFileSync(resolved, "utf-8");
-      return content.length > 20_000 ? content.slice(0, 20_000) : content;
+      return content.length > 2000 ? content.slice(0, 2000) : content;
     } catch {
-      // Fallback: try raw path
       try {
         const content = readFileSync(rawFile, "utf-8");
-        return content.length > 20_000 ? content.slice(0, 20_000) : content;
+        return content.length > 2000 ? content.slice(0, 2000) : content;
       } catch {
-        return normalized; // Last resort: return path string
+        return normalized;
       }
     }
   });
@@ -310,7 +327,7 @@ async function fts5Query(session: AftSession, query: string, k: number, verbose:
 
 async function initSemanticSession(
   bin: string, targetDir: string, model: string, backend: string,
-  verbose: boolean, storageDir?: string,
+  verbose: boolean, storageDir?: string, queryPromptOverride?: string,
 ): Promise<AftSession | null> {
   const session = new AftSession(bin);
   try {
@@ -323,7 +340,14 @@ async function initSemanticSession(
     if (backend === "semantic-api") {
       const url = (globalThis as any).__SEMANTIC_API_URL || "";
       const modelName = (globalThis as any).__SEMANTIC_API_MODEL || "";
-      config.semantic = { backend: "openai_compatible", base_url: url, model: modelName };
+      const semantic: Record<string, unknown> = { backend: "openai_compatible", base_url: url, model: modelName };
+      // CodeRankEmbed requires query prefix for optimal retrieval quality
+      if (queryPromptOverride) {
+        semantic.query_prompt_template = queryPromptOverride;
+      } else if (modelName.toLowerCase().includes("coderankembed")) {
+        semantic.query_prompt_template = "Represent this query for searching relevant code: {query}";
+      }
+      config.semantic = semantic;
     } else {
       config.semantic = { backend, model };
     }
@@ -361,7 +385,14 @@ async function semanticQuery(session: AftSession, query: string, k: number, back
     const resp = await session.call({ command: "semantic_search", query, topK: k }, 30_000);
     const items = (resp as any).results;
     if (items && Array.isArray(items)) {
-      return items.map((r: any) => ({ file: r.file || r.file_path || r.path || "", line: r.start_line || r.line, score: r.score }));
+      return items.map((r: any) => ({
+        file: r.file || r.file_path || r.path || "",
+        line: r.start_line || r.line,
+        score: r.score,
+        snippet: r.snippet,
+        start_line: r.start_line,
+        end_line: r.end_line,
+      }));
     }
   } catch (e) { if (verbose) console.log(`    SEM-${backend} ERROR: ${e}`); }
   return [];
@@ -532,6 +563,7 @@ async function main() {
   let apiModel = "";
   let doRerank = false;
   let rerankModel = "GTE-Reranker-Modernbert";
+  let queryPrompt: string | undefined;
   let rerankUrl = "http://127.0.0.1:8090/v1/rerank";
   let includeLexical = true;
   let interactive = false;
@@ -550,6 +582,7 @@ async function main() {
       case "--rerank": doRerank = true; break;
       case "--rerank-model": rerankModel = args[++i]; break;
       case "--rerank-url": rerankUrl = args[++i]; break;
+      case "--query-prompt": queryPrompt = args[++i]; break;
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
@@ -777,7 +810,7 @@ async function main() {
       for (const be of backends) {
         const storageDir = join(targetDir, `.aft-bench-${be}`);
         const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : be === "semantic-api" ? apiModel : semanticModel;
-        semSessions[be] = await initSemanticSession(bin, targetDir, beModel, be, verbose, storageDir);
+        semSessions[be] = await initSemanticSession(bin, targetDir, beModel, be, verbose, storageDir, queryPrompt);
       }
       fts5Session = await initFts5Session(bin, targetDir, verbose);
       grepSession = await initGrepSession(bin, targetDir, verbose);
@@ -879,7 +912,7 @@ async function main() {
           for (const be of backends) {
             const storageDir = join(repoDir, `.aft-bench-${be}-lex`);
             const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : be === "semantic-api" ? apiModel : semanticModel;
-            lexicalSessions[be] = await initSemanticSession(bin, repoDir, beModel, be, verbose, storageDir);
+            lexicalSessions[be] = await initSemanticSession(bin, repoDir, beModel, be, verbose, storageDir, queryPrompt);
           }
         }
 
