@@ -222,19 +222,21 @@ async function applyRerank(
   const readStart = performance.now();
   // Use snippet from search results — these are logical code blocks from AFT's symbol resolution
   // Never read by line range (not a semantic unit) or whole files (too large)
+  let pathCount = 0;
   const documents = candidates.map((r) => {
     // Prefer snippet from semantic search results (already extracted by AFT as logical blocks)
     if (r.snippet && r.snippet.length > 10) return r.snippet;
 
     // No valid snippet — use file path as label (reranker will score it low, which is correct)
+    pathCount++;
     const rawFile = r.file || "";
     const normalized = rawFile.replace(/^\\\\\?\\/, "");
     return normalized;
   });
   const readMs = performance.now() - readStart;
-  // Log if documents are short (likely path strings, not content)
-  if (verbose && documents.some((d) => d.length < 200)) {
-    console.log(`    RERANK WARNING: ${documents.filter((d) => d.length < 200).length}/${documents.length} documents are short (<200 chars) — may be path strings, not file content`);
+  // Log when documents are file paths (no snippet available) — reranker can't work with just paths
+  if (verbose && pathCount > 0) {
+    console.log(`    RERANK NOTE: ${pathCount}/${documents.length} documents have no snippet (file path only) — reranker will score low`);
   }
   // Log chunk sizes for token budget analysis
   logChunkSizes("reranker", documents, verbose);
