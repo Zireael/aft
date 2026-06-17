@@ -29,6 +29,7 @@ import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
 import { runPreflight, printPreflight } from "./bench-cli";
 import { loadCanonSuite, loadCanonRepos } from "./canon-loader";
+import { discoverModels, formatDiscoveredModels, type ModelDiscoveryResult } from "./model-discovery";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -428,6 +429,7 @@ function printHeader(opts: {
   backends: string[]; k: number; rerank: boolean; rerankModel: string;
   rerankUrl: string; apiUrl?: string; apiModel?: string;
   semanticCount: number; lexicalCount: number; repos: string[];
+  discovery?: ModelDiscoveryResult;
 }) {
   const W = "\x1b[1;37m", D = "\x1b[0;90m", N = "\x1b[0m";
   const bar = "═".repeat(65);
@@ -435,11 +437,20 @@ function printHeader(opts: {
   console.log(`${W}  AFT Search Benchmark${N}`);
   console.log(`${W}${bar}${N}`);
   console.log(`${D}  k=${opts.k}  repos=${opts.repos.join(", ")}  queries=${opts.semanticCount} NL + ${opts.lexicalCount} identifier${N}`);
-  console.log(`\n${D}  Semantic Providers:${N}`);
-  if (opts.backends.includes("model2vec")) console.log(`${D}    model2vec:   minishlab/potion-code-16M (512-dim static embeddings)${N}`);
-  if (opts.backends.includes("fastembed")) console.log(`${D}    fastembed:   all-MiniLM-L6-v2 (384-dim transformer, ONNX)${N}`);
-  if (opts.backends.includes("semantic-api") && opts.apiUrl) console.log(`${D}    semantic-api: ${opts.apiModel || "?"} @ ${opts.apiUrl}${N}`);
-  if (opts.rerank) console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
+
+  // Use discovered models if available, otherwise fall back to hardcoded
+  if (opts.discovery && opts.discovery.models.length > 0) {
+    console.log(`\n${D}  Discovered Models (${opts.discovery.endpoint}):${N}`);
+    for (const line of formatDiscoveredModels(opts.discovery)) {
+      console.log(`${D}    ${line}${N}`);
+    }
+  } else {
+    console.log(`\n${D}  Semantic Providers:${N}`);
+    if (opts.backends.includes("model2vec")) console.log(`${D}    model2vec:   minishlab/potion-code-16M (512-dim static embeddings)${N}`);
+    if (opts.backends.includes("fastembed")) console.log(`${D}    fastembed:   all-MiniLM-L6-v2 (384-dim transformer, ONNX)${N}`);
+    if (opts.backends.includes("semantic-api") && opts.apiUrl) console.log(`${D}    semantic-api: ${opts.apiModel || "?"} @ ${opts.apiUrl}${N}`);
+    if (opts.rerank) console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
+  }
   console.log("");
 }
 
@@ -605,12 +616,34 @@ async function main() {
   for (const ann of allAnnotations) allRepos.add(ann.repo_name);
   for (const lr of LEXICAL_REPOS) allRepos.add(lr.name);
 
+  // Discover models from API endpoints if available
+  let discovery: ModelDiscoveryResult | undefined;
+  if (apiUrl) {
+    console.log("  Discovering models from semantic API...");
+    discovery = await discoverModels(apiUrl, verbose);
+    // Auto-detect model name if not specified
+    if (!apiModel && discovery.embedding_models.length > 0) {
+      apiModel = discovery.embedding_models[0].id;
+      (globalThis as any).__SEMANTIC_API_MODEL = apiModel;
+      console.log(`  Auto-detected embedding model: ${apiModel} (dim=${discovery.embedding_models[0].vector_dim})`);
+    }
+  }
+  if (doRerank && rerankUrl) {
+    console.log("  Discovering models from rerank endpoint...");
+    const rerankDiscovery = await discoverModels(rerankUrl, verbose);
+    if (rerankDiscovery.reranker_models.length > 0) {
+      const best = rerankDiscovery.reranker_models[0];
+      console.log(`  Auto-detected reranker: ${best.id}`);
+    }
+  }
+
   // Print header
   printHeader({
     backends, k, rerank: doRerank, rerankModel, rerankUrl,
     apiUrl: apiUrl || undefined, apiModel: apiModel || undefined,
     semanticCount: allAnnotations.length, lexicalCount: includeLexical ? LEXICAL_QUERIES.length : 0,
     repos: [...allRepos],
+    discovery,
   });
 
   // Check which repos are available, auto-clone missing ones
