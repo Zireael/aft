@@ -220,40 +220,16 @@ async function applyRerank(
   if (candidates.length <= 1) return { results: candidates, latency_ms: 0 };
 
   const readStart = performance.now();
-  // Use snippet from search results when available, else read file span, else read file
+  // Use snippet from search results — these are logical code blocks from AFT's symbol resolution
+  // Never read by line range (not a semantic unit) or whole files (too large)
   const documents = candidates.map((r) => {
-    // Prefer snippet from semantic search results (already extracted by AFT)
+    // Prefer snippet from semantic search results (already extracted by AFT as logical blocks)
     if (r.snippet && r.snippet.length > 10) return r.snippet;
 
+    // No valid snippet — use file path as label (reranker will score it low, which is correct)
     const rawFile = r.file || "";
     const normalized = rawFile.replace(/^\\\\\?\\/, "");
-    const maybeAbsolute = /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("/");
-    const resolved = maybeAbsolute ? normalized : join(repoDir, normalized);
-
-    // If we have line range, read only that span
-    const startLine = r.start_line || r.line;
-    const endLine = r.end_line;
-    if (startLine && endLine && endLine > startLine) {
-      try {
-        const content = readFileSync(resolved, "utf-8");
-        const lines = content.split("\n");
-        const span = lines.slice(Math.max(0, startLine - 1), endLine).join("\n");
-        if (span.length > 10) return span;
-      } catch { /* fall through */ }
-    }
-
-    // Fallback: read file (capped)
-    try {
-      const content = readFileSync(resolved, "utf-8");
-      return content.length > 2000 ? content.slice(0, 2000) : content;
-    } catch {
-      try {
-        const content = readFileSync(rawFile, "utf-8");
-        return content.length > 2000 ? content.slice(0, 2000) : content;
-      } catch {
-        return normalized;
-      }
-    }
+    return normalized;
   });
   const readMs = performance.now() - readStart;
   // Log if documents are short (likely path strings, not content)
