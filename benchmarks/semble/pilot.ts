@@ -28,6 +28,7 @@ import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
 import { runPreflight, printPreflight } from "./bench-cli";
+import { loadCanonSuite, loadCanonRepos } from "./canon-loader";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -775,15 +776,20 @@ async function main() {
         }
 
         const relevant = [lq.query]; // For identifier queries, the query itself is the relevant "path"
-        // We need actual file-level relevance — use rgSearch to find ground truth
-        const rg = rgSearch(lq.query, repoDir, null, k);
-        const allRelevant = rg.results.map((r) => r.file);
+        // Use checked-in canon relevance as ground truth, NOT runtime rg results
+        // Load canon relevance if available, otherwise fall back to empty (skip scoring)
+        const canonExact = loadCanonSuite(resolve("benchmarks/semble/canon"), "identifier_exact");
+        const canonPrefix = loadCanonSuite(resolve("benchmarks/semble/canon"), "identifier_prefix");
+        const canonEntry = [...(canonExact?.queries || []), ...(canonPrefix?.queries || [])].find((q) => q.query === lq.query && q.repo_name === repoName);
+        const allRelevant = canonEntry ? canonEntry.relevant.map((r) => r.path).filter(Boolean) : [];
         if (allRelevant.length === 0) {
-          // If rg finds nothing, skip this query
+          // No canon relevance for this query — skip scoring (rg is contestant, not oracle)
+          if (verbose) console.log(`    SKIP ${lq.query}: no canon relevance defined`);
           continue;
         }
 
-        // Ripgrep
+        // Ripgrep (baseline contestant, NOT oracle)
+        const rg = rgSearch(lq.query, repoDir, null, k);
         allResults.push({ mode: "lexical (rg)", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: rg.latency_ms, results: rg.results, recall_at_k: recallAtK(rg.results, allRelevant, k), mrr: mrr(rg.results, allRelevant), ndcg_at_k: ndcgAtK(rg.results, allRelevant, k) });
 
         // AFT grep
