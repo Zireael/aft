@@ -215,8 +215,9 @@ async function applyRerank(
   k: number,
   repoDir: string,
   verbose: boolean,
+  oversample: number = 10,
 ): Promise<{ results: SearchResult[]; latency_ms: number }> {
-  const candidates = results.slice(0, k * 5);
+  const candidates = results.slice(0, k * oversample);
   if (candidates.length <= 1) return { results: candidates, latency_ms: 0 };
 
   const readStart = performance.now();
@@ -489,14 +490,14 @@ function printHeader(opts: {
   rerankUrl: string; apiUrl?: string; apiModel?: string;
   semanticCount: number; lexicalCount: number; repos: string[];
   discovery?: ModelDiscoveryResult;
-  m2vModel?: string; feModel?: string;
+  m2vModel?: string; feModel?: string; oversample?: number;
 }) {
   const W = "\x1b[1;37m", D = "\x1b[0;90m", N = "\x1b[0m";
   const bar = "═".repeat(65);
   console.log(`\n${W}${bar}${N}`);
   console.log(`${W}  AFT Search Benchmark${N}`);
   console.log(`${W}${bar}${N}`);
-  console.log(`${D}  k=${opts.k}  repos=${opts.repos.join(", ")}  queries=${opts.semanticCount} NL + ${opts.lexicalCount} identifier${N}`);
+  console.log(`${D}  k=${opts.k}  repos=${opts.repos.join(", ")}  queries=${opts.semanticCount} NL + ${opts.lexicalCount} identifier${opts.rerank ? `  oversample=${opts.oversample}` : ""}${N}`);
 
   // Use discovered models if available, otherwise fall back to hardcoded
   if (opts.discovery && opts.discovery.models.length > 0) {
@@ -577,6 +578,7 @@ async function main() {
   let doRerank = false;
   let rerankModel = "GTE-Reranker-Modernbert";
   let queryPrompt: string | undefined;
+  let oversample = 10;
   let rerankUrl = "http://127.0.0.1:8090/v1/rerank";
   let includeLexical = true;
   let interactive = false;
@@ -596,11 +598,13 @@ async function main() {
       case "--rerank-model": rerankModel = args[++i]; break;
       case "--rerank-url": rerankUrl = args[++i]; break;
       case "--query-prompt": queryPrompt = args[++i]; break;
+      case "--oversample": oversample = parseInt(args[++i], 10) || 10; break;
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
+        console.log("  --oversample <n>  Reranker oversampling multiplier (default: 10)");
         process.exit(0);
     }
   }
@@ -763,6 +767,7 @@ async function main() {
     discovery,
     m2vModel: semanticModel,
     feModel: "all-MiniLM-L6-v2",
+    oversample,
   });
 
   // Check which repos are available, auto-clone missing ones
@@ -881,11 +886,11 @@ async function main() {
       for (const [be, session] of Object.entries(semSessions)) {
         if (!session) continue;
         const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
-        const semResults = await semanticQuery(session, ann.query, k * 5, be, verbose);
+        const semResults = await semanticQuery(session, ann.query, k * oversample, be, verbose);
         if (semResults.length === 0) continue;
 
-        const preRecall = recallAtK(semResults, allRelevant, k * 5);
-        const { results: reranked, latency_ms: rerankLat } = await applyRerank(ann.query, semResults, k, repoDir, verbose);
+        const preRecall = recallAtK(semResults, allRelevant, k * oversample);
+        const { results: reranked, latency_ms: rerankLat } = await applyRerank(ann.query, semResults, k, repoDir, verbose, oversample);
         const postRecall = recallAtK(reranked, allRelevant, k);
         const postMrr = mrr(reranked, allRelevant);
         const postNdcg = ndcgAtK(reranked, allRelevant, k);
