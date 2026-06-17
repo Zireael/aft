@@ -557,11 +557,12 @@ async function main() {
   }
 
   // Auto-detect semantic-api model if URL provided but model not specified
-  if (apiUrl && !apiModel) {
+  // Skip if --interactive (handled later) or if model already specified
+  if (apiUrl && !apiModel && !interactive) {
     console.log(`  Detecting model from ${apiUrl}...`);
     const detected = await detectModel(apiUrl);
     if (detected) { apiModel = detected; (globalThis as any).__SEMANTIC_API_MODEL = detected; }
-    else console.warn(`  WARNING: Could not auto-detect model from ${apiUrl}. Pass --semantic-api-model.`);
+    else console.warn(`  WARNING: Could not auto-detect model from ${apiUrl}. Pass --semantic-api-model or use --interactive.`);
   }
 
   // Load semantic NL fixtures
