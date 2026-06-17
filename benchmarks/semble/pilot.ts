@@ -559,6 +559,11 @@ async function main() {
     }
   }
 
+  // Normalize rerank URL: append /v1/rerank if not present
+  if (rerankUrl && !rerankUrl.includes("/v1/rerank") && !rerankUrl.includes("/rerank")) {
+    rerankUrl = rerankUrl.replace(/\/+$/, "") + "/v1/rerank";
+  }
+
   RERANK_MODEL = rerankModel;
   RERANK_URL = rerankUrl;
   (globalThis as any).__SEMANTIC_API_URL = apiUrl;
