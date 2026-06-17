@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/aft/semble/lexical-canon.schema.json",
+  "title": "AFT Semble Lexical Canon",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "suite",
+    "generated_at",
+    "queries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "suite": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "repo_name",
+          "language",
+          "query",
+          "intent",
+          "eligible_modes",
+          "relevant"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "repo_name": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "intent": {
+            "type": "string"
+          },
+          "eligible_modes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "relevant": {
+            "type": "array"
+          },
+          "secondary": {
+            "type": "array"
+          },
+          "review_status": {
+            "enum": [
+              "seed",
+              "reviewed",
+              "rejected",
+              "needs_update"
+            ]
+          },
+          "ast_pattern": {
+            "type": "string"
+          },
+          "ast_language": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

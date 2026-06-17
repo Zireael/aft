@@ -1,0 +1,930 @@
+{
+  "schema_version": 1,
+  "suite": "identifier_exact",
+  "generated_at": "2026-06-16T21:22:45Z",
+  "oracle_policy": {
+    "runtime_truth_generation": "forbidden",
+    "allowed_runtime_validation": [
+      "check that relevant paths exist at pinned revision",
+      "check that line ranges still contain expected symbol/text",
+      "fail or mark unavailable; do not rewrite relevance"
+    ],
+    "canonical_source": "checked-in reviewed JSON",
+    "review_status_values": [
+      "seed",
+      "reviewed",
+      "rejected",
+      "needs_update"
+    ]
+  },
+  "description": "Exact symbol/file identifier queries. These are seed canon rows; benchmark runtime must not derive relevance with rg.",
+  "queries": [
+    {
+      "id": "axum.ident.router",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "Router",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/routing/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Router",
+          "kind": "struct"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.method_router",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "MethodRouter",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/routing/method_routing.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "MethodRouter",
+          "kind": "struct"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.handler",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "Handler",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/handler/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Handler",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.into_response",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "IntoResponse",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "IntoResponse",
+          "kind": "trait",
+          "note": "Re-export from axum_core in this file; direct definition may be outside benchmark root."
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.from_request",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "FromRequest",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/extract/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "FromRequest",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.json",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "Json",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/json.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Json",
+          "kind": "struct"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.ident.no_content",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "NoContent",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "NoContent",
+          "kind": "struct",
+          "start_line": 79,
+          "end_line": 85
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.application",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "application",
+      "intent": "exact_module_identifier",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "application",
+          "kind": "module"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.request",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "request",
+      "intent": "exact_module_identifier",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/request.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "request",
+          "kind": "module"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.response",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "response",
+      "intent": "exact_module_identifier",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "response",
+          "kind": "module"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.view",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "View",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/view.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "View",
+          "kind": "function_or_class"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.app_render",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "app.render",
+      "intent": "exact_method_identifier",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "app.render",
+          "kind": "method",
+          "start_line": 522,
+          "end_line": 596
+        }
+      ],
+      "secondary": [
+        {
+          "path": "lib/view.js",
+          "grade": "secondary",
+          "confidence": "medium",
+          "review_status": "seed"
+        }
+      ],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.ident.res_send",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "res.send",
+      "intent": "exact_method_identifier",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "res.send",
+          "kind": "method",
+          "start_line": 125,
+          "end_line": 230
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.engine",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Engine",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "gin.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Engine",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.context",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Context",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "context.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Context",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.router_group",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "RouterGroup",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "routergroup.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "RouterGroup",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.node",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "node",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "tree.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "node",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.recovery",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Recovery",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "recovery.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Recovery",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.ident.json_binding",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "jsonBinding",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "binding/json.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "jsonBinding",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.base_model",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "BaseModel",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/main.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "BaseModel",
+          "kind": "class"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.field",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "Field",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/fields.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Field",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.config_dict",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "ConfigDict",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/config.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "ConfigDict",
+          "kind": "class_or_typeddict"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.field_validator",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "field_validator",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "field_validator",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.model_validator",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "model_validator",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "model_validator",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.ident.generate_json_schema",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "GenerateJsonSchema",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/json_schema.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "GenerateJsonSchema",
+          "kind": "class"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.serialize",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Serialize",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Serialize",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.serializer",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Serializer",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Serializer",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.serialize_struct",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "SerializeStruct",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "SerializeStruct",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.deserialize",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Deserialize",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Deserialize",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.deserializer",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Deserializer",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Deserializer",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.ident.visitor",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Visitor",
+      "intent": "exact_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_exact",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Visitor",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_and_manual_seed",
+      "review_status": "seed"
+    }
+  ]
+}
