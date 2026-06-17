@@ -29,7 +29,7 @@ import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
 import { runPreflight, printPreflight } from "./bench-cli";
 import { loadCanonSuite, loadCanonRepos } from "./canon-loader";
-import { discoverModels, formatDiscoveredModels, type ModelDiscoveryResult } from "./model-discovery";
+import { discoverModels, formatDiscoveredModels, interactiveModelSelection, type ModelDiscoveryResult } from "./model-discovery";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -155,10 +155,10 @@ function aggregateMetrics(rows: ModeResult[], totalQueries: number): AggregateMo
 // ---------------------------------------------------------------------------
 
 const LEXICAL_QUERIES = [
-  { query: "validate_path", repos: ["opencode-aft"], category: "identifier" },
-  { query: "BinaryBridge", repos: ["opencode-aft"], category: "identifier" },
-  { query: "fn handle_grep", repos: ["opencode-aft"], category: "identifier" },
-  { query: "experimental_search_index", repos: ["opencode-aft"], category: "identifier" },
+  { query: "validate_path", repos: ["aft"], category: "identifier" },
+  { query: "BinaryBridge", repos: ["aft"], category: "identifier" },
+  { query: "fn handle_grep", repos: ["aft"], category: "identifier" },
+  { query: "experimental_search_index", repos: ["aft"], category: "identifier" },
   { query: "BlockNumber", repos: ["reth"], category: "identifier" },
   { query: "fn execute", repos: ["reth"], category: "identifier" },
   { query: "EthApiError", repos: ["reth"], category: "identifier" },
@@ -166,7 +166,7 @@ const LEXICAL_QUERIES = [
 ];
 
 const LEXICAL_REPOS = [
-  { name: "opencode-aft", language: "rust", url: "https://github.com/cortexkit/opencode-aft.git", benchmark_root: null },
+  { name: "aft", language: "rust", url: "https://github.com/cortexkit/aft.git", benchmark_root: null },
   { name: "reth", language: "rust", url: "https://github.com/paradigmxyz/reth.git", benchmark_root: null },
 ];
 
@@ -518,6 +518,7 @@ async function main() {
   let rerankModel = "GTE-Reranker-Modernbert";
   let rerankUrl = "http://127.0.0.1:8090/v1/rerank";
   let includeLexical = true;
+  let interactive = false;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -534,6 +535,7 @@ async function main() {
       case "--rerank-model": rerankModel = args[++i]; break;
       case "--rerank-url": rerankUrl = args[++i]; break;
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
+      case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
@@ -631,6 +633,23 @@ async function main() {
   // Discover models from API endpoints if available
   let discovery: ModelDiscoveryResult | undefined;
   if (apiUrl) {
+    // Interactive mode: discover and let user select models
+    if (interactive && !apiModel) {
+      const interactiveResult = await interactiveModelSelection(apiUrl, doRerank ? rerankUrl : undefined, verbose);
+      if (!interactiveResult.proceed) {
+        console.log("Benchmark cancelled by user.");
+        process.exit(0);
+      }
+      if (interactiveResult.embeddingModel) {
+        apiModel = interactiveResult.embeddingModel.id;
+        (globalThis as any).__SEMANTIC_API_MODEL = apiModel;
+      }
+      if (interactiveResult.rerankerModel) {
+        rerankModel = interactiveResult.rerankerModel.id;
+        RERANK_MODEL = rerankModel;
+      }
+    }
+
     console.log("  Discovering models from semantic API...");
     discovery = await discoverModels(apiUrl, verbose);
     // Auto-detect model name if not specified

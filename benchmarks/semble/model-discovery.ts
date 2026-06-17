@@ -204,3 +204,134 @@ export function selectBestRerankerModel(
   }
   return result.reranker_models[0] || null;
 }
+
+// ---------------------------------------------------------------------------
+// Interactive model selection
+// ---------------------------------------------------------------------------
+
+import * as readline from "readline";
+
+/**
+ * Prompt user to select a model from a list interactively.
+ * Returns the selected model or null if user skips.
+ */
+function promptSelect(
+  rl: readline.Interface,
+  title: string,
+  models: DiscoveredModel[],
+): Promise<DiscoveredModel | null> {
+  return new Promise((resolve) => {
+    if (models.length === 0) {
+      resolve(null);
+      return;
+    }
+    console.log(`\n  ${title}:`);
+    for (let i = 0; i < models.length; i++) {
+      const m = models[i];
+      const dim = m.vector_dim ? ` (dim=${m.vector_dim})` : "";
+      console.log(`    [${i + 1}] ${m.id}${dim}`);
+    }
+    console.log(`    [s] Skip (don't use this mode)`);
+
+    rl.question(`  Select model [1-${models.length}/s]: `, (answer) => {
+      const trimmed = answer.trim().toLowerCase();
+      if (trimmed === "s" || trimmed === "skip" || trimmed === "") {
+        resolve(null);
+      } else {
+        const idx = parseInt(trimmed, 10) - 1;
+        if (idx >= 0 && idx < models.length) {
+          resolve(models[idx]);
+        } else {
+          console.log(`  Invalid selection, using first model.`);
+          resolve(models[0]);
+        }
+      }
+    });
+  });
+}
+
+/**
+ * Interactive model selection flow.
+ * Discovers models, displays them, and prompts user to select.
+ * Returns selected embedding model, reranker model, and whether user wants to proceed.
+ */
+export async function interactiveModelSelection(
+  semanticApiUrl: string,
+  rerankUrl: string | undefined,
+  verbose: boolean,
+): Promise<{
+  embeddingModel: DiscoveredModel | null;
+  rerankerModel: DiscoveredModel | null;
+  proceed: boolean;
+}> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  try {
+    console.log("\n=== Interactive Model Discovery ===");
+
+    // Discover semantic API models
+    console.log(`\nQuerying ${semanticApiUrl}/v1/models...`);
+    const semanticDiscovery = await discoverModels(semanticApiUrl, verbose);
+
+    if (semanticDiscovery.models.length === 0) {
+      console.log("  No models found at semantic API endpoint.");
+      rl.close();
+      return { embeddingModel: null, rerankerModel: null, proceed: false };
+    }
+
+    // Print all discovered models
+    console.log("\n  Discovered models:");
+    for (const line of formatDiscoveredModels(semanticDiscovery)) {
+      console.log(`  ${line}`);
+    }
+
+    // Select embedding model
+    const embeddingModel = await promptSelect(
+      rl,
+      "Select embedding model for semantic search",
+      semanticDiscovery.embedding_models,
+    );
+
+    if (embeddingModel) {
+      console.log(`  → Selected: ${embeddingModel.id} (dim=${embeddingModel.vector_dim})`);
+    }
+
+    // Discover reranker models if endpoint provided
+    let rerankerModel: DiscoveredModel | null = null;
+    if (rerankUrl) {
+      console.log(`\nQuerying ${rerankUrl}/v1/models...`);
+      const rerankDiscovery = await discoverModels(rerankUrl, verbose);
+
+      if (rerankDiscovery.reranker_models.length > 0) {
+        rerankerModel = await promptSelect(
+          rl,
+          "Select reranker model",
+          rerankDiscovery.reranker_models,
+        );
+
+        if (rerankerModel) {
+          console.log(`  → Selected: ${rerankerModel.id}`);
+        }
+      } else {
+        console.log("  No reranker models found.");
+      }
+    }
+
+    // Confirm
+    console.log("\n  Configuration:");
+    console.log(`    Embedding: ${embeddingModel?.id || "(none)"}${embeddingModel?.vector_dim ? ` dim=${embeddingModel.vector_dim}` : ""}`);
+    console.log(`    Reranker:  ${rerankerModel?.id || "(none)"}`);
+
+    return new Promise((resolve) => {
+      rl.question("\n  Proceed with this configuration? [Y/n]: ", (answer) => {
+        const proceed = answer.trim().toLowerCase() !== "n";
+        rl.close();
+        resolve({ embeddingModel, rerankerModel, proceed });
+      });
+    });
+  } catch (e) {
+    rl.close();
+    console.error(`  Interactive discovery failed: ${e}`);
+    return { embeddingModel: null, rerankerModel: null, proceed: false };
+  }
+}

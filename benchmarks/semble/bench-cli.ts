@@ -153,6 +153,7 @@ export interface BenchConfig {
 
   // Legacy compat
   includeLexical: boolean;
+  interactive: boolean;
 }
 
 function parseNumericArg(value: string, name: string, min: number, max: number): number {
@@ -193,6 +194,7 @@ export function parseArgs(argv: string[]): BenchConfig {
   let reportMd: string | null = null;
   let cacheDir = ".bench-cache";
   let includeLexical = true;
+  let interactive = false;
   let showHelp = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -223,6 +225,7 @@ export function parseArgs(argv: string[]): BenchConfig {
       case "--report-md": reportMd = args[++i]; break;
       case "--cache-dir": cacheDir = args[++i]; break;
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
+      case "--interactive": interactive = true; break;
       case "--output": reportJson = args[++i]; break; // legacy alias
       case "--help": case "-h": showHelp = true; break;
       default:
@@ -303,6 +306,7 @@ export function parseArgs(argv: string[]): BenchConfig {
     reportMd,
     cacheDir,
     includeLexical,
+    interactive,
   };
 }
 
@@ -352,6 +356,7 @@ Behavior:
   --allow-degrade        Emit unavailable rows instead of failing
   --allow-seed-canon     Allow seed-status canon rows
   --auto-clone           Auto-clone missing repos
+  --interactive          Interactive model selection (discover and pick models)
   --repetitions <n>      Query repetitions (default: from profile)
   --warmups <n>          Warmup queries (default: from profile)
 
