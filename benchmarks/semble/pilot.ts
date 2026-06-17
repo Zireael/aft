@@ -668,9 +668,9 @@ async function main() {
     }
 
     // If user specified both models, skip full discovery (avoids unloading from GPU)
-    if (apiModel && rerankerModel && doRerank) {
+    if (apiModel && rerankModel && doRerank) {
       console.log(`  Verifying specified models (skipping full discovery to preserve GPU memory)...`);
-      discovery = await verifySpecificModels(apiUrl, apiModel, rerankerModel, verbose);
+      discovery = await verifySpecificModels(apiUrl, apiModel, rerankModel, verbose);
     } else if (apiModel) {
       console.log(`  Verifying embedding model ${apiModel}...`);
       discovery = await verifySpecificModels(apiUrl, apiModel, undefined, verbose);
@@ -688,16 +688,16 @@ async function main() {
     }
   }
   if (doRerank && rerankUrl) {
-    if (rerankerModel) {
+    if (rerankModel) {
       // Already verified above, just ensure it's loaded
-      await ensureModelLoaded(rerankUrl, rerankerModel, "reranker", verbose);
+      await ensureModelLoaded(rerankUrl, rerankModel, "reranker", verbose);
     } else {
       console.log("  Discovering models from rerank endpoint...");
       const rerankDiscovery = await discoverModels(rerankUrl, verbose);
       if (rerankDiscovery.reranker_models.length > 0) {
         const best = rerankDiscovery.reranker_models[0];
-        rerankerModel = best.id;
-        RERANK_MODEL = rerankerModel;
+        rerankModel = best.id;
+        RERANK_MODEL = rerankModel;
         console.log(`  Auto-detected reranker: ${best.id}`);
       }
     }
