@@ -111,6 +111,17 @@ export async function discoverModels(
       owner: m.owned_by,
     };
 
+    // Probe reranker FIRST (more specific — a model that responds to /v1/rerank
+    // with valid results is a reranker even if it also responds to /v1/embeddings)
+    const isReranker = await probeReranker(url, m.id);
+    if (isReranker) {
+      model.type = "reranker";
+      reranker_models.push(model);
+      if (verbose) console.log(`    ✓ ${m.id} — reranker`);
+      models.push(model);
+      continue;
+    }
+
     // Probe embedding
     const dim = await probeEmbedding(url, m.id);
     if (dim !== null) {
@@ -118,16 +129,6 @@ export async function discoverModels(
       model.vector_dim = dim;
       embedding_models.push(model);
       if (verbose) console.log(`    ✓ ${m.id} — embedding, dim=${dim}`);
-      models.push(model);
-      continue;
-    }
-
-    // Probe reranker
-    const isReranker = await probeReranker(url, m.id);
-    if (isReranker) {
-      model.type = "reranker";
-      reranker_models.push(model);
-      if (verbose) console.log(`    ✓ ${m.id} — reranker`);
       models.push(model);
       continue;
     }
