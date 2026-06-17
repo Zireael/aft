@@ -57,6 +57,35 @@ interface ModeResult {
   ndcg_at_k: number;
 }
 
+// ---------------------------------------------------------------------------
+// Approximate token counting (~4 chars/token for code)
+// ---------------------------------------------------------------------------
+
+function approxTokens(text: string): number {
+  // Simple heuristic: split on whitespace/punctuation, ~1 token per word
+  // More accurate than chars/4 for code with lots of short identifiers
+  if (!text) return 0;
+  let count = 0;
+  for (let i = 0; i < text.length; ) {
+    // Skip whitespace
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (i >= text.length) break;
+    count++;
+    // Skip non-whitespace
+    while (i < text.length && /\S/.test(text[i])) i++;
+  }
+  return count;
+}
+
+function logChunkSizes(label: string, chunks: string[], verbose: boolean): void {
+  if (!verbose || chunks.length === 0) return;
+  const sizes = chunks.map(approxTokens);
+  const over = sizes.filter((s) => s > 2048).length;
+  const max = Math.max(...sizes);
+  const avg = Math.round(sizes.reduce((a, b) => a + b, 0) / sizes.length);
+  console.log(`    CHUNK-SIZE ${label}: ${chunks.length} chunks, avg=${avg} max=${max} over2048=${over}`);
+}
+
 interface AggregateMode {
   mode: string;
   recall: number;
@@ -231,6 +260,8 @@ async function applyRerank(
   if (verbose && documents.some((d) => d.length < 200)) {
     console.log(`    RERANK WARNING: ${documents.filter((d) => d.length < 200).length}/${documents.length} documents are short (<200 chars) — may be path strings, not file content`);
   }
+  // Log chunk sizes for token budget analysis
+  logChunkSizes("reranker", documents, verbose);
 
   const start = performance.now();
   try {
@@ -385,7 +416,7 @@ async function semanticQuery(session: AftSession, query: string, k: number, back
     const resp = await session.call({ command: "semantic_search", query, topK: k }, 30_000);
     const items = (resp as any).results;
     if (items && Array.isArray(items)) {
-      return items.map((r: any) => ({
+      const results = items.map((r: any) => ({
         file: r.file || r.file_path || r.path || "",
         line: r.start_line || r.line,
         score: r.score,
@@ -393,6 +424,10 @@ async function semanticQuery(session: AftSession, query: string, k: number, back
         start_line: r.start_line,
         end_line: r.end_line,
       }));
+      // Log snippet sizes for token budget analysis
+      const snippets = results.map((r) => r.snippet || "").filter((s) => s.length > 0);
+      logChunkSizes(`sem-${backend}`, snippets, verbose);
+      return results;
     }
   } catch (e) { if (verbose) console.log(`    SEM-${backend} ERROR: ${e}`); }
   return [];
