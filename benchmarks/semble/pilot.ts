@@ -208,6 +208,7 @@ const LEXICAL_REPOS = [
 
 let RERANK_MODEL = "GTE-Reranker-Modernbert";
 let RERANK_URL = "http://127.0.0.1:8090/v1/rerank";
+let RERANK_INSTRUCTION = "";
 
 async function applyRerank(
   query: string,
@@ -247,7 +248,13 @@ async function applyRerank(
     const resp = await fetch(RERANK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: RERANK_MODEL, query, documents, top_n: Math.min(k, candidates.length) }),
+      body: JSON.stringify({
+        model: RERANK_MODEL,
+        query,
+        documents,
+        top_n: Math.min(k, candidates.length),
+        ...(RERANK_INSTRUCTION ? { instruct: RERANK_INSTRUCTION } : {}),
+      }),
       signal: AbortSignal.timeout(30_000),
     });
 
@@ -599,12 +606,15 @@ async function main() {
       case "--rerank-url": rerankUrl = args[++i]; break;
       case "--query-prompt": queryPrompt = args[++i]; break;
       case "--oversample": oversample = parseInt(args[++i], 10) || 10; break;
+      case "--rerank-instruction": RERANK_INSTRUCTION = args[++i]; break;
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
-        console.log("  --oversample <n>  Reranker oversampling multiplier (default: 10)");
+        console.log("  --oversample <n>           Reranker oversampling multiplier (default: 10)");
+        console.log("  --rerank-instruction <txt> Instruction prompt for reranker model");
+        console.log("  --query-prompt <txt>       Query prompt template for embedding model");
         process.exit(0);
     }
   }

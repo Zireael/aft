@@ -21,7 +21,7 @@ bun run benchmarks/semble/pilot.ts \
   --verbose
 
 # Key flags:
-# - --rerank enables the reranker pass (5x oversampling by default)
+# - --rerank enables the reranker pass (10x oversampling by default)
 # - --rerank-url points to your reranker endpoint (e.g., GTE-Reranker via vLLM/TEI)
 # - --allow-degrade emits status: unavailable for missing modes instead of failing
 # - --allow-seed-canon includes seed-status canon rows (all 84 are currently seeds)
@@ -48,6 +48,63 @@ bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profi
 # Extended run (all canon, 3 repetitions)
 bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile extended --suite all --allow-degrade --report-json extended.json
 ```
+
+## CLI Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--binary <path>` | `aft` | Path to AFT binary |
+| `--profile <name>` | `smoke` | Run profile: smoke, quick, extended, manual-full |
+| `--suite <name>` | `all` | Suite filter: semantic_nl, identifier_exact, identifier_prefix, path_lookup, structural, all |
+| `--mode <list>` | all eligible | Comma-separated mode filter |
+| `--k <n>` | `10` | Top-k for recall@k, MRR, nDCG@k |
+| `--backend <name>` | `model2vec` | Default embedding backend for non-API modes |
+| `--semantic-api-url <url>` | — | OpenAI-compatible embedding API URL |
+| `--semantic-api-model <name>` | auto-detected | Embedding model name for API backend |
+| `--rerank` | off | Enable reranker post-retrieval pass |
+| `--rerank-url <url>` | `http://127.0.0.1:8090/v1/rerank` | Reranker API URL (auto-normalizes to /v1/rerank) |
+| `--rerank-model <name>` | `GTE-Reranker-Modernbert` | Reranker model name |
+| `--rerank-instruction <txt>` | — | Instruction prompt for reranker (e.g., "Given a web search query...") |
+| `--oversample <n>` | `10` | Reranker oversampling multiplier (fetches k×n candidates) |
+| `--query-prompt <txt>` | auto for CodeRankEmbed | Query prompt template for embedding (e.g., "Represent this query...: {query}") |
+| `--interactive` | off | Interactive mode: discover models, select interactively |
+| `--allow-degrade` | off | Emit status=unavailable instead of failing on missing modes |
+| `--allow-seed-canon` | off | Include seed-status canon rows |
+| `--cache-dir <dir>` | `.bench-cache` | Repo cache directory |
+| `--report-json <path>` | — | Save JSON report |
+| `--report-md <path>` | — | Save Markdown report |
+| `--baseline <path>` | — | Baseline report for comparison |
+| `--verbose` | off | Verbose output (chunk sizes, model verification, rerank warnings) |
+| `--include-lexical <bool>` | `true` | Include lexical identifier queries |
+| `--help`, `-h` | — | Show help |
+
+## Semantic API model discovery
+
+When `--semantic-api-url` is provided, the benchmark can auto-discover and classify models:
+
+- **Embedding models** — probed via `/v1/embeddings` with test input
+- **Reranker models** — probed via `/v1/rerank` with test query/documents
+- **Chat/LLM models** — classified as non-embedding, non-reranker
+
+If `--semantic-api-model` and `--rerank-model` are both specified, full discovery is skipped to preserve GPU memory. The benchmark only verifies the specified models are available.
+
+### CodeRankEmbed prompt template
+
+CodeRankEmbed requires a query prefix for optimal retrieval:
+```
+Represent this query for searching relevant code: <your query>
+```
+
+The benchmark auto-applies this when model name contains "coderankembed". Override with `--query-prompt "Your prefix: {query}"`.
+
+### Reranker instruction
+
+Some reranker models (e.g., GTE-Reranker) support an instruction prompt:
+```bash
+--rerank-instruction "Given a web search query, retrieve relevant passages that answer the query"
+```
+
+This is sent as the `instruct` field in the `/v1/rerank` request body.
 
 ## Profiles
 
@@ -121,6 +178,10 @@ Rerank attempts include paired pre/post metrics:
 - `rerank_delta_ndcg` (post - pre)
 - `candidate_pool_size`, `rerank_pool_size`
 
+**Oversampling**: The reranker receives k×oversample candidates (default: 10×). Higher oversampling gives the reranker more choices to reorder, potentially improving recall at the cost of latency.
+
+**Snippet extraction**: The reranker uses `snippet` fields from semantic search results (tree-sitter-based code blocks), not arbitrary line ranges or whole files.
+
 ## Canon files
 
 Checked-in relevance canon at `benchmarks/semble/canon/`:
@@ -161,8 +222,20 @@ bun run benchmarks/semble/tools/validate-lexical-canon.ts benchmarks/semble/cano
 # Run specific suite + mode
 bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --suite identifier-exact --mode fts5_find_symbol_exact --report-json result.json
 
-# Run with rerank
+# Run with rerank (default 10x oversampling)
 bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite semantic-nl --mode semantic_m2v --rerank --rerank-url http://localhost:8090/v1/rerank --report-json result.json
+
+# Run with aggressive oversampling (20x)
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite semantic-nl --rerank --oversample 20 --report-json result.json
+
+# Run with reranker instruction
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-instruction "Given a web search query, retrieve relevant passages" --report-json result.json
+
+# Run with custom query prompt for embedding
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --semantic-api-url http://localhost:8090 --query-prompt "Represent this query for searching relevant code: {query}" --report-json result.json
+
+# Interactive mode (discover and select models)
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --semantic-api-url http://localhost:8090 --rerank --rerank-url http://localhost:8090 --interactive --report-json result.json
 
 # Baseline comparison
 bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite all --baseline prior-report.json --report-json current.json
