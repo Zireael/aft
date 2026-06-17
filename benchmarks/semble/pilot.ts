@@ -27,6 +27,7 @@ import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
+import { runPreflight, printPreflight } from "./bench-cli";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -559,6 +560,43 @@ async function main() {
       continue;
     }
     backends.push(trimmed);
+  }
+
+  // Run preflight checks
+  const canonDir = resolve("benchmarks/semble/canon");
+  if (existsSync(canonDir)) {
+    const preflightConfig = {
+      profile: { name: "quick", allow_seed_canon: includeLexical } as any,
+      profileName: "quick",
+      suites: ["semantic_nl", "identifier_exact", "identifier_prefix", "path_lookup", "structural"] as any[],
+      modes: [] as any[],
+      binaryPath: bin,
+      k,
+      candidatePool: 50,
+      rerankPool: 50,
+      repetitions: 1,
+      warmups: 1,
+      backends,
+      semanticModel,
+      semanticApiUrl: apiUrl,
+      semanticApiModel: apiModel,
+      doRerank,
+      rerankModel,
+      rerankUrl,
+      allowDegraded: true,
+      allowSeedCanon: includeLexical,
+      autoClone: false,
+      verbose,
+      reportJson: outputFile,
+      reportJsonl: null,
+      reportMd: null,
+      cacheDir,
+      includeLexical,
+    };
+    const preflightResults = runPreflight(preflightConfig, canonDir);
+    if (preflightResults.length > 0) {
+      printPreflight(preflightResults);
+    }
   }
 
   // Collect all repos
