@@ -187,18 +187,33 @@ async function applyRerank(
   const candidates = results.slice(0, k * 5);
   if (candidates.length <= 1) return { results: candidates, latency_ms: 0 };
 
+  const readStart = performance.now();
   // Read file content snippets for reranker
   const documents = candidates.map((r) => {
-    const normalized = r.file.replace(/^\\\\\?\\/, "");
+    const rawFile = r.file || "";
+    // Strip Windows UNC prefix
+    const normalized = rawFile.replace(/^\\\\\?\\/, "");
+    // Determine if path is absolute
     const maybeAbsolute = /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("/");
-    const path = maybeAbsolute ? normalized : join(repoDir, normalized);
+    const resolved = maybeAbsolute ? normalized : join(repoDir, normalized);
     try {
-      const content = readFileSync(path, "utf-8");
+      const content = readFileSync(resolved, "utf-8");
       return content.length > 20_000 ? content.slice(0, 20_000) : content;
     } catch {
-      return normalized;
+      // Fallback: try raw path
+      try {
+        const content = readFileSync(rawFile, "utf-8");
+        return content.length > 20_000 ? content.slice(0, 20_000) : content;
+      } catch {
+        return normalized; // Last resort: return path string
+      }
     }
   });
+  const readMs = performance.now() - readStart;
+  // Log if documents are short (likely path strings, not content)
+  if (verbose && documents.some((d) => d.length < 200)) {
+    console.log(`    RERANK WARNING: ${documents.filter((d) => d.length < 200).length}/${documents.length} documents are short (<200 chars) — may be path strings, not file content`);
+  }
 
   const start = performance.now();
   try {
@@ -223,14 +238,14 @@ async function applyRerank(
         ranked.push({ ...candidates[idx], score: item.relevance_score ?? item.score ?? candidates[idx].score });
       }
     }
-    if (ranked.length === 0) return { results: candidates, latency_ms: performance.now() - start };
+    if (ranked.length === 0) return { results: candidates, latency_ms: readMs + (performance.now() - start) };
 
     const rankedKeys = new Set(ranked.map((r) => normalizePath(r.file)));
     const tail = candidates.filter((r) => !rankedKeys.has(normalizePath(r.file)));
-    return { results: [...ranked, ...tail], latency_ms: performance.now() - start };
+    return { results: [...ranked, ...tail], latency_ms: readMs + (performance.now() - start) };
   } catch (e) {
     if (verbose) console.log(`    RERANK ERROR: ${e}`);
-    return { results: candidates, latency_ms: performance.now() - start };
+    return { results: candidates, latency_ms: readMs + (performance.now() - start) };
   }
 }
 
@@ -801,9 +816,11 @@ async function main() {
         allResults.push({ mode: modeName, query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: semLatency, results: semResults, recall_at_k: recallAtK(semResults, allRelevant, k), mrr: mrr(semResults, allRelevant), ndcg_at_k: ndcgAtK(semResults, allRelevant, k) });
       } else { emptyCounts[modeName] = (emptyCounts[modeName] || 0) + 1; }
 
-      // Hybrid: FTS5 + semantic RRF
-      if (fts5Results.length > 0 && semResults.length > 0) {
-        const hybridResults = rrfFusion(fts5Results, semResults, k);
+      // Hybrid: FTS5 + semantic RRF (FTS5 is optional — hybrid works with semantic-only)
+      if (semResults.length > 0) {
+        const hybridResults = fts5Results.length > 0
+          ? rrfFusion(fts5Results, semResults, k)
+          : semResults; // No FTS5 results — use semantic-only as hybrid
         allResults.push({ mode: `hybrid-${modeName.replace("semantic-", "")}`, query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: fts5Latency + semLatency, results: hybridResults, recall_at_k: recallAtK(hybridResults, allRelevant, k), mrr: mrr(hybridResults, allRelevant), ndcg_at_k: ndcgAtK(hybridResults, allRelevant, k) });
       }
     }
