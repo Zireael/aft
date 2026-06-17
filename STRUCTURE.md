@@ -55,7 +55,7 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: ~62 command-specific request parsing and response generation modules
-- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`, `crates/aft/src/commands/fts5.rs`, `crates/aft/src/commands/verify.rs`, `crates/aft/src/commands/edit_symbol.rs`, `crates/aft/src/commands/move_symbol.rs`, `crates/aft/src/commands/inline_symbol.rs`, `crates/aft/src/commands/extract_function.rs`
+- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/semantic_doctor.rs`, `crates/aft/src/commands/semantic_eval.rs`, `crates/aft/src/commands/configure.rs`, `crates/aft/src/commands/fts5.rs`, `crates/aft/src/commands/verify.rs`, `crates/aft/src/commands/edit_symbol.rs`, `crates/aft/src/commands/move_symbol.rs`, `crates/aft/src/commands/inline_symbol.rs`, `crates/aft/src/commands/extract_function.rs`
 
 **`crates/aft/src/compress/`:**
 - Purpose: Provide tiered output compression for hoisted bash commands.
@@ -104,8 +104,8 @@ opencode-aft/
 
 **`packages/opencode-plugin/src/tools/`:**
 - Purpose: Group OpenCode tool definitions by capability area.
-- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, LSP, search, semantic, and inspect tools; permissions and internals helpers
-- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`
+- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, LSP, search, semantic, semantic-doctor, semantic-eval, verify, and inspect tools; permissions and internals helpers
+- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic-doctor.ts`, `packages/opencode-plugin/src/tools/semantic-eval.ts`, `packages/opencode-plugin/src/tools/verify.ts`
 
 **`packages/pi-plugin/`:**
 - Purpose: Ship the Pi coding-agent facing package that resolves the binary and registers tools.
@@ -115,8 +115,8 @@ lugin/src/tools/hoisted.ts`
 
 **`packages/pi-plugin/src/tools/`:**
 - Purpose: Group Pi tool definitions by capability area.
-- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, semantic, and inspect tools; render helpers, diff-format helper
-- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/fs.ts`
+- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, semantic, semantic-doctor, semantic-eval, verify, and inspect tools; render helpers, diff-format helper
+- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/fs.ts`, `packages/pi-plugin/src/tools/semantic-doctor.ts`, `packages/pi-plugin/src/tools/semantic-eval.ts`, `packages/pi-plugin/src/tools/verify.ts`
 
 **`packages/npm/`:**
 - Purpose: Publish one npm package per target platform so the plugin can resolve a bundled binary.
@@ -129,9 +129,24 @@ lugin/src/tools/hoisted.ts`
 - Key subdirectories: `benchmarks/src/`, `benchmarks/aft-search/`, `benchmarks/codegraph-replication/`, `benchmarks/codegraph-vs-aft-agent/`, `benchmarks/codegraph-vs-aft-retrieval/`, `benchmarks/compression-tokens/`, `benchmarks/semble/`, `benchmarks/settle-time/`
 
 **`benchmarks/semble/`:**
-- Purpose: Benchmark the `semble` semantic code search tool against baseline `rg` (ripgrep) across multi-profile test configurations.
-- Contains: Test profiles (a-f) with different reranking and retrieval strategies, ablation tests, pilot selection, corpus management, CI integration scripts, annotation fixtures, and profile result reports
-- Key files: `benchmarks/semble/run-semble-bench.ts`, `benchmarks/semble/pilot.ts`, `benchmarks/semble/ablation.ts`, `benchmarks/semble/baseline-rg.ts`, `benchmarks/semble/corpus.ts`
+- Purpose: Benchmark AFT's semantic search against baseline modes across multi-profile test configurations with canon-based relevance truth.
+- Contains: Test profiles (smoke/quick/extended), multi-mode pilot runner, ablation tests, corpus management, CI integration scripts, annotation fixtures, profile result reports, lexical canon files, and benchmark methodology documentation
+- Key files: `benchmarks/semble/pilot.ts` (main runner), `benchmarks/semble/bench-cli.ts` (CLI parser and preflight), `benchmarks/semble/bench-metrics.ts` (attempt rows, scoring, aggregation), `benchmarks/semble/bench-modes.ts` (mode adapters for AFT-native and external modes), `benchmarks/semble/bench-profiles.ts` (profile definitions), `benchmarks/semble/bench-report.ts` (schema-versioned report writer), `benchmarks/semble/canon-loader.ts` (canon file loader), `benchmarks/semble/METHODOLOGY.md` (binding methodology decisions), `benchmarks/semble/QUICK-BENCHMARK.md` (quick benchmark guide)
+
+**`benchmarks/semble/canon/`:**
+- Purpose: Store checked-in relevance canon (ground truth) for benchmark scoring, never generated from runtime search passes.
+- Contains: Per-query-type relevance files, pinned repo metadata, mode eligibility matrix, schema definition, and validation checklist
+- Key files: `benchmarks/semble/canon/repos.json`, `benchmarks/semble/canon/identifier-exact.json`, `benchmarks/semble/canon/identifier-prefix.json`, `benchmarks/semble/canon/path-lookup.json`, `benchmarks/semble/canon/structural.json`, `benchmarks/semble/canon/unverified-seeds.json`, `benchmarks/semble/canon/mode-matrix.json`, `benchmarks/semble/canon/lexical-canon.schema.json`
+
+**`benchmarks/semble/tools/`:**
+- Purpose: Validate and manage benchmark canon files.
+- Contains: Schema validation script for lexical canon files
+- Key files: `benchmarks/semble/tools/validate-lexical-canon.ts`
+
+**`benchmarks/aft-lexical-canon-package/`:**
+- Purpose: Package the lexical canon for integration into the benchmark suite.
+- Contains: Integration prompt, package summary, example coding session, and benchmark reference
+- Key files: `benchmarks/aft-lexical-canon-package/INTEGRATION_PROMPT.md`, `benchmarks/aft-lexical-canon-package/PACKAGE_SUMMARY.json`, `benchmarks/aft-lexical-canon-package/README.md`
 
 **`benchmarks/settle-time/`:**
 - Purpose: Measure the settle time of AFT's file-watching and index-building after a fresh checkout or large file change.
@@ -159,7 +174,7 @@ lugin/src/tools/hoisted.ts`
 
 **Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.).
 
-**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/callgraph_store/` -- persist callgraph data to SQLite generations; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index with overflow chunking for large symbols; `crates/aft/src/semantic_rerank.rs` -- dual-mode search reranker (chat-based LLM and cross-encoder `/v1/rerank`); `crates/aft/src/local_embed.rs` -- local ONNX embeddings (ort-driven); `crates/aft/src/vector_store.rs` -- pluggable vector storage; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/grep_executor.rs` -- grep scope resolution and dispatch; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners (Tier 1/2); `crates/aft/src/format.rs` -- formatter detection and execution; `crates/aft/src/fts5_store.rs` -- FTS5 versioned schema and transactional updates; `crates/aft/src/fts5_planner.rs` -- multi-lane query routing and result fusion; `crates/aft/src/fts5_indexer.rs` -- incremental FTS5 indexing with staleness tracking; `crates/aft/src/symbol_resolution.rs` -- native declaration resolution, references, and implementations; `crates/aft/src/symbol_insert.rs` -- insert-before/after symbol operations; `crates/aft/src/symbol_diagnostics.rs` -- symbol-scoped diagnostics and prioritization; `crates/aft/src/mutation_risk.rs` -- pre-mutation risk classification; `crates/aft/src/export_detection.rs` -- detect removed/added public symbols; `crates/aft/src/ril_indexer.rs` -- Repository Intelligence Layer graph indexer; `crates/aft/src/intelligence_config.rs` -- settings toggles for intelligence subsystems; `crates/aft/src/lint_tool_schemas.rs` -- static analysis for tool schema drift; `crates/aft/src/observability_ledger.rs` -- local metrics for enrichment, compression, and cache hits; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
+**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/callgraph_store/` -- persist callgraph data to SQLite generations; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index with overflow chunking for large symbols; `crates/aft/src/semantic_rerank.rs` -- dual-mode search reranker (chat-based LLM and cross-encoder `/v1/rerank`); `crates/aft/src/semantic_doctor.rs` -- semantic search health report generation; `crates/aft/src/semantic_eval.rs` -- semantic search eval suite runner; `crates/aft/src/local_embed.rs` -- local ONNX embeddings (ort-driven); `crates/aft/src/vector_store.rs` -- pluggable vector storage; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/grep_executor.rs` -- grep scope resolution and dispatch; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners (Tier 1/2); `crates/aft/src/format.rs` -- formatter detection and execution; `crates/aft/src/fts5_store.rs` -- FTS5 versioned schema and transactional updates; `crates/aft/src/fts5_planner.rs` -- multi-lane query routing and result fusion; `crates/aft/src/fts5_indexer.rs` -- incremental FTS5 indexing with staleness tracking; `crates/aft/src/symbol_resolution.rs` -- native declaration resolution, references, and implementations; `crates/aft/src/symbol_insert.rs` -- insert-before/after symbol operations; `crates/aft/src/symbol_diagnostics.rs` -- symbol-scoped diagnostics and prioritization; `crates/aft/src/mutation_risk.rs` -- pre-mutation risk classification; `crates/aft/src/export_detection.rs` -- detect removed/added public symbols; `crates/aft/src/ril_indexer.rs` -- Repository Intelligence Layer graph indexer; `crates/aft/src/intelligence_config.rs` -- settings toggles for intelligence subsystems; `crates/aft/src/lint_tool_schemas.rs` -- static analysis for tool schema drift; `crates/aft/src/observability_ledger.rs` -- local metrics for enrichment, compression, and cache hits; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/` -- plugin unit and e2e tests; `packages/pi-plugin/src/__tests__/` -- Pi plugin unit and e2e tests; `packages/aft-cli/src/__tests__/` -- CLI command tests; `packages/aft-bridge/src/__tests__/` -- bridge transport tests; `crates/aft/tests/integration/` -- Rust integration tests; `crates/aft/tests/semantic_test.rs` -- semantic index tests; `tests/docker/` -- Docker e2e; `tests/macos-e2e/` -- macOS e2e; `tests/windows-e2e/` -- Windows e2e; `tests/pi-rpc/` -- Pi RPC tests.
 
@@ -206,3 +221,9 @@ lugin/src/tools/hoisted.ts`
 **New Rust integration tests:** `crates/aft/tests/integration/` -- follow the existing `*_test.rs` naming.
 
 **New benchmark:** `benchmarks/[name]/` -- create a benchmark directory with `src/`, `corpora/`, `results/`, and `scripts/` subdirectories.
+
+**New benchmark canon file:** `benchmarks/semble/canon/[suite].json` -- add a new canon file for a benchmark suite with schema version 1 and queries array.
+
+**New benchmark mode adapter:** `benchmarks/semble/bench-modes.ts` -- add a new mode adapter function for AFT-native or external search modes.
+
+**New benchmark profile:** `benchmarks/semble/bench-profiles.ts` -- add a new profile definition to the PROFILES record with suite filters and mode sets.

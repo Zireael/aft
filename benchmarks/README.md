@@ -8,6 +8,7 @@ This directory contains reproducible benchmark harnesses. Docker is the preferre
 | `codegraph-replication/` | `bun run bench:codegraph-replication` (local) or `bun run bench:codegraph-replication:docker` | Structured CodeGraph-style retrieval cases run through AFT and lexical baselines. | Docker command builds AFT and Bun in-container. |
 | `codegraph-vs-aft-retrieval/` | `bun run bench:codegraph-vs-aft-retrieval` or `make run-codegraph-vs-aft-retrieval` | **Path A:** no-LLM retrieval quality: AFT vs CodeGraph on identical cases with Recall/MRR/P@k. | Two images: one builds AFT, one installs `@colbymchenry/codegraph@0.9.6`. |
 | `codegraph-vs-aft-agent/` | `bun run bench:codegraph-vs-aft-agent` or `make run-codegraph-vs-aft-agent` | **Path B:** OpenCode agent A/B: AFT plugin vs CodeGraph MCP on deterministic tasks. | Uses `opencode-go/deepseek-v4-flash-free` via the zen endpoint. Mount auth or set `OPENCODE_API_KEY`; `AGENT_DRY_RUN=1` only validates harness shape. |
+| `semble/` | `bun run benchmarks/semble/pilot.ts` | Decision-grade benchmark for comparing AFT retrieval modes (semantic, lexical, FTS5, symbol, path, structural) with canon-based relevance truth. | Measures recall, MRR, nDCG, and latency. Supports smoke/quick/extended profiles. See `benchmarks/semble/QUICK-BENCHMARK.md` for usage. |
 
 Results are written under each benchmark's `results/` directory. These directories are ignored by default; small sample outputs for the new AFT-vs-CodeGraph suites are committed to document the JSON/Markdown shape.
 
