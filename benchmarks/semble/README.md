@@ -174,6 +174,16 @@ bun run benchmarks/semble/corpus.ts sync
 - **annotations/**: Human-authored query relevance judgments
 - **Schema**: AFT-adapted (schema_version: 1) with provenance metadata
 
+## Methodology
+
+See [METHODOLOGY.md](METHODOLOGY.md) for binding benchmark decisions:
+
+- **No runtime oracle** — relevance truth comes from checked-in canon files, never from a runtime ripgrep pass
+- **Suite separation** — semantic NL, identifier exact/prefix, path lookup, and structural suites are aggregated independently
+- **Strict denominators** — every attempted `(suite, mode, query)` emits a row, including empty/error/unavailable scored as zero
+- **Latency decomposition** — cold start, index update, model load, warm query, rerank, and end-to-end are measured separately
+- **Mode eligibility** — each canon query declares which modes it applies to
+
 ## Known Limitations
 
 1. **Lexical baseline only** — current scripts run ripgrep; AFT semantic/hybrid modes require the `aft` binary
