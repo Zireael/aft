@@ -29,7 +29,7 @@ import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
 import { runPreflight, printPreflight } from "./bench-cli";
 import { loadCanonSuite, loadCanonRepos } from "./canon-loader";
-import { discoverModels, formatDiscoveredModels, interactiveModelSelection, type ModelDiscoveryResult } from "./model-discovery";
+import { discoverModels, verifySpecificModels, ensureModelLoaded, formatDiscoveredModels, interactiveModelSelection, type ModelDiscoveryResult } from "./model-discovery";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -430,6 +430,7 @@ function printHeader(opts: {
   rerankUrl: string; apiUrl?: string; apiModel?: string;
   semanticCount: number; lexicalCount: number; repos: string[];
   discovery?: ModelDiscoveryResult;
+  m2vModel?: string; feModel?: string;
 }) {
   const W = "\x1b[1;37m", D = "\x1b[0;90m", N = "\x1b[0m";
   const bar = "═".repeat(65);
@@ -446,8 +447,8 @@ function printHeader(opts: {
     }
   } else {
     console.log(`\n${D}  Semantic Providers:${N}`);
-    if (opts.backends.includes("model2vec")) console.log(`${D}    model2vec:   minishlab/potion-code-16M (512-dim static embeddings)${N}`);
-    if (opts.backends.includes("fastembed")) console.log(`${D}    fastembed:   all-MiniLM-L6-v2 (384-dim transformer, ONNX)${N}`);
+    if (opts.backends.includes("model2vec")) console.log(`${D}    model2vec:   ${opts.m2vModel || "minishlab/potion-code-16M"} (512-dim static embeddings)${N}`);
+    if (opts.backends.includes("fastembed")) console.log(`${D}    fastembed:   ${opts.feModel || "all-MiniLM-L6-v2"} (384-dim transformer, ONNX)${N}`);
     if (opts.backends.includes("semantic-api") && opts.apiUrl) console.log(`${D}    semantic-api: ${opts.apiModel || "?"} @ ${opts.apiUrl}${N}`);
     if (opts.rerank) console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
   }
@@ -651,21 +652,39 @@ async function main() {
       }
     }
 
-    console.log("  Discovering models from semantic API...");
-    discovery = await discoverModels(apiUrl, verbose);
-    // Auto-detect model name if not specified
-    if (!apiModel && discovery.embedding_models.length > 0) {
-      apiModel = discovery.embedding_models[0].id;
-      (globalThis as any).__SEMANTIC_API_MODEL = apiModel;
-      console.log(`  Auto-detected embedding model: ${apiModel} (dim=${discovery.embedding_models[0].vector_dim})`);
+    // If user specified both models, skip full discovery (avoids unloading from GPU)
+    if (apiModel && rerankerModel && doRerank) {
+      console.log(`  Verifying specified models (skipping full discovery to preserve GPU memory)...`);
+      discovery = await verifySpecificModels(apiUrl, apiModel, rerankerModel, verbose);
+    } else if (apiModel) {
+      console.log(`  Verifying embedding model ${apiModel}...`);
+      discovery = await verifySpecificModels(apiUrl, apiModel, undefined, verbose);
+    } else {
+      // Full discovery only when no models specified
+      console.log("  Discovering models from semantic API (this probes all models)...");
+      discovery = await discoverModels(apiUrl, verbose);
+      if (discovery.embedding_models.length > 0) {
+        apiModel = discovery.embedding_models[0].id;
+        (globalThis as any).__SEMANTIC_API_MODEL = apiModel;
+        console.log(`  Auto-detected embedding model: ${apiModel} (dim=${discovery.embedding_models[0].vector_dim})`);
+      }
+      // Re-probe desired models to reload them into GPU after full discovery
+      if (apiModel) await ensureModelLoaded(apiUrl, apiModel, "embedding", verbose);
     }
   }
   if (doRerank && rerankUrl) {
-    console.log("  Discovering models from rerank endpoint...");
-    const rerankDiscovery = await discoverModels(rerankUrl, verbose);
-    if (rerankDiscovery.reranker_models.length > 0) {
-      const best = rerankDiscovery.reranker_models[0];
-      console.log(`  Auto-detected reranker: ${best.id}`);
+    if (rerankerModel) {
+      // Already verified above, just ensure it's loaded
+      await ensureModelLoaded(rerankUrl, rerankerModel, "reranker", verbose);
+    } else {
+      console.log("  Discovering models from rerank endpoint...");
+      const rerankDiscovery = await discoverModels(rerankUrl, verbose);
+      if (rerankDiscovery.reranker_models.length > 0) {
+        const best = rerankDiscovery.reranker_models[0];
+        rerankerModel = best.id;
+        RERANK_MODEL = rerankerModel;
+        console.log(`  Auto-detected reranker: ${best.id}`);
+      }
     }
   }
 
@@ -676,6 +695,8 @@ async function main() {
     semanticCount: allAnnotations.length, lexicalCount: includeLexical ? LEXICAL_QUERIES.length : 0,
     repos: [...allRepos],
     discovery,
+    m2vModel: semanticModel,
+    feModel: "all-MiniLM-L6-v2",
   });
 
   // Check which repos are available, auto-clone missing ones

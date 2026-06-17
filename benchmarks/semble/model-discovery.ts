@@ -144,6 +144,76 @@ export async function discoverModels(
 }
 
 /**
+ * Verify specific models without probing all others.
+ * When user specifies --semantic-api-model and --rerank-model, skip full
+ * discovery to avoid unloading desired models from GPU memory.
+ */
+export async function verifySpecificModels(
+  url: string,
+  embeddingModelId?: string,
+  rerankerModelId?: string,
+  verbose: boolean = false,
+): Promise<ModelDiscoveryResult> {
+  const models: DiscoveredModel[] = [];
+  const embedding_models: DiscoveredModel[] = [];
+  const reranker_models: DiscoveredModel[] = [];
+
+  if (embeddingModelId) {
+    const dim = await probeEmbedding(url, embeddingModelId);
+    if (dim !== null) {
+      const model: DiscoveredModel = { id: embeddingModelId, name: embeddingModelId, type: "embedding", vector_dim: dim };
+      embedding_models.push(model);
+      models.push(model);
+      if (verbose) console.log(`  ✓ ${embeddingModelId} — embedding verified (dim=${dim})`);
+    } else {
+      console.warn(`  WARNING: Embedding model ${embeddingModelId} did not respond to /v1/embeddings`);
+    }
+  }
+
+  if (rerankerModelId) {
+    const isReranker = await probeReranker(url, rerankerModelId);
+    if (isReranker) {
+      const model: DiscoveredModel = { id: rerankerModelId, name: rerankerModelId, type: "reranker" };
+      reranker_models.push(model);
+      models.push(model);
+      if (verbose) console.log(`  ✓ ${rerankerModelId} — reranker verified`);
+    } else {
+      console.warn(`  WARNING: Reranker model ${rerankerModelId} did not respond to /v1/rerank`);
+    }
+  }
+
+  return { endpoint: url, models, embedding_models, reranker_models, chat_models: [], unknown_models: [] };
+}
+
+/**
+ * Re-probe a specific model to ensure it's loaded into GPU memory.
+ * After full discovery unloads models, this reloads the desired ones.
+ */
+export async function ensureModelLoaded(
+  url: string,
+  modelId: string,
+  type: "embedding" | "reranker",
+  verbose: boolean = false,
+): Promise<boolean> {
+  if (verbose) console.log(`  Ensuring ${modelId} is loaded...`);
+  if (type === "embedding") {
+    const dim = await probeEmbedding(url, modelId);
+    if (dim !== null) {
+      if (verbose) console.log(`  ✓ ${modelId} loaded (dim=${dim})`);
+      return true;
+    }
+  } else {
+    const ok = await probeReranker(url, modelId);
+    if (ok) {
+      if (verbose) console.log(`  ✓ ${modelId} loaded`);
+      return true;
+    }
+  }
+  console.warn(`  WARNING: ${modelId} failed to load after discovery`);
+  return false;
+}
+
+/**
  * Format discovered models for terminal display.
  */
 export function formatDiscoveredModels(result: ModelDiscoveryResult): string[] {
