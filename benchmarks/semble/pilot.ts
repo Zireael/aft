@@ -223,22 +223,48 @@ async function applyRerank(
 
   const readStart = performance.now();
   // Use snippet from search results — these are logical code blocks from AFT's symbol resolution
-  // Never read by line range (not a semantic unit) or whole files (too large)
+  // For candidates without snippets (ranks 3+), read the symbol's line range from disk
+  let snippetCount = 0;
+  let lineRangeCount = 0;
   let pathCount = 0;
   const documents = candidates.map((r) => {
     // Prefer snippet from semantic search results (already extracted by AFT as logical blocks)
-    if (r.snippet && r.snippet.length > 10) return r.snippet;
+    if (r.snippet && r.snippet.length > 10) {
+      snippetCount++;
+      return r.snippet;
+    }
 
-    // No valid snippet — use file path as label (reranker will score it low, which is correct)
+    // No snippet — try reading the symbol's line range (start_line to end_line)
+    const startLine = r.start_line || r.line;
+    const endLine = r.end_line;
+    if (startLine && endLine && endLine > startLine) {
+      const rawFile = r.file || "";
+      const normalized = rawFile.replace(/^\\\\\?\\/, "");
+      const maybeAbsolute = /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("/");
+      const resolved = maybeAbsolute ? normalized : join(repoDir, normalized);
+      try {
+        const content = readFileSync(resolved, "utf-8");
+        const lines = content.split("\n");
+        // Read the symbol's exact range (capped to 100 lines for safety)
+        const cappedEnd = Math.min(endLine, startLine + 100);
+        const span = lines.slice(Math.max(0, startLine - 1), cappedEnd).join("\n");
+        if (span.length > 10) {
+          lineRangeCount++;
+          return span;
+        }
+      } catch { /* fall through */ }
+    }
+
+    // Last resort: file path as label
     pathCount++;
     const rawFile = r.file || "";
     const normalized = rawFile.replace(/^\\\\\?\\/, "");
     return normalized;
   });
   const readMs = performance.now() - readStart;
-  // Log when documents are file paths (no snippet available) — reranker can't work with just paths
-  if (verbose && pathCount > 0) {
-    console.log(`    RERANK NOTE: ${pathCount}/${documents.length} documents have no snippet (file path only) — reranker will score low`);
+  // Log document source breakdown
+  if (verbose && candidates.length > 0) {
+    console.log(`    RERANK DOCS: ${snippetCount} snippets, ${lineRangeCount} line-ranges, ${pathCount} paths (${candidates.length} total)`);
   }
   // Log chunk sizes for token budget analysis
   logChunkSizes("reranker", documents, verbose);
