@@ -48,7 +48,8 @@
       "review_status": "seed",
       "ast_pattern": "impl IntoResponse for $T { $$$ }",
       "ast_language": "rust",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "axum.struct.trait_handler",
@@ -77,7 +78,8 @@
       "review_status": "seed",
       "ast_pattern": "pub trait Handler<$A, $B> { $$$ }",
       "ast_language": "rust",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "gin.struct.type_engine",
@@ -106,7 +108,8 @@
       "review_status": "seed",
       "ast_pattern": "type Engine struct { $$$ }",
       "ast_language": "go",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "gin.struct.router_group_use",
@@ -135,7 +138,8 @@
       "review_status": "seed",
       "ast_pattern": "func ($R *RouterGroup) Use($$$) $$$",
       "ast_language": "go",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "pydantic.struct.class_base_model",
@@ -164,7 +168,8 @@
       "review_status": "seed",
       "ast_pattern": "class BaseModel($$$): $$$",
       "ast_language": "python",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "pydantic.struct.def_field_validator",
@@ -193,7 +198,8 @@
       "review_status": "seed",
       "ast_pattern": "def field_validator($$$): $$$",
       "ast_language": "python",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "express.struct.app_render_assignment",
@@ -224,7 +230,8 @@
       "review_status": "seed",
       "ast_pattern": "$OBJ.render = function($$$) { $$$ }",
       "ast_language": "javascript",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "express.struct.res_send_assignment",
@@ -255,7 +262,8 @@
       "review_status": "seed",
       "ast_pattern": "$OBJ.send = function($$$) { $$$ }",
       "ast_language": "javascript",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     },
     {
       "id": "serde.struct.trait_serialize",
@@ -284,7 +292,8 @@
       "review_status": "seed",
       "ast_pattern": "pub trait Serialize { $$$ }",
       "ast_language": "rust",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": true
     },
     {
       "id": "serde.struct.trait_visitor",
@@ -313,7 +322,8 @@
       "review_status": "seed",
       "ast_pattern": "pub trait Visitor<$A> { $$$ }",
       "ast_language": "rust",
-      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
+      "hold_out": false
     }
   ]
 }
