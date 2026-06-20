@@ -1,0 +1,128 @@
+{
+  "baseline_recorded_at": "2026-06-20",
+  "head_sha": "92744a184cefa522689ed786a895a6fad41fe9e9",
+  "branch": "semantic-search-enhancement",
+  "remote": "zireael/semantic-search-enhancement",
+  "divergence_from_remote": "none (local in sync)",
+
+  "fixture_schema": {
+    "location": "benchmarks/semble/schema.json",
+    "schema_version": 1,
+    "required_fields": ["schema_version", "repos", "annotations"],
+    "annotation_categories": ["symbol", "semantic", "architecture"],
+    "target_types": ["file_path_string", "line_range_object"]
+  },
+
+  "config_inventory": {
+    "semantic_backend_config": {
+      "file": "crates/aft/src/config.rs",
+      "struct": "SemanticBackendConfig",
+      "fields": {
+        "backend": "SemanticBackend enum",
+        "model": "String",
+        "base_url": "Option<String>",
+        "api_key_env": "Option<String>",
+        "timeout_ms": "u64",
+        "max_batch_size": "usize",
+        "dimensions": "Option<usize>",
+        "output_encoding": "Option<OutputEncoding>",
+        "input_mode": "Option<InputMode>",
+        "storage_strategy": "Option<StorageStrategy>",
+        "distance_metric": "Option<DistanceMetric>",
+        "query_prompt_template": "Option<String>",
+        "document_prompt_template": "Option<String>",
+        "use_model_profiles": "bool (default: true)",
+        "diagnostics": "bool (default: false)"
+      }
+    },
+    "rerank_config": {
+      "file": "crates/aft/src/config.rs",
+      "fields": {
+        "rerank_enabled": "bool (default: false)",
+        "rerank_model": "Option<String> (fallback: codellama/codellama:7b-instruct)",
+        "rerank_base_url": "Option<String>",
+        "rerank_api_key_env": "Option<String>",
+        "rerank_timeout_ms": "u64 (default: 15000)",
+        "rerank_max_candidates": "usize (default: 20)",
+        "rerank_max_candidate_chars": "usize (default: 2500)",
+        "rerank_api_type": "RerankApiType (Chat|Rerank, default: Chat)",
+        "rerank_max_candidate_chars_cross_encoder": "usize (default: 512)",
+        "rerank_prompt_template": "Option<String> (trust-boundary: cannot set from project config)"
+      }
+    },
+    "intelligence_config": {
+      "file": "crates/aft/src/intelligence_config.rs",
+      "struct": "IntelligenceConfig",
+      "sub_configs": ["fts5", "hybrid_ranking", "chunk_retrieval", "graph", "mutation_risk", "verify", "context_economy", "symbolic_refactor"]
+    },
+    "fts5_config": {
+      "file": "crates/aft/src/intelligence_config.rs",
+      "defaults": {
+        "enabled": false,
+        "auto_index": false,
+        "index_on_start": false,
+        "max_results": 20,
+        "max_body_chars": 2000,
+        "max_body_lines": 60
+      }
+    },
+    "hybrid_ranking_config": {
+      "file": "crates/aft/src/intelligence_config.rs",
+      "defaults": {
+        "enabled": false,
+        "lexical_weight": 0.5,
+        "semantic_weight": 0.5,
+        "rerank_enabled": false,
+        "rerank_max_candidates": 20
+      }
+    }
+  },
+
+  "feature_flags": {
+    "cargo_feature": "semantic-fts5 (crates/aft/Cargo.toml:27)",
+    "retrieval_intelligence_v2": "NOT YET IMPLEMENTED — planned per PRD ADR-011",
+    "current_gate": "#[cfg(feature = \"semantic-fts5\")] in commands/mod.rs:25-26 and main.rs:636-645"
+  },
+
+  "source_files_status": {
+    "crates/aft/src/commands/semantic_search.rs": "exists",
+    "crates/aft/src/query_shape.rs": "exists",
+    "crates/aft/src/config.rs": "exists",
+    "crates/aft/src/semantic_rerank.rs": "exists",
+    "crates/aft/src/fts5_planner.rs": "exists",
+    "crates/aft/src/fts5_store.rs": "exists",
+    "crates/aft/src/vector_store.rs": "exists",
+    "crates/aft/src/callgraph.rs": "exists",
+    "crates/aft/src/mutation_risk.rs": "exists",
+    "crates/aft/src/ril_indexer.rs": "exists",
+    "crates/aft/src/observability_ledger.rs": "exists",
+    "benchmarks/semble/pilot.ts": "exists"
+  },
+
+  "tokenization_api": {
+    "crate": "crates/aft-tokenizer",
+    "function": "pub fn count_tokens(text: &str) -> usize",
+    "file": "crates/aft-tokenizer/src/claude.rs:18",
+    "re_export": "crates/aft-tokenizer/src/lib.rs:5 — pub use claude::{count_tokens, encode};",
+    "mechanism": "BPE/Lookup hybrid matching Claude's encoding via ai-tokenizer"
+  },
+
+  "dispatcher": {
+    "entry_point": "crates/aft/src/main.rs:545",
+    "function": "fn dispatch(req: RawRequest, ctx: &AppContext) -> Response",
+    "pattern": "match req.command.as_str() with string arm matching",
+    "total_arms": "~60",
+    "feature_gated_arms": "lines 636-645, #[cfg(feature = \"semantic-fts5\")]",
+    "unknown_command_arm": "line 652, returns unknown_command error",
+    "handler_location": "crates/aft/src/commands/<name>.rs, declared in commands/mod.rs:1-62"
+  },
+
+  "graph_health": {
+    "type": "GraphHealth enum",
+    "file": "crates/aft/src/ril_indexer.rs:11",
+    "variants": ["Disabled", "Cold", "Indexing", "Healthy", "Stale", "Rebuilding", "Degraded", "Corrupt"],
+    "usable_fn": "returns true for Healthy/Stale/Degraded",
+    "related_types": ["GraphHealthReport", "GraphCircuitBreaker", "CircuitBreakerState"],
+    "testability": "Plain enum with PartialEq/Eq + Copy, fully testable without database"
+  }
+}
