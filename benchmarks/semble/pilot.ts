@@ -217,24 +217,39 @@ async function applyRerank(
   repoDir: string,
   verbose: boolean,
   oversample: number = 10,
-): Promise<{ results: SearchResult[]; latency_ms: number }> {
+  rerankContext: string = "aft_output",
+): Promise<{ results: SearchResult[]; latency_ms: number; reranker_skipped_reason?: string }> {
   const candidates = results.slice(0, k * oversample);
   if (candidates.length <= 1) return { results: candidates, latency_ms: 0 };
 
   const readStart = performance.now();
   // Use snippet from search results — these are logical code blocks from AFT's symbol resolution
   // For candidates without snippets (ranks 3+), read the symbol's line range from disk
+  // UNLESS rerankContext is "aft_output" (zero file reads) or "path_only" (strip content)
   let snippetCount = 0;
   let lineRangeCount = 0;
   let pathCount = 0;
   const documents = candidates.map((r) => {
+    // path_only mode: strip all snippet content, use only file path
+    if (rerankContext === "path_only") {
+      pathCount++;
+      return r.file || "";
+    }
+
     // Prefer snippet from semantic search results (already extracted by AFT as logical blocks)
     if (r.snippet && r.snippet.length > 10) {
       snippetCount++;
       return r.snippet;
     }
 
-    // No snippet — try reading the symbol's line range (start_line to end_line)
+    // aft_output mode: zero source file reads — use file path as label
+    if (rerankContext === "aft_output") {
+      pathCount++;
+      const rawFile = r.file || "";
+      return rawFile.replace(/^\\\\\?\\/, "");
+    }
+
+    // benchmark_enriched mode: read from disk as fallback
     const startLine = r.start_line || r.line;
     const endLine = r.end_line;
     if (startLine && endLine && endLine > startLine) {
@@ -615,6 +630,7 @@ async function main() {
   let rerankUrl = "http://127.0.0.1:8090/v1/rerank";
   let includeLexical = true;
   let interactive = false;
+  let rerankContext = "aft_output"; // default: aft_output (WARNING 3)
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -633,12 +649,22 @@ async function main() {
       case "--query-prompt": queryPrompt = args[++i]; break;
       case "--oversample": oversample = parseInt(args[++i], 10) || 10; break;
       case "--rerank-instruction": RERANK_INSTRUCTION = args[++i]; break;
+      case "--rerank-context": {
+        const val = args[++i];
+        if (val !== "aft_output" && val !== "benchmark_enriched" && val !== "path_only") {
+          console.error(`Error: unknown --rerank-context mode: "${val}". Valid modes: aft_output, benchmark_enriched, path_only`);
+          process.exit(1);
+        }
+        rerankContext = val;
+        break;
+      }
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
         console.log("  --oversample <n>           Reranker oversampling multiplier (default: 10)");
+        console.log("  --rerank-context <mode>    Reranker context mode: aft_output (default), benchmark_enriched, path_only");
         console.log("  --rerank-instruction <txt> Instruction prompt for reranker model");
         console.log("  --query-prompt <txt>       Query prompt template for embedding model");
         process.exit(0);
@@ -926,7 +952,7 @@ async function main() {
         if (semResults.length === 0) continue;
 
         const preRecall = recallAtK(semResults, allRelevant, k * oversample);
-        const { results: reranked, latency_ms: rerankLat } = await applyRerank(ann.query, semResults, k, repoDir, verbose, oversample);
+        const { results: reranked, latency_ms: rerankLat, reranker_skipped_reason } = await applyRerank(ann.query, semResults, k, repoDir, verbose, oversample, rerankContext);
         const postRecall = recallAtK(reranked, allRelevant, k);
         const postMrr = mrr(reranked, allRelevant);
         const postNdcg = ndcgAtK(reranked, allRelevant, k);
@@ -1088,6 +1114,7 @@ async function main() {
     binary: binaryPath,
     backends,
     rerank: doRerank ? { model: rerankModel, url: rerankUrl } : null,
+    rerank_context: rerankContext,
     results: allResults,
     aggregate: Object.fromEntries(semanticAgg.map((a) => [a.mode, a])),
     lexical_aggregate: Object.fromEntries(lexicalAgg.map((a) => [a.mode, a])),
