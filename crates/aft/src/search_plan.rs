@@ -389,6 +389,29 @@ impl SearchPlanBuilder {
             feature_flag_state: FeatureFlagState::Off,
         }
     }
+
+    /// Resolve a profile string to a ContextBudget.
+    ///
+    /// Returns Err with a descriptive message for unknown profiles.
+    pub fn resolve_profile(profile: &str) -> Result<ContextBudget, String> {
+        match profile {
+            "agent_fast" => Ok(ContextBudget::agent_fast()),
+            "agent_deep" => Ok(ContextBudget::agent_deep()),
+            "symbol_exact" => Ok(ContextBudget::symbol_exact()),
+            other => Err(format!("unknown context profile: {other}")),
+        }
+    }
+
+    /// Build a SearchPlan with a specific profile override.
+    pub fn from_query_shape_with_profile(
+        shape: &QueryShape,
+        safety_ctx: &SafetyLaneContext,
+        profile: &str,
+    ) -> Result<SearchPlan, String> {
+        let mut plan = Self::from_query_shape(shape, safety_ctx);
+        plan.context_budget = Self::resolve_profile(profile)?;
+        Ok(plan)
+    }
 }
 
 // ---------------------------------------------------------------------------

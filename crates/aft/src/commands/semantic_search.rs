@@ -65,6 +65,10 @@ struct SemanticSearchParams {
     top_k: usize,
     #[serde(default)]
     hint: SearchHint,
+    /// Optional context profile: "agent_fast", "agent_deep", "symbol_exact".
+    /// When absent with retrieval_intelligence_v2 enabled, defaults to "agent_fast".
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +139,13 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             fts5_available,
             search_index_ready: lexical_ready,
         };
-        Some(SearchPlanBuilder::from_query_shape(&shape, &safety_ctx))
+        let profile = params.profile.as_deref().unwrap_or("agent_fast");
+        match SearchPlanBuilder::from_query_shape_with_profile(&shape, &safety_ctx, profile) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                return Response::error(&req.id, "invalid_request", error);
+            }
+        }
     } else {
         None
     };
@@ -1995,6 +2005,8 @@ fn search_plan_to_json(plan: &SearchPlan) -> serde_json::Value {
     serde_json::json!({
         "intent": format!("{:?}", plan.intent),
         "active_safety_lane": format!("{:?}", plan.active_safety_lane),
+        "context_mode": format!("{:?}", plan.context_budget.mode),
+        "enrich_pool": format!("{:?}", plan.context_budget.enrich_pool),
         "lane_weights": lane_weights,
         "max_candidates_per_lane": max_candidates_per_lane,
     })
