@@ -92,6 +92,7 @@ pub mod query_shape;
 pub mod refactor_plan;
 pub mod ril_indexer;
 pub mod search_index;
+pub mod search_plan;
 pub mod semantic_diagnostics;
 pub mod semantic_doctor;
 pub mod semantic_eval;
