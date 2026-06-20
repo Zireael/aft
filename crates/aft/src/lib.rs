@@ -62,6 +62,7 @@ pub mod commands;
 pub mod compress;
 pub mod config;
 pub mod context;
+pub mod context_budget;
 pub mod db;
 pub mod edit;
 pub mod error;

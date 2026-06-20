@@ -1650,30 +1650,17 @@ fn format_grep_search_text(
 /// cosine×boost for lexically-co-matched hits), so it is NOT shown to the
 /// agent — position conveys rank. We spend snippet tokens by rank instead: the
 /// top hit is disproportionately likely to be the final answer (a fuller
-/// preview there can save a follow-up aft_zoom), tail hits only need to be
-/// identifiable. Snippets are limited to the top 3; rank 4+ shows the symbol
-/// header only and the agent zooms the ones it cares about.
-fn snippet_line_budget(global_rank: usize) -> usize {
-    match global_rank {
-        // Rank 0 gets a fuller preview: 10 lines was often half a real function,
-        // forcing a zoom anyway and defeating the "preview saves a follow-up"
-        // goal. 20 (capped at the symbol's real length) clears most functions.
-        0 => 20,
-        1 | 2 => 5,
-        _ => 0,
-    }
-}
-
 /// Replace each result's display snippet with source lines read on the fly from
-/// disk, bounded by the rank budget. Snippets are display-only (they never
-/// affect embeddings), so reading them at query time keeps the on-disk index
-/// free of display text, lets snippet sizing change without a re-index, and
-/// shows the current file content instead of whatever was captured at index
-/// time. Only the top 3 carry snippets; rank 4+ get a header only and the agent
-/// zooms the ones it cares about. Lexical rows keep their placeholder and file
-/// summaries keep the generated summary (not source lines). Returns true when
-/// any snippet was truncated or omitted, so the caller emits the zoom hint only
-/// when it is actionable.
+/// disk. Snippets are display-only (they never affect embeddings), so reading
+/// them at query time keeps the on-disk index free of display text.
+/// Rank 0 gets a fuller preview (20 lines); ranks 1-2 get 5 lines; rank 3+
+/// shows header only. Lexical rows keep their placeholder and file summaries
+/// keep the generated summary. Returns true when any snippet was truncated or
+/// omitted, so the caller emits the zoom hint only when it is actionable.
+///
+/// NOTE: The old `snippet_line_budget(rank)` function has been removed as part
+/// of the Retrieval Intelligence v1 (T3a). The budget logic is now inlined
+/// here and will be replaced by ContextBudget in a later wiring Bead.
 fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
     // Cache reads so two top-3 hits in the same file read it once.
     let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
@@ -1684,7 +1671,12 @@ fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
             continue;
         }
 
-        let budget = snippet_line_budget(rank);
+        // Inlined budget: rank 0 → 20 lines, ranks 1-2 → 5 lines, rank 3+ → 0.
+        let budget = match rank {
+            0 => 20,
+            1 | 2 => 5,
+            _ => 0,
+        };
         if budget == 0 {
             // Header-only tier: a real body means there is more to see.
             if result.end_line >= result.start_line {
