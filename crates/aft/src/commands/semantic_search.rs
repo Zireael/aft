@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::context::{AppContext, SemanticIndexStatus};
+use crate::context_budget::{ContextBudget, ContextBudgetResult, EnrichPool};
 use crate::grep_executor::{self, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
@@ -604,48 +605,77 @@ fn handle_semantic_or_hybrid_search(
         }
     };
 
+    // ROOT CAUSE FIX: Enrich rerank pool BEFORE reranking (WARNING 2).
+    // When retrieval_intelligence_v2 is enabled AND enrich_pool==RerankPool AND rerank enabled,
+    // enrich all candidates with context BEFORE rerank_candidates() so the reranker receives
+    // non-empty snippets. PathOnly candidates are excluded from reranker input.
+    let mut context_budget_result = ContextBudgetResult::default();
+    let ri_v2 = ctx.config().intelligence.retrieval_intelligence_v2;
+    let enrich_before_rerank = ri_v2
+        && rerank_enabled
+        && search_plan
+            .as_ref()
+            .map(|p| p.context_budget.enrich_pool == EnrichPool::RerankPool)
+            .unwrap_or(false);
+
+    if enrich_before_rerank {
+        let budget = &search_plan.as_ref().unwrap().context_budget;
+        context_budget_result = enrich_context_pool(&mut results, budget);
+        // If enriched ratio is below threshold, skip reranker entirely
+        if context_budget_result.reranker_skipped_reason.is_some() {
+            // Reranker will be skipped — fall through to Skipped path
+        }
+    }
+
     let rerank_timer = PhaseTimer::start();
     let rerank_latency_ms;
-    results = match rerank_candidates(&ctx.config().semantic, &params.query, &results) {
-        RerankOutcome::ReRanked(indices) => {
-            rerank_latency_ms = rerank_timer.stop();
-            let n = results.len();
-            let mut used = vec![false; n];
-            let oob_count = indices.iter().filter(|&&i| i >= n).count();
-            if oob_count > 0 && diagnostics_enabled {
-                diag_warnings.push(SearchWarning::RerankerFailure {
-                    reason: format!(
-                        "reranker returned {} out-of-bounds indices (max {})",
-                        oob_count, n
-                    ),
-                });
-            }
-            let mut reranked = indices
-                .iter()
-                .filter_map(|&i| {
-                    if i < n && !used[i] {
-                        used[i] = true;
-                        Some(results[i].clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            for (i, result) in results.iter().enumerate() {
-                if !used[i] {
-                    reranked.push(result.clone());
+    // Skip reranker when context budget says to (insufficient enriched ratio or zero enriched)
+    let rerank_skipped_by_budget = context_budget_result.reranker_skipped_reason.is_some();
+    results = if rerank_skipped_by_budget {
+        rerank_latency_ms = rerank_timer.stop();
+        results
+    } else {
+        match rerank_candidates(&ctx.config().semantic, &params.query, &results) {
+            RerankOutcome::ReRanked(indices) => {
+                rerank_latency_ms = rerank_timer.stop();
+                let n = results.len();
+                let mut used = vec![false; n];
+                let oob_count = indices.iter().filter(|&&i| i >= n).count();
+                if oob_count > 0 && diagnostics_enabled {
+                    diag_warnings.push(SearchWarning::RerankerFailure {
+                        reason: format!(
+                            "reranker returned {} out-of-bounds indices (max {})",
+                            oob_count, n
+                        ),
+                    });
                 }
+                let mut reranked = indices
+                    .iter()
+                    .filter_map(|&i| {
+                        if i < n && !used[i] {
+                            used[i] = true;
+                            Some(results[i].clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for (i, result) in results.iter().enumerate() {
+                    if !used[i] {
+                        reranked.push(result.clone());
+                    }
+                }
+                reranked
             }
-            reranked
-        }
-        RerankOutcome::Skipped => {
-            rerank_latency_ms = rerank_timer.stop();
-            results
-        }
-        RerankOutcome::Failed(error) => {
-            rerank_latency_ms = rerank_timer.stop();
-            diag_warnings.push(SearchWarning::RerankerFailure { reason: error });
-            results
+            RerankOutcome::Skipped => {
+                rerank_latency_ms = rerank_timer.stop();
+                results
+            }
+            RerankOutcome::Failed(error) => {
+                rerank_latency_ms = rerank_timer.stop();
+                diag_warnings.push(SearchWarning::RerankerFailure { reason: error });
+                results
+            }
         }
     };
 
@@ -761,6 +791,21 @@ fn handle_semantic_or_hybrid_search(
                 let mut extras = serde_json::Map::new();
                 if let Some(plan) = search_plan {
                     extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
+                }
+                // Add context budget diagnostics when RI v2 is active
+                if ri_v2 && rerank_enabled {
+                    extras.insert(
+                        "context_exhausted".to_string(),
+                        serde_json::json!(context_budget_result.context_exhausted),
+                    );
+                    extras.insert(
+                        "unenriched_candidate_count".to_string(),
+                        serde_json::json!(context_budget_result.unenriched_candidate_count),
+                    );
+                    extras.insert(
+                        "reranker_skipped_reason".to_string(),
+                        serde_json::json!(context_budget_result.reranker_skipped_reason),
+                    );
                 }
                 extras
             },
@@ -1721,6 +1766,108 @@ fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
     }
 
     incomplete
+}
+
+/// Enrich the rerank pool with context BEFORE reranking (ROOT CAUSE fix).
+///
+/// This function runs over the full rerank pool in rank order, reading source
+/// content for each candidate up to the per_candidate_tokens budget. Candidates
+/// that exceed the budget get a PathOnly fallback string.
+///
+/// PathOnly candidates are marked for exclusion from the content reranker.
+/// Returns a ContextBudgetResult with exhaustion status.
+///
+/// This replaces the old flow where enrich_snippets_from_source ran AFTER
+/// rerank_candidates(), leaving the reranker with empty snippets for rank 3+.
+fn enrich_context_pool(
+    results: &mut [HybridResult],
+    budget: &ContextBudget,
+) -> ContextBudgetResult {
+    let mut total_tokens_used: usize = 0;
+    let mut unenriched_count: usize = 0;
+    let mut file_lines_cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+
+    for result in results.iter_mut() {
+        // Lexical and file-summary results don't get enriched
+        if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+            continue;
+        }
+
+        // Check if budget is exhausted
+        if total_tokens_used + budget.per_candidate_tokens > budget.total_tokens {
+            // Budget exhausted: PathOnly fallback
+            let fallback = match (result.start_line, result.end_line) {
+                (start, end) if end >= start => {
+                    format!(
+                        "{}:{}-{} [budget_exhausted]",
+                        result.file.display(),
+                        start,
+                        end
+                    )
+                }
+                _ => format!("{} [budget_exhausted]", result.file.display()),
+            };
+            result.snippet = fallback;
+            unenriched_count += 1;
+            continue;
+        }
+
+        // Enrich: read source lines
+        let lines = file_lines_cache
+            .entry(result.file.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(&result.file)
+                    .ok()
+                    .map(|content| content.lines().map(str::to_string).collect())
+            });
+
+        if let Some(lines) = lines {
+            let start = (result.start_line as usize).min(lines.len());
+            let end = ((result.end_line as usize) + 1).min(lines.len());
+            if start < end {
+                let max_lines = budget.per_candidate_tokens / 4; // rough estimate: ~4 tokens/line
+                let shown = (end - start).min(max_lines);
+                let mut snippet = lines[start..start + shown].join("\n");
+                let remaining = (end - start) - shown;
+                if remaining > 0 {
+                    snippet.push_str(&format!("\n+{remaining} more lines"));
+                }
+                result.snippet = snippet;
+                total_tokens_used += budget.per_candidate_tokens;
+            } else {
+                // No source lines available: PathOnly fallback
+                result.snippet = format!("{} [budget_exhausted]", result.file.display());
+                unenriched_count += 1;
+            }
+        } else {
+            // File unreadable: PathOnly fallback
+            result.snippet = format!("{} [budget_exhausted]", result.file.display());
+            unenriched_count += 1;
+        }
+    }
+
+    let pool_size = results.len();
+    let enriched_count = pool_size.saturating_sub(unenriched_count);
+    let context_exhausted = unenriched_count > 0;
+
+    let reranker_skipped_reason = if pool_size == 0 {
+        Some("no_candidates".to_string())
+    } else if enriched_count == 0 {
+        Some("no_enriched_candidates".to_string())
+    } else {
+        let ratio = enriched_count as f32 / pool_size as f32;
+        if ratio < budget.rerank_min_enriched_ratio {
+            Some("insufficient_enriched_ratio".to_string())
+        } else {
+            None
+        }
+    };
+
+    ContextBudgetResult {
+        context_exhausted,
+        unenriched_candidate_count: unenriched_count,
+        reranker_skipped_reason,
+    }
 }
 
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {

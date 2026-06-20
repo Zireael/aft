@@ -340,7 +340,7 @@ mod tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: ContextBudgetResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.context_exhausted, true);
+        assert!(deserialized.context_exhausted);
         assert_eq!(deserialized.unenriched_candidate_count, 3);
     }
 }

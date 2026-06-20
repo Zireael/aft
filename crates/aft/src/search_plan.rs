@@ -14,6 +14,9 @@ use std::collections::HashMap;
 
 use crate::query_shape::{QueryKind, QueryShape};
 
+// Re-export ContextBudget from the context_budget module to avoid duplication.
+pub use crate::context_budget::ContextBudget;
+
 // ---------------------------------------------------------------------------
 // QueryIntent — derived from QueryShape.kind
 // ---------------------------------------------------------------------------
@@ -115,17 +118,6 @@ pub struct RankingProfile {
     pub same_file_coherence_boost: bool,
     /// Enable test/example/stub penalty (disabled when QueryIntent requests tests).
     pub test_example_penalty: bool,
-}
-
-/// Context budget for candidate content.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ContextBudget {
-    /// Total token budget for all candidates (default 4000).
-    pub total_tokens: usize,
-    /// Tokens per candidate (default 300).
-    pub per_candidate_tokens: usize,
-    /// Minimum candidate characters to include.
-    pub min_candidate_chars: usize,
 }
 
 /// Reranker plan.
@@ -384,6 +376,9 @@ impl SearchPlanBuilder {
                 total_tokens: 4000,
                 per_candidate_tokens: 300,
                 min_candidate_chars: 80,
+                mode: crate::context_budget::ContextMode::Auto,
+                enrich_pool: crate::context_budget::EnrichPool::FusionPool,
+                rerank_min_enriched_ratio: 0.5,
             },
             rerank: RerankPlan {
                 enabled: false,
