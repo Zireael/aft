@@ -12,6 +12,7 @@ use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
 };
+use crate::search_plan::{SafetyLaneContext, SearchPlan, SearchPlanBuilder};
 use crate::semantic_diagnostics::{
     format_diagnostics_prefix, score_statistics, top1_margin, PhaseTimer, SearchDiagnostics,
     SearchPipelineType, SearchWarning,
@@ -124,6 +125,20 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         &mut warnings,
     );
 
+    // Build SearchPlan when retrieval_intelligence_v2 is enabled (flag-gated).
+    // When flag is false, search_plan_debug is None and output is byte-identical to baseline.
+    let ri_v2_enabled = ctx.config().intelligence.retrieval_intelligence_v2;
+    let search_plan = if ri_v2_enabled {
+        let fts5_available = ctx.config().fts5.enabled;
+        let safety_ctx = SafetyLaneContext {
+            fts5_available,
+            search_index_ready: lexical_ready,
+        };
+        Some(SearchPlanBuilder::from_query_shape(&shape, &safety_ctx))
+    } else {
+        None
+    };
+
     match mode {
         SearchMode::Regex | SearchMode::Literal => handle_grep_search(
             req,
@@ -135,6 +150,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_status,
             warnings,
             &project_root,
+            search_plan.as_ref(),
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
             req,
@@ -147,6 +163,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_status,
             warnings,
             &project_root,
+            search_plan.as_ref(),
         ),
     }
 }
@@ -237,6 +254,7 @@ fn handle_grep_search(
     semantic_status: &'static str,
     mut warnings: Vec<String>,
     project_root: &Path,
+    search_plan: Option<&SearchPlan>,
 ) -> Response {
     let literal = mode == SearchMode::Literal;
     let compiled = match pattern_compile::compile(
@@ -289,6 +307,10 @@ fn handle_grep_search(
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(mode);
     let text = format_grep_search_text(&result, project_root, interpreted_as);
+    let mut extras = serde_json::Map::new();
+    if let Some(plan) = search_plan {
+        extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
+    }
     search_response(
         req,
         SearchResponseParts {
@@ -304,7 +326,7 @@ fn handle_grep_search(
             engine_capped: result.engine_capped,
             fully_degraded: result.fully_degraded,
             warnings,
-            extras: serde_json::Map::new(),
+            extras,
         },
     )
 }
@@ -320,6 +342,7 @@ fn handle_semantic_or_hybrid_search(
     semantic_status: &'static str,
     mut warnings: Vec<String>,
     project_root: &Path,
+    search_plan: Option<&SearchPlan>,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
         collect_lexical_files(ctx, &params.query, &shape)
@@ -420,6 +443,9 @@ fn handle_semantic_or_hybrid_search(
                 "lexical_only_fallback".to_string(),
                 serde_json::json!(lexical.ready),
             );
+            if let Some(plan) = search_plan {
+                extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
+            }
 
             return search_response(
                 req,
@@ -731,7 +757,13 @@ fn handle_semantic_or_hybrid_search(
             engine_capped: lexical.engine_capped,
             fully_degraded: false,
             warnings,
-            extras: serde_json::Map::new(),
+            extras: {
+                let mut extras = serde_json::Map::new();
+                if let Some(plan) = search_plan {
+                    extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
+                }
+                extras
+            },
         },
     )
 }
@@ -1798,6 +1830,34 @@ fn grep_match_to_json(grep_match: &GrepMatch, source: &'static str) -> serde_jso
         "column": grep_match.column,
         "line_text": grep_match.line_text,
         "match_text": grep_match.match_text,
+    })
+}
+
+/// Convert a SearchPlan to a JSON value for the search_plan_debug field.
+fn search_plan_to_json(plan: &SearchPlan) -> serde_json::Value {
+    let lane_weights: serde_json::Map<String, serde_json::Value> = plan
+        .lane_weights
+        .iter()
+        .map(|(lane, weight)| {
+            let key = format!("{lane:?}");
+            (key, serde_json::json!(weight))
+        })
+        .collect();
+
+    let max_candidates_per_lane: serde_json::Map<String, serde_json::Value> = plan
+        .prefetch
+        .iter()
+        .map(|p| {
+            let key = format!("{:?}", p.lane);
+            (key, serde_json::json!(p.max_candidates))
+        })
+        .collect();
+
+    serde_json::json!({
+        "intent": format!("{:?}", plan.intent),
+        "active_safety_lane": format!("{:?}", plan.active_safety_lane),
+        "lane_weights": lane_weights,
+        "max_candidates_per_lane": max_candidates_per_lane,
     })
 }
 

@@ -23,6 +23,10 @@ pub struct IntelligenceConfig {
     pub context_economy: ContextEconomyConfig,
     /// Symbolic refactor configuration.
     pub symbolic_refactor: SymbolicRefactorConfig,
+    /// Retrieval Intelligence v2 feature flag. When true, SearchPlan is built
+    /// and search_plan_debug is added to NDJSON responses. Default: false.
+    #[serde(default)]
+    pub retrieval_intelligence_v2: bool,
 }
 
 /// FTS5 full-text search configuration.

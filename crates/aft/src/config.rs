@@ -811,6 +811,9 @@ pub struct Config {
     /// cap is exceeded. Set to 0 to disable the cap entirely.
     /// Default: 5000 (covers very large monorepos with bounded memory).
     pub diagnostic_cache_size: usize,
+    /// Intelligence subsystem configuration (FTS5, hybrid ranking, retrieval intelligence).
+    #[serde(default)]
+    pub intelligence: crate::intelligence_config::IntelligenceConfig,
 }
 
 impl Default for Config {
@@ -874,6 +877,7 @@ impl Default for Config {
             url_fetch_allow_private: false,
             harness: None,
             diagnostic_cache_size: 5000,
+            intelligence: crate::intelligence_config::IntelligenceConfig::default(),
         }
     }
 }
