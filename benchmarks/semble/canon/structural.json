@@ -169,7 +169,7 @@
       "ast_pattern": "class BaseModel($$$): $$$",
       "ast_language": "python",
       "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring.",
-      "hold_out": false
+      "hold_out": true
     },
     {
       "id": "pydantic.struct.def_field_validator",
