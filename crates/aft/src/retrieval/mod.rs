@@ -6,8 +6,13 @@
 #[cfg(feature = "semantic-fts5")]
 pub mod fts5_adapter;
 
+pub mod semantic_adapter;
+pub mod trigram_adapter;
+
 #[cfg(feature = "semantic-fts5")]
 pub use fts5_adapter::Fts5Adapter;
+pub use semantic_adapter::SemanticAdapter;
+pub use trigram_adapter::TrigramAdapter;
 
 use crate::candidate::CandidateSet;
 use crate::search_plan::SearchPlan;
