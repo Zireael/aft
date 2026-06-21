@@ -21,6 +21,7 @@ pub mod delete_file;
 pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
+pub mod explain_search;
 pub mod extract_function;
 #[cfg(feature = "semantic-fts5")]
 pub mod fts5;
@@ -58,5 +59,6 @@ pub mod trust_filter_project;
 pub mod undo;
 pub mod untrust_filter_project;
 pub mod verify;
+pub mod why_missed;
 pub mod write;
 pub mod zoom;

@@ -595,6 +595,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 aft::commands::semantic_search::handle_semantic_search(&req, ctx)
             }
         }
+        "explain_search" => aft::commands::explain_search::handle_explain_search(&req, ctx),
+        "why_missed" => aft::commands::why_missed::handle_why_missed(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {
