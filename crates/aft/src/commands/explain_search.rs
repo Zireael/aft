@@ -125,13 +125,13 @@ mod tests {
 
     #[test]
     fn query_shape_from_identifier() {
-        let shape = QueryShape::from_query("SemanticBackendConfig");
+        let shape = crate::query_shape::classify("SemanticBackendConfig");
         assert_eq!(format!("{:?}", shape.kind), "Identifier");
     }
 
     #[test]
     fn query_shape_from_nl() {
-        let shape = QueryShape::from_query("how does retry backoff work");
+        let shape = crate::query_shape::classify("how does retry backoff work");
         assert_eq!(format!("{:?}", shape.kind), "NaturalLanguage");
     }
 }
