@@ -1,62 +1,92 @@
 [
   {
     "query": "how axum Handler trait dispatches requests to async handler functions",
-    "relevant": ["axum/src/handler/mod.rs"],
+    "relevant": [
+      "axum/src/handler/mod.rs"
+    ],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": true
   },
   {
     "query": "Router path_router implementation for storing and matching routes",
-    "relevant": ["axum/src/routing/path_router.rs"],
+    "relevant": [
+      "axum/src/routing/path_router.rs"
+    ],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": true
   },
   {
     "query": "how extractors implement FromRequest and FromRequestParts",
-    "relevant": ["axum/src/extract/mod.rs"],
+    "relevant": [
+      "axum/src/extract/mod.rs"
+    ],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "Json extractor and response for deserializing and serializing JSON bodies",
-    "relevant": ["axum/src/json.rs"],
+    "relevant": [
+      "axum/src/json.rs"
+    ],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "how IntoResponse converts handler return values to HTTP responses",
-    "relevant": ["axum/src/response/mod.rs"],
+    "relevant": [
+      "axum/src/response/mod.rs"
+    ],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "how MethodRouter dispatches GET POST PUT DELETE by HTTP method",
-    "relevant": ["axum/src/routing/method_routing.rs"],
+    "relevant": [
+      "axum/src/routing/method_routing.rs"
+    ],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "how axum maps Tower middleware layers onto the router",
-    "relevant": ["axum/src/middleware/mod.rs"],
+    "relevant": [
+      "axum/src/middleware/mod.rs"
+    ],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "Router",
-    "relevant": ["axum/src/routing/mod.rs"],
+    "relevant": [
+      "axum/src/routing/mod.rs"
+    ],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "IntoResponse",
-    "relevant": ["axum/src/response/mod.rs"],
+    "relevant": [
+      "axum/src/response/mod.rs"
+    ],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "FromRequest",
-    "relevant": ["axum/src/extract/mod.rs"],
+    "relevant": [
+      "axum/src/extract/mod.rs"
+    ],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   }
 ]

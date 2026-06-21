@@ -3,60 +3,70 @@
     "query": "how routes are grouped and registered",
     "relevant": ["routergroup.go"],
     "secondary": ["gin.go"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": true
   },
   {
     "query": "radix tree path matching",
     "relevant": ["tree.go"],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "request context lifecycle and helpers",
     "relevant": ["context.go"],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "JSON request binding and validation",
     "relevant": ["binding/json.go"],
     "secondary": ["binding/default_validator.go"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "how the Gin Engine embeds RouterGroup and uses Context per request",
     "relevant": ["gin.go"],
     "secondary": ["routergroup.go", "context.go"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "Engine",
     "relevant": ["gin.go"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "Context",
     "relevant": ["context.go"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "RouterGroup",
     "relevant": ["routergroup.go"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "how middleware is applied globally and to route groups",
     "relevant": ["routergroup.go"],
     "secondary": ["gin.go"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "catching runtime panics in request handlers and returning 500",
     "relevant": ["recovery.go"],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   }
 ]

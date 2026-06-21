@@ -31,6 +31,7 @@ export interface CanonQuery {
   ast_pattern?: string;
   ast_language?: string;
   candidate_source?: string;
+  hold_out?: boolean;
 }
 
 export interface CanonSuite {

@@ -756,11 +756,17 @@ async function main() {
   // Load semantic NL fixtures
   const fixture = JSON.parse(readFileSync(resolve("benchmarks/semble/fixtures.json"), "utf-8"));
   const allAnnotations: Array<any> = [];
+  const queryHoldOut = new Map<string, boolean>(); // query text → hold_out
   for (const repo of fixture.repos) {
     const annPath = resolve(`benchmarks/semble/annotations/${repo.name}.json`);
     if (!existsSync(annPath)) continue;
     const anns = JSON.parse(readFileSync(annPath, "utf-8"));
     for (const ann of anns) allAnnotations.push({ ...ann, repo_name: repo.name, _type: "semantic" });
+  }
+
+  // Build query → hold_out lookup from annotations
+  for (const ann of allAnnotations) {
+    queryHoldOut.set(ann.query, ann.hold_out === true);
   }
 
   // Build backends list (split comma-separated)
@@ -920,7 +926,7 @@ async function main() {
   const emptyCounts: Record<string, number> = {};
 
   // Per-query context quality tracking (accumulated during rerank)
-  const perQueryCQ: Array<{ mode: string; cq: Partial<ContextQuality> & { recall_at_k: number; hold_out: boolean; intent: string; harness_lat_ms: number } }> = [];
+  const perQueryCQ: Array<{ mode: string; cq: Partial<ContextQuality> & { recall_at_k: number; hold_out: boolean; intent: string; harness_lat_ms: number; engine_latency_ms: number } }> = [];
 
   // Sessions per repo
   const semSessions: Record<string, AftSession | null> = {};
@@ -971,8 +977,8 @@ async function main() {
       allResults.push({ mode: "fts5", query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: fts5Latency, results: fts5Results, recall_at_k: recallAtK(fts5Results, allRelevant, k), mrr: mrr(fts5Results, allRelevant), ndcg_at_k: ndcgAtK(fts5Results, allRelevant, k) });
       perQueryCQ.push({
         mode: "fts5",
-        cq: { candidate_pool_size: fts5Results.length, rerank_pool_size: k, snippet_count: 0, enriched_candidate_count: 0, path_only_count: fts5Results.length, unenriched_candidate_count: fts5Results.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(fts5Results, allRelevant, k), post_rerank_recall_at_k: recallAtK(fts5Results, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
-        recall_at_k: recallAtK(fts5Results, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency,
+        cq: { candidate_pool_size: fts5Results.length, rerank_pool_size: fts5Results.length, snippet_count: 0, enriched_candidate_count: 0, path_only_count: fts5Results.length, unenriched_candidate_count: fts5Results.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(fts5Results, allRelevant, k), post_rerank_recall_at_k: recallAtK(fts5Results, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
+        recall_at_k: recallAtK(fts5Results, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency, engine_latency_ms: fts5Latency,
       });
     } else { emptyCounts["fts5"] = (emptyCounts["fts5"] || 0) + 1; }
 
@@ -984,8 +990,8 @@ async function main() {
       allResults.push({ mode: "aft-grep", query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: grepLatency, results: grepResults, recall_at_k: recallAtK(grepResults, allRelevant, k), mrr: mrr(grepResults, allRelevant), ndcg_at_k: ndcgAtK(grepResults, allRelevant, k) });
       perQueryCQ.push({
         mode: "aft-grep",
-        cq: { candidate_pool_size: grepResults.length, rerank_pool_size: k, snippet_count: 0, enriched_candidate_count: 0, path_only_count: grepResults.length, unenriched_candidate_count: grepResults.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(grepResults, allRelevant, k), post_rerank_recall_at_k: recallAtK(grepResults, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
-        recall_at_k: recallAtK(grepResults, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: grepLatency,
+        cq: { candidate_pool_size: grepResults.length, rerank_pool_size: grepResults.length, snippet_count: 0, enriched_candidate_count: 0, path_only_count: grepResults.length, unenriched_candidate_count: grepResults.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(grepResults, allRelevant, k), post_rerank_recall_at_k: recallAtK(grepResults, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
+        recall_at_k: recallAtK(grepResults, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: grepLatency, engine_latency_ms: grepLatency,
       });
     } else { emptyCounts["aft-grep"] = (emptyCounts["aft-grep"] || 0) + 1; }
 
@@ -1025,6 +1031,7 @@ async function main() {
           hold_out: ann.hold_out === true,
           intent: ann.category || "unknown",
           harness_lat_ms: semLatency,
+          engine_latency_ms: semLatency,
         });
       } else { emptyCounts[modeName] = (emptyCounts[modeName] || 0) + 1; }
 
@@ -1040,7 +1047,7 @@ async function main() {
         perQueryCQ.push({
           mode: `hybrid-${modeName.replace("semantic-", "")}`,
           cq: { candidate_pool_size: hybridResults.length, rerank_pool_size: k, snippet_count: hybridSnippets, enriched_candidate_count: hybridSnippets, path_only_count: hybridResults.length - hybridSnippets, unenriched_candidate_count: hybridResults.length - hybridSnippets, avg_doc_tokens: hybridTokenCounts.length > 0 ? Math.round(hybridTokenCounts.reduce((a, b) => a + b, 0) / hybridTokenCounts.length) : 0, max_doc_tokens: hybridTokenCounts.length > 0 ? Math.max(...hybridTokenCounts) : 0, total_doc_tokens: hybridTokenCounts.reduce((a, b) => a + b, 0), pre_rerank_recall_at_pool: hybridRecall, post_rerank_recall_at_k: hybridRecall, lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
-          recall_at_k: hybridRecall, hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency + semLatency,
+          recall_at_k: hybridRecall, hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency + semLatency, engine_latency_ms: semLatency,
         });
       }
     }
@@ -1050,7 +1057,9 @@ async function main() {
       for (const [be, session] of Object.entries(semSessions)) {
         if (!session) continue;
         const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
+        const rerankSemStart = performance.now();
         const semResults = await semanticQuery(session, ann.query, k * oversample, be, verbose);
+        const rerankSemLatency = performance.now() - rerankSemStart;
         if (semResults.length === 0) continue;
 
         const preRecall = recallAtK(semResults, allRelevant, k * oversample);
@@ -1090,7 +1099,8 @@ async function main() {
           recall_at_k: postRecall,
           hold_out: ann.hold_out === true,
           intent: ann.category || "unknown",
-          harness_lat_ms: rerankLat,
+          harness_lat_ms: rerankSemLatency + rerankLat,
+          engine_latency_ms: rerankSemLatency,
         });
 
         // Track rerank metrics
@@ -1244,8 +1254,7 @@ async function main() {
   // Compute context quality per mode
   const contextQualityByMode: Record<string, ContextQuality> = {};
 
-  for (const mode of Object.keys(byMode)) {
-    const rows = byMode.get(mode) || [];
+  for (const [mode, rows] of byMode) {
     if (rows.length === 0) continue;
 
     // Check if we have per-query tracking data for this mode (rerank modes)
@@ -1284,8 +1293,8 @@ async function main() {
         totalAvgDocTokens += c.avg_doc_tokens || 0;
         maxDocTokens = Math.max(maxDocTokens, c.max_doc_tokens || 0);
         totalDocTokens += c.total_doc_tokens || 0;
-        engineLats.push(c.engine_latency_p95_ms || 0);
-        harnessLats.push(c.benchmark_harness_latency_p95_ms || 0);
+        engineLats.push(entry.engine_latency_ms || 0);
+        harnessLats.push(entry.harness_lat_ms || 0);
         if (c.reranker_skipped_reason) skippedCount++;
       }
 
@@ -1299,9 +1308,9 @@ async function main() {
         candidate_pool_size: Math.round(totalCandidatePool / n),
         rerank_pool_size: Math.round(totalRerankPool / n),
         snippet_count: totalSnippetCount,
-        enriched_candidate_count: totalEnriched,
-        path_only_count: totalPathOnly,
-        unenriched_candidate_count: totalPathOnly,
+        enriched_candidate_count: Math.round(totalEnriched / n),
+        path_only_count: Math.round(totalPathOnly / n),
+        unenriched_candidate_count: Math.round(totalPathOnly / n),
         avg_doc_tokens: n > 0 ? Math.round(totalAvgDocTokens / n) : 0,
         max_doc_tokens: maxDocTokens,
         total_doc_tokens: totalDocTokens,
@@ -1348,25 +1357,26 @@ async function main() {
         allLatencies.push(row.latency_ms);
 
         // Use annotation hold_out field if available
-        const isHoldout = (row as any).hold_out === true;
+        const isHoldout = queryHoldOut.get(row.query) === true;
         if (isHoldout) holdoutRecalls.push(row.recall_at_k);
         else tuningRecalls.push(row.recall_at_k);
       }
 
-      const rerankPoolSize = rows.length > 0 ? Math.max(rows[0].results?.length || 0, k) : k;
       const tuningRecall10 = tuningRecalls.length > 0
         ? tuningRecalls.reduce((s, v) => s + v, 0) / tuningRecalls.length : 0;
       const holdoutRecall10 = holdoutRecalls.length > 0
         ? holdoutRecalls.reduce((s, v) => s + v, 0) / holdoutRecalls.length : 0;
       const sortedLats = [...allLatencies].sort((a, b) => a - b);
 
+      const n = rows.length;
+      const avgResultsPerQuery = n > 0 ? Math.round(rows.reduce((s, r) => s + (r.results?.length || 0), 0) / n) : k;
       contextQualityByMode[mode] = {
-        candidate_pool_size: rows.length,
-        rerank_pool_size: rerankPoolSize,
+        candidate_pool_size: avgResultsPerQuery,
+        rerank_pool_size: avgResultsPerQuery,
         snippet_count: totalSnippets,
-        enriched_candidate_count: totalSnippets,
-        path_only_count: totalPathOnly,
-        unenriched_candidate_count: totalPathOnly,
+        enriched_candidate_count: n > 0 ? Math.round(totalSnippets / n) : 0,
+        path_only_count: n > 0 ? Math.round(totalPathOnly / n) : 0,
+        unenriched_candidate_count: n > 0 ? Math.round(totalPathOnly / n) : 0,
         avg_doc_tokens: totalSnippets > 0 ? Math.round(totalDocTokens / totalSnippets) : 0,
         max_doc_tokens: maxTokens,
         total_doc_tokens: totalDocTokens,

@@ -3,60 +3,70 @@
     "query": "how is BaseModel defined and instantiated",
     "relevant": ["pydantic/main.py"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": true
   },
   {
     "query": "how are model fields declared and constrained",
     "relevant": ["pydantic/fields.py"],
     "secondary": ["pydantic/types.py"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "JSON schema generation from models",
     "relevant": ["pydantic/json_schema.py"],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "custom field and model validators",
     "relevant": ["pydantic/functional_validators.py"],
     "secondary": ["pydantic/class_validators.py"],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "model configuration and settings",
     "relevant": ["pydantic/config.py"],
     "secondary": [],
-    "category": "semantic"
+    "category": "semantic",
+    "hold_out": false
   },
   {
     "query": "BaseModel",
     "relevant": ["pydantic/main.py"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "field_validator",
     "relevant": ["pydantic/functional_validators.py"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "model_validator",
     "relevant": ["pydantic/functional_validators.py"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "ConfigDict",
     "relevant": ["pydantic/config.py"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "Field",
     "relevant": ["pydantic/fields.py"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   }
 ]

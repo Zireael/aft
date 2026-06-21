@@ -3,60 +3,70 @@
     "query": "Serialize and Serializer trait definitions",
     "relevant": ["serde_core/src/ser/mod.rs"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": true
   },
   {
     "query": "Deserialize and Deserializer trait definitions",
     "relevant": ["serde_core/src/de/mod.rs"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "Visitor pattern for deserializer implementations",
     "relevant": ["serde_core/src/de/mod.rs"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
     "relevant": ["serde_derive/src/ser.rs"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "how derive macros generate Deserialize code for structs and enums",
     "relevant": ["serde_derive/src/de.rs"],
     "secondary": ["serde_derive/src/internals/ast.rs"],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   },
   {
     "query": "Serialize",
     "relevant": ["serde_core/src/ser/mod.rs"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "Deserialize",
     "relevant": ["serde_core/src/de/mod.rs"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "Serializer",
     "relevant": ["serde_core/src/ser/mod.rs"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "Visitor",
     "relevant": ["serde_core/src/de/mod.rs"],
     "secondary": [],
-    "category": "symbol"
+    "category": "symbol",
+    "hold_out": false
   },
   {
     "query": "how serde handles sequences and maps during serialization",
     "relevant": ["serde_core/src/ser/mod.rs"],
     "secondary": [],
-    "category": "architecture"
+    "category": "architecture",
+    "hold_out": false
   }
 ]
