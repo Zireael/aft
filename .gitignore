@@ -107,3 +107,19 @@ biome.json_
 aft-semantic-search-upgrade.json
 semantic-search-upgrade*.jsonl
 .bench-cache/
+
+# Local benchmark exports and artifacts (not for distribution)
+aft-benchmark-canon-beads-*.jsonl
+aft-retrieval-intelligence-*.jsonl
+aft-semantic-search-export-*.jsonl
+aft-semantic-search-benchmark-*.jsonl
+baseline-fts5-report.json
+pilot-report.json
+*.zip
+
+# Local SQLite databases (not for distribution)
+crates/aft/src/.aft/
+*.sqlite
+
+# Benchmark canon distribution package (large example files)
+benchmarks/aft-lexical-canon-package/example-coding-session.txt
