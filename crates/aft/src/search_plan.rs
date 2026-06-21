@@ -97,10 +97,21 @@ pub struct SuppressedLane {
 }
 
 /// Fusion strategy for combining lane results.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FusionPlan {
     /// Reciprocal Rank Fusion k parameter (default 60).
     pub rrf_k: u32,
+    /// Maximum exact hits promoted to Group A (default 5).
+    pub exact_hit_floor_n: usize,
+}
+
+impl Default for FusionPlan {
+    fn default() -> Self {
+        Self {
+            rrf_k: 60,
+            exact_hit_floor_n: 5,
+        }
+    }
 }
 
 /// Ranking profile controlling boost/penalty application.
