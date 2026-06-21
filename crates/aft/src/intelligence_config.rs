@@ -30,12 +30,19 @@ pub struct IntelligenceConfig {
     /// Top N results to enrich with graph context (default 5).
     #[serde(default = "default_graph_enrichment_top_n")]
     pub graph_enrichment_top_n: usize,
+    /// Max expansion candidates from graph expansion (default 10).
+    #[serde(default = "default_graph_expansion_max")]
+    pub graph_expansion_max: usize,
     /// Telemetry configuration for retrieval intelligence.
     pub telemetry: TelemetryConfig,
 }
 
 fn default_graph_enrichment_top_n() -> usize {
     5
+}
+
+fn default_graph_expansion_max() -> usize {
+    10
 }
 
 /// Telemetry configuration for retrieval intelligence.
