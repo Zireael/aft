@@ -105,6 +105,7 @@ pub mod symbol_cache_disk;
 pub mod symbol_insert;
 pub mod symbol_resolution;
 pub mod symbols;
+pub mod telemetry;
 pub mod tool_path;
 pub mod url_fetch;
 pub mod watcher_filter;

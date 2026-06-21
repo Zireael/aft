@@ -27,6 +27,41 @@ pub struct IntelligenceConfig {
     /// and search_plan_debug is added to NDJSON responses. Default: false.
     #[serde(default)]
     pub retrieval_intelligence_v2: bool,
+    /// Telemetry configuration for retrieval intelligence.
+    pub telemetry: TelemetryConfig,
+}
+
+/// Telemetry configuration for retrieval intelligence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TelemetryConfig {
+    /// Enable telemetry persistence to SQLite.
+    pub telemetry_persist: bool,
+    /// Retention period in days.
+    pub retention_days: u32,
+    /// Maximum rows per run.
+    pub max_rows_per_run: usize,
+    /// Sampling rate (0.0–1.0).
+    pub sampling_rate: f64,
+    /// Query storage mode: "hash" (default) or "raw".
+    pub telemetry_store_query: String,
+    /// Per-install salt for query hashing.
+    pub telemetry_query_hash_salt: String,
+    /// Persist snippets in candidate_scores (default: false for security).
+    pub no_snippet_persist: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            telemetry_persist: true,
+            retention_days: 30,
+            max_rows_per_run: 500,
+            sampling_rate: 1.0,
+            telemetry_store_query: "hash".to_string(),
+            telemetry_query_hash_salt: String::new(), // generated at runtime
+            no_snippet_persist: true,
+        }
+    }
 }
 
 /// FTS5 full-text search configuration.
