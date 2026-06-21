@@ -597,6 +597,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         }
         "explain_search" => aft::commands::explain_search::handle_explain_search(&req, ctx),
         "why_missed" => aft::commands::why_missed::handle_why_missed(&req, ctx),
+        "aft_orient" => aft::commands::aft_orient::handle_aft_orient(&req, ctx),
+        "aft_impact_delta" => aft::commands::aft_impact_delta::handle_aft_impact_delta(&req, ctx),
+        "aft_context_pack" => aft::commands::aft_context_pack::handle_aft_context_pack(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {

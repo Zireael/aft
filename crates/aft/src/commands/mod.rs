@@ -1,4 +1,7 @@
 pub mod add_import;
+pub mod aft_context_pack;
+pub mod aft_impact_delta;
+pub mod aft_orient;
 pub mod ast_replace;
 pub mod ast_scope;
 pub mod ast_search;
