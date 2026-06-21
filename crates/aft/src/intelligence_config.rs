@@ -27,8 +27,15 @@ pub struct IntelligenceConfig {
     /// and search_plan_debug is added to NDJSON responses. Default: false.
     #[serde(default)]
     pub retrieval_intelligence_v2: bool,
+    /// Top N results to enrich with graph context (default 5).
+    #[serde(default = "default_graph_enrichment_top_n")]
+    pub graph_enrichment_top_n: usize,
     /// Telemetry configuration for retrieval intelligence.
     pub telemetry: TelemetryConfig,
+}
+
+fn default_graph_enrichment_top_n() -> usize {
+    5
 }
 
 /// Telemetry configuration for retrieval intelligence.

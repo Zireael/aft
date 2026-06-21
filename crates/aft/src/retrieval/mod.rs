@@ -7,6 +7,7 @@
 pub mod fts5_adapter;
 
 pub mod fusion;
+pub mod graph_enrichment;
 pub mod ranking_features;
 pub mod semantic_adapter;
 pub mod trigram_adapter;
@@ -14,6 +15,7 @@ pub mod trigram_adapter;
 #[cfg(feature = "semantic-fts5")]
 pub use fts5_adapter::Fts5Adapter;
 pub use fusion::RRFFusionEngine;
+pub use graph_enrichment::enrich_with_graph_context;
 pub use ranking_features::{apply_ranking_features, RankingFeaturesConfig};
 pub use semantic_adapter::SemanticAdapter;
 pub use trigram_adapter::TrigramAdapter;
