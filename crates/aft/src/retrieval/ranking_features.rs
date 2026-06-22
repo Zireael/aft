@@ -4,7 +4,26 @@
 //! and before reranking. Features are independently toggled via config.
 
 use crate::candidate::FusedCandidate;
+use crate::context::AppContext;
 use crate::search_plan::{QueryIntent, SearchPlan};
+use crate::symbols::Symbol;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppliedRankingFeature {
+    pub feature: &'static str,
+    pub delta: f32,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RankingFeatureReport {
+    pub file: String,
+    pub line_range: Option<(usize, usize)>,
+    pub original_score: f32,
+    pub final_score: f32,
+    pub metadata_status: &'static str,
+    pub applied: Vec<AppliedRankingFeature>,
+}
 
 /// Configuration for ranking features.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -42,11 +61,12 @@ impl Default for RankingFeaturesConfig {
 /// Features are independently toggled via config.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_ranking_features(
+    ctx: &AppContext,
     candidates: &mut [FusedCandidate],
     query: &str,
     plan: &SearchPlan,
     config: &RankingFeaturesConfig,
-) {
+) -> Vec<RankingFeatureReport> {
     let query_lower = query.to_lowercase();
     let intent = plan.intent;
     let is_test_query = query_lower.contains("test")
@@ -57,35 +77,38 @@ pub fn apply_ranking_features(
     // Track files in top-3 for same-file coherence
     let mut top_files: Vec<std::path::PathBuf> = Vec::new();
 
+    let mut reports = Vec::with_capacity(candidates.len());
+
     for (i, candidate) in candidates.iter_mut().enumerate() {
+        let original_score = candidate.final_score;
         let mut delta: f32 = 0.0;
+        let mut applied = Vec::new();
+        let metadata = candidate_symbol_metadata(ctx, candidate, query);
 
         // (a) ExactDefinitionBoost +0.25
         if config.exact_definition_boost {
-            if candidate.is_exact_hit {
+            if candidate.is_exact_hit && metadata.exact_definition {
                 delta += 0.25;
+                applied.push(AppliedRankingFeature {
+                    feature: "exact_definition_boost",
+                    delta: 0.25,
+                    evidence: metadata
+                        .matched_symbol
+                        .clone()
+                        .unwrap_or_else(|| "exact symbol metadata".to_string()),
+                });
             }
         }
 
         // (b) IdentifierStemMatchBoost +0.15
         if config.identifier_stem_match_boost {
-            if let Some(symbol_name) = candidate.provenance.lanes.first().map(|l| {
-                // Use file name as rough symbol proxy
-                candidate
-                    .file_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-            }) {
-                let stem_lower = symbol_name.to_lowercase();
-                // Check if any query token appears in the symbol stem
-                let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
-                if query_tokens
-                    .iter()
-                    .any(|t| stem_lower.contains(*t) && t.len() > 2)
-                {
-                    delta += 0.15;
-                }
+            if let Some(symbol_name) = metadata.identifier_stem_match.as_ref() {
+                delta += 0.15;
+                applied.push(AppliedRankingFeature {
+                    feature: "identifier_stem_match_boost",
+                    delta: 0.15,
+                    evidence: symbol_name.clone(),
+                });
             }
         }
 
@@ -99,6 +122,11 @@ pub fn apply_ranking_features(
                     .any(|t| base_lower.contains(*t) && t.len() > 2)
                 {
                     delta += 0.10;
+                    applied.push(AppliedRankingFeature {
+                        feature: "path_base_match_boost",
+                        delta: 0.10,
+                        evidence: base.to_string(),
+                    });
                 }
             }
         }
@@ -109,9 +137,14 @@ pub fn apply_ranking_features(
                 intent,
                 QueryIntent::NaturalLanguage | QueryIntent::RelatedCode
             ) {
-                // Placeholder: would check snippet for doc comment content
-                // For now, apply a small boost for NL queries
-                delta += 0.05;
+                if let Some(evidence) = doc_comment_evidence(candidate, &query_lower) {
+                    delta += 0.10;
+                    applied.push(AppliedRankingFeature {
+                        feature: "doc_comment_boost",
+                        delta: 0.10,
+                        evidence,
+                    });
+                }
             }
         }
 
@@ -121,14 +154,20 @@ pub fn apply_ranking_features(
                 top_files.push(candidate.file_path.clone());
             } else if top_files.contains(&candidate.file_path) {
                 delta += 0.08;
+                applied.push(AppliedRankingFeature {
+                    feature: "same_file_coherence_boost",
+                    delta: 0.08,
+                    evidence: "same file as top-3 candidate".to_string(),
+                });
             }
         }
 
         // (f) TestExamplePenalty -0.20
         // WARNING 5: DISABLED when QueryIntent requests tests
         if config.test_example_penalty {
-            let is_diagnostic_error = matches!(intent, QueryIntent::DiagnosticError);
-            let queries_tests = is_test_query || matches!(intent, QueryIntent::DiagnosticError);
+            let is_diagnostic_error =
+                matches!(intent, QueryIntent::DiagnosticError) || contains_diagnostic_token(query);
+            let queries_tests = is_test_query || is_diagnostic_error;
 
             if !is_diagnostic_error && !queries_tests {
                 if candidate.is_vendor || candidate.is_generated {
@@ -138,13 +177,150 @@ pub fn apply_ranking_features(
                     let path_str = candidate.file_path.to_string_lossy().to_lowercase();
                     if path_str.contains("test") || path_str.contains("spec") {
                         delta -= 0.20;
+                        applied.push(AppliedRankingFeature {
+                            feature: "test_example_penalty",
+                            delta: -0.20,
+                            evidence: path_str,
+                        });
                     }
                 }
             }
         }
 
         candidate.final_score += delta;
+        reports.push(RankingFeatureReport {
+            file: candidate.file_path.display().to_string(),
+            line_range: candidate.line_range,
+            original_score,
+            final_score: candidate.final_score,
+            metadata_status: metadata.status,
+            applied,
+        });
     }
+
+    reports
+}
+
+#[derive(Debug, Default)]
+struct CandidateMetadata {
+    status: &'static str,
+    matched_symbol: Option<String>,
+    exact_definition: bool,
+    identifier_stem_match: Option<String>,
+}
+
+fn candidate_symbol_metadata(
+    ctx: &AppContext,
+    candidate: &FusedCandidate,
+    query: &str,
+) -> CandidateMetadata {
+    let Ok(symbols) = ctx.provider().list_symbols(&candidate.file_path) else {
+        return CandidateMetadata {
+            status: "unavailable",
+            ..CandidateMetadata::default()
+        };
+    };
+
+    let query_tokens = identifier_tokens(query);
+    let matching_symbols = symbols
+        .iter()
+        .filter(|symbol| candidate_intersects_symbol(candidate, symbol))
+        .collect::<Vec<_>>();
+
+    if matching_symbols.is_empty() {
+        return CandidateMetadata {
+            status: "no_matching_symbol_metadata",
+            ..CandidateMetadata::default()
+        };
+    }
+
+    let exact = matching_symbols
+        .iter()
+        .find(|symbol| symbol.name == query.trim())
+        .map(|symbol| render_symbol(symbol));
+    let stem_match = matching_symbols
+        .iter()
+        .find(|symbol| {
+            let symbol_lower = symbol.name.to_ascii_lowercase();
+            query_tokens
+                .iter()
+                .any(|token| token.len() > 2 && symbol_lower.contains(token))
+        })
+        .map(|symbol| render_symbol(symbol));
+
+    CandidateMetadata {
+        status: "symbol_metadata",
+        exact_definition: exact.is_some(),
+        matched_symbol: exact.clone().or_else(|| stem_match.clone()),
+        identifier_stem_match: stem_match,
+    }
+}
+
+fn candidate_intersects_symbol(candidate: &FusedCandidate, symbol: &Symbol) -> bool {
+    let Some((candidate_start, candidate_end)) = candidate.line_range else {
+        return false;
+    };
+    let symbol_start = symbol.range.start_line as usize + 1;
+    let symbol_end = symbol.range.end_line as usize + 1;
+    candidate_start <= symbol_end && candidate_end >= symbol_start
+}
+
+fn render_symbol(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+    }
+}
+
+fn identifier_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn contains_diagnostic_token(query: &str) -> bool {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| {
+            let upper = token.to_ascii_uppercase();
+            (upper.len() >= 5
+                && upper.starts_with('E')
+                && upper[1..].chars().all(|c| c.is_ascii_digit()))
+                || (upper.len() >= 6
+                    && upper.starts_with("TS")
+                    && upper[2..].chars().all(|c| c.is_ascii_digit()))
+                || upper.starts_with("ERR_")
+        })
+}
+
+fn doc_comment_evidence(candidate: &FusedCandidate, query_lower: &str) -> Option<String> {
+    let (start, _) = candidate.line_range?;
+    let content = std::fs::read_to_string(&candidate.file_path).ok()?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let first_line = start.saturating_sub(1).min(lines.len());
+    let window_start = first_line.saturating_sub(4).min(first_line);
+    let query_tokens = identifier_tokens(query_lower);
+    for line in &lines[window_start..first_line.min(lines.len())] {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("///")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("/**")
+            || trimmed.starts_with('*'))
+        {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if query_tokens
+            .iter()
+            .any(|token| token.len() > 2 && lower.contains(token))
+        {
+            return Some(trimmed.chars().take(120).collect());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -154,10 +330,17 @@ pub fn apply_ranking_features(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate::{CandidateEntry, CandidateProvenance, LaneContribution};
+    use crate::candidate::{CandidateProvenance, LaneContribution};
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::parser::TreeSitterProvider;
     use crate::query_shape::{QueryKind, QueryShape, ShapeWeights};
     use crate::search_plan::{LaneKind, SafetyLaneContext, SearchPlanBuilder};
     use std::path::PathBuf;
+
+    fn ctx() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
 
     fn test_plan(intent: QueryIntent) -> SearchPlan {
         let shape = QueryShape {
@@ -218,12 +401,16 @@ mod tests {
     fn exact_definition_boost() {
         let plan = test_plan(QueryIntent::ExactSymbol);
         let config = RankingFeaturesConfig::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let def_path = dir.path().join("def.rs");
+        std::fs::write(&def_path, "pub struct MyStruct;\n").expect("write definition");
         let mut candidates = vec![
-            make_candidate("def.rs", 0.5, true, false, false), // exact hit
-            make_candidate("ref.rs", 0.5, false, false, false), // reference
+            make_candidate(&def_path.display().to_string(), 0.5, true, false, false), // exact hit
+            make_candidate("ref.rs", 0.5, false, false, false),                       // reference
         ];
 
-        apply_ranking_features(&mut candidates, "MyStruct", &plan, &config);
+        let ctx = ctx();
+        apply_ranking_features(&ctx, &mut candidates, "MyStruct", &plan, &config);
 
         assert!(
             candidates[0].final_score > candidates[1].final_score,
@@ -246,7 +433,8 @@ mod tests {
             false,
         )];
 
-        apply_ranking_features(&mut candidates, "E0433", &plan, &config);
+        let ctx = ctx();
+        apply_ranking_features(&ctx, &mut candidates, "E0433", &plan, &config);
 
         // Should NOT have penalty
         assert!(
@@ -269,7 +457,8 @@ mod tests {
             false,
         )];
 
-        apply_ranking_features(&mut candidates, "MyStruct", &plan, &config);
+        let ctx = ctx();
+        apply_ranking_features(&ctx, &mut candidates, "MyStruct", &plan, &config);
 
         // Should have penalty (test file + non-test query)
         assert!(
@@ -283,11 +472,14 @@ mod tests {
     #[test]
     fn boost_disabled() {
         let plan = test_plan(QueryIntent::ExactSymbol);
-        let mut config = RankingFeaturesConfig::default();
-        config.exact_definition_boost = false;
+        let config = RankingFeaturesConfig {
+            exact_definition_boost: false,
+            ..Default::default()
+        };
         let mut candidates = vec![make_candidate("def.rs", 0.5, true, false, false)];
 
-        apply_ranking_features(&mut candidates, "MyStruct", &plan, &config);
+        let ctx = ctx();
+        apply_ranking_features(&ctx, &mut candidates, "MyStruct", &plan, &config);
 
         // Should NOT have boost
         assert!(

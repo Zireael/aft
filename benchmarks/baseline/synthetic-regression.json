@@ -1,4 +1,7 @@
 {
+  "status": "complete",
+  "rerank_context": "aft_output",
+  "context_quality": {},
   "intent_metrics": {
     "NaturalLanguage": {
       "recall_at_1": 0.25,

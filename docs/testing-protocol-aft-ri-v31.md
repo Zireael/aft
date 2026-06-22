@@ -1,369 +1,328 @@
-# aft-ri-v31 — Testing & Benchmarking Protocol
+# aft-ri-v31 Testing and Benchmarking Protocol
 
-**Date:** 2026-06-21
-**Branch:** `semantic-search-enhancement`
-**Epic:** aft-ri-v31 (AFT Retrieval Intelligence v1)
+Date: 2026-06-22
+Branch: `semantic-search-enhancement`
+Epic: `aft-ri-v31-remediate`
 
----
+This protocol validates Retrieval Intelligence v2 through public AFT entry points. Commands must be runnable as written from the repository root and must fail when AFT returns placeholder JSON, stale schema keys, skipped benchmark phases, or empty diagnostic/orientation payloads.
 
-## Phase 0: Push & Build
+## Windows 11 Runner Prerequisites
 
-### Step 0.1 — Push the branch
+- Git Bash or another Bash shell available as `bash`.
+- Docker Desktop running for Rust compile/test checks.
+- Node.js 20+ for `scripts/ci-recall-gate.mjs`.
+- Bun 1.1+ for `benchmarks/semble/pilot.ts`.
+- `jq` for JSON assertions.
+- `sqlite3` only for telemetry database inspection.
+
+Suggested environment:
 
 ```bash
 cd D:/Coding/_tools/aft-src
-git push origin semantic-search-enhancement
+export AFT_ROOT="D:/Coding/_tools/aft-src"
+export AFT_BIN="${AFT_BIN:-D:/Coding/_tools/aft-src/target/release/aft/aft.exe}"
+export AFT_STORAGE="$AFT_ROOT/.aft-ri-v31-smoke"
+test -x "$AFT_BIN" || { echo "AFT_BIN is not executable: $AFT_BIN"; exit 1; }
 ```
 
-### Step 0.2 — Trigger CI build
-
-Push to `iter/**` or `semantic-search-enhancement` triggers `e2e-iter.yml` (macOS + Linux only). For a full binary build on all platforms, trigger `build-aft.yml` manually:
+Do not run host `cargo` in this environment. Use:
 
 ```bash
-gh workflow run build-aft.yml \
-  -f branch=semantic-search-enhancement \
-  -f platforms=all
+cd "D:/Coding/_tools/aft-src" && bash scripts/zir-aft-check.sh quick --keep-going
 ```
 
-Or push a tag for a full release build:
+## Required NDJSON Setup
+
+Every stdio request in this protocol includes an `id`. RI v2 must be enabled through the public `configure` payload, not only with the `RETRIEVAL_INTELLIGENCE_V2` process environment override.
 
 ```bash
-git tag v0.39.0-rc1
-git push origin v0.39.0-rc1
+rm -rf "$AFT_STORAGE"
+printf '%s\n' \
+  "{\"id\":\"cfg-ri-v31\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"status-ri-v31","command":"status"}' \
+  '{"id":"shutdown-ri-v31","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio
 ```
 
-### Step 0.3 — Wait for build completion
+Pass criteria:
 
 ```bash
-gh run list --workflow=build-aft.yml --limit=1 --json databaseId,status,conclusion
+jq -e 'select(.id == "cfg-ri-v31") | .status == "ready"'
 ```
 
-### Step 0.4 — Download the binary
+## Phase 1: SearchPlan and Provenance Contract
+
+Run:
 
 ```bash
-# Linux x64
-gh run download <run-id> -n aft-linux-x64 -D /tmp/aft-bin
-chmod +x /tmp/aft-bin/aft
-
-# macOS arm64
-gh run download <run-id> -n aft-darwin-arm64 -D /tmp/aft-bin
-
-# Windows x64
-gh run download <run-id> -n aft-win32-x64 -D /tmp/aft-bin
+printf '%s\n' \
+  "{\"id\":\"cfg-search\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"search-plan","command":"semantic_search","query":"SemanticBackendConfig","top_k":10,"diagnostics":true}' \
+  '{"id":"shutdown-search","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > "$AFT_STORAGE/search-plan.ndjson"
 ```
 
-### Step 0.5 — Verify binary works
+Assertions:
 
 ```bash
-/tmp/aft-bin/aft --version
-# Expected: aft v0.39.x
+jq -e 'select(.id == "search-plan")
+  | .status == "ready"
+  and (.results | length > 0)
+  and (.search_plan_debug.intent | type == "string")
+  and (.search_plan_debug.lane_weights | type == "object")
+  and (.retrieval_intelligence_provenance | type == "object")
+  and (.retrieval_intelligence_provenance.ranking_features | type == "array")
+  and (.urfk_provenance == null)
+  and ((.results[0].provenance.lanes | length) > 0)
+  and (.results[0].is_exact_hit | type == "boolean")
+  and (.results[0].exact_hit_floor_applied | type == "boolean")
+  and (.results[0].is_graph_expansion | type == "boolean")
+  and (.results[0].enrichment_state | IN("enriched","not_enriched","path_only"))' \
+  "$AFT_STORAGE/search-plan.ndjson"
 ```
 
----
+This rejects the stale `.extras.search_plan_debug` and `.urfk_provenance` paths.
 
-## Phase 1: Flag-Gated Feature Validation
+## Phase 2: Diagnostics
 
-All new features are behind `retrieval_intelligence_v2=true`. The flag defaults to `false` — existing behavior is unchanged.
-
-### Step 1.1 — Baseline: flag=OFF produces identical output
+Run:
 
 ```bash
-# Run without flag — should produce standard semantic search output
-echo '{"command":"semantic_search","query":"SemanticBackendConfig","diagnostics":true}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null | jq '{status, result_count: (.results | length)}'
+printf '%s\n' \
+  "{\"id\":\"cfg-diag\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"explain-search","command":"explain_search","query":"SemanticBackendConfig"}' \
+  '{"id":"why-missed-absent","command":"why_missed","query":"retry","expected_file":"src/nonexistent.rs"}' \
+  '{"id":"why-missed-present","command":"why_missed","query":"SemanticBackendConfig","expected_file":"src/commands/semantic_search.rs"}' \
+  '{"id":"shutdown-diag","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > "$AFT_STORAGE/diagnostics.ndjson"
 ```
 
-Verify:
-- `status: "ready"`
-- `result_count > 0`
-- No `search_plan_debug` in extras
-- No `urfk_provenance` in extras
-
-### Step 1.2 — Flag=ON: SearchPlan built and returned
+Assertions:
 
 ```bash
-echo '{"command":"semantic_search","query":"SemanticBackendConfig","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '{status, has_search_plan: (.extras.search_plan_debug != null), extras_keys: (.extras | keys)}'
+jq -e 'select(.id == "explain-search")
+  | (.explain_search_result.query_intent | type == "string")
+  and (.explain_search_result.lane_weights | length > 0)
+  and (.explain_search_result.active_safety_lane | IN("FTS5Body","TrigramBody"))' \
+  "$AFT_STORAGE/diagnostics.ndjson"
+
+jq -e 'select(.id == "why-missed-absent")
+  | .why_missed_result.was_in_candidate_pool == false
+  and (.why_missed_result.suggested_fix | type == "string" and length > 0)' \
+  "$AFT_STORAGE/diagnostics.ndjson"
+
+jq -e 'select(.id == "why-missed-present")
+  | (.why_missed_result.missing_from_lanes | type == "array")
+  and (.why_missed_result.search_execution_status | type == "string")' \
+  "$AFT_STORAGE/diagnostics.ndjson"
 ```
 
-Verify:
-- `has_search_plan: true`
-- `search_plan_debug` contains `intent`, `lane_weights`, `prefetch`, `fusion`
+## Phase 3: Orientation, Impact, and Context Pack
 
-### Step 1.3 — Exact symbol query: ExactHitFloor working
+Run:
 
 ```bash
-echo '{"command":"semantic_search","query":"SemanticBackendConfig","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.results[:5] | map({file, score, is_exact: (.extras.is_exact_hit // false)})'
+printf '%s\n' \
+  "{\"id\":\"cfg-orient\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"orient-pipeline","command":"aft_orient","query":"semantic search pipeline","depth":2}' \
+  '{"id":"impact-semantic","command":"aft_impact_delta","symbol":"handle_semantic_search","change_type":"signature"}' \
+  '{"id":"context-pack","command":"aft_context_pack","query":"search pipeline","token_budget":4000}' \
+  '{"id":"shutdown-orient","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > "$AFT_STORAGE/orientation.ndjson"
 ```
 
-Verify:
-- Symbol `SemanticBackendConfig` appears in top-5 results
-- At least one result has `is_exact_hit: true`
-
-### Step 1.4 — Vendor exclusion: vendor files not in top-5
+Assertions that reject placeholder-empty success:
 
 ```bash
-echo '{"command":"semantic_search","query":"BinaryBridge","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.results[:5] | map(.file) | map(select(test("vendor|node_modules"))) | length'
+jq -e 'select(.id == "orient-pipeline")
+  | (.orient_result.primary_files | length > 0)
+  and (.orient_result.entry_symbols | length > 0)
+  and (.orient_result.orientation_summary | type == "string" and length > 0)
+  and (.orient_result.orientation_summary != "unknown is implemented in unknown")
+  and (.orient_result.latency_ms < 1000)' \
+  "$AFT_STORAGE/orientation.ndjson"
+
+jq -e 'select(.id == "impact-semantic")
+  | (.impact_delta_result.symbol | type == "string")
+  and (.impact_delta_result.change_type == "signature")
+  and (
+    (.impact_delta_result.graph.health == "healthy"
+      and (.impact_delta_result.blast_radius.symbol_count > 0)
+      and (.impact_delta_result.mutation_risk != "Unknown"))
+    or
+    (.impact_delta_result.graph.health != "healthy"
+      and (.impact_delta_result.graph.degraded_reason | type == "string" and length > 0))
+  )' \
+  "$AFT_STORAGE/orientation.ndjson"
+
+jq -e 'select(.id == "context-pack")
+  | (.context_pack_result.pack | length > 0)
+  and (.context_pack_result.tokens_used > 0)
+  and (.context_pack_result.tokens_used <= (.context_pack_result.token_budget * 1.10))
+  and ((.context_pack_result.omission_reason // "") | test("placeholder|scaffold"; "i") | not)' \
+  "$AFT_STORAGE/orientation.ndjson"
 ```
 
-Verify:
-- Output is `0` — no vendor/node_modules files in top-5
+## Phase 4: Ranking Features
 
----
-
-## Phase 2: Telemetry Validation
-
-### Step 2.1 — Telemetry persists by default
+Run:
 
 ```bash
-# Run a search (telemetry persists by default)
-echo '{"command":"semantic_search","query":"test query","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null > /dev/null
-
-# Check the database
-sqlite3 .aft/index.sqlite "SELECT COUNT(*) FROM retrieval_runs;"
-# Expected: >= 1
+printf '%s\n' \
+  "{\"id\":\"cfg-ranking\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"rank-definition","command":"semantic_search","query":"CandidateEntry","top_k":10,"diagnostics":true}' \
+  '{"id":"rank-diagnostic","command":"semantic_search","query":"E0433 unresolved import","top_k":10,"diagnostics":true}' \
+  '{"id":"shutdown-ranking","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > "$AFT_STORAGE/ranking.ndjson"
 ```
 
-### Step 2.2 — query_raw is NULL by default (hash mode)
+Assertions:
 
 ```bash
-sqlite3 .aft/index.sqlite "SELECT query_hash, query_raw FROM retrieval_runs ORDER BY rowid DESC LIMIT 1;"
-# Expected: <hash> | (null)
+jq -e 'select(.id == "rank-definition")
+  | (.retrieval_intelligence_provenance.ranking_features | length > 0)
+  and ([.retrieval_intelligence_provenance.ranking_features[].applied[].feature]
+    | index("exact_definition_boost") != null)' \
+  "$AFT_STORAGE/ranking.ndjson"
+
+jq -e 'select(.id == "rank-diagnostic")
+  | ([.retrieval_intelligence_provenance.ranking_features[].applied[].feature]
+    | index("test_example_penalty") == null)' \
+  "$AFT_STORAGE/ranking.ndjson"
 ```
 
-### Step 2.3 — query_raw populated in raw mode
+## Phase 5: Telemetry
+
+Run:
 
 ```bash
-echo '{"command":"semantic_search","query":"secret query","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true TELEMETRY_STORE_QUERY=raw /tmp/aft-bin/aft --stdio 2>/dev/null > /dev/null
-
-sqlite3 .aft/index.sqlite "SELECT query_raw FROM retrieval_runs WHERE query_raw IS NOT NULL LIMIT 1;"
-# Expected: secret query
+rm -rf "$AFT_STORAGE-telemetry"
+printf '%s\n' \
+  "{\"id\":\"cfg-telemetry\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE-telemetry\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"search-telemetry","command":"semantic_search","query":"test query","top_k":5}' \
+  '{"id":"shutdown-telemetry","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > /dev/null
 ```
 
-### Step 2.4 — Prune old runs
+Assertions:
 
 ```bash
-/tmp/aft-bin/aft telemetry prune
-# Expected: Pruned N rows older than 30 days
+sqlite3 "$AFT_STORAGE-telemetry/aft.db" 'SELECT COUNT(*) FROM retrieval_runs;' | jq -e 'tonumber >= 1'
+sqlite3 "$AFT_STORAGE-telemetry/aft.db" 'SELECT query_raw IS NULL FROM retrieval_runs ORDER BY CAST(timestamp AS INTEGER) DESC LIMIT 1;' | jq -e 'tonumber == 1'
+"$AFT_BIN" telemetry prune --storage-dir "$AFT_STORAGE-telemetry" --retention-days 30 | jq -e '.success == true and (.deleted_rows | type == "number")'
 ```
 
----
-
-## Phase 3: Diagnostic Commands
-
-### Step 3.1 — explain_search
+Raw-query mode remains opt-in:
 
 ```bash
-echo '{"command":"explain_search","query":"SemanticBackendConfig"}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '{
-    intent: .extras.explain_search_result.query_intent,
-    safety_lane: .extras.explain_search_result.active_safety_lane,
-    lane_count: (.extras.explain_search_result.lane_weights | length),
-    degraded: .extras.explain_search_result.degraded_lanes
-  }'
+rm -rf "$AFT_STORAGE-telemetry-raw"
+printf '%s\n' \
+  "{\"id\":\"cfg-raw-telemetry\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE-telemetry-raw\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true,\"telemetry\":{\"telemetry_store_query\":\"raw\"}}}" \
+  '{"id":"search-raw-telemetry","command":"semantic_search","query":"secret query","top_k":5}' \
+  '{"id":"shutdown-raw-telemetry","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > /dev/null
+
+sqlite3 "$AFT_STORAGE-telemetry-raw/aft.db" "SELECT query_raw FROM retrieval_runs WHERE query_raw = 'secret query' LIMIT 1;" \
+  | jq -R -e '. == "secret query"'
 ```
 
-Verify:
-- `intent` is `"Identifier"` (single uppercase word)
-- `safety_lane` is `"FTS5Body"` or `"TrigramBody"`
-- `lane_count > 0`
-- `degraded` may be empty (normal) or list low-weight lanes
+## Phase 6: Benchmark Smoke and CI Gate
 
-### Step 3.2 — why_missed for absent file
+One-command smoke test:
 
 ```bash
-echo '{"command":"why_missed","query":"retry","expected_file":"src/nonexistent.rs"}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.extras.why_missed_result | {in_pool: .was_in_candidate_pool, fix: .suggested_fix}'
+cd D:/Coding/_tools/aft-src && \
+bun run benchmarks/semble/pilot.ts \
+  --profile smoke \
+  --repo cortexkit/aft \
+  --binary "$AFT_BIN" \
+  --output .aft-bench/ri-v31-smoke.json
 ```
 
-Verify:
-- `in_pool: false`
-- `fix` contains actionable suggestion
-
-### Step 3.3 — why_missed for present file
+Smoke report assertions:
 
 ```bash
-echo '{"command":"why_missed","query":"SemanticBackendConfig","expected_file":"src/commands/semantic_search.rs"}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.extras.why_missed_result | {in_pool: .was_in_candidate_pool, missing: .missing_from_lanes}'
+jq -e '.status == "complete"
+  and .profile == "smoke"
+  and .rerank_context == "aft_output"
+  and (.intent_metrics | type == "object" and length > 0)
+  and (.context_quality | type == "object")
+  and (.incomplete_reasons | length == 0)' \
+  .aft-bench/ri-v31-smoke.json
 ```
 
-Verify:
-- `in_pool` is either true or false depending on whether the file appears in search results
-
----
-
-## Phase 4: Orientation Commands
-
-### Step 4.1 — aft_orient
+If a repo cannot be cloned, a backend cannot produce results, or all phases are empty, the report must be explicit:
 
 ```bash
-echo '{"command":"aft_orient","query":"semantic search pipeline","depth":2}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '{
-    primary_files: (.extras.orient_result.primary_files | length),
-    symbols: (.extras.orient_result.entry_symbols | length),
-    summary: .extras.orient_result.orientation_summary,
-    latency_ms: .extras.orient_result.latency_ms
-  }'
+jq -e 'select(.status == "incomplete")
+  | (.incomplete_reasons | length > 0)' \
+  .aft-bench/ri-v31-smoke.json
 ```
 
-Verify:
-- `primary_files > 0`
-- `symbols > 0`
-- `summary` is a deterministic string (not empty, not JSON)
-- `latency_ms < 500`
-
-### Step 4.2 — aft_impact_delta
+CI gate controls:
 
 ```bash
-echo '{"command":"aft_impact_delta","symbol":"handle_semantic_search","change_type":"signature"}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.extras.impact_delta_result | {symbol, change_type, blast_radius}'
+bash scripts/ci-recall-gate.sh \
+  benchmarks/baseline/schema-2026-06-20.json \
+  benchmarks/baseline/schema-2026-06-20.json
+# Expected: exit 0
+
+bash scripts/ci-recall-gate.sh \
+  benchmarks/baseline/schema-2026-06-20.json \
+  benchmarks/baseline/synthetic-regression.json
+# Expected: exit 1 with "FAIL: regression detected"
 ```
 
-Verify:
-- Returns valid JSON with `symbol` and `blast_radius`
+The gate must also fail any current report with `status: "incomplete"`, missing `intent_metrics`, missing `context_quality`, or `rerank_context` other than `aft_output`.
 
-### Step 4.3 — aft_context_pack
+## Phase 7: End-to-End Contract Smoke
+
+Run:
 
 ```bash
-echo '{"command":"aft_context_pack","query":"search pipeline","token_budget":4000}' \
-  | /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.extras.context_pack_result | {budget: .token_budget, used: .tokens_used, pack_items: (.pack | length)}'
+printf '%s\n' \
+  "{\"id\":\"cfg-e2e\",\"command\":\"configure\",\"project_root\":\"$AFT_ROOT\",\"storage_dir\":\"$AFT_STORAGE\",\"search_index\":true,\"semantic_search\":false,\"intelligence\":{\"retrieval_intelligence_v2\":true}}" \
+  '{"id":"e2e-search","command":"semantic_search","query":"how does the reranker work","diagnostics":true,"top_k":10}' \
+  '{"id":"shutdown-e2e","command":"shutdown"}' \
+  | "$AFT_BIN" --stdio > "$AFT_STORAGE/e2e.ndjson"
 ```
 
-Verify:
-- Returns valid JSON
-- `tokens_used <= 4400` (budget * 1.10)
-
----
-
-## Phase 5: Ranking Features
-
-### Step 5.1 — Exact definition boost
+Assertions:
 
 ```bash
-echo '{"command":"semantic_search","query":"CandidateEntry","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '.results[:3] | map({file, score})'
+jq -e 'select(.id == "e2e-search")
+  | .status == "ready"
+  and (.results | length > 0)
+  and (.search_plan_debug != null)
+  and (.retrieval_intelligence_provenance != null)
+  and (.urfk_provenance == null)
+  and ((.results[0].file | type == "string") and (.results[0].file | test("\\.rs$")))
+  and ((.results[0].provenance.lanes | length) > 0)
+  and (.results[0].enrichment_state | IN("enriched","not_enriched","path_only"))' \
+  "$AFT_STORAGE/e2e.ndjson"
 ```
 
-Verify:
-- The file containing the `CandidateEntry` definition ranks above files that merely reference it
+## Pass Criteria Summary
 
-### Step 5.2 — Test penalty disabled for error queries
-
-```bash
-echo '{"command":"semantic_search","query":"E0433 unresolved import","diagnostics":true}' \
-  | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null \
-  | jq '[.results[] | select(.file | test("test|spec"))] | length'
-```
-
-Verify:
-- Test files appear in results (not penalized for DiagnosticError intent)
-
----
-
-## Phase 6: Benchmark Validation
-
-### Step 6.1 — Run quick benchmark
-
-```bash
-cd benchmarks/semble
-npx ts-node pilot.ts --profile smoke --repo cortexkit/aft 2>&1 | tail -20
-```
-
-### Step 6.2 — Check intent_metrics in output
-
-```bash
-npx ts-node pilot.ts --profile smoke --repo cortexkit/aft 2>&1 \
-  | jq '.intent_metrics | keys'
-# Expected: ["NaturalLanguage", "ExactSymbol", "PathLookup", ...]
-```
-
-### Step 6.3 — Check per-intent recall
-
-```bash
-npx ts-node pilot.ts --profile smoke --repo cortexkit/aft 2>&1 \
-  | jq '.intent_metrics.NaturalLanguage.recall_at_10'
-```
-
-### Step 6.4 — CI regression gate
-
-```bash
-# Run full benchmark
-npx ts-node pilot.ts --profile quick 2>&1 > /tmp/current-run.json
-
-# Compare against baseline
-bash scripts/ci-recall-gate.sh benchmarks/baseline/schema-2026-06-20.json /tmp/current-run.json
-echo "Exit: $?"
-# Expected: 0 (no regression) or 1 (regression detected)
-```
-
----
-
-## Phase 7: End-to-End Smoke Test
-
-### Step 7.1 — Full search pipeline with all features
-
-```bash
-echo '{
-  "command": "semantic_search",
-  "query": "how does the reranker work",
-  "diagnostics": true,
-  "top_k": 10
-}' | RETRIEVAL_INTELLIGENCE_V2=true /tmp/aft-bin/aft --stdio 2>/dev/null | jq '{
-  status,
-  result_count: (.results | length),
-  has_plan: (.extras.search_plan_debug != null),
-  has_provenance: (.extras.urfk_provenance != null),
-  top_result: (.results[0] | {file, score}),
-  diagnostics: .extras.search_plan_debug.intent
-}'
-```
-
-Verify:
-- `status: "ready"`
-- `result_count > 0`
-- `has_plan: true`
-- `has_provenance: true`
-- `top_result.file` is a real Rust source file
-- `diagnostics` shows intent classification
-
----
-
-## Expected Output Summary
-
-| Phase | What | Pass Criteria |
-|-------|------|---------------|
-| 0 | Build | Binary runs, `--version` returns |
-| 1 | Flag gating | flag=OFF identical; flag=ON adds SearchPlan + ExactHitFloor |
-| 2 | Telemetry | Tables created, query_raw NULL, prune works |
-| 3 | Diagnostics | explain_search + why_missed return valid JSON |
-| 4 | Orientation | aft_orient returns files/symbols/summary <500ms |
-| 5 | Ranking | Exact definition boost, test penalty gating |
-| 6 | Benchmark | intent_metrics present, CI gate functional |
-| 7 | E2E | Full pipeline with all features working together |
-
----
+| Phase | Required evidence |
+|---|---|
+| Setup | Public `configure` enables RI v2 and every request has an `id`. |
+| Search | Top-level `search_plan_debug`, `retrieval_intelligence_provenance`, and per-result provenance are present. |
+| Diagnostics | `explain_search` and `why_missed` execute real retrieval diagnostics. |
+| Orientation | `aft_orient`, `aft_impact_delta`, and `aft_context_pack` reject empty placeholder success. |
+| Ranking | Ranking feature diagnostics prove production ranking feature application. |
+| Telemetry | Retrieval rows persist query hash by default and raw query only by opt-in. |
+| Benchmark | Smoke report emits `intent_metrics`, `context_quality`, `rerank_context=aft_output`, and incomplete status for skipped phases. |
+| Gate | Non-regression fixture passes; synthetic >5% regression fails. |
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| `unknown_command: aft_orient` | Binary not built with latest code | Rebuild from latest commit |
-| `search_plan_debug` missing | Flag not set | Add `RETRIEVAL_INTELLIGENCE_V2=true` |
-| Telemetry tables missing | First run, no search executed | Run a semantic_search first |
-| CI gate exits 1 | Recall regression | Check baseline thresholds in `benchmarks/baseline/` |
-| `graph_context` empty | GraphHealth=Disabled | Normal — graph not indexed yet |
-| `tokens_used > budget` | Placeholder not wired | Expected for v1 — context_pack is scaffolding |
+|---|---|---|
+| `unknown_command` | Binary is stale | Rebuild in the Docker-backed check flow, then rerun protocol. |
+| `search_plan_debug` missing | RI v2 was not enabled through `configure` | Re-run setup with `intelligence.retrieval_intelligence_v2=true`. |
+| `.extras.*` checks fail | Protocol or script is stale | Use the top-level fields in this file. |
+| `aft_context_pack` has zero tokens/items | Context pack is not wired to real retrieval | Treat as a failure; do not pass the phase. |
+| `aft_impact_delta` has degraded graph | Graph index is unavailable | Accept only if `graph.degraded_reason` is non-empty and explicit. |
+| Benchmark status is `incomplete` | Repo clone/backend/result phase skipped | Fix prerequisites or backend setup before using the run as pass evidence. |
+| CI gate exits 1 | Regression or invalid benchmark schema | Inspect `REGRESSIONS` and `SCHEMA FAILURES` output. |

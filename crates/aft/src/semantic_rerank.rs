@@ -534,6 +534,11 @@ mod tests {
             semantic_score: Some(1.0 / (id as f32 + 1.0)),
             lexical_score: None,
             hybrid_boosted: false,
+            provenance: None,
+            is_exact_hit: false,
+            exact_hit_floor_applied: false,
+            graph_context: None,
+            enrichment_state: "not_applicable",
         }
     }
 

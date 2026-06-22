@@ -3,7 +3,7 @@
 //! Wraps the existing trigram search index (search_index.rs) to produce
 //! `CandidateSet` results for the trigram lane.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::candidate::{CandidateEntry, CandidateSet};
 use crate::search_plan::{LaneKind, SearchPlan};
@@ -14,14 +14,21 @@ use super::{is_generated_path, is_vendor_path, RetrievalAdapter};
 ///
 /// Wraps the trigram search index to produce `CandidateSet` results.
 ///
-/// Currently a thin wrapper — the actual trigram search logic will be
-/// wired when the SearchPlan is integrated into the search pipeline.
-pub struct TrigramAdapter;
+pub struct TrigramAdapter {
+    ranked_files: Vec<(PathBuf, f32)>,
+}
 
 impl TrigramAdapter {
     /// Create a new trigram adapter.
     pub fn new() -> Self {
-        Self
+        Self {
+            ranked_files: Vec::new(),
+        }
+    }
+
+    /// Create a trigram adapter from the existing lexical index ranking.
+    pub fn from_ranked_files(ranked_files: Vec<(PathBuf, f32)>) -> Self {
+        Self { ranked_files }
     }
 }
 
@@ -32,22 +39,88 @@ impl Default for TrigramAdapter {
 }
 
 impl RetrievalAdapter for TrigramAdapter {
-    fn retrieve(&self, _query: &str, plan: &SearchPlan) -> Vec<CandidateSet> {
-        // Check if trigram lane is active
-        let trigram_plan = plan.prefetch.iter().find(|p| p.lane == LaneKind::Trigram);
+    fn retrieve(&self, query: &str, plan: &SearchPlan) -> Vec<CandidateSet> {
+        let source_lane = active_trigram_lane(plan);
+        let max_candidates = plan
+            .prefetch
+            .iter()
+            .find(|p| p.lane == source_lane)
+            .or_else(|| plan.prefetch.iter().find(|p| p.lane == LaneKind::Trigram))
+            .map(|p| p.max_candidates)
+            .unwrap_or(50);
 
-        let max_candidates = trigram_plan.map(|p| p.max_candidates).unwrap_or(50);
-
-        // For now, return an empty CandidateSet.
-        // The actual trigram search will be wired when the SearchPlan
-        // is integrated into the search pipeline.
-        let _ = max_candidates;
+        let candidates = self
+            .ranked_files
+            .iter()
+            .take(max_candidates)
+            .enumerate()
+            .map(|(rank, (file_path, score))| {
+                trigram_ranked_file_to_entry(file_path, *score, rank, query, source_lane)
+            })
+            .collect();
 
         vec![CandidateSet {
-            source_lane: LaneKind::Trigram,
-            candidates: Vec::new(),
+            source_lane,
+            candidates,
         }]
     }
+}
+
+fn active_trigram_lane(plan: &SearchPlan) -> LaneKind {
+    if plan.active_safety_lane == LaneKind::TrigramBody
+        || plan
+            .prefetch
+            .iter()
+            .any(|p| p.lane == LaneKind::TrigramBody)
+    {
+        LaneKind::TrigramBody
+    } else {
+        LaneKind::Trigram
+    }
+}
+
+fn trigram_ranked_file_to_entry(
+    file_path: &Path,
+    score: f32,
+    rank: usize,
+    query: &str,
+    source_lane: LaneKind,
+) -> CandidateEntry {
+    let path_str = file_path.display().to_string();
+    let (line_range, contains_literal) = first_literal_line(file_path, query);
+    let is_vendor = is_vendor_path(&path_str);
+    let is_generated = is_generated_path(&path_str);
+
+    CandidateEntry {
+        chunk_id: None,
+        symbol_id: None,
+        file_path: file_path.to_path_buf(),
+        line_range,
+        content_hash: None,
+        score,
+        rank,
+        is_exact_hit: contains_literal && !is_vendor && !is_generated,
+        is_vendor,
+        is_generated,
+        source_lane,
+    }
+}
+
+fn first_literal_line(file_path: &Path, query: &str) -> (Option<(usize, usize)>, bool) {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return (None, false);
+    }
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        return (None, false);
+    };
+    for (index, line) in content.lines().enumerate() {
+        if line.contains(needle) {
+            let line_number = index + 1;
+            return (Some((line_number, line_number)), true);
+        }
+    }
+    (None, false)
 }
 
 /// Build a CandidateEntry from a trigram search result.
@@ -86,7 +159,7 @@ pub fn trigram_result_to_entry(
 mod tests {
     use super::*;
     use crate::query_shape::{QueryKind, QueryShape, ShapeWeights};
-    use crate::search_plan::{RetrieverPlan, SafetyLaneContext, SearchPlanBuilder};
+    use crate::search_plan::{SafetyLaneContext, SearchPlanBuilder};
 
     fn plan_with_trigram() -> SearchPlan {
         let shape = QueryShape {
@@ -104,14 +177,14 @@ mod tests {
         SearchPlanBuilder::from_query_shape(&shape, &ctx)
     }
 
-    // AC-1: Returns CandidateSet with source_lane=Trigram
+    // AC-1: Returns CandidateSet with source_lane=TrigramBody when FTS5 is unavailable
     #[test]
     fn returns_trigram_lane() {
         let adapter = TrigramAdapter::new();
         let plan = plan_with_trigram();
         let result = adapter.retrieve("test_fn", &plan);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].source_lane, LaneKind::Trigram);
+        assert_eq!(result[0].source_lane, LaneKind::TrigramBody);
     }
 
     // Empty on failure (no panic)
@@ -136,5 +209,28 @@ mod tests {
     fn exact_hit_for_literal_match() {
         let entry = trigram_result_to_entry("src/main.rs", 1, 10, 0.95, 0, true);
         assert!(entry.is_exact_hit);
+    }
+
+    #[test]
+    fn ranked_file_becomes_exact_line_candidate() {
+        let project = tempfile::tempdir().expect("temp project");
+        let source = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("source parent")).expect("create source");
+        std::fs::write(
+            &source,
+            "pub struct SemanticBackendConfig {\n    pub model: String,\n}\n",
+        )
+        .expect("write source");
+
+        let adapter = TrigramAdapter::from_ranked_files(vec![(source.clone(), 0.9)]);
+        let plan = plan_with_trigram();
+        let result = adapter.retrieve("SemanticBackendConfig", &plan);
+
+        assert_eq!(result[0].source_lane, LaneKind::TrigramBody);
+        assert_eq!(result[0].candidates.len(), 1);
+        let candidate = &result[0].candidates[0];
+        assert_eq!(candidate.file_path, source);
+        assert_eq!(candidate.line_range, Some((1, 1)));
+        assert!(candidate.is_exact_hit);
     }
 }

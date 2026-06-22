@@ -115,7 +115,7 @@ impl Default for FusionPlan {
 }
 
 /// Ranking profile controlling boost/penalty application.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RankingProfile {
     /// Enable exact-definition boost.
     pub exact_definition_boost: bool,
@@ -129,6 +129,19 @@ pub struct RankingProfile {
     pub same_file_coherence_boost: bool,
     /// Enable test/example/stub penalty (disabled when QueryIntent requests tests).
     pub test_example_penalty: bool,
+}
+
+impl Default for RankingProfile {
+    fn default() -> Self {
+        Self {
+            exact_definition_boost: true,
+            stem_match_boost: true,
+            path_base_match_boost: true,
+            doc_comment_boost: true,
+            same_file_coherence_boost: true,
+            test_example_penalty: true,
+        }
+    }
 }
 
 /// Reranker plan.

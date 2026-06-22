@@ -84,6 +84,7 @@ mod preview_diff_test;
 mod protocol_test;
 mod query_shape_test;
 mod r_test;
+mod ri_v31_contract_baseline_test;
 mod safety_test;
 mod score_floor_drop_test;
 mod search_index_warm_restart_test;

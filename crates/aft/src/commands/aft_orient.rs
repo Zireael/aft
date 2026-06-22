@@ -3,12 +3,12 @@
 //! Returns primary files, entry symbols, dependency symbols, test hints,
 //! config hints, and a deterministic orientation summary for a query.
 
-use crate::candidate::FusedCandidate;
-use crate::context::AppContext;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
-use crate::retrieval::RetrievalAdapter;
-use crate::retrieval::{apply_ranking_features, RRFFusionEngine, RankingFeaturesConfig};
-use crate::search_plan::{SafetyLaneContext, SearchPlanBuilder};
+use crate::symbols::Symbol;
 
 /// Handle the `aft_orient` command.
 pub fn handle_aft_orient(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -28,93 +28,78 @@ pub fn handle_aft_orient(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "query is required");
     }
 
-    // Build query shape and plan
-    let shape = crate::query_shape::classify(query);
-    let fts5_available = ctx.config().fts5.enabled;
-    let safety_ctx = SafetyLaneContext {
-        fts5_available,
-        search_index_ready: true,
-    };
-    let plan = SearchPlanBuilder::from_query_shape(&shape, &safety_ctx);
+    let search = run_public_search(req, ctx, query, 10);
+    if !search.success {
+        return search;
+    }
 
-    // Collect candidates from adapters
-    let mut candidate_sets = Vec::new();
+    let results = search
+        .data
+        .get("results")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    // Trigram adapter (always available)
-    let trig = crate::retrieval::TrigramAdapter::new();
-    candidate_sets.extend(trig.retrieve(query, &plan));
-
-    // Fuse with RRF
-    let mut fused = RRFFusionEngine::fuse(&plan, candidate_sets);
-
-    // Apply ranking features
-    let ranking_config = RankingFeaturesConfig::default();
-    apply_ranking_features(&mut fused, query, &plan, &ranking_config);
-
-    // Enrich with graph context (disabled — placeholder until wired)
-    // enrich_with_graph_context(&mut fused, None, &graph_health, &ctx.config().intelligence);
-
-    // Extract primary files (top 5)
-    let primary_files: Vec<String> = fused
+    let mut seen_files = BTreeSet::new();
+    let primary_files: Vec<String> = results
         .iter()
+        .filter_map(|result| result.get("file").and_then(|value| value.as_str()))
+        .filter(|file| seen_files.insert((*file).to_string()))
         .take(5)
-        .map(|c| c.file_path.to_string_lossy().to_string())
+        .map(ToString::to_string)
         .collect();
 
-    // Entry symbols (file stems as rough proxy)
-    let entry_symbols: Vec<String> = fused
-        .iter()
-        .take(5)
-        .filter_map(|c| {
-            c.file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-
-    // Dependency symbols (empty for now — would query callgraph)
-    let dependency_symbols: Vec<String> = Vec::new();
+    let entry_symbols = entry_symbols_for_files(ctx, query, &primary_files, 8);
+    let (graph_health, dependency_symbols) =
+        graph_orientation_facts(ctx, &primary_files, &entry_symbols, depth);
 
     // Test hints (path heuristic)
-    let test_hints: Vec<String> = fused
+    let test_hints: Vec<String> = primary_files
         .iter()
-        .filter(|c| {
-            let p = c.file_path.to_string_lossy().to_lowercase();
+        .filter(|file| {
+            let p = file.to_lowercase();
             p.contains("test") || p.contains("spec")
         })
         .take(5)
-        .map(|c| c.file_path.to_string_lossy().to_string())
+        .cloned()
         .collect();
 
     // Config hints (path heuristic)
-    let config_hints: Vec<String> = fused
+    let config_hints: Vec<String> = primary_files
         .iter()
-        .filter(|c| {
-            let p = c.file_path.to_string_lossy().to_lowercase();
+        .filter(|file| {
+            let p = file.to_lowercase();
             p.contains("config") || p.ends_with(".toml") || p.ends_with(".json")
         })
         .take(5)
-        .map(|c| c.file_path.to_string_lossy().to_string())
+        .cloned()
         .collect();
 
-    // Orientation summary (deterministic template)
-    let top_file = primary_files
-        .first()
-        .map(|f| f.as_str())
-        .unwrap_or("unknown");
-    let top_symbol = entry_symbols
-        .first()
-        .map(|s| s.as_str())
-        .unwrap_or("unknown");
-    let second_context = if primary_files.len() > 1 {
-        let second_file = &primary_files[1];
-        format!("It also involves {second_file}.")
+    let orientation_summary = if let Some(top_file) = primary_files.first() {
+        let symbol_part = entry_symbols
+            .first()
+            .map(|symbol| format!("Entry symbol `{symbol}`"))
+            .unwrap_or_else(|| "No exported entry symbol was extracted".to_string());
+        let related_part = if dependency_symbols.is_empty() {
+            format!("Graph state is {graph_health}; no dependency symbols were reported.")
+        } else {
+            format!(
+                "Graph state is {graph_health}; related symbols include {}.",
+                dependency_symbols
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "{symbol_part} is oriented around {top_file}. {} primary file(s) matched. {related_part}",
+            primary_files.len()
+        )
     } else {
-        String::new()
+        format!("No primary files matched `{query}`; graph state is {graph_health}.")
     };
-    let orientation_summary =
-        format!("{top_symbol} is implemented in {top_file}. {second_context}");
 
     let latency_ms = start.elapsed().as_millis() as f64;
 
@@ -125,6 +110,9 @@ pub fn handle_aft_orient(req: &RawRequest, ctx: &AppContext) -> Response {
         "test_hints": test_hints,
         "config_hints": config_hints,
         "orientation_summary": orientation_summary,
+        "graph": {
+            "health": graph_health,
+        },
         "latency_ms": latency_ms,
     });
 
@@ -134,16 +122,107 @@ pub fn handle_aft_orient(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, serde_json::Value::Object(extras))
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke_test() {
-        // Basic compilation test
-        let result = serde_json::json!({
-            "primary_files": [],
-            "entry_symbols": [],
-            "orientation_summary": "unknown is implemented in unknown. ",
-        });
-        assert!(result.is_object());
+fn run_public_search(req: &RawRequest, ctx: &AppContext, query: &str, top_k: usize) -> Response {
+    let search_req = RawRequest {
+        id: format!("{}:aft_orient_search", req.id),
+        command: "semantic_search".to_string(),
+        lsp_hints: req.lsp_hints.clone(),
+        session_id: req.session_id.clone(),
+        params: serde_json::json!({
+            "query": query,
+            "top_k": top_k,
+            "profile": "agent_fast",
+        }),
+    };
+    crate::commands::semantic_search::handle_semantic_search(&search_req, ctx)
+}
+
+fn entry_symbols_for_files(
+    ctx: &AppContext,
+    query: &str,
+    files: &[String],
+    limit: usize,
+) -> Vec<String> {
+    let query_lower = query.to_ascii_lowercase();
+    let mut seen = BTreeSet::new();
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+
+    for file in files {
+        let path = PathBuf::from(file);
+        let Ok(symbols) = ctx.provider().list_symbols(&path) else {
+            continue;
+        };
+        for symbol in symbols {
+            let rendered = render_symbol(&symbol);
+            if !seen.insert(rendered.clone()) {
+                continue;
+            }
+            if symbol.name.to_ascii_lowercase().contains(&query_lower)
+                || query_lower.contains(&symbol.name.to_ascii_lowercase())
+            {
+                preferred.push(rendered);
+            } else {
+                fallback.push(rendered);
+            }
+        }
     }
+
+    preferred.into_iter().chain(fallback).take(limit).collect()
+}
+
+fn render_symbol(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+    }
+}
+
+fn graph_orientation_facts(
+    ctx: &AppContext,
+    files: &[String],
+    symbols: &[String],
+    depth: usize,
+) -> (String, Vec<String>) {
+    let config = ctx.config();
+    if !config.callgraph_store || !config.intelligence.graph.enabled {
+        return ("disabled".to_string(), Vec::new());
+    }
+    drop(config);
+
+    let store = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => store,
+        CallgraphStoreAccess::Building | CallgraphStoreAccess::Unavailable => {
+            return ("cold".to_string(), Vec::new())
+        }
+        CallgraphStoreAccess::Error(_) => return ("corrupt".to_string(), Vec::new()),
+    };
+
+    let mut related = BTreeSet::new();
+    for file in files.iter().take(5) {
+        for symbol in symbols.iter().take(5) {
+            let short_symbol = symbol.rsplit("::").next().unwrap_or(symbol);
+            let Ok(nodes) = store.nodes_for(Path::new(file), short_symbol) else {
+                continue;
+            };
+            for node in nodes.into_iter().take(3) {
+                if let Ok(callers) = store.callers_of(Path::new(&node.file), &node.symbol, depth) {
+                    for site in callers.callers.into_iter().take(5) {
+                        related.insert(site.caller.symbol);
+                    }
+                }
+                if let Ok(callees) = store.outgoing_calls_of(&node) {
+                    for site in callees.into_iter().take(5) {
+                        related.insert(site.target_symbol);
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        "healthy".to_string(),
+        related.into_iter().take(10).collect(),
+    )
 }

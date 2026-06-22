@@ -95,6 +95,35 @@ fn configure_semantic_openai(
     )
 }
 
+fn configure_semantic_openai_with_ri(
+    aft: &mut AftProcess,
+    root: &Path,
+    storage_dir: &Path,
+    base_url: &str,
+) -> Value {
+    send(
+        aft,
+        json!({
+            "id": "cfg-semantic-openai-ri",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "semantic_search": true,
+            "storage_dir": storage_dir.display().to_string(),
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "test-embedding",
+                "base_url": base_url,
+                "timeout_ms": 5_000,
+                "max_batch_size": 64,
+            },
+            "intelligence": {
+                "retrieval_intelligence_v2": true
+            },
+        }),
+    )
+}
+
 struct MockEmbeddingServer {
     base_url: String,
     addr: SocketAddr,
@@ -316,6 +345,88 @@ fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {
     }
 
     panic!("semantic index did not become ready in time");
+}
+
+#[test]
+fn retrieval_intelligence_semantic_lane_contributes_public_provenance() {
+    let project = setup_project(&[
+        (
+            "src/a.rs",
+            "pub fn unchanged_semantic_target() -> &'static str {\n    \"stable retrieval\"\n}\n",
+        ),
+        (
+            "src/b.rs",
+            "pub fn unrelated_helper() -> &'static str {\n    \"other\"\n}\n",
+        ),
+    ]);
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let server = MockEmbeddingServer::start();
+    let mut aft = AftProcess::spawn();
+
+    let configure = configure_semantic_openai_with_ri(
+        &mut aft,
+        project.path(),
+        storage.path(),
+        &server.base_url,
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let ready = wait_for_semantic_status(&mut aft, "ready", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["refreshing_count"] == 0
+    });
+    assert_eq!(ready["semantic_index"]["status"], "ready");
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "ri-v2-semantic-lane",
+            "command": "semantic_search",
+            "query": "unchanged semantic target",
+            "hint": "semantic",
+            "top_k": 5,
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "RI v2 semantic search should succeed: {response:?}"
+    );
+    assert_eq!(response["id"], "ri-v2-semantic-lane");
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["semantic_status"], "ready");
+
+    let provenance = response
+        .get("retrieval_intelligence_provenance")
+        .expect("RI v2 semantic search must expose provenance");
+    let lane_contributions = provenance["lane_contributions"]
+        .as_array()
+        .expect("lane_contributions array");
+    assert!(
+        lane_contributions.iter().any(|contribution| {
+            contribution["file"]
+                .as_str()
+                .is_some_and(|file| file.replace('\\', "/").ends_with("src/a.rs"))
+                && contribution["lanes"]
+                    .as_array()
+                    .is_some_and(|lanes| lanes.iter().any(|lane| lane["lane"] == "Semantic"))
+        }),
+        "expected src/a.rs to include a Semantic lane contribution, got {provenance:?}"
+    );
+
+    let results = response["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.replace('\\', "/").ends_with("src/a.rs"))),
+        "expected public results to include the semantic fixture file: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
 }
 
 #[test]

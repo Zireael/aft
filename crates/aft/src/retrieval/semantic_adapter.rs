@@ -3,28 +3,35 @@
 //! Wraps the existing semantic embedding search infrastructure to produce
 //! `CandidateSet` results for the semantic lane.
 
+#[cfg(test)]
 use std::path::PathBuf;
 
 use crate::candidate::{CandidateEntry, CandidateSet};
 use crate::search_plan::{LaneKind, SearchPlan};
+use crate::semantic_index::SemanticResult;
 
-use super::RetrievalAdapter;
+use super::{is_generated_path, is_vendor_path, RetrievalAdapter};
 
 /// Semantic retrieval adapter.
 ///
 /// Embeds the query and searches the vector store, returning
 /// `CandidateSet` results for the semantic lane.
 ///
-/// Currently a thin wrapper — the actual embedding and search
-/// logic will be wired when the SearchPlan is integrated into
-/// the search pipeline. For now, this adapter produces empty
-/// CandidateSets as a placeholder.
-pub struct SemanticAdapter;
+pub struct SemanticAdapter {
+    results: Vec<SemanticResult>,
+}
 
 impl SemanticAdapter {
     /// Create a new semantic adapter.
     pub fn new() -> Self {
-        Self
+        Self {
+            results: Vec::new(),
+        }
+    }
+
+    /// Create a semantic adapter from existing semantic index results.
+    pub fn from_results(results: Vec<SemanticResult>) -> Self {
+        Self { results }
     }
 }
 
@@ -36,25 +43,48 @@ impl Default for SemanticAdapter {
 
 impl RetrievalAdapter for SemanticAdapter {
     fn retrieve(&self, _query: &str, plan: &SearchPlan) -> Vec<CandidateSet> {
-        // Check if semantic lane is active in the plan
-        let semantic_plan = plan.prefetch.iter().find(|p| p.lane == LaneKind::Semantic);
+        let max_candidates = plan
+            .prefetch
+            .iter()
+            .find(|p| p.lane == LaneKind::Semantic)
+            .map(|p| p.max_candidates)
+            .unwrap_or(50);
 
-        let max_candidates = semantic_plan.map(|p| p.max_candidates).unwrap_or(50);
-
-        // For now, return an empty CandidateSet.
-        // The actual semantic search will be wired when the SearchPlan
-        // is integrated into the search pipeline (future Bead).
-        // The key contract is:
-        // - source_lane = Semantic
-        // - candidates.len() <= max_candidates
-        // - is_exact_hit = false for all semantic results
-
-        let _ = max_candidates; // will be used when wiring is done
+        let candidates = self
+            .results
+            .iter()
+            .take(max_candidates)
+            .enumerate()
+            .map(|(rank, result)| semantic_result_to_candidate_entry(result, rank))
+            .collect();
 
         vec![CandidateSet {
             source_lane: LaneKind::Semantic,
-            candidates: Vec::new(),
+            candidates,
         }]
+    }
+}
+
+fn semantic_result_to_candidate_entry(result: &SemanticResult, rank: usize) -> CandidateEntry {
+    let path_str = result.file.display().to_string();
+    let line_range = if result.start_line > 0 || result.end_line > 0 {
+        Some((result.start_line as usize, result.end_line as usize))
+    } else {
+        None
+    };
+
+    CandidateEntry {
+        chunk_id: None,
+        symbol_id: None,
+        file_path: result.file.clone(),
+        line_range,
+        content_hash: None,
+        score: result.score,
+        rank,
+        is_exact_hit: false,
+        is_vendor: is_vendor_path(&path_str),
+        is_generated: is_generated_path(&path_str),
+        source_lane: LaneKind::Semantic,
     }
 }
 
@@ -94,7 +124,8 @@ pub fn semantic_result_to_entry(
 mod tests {
     use super::*;
     use crate::query_shape::{QueryKind, QueryShape, ShapeWeights};
-    use crate::search_plan::{RetrieverPlan, SafetyLaneContext, SearchPlanBuilder};
+    use crate::search_plan::{SafetyLaneContext, SearchPlanBuilder};
+    use crate::symbols::SymbolKind;
 
     fn plan_with_semantic() -> SearchPlan {
         let shape = QueryShape {
@@ -137,14 +168,39 @@ mod tests {
         assert!(result[0].candidates.len() <= max);
     }
 
-    // AC-3: Empty CandidateSet (not panic) when embedding fails
+    // AC-3: Empty CandidateSet (not panic) when no semantic results are available
     #[test]
     fn empty_on_failure() {
         let adapter = SemanticAdapter::new();
         let plan = plan_with_semantic();
         let result = adapter.retrieve("test query", &plan);
-        // Currently always empty (placeholder) — no panic
         assert_eq!(result[0].candidates.len(), 0);
+    }
+
+    #[test]
+    fn semantic_results_become_candidates() {
+        let adapter = SemanticAdapter::from_results(vec![SemanticResult {
+            file: PathBuf::from("src/lib.rs"),
+            name: "SemanticBackendConfig".to_string(),
+            kind: SymbolKind::Struct,
+            start_line: 10,
+            end_line: 12,
+            exported: true,
+            snippet: "pub struct SemanticBackendConfig".to_string(),
+            score: 0.88,
+            source: "semantic",
+        }]);
+        let plan = plan_with_semantic();
+        let result = adapter.retrieve("semantic backend config", &plan);
+
+        assert_eq!(result[0].source_lane, LaneKind::Semantic);
+        assert_eq!(result[0].candidates.len(), 1);
+        let candidate = &result[0].candidates[0];
+        assert_eq!(candidate.file_path, PathBuf::from("src/lib.rs"));
+        assert_eq!(candidate.line_range, Some((10, 12)));
+        assert_eq!(candidate.score, 0.88);
+        assert_eq!(candidate.rank, 0);
+        assert!(!candidate.is_exact_hit);
     }
 
     // AC-4: is_exact_hit=false for all semantic results

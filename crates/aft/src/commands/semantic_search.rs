@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::candidate::CandidateSet;
-use crate::context::{AppContext, SemanticIndexStatus};
+use crate::candidate::{CandidateProvenance, CandidateSet};
+use crate::context::{AppContext, CallgraphStoreAccess, SemanticIndexStatus};
 use crate::context_budget::{ContextBudget, ContextBudgetResult, EnrichPool};
 use crate::grep_executor::{self, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
@@ -14,12 +14,18 @@ use crate::query_shape::{self, QueryKind, QueryShape};
 #[cfg(feature = "semantic-fts5")]
 use crate::retrieval::fts5_adapter::Fts5Adapter;
 use crate::retrieval::fusion::RRFFusionEngine;
+use crate::retrieval::graph_enrichment::enrich_with_graph_context;
+use crate::retrieval::graph_expansion::GraphExpansionAdapter;
+use crate::retrieval::ranking_features::{apply_ranking_features, RankingFeaturesConfig};
 use crate::retrieval::semantic_adapter::SemanticAdapter;
 use crate::retrieval::trigram_adapter::TrigramAdapter;
+use crate::ril_indexer::GraphHealth;
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
 };
-use crate::search_plan::{LaneKind, SafetyLaneContext, SearchPlan, SearchPlanBuilder};
+use crate::search_plan::{
+    FeatureFlagState, LaneKind, SafetyLaneContext, SearchPlan, SearchPlanBuilder,
+};
 use crate::semantic_diagnostics::{
     format_diagnostics_prefix, score_statistics, top1_margin, PhaseTimer, SearchDiagnostics,
     SearchPipelineType, SearchWarning,
@@ -27,6 +33,7 @@ use crate::semantic_diagnostics::{
 use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
 use crate::semantic_rerank::{rerank_candidates, RerankOutcome};
 use crate::symbols::SymbolKind;
+use crate::telemetry::{CandidateScoreRow, FusionScoreRow};
 
 const DEFAULT_TOP_K: usize = 10;
 const MAX_TOP_K: usize = 100;
@@ -52,6 +59,11 @@ pub struct HybridResult {
     pub lexical_score: Option<f32>,
     pub hybrid_boosted: bool,
     pub snippet: String,
+    pub provenance: Option<CandidateProvenance>,
+    pub is_exact_hit: bool,
+    pub exact_hit_floor_applied: bool,
+    pub graph_context: Option<serde_json::Value>,
+    pub enrichment_state: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -138,7 +150,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Build SearchPlan when retrieval_intelligence_v2 is enabled (flag-gated).
     // When flag is false, search_plan_debug is None and output is byte-identical to baseline.
-    let ri_v2_enabled = ctx.config().intelligence.retrieval_intelligence_v2;
+    let ri_v2_enabled = retrieval_intelligence_v2_enabled(ctx);
     let search_plan = if ri_v2_enabled {
         let fts5_available = ctx.config().fts5.enabled;
         let safety_ctx = SafetyLaneContext {
@@ -147,7 +159,12 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         let profile = params.profile.as_deref().unwrap_or("agent_fast");
         match SearchPlanBuilder::from_query_shape_with_profile(&shape, &safety_ctx, profile) {
-            Ok(plan) => Some(plan),
+            Ok(mut plan) => {
+                plan.feature_flag_state = FeatureFlagState::On;
+                plan.rerank.enabled = ctx.config().semantic.rerank_enabled;
+                plan.rerank.max_candidates = ctx.config().semantic.rerank_max_candidates;
+                Some(plan)
+            }
             Err(error) => {
                 return Response::error(&req.id, "invalid_request", error);
             }
@@ -187,6 +204,17 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn default_top_k() -> usize {
     DEFAULT_TOP_K
+}
+
+fn retrieval_intelligence_v2_enabled(ctx: &AppContext) -> bool {
+    match std::env::var("RETRIEVAL_INTELLIGENCE_V2") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => ctx.config().intelligence.retrieval_intelligence_v2,
+        },
+        Err(_) => ctx.config().intelligence.retrieval_intelligence_v2,
+    }
 }
 
 fn semantic_candidate_limit(top_k: usize) -> usize {
@@ -361,7 +389,7 @@ fn handle_semantic_or_hybrid_search(
     project_root: &Path,
     search_plan: Option<&SearchPlan>,
 ) -> Response {
-    let ri_v2_enabled = ctx.config().intelligence.retrieval_intelligence_v2;
+    let ri_v2_enabled = retrieval_intelligence_v2_enabled(ctx);
     let lexical = if mode == SearchMode::Hybrid {
         collect_lexical_files(ctx, &params.query, &shape)
     } else {
@@ -387,6 +415,7 @@ fn handle_semantic_or_hybrid_search(
                 warnings,
                 project_root,
                 top_k,
+                search_plan,
             );
         }
         SemanticIndexStatus::Failed(error) => {
@@ -403,6 +432,7 @@ fn handle_semantic_or_hybrid_search(
                 warnings,
                 project_root,
                 top_k,
+                search_plan,
             );
         }
         SemanticIndexStatus::Building {
@@ -433,6 +463,7 @@ fn handle_semantic_or_hybrid_search(
                     warnings,
                     project_root,
                     top_k,
+                    search_plan,
                 );
             }
 
@@ -531,6 +562,7 @@ fn handle_semantic_or_hybrid_search(
             warnings,
             project_root,
             top_k,
+            search_plan,
         );
     }
 
@@ -545,14 +577,11 @@ fn handle_semantic_or_hybrid_search(
                 plan,
                 ctx,
                 mode,
-                shape.clone(),
+                shape,
+                params.profile.as_deref().unwrap_or("agent_fast"),
                 &lexical,
             );
-            let result_values = results
-                .iter()
-                .map(|r| hybrid_from_semantic(r.clone(), None))
-                .map(|h| result_to_json(&h))
-                .collect::<Vec<_>>();
+            let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let mut extras = serde_json::Map::new();
             extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
             if let Some(prov) = provenance {
@@ -571,23 +600,7 @@ fn handle_semantic_or_hybrid_search(
                     status: "ready",
                     complete: true,
                     text: format_semantic_text(
-                        &results
-                            .iter()
-                            .map(|sr| HybridResult {
-                                file: sr.file.clone(),
-                                name: sr.name.clone(),
-                                kind: sr.kind.clone(),
-                                start_line: sr.start_line,
-                                end_line: sr.end_line,
-                                exported: sr.exported,
-                                score: sr.score,
-                                source: sr.source,
-                                semantic_score: None,
-                                lexical_score: None,
-                                hybrid_boosted: false,
-                                snippet: sr.snippet.clone(),
-                            })
-                            .collect::<Vec<_>>(),
+                        &results,
                         project_root,
                         results.len() > top_k,
                         false,
@@ -631,6 +644,7 @@ fn handle_semantic_or_hybrid_search(
                 warnings,
                 project_root,
                 top_k,
+                search_plan,
             );
         }
     };
@@ -696,7 +710,7 @@ fn handle_semantic_or_hybrid_search(
     // enrich all candidates with context BEFORE rerank_candidates() so the reranker receives
     // non-empty snippets. PathOnly candidates are excluded from reranker input.
     let mut context_budget_result = ContextBudgetResult::default();
-    let ri_v2 = ctx.config().intelligence.retrieval_intelligence_v2;
+    let ri_v2 = retrieval_intelligence_v2_enabled(ctx);
     let enrich_before_rerank = ri_v2
         && rerank_enabled
         && search_plan
@@ -719,48 +733,36 @@ fn handle_semantic_or_hybrid_search(
     let rerank_skipped_by_budget = context_budget_result.reranker_skipped_reason.is_some();
     results = if rerank_skipped_by_budget {
         rerank_latency_ms = rerank_timer.stop();
+        context_budget_result.reranker_input_candidate_count = 0;
+        context_budget_result.path_only_reranker_input_count = 0;
         results
     } else {
-        match rerank_candidates(&ctx.config().semantic, &params.query, &results) {
+        let (reranked_results, outcome, input_count, path_only_input_count) =
+            rerank_enriched_subset(&ctx.config().semantic, &params.query, results);
+        context_budget_result.reranker_input_candidate_count = input_count;
+        context_budget_result.path_only_reranker_input_count = path_only_input_count;
+        match outcome {
             RerankOutcome::ReRanked(indices) => {
                 rerank_latency_ms = rerank_timer.stop();
-                let n = results.len();
-                let mut used = vec![false; n];
-                let oob_count = indices.iter().filter(|&&i| i >= n).count();
+                let oob_count = indices.iter().filter(|&&i| i >= input_count).count();
                 if oob_count > 0 && diagnostics_enabled {
                     diag_warnings.push(SearchWarning::RerankerFailure {
                         reason: format!(
                             "reranker returned {} out-of-bounds indices (max {})",
-                            oob_count, n
+                            oob_count, input_count
                         ),
                     });
                 }
-                let mut reranked = indices
-                    .iter()
-                    .filter_map(|&i| {
-                        if i < n && !used[i] {
-                            used[i] = true;
-                            Some(results[i].clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                for (i, result) in results.iter().enumerate() {
-                    if !used[i] {
-                        reranked.push(result.clone());
-                    }
-                }
-                reranked
+                reranked_results
             }
             RerankOutcome::Skipped => {
                 rerank_latency_ms = rerank_timer.stop();
-                results
+                reranked_results
             }
             RerankOutcome::Failed(error) => {
                 rerank_latency_ms = rerank_timer.stop();
                 diag_warnings.push(SearchWarning::RerankerFailure { reason: error });
-                results
+                reranked_results
             }
         }
     };
@@ -881,12 +883,36 @@ fn handle_semantic_or_hybrid_search(
                 // Add context budget diagnostics when RI v2 is active
                 if ri_v2 && rerank_enabled {
                     extras.insert(
+                        "rerank_pool_size".to_string(),
+                        serde_json::json!(context_budget_result.rerank_pool_size),
+                    );
+                    extras.insert(
+                        "enriched_candidate_count".to_string(),
+                        serde_json::json!(context_budget_result.enriched_candidate_count),
+                    );
+                    extras.insert(
                         "context_exhausted".to_string(),
                         serde_json::json!(context_budget_result.context_exhausted),
                     );
                     extras.insert(
                         "unenriched_candidate_count".to_string(),
                         serde_json::json!(context_budget_result.unenriched_candidate_count),
+                    );
+                    extras.insert(
+                        "path_only_candidate_count".to_string(),
+                        serde_json::json!(context_budget_result.path_only_candidate_count),
+                    );
+                    extras.insert(
+                        "skipped_candidate_count".to_string(),
+                        serde_json::json!(context_budget_result.skipped_candidate_count),
+                    );
+                    extras.insert(
+                        "reranker_input_candidate_count".to_string(),
+                        serde_json::json!(context_budget_result.reranker_input_candidate_count),
+                    );
+                    extras.insert(
+                        "path_only_reranker_input_count".to_string(),
+                        serde_json::json!(context_budget_result.path_only_reranker_input_count),
                     );
                     extras.insert(
                         "reranker_skipped_reason".to_string(),
@@ -1005,12 +1031,61 @@ fn semantic_unavailable_or_fallback_response(
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
+    search_plan: Option<&SearchPlan>,
 ) -> Response {
     if params.hint == SearchHint::Semantic {
         return semantic_unavailable_response(&req.id, detail);
     }
 
     let lexical_ready = mode == SearchMode::Hybrid && lexical.ready;
+    if lexical_ready {
+        if let Some(plan) = search_plan {
+            let (results, provenance) = run_urfk_pipeline(
+                &params.query,
+                top_k,
+                plan,
+                ctx,
+                mode,
+                *shape,
+                params.profile.as_deref().unwrap_or("agent_fast"),
+                &lexical,
+            );
+            if !results.is_empty() {
+                let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
+                let mut extras = semantic_unavailable_extras(true, search_plan);
+                if let Some(prov) = provenance {
+                    extras.insert("retrieval_intelligence_provenance".to_string(), prov);
+                }
+                warnings.push(
+                    "Semantic search unavailable; returning RI v2 trigram safety-lane results."
+                        .to_string(),
+                );
+                return search_response(
+                    req,
+                    SearchResponseParts {
+                        query: &params.query,
+                        interpreted_as: fallback_executed_label(mode, true),
+                        query_kind: query_kind_label(shape.kind),
+                        semantic_status,
+                        status: "ready",
+                        complete: false,
+                        text: format_semantic_text(
+                            &results,
+                            project_root,
+                            results.len() > top_k,
+                            false,
+                        ),
+                        results: result_values,
+                        more_available: results.len() > top_k,
+                        engine_capped: lexical.engine_capped,
+                        fully_degraded: false,
+                        warnings,
+                        extras,
+                    },
+                );
+            }
+        }
+    }
     if lexical_ready {
         let lexical_count = lexical.files.len();
         let lexical_engine_capped = lexical.engine_capped;
@@ -1043,7 +1118,7 @@ fn semantic_unavailable_or_fallback_response(
                 engine_capped: lexical_engine_capped,
                 fully_degraded: false,
                 warnings,
-                extras: semantic_unavailable_extras(true),
+                extras: semantic_unavailable_extras(true, search_plan),
             },
         );
     }
@@ -1059,10 +1134,11 @@ fn semantic_unavailable_or_fallback_response(
             warnings,
             project_root,
             top_k,
+            search_plan,
         );
     }
 
-    let mut extras = semantic_unavailable_extras(false);
+    let mut extras = semantic_unavailable_extras(false, search_plan);
     if mode == SearchMode::Hybrid {
         extras.insert("lexical_unavailable".to_string(), serde_json::json!(true));
     }
@@ -1093,6 +1169,7 @@ fn semantic_unavailable_response(request_id: &str, detail: String) -> Response {
 
 fn semantic_unavailable_extras(
     lexical_only_fallback: bool,
+    search_plan: Option<&SearchPlan>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut extras = serde_json::Map::new();
     extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
@@ -1100,6 +1177,20 @@ fn semantic_unavailable_extras(
         "lexical_only_fallback".to_string(),
         serde_json::json!(lexical_only_fallback),
     );
+    if let Some(plan) = search_plan {
+        extras.insert("search_plan_debug".to_string(), search_plan_to_json(plan));
+        extras.insert(
+            "retrieval_intelligence_diagnostic".to_string(),
+            serde_json::json!({
+                "semantic_prerequisite": "unavailable",
+                "executed_path": if lexical_only_fallback {
+                    "lexical_only_fallback"
+                } else {
+                    "semantic_unavailable"
+                },
+            }),
+        );
+    }
     extras
 }
 
@@ -1139,6 +1230,7 @@ fn semantic_unavailable_grep_fallback_response(
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
+    search_plan: Option<&SearchPlan>,
 ) -> Response {
     let result = match execute_degraded_grep_fallback(&params.query, project_root, top_k, &req.id) {
         Ok(result) => result,
@@ -1175,7 +1267,7 @@ fn semantic_unavailable_grep_fallback_response(
             engine_capped: result.engine_capped,
             fully_degraded: result.fully_degraded,
             warnings,
-            extras: semantic_unavailable_extras(true),
+            extras: semantic_unavailable_extras(true, search_plan),
         },
     )
 }
@@ -1421,20 +1513,23 @@ fn semantic_index_loaded(ctx: &AppContext) -> bool {
 ///
 /// Collects candidates from retrieval lane adapters (FTS5, semantic, trigram),
 /// fuses with RRF + ExactHitFloor, applies ContextBudget enrichment and
-/// reranking, and maps to SemanticResult with provenance metadata.
+/// reranking, and returns public-search results with provenance metadata.
 fn run_urfk_pipeline(
     query: &str,
     top_k: usize,
     plan: &SearchPlan,
     ctx: &AppContext,
-    mode: SearchMode,
+    _mode: SearchMode,
     shape: QueryShape,
+    profile: &str,
     lexical: &LexicalCollection,
-) -> (Vec<SemanticResult>, Option<serde_json::Value>) {
+) -> (Vec<HybridResult>, Option<serde_json::Value>) {
     use crate::retrieval::RetrievalAdapter;
 
     // 1. Collect candidate sets from adapters
     let mut candidate_sets: Vec<CandidateSet> = Vec::new();
+    let mut degraded_lanes: Vec<serde_json::Value> = Vec::new();
+    let mut fts5_degraded_to_trigram_body = false;
 
     // Run FTS5Adapter if FTS5 is available
     #[cfg(feature = "semantic-fts5")]
@@ -1442,34 +1537,118 @@ fn run_urfk_pipeline(
         if ctx.config().fts5.enabled {
             let project_root = grep_executor::project_root(ctx);
             let db_path = project_root.join(".aft").join("fts5.sqlite");
-            if let Ok(store) = crate::fts5_store::Fts5Store::open(&db_path) {
-                let fts5_adapter = Fts5Adapter::new(&store);
-                candidate_sets.extend(fts5_adapter.retrieve(query, plan));
+            match crate::fts5_store::Fts5Store::open(&db_path) {
+                Ok(store) => {
+                    let fts5_adapter = Fts5Adapter::new(&store);
+                    let report = fts5_adapter.retrieve_with_diagnostics(query, plan);
+                    candidate_sets.extend(report.candidate_sets);
+                    degraded_lanes.extend(report.degraded_lanes.into_iter().map(|lane| {
+                        if lane.fallback_used == Some(LaneKind::TrigramBody) {
+                            fts5_degraded_to_trigram_body = true;
+                        }
+                        serde_json::json!({
+                            "lane": format!("{:?}", lane.lane),
+                            "reason": lane.reason,
+                            "fallback_used": lane.fallback_used.map(|fallback| format!("{:?}", fallback)),
+                        })
+                    }));
+                }
+                Err(error) => {
+                    degraded_lanes.extend(fts5_plan_degraded_lanes(
+                        plan,
+                        format!("FTS5 store unavailable: {error}"),
+                    ));
+                    if plan.active_safety_lane == LaneKind::FTS5Body {
+                        fts5_degraded_to_trigram_body = true;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "semantic-fts5"))]
+    {
+        if ctx.config().fts5.enabled {
+            degraded_lanes.extend(fts5_plan_degraded_lanes(
+                plan,
+                "FTS5 support is not compiled into this binary".to_string(),
+            ));
+            if plan.active_safety_lane == LaneKind::FTS5Body {
+                fts5_degraded_to_trigram_body = true;
             }
         }
     }
 
     // Run SemanticAdapter if semantic index is ready
     if semantic_index_loaded(ctx) {
-        let semantic_adapter = SemanticAdapter::new();
-        candidate_sets.extend(semantic_adapter.retrieve(query, plan));
+        if let Ok((query_vector, _query_cache_hit)) = embed_query(query, ctx) {
+            let semantic_limit = plan
+                .prefetch
+                .iter()
+                .find(|p| p.lane == crate::search_plan::LaneKind::Semantic)
+                .map(|p| p.max_candidates)
+                .unwrap_or(50);
+            let semantic_results = {
+                let semantic_index = ctx.semantic_index().borrow();
+                semantic_index
+                    .as_ref()
+                    .map(|index| index.search(&query_vector, semantic_limit))
+                    .unwrap_or_default()
+            };
+            let semantic_adapter = SemanticAdapter::from_results(semantic_results);
+            candidate_sets.extend(semantic_adapter.retrieve(query, plan));
+        }
     }
 
     // Run TrigramAdapter if search index is ready
     if lexical.ready {
-        let trigram_adapter = TrigramAdapter::new();
-        candidate_sets.extend(trigram_adapter.retrieve(query, plan));
+        let trigram_adapter = TrigramAdapter::from_ranked_files(lexical.files.clone());
+        let fallback_plan = if fts5_degraded_to_trigram_body {
+            let mut cloned = plan.clone();
+            cloned.active_safety_lane = LaneKind::TrigramBody;
+            Some(cloned)
+        } else {
+            None
+        };
+        let trigram_plan = fallback_plan.as_ref().unwrap_or(plan);
+        candidate_sets.extend(trigram_adapter.retrieve(query, trigram_plan));
     }
 
-    // 2. Fuse with RRF + ExactHitFloor
-    let fused = RRFFusionEngine::fuse(plan, candidate_sets);
+    // 2. Fuse with RRF + ExactHitFloor, then apply graph expansion/enrichment
+    // before converting to public results.
+    let mut fused = RRFFusionEngine::fuse(plan, candidate_sets.clone());
+    let graph_health = apply_graph_intelligence(ctx, plan, &mut candidate_sets, &mut fused);
+    let ranking_config = RankingFeaturesConfig {
+        exact_definition_boost: plan.ranking_profile.exact_definition_boost,
+        identifier_stem_match_boost: plan.ranking_profile.stem_match_boost,
+        path_base_match_boost: plan.ranking_profile.path_base_match_boost,
+        doc_comment_boost: plan.ranking_profile.doc_comment_boost,
+        same_file_coherence_boost: plan.ranking_profile.same_file_coherence_boost,
+        test_example_penalty: plan.ranking_profile.test_example_penalty,
+    };
+    let ranking_feature_reports =
+        apply_ranking_features(ctx, &mut fused, query, plan, &ranking_config);
+    fused.sort_by(|left, right| {
+        right
+            .final_score
+            .partial_cmp(&left.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .rrf_score
+                    .partial_cmp(&left.rrf_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.file_path.cmp(&right.file_path))
+    });
 
     // 3. Map FusedCandidates to HybridResult for enrich/rerank
     let mut hybrid_results: Vec<HybridResult> = fused
         .iter()
-        .enumerate()
-        .map(|(rank, fc)| {
-            let (start_line, end_line) = fc.line_range.unwrap_or((0, 0));
+        .map(|fc| {
+            let (start_line, end_line) = fc
+                .line_range
+                .map(|(start, end)| (start.saturating_sub(1), end.saturating_sub(1)))
+                .unwrap_or((0, 0));
             HybridResult {
                 file: fc.file_path.clone(),
                 name: String::new(),
@@ -1483,68 +1662,50 @@ fn run_urfk_pipeline(
                 lexical_score: None,
                 hybrid_boosted: false,
                 snippet: String::new(),
+                provenance: Some(fc.provenance.clone()),
+                is_exact_hit: fc.is_exact_hit,
+                exact_hit_floor_applied: fc.exact_hit_floor_applied,
+                graph_context: graph_context_from_fused_candidate(fc),
+                enrichment_state: "not_enriched",
             }
         })
         .collect();
 
     // 4. Apply ContextBudget enrichment + rerank (reuse existing flow)
     let budget = &plan.context_budget;
-    let _context_budget_result = enrich_context_pool(&mut hybrid_results, budget);
+    let mut context_budget_result = enrich_context_pool(&mut hybrid_results, budget);
 
     let rerank_enabled = plan.rerank.enabled;
-    if rerank_enabled {
-        hybrid_results = match rerank_candidates(&ctx.config().semantic, query, &hybrid_results) {
-            RerankOutcome::ReRanked(indices) => {
-                let n = hybrid_results.len();
-                let mut used = vec![false; n];
-                let mut reranked: Vec<HybridResult> = indices
-                    .iter()
-                    .filter_map(|&i| {
-                        if i < n && !used[i] {
-                            used[i] = true;
-                            Some(hybrid_results[i].clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                for (i, result) in hybrid_results.iter().enumerate() {
-                    if !used[i] {
-                        reranked.push(result.clone());
-                    }
-                }
-                reranked
-            }
-            RerankOutcome::Skipped | RerankOutcome::Failed(_) => hybrid_results,
-        };
+    if rerank_enabled && context_budget_result.reranker_skipped_reason.is_none() {
+        let (reranked_results, _outcome, input_count, path_only_input_count) =
+            rerank_enriched_subset(&ctx.config().semantic, query, hybrid_results);
+        context_budget_result.reranker_input_candidate_count = input_count;
+        context_budget_result.path_only_reranker_input_count = path_only_input_count;
+        hybrid_results = reranked_results;
+    } else if rerank_enabled {
+        context_budget_result.reranker_input_candidate_count = 0;
+        context_budget_result.path_only_reranker_input_count = 0;
     }
 
     // Truncate to top_k
     hybrid_results.truncate(top_k);
 
-    // 5. Map FusedCandidates to SemanticResult with provenance
-    let results: Vec<SemanticResult> = fused
-        .iter()
-        .take(top_k)
-        .map(|fc| {
-            let (start_line, end_line) = fc.line_range.unwrap_or((0, 0));
-            SemanticResult {
-                file: fc.file_path.clone(),
-                name: String::new(),
-                kind: crate::symbols::SymbolKind::FileSummary,
-                start_line: start_line as u32,
-                end_line: end_line as u32,
-                exported: false,
-                score: fc.final_score,
-                snippet: String::new(),
-                source: "ri_v2",
-            }
-        })
-        .collect();
+    if let Err(error) = persist_retrieval_telemetry(
+        ctx,
+        query,
+        &shape,
+        profile,
+        plan,
+        &context_budget_result,
+        &fused,
+    ) {
+        crate::slog_warn!("failed to persist retrieval telemetry: {}", error);
+    }
 
-    // 6. Build provenance data for diagnostics
+    // 5. Build provenance data for diagnostics.
     let provenance = serde_json::json!({
-        "lane_contributions": fused.iter().take(top_k).map(|fc| {
+        "lane_contributions": hybrid_results.iter().filter_map(|result| {
+            fused_candidate_for_hybrid_result(result, &fused).map(|fc| {
             serde_json::json!({
                 "file": fc.file_path.to_str().unwrap_or(""),
                 "lanes": fc.provenance.lanes.iter().map(|l| serde_json::json!({
@@ -1553,10 +1714,221 @@ fn run_urfk_pipeline(
                     "score": l.score_in_lane,
                 })).collect::<Vec<_>>(),
             })
+            })
         }).collect::<Vec<_>>(),
+        "degraded_lanes": degraded_lanes,
+        "context_budget": {
+            "rerank_pool_size": context_budget_result.rerank_pool_size,
+            "enriched_candidate_count": context_budget_result.enriched_candidate_count,
+            "context_exhausted": context_budget_result.context_exhausted,
+            "unenriched_candidate_count": context_budget_result.unenriched_candidate_count,
+            "path_only_candidate_count": context_budget_result.path_only_candidate_count,
+            "skipped_candidate_count": context_budget_result.skipped_candidate_count,
+            "reranker_input_candidate_count": context_budget_result.reranker_input_candidate_count,
+            "path_only_reranker_input_count": context_budget_result.path_only_reranker_input_count,
+            "reranker_skipped_reason": context_budget_result.reranker_skipped_reason,
+        },
+        "graph": {
+            "health": graph_health.label(),
+        },
+        "ranking_features": ranking_feature_reports,
     });
 
-    (results, Some(provenance))
+    (hybrid_results, Some(provenance))
+}
+
+fn apply_graph_intelligence(
+    ctx: &AppContext,
+    plan: &SearchPlan,
+    candidate_sets: &mut Vec<CandidateSet>,
+    fused: &mut Vec<crate::candidate::FusedCandidate>,
+) -> GraphHealth {
+    let config = ctx.config();
+    let intelligence = config.intelligence.clone();
+    if !config.callgraph_store || !intelligence.graph.enabled {
+        let health = GraphHealth::Disabled;
+        enrich_with_graph_context(fused, None, &health, &intelligence);
+        return health;
+    }
+
+    match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => {
+            let health = GraphHealth::Healthy;
+            let expanded =
+                GraphExpansionAdapter::expand(fused, Some(&*store), &health, &intelligence);
+            if !expanded.is_empty() {
+                candidate_sets.extend(expanded);
+                *fused = RRFFusionEngine::fuse(plan, candidate_sets.clone());
+            }
+            enrich_with_graph_context(fused, Some(&*store), &health, &intelligence);
+            health
+        }
+        CallgraphStoreAccess::Building | CallgraphStoreAccess::Unavailable => {
+            let health = GraphHealth::Cold;
+            enrich_with_graph_context(fused, None, &health, &intelligence);
+            health
+        }
+        CallgraphStoreAccess::Error(error) => {
+            crate::slog_warn!(
+                "callgraph store unavailable for RI graph enrichment: {}",
+                error
+            );
+            let health = GraphHealth::Corrupt;
+            enrich_with_graph_context(fused, None, &health, &intelligence);
+            health
+        }
+    }
+}
+
+fn persist_retrieval_telemetry(
+    ctx: &AppContext,
+    query: &str,
+    shape: &QueryShape,
+    profile: &str,
+    plan: &SearchPlan,
+    context_budget_result: &ContextBudgetResult,
+    fused: &[crate::candidate::FusedCandidate],
+) -> Result<(), String> {
+    let telemetry_config = ctx.config().intelligence.telemetry.clone();
+    if !telemetry_config.telemetry_persist || !telemetry_sample_allows(&telemetry_config, query) {
+        return Ok(());
+    }
+
+    let Some(db) = ctx.db() else {
+        return Ok(());
+    };
+    let conn = db
+        .lock()
+        .map_err(|_| "retrieval telemetry database lock poisoned".to_string())?;
+
+    crate::telemetry::init_telemetry_schema(&conn)?;
+    let backend_config = search_plan_to_json(plan).to_string();
+    let run_id = crate::telemetry::write_retrieval_run(
+        &conn,
+        &telemetry_config,
+        query,
+        query_kind_label(shape.kind),
+        0.0,
+        profile,
+        &backend_config,
+        context_budget_result.context_exhausted,
+        context_budget_result.reranker_skipped_reason.as_deref(),
+    )?;
+
+    let row_limit = telemetry_config.max_rows_per_run;
+    let candidate_rows = fused
+        .iter()
+        .flat_map(|candidate| {
+            candidate
+                .provenance
+                .lanes
+                .iter()
+                .map(move |lane| CandidateScoreRow {
+                    chunk_id: telemetry_candidate_id(candidate),
+                    source_lane: format!("{:?}", lane.lane),
+                    raw_rank: lane.rank_in_lane as u32,
+                    raw_score: lane.score_in_lane,
+                    normalized_score: lane.rrf_contribution,
+                    is_exact_hit: candidate.is_exact_hit,
+                    exact_hit_floor_applied: candidate.exact_hit_floor_applied,
+                })
+        })
+        .take(row_limit)
+        .collect::<Vec<_>>();
+    crate::telemetry::write_candidate_scores(&conn, &run_id, &candidate_rows)?;
+
+    let fusion_rows = fused
+        .iter()
+        .take(row_limit)
+        .map(|candidate| FusionScoreRow {
+            chunk_id: telemetry_candidate_id(candidate),
+            rrf_score: candidate.rrf_score,
+            exact_hit_floor_applied: candidate.exact_hit_floor_applied,
+            final_score: candidate.final_score,
+            provenance_json: Some(candidate_provenance_to_json(&candidate.provenance).to_string()),
+        })
+        .collect::<Vec<_>>();
+    crate::telemetry::write_fusion_scores(&conn, &run_id, &fusion_rows)?;
+
+    Ok(())
+}
+
+fn telemetry_sample_allows(
+    config: &crate::intelligence_config::TelemetryConfig,
+    query: &str,
+) -> bool {
+    if config.sampling_rate >= 1.0 {
+        return true;
+    }
+    if config.sampling_rate <= 0.0 {
+        return false;
+    }
+
+    let hash = crate::telemetry::hash_query(query, &config.telemetry_query_hash_salt);
+    let prefix = hash.get(..16).unwrap_or(&hash);
+    let sample = u64::from_str_radix(prefix, 16).unwrap_or(0) as f64 / u64::MAX as f64;
+    sample <= config.sampling_rate
+}
+
+fn telemetry_candidate_id(candidate: &crate::candidate::FusedCandidate) -> Option<String> {
+    candidate
+        .chunk_id
+        .map(|id| format!("chunk:{id}"))
+        .or_else(|| candidate.symbol_id.map(|id| format!("symbol:{id}")))
+        .or_else(|| {
+            candidate
+                .line_range
+                .map(|(start, end)| format!("{}:{start}-{end}", candidate.file_path.display()))
+        })
+        .or_else(|| Some(candidate.file_path.display().to_string()))
+}
+
+fn fused_candidate_for_hybrid_result<'a>(
+    result: &HybridResult,
+    fused: &'a [crate::candidate::FusedCandidate],
+) -> Option<&'a crate::candidate::FusedCandidate> {
+    fused.iter().find(|candidate| {
+        let line_range = candidate.line_range.unwrap_or((0, 0));
+        candidate.file_path == result.file
+            && line_range.0.saturating_sub(1) as u32 == result.start_line
+            && line_range.1.saturating_sub(1) as u32 == result.end_line
+    })
+}
+
+fn graph_context_from_fused_candidate(
+    candidate: &crate::candidate::FusedCandidate,
+) -> Option<serde_json::Value> {
+    candidate
+        .context
+        .as_deref()
+        .and_then(|context| serde_json::from_str(context).ok())
+}
+
+fn fts5_plan_degraded_lanes(plan: &SearchPlan, reason: String) -> Vec<serde_json::Value> {
+    plan.prefetch
+        .iter()
+        .filter(|retriever| {
+            matches!(
+                retriever.lane,
+                LaneKind::FTS5Symbol
+                    | LaneKind::FTS5Body
+                    | LaneKind::FTS5Path
+                    | LaneKind::FTS5Docs
+                    | LaneKind::SymbolExact
+            ) && (retriever.weight >= 0.1 || retriever.is_safety_lane)
+        })
+        .map(|retriever| {
+            serde_json::json!({
+                "lane": format!("{:?}", retriever.lane),
+                "reason": reason,
+                "fallback_used": if plan.active_safety_lane == LaneKind::FTS5Body {
+                    Some("TrigramBody")
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
 }
 
 fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> LexicalCollection {
@@ -1754,10 +2126,19 @@ fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> H
         exported: result.exported,
         snippet: result.snippet,
         score,
-        source: "semantic",
+        source: if result.source == "ri_v2" {
+            "ri_v2"
+        } else {
+            "semantic"
+        },
         semantic_score: Some(semantic_score),
         lexical_score,
         hybrid_boosted,
+        provenance: None,
+        is_exact_hit: false,
+        exact_hit_floor_applied: false,
+        graph_context: None,
+        enrichment_state: "not_applicable",
     }
 }
 
@@ -1779,6 +2160,11 @@ fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) ->
         lexical_score: Some(lexical_score),
         hybrid_boosted: false,
         snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
+        provenance: None,
+        is_exact_hit: false,
+        exact_hit_floor_applied: false,
+        graph_context: None,
+        enrichment_state: "not_applicable",
     }
 }
 
@@ -1801,6 +2187,73 @@ fn cap_per_file(results: Vec<HybridResult>, cap: usize) -> Vec<HybridResult> {
         }
     }
     capped
+}
+
+fn rerank_enriched_subset(
+    config: &crate::config::SemanticBackendConfig,
+    query: &str,
+    results: Vec<HybridResult>,
+) -> (Vec<HybridResult>, RerankOutcome, usize, usize) {
+    let enriched_indices = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| (result.enrichment_state == "enriched").then_some(index))
+        .collect::<Vec<_>>();
+    let path_only_input_count = enriched_indices
+        .iter()
+        .filter(|&&index| results[index].enrichment_state == "path_only")
+        .count();
+    let reranker_input_count = enriched_indices.len();
+    let enriched_results = enriched_indices
+        .iter()
+        .map(|&index| results[index].clone())
+        .collect::<Vec<_>>();
+
+    match rerank_candidates(config, query, &enriched_results) {
+        RerankOutcome::ReRanked(indices) => {
+            let n = enriched_results.len();
+            let mut used = vec![false; n];
+            let mut reordered = indices
+                .iter()
+                .filter_map(|&index| {
+                    if index < n && !used[index] {
+                        used[index] = true;
+                        Some(enriched_results[index].clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            for (index, result) in enriched_results.iter().enumerate() {
+                if !used[index] {
+                    reordered.push(result.clone());
+                }
+            }
+            for (index, result) in results.iter().enumerate() {
+                if !enriched_indices.contains(&index) {
+                    reordered.push(result.clone());
+                }
+            }
+            (
+                reordered,
+                RerankOutcome::ReRanked(indices),
+                reranker_input_count,
+                path_only_input_count,
+            )
+        }
+        RerankOutcome::Skipped => (
+            results,
+            RerankOutcome::Skipped,
+            reranker_input_count,
+            path_only_input_count,
+        ),
+        RerankOutcome::Failed(error) => (
+            results,
+            RerankOutcome::Failed(error),
+            reranker_input_count,
+            path_only_input_count,
+        ),
+    }
 }
 
 fn semantic_error_response(request_id: &str, error: &str) -> Response {
@@ -2036,12 +2489,22 @@ fn enrich_context_pool(
     budget: &ContextBudget,
 ) -> ContextBudgetResult {
     let mut total_tokens_used: usize = 0;
+    let mut enriched_count: usize = 0;
     let mut unenriched_count: usize = 0;
+    let mut path_only_count: usize = 0;
+    let mut skipped_count: usize = 0;
     let mut file_lines_cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
 
     for result in results.iter_mut() {
-        // Lexical and file-summary results don't get enriched
-        if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+        let has_line_range =
+            result.end_line >= result.start_line && (result.start_line > 0 || result.end_line > 0);
+
+        // Lexical whole-file matches and true file-summary results don't get enriched.
+        if result.source == "lexical"
+            || (matches!(result.kind, SymbolKind::FileSummary) && !has_line_range)
+        {
+            result.enrichment_state = "skipped_unsupported";
+            skipped_count += 1;
             continue;
         }
 
@@ -2060,7 +2523,9 @@ fn enrich_context_pool(
                 _ => format!("{} [budget_exhausted]", result.file.display()),
             };
             result.snippet = fallback;
+            result.enrichment_state = "path_only";
             unenriched_count += 1;
+            path_only_count += 1;
             continue;
         }
 
@@ -2085,22 +2550,27 @@ fn enrich_context_pool(
                     snippet.push_str(&format!("\n+{remaining} more lines"));
                 }
                 result.snippet = snippet;
+                result.enrichment_state = "enriched";
+                enriched_count += 1;
                 total_tokens_used += budget.per_candidate_tokens;
             } else {
                 // No source lines available: PathOnly fallback
                 result.snippet = format!("{} [budget_exhausted]", result.file.display());
+                result.enrichment_state = "path_only";
                 unenriched_count += 1;
+                path_only_count += 1;
             }
         } else {
             // File unreadable: PathOnly fallback
             result.snippet = format!("{} [budget_exhausted]", result.file.display());
+            result.enrichment_state = "path_only";
             unenriched_count += 1;
+            path_only_count += 1;
         }
     }
 
     let pool_size = results.len();
-    let enriched_count = pool_size.saturating_sub(unenriched_count);
-    let context_exhausted = unenriched_count > 0;
+    let context_exhausted = path_only_count > 0;
 
     let reranker_skipped_reason = if pool_size == 0 {
         Some("no_candidates".to_string())
@@ -2116,8 +2586,14 @@ fn enrich_context_pool(
     };
 
     ContextBudgetResult {
+        rerank_pool_size: pool_size,
+        enriched_candidate_count: enriched_count,
         context_exhausted,
         unenriched_candidate_count: unenriched_count,
+        path_only_candidate_count: path_only_count,
+        skipped_candidate_count: skipped_count,
+        reranker_input_candidate_count: 0,
+        path_only_reranker_input_count: 0,
         reranker_skipped_reason,
     }
 }
@@ -2196,7 +2672,7 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         )
     };
 
-    serde_json::json!({
+    let mut object = serde_json::json!({
         "file": result.file.display().to_string(),
         "name": result.name,
         "kind": result.kind,
@@ -2209,6 +2685,67 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         "lexical_score": result.lexical_score,
         "hybrid_boosted": result.hybrid_boosted,
         "snippet": result.snippet,
+    });
+
+    if result.source == "ri_v2" || result.provenance.is_some() {
+        let object = object
+            .as_object_mut()
+            .expect("result_to_json creates a JSON object");
+        object.insert(
+            "provenance".to_string(),
+            result
+                .provenance
+                .as_ref()
+                .map(candidate_provenance_to_json)
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "lanes": [],
+                        "is_graph_expansion": false,
+                        "graph_expansion_reason": null,
+                    })
+                }),
+        );
+        object.insert(
+            "is_exact_hit".to_string(),
+            serde_json::json!(result.is_exact_hit),
+        );
+        object.insert(
+            "exact_hit_floor_applied".to_string(),
+            serde_json::json!(result.exact_hit_floor_applied),
+        );
+        object.insert(
+            "is_graph_expansion".to_string(),
+            serde_json::json!(result
+                .provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.is_graph_expansion)),
+        );
+        object.insert(
+            "graph_context".to_string(),
+            result
+                .graph_context
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "enrichment_state".to_string(),
+            serde_json::json!(result.enrichment_state),
+        );
+    }
+
+    object
+}
+
+fn candidate_provenance_to_json(provenance: &CandidateProvenance) -> serde_json::Value {
+    serde_json::json!({
+        "lanes": provenance.lanes.iter().map(|lane| serde_json::json!({
+            "lane": format!("{:?}", lane.lane),
+            "rank": lane.rank_in_lane,
+            "score": lane.score_in_lane,
+            "rrf_contribution": lane.rrf_contribution,
+        })).collect::<Vec<_>>(),
+        "is_graph_expansion": provenance.is_graph_expansion,
+        "graph_expansion_reason": provenance.graph_expansion_reason.clone(),
     })
 }
 
@@ -2235,6 +2772,37 @@ fn search_plan_to_json(plan: &SearchPlan) -> serde_json::Value {
         })
         .collect();
 
+    let mandatory_lanes = plan
+        .mandatory_lanes
+        .iter()
+        .map(|lane| serde_json::json!(format!("{lane:?}")))
+        .collect::<Vec<_>>();
+
+    let suppressed_lanes = plan
+        .suppressed_lanes
+        .iter()
+        .map(|suppressed| {
+            serde_json::json!({
+                "lane": format!("{:?}", suppressed.lane),
+                "reason": suppressed.reason.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let prefetch = plan
+        .prefetch
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "lane": format!("{:?}", p.lane),
+                "weight": p.weight,
+                "max_candidates": p.max_candidates,
+                "is_safety_lane": p.is_safety_lane,
+                "latency_budget_ms": p.latency_budget_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
     let max_candidates_per_lane: serde_json::Map<String, serde_json::Value> = plan
         .prefetch
         .iter()
@@ -2246,10 +2814,39 @@ fn search_plan_to_json(plan: &SearchPlan) -> serde_json::Value {
 
     serde_json::json!({
         "intent": format!("{:?}", plan.intent),
+        "lane_weights": lane_weights,
+        "mandatory_lanes": mandatory_lanes,
+        "suppressed_lanes": suppressed_lanes,
+        "prefetch": prefetch,
+        "fusion": {
+            "rrf_k": plan.fusion.rrf_k,
+            "exact_hit_floor_n": plan.fusion.exact_hit_floor_n,
+        },
+        "ranking_profile": {
+            "exact_definition_boost": plan.ranking_profile.exact_definition_boost,
+            "stem_match_boost": plan.ranking_profile.stem_match_boost,
+            "path_base_match_boost": plan.ranking_profile.path_base_match_boost,
+            "doc_comment_boost": plan.ranking_profile.doc_comment_boost,
+            "same_file_coherence_boost": plan.ranking_profile.same_file_coherence_boost,
+            "test_example_penalty": plan.ranking_profile.test_example_penalty,
+        },
+        "context_budget": {
+            "total_tokens": plan.context_budget.total_tokens,
+            "per_candidate_tokens": plan.context_budget.per_candidate_tokens,
+            "min_candidate_chars": plan.context_budget.min_candidate_chars,
+            "mode": format!("{:?}", plan.context_budget.mode),
+            "enrich_pool": format!("{:?}", plan.context_budget.enrich_pool),
+            "rerank_min_enriched_ratio": plan.context_budget.rerank_min_enriched_ratio,
+        },
+        "rerank": {
+            "enabled": plan.rerank.enabled,
+            "max_candidates": plan.rerank.max_candidates,
+        },
+        "diagnostics_level": format!("{:?}", plan.diagnostics),
         "active_safety_lane": format!("{:?}", plan.active_safety_lane),
+        "feature_flag_state": format!("{:?}", plan.feature_flag_state),
         "context_mode": format!("{:?}", plan.context_budget.mode),
         "enrich_pool": format!("{:?}", plan.context_budget.enrich_pool),
-        "lane_weights": lane_weights,
         "max_candidates_per_lane": max_candidates_per_lane,
     })
 }
@@ -2718,6 +3315,11 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            provenance: None,
+            is_exact_hit: false,
+            exact_hit_floor_applied: false,
+            graph_context: None,
+            enrichment_state: "not_applicable",
         }];
 
         let text = format_semantic_text(&results, project_root, false, false);
@@ -2758,6 +3360,11 @@ mod tests {
             semantic_score: Some(0.5),
             lexical_score: None,
             hybrid_boosted: false,
+            provenance: None,
+            is_exact_hit: false,
+            exact_hit_floor_applied: false,
+            graph_context: None,
+            enrichment_state: "not_applicable",
         }
     }
 
@@ -2867,6 +3474,11 @@ mod tests {
             semantic_score: Some(0.5),
             lexical_score: None,
             hybrid_boosted: false,
+            provenance: None,
+            is_exact_hit: false,
+            exact_hit_floor_applied: false,
+            graph_context: None,
+            enrichment_state: "not_applicable",
         }];
         // Must not panic; header renders, no snippet body.
         let _ = enrich_snippets_from_source(&mut results);
@@ -2913,6 +3525,11 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            provenance: None,
+            is_exact_hit: false,
+            exact_hit_floor_applied: false,
+            graph_context: None,
+            enrichment_state: "not_applicable",
         };
 
         let json = result_to_json(&result);

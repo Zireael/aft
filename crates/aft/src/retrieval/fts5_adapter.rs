@@ -20,6 +20,21 @@ pub struct Fts5Adapter<'a> {
     store: &'a Fts5Store,
 }
 
+/// FTS5 lane degradation surfaced to the caller for RI diagnostics.
+#[derive(Debug, Clone)]
+pub struct Fts5DegradedLane {
+    pub lane: LaneKind,
+    pub reason: String,
+    pub fallback_used: Option<LaneKind>,
+}
+
+/// Result of an FTS5 adapter run, including candidates and lane failures.
+#[derive(Debug, Clone, Default)]
+pub struct Fts5RetrievalReport {
+    pub candidate_sets: Vec<CandidateSet>,
+    pub degraded_lanes: Vec<Fts5DegradedLane>,
+}
+
 impl<'a> Fts5Adapter<'a> {
     /// Create a new FTS5 adapter wrapping the given store.
     pub fn new(store: &'a Fts5Store) -> Self {
@@ -35,14 +50,19 @@ impl<'a> Fts5Adapter<'a> {
     }
 
     /// Convert a single FusedResult into a CandidateEntry for a given lane.
-    fn fused_to_entry(result: &FusedResult, lane: LaneKind) -> CandidateEntry {
+    fn fused_to_entry(result: &FusedResult, lane: LaneKind, query: &str) -> CandidateEntry {
         let file_path = PathBuf::from(&result.file_path);
         let is_vendor = is_vendor_path(&result.file_path);
         let is_generated = is_generated_path(&result.file_path);
 
-        // is_exact_hit: true for SymbolExact lane when there's an exact name match
         let is_exact_hit = matches!(lane, LaneKind::FTS5Symbol | LaneKind::SymbolExact)
-            && !result.symbol_name.is_empty();
+            && result
+                .matched_lanes
+                .iter()
+                .any(|matched| matched == "exact_symbol_sql")
+            && result.symbol_name == query.trim()
+            && !is_vendor
+            && !is_generated;
 
         CandidateEntry {
             chunk_id: None,
@@ -58,71 +78,125 @@ impl<'a> Fts5Adapter<'a> {
             source_lane: lane,
         }
     }
+
+    /// Execute FTS5 once and expose the planner's best public lane per result.
+    pub fn retrieve_with_diagnostics(&self, query: &str, plan: &SearchPlan) -> Fts5RetrievalReport {
+        let Some(max_candidates) = active_fts5_candidate_limit(plan) else {
+            return Fts5RetrievalReport::default();
+        };
+
+        match self.execute_fts5(query, max_candidates) {
+            Ok(results) => {
+                let mut candidate_sets: Vec<CandidateSet> = Vec::new();
+                for (rank, result) in results.iter().enumerate() {
+                    let lane = public_lane_for_planner_result(result);
+                    if !plan.prefetch.iter().any(|p| p.lane == lane)
+                        && !is_symbol_sublane_allowed_by_plan(lane, plan)
+                    {
+                        continue;
+                    }
+                    let mut entry = Self::fused_to_entry(result, lane, query);
+                    entry.rank = rank;
+                    push_grouped_candidate(&mut candidate_sets, lane, entry);
+                }
+
+                Fts5RetrievalReport {
+                    candidate_sets,
+                    degraded_lanes: Vec::new(),
+                }
+            }
+            Err(error) => Fts5RetrievalReport {
+                candidate_sets: Vec::new(),
+                degraded_lanes: active_fts5_lanes(plan)
+                    .into_iter()
+                    .map(|lane| Fts5DegradedLane {
+                        lane,
+                        reason: error.clone(),
+                        fallback_used: fallback_lane_after_fts5_failure(plan),
+                    })
+                    .collect(),
+            },
+        }
+    }
 }
 
 impl<'a> RetrievalAdapter for Fts5Adapter<'a> {
     fn retrieve(&self, query: &str, plan: &SearchPlan) -> Vec<CandidateSet> {
-        let mut candidate_sets = Vec::new();
+        self.retrieve_with_diagnostics(query, plan).candidate_sets
+    }
+}
 
-        // Determine which FTS5 lanes are active based on the plan's prefetch
-        let fts5_lanes = [
-            (LaneKind::FTS5Symbol, "FTS5Symbol"),
-            (LaneKind::FTS5Body, "FTS5Body"),
-            (LaneKind::FTS5Path, "FTS5Path"),
-            (LaneKind::FTS5Docs, "FTS5Docs"),
-            (LaneKind::SymbolExact, "SymbolExact"),
-        ];
+fn active_fts5_lanes(plan: &SearchPlan) -> Vec<LaneKind> {
+    plan.prefetch
+        .iter()
+        .filter(|retriever| {
+            is_active_fts5_retriever(retriever.lane, retriever.weight, retriever.is_safety_lane)
+        })
+        .map(|retriever| retriever.lane)
+        .collect()
+}
 
-        // Check if FTS5 is available — return empty sets if not
-        // The store availability is implicit: if the store was created, FTS5 is available
+fn active_fts5_candidate_limit(plan: &SearchPlan) -> Option<usize> {
+    plan.prefetch
+        .iter()
+        .filter(|retriever| {
+            is_active_fts5_retriever(retriever.lane, retriever.weight, retriever.is_safety_lane)
+        })
+        .map(|retriever| retriever.max_candidates)
+        .max()
+}
 
-        for (lane, _lane_name) in &fts5_lanes {
-            // Check if this lane is active in the plan's prefetch
-            let active = plan.prefetch.iter().any(|p| p.lane == *lane);
-            if !active {
-                continue;
-            }
+fn is_active_fts5_retriever(lane: LaneKind, weight: f32, is_safety_lane: bool) -> bool {
+    matches!(
+        lane,
+        LaneKind::FTS5Symbol
+            | LaneKind::FTS5Body
+            | LaneKind::FTS5Path
+            | LaneKind::FTS5Docs
+            | LaneKind::SymbolExact
+    ) && (weight >= 0.1 || is_safety_lane)
+}
 
-            // Get the retriever plan for this lane
-            let retriever = plan.prefetch.iter().find(|p| p.lane == *lane);
-            let max_candidates = retriever.map(|r| r.max_candidates).unwrap_or(50);
-            let weight = retriever.map(|r| r.weight).unwrap_or(0.0);
+fn public_lane_for_planner_result(result: &FusedResult) -> LaneKind {
+    match result.best_lane.as_str() {
+        "path_fts" => LaneKind::FTS5Path,
+        "body_fts" | "short_token_fallback" => LaneKind::FTS5Body,
+        "exact_symbol_sql" | "prefix_symbol_sql" | "symbol_fts" => LaneKind::FTS5Symbol,
+        _ => LaneKind::FTS5Body,
+    }
+}
 
-            // Skip lanes with weight < 0.1 unless it's the safety lane
-            let is_safety = retriever.map(|r| r.is_safety_lane).unwrap_or(false);
-            if weight < 0.1 && !is_safety {
-                continue;
-            }
+fn is_symbol_sublane_allowed_by_plan(lane: LaneKind, plan: &SearchPlan) -> bool {
+    lane == LaneKind::FTS5Symbol
+        && plan
+            .prefetch
+            .iter()
+            .any(|retriever| retriever.lane == LaneKind::SymbolExact)
+}
 
-            // Execute FTS5 search
-            match self.execute_fts5(query, max_candidates) {
-                Ok(results) => {
-                    let entries: Vec<CandidateEntry> = results
-                        .iter()
-                        .enumerate()
-                        .map(|(rank, result)| {
-                            let mut entry = Self::fused_to_entry(result, *lane);
-                            entry.rank = rank;
-                            entry
-                        })
-                        .collect();
+fn push_grouped_candidate(
+    candidate_sets: &mut Vec<CandidateSet>,
+    lane: LaneKind,
+    entry: CandidateEntry,
+) {
+    if let Some(set) = candidate_sets
+        .iter_mut()
+        .find(|candidate_set| candidate_set.source_lane == lane)
+    {
+        set.candidates.push(entry);
+    } else {
+        candidate_sets.push(CandidateSet {
+            source_lane: lane,
+            candidates: vec![entry],
+        });
+    }
+}
 
-                    candidate_sets.push(CandidateSet {
-                        source_lane: *lane,
-                        candidates: entries,
-                    });
-                }
-                Err(_e) => {
-                    // Return empty CandidateSet on error (not an error response)
-                    candidate_sets.push(CandidateSet {
-                        source_lane: *lane,
-                        candidates: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        candidate_sets
+fn fallback_lane_after_fts5_failure(plan: &SearchPlan) -> Option<LaneKind> {
+    match plan.active_safety_lane {
+        LaneKind::FTS5Body => Some(LaneKind::TrigramBody),
+        LaneKind::TrigramBody | LaneKind::DegradedLiteralBodyScan => Some(plan.active_safety_lane),
+        _ => None,
     }
 }
 
@@ -211,8 +285,78 @@ mod tests {
             duplicate_index: 0,
         };
 
-        let entry = Fts5Adapter::fused_to_entry(&result, LaneKind::SymbolExact);
+        let entry = Fts5Adapter::fused_to_entry(&result, LaneKind::SymbolExact, "MyStruct");
         assert!(entry.is_exact_hit);
+    }
+
+    #[test]
+    fn symbol_like_non_equal_candidate_is_not_exact() {
+        let result = FusedResult {
+            symbol_id: 42,
+            file_id: 1,
+            file_path: "src/main.rs".to_string(),
+            symbol_name: "BuildSemanticBackendConfig".to_string(),
+            symbol_kind: "function".to_string(),
+            start_line: 10,
+            end_line: 20,
+            snippet: String::new(),
+            score: 0.9,
+            best_lane: "prefix_symbol_sql".to_string(),
+            matched_lanes: vec!["prefix_symbol_sql".to_string()],
+            name_path: "BuildSemanticBackendConfig".to_string(),
+            duplicate_index: 0,
+        };
+
+        let entry =
+            Fts5Adapter::fused_to_entry(&result, LaneKind::FTS5Symbol, "SemanticBackendConfig");
+        assert!(
+            !entry.is_exact_hit,
+            "prefix/symbol-like FTS5 candidates must not feed ExactHitFloor"
+        );
+    }
+
+    #[test]
+    fn planner_results_are_not_duplicated_for_each_active_public_lane() {
+        let store = Fts5Store::open_in_memory().expect("open in-memory FTS5 store");
+        let file_id = store
+            .upsert_file("src/lib.rs", "hash", 0, 128, 1)
+            .expect("upsert file");
+        store
+            .upsert_symbol(
+                file_id,
+                "SemanticBackendConfig",
+                "struct",
+                1,
+                3,
+                "pub struct SemanticBackendConfig { model: String }",
+                "SemanticBackendConfig",
+                "body-hash",
+            )
+            .expect("upsert symbol");
+        let plan = plan_with_fts5_lanes();
+        assert!(plan.prefetch.iter().any(|p| p.lane == LaneKind::FTS5Symbol));
+        assert!(plan.prefetch.iter().any(|p| p.lane == LaneKind::FTS5Body));
+
+        let adapter = Fts5Adapter::new(&store);
+        let sets = adapter.retrieve("SemanticBackendConfig", &plan);
+        let non_empty = sets
+            .iter()
+            .filter(|set| !set.candidates.is_empty())
+            .collect::<Vec<_>>();
+        let total_candidates = non_empty
+            .iter()
+            .map(|set| set.candidates.len())
+            .sum::<usize>();
+
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "one fused planner result must not be duplicated across public FTS5 lanes: {sets:?}"
+        );
+        assert_eq!(
+            total_candidates, 1,
+            "planner fused result should appear once before RI fusion"
+        );
     }
 
     // AC-6: is_vendor heuristic

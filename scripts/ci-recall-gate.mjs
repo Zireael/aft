@@ -19,11 +19,53 @@ if (!baselineFile || !currentFile) {
 const baseline = JSON.parse(readFileSync(baselineFile, "utf8"));
 const current = JSON.parse(readFileSync(currentFile, "utf8"));
 
-const baselineMetrics = baseline.intent_metrics || {};
-const currentMetrics = current.intent_metrics || {};
-
 const regressions = [];
 const passed = [];
+const schemaFailures = [];
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+if (current.status === "incomplete") {
+  schemaFailures.push({
+    reason: "current benchmark report is incomplete",
+    detail: Array.isArray(current.incomplete_reasons)
+      ? current.incomplete_reasons.join("; ")
+      : "no incomplete_reasons provided",
+  });
+}
+
+if (!isObject(baseline.intent_metrics) || Object.keys(baseline.intent_metrics).length === 0) {
+  schemaFailures.push({
+    reason: "baseline is missing non-empty intent_metrics",
+    detail: baselineFile,
+  });
+}
+
+if (!isObject(current.intent_metrics) || Object.keys(current.intent_metrics).length === 0) {
+  schemaFailures.push({
+    reason: "current run is missing non-empty intent_metrics",
+    detail: currentFile,
+  });
+}
+
+if (!isObject(current.context_quality)) {
+  schemaFailures.push({
+    reason: "current run is missing context_quality",
+    detail: currentFile,
+  });
+}
+
+if (current.rerank_context !== "aft_output") {
+  schemaFailures.push({
+    reason: "current run must use rerank_context=aft_output",
+    detail: `actual: ${current.rerank_context ?? "(missing)"}`,
+  });
+}
+
+const baselineMetrics = isObject(baseline.intent_metrics) ? baseline.intent_metrics : {};
+const currentMetrics = isObject(current.intent_metrics) ? current.intent_metrics : {};
 
 for (const [intent, bMetrics] of Object.entries(baselineMetrics)) {
   const cMetrics = currentMetrics[intent];
@@ -68,6 +110,15 @@ for (const [intent, bMetrics] of Object.entries(baselineMetrics)) {
   }
 }
 
+if (schemaFailures.length > 0) {
+  console.log("SCHEMA FAILURES:");
+  for (const failure of schemaFailures) {
+    console.log(`  ${failure.reason}`);
+    if (failure.detail) console.log(`    ${failure.detail}`);
+  }
+  console.log("");
+}
+
 if (passed.length > 0) {
   console.log("PASSED:");
   for (const p of passed) {
@@ -78,7 +129,7 @@ if (passed.length > 0) {
   console.log("");
 }
 
-if (regressions.length > 0) {
+if (schemaFailures.length > 0 || regressions.length > 0) {
   console.log("REGRESSIONS:");
   for (const r of regressions) {
     console.log(`  ${r.intent}: ${r.reason}`);
@@ -89,7 +140,7 @@ if (regressions.length > 0) {
     }
   }
   console.log("");
-  console.log("FAIL: regression detected");
+  console.log(schemaFailures.length > 0 ? "FAIL: benchmark report invalid" : "FAIL: regression detected");
   process.exit(1);
 } else {
   console.log("OK: no regressions detected");

@@ -119,6 +119,15 @@ interface AggregateMode {
   empty: number;
 }
 
+interface IntentMetric {
+  recall_at_10: number;
+  mrr: number;
+  ndcg_at_10: number;
+  count: number;
+  tuning_recall_at_10: number;
+  holdout_recall_at_10: number;
+}
+
 interface RerankMetrics {
   pre_rerank_recall: number;
   post_rerank_recall: number;
@@ -158,6 +167,38 @@ interface ContextQuality {
 function normalizePath(p: string): string {
   if (!p) return "";
   return p.replace(/\\/g, "/").replace(/^\/\?\//, "").replace(/^\.\//, "").toLowerCase();
+}
+
+function normalizeRepoArg(repo: string): string {
+  const trimmed = repo.trim().replace(/\/+$/, "");
+  if (!trimmed) return trimmed;
+  const parts = trimmed.split("/");
+  return parts[parts.length - 1] || trimmed;
+}
+
+function canonicalIntent(category: string | undefined): string {
+  switch ((category || "").toLowerCase()) {
+    case "architecture":
+    case "semantic":
+    case "natural_language":
+    case "naturallanguage":
+      return "NaturalLanguage";
+    case "symbol":
+    case "identifier":
+    case "exact_symbol":
+    case "exactsymbol":
+      return "ExactSymbol";
+    case "path":
+    case "path_lookup":
+    case "pathlookup":
+      return "PathLookup";
+    case "diagnostic":
+    case "diagnostic_error":
+    case "diagnosticerror":
+      return "DiagnosticError";
+    default:
+      return category || "unknown";
+  }
 }
 
 function pathMatches(a: string, b: string): boolean {
@@ -224,6 +265,38 @@ function aggregateMetrics(rows: ModeResult[], totalQueries: number): AggregateMo
     count: n,
     empty: totalQueries - n,
   };
+}
+
+function aggregateIntentMetrics(
+  rows: ModeResult[],
+  queryHoldOut: Map<string, boolean>,
+): Record<string, IntentMetric> {
+  const byIntent = new Map<string, ModeResult[]>();
+  for (const row of rows) {
+    const intent = canonicalIntent(row.category);
+    if (!byIntent.has(intent)) byIntent.set(intent, []);
+    byIntent.get(intent)!.push(row);
+  }
+
+  const out: Record<string, IntentMetric> = {};
+  for (const [intent, intentRows] of byIntent) {
+    const n = intentRows.length;
+    const tuningRows = intentRows.filter((row) => queryHoldOut.get(row.query) !== true);
+    const holdoutRows = intentRows.filter((row) => queryHoldOut.get(row.query) === true);
+    out[intent] = {
+      recall_at_10: n > 0 ? intentRows.reduce((s, r) => s + r.recall_at_k, 0) / n : 0,
+      mrr: n > 0 ? intentRows.reduce((s, r) => s + r.mrr, 0) / n : 0,
+      ndcg_at_10: n > 0 ? intentRows.reduce((s, r) => s + r.ndcg_at_k, 0) / n : 0,
+      count: n,
+      tuning_recall_at_10: tuningRows.length > 0
+        ? tuningRows.reduce((s, r) => s + r.recall_at_k, 0) / tuningRows.length
+        : 0,
+      holdout_recall_at_10: holdoutRows.length > 0
+        ? holdoutRows.reduce((s, r) => s + r.recall_at_k, 0) / holdoutRows.length
+        : 0,
+    };
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -686,10 +759,14 @@ async function main() {
   let includeLexical = true;
   let interactive = false;
   let rerankContext = "aft_output"; // default: aft_output (WARNING 3)
+  let profileName = "quick";
+  const repoFilters = new Set<string>();
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case "--cache-dir": cacheDir = args[++i]; break;
+      case "--profile": profileName = args[++i]; break;
+      case "--repo": repoFilters.add(normalizeRepoArg(args[++i])); break;
       case "--k": k = parseInt(args[++i], 10); break;
       case "--output": outputFile = args[++i]; break;
       case "--binary": binaryPath = args[++i]; break;
@@ -717,6 +794,8 @@ async function main() {
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
+        console.log("  --profile <name>          smoke|quick|full label for report/preflight (default: quick)");
+        console.log("  --repo <name>             Limit to repo name or owner/name, e.g. aft or cortexkit/aft");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
         console.log("  --oversample <n>           Reranker oversampling multiplier (default: 10)");
         console.log("  --rerank-context <mode>    Reranker context mode: aft_output (default), benchmark_enriched, path_only");
@@ -724,6 +803,10 @@ async function main() {
         console.log("  --query-prompt <txt>       Query prompt template for embedding model");
         process.exit(0);
     }
+  }
+
+  if (profileName === "smoke" && !args.includes("--k")) {
+    k = 5;
   }
 
   // Normalize rerank URL: append /v1/rerank if not present
@@ -758,6 +841,7 @@ async function main() {
   const allAnnotations: Array<any> = [];
   const queryHoldOut = new Map<string, boolean>(); // query text → hold_out
   for (const repo of fixture.repos) {
+    if (repoFilters.size > 0 && !repoFilters.has(repo.name)) continue;
     const annPath = resolve(`benchmarks/semble/annotations/${repo.name}.json`);
     if (!existsSync(annPath)) continue;
     const anns = JSON.parse(readFileSync(annPath, "utf-8"));
@@ -787,8 +871,8 @@ async function main() {
   const canonDir = resolve("benchmarks/semble/canon");
   if (existsSync(canonDir)) {
     const preflightConfig = {
-      profile: { name: "quick", allow_seed_canon: includeLexical } as any,
-      profileName: "quick",
+      profile: { name: profileName, allow_seed_canon: includeLexical } as any,
+      profileName,
       suites: ["semantic_nl", "identifier_exact", "identifier_prefix", "path_lookup", "structural"] as any[],
       modes: [] as any[],
       binaryPath: bin,
@@ -823,7 +907,9 @@ async function main() {
   // Collect all repos
   const allRepos = new Set<string>();
   for (const ann of allAnnotations) allRepos.add(ann.repo_name);
-  for (const lr of LEXICAL_REPOS) allRepos.add(lr.name);
+  for (const lr of LEXICAL_REPOS) {
+    if (repoFilters.size === 0 || repoFilters.has(lr.name)) allRepos.add(lr.name);
+  }
 
   // Discover models from API endpoints if available
   let discovery: ModelDiscoveryResult | undefined;
@@ -1395,13 +1481,36 @@ async function main() {
   }
 
   // Write JSON report
+  const incompleteReasons: string[] = [];
+  if (skippedRepos.length > 0) {
+    incompleteReasons.push(`unavailable repos: ${skippedRepos.join(", ")}`);
+  }
+  const emptyParts = Object.entries(emptyCounts)
+    .filter(([, v]) => v > 0)
+    .map(([k, v]) => `${k}=${v}`);
+  if (emptyParts.length > 0) {
+    incompleteReasons.push(`empty result phases: ${emptyParts.join(" ")}`);
+  }
+  if (allResults.length === 0) {
+    incompleteReasons.push("no benchmark results produced");
+  }
+  const intentMetrics = aggregateIntentMetrics(allResults, queryHoldOut);
+  if (Object.keys(intentMetrics).length === 0) {
+    incompleteReasons.push("intent_metrics is empty");
+  }
+
   const report = {
     timestamp: new Date().toISOString(),
+    status: incompleteReasons.length > 0 ? "incomplete" : "complete",
+    incomplete_reasons: incompleteReasons,
+    profile: profileName,
+    repo_filter: [...repoFilters],
     k,
     binary: binaryPath,
     backends,
     rerank: doRerank ? { model: rerankModel, url: rerankUrl } : null,
     rerank_context: rerankContext,
+    intent_metrics: intentMetrics,
     results: allResults,
     aggregate: Object.fromEntries(semanticAgg.map((a) => [a.mode, a])),
     lexical_aggregate: Object.fromEntries(lexicalAgg.map((a) => [a.mode, a])),
@@ -1417,8 +1526,8 @@ async function main() {
   grepSession?.close();
 
   // Empty summary
-  const emptyParts = Object.entries(emptyCounts).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`);
   if (emptyParts.length > 0) console.log(`\n  ⚠ Empty results: ${emptyParts.join(" ")}`);
+  if (incompleteReasons.length > 0) console.log(`\n  Incomplete benchmark: ${incompleteReasons.join("; ")}`);
   console.log(`\n  Report saved to ${outputFile}`);
 }
 

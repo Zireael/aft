@@ -360,8 +360,10 @@ mod tests {
         let conn = in_memory_conn();
         init_telemetry_schema(&conn).unwrap();
 
-        let mut config = TelemetryConfig::default();
-        config.telemetry_store_query = "raw".to_string();
+        let config = TelemetryConfig {
+            telemetry_store_query: "raw".to_string(),
+            ..Default::default()
+        };
 
         let run_id = write_retrieval_run(
             &conn,
@@ -391,7 +393,6 @@ mod tests {
         let conn = in_memory_conn();
         init_telemetry_schema(&conn).unwrap();
 
-        let config = TelemetryConfig::default();
         // Insert with a very old timestamp (year 2000)
         conn.execute(
             "INSERT INTO retrieval_runs (

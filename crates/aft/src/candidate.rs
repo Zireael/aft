@@ -228,12 +228,18 @@ pub fn fuse_candidate_sets(sets: &[CandidateSet]) -> Vec<FusedCandidate> {
                 score_in_lane: entry.score,
                 rrf_contribution: 0.0, // will be computed during RRF stage
             };
+            let is_graph_expansion = entry.source_lane == LaneKind::GraphExpansion;
 
             merged
                 .entry(key)
                 .and_modify(|fused| {
                     // Merge: add lane contribution
                     fused.provenance.lanes.push(contribution.clone());
+                    if is_graph_expansion {
+                        fused.provenance.is_graph_expansion = true;
+                        fused.provenance.graph_expansion_reason =
+                            Some("callgraph_relationship".to_string());
+                    }
                     // OR flags
                     fused.is_exact_hit |= entry.is_exact_hit;
                     fused.is_vendor |= entry.is_vendor;
@@ -259,8 +265,9 @@ pub fn fuse_candidate_sets(sets: &[CandidateSet]) -> Vec<FusedCandidate> {
                     content_hash: entry.content_hash,
                     provenance: CandidateProvenance {
                         lanes: vec![contribution],
-                        is_graph_expansion: false,
-                        graph_expansion_reason: None,
+                        is_graph_expansion,
+                        graph_expansion_reason: is_graph_expansion
+                            .then(|| "callgraph_relationship".to_string()),
                     },
                     rrf_score: entry.score,
                     exact_hit_floor_applied: false,
@@ -414,6 +421,28 @@ mod tests {
         };
         let fused = fuse_candidate_sets(&[set]);
         assert!(fused[0].is_generated, "is_generated must propagate");
+    }
+
+    #[test]
+    fn graph_expansion_lane_sets_provenance_flag_and_reason() {
+        let set = CandidateSet {
+            source_lane: LaneKind::GraphExpansion,
+            candidates: vec![entry(
+                None,
+                "src/related.rs",
+                LaneKind::GraphExpansion,
+                0.4,
+                0,
+            )],
+        };
+
+        let fused = fuse_candidate_sets(&[set]);
+        assert_eq!(fused.len(), 1);
+        assert!(fused[0].provenance.is_graph_expansion);
+        assert_eq!(
+            fused[0].provenance.graph_expansion_reason.as_deref(),
+            Some("callgraph_relationship")
+        );
     }
 
     // Highest score wins on merge

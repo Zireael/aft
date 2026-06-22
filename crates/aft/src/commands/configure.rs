@@ -584,6 +584,122 @@ fn parse_fts5_config(
     Ok(fts5)
 }
 
+fn parse_intelligence_config(
+    value: &serde_json::Value,
+    current: &crate::intelligence_config::IntelligenceConfig,
+) -> Result<crate::intelligence_config::IntelligenceConfig, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: intelligence must be an object".to_string());
+    };
+
+    let mut intelligence = current.clone();
+
+    if let Some(raw) = obj.get("retrieval_intelligence_v2") {
+        let Some(value) = raw.as_bool() else {
+            return Err(
+                "configure: intelligence.retrieval_intelligence_v2 must be a boolean".to_string(),
+            );
+        };
+        intelligence.retrieval_intelligence_v2 = value;
+    }
+
+    if let Some(raw) = obj.get("telemetry") {
+        intelligence.telemetry = parse_telemetry_config(raw, &intelligence.telemetry)?;
+    }
+
+    Ok(intelligence)
+}
+
+fn parse_telemetry_config(
+    value: &serde_json::Value,
+    current: &crate::intelligence_config::TelemetryConfig,
+) -> Result<crate::intelligence_config::TelemetryConfig, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: intelligence.telemetry must be an object".to_string());
+    };
+
+    let mut telemetry = current.clone();
+
+    if let Some(raw) = obj.get("telemetry_persist") {
+        let Some(value) = raw.as_bool() else {
+            return Err(
+                "configure: intelligence.telemetry.telemetry_persist must be a boolean".to_string(),
+            );
+        };
+        telemetry.telemetry_persist = value;
+    }
+    if let Some(raw) = obj.get("retention_days") {
+        let Some(value) = raw.as_u64() else {
+            return Err(
+                "configure: intelligence.telemetry.retention_days must be an unsigned integer"
+                    .to_string(),
+            );
+        };
+        telemetry.retention_days = value as u32;
+    }
+    if let Some(raw) = obj.get("max_rows_per_run") {
+        let Some(value) = raw.as_u64() else {
+            return Err(
+                "configure: intelligence.telemetry.max_rows_per_run must be an unsigned integer"
+                    .to_string(),
+            );
+        };
+        telemetry.max_rows_per_run = value as usize;
+    }
+    if let Some(raw) = obj.get("sampling_rate") {
+        let Some(value) = raw.as_f64() else {
+            return Err(
+                "configure: intelligence.telemetry.sampling_rate must be a number".to_string(),
+            );
+        };
+        if !(0.0..=1.0).contains(&value) {
+            return Err(
+                "configure: intelligence.telemetry.sampling_rate must be between 0.0 and 1.0"
+                    .to_string(),
+            );
+        }
+        telemetry.sampling_rate = value;
+    }
+    if let Some(raw) = obj.get("telemetry_store_query") {
+        let value = raw
+            .as_str()
+            .ok_or_else(|| {
+                "configure: intelligence.telemetry.telemetry_store_query must be a string"
+                    .to_string()
+            })?
+            .trim();
+        match value {
+            "hash" | "raw" => telemetry.telemetry_store_query = value.to_string(),
+            _ => {
+                return Err(
+                    "configure: intelligence.telemetry.telemetry_store_query must be 'hash' or 'raw'"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(raw) = obj.get("telemetry_query_hash_salt") {
+        telemetry.telemetry_query_hash_salt = raw
+            .as_str()
+            .ok_or_else(|| {
+                "configure: intelligence.telemetry.telemetry_query_hash_salt must be a string"
+                    .to_string()
+            })?
+            .to_string();
+    }
+    if let Some(raw) = obj.get("no_snippet_persist") {
+        let Some(value) = raw.as_bool() else {
+            return Err(
+                "configure: intelligence.telemetry.no_snippet_persist must be a boolean"
+                    .to_string(),
+            );
+        };
+        telemetry.no_snippet_persist = value;
+    }
+
+    Ok(telemetry)
+}
+
 fn parse_semantic_config(
     value: &serde_json::Value,
     current: &SemanticBackendConfig,
@@ -2165,6 +2281,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
+    if let Some(v) = params.get("intelligence") {
+        next_config.intelligence = match parse_intelligence_config(v, &next_config.intelligence) {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
     if let Some(raw) = params.get("max_callgraph_files") {
         // Reject invalid values explicitly so user typos surface instead of
         // being silently swallowed (Oracle v0.15.1 review blocker).
@@ -2363,6 +2485,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let db_path = storage_root.join("aft.db");
     match crate::db::open(&db_path) {
         Ok(conn) => {
+            if let Err(err) = crate::telemetry::init_telemetry_schema(&conn) {
+                slog_warn!(
+                    "failed to initialize retrieval telemetry schema at {}: {}",
+                    db_path.display(),
+                    err
+                );
+            }
             let shared = Arc::new(Mutex::new(conn));
             ctx.set_db(shared.clone());
             ctx.backup().borrow().set_db_pool(shared.clone());

@@ -1,7 +1,10 @@
 {
   "schema_version": 1,
+  "status": "complete",
   "created_at": "2026-06-20",
   "description": "Baseline recall thresholds for CI regression gate",
+  "rerank_context": "aft_output",
+  "context_quality": {},
   "intent_metrics": {
     "NaturalLanguage": {
       "recall_at_1": 0.30,

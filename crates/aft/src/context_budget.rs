@@ -77,10 +77,22 @@ pub struct ContextBudget {
 /// Result of applying context budget to a candidate pool.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ContextBudgetResult {
+    /// Number of candidates considered for context enrichment before rerank.
+    pub rerank_pool_size: usize,
+    /// Number of candidates with real snippet/body context.
+    pub enriched_candidate_count: usize,
     /// Whether the budget was exhausted before all candidates could be enriched.
     pub context_exhausted: bool,
     /// Number of candidates that fell back to PathOnly.
     pub unenriched_candidate_count: usize,
+    /// Number of candidates represented as PathOnly due to budget or read failure.
+    pub path_only_candidate_count: usize,
+    /// Number of candidates skipped because content enrichment is unsupported.
+    pub skipped_candidate_count: usize,
+    /// Number of candidates eligible for content reranker input.
+    pub reranker_input_candidate_count: usize,
+    /// Number of PathOnly candidates sent to the content reranker. Must stay zero.
+    pub path_only_reranker_input_count: usize,
     /// Reason the reranker was skipped (if applicable).
     pub reranker_skipped_reason: Option<String>,
 }
@@ -159,8 +171,18 @@ pub fn simulate_budget(budget: &ContextBudget, pool_size: usize) -> ContextBudge
     };
 
     ContextBudgetResult {
+        rerank_pool_size: pool_size,
+        enriched_candidate_count: enriched_count,
         context_exhausted,
         unenriched_candidate_count: unenriched_count,
+        path_only_candidate_count: unenriched_count,
+        skipped_candidate_count: 0,
+        reranker_input_candidate_count: if reranker_skipped_reason.is_some() {
+            0
+        } else {
+            enriched_count
+        },
+        path_only_reranker_input_count: 0,
         reranker_skipped_reason,
     }
 }
@@ -334,8 +356,14 @@ mod tests {
     #[test]
     fn context_budget_result_serde_roundtrip() {
         let result = ContextBudgetResult {
+            rerank_pool_size: 5,
+            enriched_candidate_count: 2,
             context_exhausted: true,
             unenriched_candidate_count: 3,
+            path_only_candidate_count: 3,
+            skipped_candidate_count: 0,
+            reranker_input_candidate_count: 0,
+            path_only_reranker_input_count: 0,
             reranker_skipped_reason: Some("insufficient_enriched_ratio".to_string()),
         };
         let json = serde_json::to_string(&result).unwrap();

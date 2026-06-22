@@ -62,12 +62,13 @@ WITH_DEEP=0
 KEEP_GOING=0
 VERBOSE=0
 NO_PRUNE=0
-PRUNE_AFTER="1h"
+PRUNE_AFTER="36h"
 FUZZ_TARGET=""
 FUZZ_ARGS=()
 REBUILD_IMAGES=0
 INCLUDE_IMAGES_ON_CLEAN=0
 CARGO_FEATURES=""
+NEXTEST_FILTERS=()
 
 RUST_BASE_IMAGE="${AFT_RUST_BASE_IMAGE:-rust:1-bookworm}"
 RUST_CHECK_IMAGE="${AFT_RUST_CHECK_IMAGE:-aft-check-rust:bookworm}"
@@ -167,6 +168,8 @@ Options:
   --fuzz-target NAME   Required for task fuzz unless AFT_FUZZ_TARGET is set.
   --features FEATURES  Cargo features to enable (e.g. semantic-model2vec).
                         Applied to check, clippy, nextest, doctest, coverage.
+  --test-filter FILTER Limit the nextest task to tests matching FILTER.
+                        May be repeated. Applied only to nextest invocations.
   --rebuild-images     Rebuild local Rust helper images before running.
   --include-images     With clean-caches, also remove helper images.
   -h, --help           Show this help.
@@ -600,6 +603,15 @@ cargo_features_flag() {
   fi
 }
 
+nextest_filter_args() {
+  local filter
+  local quoted=()
+  for filter in "${NEXTEST_FILTERS[@]}"; do
+    quoted+=("$(printf '%q' "$filter")")
+  done
+  printf '%s' "${quoted[*]}"
+}
+
 bun_install_cmd() {
   cat <<'EOF'
 if [ -f bun.lock ] || [ -f bun.lockb ]; then
@@ -621,7 +633,7 @@ task_nextest() {
   if (( KEEP_GOING )); then
     fail_flag="--no-fail-fast"
   fi
-  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked $(cargo_features_flag) $fail_flag"
+  run_rust "nextest" "$install_nextest; cargo nextest run --workspace --locked $(cargo_features_flag) $fail_flag $(nextest_filter_args)"
 }
 task_doctest() { run_rust "doctest" "cargo test --doc --workspace --locked $(cargo_features_flag)"; }
 task_coverage() {
@@ -792,6 +804,9 @@ parse_args() {
       --features)
         shift; [[ $# -gt 0 ]] || fatal "--features requires a value"; CARGO_FEATURES="$1" ;;
       --features=*) CARGO_FEATURES="${1#*=}" ;;
+      --test-filter)
+        shift; [[ $# -gt 0 ]] || fatal "--test-filter requires a value"; NEXTEST_FILTERS+=("$1") ;;
+      --test-filter=*) NEXTEST_FILTERS+=("${1#*=}") ;;
       --rebuild-images) REBUILD_IMAGES=1 ;;
       --include-images) INCLUDE_IMAGES_ON_CLEAN=1 ;;
       --)

@@ -3,14 +3,13 @@
 //! Enriches top search results with callgraph context (callers, callees,
 //! mutation risk, public export status, graph confidence).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::callgraph_store::CallGraphStore;
 use crate::candidate::FusedCandidate;
 use crate::intelligence_config::IntelligenceConfig;
 use crate::ril_indexer::GraphHealth;
-use crate::search_plan::SearchPlan;
 
 /// Graph context for a single enriched result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,19 +68,11 @@ pub fn enrich_with_graph_context(
             break;
         }
 
-        // graph_context = null when GraphHealth Disabled or Cold
+        // graph_context = null when GraphHealth Disabled or Cold. Public
+        // serialization maps None to JSON null; do not manufacture an empty
+        // context object that looks like healthy graph evidence.
         if !graph_health.usable() {
-            candidate.context = Some(
-                serde_json::json!({
-                    "callers": [],
-                    "callees": [],
-                    "imported_by": [],
-                    "mutation_risk": "Unknown",
-                    "is_public_export": false,
-                    "graph_confidence": format!("{:?}", graph_health),
-                })
-                .to_string(),
-            );
+            candidate.context = None;
             continue;
         }
 
@@ -109,8 +100,8 @@ fn build_graph_context(
     graph_health: &GraphHealth,
 ) -> GraphContext {
     let mut callers = Vec::new();
-    let mut callees = Vec::new();
-    let mut imported_by = Vec::new();
+    let callees = Vec::new();
+    let imported_by = Vec::new();
 
     // Get callers — requires specific symbol; for file-level, use empty symbol
     // which may return all callers for the file (implementation-dependent)
@@ -164,7 +155,7 @@ fn compute_risk_label(file_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate::{CandidateEntry, CandidateProvenance, LaneContribution};
+    use crate::candidate::{CandidateProvenance, LaneContribution};
     use crate::search_plan::LaneKind;
     use std::path::PathBuf;
 
@@ -204,12 +195,7 @@ mod tests {
 
         enrich_with_graph_context(&mut candidates, None, &health, &config);
 
-        // Should have context with empty data, not error or empty {}
-        assert!(candidates[0].context.is_some());
-        let ctx: serde_json::Value =
-            serde_json::from_str(&candidates[0].context.as_ref().unwrap()).unwrap();
-        assert_eq!(ctx["callers"], serde_json::json!([]));
-        assert_eq!(ctx["graph_confidence"], "Disabled");
+        assert_eq!(candidates[0].context, None);
     }
 
     // AC-3: graph_confidence="Stale" when GraphHealth=Stale
@@ -235,17 +221,16 @@ mod tests {
 
         enrich_with_graph_context(&mut candidates, None, &health, &config);
 
-        let ctx: serde_json::Value =
-            serde_json::from_str(&candidates[0].context.as_ref().unwrap()).unwrap();
-        assert!(ctx.get("test_coverage_hint").is_none());
-        assert!(ctx.get("config_owner").is_none());
+        assert_eq!(candidates[0].context, None);
     }
 
     // Top-N limit
     #[test]
     fn respects_top_n_limit() {
-        let mut config = IntelligenceConfig::default();
-        config.graph_enrichment_top_n = 3;
+        let config = IntelligenceConfig {
+            graph_enrichment_top_n: 3,
+            ..Default::default()
+        };
         let mut candidates = vec![
             make_candidate("a.rs"),
             make_candidate("b.rs"),
@@ -256,10 +241,10 @@ mod tests {
 
         enrich_with_graph_context(&mut candidates, None, &health, &config);
 
-        // Only first 3 should have context (capped at 3)
-        assert!(candidates[0].context.is_some());
-        assert!(candidates[1].context.is_some());
-        assert!(candidates[2].context.is_some());
+        // Disabled graph never invents context, even inside the top-N cap.
+        assert!(candidates[0].context.is_none());
+        assert!(candidates[1].context.is_none());
+        assert!(candidates[2].context.is_none());
         assert!(candidates[3].context.is_none());
     }
 }

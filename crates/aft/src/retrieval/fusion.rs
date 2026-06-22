@@ -4,19 +4,8 @@
 //! deduplicates by canonical identity, and applies ExactHitFloor promotion
 //! for exact symbol/path hits from non-vendor, non-generated files.
 
-use std::collections::HashMap;
-
-use crate::candidate::{
-    fuse_candidate_sets, CandidateEntry, CandidateProvenance, CandidateSet, FusedCandidate,
-    LaneContribution,
-};
+use crate::candidate::{fuse_candidate_sets, CandidateSet, FusedCandidate};
 use crate::search_plan::{LaneKind, SearchPlan};
-
-/// Default RRF constant k.
-const DEFAULT_RRF_K: f32 = 60.0;
-
-/// Default ExactHitFloor cap — maximum exact hits promoted to Group A.
-const DEFAULT_EXACT_HIT_FLOOR_N: usize = 5;
 
 /// RRF fusion engine.
 pub struct RRFFusionEngine;
@@ -148,7 +137,7 @@ mod tests {
     use super::*;
     use crate::candidate::CandidateEntry;
     use crate::query_shape::{QueryKind, QueryShape, ShapeWeights};
-    use crate::search_plan::{FusionPlan, SafetyLaneContext, SearchPlanBuilder};
+    use crate::search_plan::{SafetyLaneContext, SearchPlanBuilder};
     use std::path::PathBuf;
 
     fn simple_plan() -> SearchPlan {

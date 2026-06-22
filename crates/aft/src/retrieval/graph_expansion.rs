@@ -4,7 +4,7 @@
 //! callers and imported_by relationships from the callgraph store.
 //! Expansion candidates are added as additional CandidateSets for re-fusion.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::callgraph_store::CallGraphStore;
 use crate::candidate::{CandidateEntry, CandidateSet, FusedCandidate};
@@ -134,8 +134,10 @@ mod tests {
     // AC-4: Expansion count <= graph_expansion_max
     #[test]
     fn expansion_count_capped() {
-        let mut config = IntelligenceConfig::default();
-        config.graph_expansion_max = 3;
+        let config = IntelligenceConfig {
+            graph_expansion_max: 3,
+            ..Default::default()
+        };
         let results = (0..10)
             .map(|i| make_candidate(&format!("src/file_{i}.rs")))
             .collect::<Vec<_>>();

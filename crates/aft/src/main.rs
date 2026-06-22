@@ -56,6 +56,17 @@ fn main() {
         })
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("telemetry") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::telemetry::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
     if std::env::args().nth(1).as_deref() == Some("warmup") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         match cli::warmup::run(args) {
