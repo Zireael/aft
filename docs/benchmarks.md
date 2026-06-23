@@ -70,12 +70,14 @@ bun run benchmarks/semble/aft-feature-showcase.ts \
 ## Trigram Grep Baseline
 
 With `search_index: true`, AFT builds a trigram index in the background and serves
-grep queries from memory. Here's how it compares to ripgrep on real codebases.
+grep queries from memory. The legacy mode is now called `AFT-GREP`; the same live
+benchmark harness also reports `AFT-FTS5` so lexical and FTS-backed lookup can be
+compared side by side.
 
 ## opencode-aft (253 files)
 
-| Query | ripgrep | AFT | Speedup |
-|-------|---------|-----|---------|
+| Query | ripgrep | AFT-GREP | Speedup |
+|-------|---------|----------|---------|
 | `validate_path` | 31.4ms | 1.48ms | **21x** |
 | `BinaryBridge` | 31.0ms | 1.3ms | **24x** |
 | `fn handle_grep` | 31.3ms | 0.2ms | **136x** |
@@ -83,8 +85,8 @@ grep queries from memory. Here's how it compares to ripgrep on real codebases.
 
 ## reth (1,878 Rust files)
 
-| Query | ripgrep | AFT | Speedup |
-|-------|---------|-----|---------|
+| Query | ripgrep | AFT-GREP | Speedup |
+|-------|---------|----------|---------|
 | `impl Display for` | 98.9ms | 1.10ms | **90x** |
 | `BlockNumber` | 61.6ms | 2.19ms | **28x** |
 | `EthApiError` | 32.7ms | 1.31ms | **25x** |
@@ -92,12 +94,23 @@ grep queries from memory. Here's how it compares to ripgrep on real codebases.
 
 ## Chromium/base (3,953 C++ files)
 
-| Query | ripgrep | AFT | Speedup |
-|-------|---------|-----|---------|
+| Query | ripgrep | AFT-GREP | Speedup |
+|-------|---------|----------|---------|
 | `WebContents` | 69.5ms | 0.29ms | **236x** |
 | `StringPiece` | 51.8ms | 0.78ms | **66x** |
 | `NOTREACHED` | 51.6ms | 2.16ms | **24x** |
 | `base::Value` | 54.4ms | 1.13ms | **48x** |
+
+### Live lexical comparison from `pilot.ts` (serde smoke)
+
+The saved `ri-v31-smoke-serde.json` report shows the benchmark harness reporting
+both `AFT-GREP` and `AFT-FTS5` rows directly:
+
+| Mode | Recall | MRR | nDCG | p50(ms) | p95(ms) | Queries |
+|------|--------|-----|------|---------|---------|---------|
+| `lexical (rg)` | 0.0% | 0.000 | 0.000 | 149.3 | 416.6 | 10/10 |
+| `AFT-GREP` | 0.0% | 0.000 | 0.000 | 61.6 | 62.7 | 4/10 |
+| `AFT-FTS5` | 71.4% | 0.600 | 0.627 | 62.7 | 66.4 | 7/10 |
 
 Rare queries see the biggest gains — the trigram index narrows candidates to a few files instantly.
 High-match queries still benefit from `memchr` SIMD scanning and early termination.

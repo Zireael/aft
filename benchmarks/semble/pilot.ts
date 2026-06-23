@@ -491,6 +491,39 @@ export interface FeatureBranchComparisonRow {
   p50DeltaMs: number;
 }
 
+export interface BenchmarkGlossaryRow {
+  term: string;
+  meaning: string;
+}
+
+export const benchmarkGlossaryRows: BenchmarkGlossaryRow[] = [
+  { term: "Mode", meaning: "A concrete benchmark variant such as `fts5`, `aft-grep`, or `hybrid-fe-budget`." },
+  { term: "Recall", meaning: "Fraction of relevant items found in the top-k results." },
+  { term: "MRR", meaning: "Mean reciprocal rank; rewards the first relevant hit appearing earlier." },
+  { term: "nDCG", meaning: "Normalized discounted cumulative gain; values earlier relevant hits more." },
+  { term: "Tok/q", meaning: "Average tokens returned per query." },
+  { term: "Snip/q", meaning: "Average snippets returned per query." },
+  { term: "p50(ms)", meaning: "Median latency across queries." },
+  { term: "p95(ms)", meaning: "95th percentile latency across queries." },
+  { term: "Queries", meaning: "How many benchmark queries produced results out of the total attempted." },
+  { term: "Rerank Delta", meaning: "Subtable that compares the base semantic ranking against the reranked output." },
+  { term: "Pre-Recall", meaning: "Recall before reranking, measured from the candidate pool." },
+  { term: "Post-Recall", meaning: "Recall after reranking, measured at the final top-k." },
+  { term: "Post-MRR", meaning: "MRR after reranking." },
+  { term: "Post-nDCG", meaning: "nDCG after reranking." },
+  { term: "ΔnDCG", meaning: "Change in nDCG caused by reranking." },
+  { term: "lexical (rg)", meaning: "ripgrep baseline used as the external lexical reference." },
+  { term: "AFT-GREP", meaning: "User-facing name for AFT's trigram-backed grep mode." },
+  { term: "aft-grep", meaning: "AFT trigram-backed grep mode." },
+  { term: "AFT-FTS5", meaning: "User-facing name for AFT's FTS5-backed search mode." },
+  { term: "fts5", meaning: "AFT's SQLite FTS5 full-text search mode." },
+  { term: "fts5_find_symbol_exact", meaning: "FTS5 exact symbol lookup." },
+  { term: "fts5_find_symbol_prefix", meaning: "FTS5 prefix symbol lookup." },
+  { term: "hybrid-fe-legacy", meaning: "FastEmbed semantic search combined with FTS5 using the legacy public context cap." },
+  { term: "hybrid-fe-budget", meaning: "FastEmbed semantic search combined with FTS5 using token-budget context selection." },
+  { term: "hybrid-api-budget", meaning: "OpenAI-compatible semantic API combined with FTS5 using token-budget context selection." },
+];
+
 function firstMetric(metrics: AggregateMode[] | undefined, modes: string[]): AggregateMode | null {
   if (!metrics) return null;
   for (const mode of modes) {
@@ -1181,6 +1214,25 @@ function printFeatureBranchComparisonTable(rows: FeatureBranchComparisonRow[]) {
   }
 }
 
+function printBenchmarkGlossary() {
+  console.log("\n\x1b[1;37mBENCHMARK GLOSSARY\x1b[0m");
+  console.log(formatBenchmarkGlossary());
+}
+
+export function formatBenchmarkGlossary(): string {
+  const termWidth = Math.max(24, ...benchmarkGlossaryRows.map((row) => row.term.length));
+  const meaningWidth = Math.max(48, ...benchmarkGlossaryRows.map((row) => row.meaning.length));
+  const gap = "  ";
+  const header = `  ${"Term".padEnd(termWidth)}${gap}${"Meaning".padEnd(meaningWidth)}`;
+  const rule = `  ${"─".repeat(termWidth)}${gap}${"─".repeat(meaningWidth)}`;
+  const rows = benchmarkGlossaryRows.map((row) => `  ${row.term.padEnd(termWidth)}${gap}${row.meaning.padEnd(meaningWidth)}`);
+  return [
+    header,
+    rule,
+    ...rows,
+  ].join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1510,7 +1562,7 @@ async function main() {
       grepSession?.close();
 
       currentRepo = ann.repo_name;
-      console.log(`\n  Initializing sessions for ${ann.repo_name}...`);
+      console.log(`\n  Initializing semantic search sessions for ${ann.repo_name}...`);
 
       for (const run of semanticRuns) {
         const storageDir = join(targetDir, `.aft-bench-${run.backend}-${run.variant}`);
@@ -1692,7 +1744,7 @@ async function main() {
       const repoDir = join(resolve(cacheDir), repoName);
       const lexicalSessions: Record<string, AftSession | null> = {};
 
-      console.log(`\n  Initializing lexical sessions for ${repoName}...`);
+      console.log(`\n  Initializing lexical search sessions for ${repoName}...`);
       lexicalSessions["aft-grep"] = await initGrepSession(bin, repoDir, verbose);
       lexicalSessions["fts5"] = await initFts5Session(bin, repoDir, verbose);
 
@@ -1812,6 +1864,7 @@ async function main() {
   }
   const featureBranchComparison = buildFeatureBranchComparison(suiteAggregates);
   printFeatureBranchComparisonTable(featureBranchComparison);
+  printBenchmarkGlossary();
 
   // Compute context quality per mode
   const contextQualityByMode: Record<string, ContextQuality> = {};

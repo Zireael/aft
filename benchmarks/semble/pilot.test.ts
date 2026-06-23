@@ -5,7 +5,9 @@ import {
   buildLexicalQueriesFromCanon,
   buildFeatureBranchComparison,
   buildSemanticRuns,
+  benchmarkGlossaryRows,
   formatChunkSizeLog,
+  formatBenchmarkGlossary,
   groupLexicalQueriesByRepo,
   identifierModePlan,
   applyLegacySnippetCap,
@@ -201,5 +203,15 @@ describe("pilot benchmark reporting", () => {
     expect(rows.find((row) => row.featureMode === "semantic-fe-budget")?.recallDelta).toBeCloseTo(0.1);
     expect(rows.find((row) => row.featureMode === "fts5_find_symbol_exact")?.recallDeltaPercentagePoints).toBeCloseTo(50);
     expect(rows.find((row) => row.featureMode === "hybrid-fe-budget")?.snippetDelta).toBeCloseTo(5);
+  });
+
+  it("renders a glossary for benchmark headers and mode acronyms", () => {
+    const glossary = formatBenchmarkGlossary();
+
+    expect(benchmarkGlossaryRows.some((row) => row.term === "MRR")).toBe(true);
+    expect(glossary).toContain("Mode");
+    expect(glossary).toContain("hybrid-fe-legacy");
+    expect(glossary).toContain("fts5_find_symbol_prefix");
+    expect(glossary).toContain("AFT-GREP");
   });
 });

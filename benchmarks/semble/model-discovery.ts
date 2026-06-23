@@ -23,12 +23,42 @@ export interface ModelDiscoveryResult {
   unknown_models: DiscoveredModel[];
 }
 
+export function normalizeOpenAiBaseUrl(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  if (!trimmed) return trimmed;
+
+  try {
+    const parsed = new URL(trimmed);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const tail = parts[parts.length - 1];
+    if (tail === "models" || tail === "embeddings" || tail === "rerank") {
+      parts.pop();
+      parsed.pathname = `/${parts.join("/")}`;
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return trimmed.replace(/\/(models|embeddings|rerank)$/, "");
+  }
+}
+
+export function openAiEndpoint(url: string, kind: "models" | "embeddings" | "rerank"): string {
+  const base = normalizeOpenAiBaseUrl(url);
+  if (base.endsWith("/v1")) return `${base}/${kind}`;
+  return `${base}/v1/${kind}`;
+}
+
+export function rerankResponseHasResults(json: any): boolean {
+  if (Array.isArray(json?.results)) return json.results.length > 0;
+  if (Array.isArray(json?.data)) return json.data.length > 0;
+  return false;
+}
+
 /**
  * Fetch the model list from an OpenAI-compatible /v1/models endpoint.
  */
 async function fetchModelList(url: string): Promise<Array<{ id: string; name?: string; owned_by?: string }>> {
   try {
-    const resp = await fetch(`${url}/v1/models`, { signal: AbortSignal.timeout(5000) });
+    const resp = await fetch(openAiEndpoint(url, "models"), { signal: AbortSignal.timeout(5000) });
     if (!resp.ok) return [];
     const json = await resp.json() as any;
     return json.data || json.models || [];
@@ -43,7 +73,7 @@ async function fetchModelList(url: string): Promise<Array<{ id: string; name?: s
  */
 async function probeEmbedding(url: string, modelId: string): Promise<number | null> {
   try {
-    const resp = await fetch(`${url}/v1/embeddings`, {
+    const resp = await fetch(openAiEndpoint(url, "embeddings"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: modelId, input: "test" }),
@@ -67,7 +97,7 @@ async function probeEmbedding(url: string, modelId: string): Promise<number | nu
  */
 async function probeReranker(url: string, modelId: string): Promise<boolean> {
   try {
-    const resp = await fetch(`${url}/v1/rerank`, {
+    const resp = await fetch(openAiEndpoint(url, "rerank"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: modelId, query: "test", documents: ["doc1", "doc2"], top_n: 2 }),
@@ -75,7 +105,7 @@ async function probeReranker(url: string, modelId: string): Promise<boolean> {
     });
     if (!resp.ok) return false;
     const json = await resp.json() as any;
-    return Array.isArray(json.results) && json.results.length > 0;
+    return rerankResponseHasResults(json);
   } catch {
     return false;
   }
@@ -101,7 +131,7 @@ export async function discoverModels(
   const chat_models: DiscoveredModel[] = [];
   const unknown_models: DiscoveredModel[] = [];
 
-  if (verbose) console.log(`  Discovering models from ${url}/v1/models...`);
+  if (verbose) console.log(`  Discovering models from ${openAiEndpoint(url, "models")}...`);
 
   for (const m of rawModels) {
     const model: DiscoveredModel = {
@@ -341,7 +371,7 @@ export async function interactiveModelSelection(
     console.log("\n=== Interactive Model Discovery ===");
 
     // Discover semantic API models
-    console.log(`\nQuerying ${semanticApiUrl}/v1/models...`);
+    console.log(`\nQuerying ${openAiEndpoint(semanticApiUrl, "models")}...`);
     const semanticDiscovery = await discoverModels(semanticApiUrl, verbose);
 
     if (semanticDiscovery.models.length === 0) {
@@ -370,7 +400,7 @@ export async function interactiveModelSelection(
     // Discover reranker models if endpoint provided
     let rerankerModel: DiscoveredModel | null = null;
     if (rerankUrl) {
-      console.log(`\nQuerying ${rerankUrl}/v1/models...`);
+      console.log(`\nQuerying ${openAiEndpoint(rerankUrl, "models")}...`);
       const rerankDiscovery = await discoverModels(rerankUrl, verbose);
 
       if (rerankDiscovery.reranker_models.length > 0) {

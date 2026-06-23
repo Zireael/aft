@@ -25,6 +25,7 @@ export interface ShowcaseConfig {
   expectedFile: string;
   topK: number;
   timeoutMs: number;
+  diagnosticTimeoutMs: number;
   color: boolean;
   jsonOutput?: string;
   markdownOutput?: string;
@@ -95,11 +96,12 @@ interface TimedResponse {
   latencyMs: number;
 }
 
-const DEFAULT_QUERY = "CandidateEntry";
-const DEFAULT_DIAGNOSTIC_QUERY = "E0433 unresolved import";
-const DEFAULT_SYMBOL = "handle_semantic_search";
-const DEFAULT_TOP_K = 10;
-const DEFAULT_TIMEOUT_MS = 60_000;
+  const DEFAULT_QUERY = "CandidateEntry";
+  const DEFAULT_DIAGNOSTIC_QUERY = "E0433 unresolved import";
+  const DEFAULT_SYMBOL = "handle_semantic_search";
+  const DEFAULT_TOP_K = 10;
+  const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 180_000;
 
 function usage(): string {
   return [
@@ -118,6 +120,7 @@ function usage(): string {
     "  --markdown-output <file> Write rendered report text",
     "  --skip-fts5-index        Skip fts5_index update",
     "  --timeout-ms <n>         Per-command timeout (default: 60000)",
+    "  --diagnostic-timeout-ms <n>  Timeout for FTS5/doctor/context diagnostics (default: 180000)",
     "  --no-color              Disable ANSI colors",
     "  --help                  Show this help",
   ].join("\n");
@@ -134,6 +137,7 @@ export function parseArgs(argv: string[]): ShowcaseConfig {
     expectedFile: "",
     topK: DEFAULT_TOP_K,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    diagnosticTimeoutMs: DEFAULT_DIAGNOSTIC_TIMEOUT_MS,
     color: true,
     skipFts5Index: false,
   };
@@ -167,6 +171,9 @@ export function parseArgs(argv: string[]): ShowcaseConfig {
         break;
       case "--timeout-ms":
         config.timeoutMs = parsePositiveInt(argv[++i], "--timeout-ms", 1_000, 600_000);
+        break;
+      case "--diagnostic-timeout-ms":
+        config.diagnosticTimeoutMs = parsePositiveInt(argv[++i], "--diagnostic-timeout-ms", 1_000, 600_000);
         break;
       case "--json-output":
         config.jsonOutput = argv[++i];
@@ -214,13 +221,13 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
   const diagnostics: DiagnosticRow[] = [];
   let riSearch: AftResponse | null = null;
 
-  comparisons.push(await runComparisonCommand(config, "Baseline grep", "grep", {
+  comparisons.push(await runComparisonCommand(config, "AFT-GREP baseline", "grep", {
     command: "grep",
     pattern: config.query,
     max_results: config.topK,
   }));
 
-  comparisons.push(await runComparisonCommand(config, "Baseline FTS5", "fts5_search", {
+  comparisons.push(await runComparisonCommand(config, "AFT-FTS5 baseline", "fts5_search", {
     command: "fts5_search",
     query: config.query,
     scope: "all",
@@ -234,30 +241,30 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
       diagnostics.push(await diagnosticCall(session, "FTS5 index update", {
         command: "fts5_index",
         action: "update",
-      }, Math.max(config.timeoutMs, 60_000), summarizeFts5Index, "Builds the SQLite FTS5 symbol/body/path index used by exact lookup, prefix lookup, full-text search, and hybrid retrieval."));
+      }, Math.max(config.diagnosticTimeoutMs, 60_000), summarizeFts5Index, "Builds the SQLite FTS5 symbol/body/path index used by exact lookup, prefix lookup, full-text search, and hybrid retrieval."));
     }
 
     diagnostics.push(await diagnosticCall(session, "FTS5 doctor", {
       command: "fts5_doctor",
-    }, config.timeoutMs, summarizeFts5Doctor, "Confirms whether FTS5 is compiled, enabled, populated, and healthy before judging search quality."));
+    }, config.diagnosticTimeoutMs, summarizeFts5Doctor, "Confirms whether FTS5 is compiled, enabled, populated, and healthy before judging search quality."));
 
     diagnostics.push(await diagnosticCall(session, "FTS5 symbol lookup", {
       command: "fts5_find_symbol",
       name: config.symbol,
       mode: "exact",
       top_k: config.topK,
-    }, config.timeoutMs, summarizeFts5FindSymbol, "Shows exact symbol lookup over the FTS5 symbol table, the clearest win over plain grep for code navigation."));
+    }, config.diagnosticTimeoutMs, summarizeFts5FindSymbol, "Shows exact symbol lookup over the FTS5 symbol table, the clearest win over plain grep for code navigation."));
 
     diagnostics.push(await diagnosticCall(session, "FTS5 read symbol", {
       command: "fts5_read_symbol",
       name: config.symbol,
       context_lines: 2,
-    }, config.timeoutMs, summarizeFts5ReadSymbol, "Reads canonical source for a symbol from the index, turning lookup results into usable code context."));
+    }, config.diagnosticTimeoutMs, summarizeFts5ReadSymbol, "Reads canonical source for a symbol from the index, turning lookup results into usable code context."));
 
     diagnostics.push(await diagnosticCall(session, "Semantic doctor", {
       command: "semantic_doctor",
       probe_provider: false,
-    }, config.timeoutMs, summarizeSemanticDoctor, "Reports semantic backend, index, and metrics health so quality issues can be separated from provider/config problems."));
+    }, config.diagnosticTimeoutMs, summarizeSemanticDoctor, "Reports semantic backend, index, and metrics health so quality issues can be separated from provider/config problems."));
 
     const semantic = await timedCall(session, {
       command: "semantic_search",
@@ -286,33 +293,33 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
     diagnostics.push(await diagnosticCall(session, "Explain search", {
       command: "explain_search",
       query: config.query,
-    }, config.timeoutMs, summarizeExplain, "Explains lane weights and safety lanes, so users know why the search behaved the way it did."));
+    }, config.diagnosticTimeoutMs, summarizeExplain, "Explains lane weights and safety lanes, so users know why the search behaved the way it did."));
 
     if (config.expectedFile) {
       diagnostics.push(await diagnosticCall(session, "Why missed", {
         command: "why_missed",
         query: config.query,
         expected_file: config.expectedFile,
-      }, config.timeoutMs, summarizeWhyMissed, "Shows whether an expected file entered the candidate pool and which lanes missed it."));
+      }, config.diagnosticTimeoutMs, summarizeWhyMissed, "Shows whether an expected file entered the candidate pool and which lanes missed it."));
     }
 
     diagnostics.push(await diagnosticCall(session, "Orient", {
       command: "aft_orient",
       query: config.query,
       depth: 2,
-    }, config.timeoutMs, summarizeOrient, "Turns search hits into an entry-point map instead of a flat list."));
+    }, config.diagnosticTimeoutMs, summarizeOrient, "Turns search hits into an entry-point map instead of a flat list."));
 
     diagnostics.push(await diagnosticCall(session, "Impact delta", {
       command: "aft_impact_delta",
       symbol: config.symbol,
       change_type: "signature",
-    }, config.timeoutMs, summarizeImpact, "Estimates blast radius and mutation risk for a symbol-level change."));
+    }, config.diagnosticTimeoutMs, summarizeImpact, "Estimates blast radius and mutation risk for a symbol-level change."));
 
     diagnostics.push(await diagnosticCall(session, "Context pack", {
       command: "aft_context_pack",
       query: config.query,
       token_budget: 4000,
-    }, config.timeoutMs, summarizeContextPack, "Packages relevant code into a bounded context budget for agent workflows."));
+    }, config.diagnosticTimeoutMs, summarizeContextPack, "Packages relevant code into a bounded context budget for agent workflows."));
   } finally {
     session.close();
   }
@@ -529,7 +536,7 @@ function buildQualityNotes(label: string, response: AftResponse, expectedRank: n
   if (response.retrieval_intelligence_provenance) notes.push("RI provenance emitted");
   if ((response as any).semantic_unavailable) notes.push("semantic unavailable surfaced explicitly");
   if ((response as any).lexical_only_fallback) notes.push("lexical fallback surfaced explicitly");
-  if (label.includes("Baseline")) notes.push("baseline comparison path");
+  if (label.toLowerCase().includes("baseline")) notes.push("baseline comparison path");
   return notes;
 }
 

@@ -19,6 +19,8 @@ describe("aft-feature-showcase", () => {
       "src/lib.rs",
       "--top-k",
       "7",
+      "--diagnostic-timeout-ms",
+      "180000",
       "--no-color",
     ]);
 
@@ -27,6 +29,7 @@ describe("aft-feature-showcase", () => {
     expect(config.query).toBe("CandidateEntry");
     expect(config.expectedFile).toBe("src/lib.rs");
     expect(config.topK).toBe(7);
+    expect(config.diagnosticTimeoutMs).toBe(180000);
     expect(config.color).toBe(false);
   });
 
@@ -40,7 +43,7 @@ describe("aft-feature-showcase", () => {
       topK: 5,
       comparisons: [
         {
-          label: "Baseline grep",
+          label: "AFT-GREP baseline",
           command: "grep",
           status: "ok",
           latencyMs: 50,
@@ -111,6 +114,7 @@ describe("aft-feature-showcase", () => {
     const rendered = renderReport(report, { color: false });
 
     expect(rendered).toContain("AFT Feature Showcase");
+    expect(rendered).toContain("AFT-GREP baseline");
     expect(rendered).toContain("RI v2 semantic_search");
     expect(rendered).toContain("Expected file rank: #1");
     expect(rendered).toContain("2.50x faster than baseline");
