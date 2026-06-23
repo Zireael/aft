@@ -64,6 +64,13 @@ describe("aft-feature-showcase", () => {
           laneCount: 3,
           rankingFeatures: ["exact_definition_boost"],
           enrichmentStates: ["enriched"],
+          snippetCount: 8,
+          tokenCount: 512,
+          contextBudget: {
+            totalTokens: 4096,
+            perCandidateTokens: 384,
+            softOverflowTokens: 128,
+          },
           qualityNotes: ["definition-aware ranking"],
         },
       ],
@@ -76,6 +83,20 @@ describe("aft-feature-showcase", () => {
         },
       ],
       diagnostics: [
+        {
+          label: "FTS5 symbol lookup",
+          status: "ok",
+          latencyMs: 8,
+          summary: "1 symbol candidate; top handle_semantic_search",
+          whyItMatters: "Shows exact indexed symbol lookup.",
+        },
+        {
+          label: "Semantic doctor",
+          status: "ok",
+          latencyMs: 9,
+          summary: "status=ok, backend=model2vec",
+          whyItMatters: "Separates backend health from search quality.",
+        },
         {
           label: "Context pack",
           status: "ok",
@@ -94,6 +115,10 @@ describe("aft-feature-showcase", () => {
     expect(rendered).toContain("Expected file rank: #1");
     expect(rendered).toContain("2.50x faster than baseline");
     expect(rendered).toContain("exact_definition_boost");
+    expect(rendered).toContain("8 snippets, 512 snippet tokens");
+    expect(rendered).toContain("total=4096, per_candidate=384, soft_overflow=128");
+    expect(rendered).toContain("FTS5 symbol lookup");
+    expect(rendered).toContain("Semantic doctor");
     expect(rendered).toContain("Why it matters");
   });
 });

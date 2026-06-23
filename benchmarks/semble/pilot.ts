@@ -110,7 +110,7 @@ export function formatChunkSizeLog(label: string, chunks: string[]): { line: str
   const max = Math.max(...sizes);
   const avg = Math.round(sizes.reduce((a, b) => a + b, 0) / sizes.length);
   return {
-    line: `    CHUNK-SIZE ${label}: ${chunks.length} chunks, avg=${avg} max=${max}`,
+    line: `    CHUNK-SIZE ${label}: ${chunks.length} chunks selected, avg=${avg} max=${max}`,
     warning: over > 0 ? `    \x1b[0;33mWARNING ${label}: ${over} chunk(s) >2048 tokens; max=${max}\x1b[0m` : null,
   };
 }
@@ -122,7 +122,7 @@ function logChunkSizes(label: string, chunks: string[], verbose: boolean): void 
   if (formatted.warning) console.log(formatted.warning);
 }
 
-interface AggregateMode {
+export interface AggregateMode {
   mode: string;
   recall: number;
   mrr: number;
@@ -429,6 +429,16 @@ export interface SemanticRun {
   request: Record<string, unknown>;
 }
 
+const LEGACY_SNIPPET_LIMIT = 3;
+
+export function applyLegacySnippetCap(results: SearchResult[]): SearchResult[] {
+  return results.map((result, index) => {
+    if (index < LEGACY_SNIPPET_LIMIT) return result;
+    const { snippet: _snippet, content: _content, start_line: _startLine, end_line: _endLine, ...pathOnly } = result;
+    return pathOnly;
+  });
+}
+
 export function buildSemanticRuns(
   backends: string[],
   contextMode: ContextBenchmarkMode,
@@ -463,6 +473,119 @@ export function buildSemanticRuns(
 function semanticModeName(run: SemanticRun): string {
   const base = run.backend === "model2vec" ? "semantic-m2v" : run.backend === "fastembed" ? "semantic-fe" : "semantic-api";
   return `${base}${run.modeSuffix}`;
+}
+
+export interface FeatureBranchComparisonRow {
+  suite: string;
+  capability: string;
+  baselineMode: string;
+  featureMode: string;
+  baselineRecall: number;
+  featureRecall: number;
+  recallDelta: number;
+  recallDeltaPercentagePoints: number;
+  mrrDelta: number;
+  ndcgDelta: number;
+  tokenDelta: number;
+  snippetDelta: number;
+  p50DeltaMs: number;
+}
+
+function firstMetric(metrics: AggregateMode[] | undefined, modes: string[]): AggregateMode | null {
+  if (!metrics) return null;
+  for (const mode of modes) {
+    const found = metrics.find((metric) => metric.mode === mode);
+    if (found) return found;
+  }
+  return null;
+}
+
+function comparisonRow(
+  suite: string,
+  capability: string,
+  baseline: AggregateMode | null,
+  feature: AggregateMode | null,
+): FeatureBranchComparisonRow | null {
+  if (!baseline || !feature) return null;
+  return {
+    suite,
+    capability,
+    baselineMode: baseline.mode,
+    featureMode: feature.mode,
+    baselineRecall: baseline.recall,
+    featureRecall: feature.recall,
+    recallDelta: feature.recall - baseline.recall,
+    recallDeltaPercentagePoints: (feature.recall - baseline.recall) * 100,
+    mrrDelta: feature.mrr - baseline.mrr,
+    ndcgDelta: feature.ndcg - baseline.ndcg,
+    tokenDelta: feature.tokens_per_query - baseline.tokens_per_query,
+    snippetDelta: feature.snippets_per_query - baseline.snippets_per_query,
+    p50DeltaMs: feature.p50_ms - baseline.p50_ms,
+  };
+}
+
+export function buildFeatureBranchComparison(
+  suiteAggregates: Record<string, AggregateMode[]>,
+): FeatureBranchComparisonRow[] {
+  const semantic = suiteAggregates.semantic_nl ?? [];
+  const rows = [
+    comparisonRow(
+      "semantic_nl",
+      "Model2Vec semantic retrieval",
+      firstMetric(semantic, ["semantic-fe-legacy", "semantic-fe"]),
+      firstMetric(semantic, ["semantic-m2v-budget", "semantic-m2v"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "FastEmbed token-budget context",
+      firstMetric(semantic, ["semantic-fe-legacy", "semantic-fe"]),
+      firstMetric(semantic, ["semantic-fe-budget"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "Semantic API token-budget context",
+      firstMetric(semantic, ["semantic-api-legacy", "semantic-api"]),
+      firstMetric(semantic, ["semantic-api-budget"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "Hybrid Model2Vec budget context",
+      firstMetric(semantic, ["hybrid-m2v-legacy", "hybrid-m2v"]),
+      firstMetric(semantic, ["hybrid-m2v-budget"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "Hybrid FastEmbed budget context",
+      firstMetric(semantic, ["hybrid-fe-legacy", "hybrid-fe"]),
+      firstMetric(semantic, ["hybrid-fe-budget"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "Hybrid API budget context",
+      firstMetric(semantic, ["hybrid-api-legacy", "hybrid-api"]),
+      firstMetric(semantic, ["hybrid-api-budget"]),
+    ),
+    comparisonRow(
+      "semantic_nl",
+      "FTS5 full-text search",
+      firstMetric(semantic, ["aft-grep", "lexical (rg)"]),
+      firstMetric(semantic, ["fts5"]),
+    ),
+    comparisonRow(
+      "identifier_exact",
+      "FTS5 exact symbol lookup",
+      firstMetric(suiteAggregates.identifier_exact, ["aft-grep", "lexical (rg)"]),
+      firstMetric(suiteAggregates.identifier_exact, ["fts5_find_symbol_exact"]),
+    ),
+    comparisonRow(
+      "identifier_prefix",
+      "FTS5 prefix symbol lookup",
+      firstMetric(suiteAggregates.identifier_prefix, ["aft-grep"]),
+      firstMetric(suiteAggregates.identifier_prefix, ["fts5_find_symbol_prefix"]),
+    ),
+  ];
+
+  return rows.filter((row): row is FeatureBranchComparisonRow => row !== null);
 }
 
 export function buildEmptyCounts(rows: ModeResult[]): Record<string, number> {
@@ -840,7 +963,7 @@ async function semanticQuery(session: AftSession, query: string, k: number, run:
     const resp = await session.call({ command: "semantic_search", query, topK: k, ...run.request }, 30_000);
     const items = (resp as any).results;
     if (items && Array.isArray(items)) {
-      const results = items.map((r: any) => ({
+      let results = items.map((r: any) => ({
         file: r.file || r.file_path || r.path || "",
         line: r.start_line || r.line,
         score: r.score,
@@ -848,6 +971,9 @@ async function semanticQuery(session: AftSession, query: string, k: number, run:
         start_line: r.start_line,
         end_line: r.end_line,
       }));
+      if (run.variant === "legacy") {
+        results = applyLegacySnippetCap(results);
+      }
       // Log snippet sizes for token budget analysis
       const snippets = results.map((r) => r.snippet || "").filter((s) => s.length > 0);
       logChunkSizes(`sem-${run.backend}${run.modeSuffix}`, snippets, verbose);
@@ -938,6 +1064,7 @@ function printHeader(opts: {
   m2vModel?: string; feModel?: string; oversample?: number;
   profileName: string; identifierSemantic: boolean;
   contextMode: ContextBenchmarkMode; contextBudget: ContextBudgetOptions;
+  rerankInstruction?: string;
 }) {
   const W = "\x1b[1;37m", D = "\x1b[0;90m", N = "\x1b[0m";
   const bar = "═".repeat(65);
@@ -967,7 +1094,10 @@ function printHeader(opts: {
     if (opts.backends.includes("model2vec")) console.log(`${D}    model2vec:   ${opts.m2vModel || "minishlab/potion-code-16M"} (512-dim static embeddings)${N}`);
     if (opts.backends.includes("fastembed")) console.log(`${D}    fastembed:   ${opts.feModel || "all-MiniLM-L6-v2"} (384-dim transformer, ONNX)${N}`);
     if (opts.backends.includes("semantic-api") && opts.apiUrl) console.log(`${D}    semantic-api: ${opts.apiModel || "?"} @ ${opts.apiUrl}${N}`);
-    if (opts.rerank) console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
+    if (opts.rerank) {
+      console.log(`${D}  Reranker:      ${opts.rerankModel} @ ${opts.rerankUrl} (5x oversampling)${N}`);
+      if (opts.rerankInstruction) console.log(`${D}    instruction: ${opts.rerankInstruction}${N}`);
+    }
   }
 
   // Tool-command mapping reference
@@ -990,12 +1120,18 @@ function printHeader(opts: {
 
 function printTable(title: string, metrics: AggregateMode[], rerankMetrics?: Record<string, RerankMetrics>) {
   const W = "\x1b[1;37m", G = "\x1b[0;32m", Y = "\x1b[0;33m", N = "\x1b[0m";
-  const bar = "═".repeat(95);
+  const modeWidth = Math.max(
+    34,
+    ...metrics.map((metric) => metric.mode.length),
+    ...(rerankMetrics ? Object.keys(rerankMetrics).map((mode) => mode.length) : []),
+  );
+  const gap = "  ";
+  const bar = "═".repeat(modeWidth + 86);
   console.log(`\n${W}${bar}${N}`);
   console.log(`${W}  ${title}${N}`);
   console.log(`${W}${bar}${N}`);
-  console.log(`  ${"Mode".padEnd(24)} ${"Recall".padStart(7)} ${"MRR".padStart(7)} ${"nDCG".padStart(7)} ${"Tok/q".padStart(7)} ${"Snip/q".padStart(7)} ${"p50(ms)".padStart(8)} ${"p95(ms)".padStart(8)} ${"Queries".padStart(9)}`);
-  console.log(`  ${"─".repeat(24)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(8)} ${"─".repeat(8)} ${"─".repeat(9)}`);
+  console.log(`  ${"Mode".padEnd(modeWidth)}${gap}${"Recall".padStart(7)}${gap}${"MRR".padStart(7)}${gap}${"nDCG".padStart(7)}${gap}${"Tok/q".padStart(7)}${gap}${"Snip/q".padStart(7)}${gap}${"p50(ms)".padStart(8)}${gap}${"p95(ms)".padStart(8)}${gap}${"Queries".padStart(9)}`);
+  console.log(`  ${"─".repeat(modeWidth)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(8)}${gap}${"─".repeat(8)}${gap}${"─".repeat(9)}`);
 
   for (const m of metrics) {
     const recall = `${(m.recall * 100).toFixed(1)}%`;
@@ -1007,15 +1143,41 @@ function printTable(title: string, metrics: AggregateMode[], rerankMetrics?: Rec
     const p95 = m.p95_ms.toFixed(0);
     const queries = m.empty > 0 ? `${m.count}/${m.count + m.empty}` : `${m.count}/${m.count}`;
     const color = m.recall > 0.6 ? G : m.recall > 0.3 ? Y : "";
-    console.log(`  ${color}${m.mode.padEnd(24)}${N} ${recall.padStart(7)} ${mrr.padStart(7)} ${ndcg.padStart(7)} ${tokens.padStart(7)} ${snippets.padStart(7)} ${p50.padStart(8)} ${p95.padStart(8)} ${queries.padStart(9)}`);
+    console.log(`  ${color}${m.mode.padEnd(modeWidth)}${N}${gap}${recall.padStart(7)}${gap}${mrr.padStart(7)}${gap}${ndcg.padStart(7)}${gap}${tokens.padStart(7)}${gap}${snippets.padStart(7)}${gap}${p50.padStart(8)}${gap}${p95.padStart(8)}${gap}${queries.padStart(9)}`);
   }
 
   if (rerankMetrics) {
-    console.log(`\n  ${"Rerank Delta".padEnd(24)} ${"Pre-Recall".padStart(10)} ${"Post-Recall".padStart(11)} ${"Post-MRR".padStart(9)} ${"Post-nDCG".padStart(10)} ${"ΔnDCG".padStart(7)} ${"p50(ms)".padStart(8)}`);
-    console.log(`  ${"─".repeat(24)} ${"─".repeat(10)} ${"─".repeat(11)} ${"─".repeat(9)} ${"─".repeat(10)} ${"─".repeat(7)} ${"─".repeat(8)}`);
+    console.log(`\n  ${"Rerank Delta".padEnd(modeWidth)}${gap}${"Pre-Recall".padStart(10)}${gap}${"Post-Recall".padStart(11)}${gap}${"Post-MRR".padStart(9)}${gap}${"Post-nDCG".padStart(10)}${gap}${"ΔnDCG".padStart(7)}${gap}${"p50(ms)".padStart(8)}`);
+    console.log(`  ${"─".repeat(modeWidth)}${gap}${"─".repeat(10)}${gap}${"─".repeat(11)}${gap}${"─".repeat(9)}${gap}${"─".repeat(10)}${gap}${"─".repeat(7)}${gap}${"─".repeat(8)}`);
     for (const [mode, rm] of Object.entries(rerankMetrics)) {
-      console.log(`  ${mode.padEnd(24)} ${(rm.pre_rerank_recall * 100).toFixed(1).padStart(9)}% ${(rm.post_rerank_recall * 100).toFixed(1).padStart(10)}% ${rm.post_rerank_mrr.toFixed(3).padStart(9)} ${rm.post_rerank_ndcg.toFixed(3).padStart(10)} ${rm.rerank_delta_ndcg >= 0 ? "+" : ""}${rm.rerank_delta_ndcg.toFixed(3).padStart(6)} ${rm.rerank_p50_ms.toFixed(0).padStart(8)}`);
+      console.log(`  ${mode.padEnd(modeWidth)}${gap}${(rm.pre_rerank_recall * 100).toFixed(1).padStart(9)}%${gap}${(rm.post_rerank_recall * 100).toFixed(1).padStart(10)}%${gap}${rm.post_rerank_mrr.toFixed(3).padStart(9)}${gap}${rm.post_rerank_ndcg.toFixed(3).padStart(10)}${gap}${rm.rerank_delta_ndcg >= 0 ? "+" : ""}${rm.rerank_delta_ndcg.toFixed(3).padStart(6)}${gap}${rm.rerank_p50_ms.toFixed(0).padStart(8)}`);
     }
+  }
+}
+
+function printFeatureBranchComparisonTable(rows: FeatureBranchComparisonRow[]) {
+  if (rows.length === 0) return;
+  const W = "\x1b[1;37m", G = "\x1b[0;32m", R = "\x1b[0;31m", N = "\x1b[0m";
+  const capabilityWidth = Math.max(32, ...rows.map((row) => row.capability.length));
+  const baselineWidth = Math.max(24, ...rows.map((row) => row.baselineMode.length));
+  const featureWidth = Math.max(28, ...rows.map((row) => row.featureMode.length));
+  const gap = "  ";
+  const bar = "═".repeat(capabilityWidth + baselineWidth + featureWidth + 105);
+  console.log(`\n${W}${bar}${N}`);
+  console.log(`${W}  FEATURE BRANCH BENEFIT SUMMARY${N}`);
+  console.log(`${W}${bar}${N}`);
+  console.log(`  ${"Capability".padEnd(capabilityWidth)}${gap}${"Legacy/Baseline".padEnd(baselineWidth)}${gap}${"Feature Branch".padEnd(featureWidth)}${gap}${"Base R".padStart(7)}${gap}${"Feat R".padStart(7)}${gap}${"Recall Δ pp".padStart(11)}${gap}${"MRR Δ".padStart(7)}${gap}${"nDCG Δ".padStart(7)}${gap}${"Tok/q Δ".padStart(8)}${gap}${"Snip/q Δ".padStart(8)}${gap}${"p50 Δ".padStart(8)}`);
+  console.log(`  ${"─".repeat(capabilityWidth)}${gap}${"─".repeat(baselineWidth)}${gap}${"─".repeat(featureWidth)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(11)}${gap}${"─".repeat(7)}${gap}${"─".repeat(7)}${gap}${"─".repeat(8)}${gap}${"─".repeat(8)}${gap}${"─".repeat(8)}`);
+  for (const row of rows) {
+    const color = row.recallDelta >= 0 ? G : R;
+    const fmtSigned = (value: number, digits = 3) => `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
+    const fmtPct = (value: number) => `${(value * 100).toFixed(1)}%`;
+    const fmtPp = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(1)}pp`;
+    console.log(
+      `  ${row.capability.padEnd(capabilityWidth)}${gap}${row.baselineMode.padEnd(baselineWidth)}${gap}${row.featureMode.padEnd(featureWidth)}${gap}` +
+      `${fmtPct(row.baselineRecall).padStart(7)}${gap}${fmtPct(row.featureRecall).padStart(7)}${gap}${color}${fmtPp(row.recallDeltaPercentagePoints).padStart(11)}${N}${gap}${fmtSigned(row.mrrDelta).padStart(7)}${gap}${fmtSigned(row.ndcgDelta).padStart(7)}${gap}` +
+      `${fmtSigned(row.tokenDelta, 0).padStart(8)}${gap}${fmtSigned(row.snippetDelta, 1).padStart(8)}${gap}${fmtSigned(row.p50DeltaMs, 0).padStart(8)}`,
+    );
   }
 }
 
@@ -1289,6 +1451,7 @@ async function main() {
     identifierSemantic,
     contextMode,
     contextBudget,
+    rerankInstruction: RERANK_INSTRUCTION,
   });
 
   // Check which repos are available, auto-clone missing ones
@@ -1647,6 +1810,8 @@ async function main() {
     if (suite === "semantic_nl" || metrics.length === 0) continue;
     printTable(`${suite.toUpperCase()} (identifier queries, k=${k})`, metrics);
   }
+  const featureBranchComparison = buildFeatureBranchComparison(suiteAggregates);
+  printFeatureBranchComparisonTable(featureBranchComparison);
 
   // Compute context quality per mode
   const contextQualityByMode: Record<string, ContextQuality> = {};
@@ -1831,10 +1996,11 @@ async function main() {
       request: run.request,
     })),
     semantic_snippet_display_policy: {
-      mode: "rank_tiered_public_semantic_search",
-      note: "AFT currently enriches public semantic_search snippets for the first three ranked semantic results only; rank 4+ results are path/header oriented even when k is larger.",
+      legacy_mode: "benchmark_compat_top3_snippets",
+      budget_mode: "public_context_budget_request",
+      note: "Legacy benchmark variants strip snippets after rank 3 to reproduce the historical public semantic_search context cap. Budget variants pass context budget fields to AFT.",
     },
-    rerank: doRerank ? { model: rerankModel, url: rerankUrl } : null,
+    rerank: doRerank ? { model: rerankModel, url: rerankUrl, instruction: RERANK_INSTRUCTION || null } : null,
     rerank_context: rerankContext,
     suite_totals: suiteTotals,
     intent_metrics: intentMetrics,
@@ -1848,6 +2014,7 @@ async function main() {
     suite_aggregates: Object.fromEntries(
       Object.entries(suiteAggregates).map(([suite, metrics]) => [suite, Object.fromEntries(metrics.map((a) => [a.mode, a]))]),
     ),
+    feature_branch_comparison: featureBranchComparison,
     rerank_metrics: rerankAgg,
     context_quality: contextQualityByMode,
     empty_counts: reportEmptyCounts,

@@ -96,6 +96,16 @@ This document records the binding methodology decisions for the AFT Semble quick
 
 **Required metrics:** Reports must include at least snippets/query, tokens/query, max document tokens, recall, MRR, nDCG, and latency per semantic context mode.
 
+**Compatibility rule:** `legacy` rows strip snippet context after rank 3 before scoring context
+and reranker inputs. File ranking is preserved; only the public context surface is capped. This
+keeps the legacy-vs-budget comparison stable even when the current AFT binary can return more
+than three snippets.
+
+**Feature branch comparison:** Reports should include a dedicated branch-benefit comparison
+that pairs legacy/baseline modes with new branch capabilities: Model2Vec, FTS5 full-text/symbol
+lookup, hybrid retrieval, and token-budget context selection. Recall deltas are displayed in
+percentage points to match the recall tables.
+
 ## Decision 8: Identifier semantic modes are opt-in
 
 **Rule:** Identifier suites default to lexical and symbol-aware modes. Semantic backends are included only when the run explicitly passes `--identifier-semantic true`.

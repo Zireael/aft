@@ -3,10 +3,12 @@ import {
   aggregateMetrics,
   buildEmptyCounts,
   buildLexicalQueriesFromCanon,
+  buildFeatureBranchComparison,
   buildSemanticRuns,
   formatChunkSizeLog,
   groupLexicalQueriesByRepo,
   identifierModePlan,
+  applyLegacySnippetCap,
   ndcgAtK,
   shouldRunIdentifierSemantic,
   symbolResultFromFts5Row,
@@ -119,7 +121,7 @@ describe("pilot benchmark reporting", () => {
 
   it("omits over2048=0 from normal verbose chunk logs and warns only for oversized chunks", () => {
     expect(formatChunkSizeLog("sem-model2vec", ["small chunk"])).toEqual({
-      line: "    CHUNK-SIZE sem-model2vec: 1 chunks, avg=2 max=2",
+      line: "    CHUNK-SIZE sem-model2vec: 1 chunks selected, avg=2 max=2",
       warning: null,
     });
 
@@ -159,5 +161,45 @@ describe("pilot benchmark reporting", () => {
         },
       },
     ]);
+  });
+
+  it("caps legacy semantic snippets to the historical top-three context surface", () => {
+    const results = Array.from({ length: 6 }, (_, i) => ({
+      file: `src/${i}.rs`,
+      snippet: `snippet ${i}`,
+      start_line: i + 1,
+      end_line: i + 2,
+    }));
+
+    const capped = applyLegacySnippetCap(results);
+
+    expect(capped).toHaveLength(6);
+    expect(capped.slice(0, 3).every((result) => result.snippet)).toBe(true);
+    expect(capped.slice(3).every((result) => result.snippet === undefined)).toBe(true);
+    expect(capped.slice(3).every((result) => result.start_line === undefined)).toBe(true);
+  });
+
+  it("builds a feature branch comparison table from suite aggregates", () => {
+    const rows = buildFeatureBranchComparison({
+      semantic_nl: [
+        { mode: "aft-grep", recall: 0.1, mrr: 0.1, ndcg: 0.1, p50_ms: 20, p95_ms: 30, count: 10, empty: 0, snippets_per_query: 0, tokens_per_query: 0, max_doc_tokens: 0 },
+        { mode: "semantic-fe-legacy", recall: 0.5, mrr: 0.4, ndcg: 0.45, p50_ms: 60, p95_ms: 80, count: 10, empty: 0, snippets_per_query: 3, tokens_per_query: 150, max_doc_tokens: 80 },
+        { mode: "semantic-fe-budget", recall: 0.6, mrr: 0.45, ndcg: 0.5, p50_ms: 70, p95_ms: 100, count: 10, empty: 0, snippets_per_query: 10, tokens_per_query: 500, max_doc_tokens: 120 },
+        { mode: "semantic-m2v-budget", recall: 0.7, mrr: 0.55, ndcg: 0.6, p50_ms: 50, p95_ms: 70, count: 10, empty: 0, snippets_per_query: 10, tokens_per_query: 420, max_doc_tokens: 100 },
+        { mode: "hybrid-fe-legacy", recall: 0.85, mrr: 0.7, ndcg: 0.72, p50_ms: 80, p95_ms: 120, count: 10, empty: 0, snippets_per_query: 3, tokens_per_query: 200, max_doc_tokens: 80 },
+        { mode: "hybrid-fe-budget", recall: 0.85, mrr: 0.7, ndcg: 0.72, p50_ms: 82, p95_ms: 125, count: 10, empty: 0, snippets_per_query: 8, tokens_per_query: 520, max_doc_tokens: 120 },
+        { mode: "fts5", recall: 0.4, mrr: 0.3, ndcg: 0.35, p50_ms: 15, p95_ms: 25, count: 10, empty: 0, snippets_per_query: 1, tokens_per_query: 40, max_doc_tokens: 50 },
+      ],
+      identifier_exact: [
+        { mode: "aft-grep", recall: 0.3, mrr: 0.2, ndcg: 0.25, p50_ms: 20, p95_ms: 40, count: 10, empty: 0, snippets_per_query: 0, tokens_per_query: 0, max_doc_tokens: 0 },
+        { mode: "fts5_find_symbol_exact", recall: 0.8, mrr: 0.7, ndcg: 0.75, p50_ms: 8, p95_ms: 12, count: 10, empty: 0, snippets_per_query: 0, tokens_per_query: 0, max_doc_tokens: 0 },
+      ],
+    });
+
+    expect(rows.map((row) => row.featureMode)).toContain("semantic-m2v-budget");
+    expect(rows.map((row) => row.featureMode)).toContain("fts5_find_symbol_exact");
+    expect(rows.find((row) => row.featureMode === "semantic-fe-budget")?.recallDelta).toBeCloseTo(0.1);
+    expect(rows.find((row) => row.featureMode === "fts5_find_symbol_exact")?.recallDeltaPercentagePoints).toBeCloseTo(50);
+    expect(rows.find((row) => row.featureMode === "hybrid-fe-budget")?.snippetDelta).toBeCloseTo(5);
   });
 });

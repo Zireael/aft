@@ -12,6 +12,7 @@ bun run benchmarks/semble/pilot.ts \
   --semantic-api-url http://localhost:8090 \
   --rerank \
   --rerank-url http://localhost:8090 \
+  --rerank-instruction "Given a code search query, retrieve relevant code snippets that answer the query." \
   --context-mode compare \
   --context-total-tokens 4096 \
   --context-per-chunk-tokens 384 \
@@ -22,6 +23,7 @@ bun run benchmarks/semble/pilot.ts \
 # Key flags:
 # - --rerank enables the reranker pass (10x oversampling by default)
 # - --rerank-url points to your reranker endpoint (e.g., GTE-Reranker via vLLM/TEI)
+# - --rerank-instruction passes the model-specific instruction as the `instruct` field
 # - --profile extended runs all canon queries with 3 repetitions for latency stability
 # - --context-mode compare runs legacy and token-budgeted semantic context variants
 
@@ -97,7 +99,7 @@ The benchmark auto-applies this when model name contains "coderankembed". Overri
 
 Some reranker models (e.g., GTE-Reranker) support an instruction prompt:
 ```bash
---rerank-instruction "Given a web search query, retrieve relevant passages that answer the query"
+--rerank-instruction "Given a code search query, retrieve relevant code snippets that answer the query."
 ```
 
 This is sent as the `instruct` field in the `/v1/rerank` request body.
@@ -200,6 +202,22 @@ bun run benchmarks/semble/pilot.ts \
 The soft-overflow budget is intentionally small. It lets AFT include the last useful snippet
 when it crosses the total cap by a little, instead of throwing away near-fit context.
 
+In compare mode, the benchmark applies a compatibility cap to `*-legacy` rows: only the first
+three ranked results keep snippet context. This reproduces the old public semantic output
+surface even when the current AFT binary can return more snippets. Budget rows keep the context
+selected by AFT's token-budget request fields.
+
+The terminal output also includes `FEATURE BRANCH BENEFIT SUMMARY`, a separate table comparing
+legacy/baseline modes (`aft-grep`, legacy FastEmbed/API semantic search) against branch features
+(Model2Vec, FTS5 search/symbol lookup, and token-budget context). Use this table for a quick
+read on whether the branch improved quality, context volume, or latency for each capability.
+Recall deltas in this table are reported in percentage points (`pp`), so `+58.1pp` means recall
+went from, for example, `16.1%` to `74.2%`.
+
+Budget and legacy rows can have identical recall because the base file ranking is unchanged;
+the budget feature changes how much snippet context AFT returns for downstream reranking and
+agent context. In that case, inspect `Tok/q Δ` and `Snip/q Δ` rather than expecting recall to move.
+
 ## Canon files
 
 Checked-in relevance canon at `benchmarks/semble/canon/`:
@@ -247,7 +265,7 @@ bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rer
 bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --oversample 20 --output result.json
 
 # Run with reranker instruction
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-instruction "Given a web search query, retrieve relevant passages" --output result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-instruction "Given a code search query, retrieve relevant code snippets that answer the query." --output result.json
 
 # Run with custom query prompt for embedding
 bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --semantic-api-url http://localhost:8090 --query-prompt "Represent this query for searching relevant code: {query}" --output result.json

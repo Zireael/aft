@@ -23,6 +23,16 @@ Use `--context-mode compare` to benchmark legacy public snippet behavior against
 token-budgeted context path. The JSON report includes recall, MRR, nDCG, latency,
 snippets/query, tokens/query, and max document tokens for each context mode.
 
+In compare mode, `*-legacy` rows intentionally keep snippet context only for the top three
+results. This is a benchmark compatibility cap that reproduces the old public output surface;
+`*-budget` rows use AFT's token-budget request fields.
+
+The terminal output includes a `FEATURE BRANCH BENEFIT SUMMARY` table. It pairs baseline modes
+such as `aft-grep` and legacy FastEmbed/API semantic search against branch capabilities such as
+Model2Vec, FTS5 search/symbol lookup, hybrid retrieval, and token-budget context selection.
+Recall deltas are shown in percentage points (`pp`). When budget and legacy rows have the same
+recall, the budget gain is context volume (`Tok/q`, `Snip/q`) rather than ranking.
+
 Exact/prefix identifier suites default to lexical and symbol-aware modes. Pass
 `--identifier-semantic true` only when you intentionally want semantic backends included in
 identifier suites; otherwise model cold starts can distort lexical timing.
@@ -35,7 +45,18 @@ See `benchmarks/semble/QUICK-BENCHMARK.md` for runner flags and
 For demos and user-readable summaries, use `benchmarks/semble/aft-feature-showcase.ts`. It
 prints a polished report comparing baseline AFT search tools with Retrieval Intelligence
 behavior, including quality notes, speed deltas, active retrieval lanes, context diagnostics,
-and recommendations.
+token-budget semantic context, and recommendations.
+
+The showcase also exercises the FTS5 and exploration tool surface:
+
+- `fts5_index`, `fts5_doctor`, `fts5_search`, `fts5_find_symbol`, and `fts5_read_symbol`
+- `semantic_doctor`
+- `explain_search`, `why_missed`, `aft_orient`, `aft_impact_delta`, and `aft_context_pack`
+
+Only retrieval tools are scored with recall/MRR/nDCG in `pilot.ts`. Exploration and diagnostic
+tools are better showcased with status, latency, structured evidence, and human-readable
+summaries because commands like `fts5_doctor` or `aft_impact_delta` do not have a top-k
+relevance set.
 
 ```bash
 bun run benchmarks/semble/aft-feature-showcase.ts \

@@ -89,6 +89,11 @@ Use `--identifier-semantic true` only when semantic backends should also run aga
 AFT tools with Retrieval Intelligence behavior and explains what changed in terms of quality,
 speed, context, and diagnostics.
 
+It covers both retrieval and exploration commands: FTS5 index/search/symbol/read/doctor,
+semantic doctor, token-budget semantic search, explain/why-missed diagnostics, orientation,
+impact, and context-pack. Retrieval modes belong in scored `pilot.ts` tables; exploration tools
+are shown with status, latency, and evidence summaries.
+
 ```bash
 bun run benchmarks/semble/aft-feature-showcase.ts \
   --binary ./target/release/aft/aft.exe \

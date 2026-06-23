@@ -46,6 +46,13 @@ export interface ComparisonRow {
   laneCount?: number;
   rankingFeatures?: string[];
   enrichmentStates?: string[];
+  snippetCount?: number;
+  tokenCount?: number;
+  contextBudget?: {
+    totalTokens?: number;
+    perCandidateTokens?: number;
+    softOverflowTokens?: number;
+  };
   qualityNotes: string[];
   error?: string;
 }
@@ -223,6 +230,34 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
   const session = new AftSession(config.binary);
   try {
     await configureSession(session, config, { storageSuffix: "ri", fts5: true, intelligence: true });
+    if (!config.skipFts5Index) {
+      diagnostics.push(await diagnosticCall(session, "FTS5 index update", {
+        command: "fts5_index",
+        action: "update",
+      }, Math.max(config.timeoutMs, 60_000), summarizeFts5Index, "Builds the SQLite FTS5 symbol/body/path index used by exact lookup, prefix lookup, full-text search, and hybrid retrieval."));
+    }
+
+    diagnostics.push(await diagnosticCall(session, "FTS5 doctor", {
+      command: "fts5_doctor",
+    }, config.timeoutMs, summarizeFts5Doctor, "Confirms whether FTS5 is compiled, enabled, populated, and healthy before judging search quality."));
+
+    diagnostics.push(await diagnosticCall(session, "FTS5 symbol lookup", {
+      command: "fts5_find_symbol",
+      name: config.symbol,
+      mode: "exact",
+      top_k: config.topK,
+    }, config.timeoutMs, summarizeFts5FindSymbol, "Shows exact symbol lookup over the FTS5 symbol table, the clearest win over plain grep for code navigation."));
+
+    diagnostics.push(await diagnosticCall(session, "FTS5 read symbol", {
+      command: "fts5_read_symbol",
+      name: config.symbol,
+      context_lines: 2,
+    }, config.timeoutMs, summarizeFts5ReadSymbol, "Reads canonical source for a symbol from the index, turning lookup results into usable code context."));
+
+    diagnostics.push(await diagnosticCall(session, "Semantic doctor", {
+      command: "semantic_doctor",
+      probe_provider: false,
+    }, config.timeoutMs, summarizeSemanticDoctor, "Reports semantic backend, index, and metrics health so quality issues can be separated from provider/config problems."));
 
     const semantic = await timedCall(session, {
       command: "semantic_search",
@@ -232,6 +267,19 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
     }, config.timeoutMs);
     riSearch = semantic.response;
     comparisons.push(toComparison("RI v2 semantic_search", "semantic_search", semantic, config));
+
+    const budgetSemantic = await timedCall(session, {
+      command: "semantic_search",
+      query: config.query,
+      top_k: config.topK,
+      diagnostics: true,
+      context_budget_enabled: true,
+      profile: "agent_fast",
+      context_total_tokens: 4096,
+      context_per_candidate_tokens: 384,
+      context_soft_overflow_tokens: 128,
+    }, config.timeoutMs);
+    comparisons.push(toComparison("RI v2 token-budget semantic_search", "semantic_search", budgetSemantic, config));
 
     addSpeedAndQualityDeltas(comparisons);
 
@@ -277,7 +325,7 @@ export async function runShowcase(config: ShowcaseConfig): Promise<ShowcaseRepor
     expectedFile: config.expectedFile,
     topK: config.topK,
     comparisons,
-    featureCards: buildFeatureCards(riSearch, diagnostics, config),
+    featureCards: buildFeatureCards(riSearch, comparisons, diagnostics, config),
     diagnostics,
     recommendations: buildRecommendations(comparisons, diagnostics, config.expectedFile),
   };
@@ -395,6 +443,9 @@ function toComparison(label: string, command: string, timed: TimedResponse, conf
   }));
   const enrichmentStates = uniqueStrings(results.map((result: any) => String(result.enrichment_state || "")).filter(Boolean));
   const laneCount = countLanes(response);
+  const snippetCount = results.filter((result: any) => typeof result.snippet === "string" && result.snippet.length > 0).length;
+  const tokenCount = results.reduce((sum: number, result: any) => sum + approxTokens(String(result.snippet || "")), 0);
+  const contextBudget = extractContextBudget(response);
 
   return {
     label,
@@ -409,8 +460,21 @@ function toComparison(label: string, command: string, timed: TimedResponse, conf
     laneCount,
     rankingFeatures,
     enrichmentStates,
+    snippetCount,
+    tokenCount,
+    contextBudget,
     qualityNotes: buildQualityNotes(label, response, expectedRank, config.expectedFile),
     error: response.success === false ? String(response.message || response.code || "command failed") : undefined,
+  };
+}
+
+function extractContextBudget(response: AftResponse): ComparisonRow["contextBudget"] {
+  const budget = (response.search_plan_debug as any)?.context_budget;
+  if (!budget || typeof budget !== "object") return undefined;
+  return {
+    totalTokens: typeof budget.total_tokens === "number" ? budget.total_tokens : undefined,
+    perCandidateTokens: typeof budget.per_candidate_tokens === "number" ? budget.per_candidate_tokens : undefined,
+    softOverflowTokens: typeof budget.soft_overflow_tokens === "number" ? budget.soft_overflow_tokens : undefined,
   };
 }
 
@@ -461,6 +525,7 @@ function buildQualityNotes(label: string, response: AftResponse, expectedRank: n
   if (expectedFile && expectedRank) notes.push(`expected file found at rank ${expectedRank}`);
   if (expectedFile && !expectedRank) notes.push("expected file not in top results");
   if (response.search_plan_debug) notes.push("search plan emitted");
+  if (label.includes("token-budget")) notes.push("token-budget context request enabled");
   if (response.retrieval_intelligence_provenance) notes.push("RI provenance emitted");
   if ((response as any).semantic_unavailable) notes.push("semantic unavailable surfaced explicitly");
   if ((response as any).lexical_only_fallback) notes.push("lexical fallback surfaced explicitly");
@@ -482,7 +547,7 @@ function addSpeedAndQualityDeltas(rows: ComparisonRow[]): void {
   }
 }
 
-function buildFeatureCards(response: AftResponse | null, diagnostics: DiagnosticRow[], config: ShowcaseConfig): FeatureCard[] {
+function buildFeatureCards(response: AftResponse | null, comparisons: ComparisonRow[], diagnostics: DiagnosticRow[], config: ShowcaseConfig): FeatureCard[] {
   const cards: FeatureCard[] = [];
   const plan = response?.search_plan_debug as any;
   const provenance = response?.retrieval_intelligence_provenance as any;
@@ -520,6 +585,22 @@ function buildFeatureCards(response: AftResponse | null, diagnostics: Diagnostic
     status: diagnostics.some((row) => row.status === "ok") ? "available" : "missing",
     whyItMatters: "Turns search from a list of hits into explainable workflow primitives: orient, why-missed, impact, and context pack.",
     evidence: diagnostics.map((row) => `${row.label}: ${row.status}`),
+  });
+
+  const budgetRow = comparisons.find((row) => row.label.includes("token-budget"));
+  cards.push({
+    title: "Token-budget context",
+    status: budgetRow?.contextBudget ? "available" : "degraded",
+    whyItMatters: "Shows the branch's context-volume improvement separately from ranking quality: more selected snippets can feed reranking and agent context without changing base recall.",
+    evidence: budgetRow
+      ? [
+        `${budgetRow.snippetCount || 0} snippets selected`,
+        `${budgetRow.tokenCount || 0} snippet tokens`,
+        budgetRow.contextBudget
+          ? `budget total=${budgetRow.contextBudget.totalTokens ?? "?"}, per_candidate=${budgetRow.contextBudget.perCandidateTokens ?? "?"}, soft_overflow=${budgetRow.contextBudget.softOverflowTokens ?? 0}`
+          : "context budget debug not present",
+      ]
+      : ["Token-budget semantic search comparison did not run."],
   });
 
   cards.push({
@@ -566,6 +647,60 @@ function summarizeContextPack(response: AftResponse): string {
   const result = (response as any).context_pack_result;
   if (!result) return String(response.message || "No context_pack_result payload.");
   return `${(result.pack || []).length} items, ${result.tokens_used || 0}/${result.token_budget || "?"} tokens used`;
+}
+
+function summarizeFts5Index(response: AftResponse): string {
+  const text = typeof response.text === "string" ? response.text.trim() : "";
+  if (text) return firstLine(text);
+  const indexed = (response as any).indexed_files ?? (response as any).files_indexed;
+  const symbols = (response as any).symbols_indexed ?? (response as any).symbol_count;
+  return `indexed files=${indexed ?? "?"}, symbols=${symbols ?? "?"}`;
+}
+
+function summarizeFts5Doctor(response: AftResponse): string {
+  const text = typeof response.text === "string" ? response.text.trim() : "";
+  if (text) return firstLine(text);
+  const compiled = (response as any).compiled ?? (response as any).fts5_compiled;
+  const enabled = (response as any).enabled ?? (response as any).fts5_enabled;
+  const status = (response as any).status || (response.success === false ? "error" : "ok");
+  return `status=${status}, compiled=${compiled ?? "?"}, enabled=${enabled ?? "?"}`;
+}
+
+function summarizeFts5FindSymbol(response: AftResponse): string {
+  const results = extractResults(response);
+  if (results.length === 0) return String(response.message || "No symbols returned.");
+  const first = results[0] as any;
+  const name = first.symbol_name || first.name || first.symbol || "?";
+  const file = first.file || first.file_path || first.path || "?";
+  return `${results.length} symbol candidates; top ${name} in ${file}`;
+}
+
+function summarizeFts5ReadSymbol(response: AftResponse): string {
+  const text = typeof response.text === "string" ? response.text.trim() : "";
+  if (text) return firstLine(text);
+  const file = (response as any).file || (response as any).file_path || (response as any).path;
+  const source = (response as any).source || (response as any).content || "";
+  return file ? `${file}, ${source.split("\n").filter(Boolean).length} source lines` : String(response.message || "No symbol source returned.");
+}
+
+function summarizeSemanticDoctor(response: AftResponse): string {
+  if (typeof response.summary_line === "string" && response.summary_line.length > 0) {
+    return response.summary_line;
+  }
+  const status = typeof response.status === "string" ? response.status : response.success === false ? "error" : "ok";
+  const config = (response as any).config || {};
+  const backend = config.backend || "?";
+  const model = config.model || "?";
+  return `status=${status}, backend=${backend}, model=${model}`;
+}
+
+function firstLine(text: string): string {
+  return text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() || text;
+}
+
+function approxTokens(text: string): number {
+  if (!text) return 0;
+  return text.split(/\s+/).filter(Boolean).length;
 }
 
 function buildRecommendations(comparisons: ComparisonRow[], diagnostics: DiagnosticRow[], expectedFile: string): string[] {
@@ -622,6 +757,10 @@ export function renderReport(report: ShowcaseReport, options: RenderOptions = { 
     if (row.searchPlanIntent) lines.push(`  SearchPlan: ${row.searchPlanIntent}, safety lane ${row.activeSafetyLane || "unknown"}, ${row.laneCount || 0} lanes`);
     if (row.rankingFeatures?.length) lines.push(`  Ranking features: ${row.rankingFeatures.join(", ")}`);
     if (row.enrichmentStates?.length) lines.push(`  Enrichment states: ${row.enrichmentStates.join(", ")}`);
+    if (typeof row.snippetCount === "number") lines.push(`  Context: ${row.snippetCount} snippets, ${row.tokenCount || 0} snippet tokens`);
+    if (row.contextBudget) {
+      lines.push(`  Budget: total=${row.contextBudget.totalTokens ?? "?"}, per_candidate=${row.contextBudget.perCandidateTokens ?? "?"}, soft_overflow=${row.contextBudget.softOverflowTokens ?? 0}`);
+    }
     if (row.qualityNotes.length) lines.push(`  Notes: ${row.qualityNotes.join("; ")}`);
     if (row.error) lines.push(`  Error: ${row.error}`);
     lines.push("");
@@ -653,11 +792,13 @@ export function renderReport(report: ShowcaseReport, options: RenderOptions = { 
 }
 
 function formatComparisonTable(rows: ComparisonRow[]): string {
-  const headers = ["Mode", "ms", "results", "expected", "top file"];
+  const headers = ["Mode", "ms", "results", "snips", "tokens", "expected", "top file"];
   const body = rows.map((row) => [
     row.label,
     formatMs(row.latencyMs),
     String(row.resultCount),
+    typeof row.snippetCount === "number" ? String(row.snippetCount) : "-",
+    typeof row.tokenCount === "number" ? String(row.tokenCount) : "-",
     row.expectedRank ? `#${row.expectedRank}` : "-",
     row.topFile ? shortenPath(row.topFile, 58) : "-",
   ]);
