@@ -708,6 +708,36 @@ comment, and export list — this lifts recall for filename-shaped concept queri
 
 Parameters: `query` (required — natural language description), `topK` (optional — default 10).
 
+#### Context budget controls
+
+`aft_search` can opt into token-budgeted context enrichment per request. This switches the
+public `semantic_search` response from the legacy rank-tiered snippet cap toward a budgeted
+selection model: include useful snippets until the total budget is reached, cap each snippet,
+and optionally allow the final snippet to cross the total budget by a small soft-overflow
+allowance.
+
+```json
+{
+  "query": "where does request body validation happen",
+  "topK": 10,
+  "context_budget_enabled": true,
+  "context_total_tokens": 4096,
+  "context_per_candidate_tokens": 384,
+  "context_soft_overflow_tokens": 128
+}
+```
+
+| Field | Description |
+|---|---|
+| `context_budget_enabled` | Enables token-budgeted context filtering for this search. Any budget override also enables it. |
+| `context_total_tokens` | Approximate total token budget for returned context snippets. |
+| `context_per_candidate_tokens` | Approximate maximum tokens retained from one candidate snippet. Values below 1 are clamped to 1. |
+| `context_soft_overflow_tokens` | Allows the final included snippet to cross the total budget by this many tokens. This prevents near-fit snippets from being discarded just because they are slightly above the cap. |
+
+When budgeted context is requested, AFT enables the Retrieval Intelligence v2 planning path
+for that request even if the global feature flag is off. Responses include `search_plan_debug`
+with the effective budget when diagnostics are available.
+
 #### Embedding backends
 
 `aft_search` supports three embedding backends. Set them under the `semantic` block in your

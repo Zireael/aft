@@ -87,6 +87,41 @@ struct SemanticSearchParams {
     /// When absent with retrieval_intelligence_v2 enabled, defaults to "agent_fast".
     #[serde(default)]
     profile: Option<String>,
+    /// Enable token-budgeted context filtering for this request. This activates
+    /// the Retrieval Intelligence pipeline even when the global feature flag is
+    /// off.
+    #[serde(default)]
+    context_budget_enabled: Option<bool>,
+    /// Optional request-level override for total context tokens.
+    #[serde(default)]
+    context_total_tokens: Option<usize>,
+    /// Optional request-level override for tokens per enriched candidate.
+    #[serde(default)]
+    context_per_candidate_tokens: Option<usize>,
+    /// Optional request-level soft overflow for the final included candidate.
+    #[serde(default)]
+    context_soft_overflow_tokens: Option<usize>,
+}
+
+impl SemanticSearchParams {
+    fn context_budget_requested(&self) -> bool {
+        self.context_budget_enabled.unwrap_or(false)
+            || self.context_total_tokens.is_some()
+            || self.context_per_candidate_tokens.is_some()
+            || self.context_soft_overflow_tokens.is_some()
+    }
+
+    fn apply_context_budget_overrides(&self, budget: &mut ContextBudget) {
+        if let Some(total_tokens) = self.context_total_tokens {
+            budget.total_tokens = total_tokens;
+        }
+        if let Some(per_candidate_tokens) = self.context_per_candidate_tokens {
+            budget.per_candidate_tokens = per_candidate_tokens.max(1);
+        }
+        if let Some(soft_overflow_tokens) = self.context_soft_overflow_tokens {
+            budget.soft_overflow_tokens = soft_overflow_tokens;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +185,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Build SearchPlan when retrieval_intelligence_v2 is enabled (flag-gated).
     // When flag is false, search_plan_debug is None and output is byte-identical to baseline.
-    let ri_v2_enabled = retrieval_intelligence_v2_enabled(ctx);
+    let ri_v2_enabled = retrieval_intelligence_v2_enabled(ctx) || params.context_budget_requested();
     let search_plan = if ri_v2_enabled {
         let fts5_available = ctx.config().fts5.enabled;
         let safety_ctx = SafetyLaneContext {
@@ -163,6 +198,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 plan.feature_flag_state = FeatureFlagState::On;
                 plan.rerank.enabled = ctx.config().semantic.rerank_enabled;
                 plan.rerank.max_candidates = ctx.config().semantic.rerank_max_candidates;
+                params.apply_context_budget_overrides(&mut plan.context_budget);
                 Some(plan)
             }
             Err(error) => {
@@ -2508,8 +2544,17 @@ fn enrich_context_pool(
             continue;
         }
 
-        // Check if budget is exhausted
-        if total_tokens_used + budget.per_candidate_tokens > budget.total_tokens {
+        let next_tokens_used = total_tokens_used.saturating_add(budget.per_candidate_tokens);
+        let fits_strict = next_tokens_used <= budget.total_tokens;
+        let fits_soft = total_tokens_used < budget.total_tokens
+            && next_tokens_used
+                <= budget
+                    .total_tokens
+                    .saturating_add(budget.soft_overflow_tokens);
+
+        // Check if budget is exhausted. Soft overflow allows exactly the
+        // candidate that crosses the cap; later candidates remain PathOnly.
+        if !fits_strict && !fits_soft {
             // Budget exhausted: PathOnly fallback
             let fallback = match (result.start_line, result.end_line) {
                 (start, end) if end >= start => {
@@ -2552,7 +2597,7 @@ fn enrich_context_pool(
                 result.snippet = snippet;
                 result.enrichment_state = "enriched";
                 enriched_count += 1;
-                total_tokens_used += budget.per_candidate_tokens;
+                total_tokens_used = next_tokens_used;
             } else {
                 // No source lines available: PathOnly fallback
                 result.snippet = format!("{} [budget_exhausted]", result.file.display());
@@ -2834,6 +2879,7 @@ fn search_plan_to_json(plan: &SearchPlan) -> serde_json::Value {
             "total_tokens": plan.context_budget.total_tokens,
             "per_candidate_tokens": plan.context_budget.per_candidate_tokens,
             "min_candidate_chars": plan.context_budget.min_candidate_chars,
+            "soft_overflow_tokens": plan.context_budget.soft_overflow_tokens,
             "mode": format!("{:?}", plan.context_budget.mode),
             "enrich_pool": format!("{:?}", plan.context_budget.enrich_pool),
             "rerank_min_enriched_ratio": plan.context_budget.rerank_min_enriched_ratio,
@@ -3012,6 +3058,26 @@ mod tests {
             "hint": hint,
         }))
         .expect("build semantic search request")
+    }
+
+    fn semantic_request_with_context_budget(
+        query: &str,
+        top_k: usize,
+        total_tokens: usize,
+        per_candidate_tokens: usize,
+        soft_overflow_tokens: usize,
+    ) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "semantic-search-test",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+            "context_budget_enabled": true,
+            "context_total_tokens": total_tokens,
+            "context_per_candidate_tokens": per_candidate_tokens,
+            "context_soft_overflow_tokens": soft_overflow_tokens,
+        }))
+        .expect("build semantic search request with context budget")
     }
 
     fn response_value(response: Response) -> serde_json::Value {
@@ -3296,6 +3362,47 @@ mod tests {
         assert_eq!(response["status"], "ready");
         assert_eq!(response["semantic_status"], "ready");
         assert!(response["results"].as_array().expect("results").is_empty());
+        handle.join().expect("embedding server thread");
+    }
+
+    #[test]
+    fn request_context_budget_enables_public_token_budget_filtering() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let (base_url, handle) = start_mock_embedding_server();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic: SemanticBackendConfig {
+                    backend: SemanticBackend::OpenAiCompatible,
+                    model: "test-embedding".to_string(),
+                    base_url: Some(base_url),
+                    api_key_env: None,
+                    timeout_ms: 5_000,
+                    max_batch_size: 64,
+                    max_files: 20_000,
+                    ..SemanticBackendConfig::default()
+                },
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        *ctx.semantic_index().borrow_mut() =
+            Some(SemanticIndex::new(project.path().to_path_buf(), 384));
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_context_budget("anything", 5, 4096, 384, 128),
+            &ctx,
+        ));
+
+        assert_eq!(
+            response["success"], true,
+            "response should not fail: {response:?}"
+        );
+        let budget = &response["search_plan_debug"]["context_budget"];
+        assert_eq!(budget["total_tokens"], 4096);
+        assert_eq!(budget["per_candidate_tokens"], 384);
+        assert_eq!(budget["soft_overflow_tokens"], 128);
         handle.join().expect("embedding server thread");
     }
 

@@ -11,6 +11,12 @@ function arg(schema: unknown): ToolArg {
   return schema as ToolArg;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 /**
  * aft_semantic_doctor — semantic search health report.
  *
@@ -72,8 +78,8 @@ export function semanticDoctorTools(ctx: PluginContext): Record<string, ToolDefi
       parts.push(`## Semantic Search Health: ${status}`);
 
       // Config
-      const config = response.config;
-      if (config && typeof config === "object") {
+      const config = asRecord(response.config);
+      if (config) {
         const backend = typeof config.backend === "string" ? config.backend : "unknown";
         const model = typeof config.model === "string" ? config.model : "unknown";
         const dimensions = typeof config.dimensions === "number" ? config.dimensions : "unknown";
@@ -81,16 +87,16 @@ export function semanticDoctorTools(ctx: PluginContext): Record<string, ToolDefi
       }
 
       // Index
-      const index = response.index;
-      if (index && typeof index === "object") {
+      const index = asRecord(response.index);
+      if (index) {
         const indexStatus = typeof index.status === "string" ? index.status : "unknown";
         const entryCount = typeof index.entry_count === "number" ? index.entry_count : 0;
         parts.push(`**Index:** ${indexStatus} (${entryCount} entries)`);
       }
 
       // Metrics
-      const metrics = response.metrics;
-      if (metrics && typeof metrics === "object") {
+      const metrics = asRecord(response.metrics);
+      if (metrics) {
         const totalQueries = typeof metrics.total_queries === "number" ? metrics.total_queries : 0;
         const p50 = typeof metrics.p50_latency_ms === "number" ? metrics.p50_latency_ms : 0;
         const p95 = typeof metrics.p95_latency_ms === "number" ? metrics.p95_latency_ms : 0;

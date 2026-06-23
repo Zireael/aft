@@ -60,15 +60,45 @@ bun run benchmarks/semble/baseline-fts5.ts --pilot --k 10 --binary ./target/rele
 
 Runs search against all annotations and produces recall@10, MRR, and latency metrics.
 
-### 3. Run the full pilot
+### 3. Run the pilot
 
 ```bash
-bun run benchmarks/semble/pilot.ts --binary ./target/release/aft --k 10
+bun run benchmarks/semble/pilot.ts --binary ./target/release/aft --profile quick --k 10 --output pilot-report.json
 ```
 
-Compares lexical (ripgrep), AFT grep (trigram-indexed), FTS5, and semantic modes across all 50 queries. Produces a single `pilot-report.json` with aggregate and per-category breakdowns.
+Compares lexical (ripgrep), AFT grep (trigram-indexed), FTS5, symbol lookup, AST, semantic, hybrid, and rerank modes. Natural-language semantic queries and lexical/symbol suites are aggregated separately so exact identifier performance is not averaged into semantic retrieval.
 
-### 4. Check for regressions
+To compare legacy snippet caps with token-budgeted context output:
+
+```bash
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft/aft.exe \
+  --profile quick \
+  --context-mode compare \
+  --context-total-tokens 4096 \
+  --context-per-chunk-tokens 384 \
+  --context-soft-overflow-tokens 128 \
+  --output .aft-bench/context-compare.json
+```
+
+Use `--identifier-semantic true` only when semantic backends should also run against exact/prefix identifier suites.
+
+### 4. Run the feature showcase
+
+`aft-feature-showcase.ts` is a user-facing report, not a scored benchmark. It compares baseline
+AFT tools with Retrieval Intelligence behavior and explains what changed in terms of quality,
+speed, context, and diagnostics.
+
+```bash
+bun run benchmarks/semble/aft-feature-showcase.ts \
+  --binary ./target/release/aft/aft.exe \
+  --project-root D:/Coding/_tools/aft-src \
+  --query "where is semantic search reranking handled" \
+  --expected-file crates/aft/src/commands/semantic_search.rs \
+  --markdown-output .aft-bench/aft-feature-showcase.md
+```
+
+### 5. Check for regressions
 
 ```bash
 bun run benchmarks/semble/ci.ts --baseline baseline.json --current pilot-report.json
@@ -186,7 +216,7 @@ See [METHODOLOGY.md](METHODOLOGY.md) for binding benchmark decisions:
 
 ## Known Limitations
 
-1. **Lexical baseline only** — current scripts run ripgrep; AFT semantic/hybrid modes require the `aft` binary
-2. **Small pilot** — 50 queries across 5 repos; not statistically significant for production decisions
-3. **No reranker** — reranked mode requires AFT binary with reranker configured
-4. **Category imbalance** — more architecture queries than semantic in some repos
+1. **Small pilot** — 50 natural-language queries plus checked-in lexical/path/structural canon; not statistically significant for production decisions
+2. **Seed canon** — lexical/path/structural canon should be reviewed before hard CI gates
+3. **External services** — semantic API and reranked modes require live compatible endpoints
+4. **Local variability** — model cold starts, cache state, and hardware affect latency

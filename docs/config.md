@@ -117,6 +117,16 @@ The schema is identical across harnesses. Only file location differs.
     "cap_per_file": null                // max results per file (null = default from fusion logic)
   },
 
+  // Retrieval Intelligence settings. `retrieval_intelligence_v2` enables the
+  // SearchPlan path globally and adds search-plan debug/provenance fields to
+  // semantic search responses. Per-request `context_budget_enabled`,
+  // `context_total_tokens`, `context_per_candidate_tokens`, and
+  // `context_soft_overflow_tokens` can also enable the budgeted path for a
+  // single aft_search call without changing global config.
+  "intelligence": {
+    "retrieval_intelligence_v2": false
+  },
+
   // Model2Vec backend — a pure-Rust static embedding alternative to fastembed.
   // Requires no ONNX Runtime or C dependencies. Models are downloaded automatically
   // from HuggingFace Hub on first use. Supported models:

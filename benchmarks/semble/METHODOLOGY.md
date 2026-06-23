@@ -82,6 +82,26 @@ This document records the binding methodology decisions for the AFT Semble quick
 
 **Rationale:** Scoring `ast_search` against natural-language queries, or `glob` against identifier queries, produces meaningless zeros that dilute mode-specific aggregates.
 
+## Decision 7: Semantic context cap modes
+
+**Rule:** Semantic modes must label which public AFT context-cap behavior they used:
+
+| Mode | Behavior |
+|---|---|
+| `legacy` | The historical public `semantic_search` snippet policy. Useful as a compatibility baseline. |
+| `budget` | Token-budgeted context filtering with total, per-candidate, and soft-overflow budgets. |
+| `compare` | Runs both legacy and budget variants so quality, latency, snippet count, and token count can be compared side by side. |
+
+**Rationale:** Retrieval quality can change when the reranker and user-facing output receive more than the legacy small snippet set. The benchmark must make that tradeoff visible instead of silently mixing old and new context policies.
+
+**Required metrics:** Reports must include at least snippets/query, tokens/query, max document tokens, recall, MRR, nDCG, and latency per semantic context mode.
+
+## Decision 8: Identifier semantic modes are opt-in
+
+**Rule:** Identifier suites default to lexical and symbol-aware modes. Semantic backends are included only when the run explicitly passes `--identifier-semantic true`.
+
+**Rationale:** Exact and prefix symbol lookup should be judged by lexical/symbol tools first. Starting embedding models during identifier-only runs adds cold-start noise, can trigger unrelated API context-window failures, and makes the lexical benchmark look slower than it is.
+
 ## Included AFT-native modes
 
 | Mode | Command | Notes |

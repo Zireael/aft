@@ -403,6 +403,7 @@ impl SearchPlanBuilder {
                 mode: crate::context_budget::ContextMode::Auto,
                 enrich_pool: crate::context_budget::EnrichPool::FusionPool,
                 rerank_min_enriched_ratio: 0.5,
+                soft_overflow_tokens: 0,
             },
             rerank: RerankPlan {
                 enabled: false,

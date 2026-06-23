@@ -1,5 +1,53 @@
 # Search Benchmarks
 
+## Semble Retrieval Benchmark
+
+The current decision-grade retrieval benchmark lives in `benchmarks/semble/pilot.ts`. It
+compares semantic, hybrid, rerank, FTS5, trigram grep, path, prefix, exact-symbol, and
+structural search behavior against checked-in relevance canon. Natural-language semantic
+queries and lexical/symbol suites are reported separately; do not average them into one
+leaderboard.
+
+```bash
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft/aft.exe \
+  --profile quick \
+  --context-mode compare \
+  --context-total-tokens 4096 \
+  --context-per-chunk-tokens 384 \
+  --context-soft-overflow-tokens 128 \
+  --output .aft-bench/context-compare.json
+```
+
+Use `--context-mode compare` to benchmark legacy public snippet behavior against the new
+token-budgeted context path. The JSON report includes recall, MRR, nDCG, latency,
+snippets/query, tokens/query, and max document tokens for each context mode.
+
+Exact/prefix identifier suites default to lexical and symbol-aware modes. Pass
+`--identifier-semantic true` only when you intentionally want semantic backends included in
+identifier suites; otherwise model cold starts can distort lexical timing.
+
+See `benchmarks/semble/QUICK-BENCHMARK.md` for runner flags and
+`benchmarks/semble/METHODOLOGY.md` for scoring rules.
+
+## Feature Showcase
+
+For demos and user-readable summaries, use `benchmarks/semble/aft-feature-showcase.ts`. It
+prints a polished report comparing baseline AFT search tools with Retrieval Intelligence
+behavior, including quality notes, speed deltas, active retrieval lanes, context diagnostics,
+and recommendations.
+
+```bash
+bun run benchmarks/semble/aft-feature-showcase.ts \
+  --binary ./target/release/aft/aft.exe \
+  --project-root D:/Coding/_tools/aft-src \
+  --query "where is semantic search reranking handled" \
+  --expected-file crates/aft/src/commands/semantic_search.rs \
+  --markdown-output .aft-bench/aft-feature-showcase.md
+```
+
+## Trigram Grep Baseline
+
 With `search_index: true`, AFT builds a trigram index in the background and serves
 grep queries from memory. Here's how it compares to ripgrep on real codebases.
 

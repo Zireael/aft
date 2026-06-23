@@ -19,11 +19,12 @@
  *   --rerank-model <name>    Reranker model (default: GTE-Reranker-Modernbert)
  *   --rerank-url <url>       Reranker endpoint (default: http://127.0.0.1:8090/v1/rerank)
  *   --include-lexical        Include lexical identifier queries (default: true)
+ *   --identifier-semantic    Include semantic backends in identifier suites (default: false)
  *   --output <file>          JSON report output path
  *   --verbose, -v            Per-query debug output
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { AftSession } from "./aft-ndjson";
@@ -43,6 +44,7 @@ interface SearchResult {
   snippet?: string;
   start_line?: number;
   end_line?: number;
+  symbol_id?: number;
 }
 
 interface ContextQuality {
@@ -67,16 +69,19 @@ interface ContextQuality {
   benchmark_harness_latency_p95_ms: number;
 }
 
-interface ModeResult {
+export interface ModeResult {
   mode: string;
   query: string;
   repo_name: string;
   category: string;
+  suite: string;
   latency_ms: number;
   results: SearchResult[];
   recall_at_k: number;
   mrr: number;
   ndcg_at_k: number;
+  status?: "ok" | "empty" | "unavailable" | "error";
+  reason?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,13 +104,22 @@ function approxTokens(text: string): number {
   return count;
 }
 
-function logChunkSizes(label: string, chunks: string[], verbose: boolean): void {
-  if (!verbose || chunks.length === 0) return;
+export function formatChunkSizeLog(label: string, chunks: string[]): { line: string; warning: string | null } {
   const sizes = chunks.map(approxTokens);
   const over = sizes.filter((s) => s > 2048).length;
   const max = Math.max(...sizes);
   const avg = Math.round(sizes.reduce((a, b) => a + b, 0) / sizes.length);
-  console.log(`    CHUNK-SIZE ${label}: ${chunks.length} chunks, avg=${avg} max=${max} over2048=${over}`);
+  return {
+    line: `    CHUNK-SIZE ${label}: ${chunks.length} chunks, avg=${avg} max=${max}`,
+    warning: over > 0 ? `    \x1b[0;33mWARNING ${label}: ${over} chunk(s) >2048 tokens; max=${max}\x1b[0m` : null,
+  };
+}
+
+function logChunkSizes(label: string, chunks: string[], verbose: boolean): void {
+  if (!verbose || chunks.length === 0) return;
+  const formatted = formatChunkSizeLog(label, chunks);
+  console.log(formatted.line);
+  if (formatted.warning) console.log(formatted.warning);
 }
 
 interface AggregateMode {
@@ -117,6 +131,9 @@ interface AggregateMode {
   p95_ms: number;
   count: number;
   empty: number;
+  snippets_per_query: number;
+  tokens_per_query: number;
+  max_doc_tokens: number;
 }
 
 interface IntentMetric {
@@ -185,6 +202,8 @@ function canonicalIntent(category: string | undefined): string {
       return "NaturalLanguage";
     case "symbol":
     case "identifier":
+    case "identifier_exact":
+    case "identifier_prefix":
     case "exact_symbol":
     case "exactsymbol":
       return "ExactSymbol";
@@ -224,14 +243,16 @@ function mrr(retrieved: SearchResult[], relevant: string[]): number {
   return 0;
 }
 
-function ndcgAtK(retrieved: SearchResult[], relevant: string[], k: number): number {
+export function ndcgAtK(retrieved: SearchResult[], relevant: string[], k: number): number {
   if (!retrieved) return 0;
   const relSet = new Set(relevant.map(normalizePath));
   let dcg = 0;
   const matched = new Set<string>();
   for (let i = 0; i < Math.min(k, retrieved.length); i++) {
     const rf = normalizePath(retrieved[i].file);
+    if (!rf) continue;
     for (const r of relSet) {
+      if (!r) continue;
       if (!matched.has(r) && (rf.endsWith(r) || r.endsWith(rf))) {
         matched.add(r);
         dcg += 1 / Math.log2(i + 2);
@@ -251,10 +272,13 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, idx)];
 }
 
-function aggregateMetrics(rows: ModeResult[], totalQueries: number): AggregateMode {
+export function aggregateMetrics(rows: ModeResult[], totalQueries: number): AggregateMode {
   const mode = rows.length > 0 ? rows[0].mode : "unknown";
   const n = rows.length;
   const latencies = rows.map((r) => r.latency_ms).sort((a, b) => a - b);
+  const snippetCounts = rows.map((row) => row.results.filter((result) => (result.snippet || "").length > 0).length);
+  const tokenCounts = rows.map((row) => row.results.reduce((sum, result) => sum + approxTokens(result.snippet || ""), 0));
+  const maxDocTokens = rows.flatMap((row) => row.results.map((result) => approxTokens(result.snippet || "")));
   return {
     mode,
     recall: n > 0 ? rows.reduce((s, r) => s + r.recall_at_k, 0) / n : 0,
@@ -263,7 +287,222 @@ function aggregateMetrics(rows: ModeResult[], totalQueries: number): AggregateMo
     p50_ms: percentile(latencies, 50),
     p95_ms: percentile(latencies, 95),
     count: n,
-    empty: totalQueries - n,
+    empty: Math.max(0, totalQueries - n),
+    snippets_per_query: n > 0 ? rows.reduce((s, _row, i) => s + snippetCounts[i], 0) / n : 0,
+    tokens_per_query: n > 0 ? rows.reduce((s, _row, i) => s + tokenCounts[i], 0) / n : 0,
+    max_doc_tokens: maxDocTokens.length > 0 ? Math.max(...maxDocTokens) : 0,
+  };
+}
+
+export function splitAggregatesBySuite(
+  rows: ModeResult[],
+  suiteTotals: Record<string, number>,
+): { semantic: AggregateMode[]; lexical: AggregateMode[]; bySuite: Record<string, AggregateMode[]> } {
+  const bySuiteMode = new Map<string, ModeResult[]>();
+  for (const row of rows) {
+    const suite = row.suite || row.category || "semantic_nl";
+    const key = `${suite}\0${row.mode}`;
+    if (!bySuiteMode.has(key)) bySuiteMode.set(key, []);
+    bySuiteMode.get(key)!.push(row);
+  }
+
+  const bySuite: Record<string, AggregateMode[]> = {};
+  for (const [key, suiteRows] of bySuiteMode) {
+    const [suite] = key.split("\0");
+    if (!bySuite[suite]) bySuite[suite] = [];
+    bySuite[suite].push(aggregateMetrics(suiteRows, suiteTotals[suite] ?? suiteRows.length));
+  }
+
+  for (const metrics of Object.values(bySuite)) {
+    metrics.sort((a, b) => b.recall - a.recall);
+  }
+
+  return {
+    semantic: bySuite.semantic_nl ?? [],
+    lexical: Object.entries(bySuite)
+      .filter(([suite]) => suite !== "semantic_nl")
+      .flatMap(([, metrics]) => metrics)
+      .sort((a, b) => b.recall - a.recall),
+    bySuite,
+  };
+}
+
+export interface LexicalBenchmarkQuery {
+  id: string;
+  query: string;
+  repos: string[];
+  repo_name: string;
+  category: string;
+  suite: "identifier_exact" | "identifier_prefix";
+  relevant: string[];
+  secondary: string[];
+}
+
+export function buildLexicalQueriesFromCanon(canonDir: string, repoFilters = new Set<string>()): LexicalBenchmarkQuery[] {
+  const suites = [
+    ["identifier_exact", loadCanonSuite(resolve(canonDir), "identifier_exact")],
+    ["identifier_prefix", loadCanonSuite(resolve(canonDir), "identifier_prefix")],
+  ] as const;
+  const queries: LexicalBenchmarkQuery[] = [];
+
+  for (const [suite, canon] of suites) {
+    for (const q of canon?.queries || []) {
+      if (repoFilters.size > 0 && !repoFilters.has(q.repo_name)) continue;
+      const relevant = (q.relevant || []).map((r: any) => r.path).filter(Boolean);
+      const secondary = (q.secondary || []).map((r: any) => r.path).filter(Boolean);
+      if (relevant.length + secondary.length === 0) continue;
+      queries.push({
+        id: q.id || `${q.repo_name}.${suite}.${q.query}`,
+        query: q.query,
+        repos: [q.repo_name],
+        repo_name: q.repo_name,
+        category: suite,
+        suite,
+        relevant,
+        secondary,
+      });
+    }
+  }
+
+  return queries;
+}
+
+export function groupLexicalQueriesByRepo(
+  queries: LexicalBenchmarkQuery[],
+): Array<[string, LexicalBenchmarkQuery[]]> {
+  const byRepo = new Map<string, LexicalBenchmarkQuery[]>();
+  for (const query of queries) {
+    for (const repo of query.repos) {
+      if (!byRepo.has(repo)) byRepo.set(repo, []);
+      byRepo.get(repo)!.push(query);
+    }
+  }
+
+  return [...byRepo.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([repo, repoQueries]) => [
+      repo,
+      [...repoQueries].sort((a, b) => {
+        const suiteOrder = a.suite.localeCompare(b.suite);
+        return suiteOrder !== 0 ? suiteOrder : a.id.localeCompare(b.id);
+      }),
+    ]);
+}
+
+export function shouldRunIdentifierSemantic(_profileName: string, explicit: boolean | undefined): boolean {
+  return explicit === true;
+}
+
+export function identifierModePlan(
+  suite: "identifier_exact" | "identifier_prefix",
+  backends: string[],
+  includeSemantic: boolean,
+): string[] {
+  const modes = [
+    "lexical (rg)",
+    "aft-grep",
+    "fts5",
+    suite === "identifier_exact" ? "fts5_find_symbol_exact" : "fts5_find_symbol_prefix",
+  ];
+  if (includeSemantic) {
+    modes.push(...backends.map((be) => (
+      be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api"
+    )));
+  }
+  return modes;
+}
+
+export type ContextBenchmarkMode = "legacy" | "budget" | "compare";
+
+export interface ContextBudgetOptions {
+  totalTokens?: number;
+  perChunkTokens?: number;
+  softOverflowTokens?: number;
+}
+
+export interface SemanticRun {
+  key: string;
+  backend: string;
+  variant: "legacy" | "budget";
+  modeSuffix: string;
+  retrievalIntelligenceV2: boolean;
+  request: Record<string, unknown>;
+}
+
+export function buildSemanticRuns(
+  backends: string[],
+  contextMode: ContextBenchmarkMode,
+  budget: ContextBudgetOptions,
+): SemanticRun[] {
+  const variants: Array<"legacy" | "budget"> = contextMode === "compare"
+    ? ["legacy", "budget"]
+    : [contextMode];
+  const includeSuffix = contextMode === "compare" || contextMode === "budget";
+
+  return backends.flatMap((backend) => variants.map((variant) => {
+    const request: Record<string, unknown> = {};
+    if (variant === "budget") {
+      request.context_budget_enabled = true;
+      request.profile = "agent_fast";
+      if (budget.totalTokens !== undefined) request.context_total_tokens = budget.totalTokens;
+      if (budget.perChunkTokens !== undefined) request.context_per_candidate_tokens = budget.perChunkTokens;
+      if (budget.softOverflowTokens !== undefined) request.context_soft_overflow_tokens = budget.softOverflowTokens;
+    }
+
+    return {
+      key: `${backend}:${variant}`,
+      backend,
+      variant,
+      modeSuffix: includeSuffix ? `-${variant}` : "",
+      retrievalIntelligenceV2: variant === "budget",
+      request,
+    };
+  }));
+}
+
+function semanticModeName(run: SemanticRun): string {
+  const base = run.backend === "model2vec" ? "semantic-m2v" : run.backend === "fastembed" ? "semantic-fe" : "semantic-api";
+  return `${base}${run.modeSuffix}`;
+}
+
+export function buildEmptyCounts(rows: ModeResult[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    if (row.status !== "empty") continue;
+    const key = `${row.suite || row.category || "unknown"}/${row.mode}`;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function scoredRow(opts: {
+  mode: string;
+  query: string;
+  repo_name: string;
+  category: string;
+  suite: string;
+  latency_ms: number;
+  results: SearchResult[];
+  relevant: string[];
+  k: number;
+  status?: ModeResult["status"];
+  reason?: string;
+}): ModeResult {
+  const status = opts.status ?? (opts.results.length > 0 ? "ok" : "empty");
+  const scoreable = status === "ok";
+  return {
+    mode: opts.mode,
+    query: opts.query,
+    repo_name: opts.repo_name,
+    category: opts.category,
+    suite: opts.suite,
+    latency_ms: opts.latency_ms,
+    results: opts.results,
+    recall_at_k: scoreable ? recallAtK(opts.results, opts.relevant, opts.k) : 0,
+    mrr: scoreable ? mrr(opts.results, opts.relevant) : 0,
+    ndcg_at_k: scoreable ? ndcgAtK(opts.results, opts.relevant, opts.k) : 0,
+    status,
+    reason: opts.reason,
   };
 }
 
@@ -298,26 +537,6 @@ function aggregateIntentMetrics(
   }
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// Lexical queries (ported from search-bench-v2.py)
-// ---------------------------------------------------------------------------
-
-const LEXICAL_QUERIES = [
-  { query: "validate_path", repos: ["aft"], category: "identifier" },
-  { query: "BinaryBridge", repos: ["aft"], category: "identifier" },
-  { query: "fn handle_grep", repos: ["aft"], category: "identifier" },
-  { query: "experimental_search_index", repos: ["aft"], category: "identifier" },
-  { query: "BlockNumber", repos: ["reth"], category: "identifier" },
-  { query: "fn execute", repos: ["reth"], category: "identifier" },
-  { query: "EthApiError", repos: ["reth"], category: "identifier" },
-  { query: "impl Display for", repos: ["reth"], category: "identifier" },
-];
-
-const LEXICAL_REPOS = [
-  { name: "aft", language: "rust", url: "https://github.com/cortexkit/aft.git", benchmark_root: null },
-  { name: "reth", language: "rust", url: "https://github.com/paradigmxyz/reth.git", benchmark_root: null },
-];
 
 // ---------------------------------------------------------------------------
 // External reranking
@@ -507,6 +726,52 @@ async function fts5Query(session: AftSession, query: string, k: number, verbose:
   return [];
 }
 
+export function symbolResultFromFts5Row(row: any, fallbackFile = ""): SearchResult {
+  return {
+    file: row.file_path || row.path || row.file || fallbackFile || "",
+    line: row.start_line || row.line,
+    score: row.score,
+    symbol_id: typeof row.symbol_id === "number" ? row.symbol_id : undefined,
+  };
+}
+
+async function resolveFts5SymbolFile(session: AftSession, row: any, verbose: boolean): Promise<string> {
+  const symbolId = typeof row.symbol_id === "number" ? row.symbol_id : undefined;
+  if (!symbolId) return "";
+  try {
+    const resp = await session.call({ command: "fts5_read_symbol", symbol_id: symbolId, context_lines: 0 }, 30_000);
+    return String((resp as any).file_path || "");
+  } catch (e) {
+    if (verbose) console.log(`    FTS5 read-symbol fallback ERROR: ${e}`);
+    return "";
+  }
+}
+
+async function fts5FindSymbolQuery(
+  session: AftSession,
+  name: string,
+  mode: "exact" | "prefix",
+  k: number,
+  verbose: boolean,
+): Promise<SearchResult[]> {
+  try {
+    const resp = await session.call({ command: "fts5_find_symbol", name, mode, top_k: k }, 30_000);
+    const items = (resp as any).symbols || (resp as any).results || (resp as any).evidence || (resp as any).matches;
+    if (items && Array.isArray(items)) {
+      const results: SearchResult[] = [];
+      for (const r of items) {
+        const initial = symbolResultFromFts5Row(r);
+        if (!initial.file) {
+          initial.file = await resolveFts5SymbolFile(session, r, verbose);
+        }
+        results.push(initial);
+      }
+      return results;
+    }
+  } catch (e) { if (verbose) console.log(`    FTS5 find-symbol ${mode} ERROR: ${e}`); }
+  return [];
+}
+
 // ---------------------------------------------------------------------------
 // Semantic mode — persistent session per repo
 // ---------------------------------------------------------------------------
@@ -514,6 +779,7 @@ async function fts5Query(session: AftSession, query: string, k: number, verbose:
 async function initSemanticSession(
   bin: string, targetDir: string, model: string, backend: string,
   verbose: boolean, storageDir?: string, queryPromptOverride?: string,
+  retrievalIntelligenceV2?: boolean,
 ): Promise<AftSession | null> {
   const session = new AftSession(bin);
   try {
@@ -523,6 +789,9 @@ async function initSemanticSession(
       storage_dir: storageDir || join(targetDir, ".aft-bench"),
       semantic_search: true,
     };
+    if (retrievalIntelligenceV2 !== undefined) {
+      config.intelligence = { retrieval_intelligence_v2: retrievalIntelligenceV2 };
+    }
     if (backend === "semantic-api") {
       const url = (globalThis as any).__SEMANTIC_API_URL || "";
       const modelName = (globalThis as any).__SEMANTIC_API_MODEL || "";
@@ -566,9 +835,9 @@ async function initSemanticSession(
   }
 }
 
-async function semanticQuery(session: AftSession, query: string, k: number, backend: string, verbose: boolean): Promise<SearchResult[]> {
+async function semanticQuery(session: AftSession, query: string, k: number, run: SemanticRun, verbose: boolean): Promise<SearchResult[]> {
   try {
-    const resp = await session.call({ command: "semantic_search", query, topK: k }, 30_000);
+    const resp = await session.call({ command: "semantic_search", query, topK: k, ...run.request }, 30_000);
     const items = (resp as any).results;
     if (items && Array.isArray(items)) {
       const results = items.map((r: any) => ({
@@ -581,10 +850,10 @@ async function semanticQuery(session: AftSession, query: string, k: number, back
       }));
       // Log snippet sizes for token budget analysis
       const snippets = results.map((r) => r.snippet || "").filter((s) => s.length > 0);
-      logChunkSizes(`sem-${backend}`, snippets, verbose);
+      logChunkSizes(`sem-${run.backend}${run.modeSuffix}`, snippets, verbose);
       return results;
     }
-  } catch (e) { if (verbose) console.log(`    SEM-${backend} ERROR: ${e}`); }
+  } catch (e) { if (verbose) console.log(`    SEM-${run.backend}${run.modeSuffix} ERROR: ${e}`); }
   return [];
 }
 
@@ -667,13 +936,25 @@ function printHeader(opts: {
   semanticCount: number; lexicalCount: number; repos: string[];
   discovery?: ModelDiscoveryResult;
   m2vModel?: string; feModel?: string; oversample?: number;
+  profileName: string; identifierSemantic: boolean;
+  contextMode: ContextBenchmarkMode; contextBudget: ContextBudgetOptions;
 }) {
   const W = "\x1b[1;37m", D = "\x1b[0;90m", N = "\x1b[0m";
   const bar = "═".repeat(65);
   console.log(`\n${W}${bar}${N}`);
   console.log(`${W}  AFT Search Benchmark${N}`);
   console.log(`${W}${bar}${N}`);
-  console.log(`${D}  k=${opts.k}  repos=${opts.repos.join(", ")}  queries=${opts.semanticCount} NL + ${opts.lexicalCount} identifier${opts.rerank ? `  oversample=${opts.oversample}` : ""}${N}`);
+  console.log(`${D}  profile=${opts.profileName}  k=${opts.k}  repos=${opts.repos.join(", ")}  queries=${opts.semanticCount} NL + ${opts.lexicalCount} identifier${opts.rerank ? `  oversample=${opts.oversample}` : ""}${N}`);
+  console.log(`${D}  identifier suites: lexical-symbol modes${opts.identifierSemantic ? " + semantic comparison" : " (semantic comparison off)"}${N}`);
+  const budgetBits = [
+    opts.contextBudget.totalTokens !== undefined ? `total=${opts.contextBudget.totalTokens}` : "",
+    opts.contextBudget.perChunkTokens !== undefined ? `per_chunk=${opts.contextBudget.perChunkTokens}` : "",
+    opts.contextBudget.softOverflowTokens !== undefined ? `soft_overflow=${opts.contextBudget.softOverflowTokens}` : "",
+  ].filter(Boolean).join(" ");
+  console.log(`${D}  semantic context: ${opts.contextMode}${budgetBits ? ` (${budgetBits})` : ""}${N}`);
+  if (opts.contextMode === "legacy") {
+    console.log(`${D}  note: legacy public semantic_search display snippets are rank-tiered: top hit fuller, ranks 2-3 short, rank 4+ path/header only${N}`);
+  }
 
   // Use discovered models if available, otherwise fall back to hardcoded
   if (opts.discovery && opts.discovery.models.length > 0) {
@@ -713,18 +994,20 @@ function printTable(title: string, metrics: AggregateMode[], rerankMetrics?: Rec
   console.log(`\n${W}${bar}${N}`);
   console.log(`${W}  ${title}${N}`);
   console.log(`${W}${bar}${N}`);
-  console.log(`  ${"Mode".padEnd(24)} ${"Recall".padStart(7)} ${"MRR".padStart(7)} ${"nDCG".padStart(7)} ${"p50(ms)".padStart(8)} ${"p95(ms)".padStart(8)} ${"Queries".padStart(9)}`);
-  console.log(`  ${"─".repeat(24)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(8)} ${"─".repeat(8)} ${"─".repeat(9)}`);
+  console.log(`  ${"Mode".padEnd(24)} ${"Recall".padStart(7)} ${"MRR".padStart(7)} ${"nDCG".padStart(7)} ${"Tok/q".padStart(7)} ${"Snip/q".padStart(7)} ${"p50(ms)".padStart(8)} ${"p95(ms)".padStart(8)} ${"Queries".padStart(9)}`);
+  console.log(`  ${"─".repeat(24)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(7)} ${"─".repeat(8)} ${"─".repeat(8)} ${"─".repeat(9)}`);
 
   for (const m of metrics) {
     const recall = `${(m.recall * 100).toFixed(1)}%`;
     const mrr = m.mrr.toFixed(3);
     const ndcg = m.ndcg.toFixed(3);
+    const tokens = m.tokens_per_query.toFixed(0);
+    const snippets = m.snippets_per_query.toFixed(1);
     const p50 = m.p50_ms.toFixed(0);
     const p95 = m.p95_ms.toFixed(0);
     const queries = m.empty > 0 ? `${m.count}/${m.count + m.empty}` : `${m.count}/${m.count}`;
     const color = m.recall > 0.6 ? G : m.recall > 0.3 ? Y : "";
-    console.log(`  ${color}${m.mode.padEnd(24)}${N} ${recall.padStart(7)} ${mrr.padStart(7)} ${ndcg.padStart(7)} ${p50.padStart(8)} ${p95.padStart(8)} ${queries.padStart(9)}`);
+    console.log(`  ${color}${m.mode.padEnd(24)}${N} ${recall.padStart(7)} ${mrr.padStart(7)} ${ndcg.padStart(7)} ${tokens.padStart(7)} ${snippets.padStart(7)} ${p50.padStart(8)} ${p95.padStart(8)} ${queries.padStart(9)}`);
   }
 
   if (rerankMetrics) {
@@ -760,6 +1043,9 @@ async function main() {
   let interactive = false;
   let rerankContext = "aft_output"; // default: aft_output (WARNING 3)
   let profileName = "quick";
+  let identifierSemanticExplicit: boolean | undefined;
+  let contextMode: ContextBenchmarkMode = "legacy";
+  const contextBudget: ContextBudgetOptions = {};
   const repoFilters = new Set<string>();
 
   for (let i = 0; i < args.length; i++) {
@@ -781,6 +1067,18 @@ async function main() {
       case "--query-prompt": queryPrompt = args[++i]; break;
       case "--oversample": oversample = parseInt(args[++i], 10) || 10; break;
       case "--rerank-instruction": RERANK_INSTRUCTION = args[++i]; break;
+      case "--context-mode": {
+        const val = args[++i] as ContextBenchmarkMode;
+        if (val !== "legacy" && val !== "budget" && val !== "compare") {
+          console.error(`Error: unknown --context-mode: "${val}". Valid modes: legacy, budget, compare`);
+          process.exit(1);
+        }
+        contextMode = val;
+        break;
+      }
+      case "--context-total-tokens": contextBudget.totalTokens = parseInt(args[++i], 10); break;
+      case "--context-per-chunk-tokens": contextBudget.perChunkTokens = parseInt(args[++i], 10); break;
+      case "--context-soft-overflow-tokens": contextBudget.softOverflowTokens = parseInt(args[++i], 10); break;
       case "--rerank-context": {
         const val = args[++i];
         if (val !== "aft_output" && val !== "benchmark_enriched" && val !== "path_only") {
@@ -791,16 +1089,22 @@ async function main() {
         break;
       }
       case "--include-lexical": includeLexical = args[++i] !== "false"; break;
+      case "--identifier-semantic": identifierSemanticExplicit = args[++i] !== "false"; break;
       case "--interactive": interactive = true; break;
       case "--help": case "-h":
         console.log("Usage: bun run benchmarks/semble/pilot.ts --binary <path> [options]");
-        console.log("  --profile <name>          smoke|quick|full label for report/preflight (default: quick)");
+        console.log("  --profile <name>          smoke|quick|full");
         console.log("  --repo <name>             Limit to repo name or owner/name, e.g. aft or cortexkit/aft");
         console.log("  --k, --backend, --rerank, --semantic-api-url, --verbose");
         console.log("  --oversample <n>           Reranker oversampling multiplier (default: 10)");
         console.log("  --rerank-context <mode>    Reranker context mode: aft_output (default), benchmark_enriched, path_only");
         console.log("  --rerank-instruction <txt> Instruction prompt for reranker model");
         console.log("  --query-prompt <txt>       Query prompt template for embedding model");
+        console.log("  --identifier-semantic <bool> Include semantic backends in identifier suites");
+        console.log("  --context-mode <mode>      legacy|budget|compare semantic context behavior (default: legacy)");
+        console.log("  --context-total-tokens <n> Total context token budget for budget/compare modes");
+        console.log("  --context-per-chunk-tokens <n> Per chunk token budget for budget/compare modes");
+        console.log("  --context-soft-overflow-tokens <n> Allow one chunk to overflow total budget by this much");
         process.exit(0);
     }
   }
@@ -808,6 +1112,7 @@ async function main() {
   if (profileName === "smoke" && !args.includes("--k")) {
     k = 5;
   }
+  const identifierSemantic = shouldRunIdentifierSemantic(profileName, identifierSemanticExplicit);
 
   // Normalize rerank URL: append /v1/rerank if not present
   if (rerankUrl && !rerankUrl.includes("/v1/rerank") && !rerankUrl.includes("/rerank")) {
@@ -853,6 +1158,11 @@ async function main() {
     queryHoldOut.set(ann.query, ann.hold_out === true);
   }
 
+  const canonDir = resolve("benchmarks/semble/canon");
+  const lexicalQueries = includeLexical
+    ? buildLexicalQueriesFromCanon(canonDir, repoFilters)
+    : [];
+
   // Build backends list (split comma-separated)
   const backends: string[] = [];
   for (const b of semanticBackend.split(',')) {
@@ -866,9 +1176,9 @@ async function main() {
     }
     backends.push(trimmed);
   }
+  const semanticRuns = buildSemanticRuns(backends, contextMode, contextBudget);
 
   // Run preflight checks
-  const canonDir = resolve("benchmarks/semble/canon");
   if (existsSync(canonDir)) {
     const preflightConfig = {
       profile: { name: profileName, allow_seed_canon: includeLexical } as any,
@@ -907,9 +1217,7 @@ async function main() {
   // Collect all repos
   const allRepos = new Set<string>();
   for (const ann of allAnnotations) allRepos.add(ann.repo_name);
-  for (const lr of LEXICAL_REPOS) {
-    if (repoFilters.size === 0 || repoFilters.has(lr.name)) allRepos.add(lr.name);
-  }
+  for (const lq of lexicalQueries) allRepos.add(lq.repo_name);
 
   // Discover models from API endpoints if available
   let discovery: ModelDiscoveryResult | undefined;
@@ -971,17 +1279,21 @@ async function main() {
   printHeader({
     backends, k, rerank: doRerank, rerankModel, rerankUrl,
     apiUrl: apiUrl || undefined, apiModel: apiModel || undefined,
-    semanticCount: allAnnotations.length, lexicalCount: includeLexical ? LEXICAL_QUERIES.length : 0,
+    semanticCount: allAnnotations.length, lexicalCount: lexicalQueries.length,
     repos: [...allRepos],
     discovery,
     m2vModel: semanticModel,
     feModel: "all-MiniLM-L6-v2",
     oversample,
+    profileName,
+    identifierSemantic,
+    contextMode,
+    contextBudget,
   });
 
   // Check which repos are available, auto-clone missing ones
   const availableRepos = new Set<string>();
-  const allRepoDefs = [...fixture.repos, ...LEXICAL_REPOS];
+  const allRepoDefs = [...fixture.repos];
   for (const repoName of allRepos) {
     const repoDir = join(resolve(cacheDir), repoName);
     if (existsSync(repoDir)) {
@@ -1005,11 +1317,11 @@ async function main() {
   if (skippedRepos.length > 0) {
     console.log(`  Skipping (unavailable): ${skippedRepos.join(", ")}`);
   }
+  const runnableLexicalQueries = lexicalQueries.filter((q) => q.repos.some((repo) => availableRepos.has(repo)));
 
   // Run semantic NL queries
   const allResults: ModeResult[] = [];
   const rerankResults: Record<string, RerankMetrics> = {};
-  const emptyCounts: Record<string, number> = {};
 
   // Per-query context quality tracking (accumulated during rerank)
   const perQueryCQ: Array<{ mode: string; cq: Partial<ContextQuality> & { recall_at_k: number; hold_out: boolean; intent: string; harness_lat_ms: number; engine_latency_ms: number } }> = [];
@@ -1037,10 +1349,10 @@ async function main() {
       currentRepo = ann.repo_name;
       console.log(`\n  Initializing sessions for ${ann.repo_name}...`);
 
-      for (const be of backends) {
-        const storageDir = join(targetDir, `.aft-bench-${be}`);
-        const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : be === "semantic-api" ? apiModel : semanticModel;
-        semSessions[be] = await initSemanticSession(bin, targetDir, beModel, be, verbose, storageDir, queryPrompt);
+      for (const run of semanticRuns) {
+        const storageDir = join(targetDir, `.aft-bench-${run.backend}-${run.variant}`);
+        const beModel = run.backend === "fastembed" ? "all-MiniLM-L6-v2" : run.backend === "semantic-api" ? apiModel : semanticModel;
+        semSessions[run.key] = await initSemanticSession(bin, targetDir, beModel, run.backend, verbose, storageDir, queryPrompt, run.retrievalIntelligenceV2);
       }
       fts5Session = await initFts5Session(bin, targetDir, verbose);
       grepSession = await initGrepSession(bin, targetDir, verbose);
@@ -1053,45 +1365,49 @@ async function main() {
 
     // Ripgrep
     const rg = rgSearch(ann.query, repoDir, repo.benchmark_root, k);
-    allResults.push({ mode: "lexical (rg)", query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: rg.latency_ms, results: rg.results, recall_at_k: recallAtK(rg.results, allRelevant, k), mrr: mrr(rg.results, allRelevant), ndcg_at_k: ndcgAtK(rg.results, allRelevant, k) });
+    allResults.push(scoredRow({ mode: "lexical (rg)", query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: rg.latency_ms, results: rg.results, relevant: allRelevant, k }));
 
     // FTS5
     const fts5Start = performance.now();
     const fts5Results = fts5Session ? await fts5Query(fts5Session, ann.query, k, verbose) : [];
     const fts5Latency = performance.now() - fts5Start;
+    allResults.push(scoredRow({ mode: "fts5", query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: fts5Latency, results: fts5Results, relevant: allRelevant, k }));
     if (fts5Results.length > 0) {
-      allResults.push({ mode: "fts5", query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: fts5Latency, results: fts5Results, recall_at_k: recallAtK(fts5Results, allRelevant, k), mrr: mrr(fts5Results, allRelevant), ndcg_at_k: ndcgAtK(fts5Results, allRelevant, k) });
       perQueryCQ.push({
         mode: "fts5",
         cq: { candidate_pool_size: fts5Results.length, rerank_pool_size: fts5Results.length, snippet_count: 0, enriched_candidate_count: 0, path_only_count: fts5Results.length, unenriched_candidate_count: fts5Results.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(fts5Results, allRelevant, k), post_rerank_recall_at_k: recallAtK(fts5Results, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
         recall_at_k: recallAtK(fts5Results, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency, engine_latency_ms: fts5Latency,
       });
-    } else { emptyCounts["fts5"] = (emptyCounts["fts5"] || 0) + 1; }
+    }
 
     // AFT grep
     const grepStart = performance.now();
     const grepResults = grepSession ? await grepQuery(grepSession, ann.query, k, verbose) : [];
     const grepLatency = performance.now() - grepStart;
+    allResults.push(scoredRow({ mode: "aft-grep", query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: grepLatency, results: grepResults, relevant: allRelevant, k }));
     if (grepResults.length > 0) {
-      allResults.push({ mode: "aft-grep", query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: grepLatency, results: grepResults, recall_at_k: recallAtK(grepResults, allRelevant, k), mrr: mrr(grepResults, allRelevant), ndcg_at_k: ndcgAtK(grepResults, allRelevant, k) });
       perQueryCQ.push({
         mode: "aft-grep",
         cq: { candidate_pool_size: grepResults.length, rerank_pool_size: grepResults.length, snippet_count: 0, enriched_candidate_count: 0, path_only_count: grepResults.length, unenriched_candidate_count: grepResults.length, avg_doc_tokens: 0, max_doc_tokens: 0, total_doc_tokens: 0, pre_rerank_recall_at_pool: recallAtK(grepResults, allRelevant, k), post_rerank_recall_at_k: recallAtK(grepResults, allRelevant, k), lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
         recall_at_k: recallAtK(grepResults, allRelevant, k), hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: grepLatency, engine_latency_ms: grepLatency,
       });
-    } else { emptyCounts["aft-grep"] = (emptyCounts["aft-grep"] || 0) + 1; }
+    }
 
     // Semantic backends
-    for (const [be, session] of Object.entries(semSessions)) {
-      if (!session) { emptyCounts[`semantic-${be}`] = (emptyCounts[`semantic-${be}`] || 0) + 1; continue; }
-      const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
+    for (const run of semanticRuns) {
+      const session = semSessions[run.key];
+      const modeName = semanticModeName(run);
+      if (!session) {
+        allResults.push(scoredRow({ mode: modeName, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "semantic session unavailable" }));
+        continue;
+      }
 
       // Base pass
       const semStart = performance.now();
-      const semResults = await semanticQuery(session, ann.query, k, be, verbose);
+      const semResults = await semanticQuery(session, ann.query, k, run, verbose);
       const semLatency = performance.now() - semStart;
+      allResults.push(scoredRow({ mode: modeName, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: semLatency, results: semResults, relevant: allRelevant, k }));
       if (semResults.length > 0) {
-        allResults.push({ mode: modeName, query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: semLatency, results: semResults, recall_at_k: recallAtK(semResults, allRelevant, k), mrr: mrr(semResults, allRelevant), ndcg_at_k: ndcgAtK(semResults, allRelevant, k) });
         // Track per-query context quality for base semantic mode
         const baseSnippets = semResults.filter((r) => (r.snippet || "").length > 10).length;
         const baseTokenCounts = semResults.map((r) => approxTokens(r.snippet || ""));
@@ -1119,7 +1435,7 @@ async function main() {
           harness_lat_ms: semLatency,
           engine_latency_ms: semLatency,
         });
-      } else { emptyCounts[modeName] = (emptyCounts[modeName] || 0) + 1; }
+      }
 
       // Hybrid: FTS5 + semantic RRF (FTS5 is optional — hybrid works with semantic-only)
       if (semResults.length > 0) {
@@ -1127,7 +1443,7 @@ async function main() {
           ? rrfFusion(fts5Results, semResults, k)
           : semResults; // No FTS5 results — use semantic-only as hybrid
         const hybridRecall = recallAtK(hybridResults, allRelevant, k);
-        allResults.push({ mode: `hybrid-${modeName.replace("semantic-", "")}`, query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: fts5Latency + semLatency, results: hybridResults, recall_at_k: hybridRecall, mrr: mrr(hybridResults, allRelevant), ndcg_at_k: ndcgAtK(hybridResults, allRelevant, k) });
+        allResults.push(scoredRow({ mode: `hybrid-${modeName.replace("semantic-", "")}`, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: fts5Latency + semLatency, results: hybridResults, relevant: allRelevant, k }));
         const hybridSnippets = hybridResults.filter((r) => (r.snippet || "").length > 10).length;
         const hybridTokenCounts = hybridResults.map((r) => approxTokens(r.snippet || ""));
         perQueryCQ.push({
@@ -1135,18 +1451,27 @@ async function main() {
           cq: { candidate_pool_size: hybridResults.length, rerank_pool_size: k, snippet_count: hybridSnippets, enriched_candidate_count: hybridSnippets, path_only_count: hybridResults.length - hybridSnippets, unenriched_candidate_count: hybridResults.length - hybridSnippets, avg_doc_tokens: hybridTokenCounts.length > 0 ? Math.round(hybridTokenCounts.reduce((a, b) => a + b, 0) / hybridTokenCounts.length) : 0, max_doc_tokens: hybridTokenCounts.length > 0 ? Math.max(...hybridTokenCounts) : 0, total_doc_tokens: hybridTokenCounts.reduce((a, b) => a + b, 0), pre_rerank_recall_at_pool: hybridRecall, post_rerank_recall_at_k: hybridRecall, lost_relevant_after_rerank: [], context_exhausted: null, reranker_skipped_reason: null },
           recall_at_k: hybridRecall, hold_out: ann.hold_out === true, intent: ann.category || "unknown", harness_lat_ms: fts5Latency + semLatency, engine_latency_ms: semLatency,
         });
+      } else {
+        allResults.push(scoredRow({ mode: `hybrid-${modeName.replace("semantic-", "")}`, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: fts5Latency + semLatency, results: [], relevant: allRelevant, k }));
       }
     }
 
     // Rerank pass (for each semantic backend)
     if (doRerank) {
-      for (const [be, session] of Object.entries(semSessions)) {
-        if (!session) continue;
-        const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
+      for (const run of semanticRuns) {
+        const session = semSessions[run.key];
+        const modeName = semanticModeName(run);
+        if (!session) {
+          allResults.push(scoredRow({ mode: `${modeName}+rerank`, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "semantic session unavailable" }));
+          continue;
+        }
         const rerankSemStart = performance.now();
-        const semResults = await semanticQuery(session, ann.query, k * oversample, be, verbose);
+        const semResults = await semanticQuery(session, ann.query, k * oversample, run, verbose);
         const rerankSemLatency = performance.now() - rerankSemStart;
-        if (semResults.length === 0) continue;
+        if (semResults.length === 0) {
+          allResults.push(scoredRow({ mode: `${modeName}+rerank`, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: rerankSemLatency, results: [], relevant: allRelevant, k }));
+          continue;
+        }
 
         const preRecall = recallAtK(semResults, allRelevant, k * oversample);
         const { results: reranked, latency_ms: rerankLat, reranker_skipped_reason, enriched_candidate_count, path_only_count, snippet_count, avg_doc_tokens, max_doc_tokens, total_doc_tokens } = await applyRerank(ann.query, semResults, k, repoDir, verbose, oversample, rerankContext);
@@ -1161,7 +1486,7 @@ async function main() {
         const postRerankRelevant = new Set(postRerankTopK.filter((r) => allRelevant.some((rel) => pathMatches(r.file, rel))).map((r) => normalizePath(r.file)));
         const lostRelevant = [...preRerankRelevant].filter((f) => !postRerankRelevant.has(f));
 
-        allResults.push({ mode: `${modeName}+rerank`, query: ann.query, repo_name: ann.repo_name, category: ann.category, latency_ms: rerankLat, results: reranked, recall_at_k: postRecall, mrr: postMrr, ndcg_at_k: postNdcg });
+        allResults.push(scoredRow({ mode: `${modeName}+rerank`, query: ann.query, repo_name: ann.repo_name, category: ann.category, suite: "semantic_nl", latency_ms: rerankLat, results: reranked, relevant: allRelevant, k }));
 
         // Track per-query context quality for rerank modes
         perQueryCQ.push({
@@ -1199,56 +1524,38 @@ async function main() {
 
   // Run lexical identifier queries
   if (includeLexical) {
-    const lexicalSessions: Record<string, AftSession | null> = {};
-    let lexCurrentRepo = "";
+    for (const [repoName, repoQueries] of groupLexicalQueriesByRepo(runnableLexicalQueries)) {
+      if (!availableRepos.has(repoName)) continue;
+      const repoDir = join(resolve(cacheDir), repoName);
+      const lexicalSessions: Record<string, AftSession | null> = {};
 
-    for (const lq of LEXICAL_QUERIES) {
-      for (const repoName of lq.repos) {
-        if (!availableRepos.has(repoName)) continue;
-        const repoDir = join(resolve(cacheDir), repoName);
+      console.log(`\n  Initializing lexical sessions for ${repoName}...`);
+      lexicalSessions["aft-grep"] = await initGrepSession(bin, repoDir, verbose);
+      lexicalSessions["fts5"] = await initFts5Session(bin, repoDir, verbose);
 
-        // Init sessions when repo changes
-        if (repoName !== lexCurrentRepo) {
-          for (const s of Object.values(lexicalSessions)) s?.close();
-          for (const k of Object.keys(lexicalSessions)) delete lexicalSessions[k];
-          lexCurrentRepo = repoName;
-          console.log(`\n  Initializing lexical sessions for ${repoName}...`);
-
-          // Init grep + fts5 sessions
-          lexicalSessions["aft-grep"] = await initGrepSession(bin, repoDir, verbose);
-          lexicalSessions["fts5"] = await initFts5Session(bin, repoDir, verbose);
-
-          // Init semantic sessions for lexical queries
-          for (const be of backends) {
-            const storageDir = join(repoDir, `.aft-bench-${be}-lex`);
-            const beModel = be === "fastembed" ? "all-MiniLM-L6-v2" : be === "semantic-api" ? apiModel : semanticModel;
-            lexicalSessions[be] = await initSemanticSession(bin, repoDir, beModel, be, verbose, storageDir, queryPrompt);
-          }
+      if (identifierSemantic) {
+        for (const run of semanticRuns) {
+          const storageDir = join(repoDir, `.aft-bench-${run.backend}-${run.variant}-lex`);
+          const beModel = run.backend === "fastembed" ? "all-MiniLM-L6-v2" : run.backend === "semantic-api" ? apiModel : semanticModel;
+          lexicalSessions[run.key] = await initSemanticSession(bin, repoDir, beModel, run.backend, verbose, storageDir, queryPrompt, run.retrievalIntelligenceV2);
         }
+      }
 
-        const relevant = [lq.query]; // For identifier queries, the query itself is the relevant "path"
-        // Use checked-in canon relevance as ground truth, NOT runtime rg results
-        // Load canon relevance if available, otherwise fall back to empty (skip scoring)
-        const canonExact = loadCanonSuite(resolve("benchmarks/semble/canon"), "identifier_exact");
-        const canonPrefix = loadCanonSuite(resolve("benchmarks/semble/canon"), "identifier_prefix");
-        const canonEntry = [...(canonExact?.queries || []), ...(canonPrefix?.queries || [])].find((q) => q.query === lq.query && q.repo_name === repoName);
-        const allRelevant = canonEntry ? canonEntry.relevant.map((r) => r.path).filter(Boolean) : [];
-        if (allRelevant.length === 0) {
-          // No canon relevance for this query — skip scoring (rg is contestant, not oracle)
-          if (verbose) console.log(`    SKIP ${lq.query}: no canon relevance defined`);
-          continue;
-        }
+      for (const lq of repoQueries) {
+        const allRelevant = [...lq.relevant, ...lq.secondary];
 
         // Ripgrep (baseline contestant, NOT oracle)
         const rg = rgSearch(lq.query, repoDir, null, k);
-        allResults.push({ mode: "lexical (rg)", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: rg.latency_ms, results: rg.results, recall_at_k: recallAtK(rg.results, allRelevant, k), mrr: mrr(rg.results, allRelevant), ndcg_at_k: ndcgAtK(rg.results, allRelevant, k) });
+        allResults.push(scoredRow({ mode: "lexical (rg)", query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: rg.latency_ms, results: rg.results, relevant: allRelevant, k }));
 
         // AFT grep
         const grepS = lexicalSessions["aft-grep"];
         if (grepS) {
           const gs = performance.now();
           const gr = await grepQuery(grepS, lq.query, k, verbose);
-          allResults.push({ mode: "aft-grep", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - gs, results: gr, recall_at_k: recallAtK(gr, allRelevant, k), mrr: mrr(gr, allRelevant), ndcg_at_k: ndcgAtK(gr, allRelevant, k) });
+          allResults.push(scoredRow({ mode: "aft-grep", query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: performance.now() - gs, results: gr, relevant: allRelevant, k }));
+        } else {
+          allResults.push(scoredRow({ mode: "aft-grep", query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "grep session unavailable" }));
         }
 
         // FTS5
@@ -1256,21 +1563,40 @@ async function main() {
         if (f5S) {
           const fs = performance.now();
           const f5r = await fts5Query(f5S, lq.query, k, verbose);
-          if (f5r.length > 0) allResults.push({ mode: "fts5", query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - fs, results: f5r, recall_at_k: recallAtK(f5r, allRelevant, k), mrr: mrr(f5r, allRelevant), ndcg_at_k: ndcgAtK(f5r, allRelevant, k) });
+          allResults.push(scoredRow({ mode: "fts5", query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: performance.now() - fs, results: f5r, relevant: allRelevant, k }));
+        } else {
+          allResults.push(scoredRow({ mode: "fts5", query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "FTS5 session unavailable" }));
+        }
+
+        // Dedicated FTS5 symbol lookup
+        if (f5S) {
+          const symbolMode = lq.suite === "identifier_exact" ? "exact" : "prefix";
+          const symbolModeName = symbolMode === "exact" ? "fts5_find_symbol_exact" : "fts5_find_symbol_prefix";
+          const ss = performance.now();
+          const symbols = await fts5FindSymbolQuery(f5S, lq.query, symbolMode, k, verbose);
+          allResults.push(scoredRow({ mode: symbolModeName, query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: performance.now() - ss, results: symbols, relevant: allRelevant, k }));
+        } else {
+          const symbolModeName = lq.suite === "identifier_exact" ? "fts5_find_symbol_exact" : "fts5_find_symbol_prefix";
+          allResults.push(scoredRow({ mode: symbolModeName, query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "FTS5 session unavailable" }));
         }
 
         // Semantic backends
-        for (const [be, session] of Object.entries(lexicalSessions)) {
-          if (!session || be === "aft-grep" || be === "fts5") continue;
-          const modeName = be === "model2vec" ? "semantic-m2v" : be === "fastembed" ? "semantic-fe" : "semantic-api";
-          const ss = performance.now();
-          const sr = await semanticQuery(session, lq.query, k, be, verbose);
-          if (sr.length > 0) allResults.push({ mode: modeName, query: lq.query, repo_name: repoName, category: "identifier", latency_ms: performance.now() - ss, results: sr, recall_at_k: recallAtK(sr, allRelevant, k), mrr: mrr(sr, allRelevant), ndcg_at_k: ndcgAtK(sr, allRelevant, k) });
+        if (identifierSemantic) {
+          for (const run of semanticRuns) {
+            const session = lexicalSessions[run.key];
+            const modeName = semanticModeName(run);
+            if (!session) {
+              allResults.push(scoredRow({ mode: modeName, query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: 0, results: [], relevant: allRelevant, k, status: "unavailable", reason: "semantic session unavailable" }));
+              continue;
+            }
+            const ss = performance.now();
+            const sr = await semanticQuery(session, lq.query, k, run, verbose);
+            allResults.push(scoredRow({ mode: modeName, query: lq.query, repo_name: repoName, category: lq.category, suite: lq.suite, latency_ms: performance.now() - ss, results: sr, relevant: allRelevant, k }));
+          }
         }
       }
+      for (const s of Object.values(lexicalSessions)) s?.close();
     }
-    // Close lexical sessions
-    for (const s of Object.values(lexicalSessions)) s?.close();
   }
 
   // Aggregate results
@@ -1280,38 +1606,20 @@ async function main() {
     byMode.get(r.mode)!.push(r);
   }
 
-  const totalSemantic = allAnnotations.length;
-  const semanticAgg: AggregateMode[] = [];
-  const lexicalAgg: AggregateMode[] = [];
-
-  for (const [mode, rows] of byMode) {
-    const agg = aggregateMetrics(rows, totalSemantic);
-    // Classify by query category: NL queries → semantic table, identifier queries → lexical table
-    const hasIdentifier = rows.some((r) => r.category === "identifier");
-    const hasSemantic = rows.some((r) => r.category !== "identifier");
-    if (hasIdentifier && !hasSemantic) {
-      lexicalAgg.push(agg);
-    } else if (hasSemantic && !hasIdentifier) {
-      semanticAgg.push(agg);
-    } else if (hasIdentifier && hasSemantic) {
-      // Mixed: show in both tables
-      semanticAgg.push(agg);
-      lexicalAgg.push(agg);
-    } else {
-      semanticAgg.push(agg);
-    }
+  const suiteTotals: Record<string, number> = {
+    semantic_nl: allAnnotations.filter((ann) => availableRepos.has(ann.repo_name)).length,
+  };
+  for (const lq of runnableLexicalQueries) {
+    suiteTotals[lq.suite] = (suiteTotals[lq.suite] || 0) + lq.repos.filter((repo) => availableRepos.has(repo)).length;
   }
-
-  // Sort by recall descending
-  semanticAgg.sort((a, b) => b.recall - a.recall);
-  lexicalAgg.sort((a, b) => b.recall - a.recall);
+  const { semantic: semanticAgg, bySuite: suiteAggregates } = splitAggregatesBySuite(allResults, suiteTotals);
 
   // Compute rerank metrics
   const rerankAgg: Record<string, RerankMetrics> = {};
   for (const mode of Object.keys(rerankResults)) {
     const baseMode = mode.replace("+rerank", "");
-    const baseRows = byMode.get(baseMode) || [];
-    const rerankRows = byMode.get(mode) || [];
+    const baseRows = (byMode.get(baseMode) || []).filter((r) => r.suite === "semantic_nl");
+    const rerankRows = (byMode.get(mode) || []).filter((r) => r.suite === "semantic_nl");
     if (baseRows.length === 0 || rerankRows.length === 0) continue;
 
     const preRecalls = baseRows.map((r) => r.recall_at_k);
@@ -1334,8 +1642,11 @@ async function main() {
   }
 
   // Print tables
-  if (semanticAgg.length > 0) printTable(`SEMANTIC SEARCH (NL queries, k=${k})`, semanticAgg, Object.keys(rerankAgg).length > 0 ? rerankAgg : undefined);
-  if (lexicalAgg.length > 0) printTable(`LEXICAL SEARCH (identifier queries, k=${k})`, lexicalAgg);
+  if (semanticAgg.length > 0) printTable(`SEMANTIC_NL (natural-language queries, k=${k})`, semanticAgg, Object.keys(rerankAgg).length > 0 ? rerankAgg : undefined);
+  for (const [suite, metrics] of Object.entries(suiteAggregates)) {
+    if (suite === "semantic_nl" || metrics.length === 0) continue;
+    printTable(`${suite.toUpperCase()} (identifier queries, k=${k})`, metrics);
+  }
 
   // Compute context quality per mode
   const contextQualityByMode: Record<string, ContextQuality> = {};
@@ -1485,7 +1796,8 @@ async function main() {
   if (skippedRepos.length > 0) {
     incompleteReasons.push(`unavailable repos: ${skippedRepos.join(", ")}`);
   }
-  const emptyParts = Object.entries(emptyCounts)
+  const reportEmptyCounts = buildEmptyCounts(allResults);
+  const emptyParts = Object.entries(reportEmptyCounts)
     .filter(([, v]) => v > 0)
     .map(([k, v]) => `${k}=${v}`);
   if (emptyParts.length > 0) {
@@ -1508,17 +1820,41 @@ async function main() {
     k,
     binary: binaryPath,
     backends,
+    identifier_semantic: identifierSemantic,
+    context_mode: contextMode,
+    context_budget: contextBudget,
+    semantic_runs: semanticRuns.map((run) => ({
+      key: run.key,
+      backend: run.backend,
+      variant: run.variant,
+      retrieval_intelligence_v2: run.retrievalIntelligenceV2,
+      request: run.request,
+    })),
+    semantic_snippet_display_policy: {
+      mode: "rank_tiered_public_semantic_search",
+      note: "AFT currently enriches public semantic_search snippets for the first three ranked semantic results only; rank 4+ results are path/header oriented even when k is larger.",
+    },
     rerank: doRerank ? { model: rerankModel, url: rerankUrl } : null,
     rerank_context: rerankContext,
+    suite_totals: suiteTotals,
     intent_metrics: intentMetrics,
     results: allResults,
     aggregate: Object.fromEntries(semanticAgg.map((a) => [a.mode, a])),
-    lexical_aggregate: Object.fromEntries(lexicalAgg.map((a) => [a.mode, a])),
+    lexical_aggregate: Object.fromEntries(
+      Object.entries(suiteAggregates)
+        .filter(([suite]) => suite !== "semantic_nl")
+        .map(([suite, metrics]) => [suite, Object.fromEntries(metrics.map((a) => [a.mode, a]))]),
+    ),
+    suite_aggregates: Object.fromEntries(
+      Object.entries(suiteAggregates).map(([suite, metrics]) => [suite, Object.fromEntries(metrics.map((a) => [a.mode, a]))]),
+    ),
     rerank_metrics: rerankAgg,
     context_quality: contextQualityByMode,
-    empty_counts: emptyCounts,
+    empty_counts: reportEmptyCounts,
   };
-  writeFileSync(resolve(outputFile), JSON.stringify(report, null, 2) + "\n");
+  const resolvedOutput = resolve(outputFile);
+  mkdirSync(resolve(resolvedOutput, ".."), { recursive: true });
+  writeFileSync(resolvedOutput, JSON.stringify(report, null, 2) + "\n");
 
   // Close sessions
   for (const s of Object.values(semSessions)) s?.close();
@@ -1528,7 +1864,9 @@ async function main() {
   // Empty summary
   if (emptyParts.length > 0) console.log(`\n  ⚠ Empty results: ${emptyParts.join(" ")}`);
   if (incompleteReasons.length > 0) console.log(`\n  Incomplete benchmark: ${incompleteReasons.join("; ")}`);
-  console.log(`\n  Report saved to ${outputFile}`);
+  console.log(`\n  Report saved to ${resolvedOutput}`);
 }
 
-main();
+if (import.meta.main) {
+  main();
+}

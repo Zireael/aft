@@ -125,9 +125,25 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 
 ## Benchmarks
 
-A full, reproducible benchmark suite is in progress: search latency, retrieval quality, bash-output token reduction, and end-to-end agent task success against other code-context plugins. We'll publish numbers here once the methodology is locked and the harnesses are reproducible from a clean checkout.
+AFT includes a local Semble-derived benchmark runner for retrieval quality, latency, reranking,
+and context-budget behavior. The runner separates natural-language semantic queries from exact
+identifier, prefix, path, and structural suites so lexical and semantic tools are not averaged
+into one misleading leaderboard.
 
-_Coming soon._
+```bash
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft/aft.exe \
+  --profile quick \
+  --context-mode compare \
+  --context-total-tokens 4096 \
+  --context-per-chunk-tokens 384 \
+  --context-soft-overflow-tokens 128 \
+  --output .aft-bench/context-compare.json
+```
+
+See [benchmarks/semble/QUICK-BENCHMARK.md](benchmarks/semble/QUICK-BENCHMARK.md) for the full
+runner reference and [benchmarks/semble/METHODOLOGY.md](benchmarks/semble/METHODOLOGY.md) for
+the scoring rules.
 
 ---
 
@@ -279,4 +295,4 @@ Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and 
 - [Tool reference](docs/tools.md): complete documentation for every tool
 - [Configuration](docs/config.md): config schema, LSP, auto-install
 - [CLI commands](docs/cli.md): setup, doctor, and cache management
-- [Benchmarks](docs/benchmarks.md): search-index methodology *(numbers being finalized)*
+- [Benchmarks](docs/benchmarks.md): Semble retrieval runner and search-index methodology

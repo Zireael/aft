@@ -68,6 +68,11 @@ pub struct ContextBudget {
     /// Minimum enriched ratio (enriched/pool) to run reranker.
     /// Below this: skip reranker, emit reranker_skipped_reason.
     pub rerank_min_enriched_ratio: f32,
+    /// Allow the final enriched candidate to exceed `total_tokens` by this
+    /// many tokens. This avoids wasting nearly-full budgets when the next
+    /// candidate slightly crosses the cap.
+    #[serde(default)]
+    pub soft_overflow_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +116,7 @@ impl ContextBudget {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::FusionPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         }
     }
 
@@ -123,6 +129,7 @@ impl ContextBudget {
             mode: ContextMode::Signature,
             enrich_pool: EnrichPool::FinalTopK,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         }
     }
 
@@ -135,6 +142,7 @@ impl ContextBudget {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::RerankPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         }
     }
 }
@@ -151,8 +159,23 @@ impl ContextBudget {
 ///
 /// Returns the ContextBudgetResult with exhaustion status and counts.
 pub fn simulate_budget(budget: &ContextBudget, pool_size: usize) -> ContextBudgetResult {
-    let max_enriched = budget.total_tokens / budget.per_candidate_tokens;
-    let enriched_count = pool_size.min(max_enriched);
+    let mut used_tokens = 0usize;
+    let mut enriched_count = 0usize;
+    for _ in 0..pool_size {
+        let next_used = used_tokens.saturating_add(budget.per_candidate_tokens);
+        let fits_strict = next_used <= budget.total_tokens;
+        let fits_soft = used_tokens < budget.total_tokens
+            && next_used
+                <= budget
+                    .total_tokens
+                    .saturating_add(budget.soft_overflow_tokens);
+        if fits_strict || fits_soft {
+            enriched_count += 1;
+            used_tokens = next_used;
+        } else {
+            break;
+        }
+    }
     let unenriched_count = pool_size.saturating_sub(enriched_count);
     let context_exhausted = unenriched_count > 0;
 
@@ -245,6 +268,7 @@ mod tests {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::RerankPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         };
         let result = simulate_budget(&budget, 5);
         // 400 / 200 = 2 enriched, 3 unenriched
@@ -277,6 +301,7 @@ mod tests {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::RerankPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         };
         // 500/100 = 5 enriched, pool=11 → 5/11 ≈ 0.45 < 0.5
         let result = simulate_budget(&budget, 11);
@@ -296,6 +321,7 @@ mod tests {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::RerankPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         };
         let result = simulate_budget(&budget, 5);
         assert_eq!(
@@ -327,6 +353,7 @@ mod tests {
             mode: ContextMode::Auto,
             enrich_pool: EnrichPool::RerankPool,
             rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 0,
         };
         // 1000/100 = 10 enriched, pool=10 → 10/10 = 1.0 >= 0.5
         let result = simulate_budget(&budget, 10);
@@ -351,6 +378,31 @@ mod tests {
         let deserialized: ContextBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.total_tokens, budget.total_tokens);
         assert_eq!(deserialized.enrich_pool, budget.enrich_pool);
+        assert_eq!(
+            deserialized.soft_overflow_tokens,
+            budget.soft_overflow_tokens
+        );
+    }
+
+    #[test]
+    fn soft_overflow_includes_last_chunk_that_crosses_budget() {
+        let budget = ContextBudget {
+            total_tokens: 400,
+            per_candidate_tokens: 250,
+            min_candidate_chars: 80,
+            mode: ContextMode::Auto,
+            enrich_pool: EnrichPool::RerankPool,
+            rerank_min_enriched_ratio: 0.5,
+            soft_overflow_tokens: 120,
+        };
+
+        let result = simulate_budget(&budget, 3);
+
+        // Strict cap would enrich only one candidate. Soft overflow lets the
+        // second candidate cross 400 by 100 tokens, then stops before the third.
+        assert_eq!(result.enriched_candidate_count, 2);
+        assert_eq!(result.unenriched_candidate_count, 1);
+        assert!(result.context_exhausted);
     }
 
     #[test]

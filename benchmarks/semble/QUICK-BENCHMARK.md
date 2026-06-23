@@ -9,44 +9,40 @@ Decision-grade benchmark for comparing AFT retrieval modes. Measures retrieval q
 bun run benchmarks/semble/pilot.ts \
   --binary ./target/release/aft \
   --profile extended \
-  --suite all \
-  --mode rg,aft-grep,fts5_search,fts5_find_symbol_exact,fts5_find_symbol_prefix,glob,ast_search,semantic_m2v,semantic_fe,semantic_api,hybrid,rerank \
   --semantic-api-url http://localhost:8090 \
   --rerank \
   --rerank-url http://localhost:8090 \
-  --allow-degrade \
-  --allow-seed-canon \
-  --report-json bench-report.json \
-  --report-md bench-report.md \
+  --context-mode compare \
+  --context-total-tokens 4096 \
+  --context-per-chunk-tokens 384 \
+  --context-soft-overflow-tokens 128 \
+  --output bench-report.json \
   --verbose
 
 # Key flags:
 # - --rerank enables the reranker pass (10x oversampling by default)
 # - --rerank-url points to your reranker endpoint (e.g., GTE-Reranker via vLLM/TEI)
-# - --allow-degrade emits status: unavailable for missing modes instead of failing
-# - --allow-seed-canon includes seed-status canon rows (all 84 are currently seeds)
 # - --profile extended runs all canon queries with 3 repetitions for latency stability
+# - --context-mode compare runs legacy and token-budgeted semantic context variants
 
 # Quick smoke:
 bun run benchmarks/semble/pilot.ts \
   --binary ./target/release/aft \
   --profile smoke \
-  --suite all \
   --semantic-api-url http://localhost:8090 \
   --rerank \
   --rerank-url http://localhost:8090 \
-  --allow-degrade \
-  --report-json smoke.json
+  --output smoke.json
 
 
 # Smoke test (fastest, 2 queries per suite)
-bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile smoke --suite all --mode rg,aft-grep --allow-degrade --report-json smoke.json --report-md smoke.md
+bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile smoke --output smoke.json
 
 # Quick decision-grade run (all reviewed + seed queries)
-bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile quick --suite all --allow-degrade --report-json quick.json --report-md quick.md
+bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile quick --output quick.json
 
 # Extended run (all canon, 3 repetitions)
-bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile extended --suite all --allow-degrade --report-json extended.json
+bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profile extended --output extended.json
 ```
 
 ## CLI Reference
@@ -55,8 +51,6 @@ bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profi
 |------|---------|-------------|
 | `--binary <path>` | `aft` | Path to AFT binary |
 | `--profile <name>` | `smoke` | Run profile: smoke, quick, extended, manual-full |
-| `--suite <name>` | `all` | Suite filter: semantic_nl, identifier_exact, identifier_prefix, path_lookup, structural, all |
-| `--mode <list>` | all eligible | Comma-separated mode filter |
 | `--k <n>` | `10` | Top-k for recall@k, MRR, nDCG@k |
 | `--backend <name>` | `model2vec` | Default embedding backend for non-API modes |
 | `--semantic-api-url <url>` | — | OpenAI-compatible embedding API URL |
@@ -68,12 +62,14 @@ bun run benchmarks/semble/pilot.ts --binary ./target/release/aft/aft.exe --profi
 | `--oversample <n>` | `10` | Reranker oversampling multiplier (fetches k×n candidates) |
 | `--query-prompt <txt>` | auto for CodeRankEmbed | Query prompt template for embedding (e.g., "Represent this query...: {query}") |
 | `--interactive` | off | Interactive mode: discover models, select interactively |
-| `--allow-degrade` | off | Emit status=unavailable instead of failing on missing modes |
-| `--allow-seed-canon` | off | Include seed-status canon rows |
 | `--cache-dir <dir>` | `.bench-cache` | Repo cache directory |
-| `--report-json <path>` | — | Save JSON report |
-| `--report-md <path>` | — | Save Markdown report |
-| `--baseline <path>` | — | Baseline report for comparison |
+| `--repo <name>` | all pilot repos | Limit the semantic NL suite to a repo name or owner/name |
+| `--output <path>` | `pilot-report.json` | Save JSON report; parent directories are created automatically |
+| `--context-mode <mode>` | `legacy` | Semantic public context behavior: `legacy`, `budget`, or `compare` |
+| `--context-total-tokens <n>` | AFT preset | Total token budget for `budget`/`compare` modes |
+| `--context-per-chunk-tokens <n>` | AFT preset | Per-candidate token budget for `budget`/`compare` modes |
+| `--context-soft-overflow-tokens <n>` | `0` | Extra tokens allowed for the final snippet crossing the total budget |
+| `--identifier-semantic <bool>` | `false` | Include semantic backends in identifier exact/prefix suites |
 | `--verbose` | off | Verbose output (chunk sizes, model verification, rerank warnings) |
 | `--include-lexical <bool>` | `true` | Include lexical identifier queries |
 | `--help`, `-h` | — | Show help |
@@ -182,6 +178,28 @@ Rerank attempts include paired pre/post metrics:
 
 **Snippet extraction**: The reranker uses `snippet` fields from semantic search results (tree-sitter-based code blocks), not arbitrary line ranges or whole files.
 
+### Context budget comparison
+
+Use `--context-mode compare` to run semantic backends twice: once with legacy public
+`semantic_search` snippet behavior and once with token-budgeted context filtering. Reports
+include quality metrics plus token/context metrics (`snippets_per_query`,
+`tokens_per_query`, and `max_doc_tokens`) so the tradeoff is visible.
+
+```bash
+bun run benchmarks/semble/pilot.ts \
+  --binary ./target/release/aft/aft.exe \
+  --profile quick \
+  --semantic-api-url http://localhost:8090 \
+  --context-mode compare \
+  --context-total-tokens 4096 \
+  --context-per-chunk-tokens 384 \
+  --context-soft-overflow-tokens 128 \
+  --output .aft-bench/context-compare.json
+```
+
+The soft-overflow budget is intentionally small. It lets AFT include the last useful snippet
+when it crosses the total cap by a little, instead of throwing away near-fit context.
+
 ## Canon files
 
 Checked-in relevance canon at `benchmarks/semble/canon/`:
@@ -220,25 +238,22 @@ Checks: schema version, required fields, duplicate IDs, valid review status.
 bun run benchmarks/semble/tools/validate-lexical-canon.ts benchmarks/semble/canon
 
 # Run specific suite + mode
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --suite identifier-exact --mode fts5_find_symbol_exact --report-json result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --include-lexical true --output result.json
 
 # Run with rerank (default 10x oversampling)
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite semantic-nl --mode semantic_m2v --rerank --rerank-url http://localhost:8090/v1/rerank --report-json result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-url http://localhost:8090/v1/rerank --output result.json
 
 # Run with aggressive oversampling (20x)
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite semantic-nl --rerank --oversample 20 --report-json result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --oversample 20 --output result.json
 
 # Run with reranker instruction
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-instruction "Given a web search query, retrieve relevant passages" --report-json result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --rerank --rerank-instruction "Given a web search query, retrieve relevant passages" --output result.json
 
 # Run with custom query prompt for embedding
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --semantic-api-url http://localhost:8090 --query-prompt "Represent this query for searching relevant code: {query}" --report-json result.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --semantic-api-url http://localhost:8090 --query-prompt "Represent this query for searching relevant code: {query}" --output result.json
 
 # Interactive mode (discover and select models)
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --semantic-api-url http://localhost:8090 --rerank --rerank-url http://localhost:8090 --interactive --report-json result.json
-
-# Baseline comparison
-bun run benchmarks/semble/pilot.ts --binary <aft> --profile quick --suite all --baseline prior-report.json --report-json current.json
+bun run benchmarks/semble/pilot.ts --binary <aft> --profile smoke --semantic-api-url http://localhost:8090 --rerank --rerank-url http://localhost:8090 --interactive --output result.json
 ```
 
 ## Limitations
