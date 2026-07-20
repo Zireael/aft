@@ -1880,10 +1880,21 @@ where
 }
 
 pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
-    if is_binary_bytes(&bytes) {
+    let metadata = fs::metadata(path).ok()?;
+    // Skip files that exceed the search-index size limit — source files are
+    // almost never this large, and reading multi-megabyte binary blobs (SQLite
+    // databases, benchmark caches, etc.) blocks the caller for seconds per
+    // file.  This matches DEFAULT_MAX_FILE_SIZE used by the search index.
+    if metadata.len() > DEFAULT_MAX_FILE_SIZE {
         return None;
     }
+    // Use a preview-based binary check instead of reading the entire file
+    // first.  For small files the difference is negligible, but it avoids
+    // allocating a full-size buffer when we can reject early.
+    if is_binary_path(path, metadata.len()) {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
     String::from_utf8(bytes).ok()
 }
 

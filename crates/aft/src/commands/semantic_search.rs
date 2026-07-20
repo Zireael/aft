@@ -1416,6 +1416,16 @@ fn collect_degraded_grep_files(project_root: &Path) -> (Vec<PathBuf>, bool) {
                         | ".tox"
                         | "dist"
                         | "build"
+                        // AFT storage and benchmark caches — these contain
+                        // SQLite databases, binary embeddings, and JSON
+                        // reports that are never source code.  Without this
+                        // filter, `read_searchable_text` reads multi-GB of
+                        // binary data and the handler times out.
+                        | ".aft"
+                        | ".bench-cache"
+                        | ".aft-bench"
+                        | ".beads"
+                        | ".pi"
                 );
             }
             true
