@@ -68,8 +68,27 @@ pub fn is_process_alive(pid: u32) -> bool {
     if pid <= 0 {
         return false;
     }
-    (unsafe { libc::kill(pid, 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+
+    // `kill(pid, 0)` succeeds for zombie entries, so in container environments
+    // where PID 1 does not reap orphaned children the caller may wait forever.
+    // Treat zombies as dead so termination loops converge.
+    let stat_path = format!("/proc/{pid}/stat");
+    if let Ok(content) = std::fs::read_to_string(&stat_path) {
+        // The state character is the third field and is enclosed in parentheses
+        // just before it (the command name in parens may contain spaces).
+        // Extract the last ')'-delimited field and take the following word.
+        if let Some(after_name) = content.rsplit(')').next() {
+            let state = after_name.split_whitespace().next();
+            if state == Some("Z") {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 #[cfg(windows)]
