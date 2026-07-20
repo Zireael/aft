@@ -764,6 +764,37 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring bridge from project config");
   });
 
+  test("project config can override fts5 settings", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        fts5: { enabled: false, max_results: 10, max_body_chars: 2000 },
+      }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        fts5: { enabled: true, max_body_chars: 1000, raw_fts_debug: true },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout);
+    // Project-level fts5 is project-safe and overrides the user's block.
+    // Note: top-level fields shallow-merge, so the project's fts5 object wins
+    // in full (not field-by-field) unless a dedicated merge helper is added.
+    expect(config.fts5).toEqual({
+      enabled: true,
+      max_body_chars: 1000,
+      raw_fts_debug: true,
+    });
+    expect(result.stderr).not.toContain("Ignoring fts5 from project config");
+  });
+
   test("bridge rejects request_timeout_ms below 1000 and hang_threshold below 1", () => {
     const fixture = createConfigFixture();
     writeFileSync(

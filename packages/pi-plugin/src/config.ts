@@ -540,6 +540,17 @@ export const AftConfigSchema = z
     restrict_to_project_root: z.boolean().optional(),
     search_index: z.boolean().optional(),
     semantic_search: z.boolean().optional(),
+    fts5: z
+      .object({
+        enabled: z.boolean().optional(),
+        auto_index: z.boolean().optional(),
+        index_on_start: z.boolean().optional(),
+        max_results: z.number().optional(),
+        max_body_chars: z.number().optional(),
+        max_body_lines: z.number().optional(),
+        raw_fts_debug: z.boolean().optional(),
+      })
+      .optional(),
     inspect: InspectConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
@@ -1119,6 +1130,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "fts5",
   "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:

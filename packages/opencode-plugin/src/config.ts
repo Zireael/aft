@@ -321,8 +321,9 @@ export const AftConfigSchema = z
     /** Enable indexed search for grep and glob hoisting. Default: false. */
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
-    semantic_search: z.boolean().optional(),      /** FTS5 full-text search configuration. Default: { enabled: false }. */
-      fts5: z
+    semantic_search: z.boolean().optional(),
+    /** FTS5 full-text search configuration. Default: { enabled: false }. */
+    fts5: z
         .object({
           enabled: z.boolean().optional(),
           auto_index: z.boolean().optional(),
@@ -502,6 +503,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // Indexed search and semantic search — both are per-project opt-ins.
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
+  if (config.fts5 !== undefined) overrides.fts5 = config.fts5;
 
   // Bash / LSP / semantic / max_callgraph_files — all flow through dedicated
   // resolvers because they have their own merge / project-safety rules.
@@ -1254,6 +1256,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "fts5",
   "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:

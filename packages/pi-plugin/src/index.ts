@@ -468,6 +468,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (config.search_index !== undefined) configOverrides.search_index = config.search_index;
   if (config.semantic_search !== undefined)
     configOverrides.semantic_search = config.semantic_search;
+  if (config.fts5 !== undefined) configOverrides.fts5 = config.fts5;
   Object.assign(configOverrides, resolveExperimentalConfigForConfigure(config));
   Object.assign(configOverrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) configOverrides.semantic = config.semantic;
