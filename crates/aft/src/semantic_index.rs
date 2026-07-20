@@ -2705,7 +2705,7 @@ impl SemanticIndexSnapshot {
             size: metadata.size,
             content_hash: metadata.content_hash,
         };
-        match cache_freshness::verify_file(file, &cached) {
+        match cache_freshness::verify_file_strict(file, &cached) {
             FreshnessVerdict::HotFresh => false,
             FreshnessVerdict::ContentFresh { .. } => false,
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
@@ -3704,13 +3704,17 @@ impl SemanticIndex {
                     size: meta.size,
                     content_hash: meta.content_hash,
                 });
-            match cached.map(|freshness| cache_freshness::verify_file(indexed_path, &freshness)) {
+            match cached
+                .map(|freshness| cache_freshness::verify_file_strict(indexed_path, &freshness))
+            {
                 Some(FreshnessVerdict::HotFresh) => {}
                 Some(FreshnessVerdict::ContentFresh {
                     new_mtime,
                     new_size,
                 }) => {
-                    // Update mtime/size in metadata — content_hash unchanged.
+                    // mtime/size changed but the content hash is identical.
+                    // Update stored metadata so future refreshes can cheaply
+                    // detect this file as hot-fresh.
                     if let Some(meta) = snapshot
                         .store_mut()
                         .file_metadata_mut()
@@ -3775,6 +3779,10 @@ impl SemanticIndex {
             });
         }
 
+        // Build a reuse map from the existing entries for changed files so that
+        // unchanged chunks can keep their vectors during a refresh.
+        let reuse_map = self.build_chunk_reuse_map(&changed);
+
         let (chunks, fresh_metadata) = Self::collect_chunks(
             project_root,
             &to_embed,
@@ -3813,54 +3821,23 @@ impl SemanticIndex {
             });
         }
 
-        // 4. Embed in batches and dimension-check against the existing index.
-        let total_chunks = chunks.len();
-        progress(0, total_chunks);
-        let batch_size = max_batch_size.max(1);
+        // 4. Embed in batches, reusing unchanged chunk vectors from the existing
+        //    index when possible, and dimension-check against the existing index.
         let existing_dimension = if snapshot.is_empty() {
             None
         } else {
             Some(snapshot.dimension)
         };
-        let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
-        let mut observed_dimension: Option<usize> = existing_dimension;
 
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(chunks.len());
-            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
-                .iter()
-                .map(|c| c.embed_text.clone())
-                .collect();
-
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            if let Some(dim) = vectors.first().map(|v| v.len()) {
-                match observed_dimension {
-                    None => observed_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        // Refuse to mix dimensions in one index. Caller should
-                        // fall back to a full rebuild.
-                        return Err(format!(
-                            "embedding dimension changed during incremental refresh: \
-                             cached index uses {expected}, new vectors use {dim}"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let chunk_idx = batch_start + i;
-                new_entries.push(EmbeddingEntry {
-                    chunk: chunks[chunk_idx].clone(),
-                    vector,
-                    chunk_hash: compute_chunk_hash(&chunks[chunk_idx]),
-                });
-            }
-
-            progress(new_entries.len(), total_chunks);
-        }
+        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            existing_dimension,
+            "stale-file refresh",
+            progress,
+        )?;
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         if !successful_files.is_empty() {
@@ -4325,12 +4302,23 @@ impl SemanticIndex {
     }
 
     pub fn invalidate_file(&mut self, file: &Path) {
+        let target = crate::search_index::canonicalize_existing_or_deleted_path(file);
         let mut snapshot = (*self.snapshot).clone();
-        snapshot
-            .store_mut()
-            .entries_mut()
-            .retain(|e| e.chunk.file != file);
+        snapshot.store_mut().entries_mut().retain(|e| {
+            if e.chunk.file == target || e.chunk.file == file {
+                return false;
+            }
+            // Stored paths are canonical; if the supplied path is an alias
+            // that no longer resolves because the file was deleted, try to
+            // resolve the entry's canonical parent against the alias parent.
+            if let Ok(entry_canon) = fs::canonicalize(&e.chunk.file) {
+                entry_canon != target && entry_canon != file
+            } else {
+                true
+            }
+        });
         snapshot.store_mut().file_metadata_mut().remove(file);
+        snapshot.store_mut().file_metadata_mut().remove(&target);
         self.snapshot = Arc::new(snapshot);
     }
 
@@ -5294,6 +5282,11 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "zsh"
                 | "sol"
                 | "vue"
+                | "pas"
+                | "pp"
+                | "dpr"
+                | "dpk"
+                | "lpr"
         )
     )
 }

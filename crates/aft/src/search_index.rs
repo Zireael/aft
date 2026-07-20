@@ -2286,7 +2286,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
-fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
     }
