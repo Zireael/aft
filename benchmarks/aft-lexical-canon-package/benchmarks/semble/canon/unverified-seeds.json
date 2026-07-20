@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "suite": "unverified_seed_queries",
+  "generated_at": "2026-06-16T21:22:45Z",
+  "description": "Hardcoded lexical queries from current pilot.ts whose repos are not pinned in the fixture manifest. Do not score these until revisions and relevant paths are resolved.",
+  "queries": [
+    {
+      "repo_name": "opencode-aft",
+      "query": "validate_path",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "opencode_aft.unverified.01.validate_path",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "opencode-aft",
+      "query": "BinaryBridge",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "opencode_aft.unverified.02.binarybridge",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "opencode-aft",
+      "query": "fn handle_grep",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "opencode_aft.unverified.03.fn_handle_grep",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "opencode-aft",
+      "query": "experimental_search_index",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "opencode_aft.unverified.04.experimental_search_index",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "reth",
+      "query": "BlockNumber",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "reth.unverified.05.blocknumber",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "reth",
+      "query": "fn execute",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "reth.unverified.06.fn_execute",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "reth",
+      "query": "EthApiError",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "reth.unverified.07.ethapierror",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    },
+    {
+      "repo_name": "reth",
+      "query": "impl Display for",
+      "language": "rust",
+      "status": "needs_repo_pin_and_relevance",
+      "id": "reth.unverified.08.impl_display_for",
+      "intent": "unverified_seed",
+      "eligible_modes": [],
+      "relevant": []
+    }
+  ],
+  "recommended_action": [
+    "Pin opencode-aft and reth revisions in repos.json before scoring.",
+    "Resolve relevant paths with AFT outline/LSP/ast-search, not benchmark-time rg.",
+    "Move reviewed rows into identifier-exact.json, path-lookup.json, or structural.json."
+  ]
+}

@@ -1,0 +1,482 @@
+{
+  "schema_version": 1,
+  "suite": "identifier_prefix",
+  "generated_at": "2026-06-16T21:22:45Z",
+  "oracle_policy": {
+    "runtime_truth_generation": "forbidden",
+    "allowed_runtime_validation": [
+      "check that relevant paths exist at pinned revision",
+      "check that line ranges still contain expected symbol/text",
+      "fail or mark unavailable; do not rewrite relevance"
+    ],
+    "canonical_source": "checked-in reviewed JSON",
+    "review_status_values": [
+      "seed",
+      "reviewed",
+      "rejected",
+      "needs_update"
+    ]
+  },
+  "description": "Prefix/partial identifier queries intended for fts5_find_symbol prefix and comparable fuzzy lexical modes.",
+  "queries": [
+    {
+      "id": "axum.prefix.rout",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "Rout",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/routing/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Router",
+          "kind": "struct"
+        },
+        {
+          "path": "axum/src/routing/method_routing.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "MethodRouter",
+          "kind": "struct"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.prefix.from_req",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "FromReq",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/extract/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "FromRequest",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.prefix.into_resp",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "IntoResp",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "IntoResponse",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.prefix.app",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "app.",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "app",
+          "kind": "prototype_methods"
+        }
+      ],
+      "secondary": [
+        {
+          "path": "lib/express.js",
+          "grade": "secondary",
+          "confidence": "medium",
+          "review_status": "seed"
+        }
+      ],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.prefix.res",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "res.",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "res",
+          "kind": "prototype_methods"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.prefix.req",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "req.",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/request.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "req",
+          "kind": "prototype_methods"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.prefix.rout",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Rout",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "routergroup.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "RouterGroup",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.prefix.context",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Cont",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "context.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Context",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.prefix.bind",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "Bind",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "binding/json.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "jsonBinding",
+          "kind": "type"
+        },
+        {
+          "path": "binding/default_validator.go",
+          "grade": "secondary",
+          "confidence": "medium",
+          "review_status": "seed"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.prefix.base",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "Base",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/main.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "BaseModel",
+          "kind": "class"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.prefix.model_val",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "model_",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "model_validator",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.prefix.field_val",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "field_",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "field_validator",
+          "kind": "function"
+        },
+        {
+          "path": "pydantic/fields.py",
+          "grade": "secondary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Field",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.prefix.ser",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Ser",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Serialize",
+          "kind": "trait"
+        },
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Serializer",
+          "kind": "trait"
+        },
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "SerializeStruct",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.prefix.deser",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "Deser",
+      "intent": "prefix_symbol",
+      "eligible_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "fts5_find_symbol_prefix",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Deserialize",
+          "kind": "trait"
+        },
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Deserializer",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_prefix_seed",
+      "review_status": "seed"
+    }
+  ]
+}

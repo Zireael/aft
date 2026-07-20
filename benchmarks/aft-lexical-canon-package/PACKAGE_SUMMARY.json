@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-06-16T21:22:45Z",
+  "query_counts": {
+    "identifier_exact": 31,
+    "identifier_prefix": 14,
+    "path_lookup": 29,
+    "structural": 10,
+    "unverified_seeds": 8
+  },
+  "total_scored_seed_rows": 84,
+  "total_unverified_seed_rows": 8
+}

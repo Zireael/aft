@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "suite": "structural",
+  "generated_at": "2026-06-16T21:22:45Z",
+  "oracle_policy": {
+    "runtime_truth_generation": "forbidden",
+    "allowed_runtime_validation": [
+      "check that relevant paths exist at pinned revision",
+      "check that line ranges still contain expected symbol/text",
+      "fail or mark unavailable; do not rewrite relevance"
+    ],
+    "canonical_source": "checked-in reviewed JSON",
+    "review_status_values": [
+      "seed",
+      "reviewed",
+      "rejected",
+      "needs_update"
+    ]
+  },
+  "description": "AST/structural search canon. Review ast_pattern syntax before enforcing in CI.",
+  "queries": [
+    {
+      "id": "axum.struct.impl_into_response",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "impl IntoResponse for NoContent",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "NoContent",
+          "kind": "impl",
+          "start_line": 82,
+          "end_line": 85
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "impl IntoResponse for $T { $$$ }",
+      "ast_language": "rust",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "axum.struct.trait_handler",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "trait Handler definition",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/handler/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Handler",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "pub trait Handler<$A, $B> { $$$ }",
+      "ast_language": "rust",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "gin.struct.type_engine",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "type Engine struct",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "gin.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Engine",
+          "kind": "type"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "type Engine struct { $$$ }",
+      "ast_language": "go",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "gin.struct.router_group_use",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "RouterGroup Use method",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "routergroup.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Use",
+          "kind": "method"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "func ($R *RouterGroup) Use($$$) $$$",
+      "ast_language": "go",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "pydantic.struct.class_base_model",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "class BaseModel",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/main.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "BaseModel",
+          "kind": "class"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "class BaseModel($$$): $$$",
+      "ast_language": "python",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "pydantic.struct.def_field_validator",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "def field_validator",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "field_validator",
+          "kind": "function"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "def field_validator($$$): $$$",
+      "ast_language": "python",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "express.struct.app_render_assignment",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "app.render function assignment",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "app.render",
+          "kind": "method",
+          "start_line": 522,
+          "end_line": 596
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "$OBJ.render = function($$$) { $$$ }",
+      "ast_language": "javascript",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "express.struct.res_send_assignment",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "res.send function assignment",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "res.send",
+          "kind": "method",
+          "start_line": 125,
+          "end_line": 230
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "$OBJ.send = function($$$) { $$$ }",
+      "ast_language": "javascript",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "serde.struct.trait_serialize",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "trait Serialize",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Serialize",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "pub trait Serialize { $$$ }",
+      "ast_language": "rust",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    },
+    {
+      "id": "serde.struct.trait_visitor",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "trait Visitor",
+      "intent": "structural_pattern",
+      "eligible_modes": [
+        "ast_search",
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "symbol": "Visitor",
+          "kind": "trait"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "manual_structural_seed",
+      "review_status": "seed",
+      "ast_pattern": "pub trait Visitor<$A> { $$$ }",
+      "ast_language": "rust",
+      "notes": "Pattern syntax may need adjustment for ast-grep compatibility in AFT; validate before hard scoring."
+    }
+  ]
+}

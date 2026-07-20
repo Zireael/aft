@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-16T21:22:45Z",
+  "suites": {
+    "identifier_exact": {
+      "primary_modes": [
+        "fts5_find_symbol_exact",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "control_modes": [
+        "rg",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "do_not_mix_with": [
+        "semantic_nl",
+        "path_lookup",
+        "structural"
+      ]
+    },
+    "identifier_prefix": {
+      "primary_modes": [
+        "fts5_find_symbol_prefix",
+        "aft-grep",
+        "fts5_search"
+      ],
+      "control_modes": [
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ]
+    },
+    "path_lookup": {
+      "primary_modes": [
+        "glob",
+        "fts5_search"
+      ],
+      "control_modes": [
+        "rg",
+        "aft-grep",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ]
+    },
+    "structural": {
+      "primary_modes": [
+        "ast_search"
+      ],
+      "control_modes": [
+        "rg",
+        "aft-grep",
+        "fts5_search"
+      ]
+    }
+  }
+}

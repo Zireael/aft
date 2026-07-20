@@ -1,0 +1,2753 @@
+{
+  "timestamp": "2026-06-22T18:26:28.087Z",
+  "status": "incomplete",
+  "incomplete_reasons": [
+    "empty result phases: aft-grep=6 fts5=3"
+  ],
+  "profile": "smoke",
+  "repo_filter": [
+    "serde"
+  ],
+  "k": 5,
+  "binary": "D:/Coding/_tools/aft-src/target/release/aft/aft.exe",
+  "backends": [
+    "model2vec",
+    "fastembed"
+  ],
+  "rerank": null,
+  "rerank_context": "aft_output",
+  "intent_metrics": {
+    "NaturalLanguage": {
+      "recall_at_10": 0.5757575757575758,
+      "mrr": 0.4747474747474748,
+      "ndcg_at_10": 0.5007187580086615,
+      "count": 33,
+      "tuning_recall_at_10": 0.5185185185185185,
+      "holdout_recall_at_10": 0.8333333333333334
+    },
+    "ExactSymbol": {
+      "recall_at_10": 0.5357142857142857,
+      "mrr": 0.3297619047619048,
+      "ndcg_at_10": 0.37954791429764695,
+      "count": 28,
+      "tuning_recall_at_10": 0.5357142857142857,
+      "holdout_recall_at_10": 0
+    }
+  },
+  "results": [
+    {
+      "mode": "lexical (rg)",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 133.1267000000007,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 66.37199999999939,
+      "results": [
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1051,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 270,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 966,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1043,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 189.74809999999889,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 32,
+          "score": 0.8583226799964905,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Serialize {\n        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;\n    }",
+          "start_line": 32,
+          "end_line": 35
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.8187772035598755,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n+100 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.7982803583145142,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n+1188 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.7905638813972473,
+          "snippet": "",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.7824668884277344,
+          "snippet": "",
+          "start_line": 1868,
+          "end_line": 1930
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5,
+      "ndcg_at_k": 0.6309297535714575
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 256.1200999999983,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.8187772035598755,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n+100 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1051,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 32,
+          "score": 0.8583226799964905,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Serialize {\n        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;\n    }",
+          "start_line": 32,
+          "end_line": 35
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 243.75500000000102,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.6901710629463196,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n/// data model], which is a way to categorize every Rust data structure into one\n/// of 29 possible types. Each method of the `Serializer` trait corresponds to\n/// one of the types of the data model.\n///\n/// Implementations of `Serialize` map themselves into this data model by\n/// invoking exactly one of the `Serializer` methods.\n///\n/// The types that make up the Serde data model are:\n///\n///  - **14 primitive types**\n///    - bool\n///    - i8, i16, i32, i64, i128\n///    - u8, u16, u32, u64, u128\n///    - f32, f64\n///    - char\n+1173 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 32,
+          "score": 0.6682785749435425,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Serialize {\n        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;\n    }",
+          "start_line": 32,
+          "end_line": 35
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.6619676947593689,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_variant`.\n///\n/// # Example use\n///\n/// ```edition2021\n+58 more lines",
+          "start_line": 1691,
+          "end_line": 1753
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.6537360548973083,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
+          "line": 33,
+          "score": 0.6471071839332581,
+          "snippet": "",
+          "start_line": 33,
+          "end_line": 37
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Serialize and Serializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 310.1270000000004,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.6901710629463196,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n/// data model], which is a way to categorize every Rust data structure into one\n/// of 29 possible types. Each method of the `Serializer` trait corresponds to\n/// one of the types of the data model.\n///\n/// Implementations of `Serialize` map themselves into this data model by\n/// invoking exactly one of the `Serializer` methods.\n///\n/// The types that make up the Serde data model are:\n///\n///  - **14 primitive types**\n///    - bool\n///    - i8, i16, i32, i64, i128\n///    - u8, u16, u32, u64, u128\n///    - f32, f64\n///    - char\n+1173 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1051,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 32,
+          "score": 0.6682785749435425,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Serialize {\n        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;\n    }",
+          "start_line": 32,
+          "end_line": 35
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_annotations.rs",
+          "line": 33,
+          "score": 0.6471071839332581,
+          "snippet": "",
+          "start_line": 33,
+          "end_line": 37
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 149.33879999999954,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 64.45950000000084,
+      "results": [
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 177,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3221,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 39,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 22,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 2178,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 54.531699999999546,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 37,
+          "score": 0.8676093816757202,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Deserialize<'a>: Sized {\n        fn deserialize<D: Deserializer<'a>>(deserializer: D) -> Result<Self, D::Error>;\n    }",
+          "start_line": 37,
+          "end_line": 40
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 635,
+          "score": 0.8302067518234253,
+          "snippet": "/// `DeserializeSeed` is the stateful form of the `Deserialize` trait. If you\n/// ever find yourself looking for a way to pass data into a `Deserialize` impl,\n/// this trait is the way to do it.\n///\n/// As one example of stateful deserialization consider deserializing a JSON\n+173 more lines",
+          "start_line": 635,
+          "end_line": 812
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 829,
+          "score": 0.8042944669723511,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can deserialize any data structure supported by\n/// Serde.\n///\n+433 more lines",
+          "start_line": 829,
+          "end_line": 1266
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 3094,
+          "score": 0.8021295666694641,
+          "snippet": "",
+          "start_line": 3094,
+          "end_line": 3099
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 820,
+          "score": 0.7951915264129639,
+          "snippet": "",
+          "start_line": 820,
+          "end_line": 826
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5,
+      "ndcg_at_k": 0.6309297535714575
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 118.99120000000039,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 635,
+          "score": 0.8302067518234253,
+          "snippet": "/// `DeserializeSeed` is the stateful form of the `Deserialize` trait. If you\n/// ever find yourself looking for a way to pass data into a `Deserialize` impl,\n/// this trait is the way to do it.\n///\n/// As one example of stateful deserialization consider deserializing a JSON\n+173 more lines",
+          "start_line": 635,
+          "end_line": 812
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 177,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3221,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_serde_path.rs",
+          "line": 37,
+          "score": 0.8676093816757202,
+          "snippet": "    #[allow(dead_code)]\n    pub trait Deserialize<'a>: Sized {\n        fn deserialize<D: Deserializer<'a>>(deserializer: D) -> Result<Self, D::Error>;\n    }",
+          "start_line": 37,
+          "end_line": 40
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 39,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 60.280000000000655,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 829,
+          "score": 0.6838821172714233,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can deserialize any data structure supported by\n/// Serde.\n///\n/// The role of this trait is to define the deserialization half of the [Serde\n/// data model], which is a way to categorize every Rust data type into one of\n/// 29 possible types. Each method of the `Deserializer` trait corresponds to one\n/// of the types of the data model.\n///\n/// Implementations of `Deserialize` map themselves into this data model by\n/// passing to the `Deserializer` a `Visitor` implementation that can receive\n/// these various types.\n///\n/// The types that make up the Serde data model are:\n///\n///  - **14 primitive types**\n///    - bool\n///    - i8, i16, i32, i64, i128\n///    - u8, u16, u32, u64, u128\n+418 more lines",
+          "start_line": 829,
+          "end_line": 1266
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 635,
+          "score": 0.6740680932998657,
+          "snippet": "/// `DeserializeSeed` is the stateful form of the `Deserialize` trait. If you\n/// ever find yourself looking for a way to pass data into a `Deserialize` impl,\n/// this trait is the way to do it.\n///\n/// As one example of stateful deserialization consider deserializing a JSON\n+173 more lines",
+          "start_line": 635,
+          "end_line": 812
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 595,
+          "score": 0.672502338886261,
+          "snippet": "/// A data structure that can be deserialized without borrowing any data from\n/// the deserializer.\n///\n/// This is primarily useful for trait bounds on functions. For example a\n/// `from_str` function may be able to deserialize a data structure that borrows\n+33 more lines",
+          "start_line": 595,
+          "end_line": 632
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 3057,
+          "score": 0.660844087600708,
+          "snippet": "",
+          "start_line": 3057,
+          "end_line": 3061
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 2282,
+          "score": 0.6598929762840271,
+          "snippet": "",
+          "start_line": 2282,
+          "end_line": 2322
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Deserialize and Deserializer trait definitions",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 124.7395000000015,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 829,
+          "score": 0.6838821172714233,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can deserialize any data structure supported by\n/// Serde.\n///\n/// The role of this trait is to define the deserialization half of the [Serde\n/// data model], which is a way to categorize every Rust data type into one of\n/// 29 possible types. Each method of the `Deserializer` trait corresponds to one\n/// of the types of the data model.\n///\n/// Implementations of `Deserialize` map themselves into this data model by\n/// passing to the `Deserializer` a `Visitor` implementation that can receive\n/// these various types.\n///\n/// The types that make up the Serde data model are:\n///\n///  - **14 primitive types**\n///    - bool\n///    - i8, i16, i32, i64, i128\n///    - u8, u16, u32, u64, u128\n+418 more lines",
+          "start_line": 829,
+          "end_line": 1266
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 177,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3221,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 39,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 3057,
+          "score": 0.660844087600708,
+          "snippet": "",
+          "start_line": 3057,
+          "end_line": 3061
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 179.8137999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 50.92580000000089,
+      "results": [
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 62.724199999998746,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2481,
+          "score": 0.6613078117370605,
+          "snippet": "        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n        where\n            D: Deserializer<'de>,\n        {\n            struct FieldVisitor;\n\n            impl<'de> Visitor<'de> for FieldVisitor {\n                type Value = Field;\n\n                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {\n                    formatter.write_str(\"`start` or `end`\")\n                }\n\n                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>\n                where\n                    E: Error,\n                {\n                    match value {\n                        \"start\" => Ok(Field::Start),\n                        \"end\" => Ok(Field::End),\n+21 more lines",
+          "start_line": 2481,
+          "end_line": 2521
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2639,
+          "score": 0.6613078117370605,
+          "snippet": "        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n        where\n            D: Deserializer<'de>,\n        {\n            struct FieldVisitor;\n+34 more lines",
+          "start_line": 2639,
+          "end_line": 2677
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2778,
+          "score": 0.6613078117370605,
+          "snippet": "        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n        where\n            D: Deserializer<'de>,\n        {\n            struct FieldVisitor;\n+34 more lines",
+          "start_line": 2778,
+          "end_line": 2816
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 3001,
+          "score": 0.6490298509597778,
+          "snippet": "",
+          "start_line": 3001,
+          "end_line": 3055
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2888,
+          "score": 0.6485970616340637,
+          "snippet": "",
+          "start_line": 2888,
+          "end_line": 2945
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 113.64999999999964,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2481,
+          "score": 0.6613078117370605,
+          "snippet": "        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n        where\n            D: Deserializer<'de>,\n        {\n            struct FieldVisitor;\n\n            impl<'de> Visitor<'de> for FieldVisitor {\n                type Value = Field;\n\n                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {\n                    formatter.write_str(\"`start` or `end`\")\n                }\n\n                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>\n                where\n                    E: Error,\n                {\n                    match value {\n                        \"start\" => Ok(Field::Start),\n                        \"end\" => Ok(Field::End),\n+21 more lines",
+          "start_line": 2481,
+          "end_line": 2521
+        },
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5,
+      "ndcg_at_k": 0.6309297535714575
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 59.21630000000005,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 1722,
+          "score": 0.5890362858772278,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// Provides a `Visitor` access to each element of a sequence in the input.\n///\n/// This is a trait that a `Deserializer` passes to a `Visitor` implementation,\n/// which deserializes each item in a sequence.\n///\n/// # Lifetime\n///\n/// The `'de` lifetime of this trait is the lifetime of data that may be\n/// borrowed by deserialized sequence elements. See the page [Understanding\n/// deserializer lifetimes] for a more detailed explanation of these lifetimes.\n///\n/// [Understanding deserializer lifetimes]: https://serde.rs/lifetimes.html\n///\n/// # Example implementation\n///\n/// The [example data format] presented on the website demonstrates an\n/// implementation of `SeqAccess` for a basic JSON data format.\n///\n+40 more lines",
+          "start_line": 1722,
+          "end_line": 1781
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 1055,
+          "score": 0.5629473924636841,
+          "snippet": "        fn deserialize_integer<V>(self, visitor: V) -> Result<V::Value, E>\n        where\n            V: Visitor<'de>,\n        {\n            match self.content {\n+11 more lines",
+          "start_line": 1055,
+          "end_line": 1070
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 869,
+          "score": 0.5579290390014648,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A deserializer holding a `&[u8]`. Always calls [`Visitor::visit_bytes`].\npub struct BytesDeserializer<'a, E> {\n    value: &'a [u8],\n+2 more lines",
+          "start_line": 869,
+          "end_line": 875
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2411,
+          "score": 0.5573519468307495,
+          "snippet": "",
+          "start_line": 2411,
+          "end_line": 2424
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2006,
+          "score": 0.5571414828300476,
+          "snippet": "",
+          "start_line": 2006,
+          "end_line": 2021
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Visitor pattern for deserializer implementations",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 110.14210000000094,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 1055,
+          "score": 0.5629473924636841,
+          "snippet": "        fn deserialize_integer<V>(self, visitor: V) -> Result<V::Value, E>\n        where\n            V: Visitor<'de>,\n        {\n            match self.content {\n+11 more lines",
+          "start_line": 1055,
+          "end_line": 1070
+        },
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 1722,
+          "score": 0.5890362858772278,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// Provides a `Visitor` access to each element of a sequence in the input.\n///\n/// This is a trait that a `Deserializer` passes to a `Visitor` implementation,\n/// which deserializes each item in a sequence.\n///\n/// # Lifetime\n///\n/// The `'de` lifetime of this trait is the lifetime of data that may be\n/// borrowed by deserialized sequence elements. See the page [Understanding\n/// deserializer lifetimes] for a more detailed explanation of these lifetimes.\n///\n/// [Understanding deserializer lifetimes]: https://serde.rs/lifetimes.html\n///\n/// # Example implementation\n///\n/// The [example data format] presented on the website demonstrates an\n/// implementation of `SeqAccess` for a basic JSON data format.\n///\n+40 more lines",
+          "start_line": 1722,
+          "end_line": 1781
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 869,
+          "score": 0.5579290390014648,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A deserializer holding a `&[u8]`. Always calls [`Visitor::visit_bytes`].\npub struct BytesDeserializer<'a, E> {\n    value: &'a [u8],\n+2 more lines",
+          "start_line": 869,
+          "end_line": 875
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5,
+      "ndcg_at_k": 0.6309297535714575
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 126.02239999999983,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 61.967099999999846,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.9436914324760437,
+          "snippet": "/// Returned from `Serializer::serialize_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeStruct, Serializer};\n///\n/// struct Rgb {\n///     r: u8,\n///     g: u8,\n///     b: u8,\n/// }\n///\n/// impl Serialize for Rgb {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         let mut rgb = serializer.serialize_struct(\"Rgb\", 3)?;\n///         rgb.serialize_field(\"r\", &self.r)?;\n+43 more lines",
+          "start_line": 1868,
+          "end_line": 1930
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.9314974546432495,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n+100 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.9281480312347412,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+45 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.9108438491821289,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.9047038555145264,
+          "snippet": "",
+          "start_line": 1691,
+          "end_line": 1753
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 118.60139999999956,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.9436914324760437,
+          "snippet": "/// Returned from `Serializer::serialize_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeStruct, Serializer};\n///\n/// struct Rgb {\n///     r: u8,\n///     g: u8,\n///     b: u8,\n/// }\n///\n/// impl Serialize for Rgb {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         let mut rgb = serializer.serialize_struct(\"Rgb\", 3)?;\n///         rgb.serialize_field(\"r\", &self.r)?;\n+43 more lines",
+          "start_line": 1868,
+          "end_line": 1930
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.9314974546432495,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n+100 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.9281480312347412,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+45 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.9108438491821289,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.9047038555145264,
+          "snippet": "",
+          "start_line": 1691,
+          "end_line": 1753
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 59.49569999999949,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.7362542152404785,
+          "snippet": "/// Returned from `Serializer::serialize_struct_variant`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeStructVariant, Serializer};\n///\n/// enum E {\n///     S { r: u8, g: u8, b: u8 },\n/// }\n///\n/// impl Serialize for E {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         match *self {\n///             E::S {\n///                 ref r,\n///                 ref g,\n+49 more lines",
+          "start_line": 1932,
+          "end_line": 2000
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.7264035940170288,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+45 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "line": 884,
+          "score": 0.7146613001823425,
+          "snippet": "fn serialize_struct_variant(\n    context: StructVariant,\n    params: &Parameters,\n    fields: &[Field],\n    name: &Name,\n+78 more lines",
+          "start_line": 884,
+          "end_line": 966
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "line": 1322,
+          "score": 0.7077740430831909,
+          "snippet": "",
+          "start_line": 1322,
+          "end_line": 1334
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.7074496150016785,
+          "snippet": "",
+          "start_line": 1868,
+          "end_line": 1930
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333,
+      "ndcg_at_k": 0.5
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "how serde_derive generates Serialize impl with serialize_field and serialize_struct",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 116.1299999999992,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.7362542152404785,
+          "snippet": "/// Returned from `Serializer::serialize_struct_variant`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeStructVariant, Serializer};\n///\n/// enum E {\n///     S { r: u8, g: u8, b: u8 },\n/// }\n///\n/// impl Serialize for E {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         match *self {\n///             E::S {\n///                 ref r,\n///                 ref g,\n+49 more lines",
+          "start_line": 1932,
+          "end_line": 2000
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.7264035940170288,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+45 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "line": 884,
+          "score": 0.7146613001823425,
+          "snippet": "fn serialize_struct_variant(\n    context: StructVariant,\n    params: &Parameters,\n    fields: &[Field],\n    name: &Name,\n+78 more lines",
+          "start_line": 884,
+          "end_line": 966
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\ser.rs",
+          "line": 1322,
+          "score": 0.7077740430831909,
+          "snippet": "",
+          "start_line": 1322,
+          "end_line": 1334
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.7074496150016785,
+          "snippet": "",
+          "start_line": 1868,
+          "end_line": 1930
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333,
+      "ndcg_at_k": 0.5
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 143.1180000000004,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 63.30400000000009,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\mod.rs",
+          "line": 17,
+          "score": 0.6868284344673157,
+          "snippet": "#[derive(Copy, Clone)]\npub enum Derive {\n    Serialize,\n    Deserialize,\n}",
+          "start_line": 17,
+          "end_line": 21
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\enum_externally.rs",
+          "line": 22,
+          "score": 0.6575725674629211,
+          "snippet": "/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` without additional attributes\npub(super) fn deserialize(\n    params: &Parameters,\n    variants: &[Variant],\n    cattrs: &attr::Container,\n+90 more lines",
+          "start_line": 22,
+          "end_line": 116
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
+          "line": 421,
+          "score": 0.647787868976593,
+          "snippet": "/// Generates `Deserialize::deserialize_in_place` body for a `struct Struct {...}`\n#[cfg(feature = \"deserialize_in_place\")]\npub(super) fn deserialize_in_place(\n    params: &Parameters,\n    fields: &[Field],\n+85 more lines",
+          "start_line": 421,
+          "end_line": 510
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
+          "score": 0.644682765007019,
+          "snippet": "//! This crate provides Serde's two derive macros.\n//!\n//! ```edition2021\n//! # use serde_derive::{Deserialize, Serialize};\n//! #\n//! #[derive(Serialize, Deserialize)]\n//! # struct S;\n//! #\n//! # fn m",
+          "start_line": null,
+          "end_line": null
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
+          "line": 16,
+          "score": 0.6342166066169739,
+          "snippet": "",
+          "start_line": 16,
+          "end_line": 197
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 119.6291999999994,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\internals\\mod.rs",
+          "line": 17,
+          "score": 0.6868284344673157,
+          "snippet": "#[derive(Copy, Clone)]\npub enum Derive {\n    Serialize,\n    Deserialize,\n}",
+          "start_line": 17,
+          "end_line": 21
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\enum_externally.rs",
+          "line": 22,
+          "score": 0.6575725674629211,
+          "snippet": "/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` without additional attributes\npub(super) fn deserialize(\n    params: &Parameters,\n    variants: &[Variant],\n    cattrs: &attr::Container,\n+90 more lines",
+          "start_line": 22,
+          "end_line": 116
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
+          "line": 421,
+          "score": 0.647787868976593,
+          "snippet": "/// Generates `Deserialize::deserialize_in_place` body for a `struct Struct {...}`\n#[cfg(feature = \"deserialize_in_place\")]\npub(super) fn deserialize_in_place(\n    params: &Parameters,\n    fields: &[Field],\n+85 more lines",
+          "start_line": 421,
+          "end_line": 510
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\lib.rs",
+          "score": 0.644682765007019,
+          "snippet": "//! This crate provides Serde's two derive macros.\n//!\n//! ```edition2021\n//! # use serde_derive::{Deserialize, Serialize};\n//! #\n//! #[derive(Serialize, Deserialize)]\n//! # struct S;\n//! #\n//! # fn m",
+          "start_line": null,
+          "end_line": null
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_derive\\src\\de\\struct_.rs",
+          "line": 16,
+          "score": 0.6342166066169739,
+          "snippet": "",
+          "start_line": 16,
+          "end_line": 197
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 60.26190000000133,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_self.rs",
+          "line": 62,
+          "score": 0.6917799711227417,
+          "snippet": "    #[derive(Deserialize, Serialize)]\n    pub enum Enum {\n        Struct {\n            _f1: Box<Self>,\n            _f2: Box<<Self as Trait>::Assoc>,\n            _f4: [(); Self::ASSOC],\n            _f5: [(); Self::assoc()],\n        },\n        Tuple(\n            Box<Self>,\n            Box<<Self as Trait>::Assoc>,\n            [(); Self::ASSOC],\n            [(); Self::assoc()],\n        ),\n    }",
+          "start_line": 62,
+          "end_line": 76
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 1683,
+          "score": 0.6722407937049866,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A deserializer holding an `EnumAccess`.\n#[derive(Clone, Debug)]\npub struct EnumAccessDeserializer<A> {\n+2 more lines",
+          "start_line": 1683,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "line": 100,
+          "score": 0.6589848399162292,
+          "snippet": "    #[derive(Serialize, Deserialize)]\n    enum EnumWith<T> {\n        Unit,\n        Newtype(#[serde(serialize_with = \"ser_x\", deserialize_with = \"de_x\")] X),\n        Tuple(\n+9 more lines",
+          "start_line": 100,
+          "end_line": 113
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "line": 611,
+          "score": 0.6411691904067993,
+          "snippet": "",
+          "start_line": 611,
+          "end_line": 616
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "line": 86,
+          "score": 0.6303092241287231,
+          "snippet": "",
+          "start_line": 86,
+          "end_line": 87
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "how derive macros generate Deserialize code for structs and enums",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 116.58710000000065,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_self.rs",
+          "line": 62,
+          "score": 0.6917799711227417,
+          "snippet": "    #[derive(Deserialize, Serialize)]\n    pub enum Enum {\n        Struct {\n            _f1: Box<Self>,\n            _f2: Box<<Self as Trait>::Assoc>,\n            _f4: [(); Self::ASSOC],\n            _f5: [(); Self::assoc()],\n        },\n        Tuple(\n            Box<Self>,\n            Box<<Self as Trait>::Assoc>,\n            [(); Self::ASSOC],\n            [(); Self::assoc()],\n        ),\n    }",
+          "start_line": 62,
+          "end_line": 76
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 1683,
+          "score": 0.6722407937049866,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A deserializer holding an `EnumAccess`.\n#[derive(Clone, Debug)]\npub struct EnumAccessDeserializer<A> {\n+2 more lines",
+          "start_line": 1683,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_gen.rs",
+          "line": 100,
+          "score": 0.6589848399162292,
+          "snippet": "    #[derive(Serialize, Deserialize)]\n    enum EnumWith<T> {\n        Unit,\n        Newtype(#[serde(serialize_with = \"ser_x\", deserialize_with = \"de_x\")] X),\n        Tuple(\n+9 more lines",
+          "start_line": 100,
+          "end_line": 113
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "line": 611,
+          "score": 0.6411691904067993,
+          "snippet": "",
+          "start_line": 611,
+          "end_line": 616
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_macros.rs",
+          "line": 86,
+          "score": 0.6303092241287231,
+          "snippet": "",
+          "start_line": 86,
+          "end_line": 87
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 151.91469999999936,
+      "results": [
+        {
+          "file": ".\\README.md",
+          "line": 20
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36
+        },
+        {
+          "file": ".\\README.md",
+          "line": 38
+        },
+        {
+          "file": ".\\README.md",
+          "line": 51
+        },
+        {
+          "file": ".\\README.md",
+          "line": 53
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 62.113900000000285,
+      "results": [
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 502,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1337,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 385,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1039,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.2,
+      "ndcg_at_k": 0.38685280723454163
+    },
+    {
+      "mode": "aft-grep",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 62.650799999999435,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_enum_internally_tagged.rs",
+          "line": 11
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_enum_internally_tagged.rs",
+          "line": 16
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_enum_internally_tagged.rs",
+          "line": 19
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_enum_internally_tagged.rs",
+          "line": 22
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_enum_internally_tagged.rs",
+          "line": 27
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 59.60620000000017,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.9032138586044312,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeTuple, Serializer};\n///\n/// # mod fool {\n/// #     trait Serialize {}\n/// impl<A, B, C> Serialize for (A, B, C)\n/// #     {}\n/// # }\n/// #\n/// # struct Tuple3<A, B, C>(A, B, C);\n/// #\n/// # impl<A, B, C> Serialize for Tuple3<A, B, C>\n/// where\n///     A: Serialize,\n///     B: Serialize,\n///     C: Serialize,\n+85 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.8879685997962952,
+          "snippet": "/// Returned from `Serializer::serialize_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+58 more lines",
+          "start_line": 1868,
+          "end_line": 1930
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.885965883731842,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+45 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.8775887489318848,
+          "snippet": "",
+          "start_line": 1691,
+          "end_line": 1753
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.8598520755767822,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 121.72010000000046,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.9032138586044312,
+          "snippet": "/// Returned from `Serializer::serialize_tuple`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeTuple, Serializer};\n///\n/// # mod fool {\n/// #     trait Serialize {}\n/// impl<A, B, C> Serialize for (A, B, C)\n/// #     {}\n/// # }\n/// #\n/// # struct Tuple3<A, B, C>(A, B, C);\n/// #\n/// # impl<A, B, C> Serialize for Tuple3<A, B, C>\n/// where\n///     A: Serialize,\n///     B: Serialize,\n///     C: Serialize,\n+85 more lines",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1337,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 502,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 60.19259999999849,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 1095,
+          "score": 0.580958366394043,
+          "snippet": "    fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>\n    where\n        T: ?Sized + Serialize,\n    {\n        value.serialize(self)\n    }",
+          "start_line": 1095,
+          "end_line": 1100
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 251,
+          "score": 0.5681112408638,
+          "snippet": "    #[cfg(not(any(feature = \"std\", feature = \"alloc\")))]\n    fn serialize_tuple_variant(\n        self,\n        _: &'static str,\n        _: u32,\n+7 more lines",
+          "start_line": 251,
+          "end_line": 262
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 16,
+          "score": 0.5621996521949768,
+          "snippet": "/// Not public API.\npub fn serialize_tagged_newtype<S, T>(\n    serializer: S,\n    type_ident: &'static str,\n    variant_ident: &'static str,\n+16 more lines",
+          "start_line": 16,
+          "end_line": 36
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 1216,
+          "score": 0.5618298053741455,
+          "snippet": "",
+          "start_line": 1216,
+          "end_line": 1221
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 662,
+          "score": 0.5595947504043579,
+          "snippet": "",
+          "start_line": 662,
+          "end_line": 670
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Serialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 122.30649999999878,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 1095,
+          "score": 0.580958366394043,
+          "snippet": "    fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>\n    where\n        T: ?Sized + Serialize,\n    {\n        value.serialize(self)\n    }",
+          "start_line": 1095,
+          "end_line": 1100
+        },
+        {
+          "file": "serde/src/private/ser.rs",
+          "line": 1337,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 502,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 1534,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25,
+      "ndcg_at_k": 0.43067655807339306
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 416.5650000000005,
+      "results": [
+        {
+          "file": ".\\crates-io.md",
+          "line": 11
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 19
+        },
+        {
+          "file": ".\\crates-io.md",
+          "line": 21
+        },
+        {
+          "file": ".\\README.md",
+          "line": 20
+        },
+        {
+          "file": ".\\README.md",
+          "line": 36
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 62.746399999999994,
+      "results": [
+        {
+          "file": "serde_core/src/de/value.rs",
+          "line": 1704,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 22,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3488,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/de/enum_internally.rs",
+          "line": 20,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/de/value.rs",
+          "line": 1869,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "aft-grep",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 61.57839999999851,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 3
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 4
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 5
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 11
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 17
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 63.66330000000016,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 3094,
+          "score": 0.8885048031806946,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        Deserialize::deserialize(deserializer).map(Wrapping)\n    }",
+          "start_line": 3094,
+          "end_line": 3099
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2095,
+          "score": 0.8675325512886047,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        T::deserialize(deserializer).map(Cell::new)\n+1 more lines",
+          "start_line": 2095,
+          "end_line": 2100
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 820,
+          "score": 0.8667957782745361,
+          "snippet": "    #[inline]\n    fn deserialize<D>(self, deserializer: D) -> Result<T, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n+2 more lines",
+          "start_line": 820,
+          "end_line": 826
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 1259,
+          "score": 0.8567286729812622,
+          "snippet": "",
+          "start_line": 1259,
+          "end_line": 1264
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\private\\seed.rs",
+          "line": 14,
+          "score": 0.8552883863449097,
+          "snippet": "",
+          "start_line": 14,
+          "end_line": 19
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.3333333333333333,
+      "ndcg_at_k": 0.5
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 126.40970000000016,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 3094,
+          "score": 0.8885048031806946,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        Deserialize::deserialize(deserializer).map(Wrapping)\n    }",
+          "start_line": 3094,
+          "end_line": 3099
+        },
+        {
+          "file": "serde_core/src/de/value.rs",
+          "line": 1704,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 22,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3488,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 820,
+          "score": 0.8667957782745361,
+          "snippet": "    #[inline]\n    fn deserialize<D>(self, deserializer: D) -> Result<T, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n+2 more lines",
+          "start_line": 820,
+          "end_line": 826
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.2,
+      "ndcg_at_k": 0.38685280723454163
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 59.41679999999906,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 635,
+          "score": 0.591586172580719,
+          "snippet": "/// `DeserializeSeed` is the stateful form of the `Deserialize` trait. If you\n/// ever find yourself looking for a way to pass data into a `Deserialize` impl,\n/// this trait is the way to do it.\n///\n/// As one example of stateful deserialization consider deserializing a JSON\n/// array into an existing buffer. Using the `Deserialize` trait we could\n/// deserialize a JSON array into a `Vec<T>` but it would be a freshly allocated\n/// `Vec<T>`; there is no way for `Deserialize` to reuse a previously allocated\n/// buffer. Using `DeserializeSeed` instead makes this possible as in the\n/// example code below.\n///\n/// The canonical API for stateless deserialization looks like this:\n///\n/// ```edition2021\n/// # use serde::Deserialize;\n/// #\n/// # enum Error {}\n/// #\n/// fn func<'de, T: Deserialize<'de>>() -> Result<T, Error>\n/// # {\n+158 more lines",
+          "start_line": 635,
+          "end_line": 812
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2031,
+          "score": 0.5819487571716309,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        tri!(Option::<T>::deserialize(deserializer));\n+2 more lines",
+          "start_line": 2031,
+          "end_line": 2037
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 32,
+          "score": 0.5755854249000549,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        deserializer.deserialize_unit(UnitVisitor)\n+1 more lines",
+          "start_line": 32,
+          "end_line": 37
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 3488,
+          "score": 0.5754151344299316,
+          "snippet": "",
+          "start_line": 3488,
+          "end_line": 3500
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 304,
+          "score": 0.5677035450935364,
+          "snippet": "",
+          "start_line": 304,
+          "end_line": 309
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Deserialize",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 122.16319999999905,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\impls.rs",
+          "line": 2031,
+          "score": 0.5819487571716309,
+          "snippet": "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n    where\n        D: Deserializer<'de>,\n    {\n        tri!(Option::<T>::deserialize(deserializer));\n+2 more lines",
+          "start_line": 2031,
+          "end_line": 2037
+        },
+        {
+          "file": "serde_core/src/de/value.rs",
+          "line": 1704,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 3488,
+          "score": 0.5754151344299316,
+          "snippet": "",
+          "start_line": 3488,
+          "end_line": 3500
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 635,
+          "score": 0.591586172580719,
+          "snippet": "/// `DeserializeSeed` is the stateful form of the `Deserialize` trait. If you\n/// ever find yourself looking for a way to pass data into a `Deserialize` impl,\n/// this trait is the way to do it.\n///\n/// As one example of stateful deserialization consider deserializing a JSON\n/// array into an existing buffer. Using the `Deserialize` trait we could\n/// deserialize a JSON array into a `Vec<T>` but it would be a freshly allocated\n/// `Vec<T>`; there is no way for `Deserialize` to reuse a previously allocated\n/// buffer. Using `DeserializeSeed` instead makes this possible as in the\n/// example code below.\n///\n/// The canonical API for stateless deserialization looks like this:\n///\n/// ```edition2021\n/// # use serde::Deserialize;\n/// #\n/// # enum Error {}\n/// #\n/// fn func<'de, T: Deserialize<'de>>() -> Result<T, Error>\n/// # {\n+158 more lines",
+          "start_line": 635,
+          "end_line": 812
+        },
+        {
+          "file": "serde_derive/src/de/enum_externally.rs",
+          "line": 22,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25,
+      "ndcg_at_k": 0.43067655807339306
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 150.79399999999987,
+      "results": [
+        {
+          "file": ".\\serde_core\\src\\crate_root.rs",
+          "line": 146
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 14
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 36
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 60
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 1023
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 64.70030000000042,
+      "results": [
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 270,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 1180,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/bytes/mod.rs",
+          "line": 4,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/impls.rs",
+          "line": 998,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 3057,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "aft-grep",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 62.05969999999979,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 3
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 7
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 26
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 29
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\lib.rs",
+          "line": 253
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 61.92029999999977,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 103,
+          "score": 0.8026782274246216,
+          "snippet": "    #[inline]\n    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n    where\n        S: Serializer,\n    {\n        match *self {\n            Some(ref value) => serializer.serialize_some(value),\n            None => serializer.serialize_none(),\n        }\n    }",
+          "start_line": 103,
+          "end_line": 112
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 604,
+          "score": 0.7910224795341492,
+          "snippet": "    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n    where\n        S: Serializer,\n    {\n        self.get().serialize(serializer)\n+1 more lines",
+          "start_line": 604,
+          "end_line": 609
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 340,
+          "score": 0.7899066805839539,
+          "snippet": "    #[inline]\n    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n    where\n        S: Serializer,\n    {\n+2 more lines",
+          "start_line": 340,
+          "end_line": 346
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 471,
+          "score": 0.7886665463447571,
+          "snippet": "",
+          "start_line": 471,
+          "end_line": 549
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 971,
+          "score": 0.7878379225730896,
+          "snippet": "",
+          "start_line": 971,
+          "end_line": 977
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 126.6206000000002,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 103,
+          "score": 0.8026782274246216,
+          "snippet": "    #[inline]\n    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n    where\n        S: Serializer,\n    {\n        match *self {\n            Some(ref value) => serializer.serialize_some(value),\n            None => serializer.serialize_none(),\n        }\n    }",
+          "start_line": 103,
+          "end_line": 112
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 270,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 1180,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/bytes/mod.rs",
+          "line": 4,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/ser/impls.rs",
+          "line": 998,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.5,
+      "ndcg_at_k": 0.6309297535714575
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 60.354300000000876,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.5695099830627441,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeTupleStruct, Serializer};\n///\n/// struct Rgb(u8, u8, u8);\n///\n/// impl Serialize for Rgb {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         let mut ts = serializer.serialize_tuple_struct(\"Rgb\", 3)?;\n///         ts.serialize_field(&self.0)?;\n///         ts.serialize_field(&self.1)?;\n///         ts.serialize_field(&self.2)?;\n///         ts.end()\n///     }\n+30 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impossible.rs",
+          "line": 10,
+          "score": 0.5691118240356445,
+          "snippet": "/// Helper type for implementing a `Serializer` that does not support\n/// serializing one of the compound types.\n///\n/// This type cannot be instantiated, but implements every one of the traits\n/// corresponding to the [`Serializer`] compound types: [`SerializeSeq`],\n+50 more lines",
+          "start_line": 10,
+          "end_line": 64
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1868,
+          "score": 0.5405482053756714,
+          "snippet": "/// Returned from `Serializer::serialize_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n+58 more lines",
+          "start_line": 1868,
+          "end_line": 1930
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impls.rs",
+          "line": 737,
+          "score": 0.5375831127166748,
+          "snippet": "",
+          "start_line": 737,
+          "end_line": 756
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\ser.rs",
+          "line": 251,
+          "score": 0.5335791707038879,
+          "snippet": "",
+          "start_line": 251,
+          "end_line": 262
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Serializer",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 125.0546000000013,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1640,
+          "score": 0.5695099830627441,
+          "snippet": "/// Returned from `Serializer::serialize_tuple_struct`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// use serde::ser::{Serialize, SerializeTupleStruct, Serializer};\n///\n/// struct Rgb(u8, u8, u8);\n///\n/// impl Serialize for Rgb {\n///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>\n///     where\n///         S: Serializer,\n///     {\n///         let mut ts = serializer.serialize_tuple_struct(\"Rgb\", 3)?;\n///         ts.serialize_field(&self.0)?;\n///         ts.serialize_field(&self.1)?;\n///         ts.serialize_field(&self.2)?;\n///         ts.end()\n///     }\n+30 more lines",
+          "start_line": 1640,
+          "end_line": 1689
+        },
+        {
+          "file": "serde_core/src/ser/mod.rs",
+          "line": 270,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "test_suite/tests/test_annotations.rs",
+          "line": 1180,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\impossible.rs",
+          "line": 10,
+          "score": 0.5691118240356445,
+          "snippet": "/// Helper type for implementing a `Serializer` that does not support\n/// serializing one of the compound types.\n///\n/// This type cannot be instantiated, but implements every one of the traits\n/// corresponding to the [`Serializer`] compound types: [`SerializeSeq`],\n+50 more lines",
+          "start_line": 10,
+          "end_line": 64
+        },
+        {
+          "file": "test_suite/tests/bytes/mod.rs",
+          "line": 4,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 145.0119999999988,
+      "results": [
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 13
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2436
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2438
+        },
+        {
+          "file": ".\\test_suite\\tests\\test_annotations.rs",
+          "line": 2454
+        },
+        {
+          "file": ".\\test_suite\\tests\\bytes\\mod.rs",
+          "line": 1
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "fts5",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 53.81490000000122,
+      "results": [
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 1092,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 1105,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 2006,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 1056,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "aft-grep",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 59.613900000000285,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 4
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 60
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 62
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_value.rs",
+          "line": 77
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\test_suite\\tests\\test_ignored_any.rs",
+          "line": 6
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 61.25489999999991,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 1498,
+          "score": 0.6689233779907227,
+          "snippet": "    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n    where\n        V: de::Visitor<'de>,\n    {\n        let mut pair_visitor = PairVisitor(Some(self.0), Some(self.1), PhantomData);\n        let pair = tri!(visitor.visit_seq(&mut pair_visitor));\n        if pair_visitor.1.is_none() {\n            Ok(pair)\n        } else {\n            let remaining = pair_visitor.size_hint().unwrap();\n            // First argument is the number of elements in the data, second\n            // argument is the number of elements expected by the Deserialize.\n            Err(de::Error::invalid_length(2, &ExpectedInSeq(2 - remaining)))\n        }\n    }",
+          "start_line": 1498,
+          "end_line": 1512
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2737,
+          "score": 0.6386436223983765,
+          "snippet": "        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            let mut pair_visitor = PairRefVisitor(Some(self.0), Some(self.1), PhantomData);\n+10 more lines",
+          "start_line": 2737,
+          "end_line": 2751
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 1791,
+          "score": 0.6386435627937317,
+          "snippet": "        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            let mut pair_visitor = PairVisitor(Some(self.0), Some(self.1), PhantomData);\n+10 more lines",
+          "start_line": 1791,
+          "end_line": 1805
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2080,
+          "score": 0.6359575390815735,
+          "snippet": "",
+          "start_line": 2080,
+          "end_line": 2110
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2006,
+          "score": 0.625810444355011,
+          "snippet": "",
+          "start_line": 2006,
+          "end_line": 2021
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 115.06980000000112,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2737,
+          "score": 0.6386436223983765,
+          "snippet": "        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            let mut pair_visitor = PairRefVisitor(Some(self.0), Some(self.1), PhantomData);\n+10 more lines",
+          "start_line": 2737,
+          "end_line": 2751
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 1092,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 1105,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\value.rs",
+          "line": 1498,
+          "score": 0.6689233779907227,
+          "snippet": "    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n    where\n        V: de::Visitor<'de>,\n    {\n        let mut pair_visitor = PairVisitor(Some(self.0), Some(self.1), PhantomData);\n        let pair = tri!(visitor.visit_seq(&mut pair_visitor));\n        if pair_visitor.1.is_none() {\n            Ok(pair)\n        } else {\n            let remaining = pair_visitor.size_hint().unwrap();\n            // First argument is the number of elements in the data, second\n            // argument is the number of elements expected by the Deserialize.\n            Err(de::Error::invalid_length(2, &ExpectedInSeq(2 - remaining)))\n        }\n    }",
+          "start_line": 1498,
+          "end_line": 1512
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25,
+      "ndcg_at_k": 0.43067655807339306
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 60.422999999998865,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2411,
+          "score": 0.3932046890258789,
+          "snippet": "        fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            match *self.content {\n                Content::String(ref v) => visitor.visit_str(v),\n                Content::Str(v) => visitor.visit_borrowed_str(v),\n                Content::ByteBuf(ref v) => visitor.visit_bytes(v),\n                Content::Bytes(v) => visitor.visit_borrowed_bytes(v),\n                Content::U8(v) => visitor.visit_u8(v),\n                Content::U64(v) => visitor.visit_u64(v),\n                _ => Err(self.invalid_type(&visitor)),\n            }\n        }",
+          "start_line": 2411,
+          "end_line": 2424
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 1462,
+          "score": 0.38804692029953003,
+          "snippet": "        fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            match self.content {\n+9 more lines",
+          "start_line": 1462,
+          "end_line": 1475
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2224,
+          "score": 0.3806108236312866,
+          "snippet": "        fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            match *self.content {\n+8 more lines",
+          "start_line": 2224,
+          "end_line": 2236
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 1055,
+          "score": 0.3727383315563202,
+          "snippet": "",
+          "start_line": 1055,
+          "end_line": 1070
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2006,
+          "score": 0.3718918263912201,
+          "snippet": "",
+          "start_line": 2006,
+          "end_line": 2021
+        }
+      ],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "Visitor",
+      "repo_name": "serde",
+      "category": "symbol",
+      "latency_ms": 114.23790000000008,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde\\src\\private\\de.rs",
+          "line": 2411,
+          "score": 0.3932046890258789,
+          "snippet": "        fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>\n        where\n            V: Visitor<'de>,\n        {\n            match *self.content {\n                Content::String(ref v) => visitor.visit_str(v),\n                Content::Str(v) => visitor.visit_borrowed_str(v),\n                Content::ByteBuf(ref v) => visitor.visit_bytes(v),\n                Content::Bytes(v) => visitor.visit_borrowed_bytes(v),\n                Content::U8(v) => visitor.visit_u8(v),\n                Content::U64(v) => visitor.visit_u64(v),\n                _ => Err(self.invalid_type(&visitor)),\n            }\n        }",
+          "start_line": 2411,
+          "end_line": 2424
+        },
+        {
+          "file": "serde/src/private/de.rs",
+          "line": 1092,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_derive/src/ser.rs",
+          "line": 1105,
+          "score": 0.01639344262295082
+        },
+        {
+          "file": "serde_core/src/de/mod.rs",
+          "line": 1268,
+          "score": 0.01639344262295082
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 0.25,
+      "ndcg_at_k": 0.43067655807339306
+    },
+    {
+      "mode": "lexical (rg)",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 151.36599999999999,
+      "results": [],
+      "recall_at_k": 0,
+      "mrr": 0,
+      "ndcg_at_k": 0
+    },
+    {
+      "mode": "semantic-m2v",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 58.8737000000001,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 197,
+          "score": 0.7274967432022095,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be serialized into any data format supported\n/// by Serde.\n///\n/// Serde provides `Serialize` implementations for many Rust primitive and\n/// standard library types. The complete list is [here][crate::ser]. All of\n/// these can be serialized using Serde out of the box.\n///\n/// Additionally, Serde provides a procedural macro called [`serde_derive`] to\n/// automatically generate `Serialize` implementations for structs and enums in\n/// your program. See the [derive section of the manual] for how to use this.\n///\n/// In rare cases it may be necessary to implement `Serialize` manually for some\n/// type in your program. See the [Implementing `Serialize`] section of the\n/// manual for more about this.\n///\n/// Third-party crates may provide `Serialize` implementations for types that\n/// they expose. For example the [`linked-hash-map`] crate provides a\n/// [`LinkedHashMap<K, V>`] type that is serializable by Serde because the crate\n+52 more lines",
+          "start_line": 197,
+          "end_line": 268
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.6923951506614685,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n+1188 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 511,
+          "score": 0.6589064598083496,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be deserialized from any data format supported\n/// by Serde.\n///\n+78 more lines",
+          "start_line": 511,
+          "end_line": 593
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.6545771360397339,
+          "snippet": "",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 829,
+          "score": 0.6518792510032654,
+          "snippet": "",
+          "start_line": 829,
+          "end_line": 1266
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-m2v",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 122.61939999999959,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 197,
+          "score": 0.7274967432022095,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be serialized into any data format supported\n/// by Serde.\n///\n/// Serde provides `Serialize` implementations for many Rust primitive and\n/// standard library types. The complete list is [here][crate::ser]. All of\n/// these can be serialized using Serde out of the box.\n///\n/// Additionally, Serde provides a procedural macro called [`serde_derive`] to\n/// automatically generate `Serialize` implementations for structs and enums in\n/// your program. See the [derive section of the manual] for how to use this.\n///\n/// In rare cases it may be necessary to implement `Serialize` manually for some\n/// type in your program. See the [Implementing `Serialize`] section of the\n/// manual for more about this.\n///\n/// Third-party crates may provide `Serialize` implementations for types that\n/// they expose. For example the [`linked-hash-map`] crate provides a\n/// [`LinkedHashMap<K, V>`] type that is serializable by Serde because the crate\n+52 more lines",
+          "start_line": 197,
+          "end_line": 268
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.6923951506614685,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n+1188 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 511,
+          "score": 0.6589064598083496,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be deserialized from any data format supported\n/// by Serde.\n///\n+78 more lines",
+          "start_line": 511,
+          "end_line": 593
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1534,
+          "score": 0.6545771360397339,
+          "snippet": "",
+          "start_line": 1534,
+          "end_line": 1638
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\de\\mod.rs",
+          "line": 829,
+          "score": 0.6518792510032654,
+          "snippet": "",
+          "start_line": 829,
+          "end_line": 1266
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "semantic-fe",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 60.817699999999604,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1755,
+          "score": 0.6907172203063965,
+          "snippet": "/// Returned from `Serializer::serialize_map`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// # use std::marker::PhantomData;\n/// #\n/// # struct HashMap<K, V>(PhantomData<K>, PhantomData<V>);\n/// #\n/// # impl<K, V> HashMap<K, V> {\n/// #     fn len(&self) -> usize {\n/// #         unimplemented!()\n/// #     }\n/// # }\n/// #\n/// # impl<'a, K, V> IntoIterator for &'a HashMap<K, V> {\n/// #     type Item = (&'a K, &'a V);\n/// #     type IntoIter = Box<dyn Iterator<Item = (&'a K, &'a V)>>;\n/// #\n/// #     fn into_iter(self) -> Self::IntoIter {\n+92 more lines",
+          "start_line": 1755,
+          "end_line": 1866
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.640127956867218,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n+1188 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 197,
+          "score": 0.6306741237640381,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be serialized into any data format supported\n/// by Serde.\n///\n+67 more lines",
+          "start_line": 197,
+          "end_line": 268
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.6255103945732117,
+          "snippet": "",
+          "start_line": 1691,
+          "end_line": 1753
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.6191002130508423,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    },
+    {
+      "mode": "hybrid-fe",
+      "query": "how serde handles sequences and maps during serialization",
+      "repo_name": "serde",
+      "category": "architecture",
+      "latency_ms": 124.56339999999909,
+      "results": [
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1755,
+          "score": 0.6907172203063965,
+          "snippet": "/// Returned from `Serializer::serialize_map`.\n///\n/// # Example use\n///\n/// ```edition2021\n/// # use std::marker::PhantomData;\n/// #\n/// # struct HashMap<K, V>(PhantomData<K>, PhantomData<V>);\n/// #\n/// # impl<K, V> HashMap<K, V> {\n/// #     fn len(&self) -> usize {\n/// #         unimplemented!()\n/// #     }\n/// # }\n/// #\n/// # impl<'a, K, V> IntoIterator for &'a HashMap<K, V> {\n/// #     type Item = (&'a K, &'a V);\n/// #     type IntoIter = Box<dyn Iterator<Item = (&'a K, &'a V)>>;\n/// #\n/// #     fn into_iter(self) -> Self::IntoIter {\n+92 more lines",
+          "start_line": 1755,
+          "end_line": 1866
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 270,
+          "score": 0.640127956867218,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data format** that can serialize any data structure supported by Serde.\n///\n/// The role of this trait is to define the serialization half of the [Serde\n+1188 more lines",
+          "start_line": 270,
+          "end_line": 1462
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 197,
+          "score": 0.6306741237640381,
+          "snippet": "////////////////////////////////////////////////////////////////////////////////\n\n/// A **data structure** that can be serialized into any data format supported\n/// by Serde.\n///\n+67 more lines",
+          "start_line": 197,
+          "end_line": 268
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1691,
+          "score": 0.6255103945732117,
+          "snippet": "",
+          "start_line": 1691,
+          "end_line": 1753
+        },
+        {
+          "file": "\\\\?\\D:\\Coding\\_tools\\aft-src\\.bench-cache\\serde\\serde_core\\src\\ser\\mod.rs",
+          "line": 1932,
+          "score": 0.6191002130508423,
+          "snippet": "",
+          "start_line": 1932,
+          "end_line": 2000
+        }
+      ],
+      "recall_at_k": 1,
+      "mrr": 1,
+      "ndcg_at_k": 1
+    }
+  ],
+  "aggregate": {
+    "hybrid-fe": {
+      "mode": "hybrid-fe",
+      "recall": 0.9,
+      "mrr": 0.5583333333333333,
+      "ndcg": 0.6422959427791637,
+      "p50_ms": 122.16319999999905,
+      "p95_ms": 310.1270000000004,
+      "count": 10,
+      "empty": 0
+    },
+    "hybrid-m2v": {
+      "mode": "hybrid-m2v",
+      "recall": 0.8,
+      "mrr": 0.545,
+      "ndcg": 0.607938887245085,
+      "p50_ms": 119.6291999999994,
+      "p95_ms": 256.1200999999983,
+      "count": 10,
+      "empty": 0
+    },
+    "fts5": {
+      "mode": "fts5",
+      "recall": 0.7142857142857143,
+      "mrr": 0.6,
+      "ndcg": 0.6266932581763631,
+      "p50_ms": 62.746399999999994,
+      "p95_ms": 66.37199999999939,
+      "count": 7,
+      "empty": 3
+    },
+    "semantic-fe": {
+      "mode": "semantic-fe",
+      "recall": 0.7,
+      "mrr": 0.6333333333333334,
+      "ndcg": 0.65,
+      "p50_ms": 60.26190000000133,
+      "p95_ms": 243.75500000000102,
+      "count": 10,
+      "empty": 0
+    },
+    "semantic-m2v": {
+      "mode": "semantic-m2v",
+      "recall": 0.5,
+      "mrr": 0.33333333333333337,
+      "ndcg": 0.3761859507142915,
+      "p50_ms": 61.92029999999977,
+      "p95_ms": 189.74809999999889,
+      "count": 10,
+      "empty": 0
+    },
+    "lexical (rg)": {
+      "mode": "lexical (rg)",
+      "recall": 0,
+      "mrr": 0,
+      "ndcg": 0,
+      "p50_ms": 149.33879999999954,
+      "p95_ms": 416.5650000000005,
+      "count": 10,
+      "empty": 0
+    },
+    "aft-grep": {
+      "mode": "aft-grep",
+      "recall": 0,
+      "mrr": 0,
+      "ndcg": 0,
+      "p50_ms": 61.57839999999851,
+      "p95_ms": 62.650799999999435,
+      "count": 4,
+      "empty": 6
+    }
+  },
+  "lexical_aggregate": {},
+  "rerank_metrics": {},
+  "context_quality": {
+    "lexical (rg)": {
+      "candidate_pool_size": 2,
+      "rerank_pool_size": 2,
+      "snippet_count": 0,
+      "enriched_candidate_count": 0,
+      "path_only_count": 2,
+      "unenriched_candidate_count": 2,
+      "avg_doc_tokens": 0,
+      "max_doc_tokens": 0,
+      "total_doc_tokens": 0,
+      "pre_rerank_recall_at_pool": 0,
+      "post_rerank_recall_at_k": 0,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": null,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 6,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0,
+      "holdout_recall_at_10": 0,
+      "engine_latency_p95_ms": 416.5650000000005,
+      "benchmark_harness_latency_p95_ms": 416.5650000000005
+    },
+    "fts5": {
+      "candidate_pool_size": 4,
+      "rerank_pool_size": 4,
+      "snippet_count": 0,
+      "enriched_candidate_count": 0,
+      "path_only_count": 4,
+      "unenriched_candidate_count": 4,
+      "avg_doc_tokens": 0,
+      "max_doc_tokens": 0,
+      "total_doc_tokens": 0,
+      "pre_rerank_recall_at_pool": 0.7142857142857143,
+      "post_rerank_recall_at_k": 0.7142857142857143,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 3,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0.6666666666666666,
+      "holdout_recall_at_10": 1,
+      "engine_latency_p95_ms": 66.37199999999939,
+      "benchmark_harness_latency_p95_ms": 66.37199999999939
+    },
+    "semantic-m2v": {
+      "candidate_pool_size": 5,
+      "rerank_pool_size": 5,
+      "snippet_count": 31,
+      "enriched_candidate_count": 3,
+      "path_only_count": 2,
+      "unenriched_candidate_count": 2,
+      "avg_doc_tokens": 19,
+      "max_doc_tokens": 155,
+      "total_doc_tokens": 934,
+      "pre_rerank_recall_at_pool": 0.5,
+      "post_rerank_recall_at_k": 0.5,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 6,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0.4444444444444444,
+      "holdout_recall_at_10": 1,
+      "engine_latency_p95_ms": 189.74809999999889,
+      "benchmark_harness_latency_p95_ms": 189.74809999999889
+    },
+    "hybrid-m2v": {
+      "candidate_pool_size": 5,
+      "rerank_pool_size": 5,
+      "snippet_count": 21,
+      "enriched_candidate_count": 2,
+      "path_only_count": 2,
+      "unenriched_candidate_count": 2,
+      "avg_doc_tokens": 17,
+      "max_doc_tokens": 155,
+      "total_doc_tokens": 757,
+      "pre_rerank_recall_at_pool": 0.8,
+      "post_rerank_recall_at_k": 0.8,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 6,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0.7777777777777778,
+      "holdout_recall_at_10": 1,
+      "engine_latency_p95_ms": 189.74809999999889,
+      "benchmark_harness_latency_p95_ms": 256.1200999999983
+    },
+    "semantic-fe": {
+      "candidate_pool_size": 5,
+      "rerank_pool_size": 5,
+      "snippet_count": 30,
+      "enriched_candidate_count": 3,
+      "path_only_count": 2,
+      "unenriched_candidate_count": 2,
+      "avg_doc_tokens": 26,
+      "max_doc_tokens": 144,
+      "total_doc_tokens": 1277,
+      "pre_rerank_recall_at_pool": 0.7,
+      "post_rerank_recall_at_k": 0.7,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 6,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0.6666666666666666,
+      "holdout_recall_at_10": 1,
+      "engine_latency_p95_ms": 243.75500000000102,
+      "benchmark_harness_latency_p95_ms": 243.75500000000102
+    },
+    "hybrid-fe": {
+      "candidate_pool_size": 5,
+      "rerank_pool_size": 5,
+      "snippet_count": 21,
+      "enriched_candidate_count": 2,
+      "path_only_count": 3,
+      "unenriched_candidate_count": 3,
+      "avg_doc_tokens": 23,
+      "max_doc_tokens": 144,
+      "total_doc_tokens": 1066,
+      "pre_rerank_recall_at_pool": 0.9,
+      "post_rerank_recall_at_k": 0.9,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "architecture": 6,
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0.8888888888888888,
+      "holdout_recall_at_10": 1,
+      "engine_latency_p95_ms": 243.75500000000102,
+      "benchmark_harness_latency_p95_ms": 310.1270000000004
+    },
+    "aft-grep": {
+      "candidate_pool_size": 5,
+      "rerank_pool_size": 5,
+      "snippet_count": 0,
+      "enriched_candidate_count": 0,
+      "path_only_count": 5,
+      "unenriched_candidate_count": 5,
+      "avg_doc_tokens": 0,
+      "max_doc_tokens": 0,
+      "total_doc_tokens": 0,
+      "pre_rerank_recall_at_pool": 0,
+      "post_rerank_recall_at_k": 0,
+      "lost_relevant_after_rerank": [],
+      "context_exhausted": false,
+      "reranker_skipped_reason": null,
+      "intent_distribution": {
+        "symbol": 4
+      },
+      "tuning_recall_at_10": 0,
+      "holdout_recall_at_10": 0,
+      "engine_latency_p95_ms": 62.650799999999435,
+      "benchmark_harness_latency_p95_ms": 62.650799999999435
+    }
+  },
+  "empty_counts": {
+    "aft-grep": 6,
+    "fts5": 3
+  }
+}

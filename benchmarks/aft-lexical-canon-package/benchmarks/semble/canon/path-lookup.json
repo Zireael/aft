@@ -1,0 +1,835 @@
+{
+  "schema_version": 1,
+  "suite": "path_lookup",
+  "generated_at": "2026-06-16T21:22:45Z",
+  "oracle_policy": {
+    "runtime_truth_generation": "forbidden",
+    "allowed_runtime_validation": [
+      "check that relevant paths exist at pinned revision",
+      "check that line ranges still contain expected symbol/text",
+      "fail or mark unavailable; do not rewrite relevance"
+    ],
+    "canonical_source": "checked-in reviewed JSON",
+    "review_status_values": [
+      "seed",
+      "reviewed",
+      "rejected",
+      "needs_update"
+    ]
+  },
+  "description": "File/path lookup canon. This suite should be scored separately from symbol and semantic NL retrieval.",
+  "queries": [
+    {
+      "id": "axum.path.handler_mod",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "handler/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/handler/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.path_router",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "routing/path_router.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/routing/path_router.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.extract_mod",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "extract/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/extract/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.json_rs",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "json.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/json.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.response_mod",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "response/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/response/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.method_routing",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "method_routing.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/routing/method_routing.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "axum.path.middleware_mod",
+      "repo_name": "axum",
+      "language": "rust",
+      "query": "middleware/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "axum/src/middleware/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.path.application",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "application.js",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/application.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.path.request",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "request.js",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/request.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.path.response",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "response.js",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/response.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.path.express",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "express.js",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/express.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "express.path.view",
+      "repo_name": "express",
+      "language": "javascript",
+      "query": "view.js",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "lib/view.js",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.routergroup",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "routergroup.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "routergroup.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.tree",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "tree.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "tree.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.context",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "context.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "context.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.binding_json",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "binding/json.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "binding/json.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.gin_go",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "gin.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "gin.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "gin.path.recovery",
+      "repo_name": "gin",
+      "language": "go",
+      "query": "recovery.go",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "recovery.go",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.main",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/main.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/main.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.fields",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/fields.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/fields.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.json_schema",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/json_schema.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/json_schema.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.functional_validators",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/functional_validators.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/functional_validators.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.config",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/config.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/config.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "pydantic.path.types",
+      "repo_name": "pydantic",
+      "language": "python",
+      "query": "pydantic/types.py",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "pydantic/types.py",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.path.ser_mod",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "serde_core/src/ser/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/ser/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.path.de_mod",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "serde_core/src/de/mod.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_core/src/de/mod.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.path.derive_ser",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "serde_derive/src/ser.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_derive/src/ser.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.path.derive_de",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "serde_derive/src/de.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_derive/src/de.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    },
+    {
+      "id": "serde.path.ast",
+      "repo_name": "serde",
+      "language": "rust",
+      "query": "serde_derive/src/internals/ast.rs",
+      "intent": "path_lookup",
+      "eligible_modes": [
+        "glob",
+        "rg",
+        "aft-grep",
+        "fts5_search",
+        "semantic-m2v",
+        "semantic-fe",
+        "semantic-api"
+      ],
+      "relevant": [
+        {
+          "path": "serde_derive/src/internals/ast.rs",
+          "grade": "primary",
+          "confidence": "high",
+          "review_status": "seed",
+          "kind": "file"
+        }
+      ],
+      "secondary": [],
+      "candidate_source": "fixture_path_seed",
+      "review_status": "seed"
+    }
+  ]
+}
