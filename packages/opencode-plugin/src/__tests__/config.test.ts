@@ -836,7 +836,9 @@ describe("loadAftConfig", () => {
     expect(config.semantic.query_prompt_template).toBeUndefined();
     expect(config.semantic.document_prompt_template).toBeUndefined();
     // Warning must mention the new fields
-    expect(result.stderr).toContain("Ignoring semantic.output_encoding, storage_strategy, input_mode");
+    expect(result.stderr).toContain(
+      "Ignoring semantic.output_encoding, storage_strategy, input_mode",
+    );
     expect(result.stderr).toContain("Ignoring semantic.");
   });
 
@@ -919,7 +921,8 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("model2vec_max_length");
   });
 
-  test("partial safe-field override preserves user model", () => {    const fixture = createConfigFixture();
+  test("partial safe-field override preserves user model", () => {
+    const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({

@@ -36,7 +36,12 @@ export type Checker =
 /** How configure-time missing-tool warnings are delivered (OpenCode plugin). */
 export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
 
-export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama" | "model2vec" | "perplexity";
+export type SemanticBackend =
+  | "fastembed"
+  | "openai_compatible"
+  | "ollama"
+  | "model2vec"
+  | "perplexity";
 
 export interface BridgeConfig {
   request_timeout_ms?: number;
@@ -368,7 +373,9 @@ const CheckerEnum = z.enum([
 const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
 
 const SemanticConfigSchema = z.object({
-  backend: z.enum(["fastembed", "openai_compatible", "ollama", "model2vec", "perplexity"]).optional(),
+  backend: z
+    .enum(["fastembed", "openai_compatible", "ollama", "model2vec", "perplexity"])
+    .optional(),
   model: z.string().trim().min(1).optional(),
   base_url: z.string().trim().min(1).optional(),
   api_key_env: z.string().trim().min(1).optional(),

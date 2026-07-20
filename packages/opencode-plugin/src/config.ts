@@ -39,7 +39,13 @@ const CheckerEnum = z.enum([
 export const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
 export type ConfigureWarningsDelivery = z.infer<typeof ConfigureWarningsDeliveryEnum>;
 
-const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama", "model2vec", "perplexity"]);
+const SemanticBackendEnum = z.enum([
+  "fastembed",
+  "openai_compatible",
+  "ollama",
+  "model2vec",
+  "perplexity",
+]);
 
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, Ollama, model2vec, or Perplexity. */
@@ -324,19 +330,19 @@ export const AftConfigSchema = z
     semantic_search: z.boolean().optional(),
     /** FTS5 full-text search configuration. Default: { enabled: false }. */
     fts5: z
-        .object({
-          enabled: z.boolean().optional(),
-          auto_index: z.boolean().optional(),
-          index_on_start: z.boolean().optional(),
-          max_results: z.number().optional(),
-          /** Maximum characters stored per symbol body (default: 2000). */
-          max_body_chars: z.number().optional(),
-          /** Maximum lines stored per symbol body (default: 60). */
-          max_body_lines: z.number().optional(),
-          /** Enable raw FTS5 debug output in search results (default: false). */
-          raw_fts_debug: z.boolean().optional(),
-        })
-        .optional(),
+      .object({
+        enabled: z.boolean().optional(),
+        auto_index: z.boolean().optional(),
+        index_on_start: z.boolean().optional(),
+        max_results: z.number().optional(),
+        /** Maximum characters stored per symbol body (default: 2000). */
+        max_body_chars: z.number().optional(),
+        /** Maximum lines stored per symbol body (default: 60). */
+        max_body_lines: z.number().optional(),
+        /** Enable raw FTS5 debug output in search results (default: false). */
+        raw_fts_debug: z.boolean().optional(),
+      })
+      .optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
     /**
