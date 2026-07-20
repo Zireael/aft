@@ -192,6 +192,12 @@ export interface AftConfig {
     auto_index?: boolean;
     index_on_start?: boolean;
     max_results?: number;
+    /** Maximum characters stored per symbol body (default: 2000). */
+    max_body_chars?: number;
+    /** Maximum lines stored per symbol body (default: 60). */
+    max_body_lines?: number;
+    /** Enable raw FTS5 debug output in search results (default: false). */
+    raw_fts_debug?: boolean;
   };
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;

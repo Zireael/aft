@@ -2,7 +2,7 @@
 
 ## Methodology
 
-This spike measures AFT bash output compression fixtures through the real Rust compression dispatch (`compress_with_registry`) using built-in TOML filters and Rust compressors. A Cargo integration test writes `data/spike-output.json`; this Bun script tokenizes each original/compressed pair with `ai-tokenizer` Claude encoding and compares it with byte-ratio estimates.
+This spike measures AFT bash output compression fixtures through the real Rust compression dispatch (`compress_with_registry`) using built-in TOML filters and Rust compressors. The compression spike benchmark generates output via `spike.ts`; this Bun script tokenizes each original/compressed pair with `ai-tokenizer` Claude encoding and compares it with byte-ratio estimates.
 
 - Fixtures: 26 realistic bash outputs across git, build/test, lint, filesystem, deploy/container, plus one generic fallback sample.
 - Option A: precise Claude token counts using `ai-tokenizer@^1.0.6`.

@@ -321,16 +321,21 @@ export const AftConfigSchema = z
     /** Enable indexed search for grep and glob hoisting. Default: false. */
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
-    semantic_search: z.boolean().optional(),
-    /** FTS5 full-text search configuration. Default: { enabled: false }. */
-    fts5: z
-      .object({
-        enabled: z.boolean().optional(),
-        auto_index: z.boolean().optional(),
-        index_on_start: z.boolean().optional(),
-        max_results: z.number().optional(),
-      })
-      .optional(),
+    semantic_search: z.boolean().optional(),      /** FTS5 full-text search configuration. Default: { enabled: false }. */
+      fts5: z
+        .object({
+          enabled: z.boolean().optional(),
+          auto_index: z.boolean().optional(),
+          index_on_start: z.boolean().optional(),
+          max_results: z.number().optional(),
+          /** Maximum characters stored per symbol body (default: 2000). */
+          max_body_chars: z.number().optional(),
+          /** Maximum lines stored per symbol body (default: 60). */
+          max_body_lines: z.number().optional(),
+          /** Enable raw FTS5 debug output in search results (default: false). */
+          raw_fts_debug: z.boolean().optional(),
+        })
+        .optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
     /**
