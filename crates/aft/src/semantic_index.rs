@@ -4304,18 +4304,28 @@ impl SemanticIndex {
     pub fn invalidate_file(&mut self, file: &Path) {
         let target = crate::search_index::canonicalize_existing_or_deleted_path(file);
         let mut snapshot = (*self.snapshot).clone();
+
+        let file_name = file.file_name();
+        let target_name = target.file_name();
+
         snapshot.store_mut().entries_mut().retain(|e| {
             if e.chunk.file == target || e.chunk.file == file {
                 return false;
             }
-            // Stored paths are canonical; if the supplied path is an alias
-            // that no longer resolves because the file was deleted, try to
-            // resolve the entry's canonical parent against the alias parent.
-            if let Ok(entry_canon) = fs::canonicalize(&e.chunk.file) {
-                entry_canon != target && entry_canon != file
-            } else {
-                true
+            // Stored paths are canonical in practice; this is a defensive
+            // fallback for the rare case where an entry was indexed through
+            // an alias. Avoid O(N) filesystem calls: only canonicalize when
+            // the base name matches the supplied or canonical target. Aliases
+            // with a different base name cannot be resolved safely without a
+            // full scan, so they are left in place.
+            let e_name = e.chunk.file.file_name();
+            let name_matches = e_name.is_some() && (e_name == file_name || e_name == target_name);
+            if name_matches {
+                if let Ok(entry_canon) = fs::canonicalize(&e.chunk.file) {
+                    return entry_canon != target && entry_canon != file;
+                }
             }
+            true
         });
         snapshot.store_mut().file_metadata_mut().remove(file);
         snapshot.store_mut().file_metadata_mut().remove(&target);
