@@ -922,7 +922,7 @@ fn spawn_detached_survives_parent_restart() {
     let task_id = {
         let mut aft = AftProcess::spawn();
         configure_background(&mut aft, project.path(), storage.path(), SESSION);
-        let task_id = spawn_bg(&mut aft, SESSION, "sleep 1", None);
+        let task_id = spawn_bg(&mut aft, SESSION, "sleep 10", None);
         assert!(aft.shutdown().success());
         task_id
     };
