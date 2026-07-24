@@ -6750,6 +6750,14 @@ export function leaf() {}
         let reference = build_reference_connection(project_root, &extract, &resolved);
         let optimized = build_optimized_connection(project_root, &extract, &resolved);
 
+        // `insert_file_extract` and `insert_file_extract_prepared` both call
+        // `unix_seconds_now()` for `files.indexed_at`. If the reference and
+        // optimized builds straddle a one-second boundary, the rows would differ
+        // only by that timestamp. Normalize it so the comparison tests the
+        // insert parity, not wall-clock time.
+        normalize_indexed_at(&reference);
+        normalize_indexed_at(&optimized);
+
         for table in [
             "files",
             "nodes",
@@ -6847,8 +6855,8 @@ export function leaf() {}
             "dispatch_hints",
         ] {
             assert_eq!(
-                graph_table_rows(&store, table),
-                graph_table_rows(&cold_store, table),
+                graph_table_rows_normalized(&store, table),
+                graph_table_rows_normalized(&cold_store, table),
                 "incremental refresh {table} rows must match cold rebuild"
             );
         }
@@ -7034,9 +7042,18 @@ export function leaf() {}
         files
     }
 
-    fn graph_table_rows(store: &CallGraphStore, table: &str) -> Vec<String> {
+    fn graph_table_rows_normalized(store: &CallGraphStore, table: &str) -> Vec<String> {
         let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        // Normalize the wall-clock `indexed_at` column so that two stores built
+        // at different seconds produce identical row strings when the test is
+        // comparing insert parity rather than clock time.
+        normalize_indexed_at(&conn);
         table_rows(&conn, table)
+    }
+
+    fn normalize_indexed_at(conn: &Connection) {
+        conn.execute("UPDATE files SET indexed_at = 0", [])
+            .expect("normalize indexed_at");
     }
 
     fn table_rows(conn: &Connection, table: &str) -> Vec<String> {

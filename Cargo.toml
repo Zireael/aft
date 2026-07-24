@@ -2,6 +2,11 @@
 resolver = "2"
 members = ["crates/aft", "crates/aft-tokenizer"]
 
+# Patch model2vec-rs to use tokenizers 0.22.2, which depends on indicatif 0.18
+# (using unit-prefix) rather than indicatif 0.17 (using number_prefix).
+[patch.crates-io]
+model2vec-rs = { path = "vendor/model2vec-rs" }
+
 [profile.release]
 lto = true
 codegen-units = 1

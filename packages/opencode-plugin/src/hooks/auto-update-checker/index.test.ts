@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createLoggerMock } from "../../__tests__/helpers/logger-mock.js";
 
 const logMock = mock(() => {});
 const warnMock = mock(() => {});
@@ -21,12 +22,7 @@ const cacheMocks = {
   runNpmInstallSafe: mock(async () => ({ ok: true })),
 };
 
-mock.module("../../logger.js", () => ({
-  log: logMock,
-  debug: mock(() => {}),
-  warn: warnMock,
-  error: mock(() => {}),
-}));
+mock.module("../../logger.js", () => createLoggerMock({ log: logMock, warn: warnMock }));
 
 mock.module("./checker.js", () => checkerMocks);
 mock.module("./cache.js", () => cacheMocks);

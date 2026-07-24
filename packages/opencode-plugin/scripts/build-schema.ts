@@ -498,7 +498,6 @@ function buildSchema(): Record<string, unknown> {
         description: "External semantic backend configuration for embedding and retrieval.",
       },
 
-
       bridge: {
         type: "object",
         properties: {

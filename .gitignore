@@ -28,6 +28,7 @@ __pycache__/
 venv/
 target/
 vendor/
+!vendor/model2vec-rs/
 *.log
 coverage/
 .cache/

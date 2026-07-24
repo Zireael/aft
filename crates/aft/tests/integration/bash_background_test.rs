@@ -426,15 +426,21 @@ fn background_kill_terminates_shell_process_group_grandchild() {
 
     let task_id = spawn_bg(&mut aft, "spawn-kill-pgroup", &command);
     let started = Instant::now();
-    while !pid_file.exists() {
-        assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pid file was not written"
+        );
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                break trimmed
+                    .parse()
+                    .expect("pid file should contain a valid pid");
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
-    }
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
 
     let killed = aft.send(
         &json!({

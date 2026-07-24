@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use crate::lint_tool_schemas::lint_fts5_schemas;
+//! use aft::lint_tool_schemas::{lint_fts5_schemas, Severity};
 //!
 //! let results = lint_fts5_schemas();
 //! for result in &results {

@@ -90,7 +90,7 @@ fn is_model_cached(model_dir: &Path) -> bool {
 }
 
 /// Validate that a directory contains all required model2vec files.
-fn validate_model_dir(path: &Path) -> Result<(), String> {
+pub fn validate_model_dir(path: &Path) -> Result<(), String> {
     if !path.is_dir() {
         return Err(format!("model_path is not a directory: {}", path.display()));
     }
@@ -178,7 +178,7 @@ pub fn validate_model_dimensions(model_dir: &Path, expected_repo_id: &str) -> Re
 
 /// Download a model from HuggingFace Hub.
 fn download_model(repo_id: &str, target_dir: &Path) -> Result<PathBuf, String> {
-    use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::HFClientSync;
 
     slog_info!(
         "downloading model2vec model {} to {}",
@@ -195,17 +195,22 @@ fn download_model(repo_id: &str, target_dir: &Path) -> Result<PathBuf, String> {
     })?;
 
     let cache_dir = model2vec_cache_dir();
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .with_cache_dir(cache_dir)
+    let async_client = hf_hub::HFClient::builder()
+        .cache_dir(cache_dir)
         .build()
         .map_err(|e| format!("failed to init hf-hub api: {e}"))?;
+    let client = HFClientSync::from_inner(async_client)
+        .map_err(|e| format!("failed to create hf-hub sync client: {e}"))?;
 
-    let repo = api.model(repo_id.to_string());
+    let (owner, name) = crate::repo_id::split_hf_repo_id(repo_id)
+        .map_err(|e| format!("model2vec download failed: {e}"))?;
+    let repo = client.model(owner, name);
 
     for file in MODEL2VEC_FILES {
         let cached_path = repo
-            .get(file)
+            .download_file()
+            .filename(*file)
+            .send()
             .map_err(|e| format!("failed to download {file} from {repo_id}: {e}"))?;
 
         // Copy from HF cache to our target directory
@@ -260,6 +265,8 @@ pub fn list_cached_models() -> Vec<(String, PathBuf, u64)> {
 
 /// Remove a cached model from disk.
 pub fn remove_cached_model(repo_id: &str) -> Result<(), String> {
+    crate::repo_id::split_hf_repo_id(repo_id).map(|_| ())?;
+
     let cache_dir = model2vec_cache_dir();
     let model_dir = cache_dir.join(model_name_to_dir_name(repo_id));
 
@@ -289,6 +296,8 @@ pub struct ModelVersionInfo {
 
 /// Get version information about a cached model.
 pub fn get_model_version_info(repo_id: &str) -> Option<ModelVersionInfo> {
+    crate::repo_id::split_hf_repo_id(repo_id).ok()?;
+
     let cache_dir = model2vec_cache_dir();
     let model_dir = cache_dir.join(model_name_to_dir_name(repo_id));
 
@@ -625,5 +634,32 @@ mod tests {
     fn check_for_update_returns_none_for_missing() {
         let result = check_for_update("nonexistent/model");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn remove_cached_model_rejects_invalid_repo_id() {
+        assert!(remove_cached_model("/name")
+            .unwrap_err()
+            .contains("owner is empty"));
+        assert!(remove_cached_model("owner/")
+            .unwrap_err()
+            .contains("name is empty"));
+        assert!(remove_cached_model("no-slash")
+            .unwrap_err()
+            .contains("expected 'owner/name'"));
+    }
+
+    #[test]
+    fn get_model_version_info_rejects_invalid_repo_id() {
+        assert!(get_model_version_info("/name").is_none());
+        assert!(get_model_version_info("owner/").is_none());
+        assert!(get_model_version_info("no-slash").is_none());
+    }
+
+    #[test]
+    fn check_for_update_rejects_invalid_repo_id() {
+        assert!(check_for_update("/name").is_none());
+        assert!(check_for_update("owner/").is_none());
+        assert!(check_for_update("no-slash").is_none());
     }
 }

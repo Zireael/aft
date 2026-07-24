@@ -2975,11 +2975,32 @@ impl SemanticIndex {
         file_policy: &SemanticFilePolicy,
         document_prompt_template: Option<&str>,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
-        let policy = file_policy.clone();
+        let policy = file_policy.clone(); // Canonicalize the project root and input file paths so every stored
+                                          // chunk path is canonical. This invariant lets invalidation compare
+                                          // paths without per-entry filesystem calls.
+                                          // project_root only needs to be canonical enough for strip_prefix; if
+                                          // the root itself is inaccessible we still try to proceed with the
+                                          // supplied path rather than failing the whole build.
+        let project_root =
+            fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let canonical_files: Vec<PathBuf> = files
+            .iter()
+            .filter_map(|file| match fs::canonicalize(file) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    slog_warn!(
+                        "skipping semantic index file {}: failed to canonicalize: {error}",
+                        file.display()
+                    );
+                    None
+                }
+            })
+            .collect();
+
         let per_file: Vec<(
             PathBuf,
             Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
-        )> = files
+        )> = canonical_files
             .par_iter()
             .map_init(HashMap::new, |parsers, file| {
                 let result = collect_file_metadata(file).and_then(|metadata| {
@@ -3067,7 +3088,7 @@ impl SemanticIndex {
                         return Err("generated file".to_string());
                     }
 
-                    collect_file_chunks(project_root, file, parsers)
+                    collect_file_chunks(&project_root, file, parsers)
                         .map(|chunks| (metadata, chunks))
                 });
                 (file.clone(), result)
@@ -4305,28 +4326,16 @@ impl SemanticIndex {
         let target = crate::search_index::canonicalize_existing_or_deleted_path(file);
         let mut snapshot = (*self.snapshot).clone();
 
-        let file_name = file.file_name();
-        let target_name = target.file_name();
+        // Stored chunk paths are always canonical because collect_chunks
+        // canonicalizes every input file path. The caller supplies either the
+        // canonical path or an alias; canonicalize_existing_or_deleted_path
+        // resolves the alias to the canonical form when possible (including
+        // the deleted-file case). Either way, a direct comparison is sufficient.
+        snapshot
+            .store_mut()
+            .entries_mut()
+            .retain(|e| e.chunk.file != target && e.chunk.file != file);
 
-        snapshot.store_mut().entries_mut().retain(|e| {
-            if e.chunk.file == target || e.chunk.file == file {
-                return false;
-            }
-            // Stored paths are canonical in practice; this is a defensive
-            // fallback for the rare case where an entry was indexed through
-            // an alias. Avoid O(N) filesystem calls: only canonicalize when
-            // the base name matches the supplied or canonical target. Aliases
-            // with a different base name cannot be resolved safely without a
-            // full scan, so they are left in place.
-            let e_name = e.chunk.file.file_name();
-            let name_matches = e_name.is_some() && (e_name == file_name || e_name == target_name);
-            if name_matches {
-                if let Ok(entry_canon) = fs::canonicalize(&e.chunk.file) {
-                    return entry_canon != target && entry_canon != file;
-                }
-            }
-            true
-        });
         snapshot.store_mut().file_metadata_mut().remove(file);
         snapshot.store_mut().file_metadata_mut().remove(&target);
         self.snapshot = Arc::new(snapshot);
@@ -6468,6 +6477,67 @@ mod tests {
 
         assert!(index.is_empty());
         assert!(!index.file_metadata().contains_key(&target));
+    }
+
+    #[test]
+    fn invalidate_file_asserts_stored_paths_are_canonical() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("real-project");
+        let src_file = real_root.join("src/lib.rs");
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        write_rust_file(&src_file, "alias_canonical_check");
+
+        let alias_root = temp.path().join("alias-project");
+        let symlink_result = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_root, &alias_root)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&real_root, &alias_root)
+            }
+        };
+        if let Err(error) = symlink_result {
+            eprintln!("skipping symlink canonicalization test: {error}");
+            return;
+        }
+
+        let alias_file = alias_root.join("src/lib.rs");
+        let canonical_file = fs::canonicalize(&src_file).unwrap();
+
+        let mut index = build_test_index(&alias_root, std::slice::from_ref(&alias_file));
+
+        assert!(
+            !index.is_empty(),
+            "index should contain entries built through the alias"
+        );
+        for entry in index.entries_for_test() {
+            assert_eq!(
+                entry.chunk.file, canonical_file,
+                "semantic index must store the canonical file path, not the alias"
+            );
+        }
+
+        index.invalidate_file(&alias_file);
+        assert!(
+            index.is_empty(),
+            "invalidating the alias should drop canonical entries"
+        );
+    }
+
+    #[test]
+    fn collect_chunks_skips_nonexistent_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let missing_file = project_root.join("missing.rs");
+
+        let index = build_test_index(&project_root, std::slice::from_ref(&missing_file));
+        assert!(
+            index.is_empty(),
+            "non-existent files should be skipped instead of indexed"
+        );
     }
 
     #[test]

@@ -631,6 +631,12 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "verify" => aft::commands::verify::handle_verify(&req, ctx),
         "semantic_doctor" => aft::commands::semantic_doctor::handle_semantic_doctor(&req, ctx),
         "semantic_eval" => aft::commands::semantic_eval::handle_semantic_eval(&req, ctx),
+        "model_cache_list" => aft::commands::model_cache::handle_model_cache_list(&req, ctx),
+        "model_cache_remove" => aft::commands::model_cache::handle_model_cache_remove(&req, ctx),
+        "model_cache_info" => aft::commands::model_cache::handle_model_cache_info(&req, ctx),
+        "model_cache_check_update" => {
+            aft::commands::model_cache::handle_model_cache_check_update(&req, ctx)
+        }
         "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
@@ -2042,8 +2048,6 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
             status_changed = true;
         }
     }
-
-    maybe_fire_semantic_refresh_probe(ctx);
 
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());

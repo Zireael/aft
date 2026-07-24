@@ -245,6 +245,14 @@ export function preparePackageUpdate(
  */
 const STDERR_TAIL_BYTES = 16 * 1024;
 
+function restoreAndCleanupSnapshot(installDir: string): void {
+  const snapshot = pendingSnapshots.get(installDir);
+  if (snapshot) {
+    pendingSnapshots.delete(installDir);
+    restoreAutoUpdateSnapshot(snapshot);
+  }
+}
+
 export async function runNpmInstallSafe(
   installDir: string,
   options: { timeoutMs?: number; signal?: AbortSignal } = {},
@@ -253,7 +261,10 @@ export async function runNpmInstallSafe(
   let stderrTail = "";
 
   try {
-    if (options.signal?.aborted) return { ok: false, reason: "aborted" };
+    if (options.signal?.aborted) {
+      restoreAndCleanupSnapshot(installDir);
+      return { ok: false, reason: "aborted" };
+    }
     // Resolve npm beyond PATH: GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT
     // and the update silently never installs. resolveNpm() also yields the bin
@@ -262,6 +273,7 @@ export async function runNpmInstallSafe(
     if (!npm) {
       const reason = "npm not found on PATH or in known version-manager locations";
       warnNpmInstallFailure(reason, stderrTail);
+      restoreAndCleanupSnapshot(installDir);
       return { ok: false, reason };
     }
     const proc = spawn(
@@ -310,32 +322,22 @@ export async function runNpmInstallSafe(
 
     if (result === "timeout" || options.signal?.aborted) {
       abortProcess();
-      const snapshot = pendingSnapshots.get(installDir);
-      if (snapshot) {
-        pendingSnapshots.delete(installDir);
-        restoreAutoUpdateSnapshot(snapshot);
-      }
+      restoreAndCleanupSnapshot(installDir);
       const reason = options.signal?.aborted ? "aborted" : "timeout";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason, stderrTail: stderrTail || undefined };
     }
     const snapshot = pendingSnapshots.get(installDir);
     pendingSnapshots.delete(installDir);
-    if (!result.ok && snapshot) {
-      restoreAutoUpdateSnapshot(snapshot);
+    if (!result.ok) {
+      if (snapshot) restoreAutoUpdateSnapshot(snapshot);
+      warnNpmInstallFailure(result.reason ?? "npm install failed", stderrTail);
     } else if (snapshot) {
       rmSync(snapshot.tempDir, { recursive: true, force: true });
     }
-    if (!result.ok) {
-      warnNpmInstallFailure(result.reason ?? "npm install failed", stderrTail);
-    }
     return { ...result, stderrTail: stderrTail || undefined };
   } catch (err) {
-    const snapshot = pendingSnapshots.get(installDir);
-    if (snapshot) {
-      pendingSnapshots.delete(installDir);
-      restoreAutoUpdateSnapshot(snapshot);
-    }
+    restoreAndCleanupSnapshot(installDir);
     const reason = `exception: ${String(err)}`;
     warnNpmInstallFailure(reason, stderrTail);
     return { ok: false, reason, stderrTail: stderrTail || undefined };

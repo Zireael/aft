@@ -93,7 +93,7 @@ function renderSemanticEvalCall(
 
 function renderSemanticEvalResult(
   result: AgentToolResult<unknown>,
-  args: Static<typeof SemanticEvalParams>,
+  _args: Static<typeof SemanticEvalParams>,
   theme: Theme,
   context: RenderContextLike,
 ) {

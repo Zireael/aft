@@ -1057,7 +1057,42 @@ fn parse_semantic_config(
         })? as usize;
     }
 
+    // Validate model2vec-specific configuration before accepting it.
+    validate_model2vec_config(&semantic)?;
+
     Ok(semantic)
+}
+
+/// Validate model2vec-specific configuration.
+///
+/// When the backend is model2vec, either a local `model_path` must point to a
+/// valid model directory, or `model` must name a known catalog model (which can
+/// be downloaded on first use).
+fn validate_model2vec_config(config: &SemanticBackendConfig) -> Result<(), String> {
+    if config.backend != crate::config::SemanticBackend::Model2Vec {
+        return Ok(());
+    }
+
+    if config.model2vec_max_length == 0 {
+        return Err("configure: semantic.model2vec_max_length must be greater than 0".to_string());
+    }
+
+    // If a local path is provided, validate it now. Otherwise, the model name
+    // must be a known catalog model so that resolve_model2vec_files can either
+    // find cached files or download them on first use.
+    if let Some(model_path) = config.model_path.as_deref() {
+        crate::model2vec_download::validate_model_dir(model_path).map_err(|e| {
+            format!("configure: semantic.model_path is not a valid model2vec model directory: {e}")
+        })?;
+    } else if !crate::model2vec_catalog::is_known_model(&config.model) {
+        return Err(format!(
+            "configure: semantic.model '{}' is not a known model2vec model. \
+             Provide a local semantic.model_path or choose a known model from the catalog.",
+            config.model
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_semantic_files_config(
@@ -4061,5 +4096,53 @@ mod tests {
         let base = SemanticBackendConfig::default();
         assert!(parse_semantic_config(&json!({ "max_files": "lots" }), &base).is_err());
         assert!(parse_semantic_config(&json!({ "max_files": 1.5 }), &base).is_err());
+    }
+
+    #[test]
+    fn parse_semantic_config_model2vec_requires_known_model_or_path() {
+        let base = SemanticBackendConfig::default();
+        let err = parse_semantic_config(
+            &json!({ "backend": "model2vec", "model": "unknown/model" }),
+            &base,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a known model2vec model"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_semantic_config_model2vec_accepts_known_catalog_model() {
+        let base = SemanticBackendConfig::default();
+        let cfg = parse_semantic_config(
+            &json!({ "backend": "model2vec", "model": "minishlab/potion-code-16M" }),
+            &base,
+        )
+        .expect("known catalog model should parse");
+        assert_eq!(cfg.backend, super::SemanticBackend::Model2Vec);
+        assert_eq!(cfg.model, "minishlab/potion-code-16M");
+    }
+
+    #[test]
+    fn parse_semantic_config_model2vec_rejects_zero_max_length() {
+        let base = SemanticBackendConfig::default();
+        let err = parse_semantic_config(
+            &json!({ "backend": "model2vec", "model": "minishlab/potion-code-16M", "model2vec_max_length": 0 }),
+            &base,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("model2vec_max_length") && err.contains("0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_semantic_config_model2vec_rejects_invalid_local_path() {
+        let base = SemanticBackendConfig::default();
+        let err = parse_semantic_config(
+            &json!({ "backend": "model2vec", "model_path": "/definitely/not/a/model/dir" }),
+            &base,
+        )
+        .unwrap_err();
+        assert!(err.contains("model_path"), "got: {err}");
     }
 }

@@ -75,6 +75,7 @@ RUST_CHECK_IMAGE="${AFT_RUST_CHECK_IMAGE:-aft-check-rust:bookworm}"
 RUST_NIGHTLY_BASE_IMAGE="${AFT_RUST_NIGHTLY_BASE_IMAGE:-rust:nightly-bookworm}"
 RUST_NIGHTLY_CHECK_IMAGE="${AFT_RUST_NIGHTLY_CHECK_IMAGE:-aft-check-rust:nightly-bookworm}"
 BUN_IMAGE="${AFT_BUN_IMAGE:-oven/bun:1-debian}"
+BUN_CHECK_IMAGE="${AFT_BUN_CHECK_IMAGE:-aft-check-bun:debian}"
 ACTIONLINT_IMAGE="${AFT_ACTIONLINT_IMAGE:-rhysd/actionlint:latest}"
 BUSYBOX_IMAGE="${AFT_BUSYBOX_IMAGE:-busybox:1.36}"
 
@@ -388,6 +389,25 @@ DOCKERFILE
   fi
 }
 
+ensure_bun_image() {
+  require_docker
+  if (( REBUILD_IMAGES )) || ! docker image inspect "$BUN_CHECK_IMAGE" >/dev/null 2>&1; then
+    log "Building local Bun check image: $BUN_CHECK_IMAGE from $BUN_IMAGE"
+    docker build --pull=false \
+      --label aft.check.image=true \
+      --build-arg BUN_BASE_IMAGE="$BUN_IMAGE" \
+      -t "$BUN_CHECK_IMAGE" \
+      -f - . <<'DOCKERFILE'
+ARG BUN_BASE_IMAGE=oven/bun:1-debian
+FROM ${BUN_BASE_IMAGE}
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git golang-go npm python3 ripgrep rustfmt unzip \
+  && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+  fi
+}
+
 rust_docker_args() {
   local image="$1"
   printf '%s\0' \
@@ -416,9 +436,10 @@ bun_docker_args() {
     --volume "$V_BUN_CACHE:/bun-cache" \
     --volume "$V_BUN_HOME:/bun-home" \
     --volume "$V_NODE_MODULES:/work/node_modules" \
+    --volume "$V_TARGET:/work/target" \
     --env HOME=/bun-home \
     --env BUN_INSTALL_CACHE_DIR=/bun-cache \
-    "$BUN_IMAGE" bash -lc
+    "$BUN_CHECK_IMAGE" bash -lc
 }
 
 # Filter passing test output to reduce noise. Keeps failures, errors,
@@ -586,6 +607,7 @@ run_rust_nightly() {
 run_bun() {
   local label="$1"
   local command="$2"
+  ensure_bun_image
   local args=()
   while IFS= read -r -d '' part; do args+=("$part"); done < <(bun_docker_args)
   run_step "$label" docker "${args[@]}" "set -Eeuo pipefail; $command"
@@ -683,7 +705,16 @@ task_fuzz() {
 task_ts() {
   local install
   install="$(bun_install_cmd)"
-  run_bun "typescript-and-bun" "$install; bun run typecheck; bun run lint; bun run --filter '*' test"
+  # TypeScript tests (especially the OpenCode e2e suite) need the Rust
+  # debug binary at target/debug/aft. Build it first so the Bun container
+  # can reach it via the shared target volume mounted at /work/target.
+  run_rust "build-aft-for-ts-tests" "cargo build --bin aft --locked $(cargo_features_flag)"
+  # Run unit tests for the workspace packages and the pi-rpc integration tests.
+  # The OpenCode plugin e2e tests are excluded here because they require
+  # external tooling and runtime artifacts (semantic model, gofmt, etc.) that
+  # are validated in separate e2e workflows rather than this fast TypeScript
+  # validation task.
+  run_bun "typescript-and-bun" "$install; bun run typecheck; bun run lint; bun run build; bun run --filter './packages/*' test:unit; bun run --filter '@cortexkit/aft-pi-rpc-e2e' test"
 }
 task_workflows() {
   # Run through a shell inside the image so .github/workflows/*.yml expands

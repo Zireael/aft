@@ -4,7 +4,7 @@
 //
 // Usage: node scripts/ci-recall-gate.mjs <baseline.json> <current.json>
 
-import { readFileSync } from "fs";
+import { readFileSync } from "node:fs";
 
 const THRESHOLD = 5; // percent drop allowed
 
@@ -140,7 +140,9 @@ if (schemaFailures.length > 0 || regressions.length > 0) {
     }
   }
   console.log("");
-  console.log(schemaFailures.length > 0 ? "FAIL: benchmark report invalid" : "FAIL: regression detected");
+  console.log(
+    schemaFailures.length > 0 ? "FAIL: benchmark report invalid" : "FAIL: regression detected",
+  );
   process.exit(1);
 } else {
   console.log("OK: no regressions detected");

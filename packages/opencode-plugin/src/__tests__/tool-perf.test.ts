@@ -1,21 +1,11 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ToolDefinition } from "@opencode-ai/plugin";
+import { createLoggerMock } from "./helpers/logger-mock.js";
 
 // Full enumeration of logger exports so the partial mock can't leak missing
 // members into other suites (see the bun mock.module leakage rule).
 const sessionLogSpy = mock((_sessionId: string | undefined, _message: string) => {});
-mock.module("../logger.js", () => ({
-  log: () => {},
-  debug: () => {},
-  warn: () => {},
-  error: () => {},
-  sessionLog: sessionLogSpy,
-  sessionDebug: () => {},
-  sessionWarn: () => {},
-  sessionError: () => {},
-  getLogFilePath: () => "",
-  bridgeLogger: { log: () => {}, warn: () => {}, error: () => {} },
-}));
+mock.module("../logger.js", () => createLoggerMock({ sessionLog: sessionLogSpy }));
 
 const { instrumentToolMap, markBridgeStart, markBridgeEnd } = await import("../tool-perf.js");
 

@@ -2,13 +2,9 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
+import { createLoggerMock } from "../../__tests__/helpers/logger-mock.js";
 
-mock.module("../../logger.js", () => ({
-  log: mock(() => {}),
-  debug: mock(() => {}),
-  warn: mock(() => {}),
-  error: mock(() => {}),
-}));
+mock.module("../../logger.js", () => createLoggerMock());
 
 // Make npm resolution deterministic so the test does not depend on the host
 // environment having npm on PATH (the resolver now searches beyond PATH).

@@ -1,13 +1,9 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
+import { createLoggerMock } from "../../__tests__/helpers/logger-mock.js";
 
-mock.module("../../logger.js", () => ({
-  log: mock(() => {}),
-  debug: mock(() => {}),
-  warn: mock(() => {}),
-  error: mock(() => {}),
-}));
+mock.module("../../logger.js", () => createLoggerMock());
 
 let importCounter = 0;
 

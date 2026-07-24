@@ -62,6 +62,20 @@ const SemanticConfigSchema = z.object({
   max_batch_size: z.number().int().positive().optional(),
   /** Maximum number of project files to semantically index (default 20000). */
   max_files: z.number().int().positive().optional(),
+  /** Output encoding used by the embedding backend (e.g. base64_binary). */
+  output_encoding: z.enum(["float32", "base64_binary", "binary_packed"]).optional(),
+  /** Storage strategy for cached embeddings (e.g. binary_packed). */
+  storage_strategy: z.enum(["float32", "binary_packed", "sqlite"]).optional(),
+  /** Input mode for the embedding backend (e.g. document_chunks). */
+  input_mode: z.enum(["document_chunks", "symbol_chunks", "full_file"]).optional(),
+  /** Embedding dimensions (overrides model default). */
+  dimensions: z.number().int().positive().optional(),
+  /** Distance metric for similarity search (e.g. cosine, dot_product, euclidean). */
+  distance_metric: z.enum(["cosine", "dot_product", "euclidean"]).optional(),
+  /** Local path to a model2vec model directory (user-only trust boundary). */
+  model_path: z.string().trim().min(1).optional(),
+  /** Maximum sequence length for model2vec tokenization. */
+  model2vec_max_length: z.number().int().positive().optional(),
   /** Enable optional reranking via an OpenAI-compatible endpoint (default: false). */
   rerank_enabled: z.boolean().optional(),
   /** Override model for reranking. Defaults to codellama/codellama:7b-instruct if unset. */
@@ -1414,15 +1428,45 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   // Override with project config
   const projectConfig = loadConfigFromPath(projectConfigPath);
   if (projectConfig) {
-    if (
-      projectConfig.semantic?.backend !== undefined ||
-      projectConfig.semantic?.base_url !== undefined ||
-      projectConfig.semantic?.api_key_env !== undefined
-    ) {
+    const sensitiveSemanticKeys: string[] = [];
+    if (projectConfig.semantic?.backend !== undefined) sensitiveSemanticKeys.push("backend");
+    if (projectConfig.semantic?.base_url !== undefined) sensitiveSemanticKeys.push("base_url");
+    if (projectConfig.semantic?.api_key_env !== undefined)
+      sensitiveSemanticKeys.push("api_key_env");
+    if (sensitiveSemanticKeys.length > 0) {
       warn(
-        "Ignoring semantic.backend/base_url/api_key_env from project config (security: use user config for external backends)",
+        "Ignoring semantic.backend, base_url, api_key_env from project config (security: these semantic settings only honor user-level config)",
       );
     }
+
+    const newSemanticFields = [
+      "output_encoding",
+      "storage_strategy",
+      "input_mode",
+      "dimensions",
+      "distance_metric",
+    ];
+    const strippedNewSemanticFields = newSemanticFields.filter(
+      (field) =>
+        projectConfig.semantic?.[field as keyof typeof projectConfig.semantic] !== undefined,
+    );
+    if (strippedNewSemanticFields.length > 0) {
+      warn(
+        `Ignoring semantic.${strippedNewSemanticFields.join(", ")} from project config (security: trust-boundary fields — use user config for semantic backend tuning)`,
+      );
+    }
+
+    const model2vecSemanticFields = ["model_path", "model2vec_max_length"];
+    const strippedModel2vecFields = model2vecSemanticFields.filter(
+      (field) =>
+        projectConfig.semantic?.[field as keyof typeof projectConfig.semantic] !== undefined,
+    );
+    if (strippedModel2vecFields.length > 0) {
+      warn(
+        `Ignoring semantic.${strippedModel2vecFields.join(", ")} from project config (security: trust-boundary fields — use user config for model2vec settings)`,
+      );
+    }
+
     if (
       projectConfig.semantic?.rerank_prompt_template !== undefined ||
       projectConfig.semantic?.query_prompt_template !== undefined ||

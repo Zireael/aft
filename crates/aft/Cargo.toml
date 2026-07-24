@@ -108,7 +108,7 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["fancy-regex", "local-only"], optional = true }
 ndarray = "0.17.2"
 half = "2"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 htmd = "0.5.4"
 
 [target.'cfg(unix)'.dependencies]

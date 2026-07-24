@@ -84,7 +84,7 @@ impl LocalEmbedder {
         // inside dlopen on an incompatible/absent ONNX Runtime.
         pre_validate_onnx_runtime()?;
 
-        let (model_path, tokenizer_path) = resolve_model_files()?;
+        let (model_path, tokenizer_path) = resolve_model_files(&embedding_cache_dir())?;
 
         let threads = intra_thread_cap();
         let session = Session::builder()
@@ -294,16 +294,14 @@ fn mask_at(mask: &ndarray::Array2<i64>, row: usize, col: usize) -> i64 {
 
 /// Resolve the MiniLM model.onnx + tokenizer.json, reusing an existing local
 /// download when present (offline-safe) and falling back to an hf-hub fetch.
-fn resolve_model_files() -> Result<(PathBuf, PathBuf), String> {
-    let cache_dir = embedding_cache_dir();
-
-    if let Some(found) = scan_local_snapshot(&cache_dir) {
+fn resolve_model_files(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
+    if let Some(found) = scan_local_snapshot(cache_dir) {
         return Ok(found);
     }
 
     // Not cached locally — download via hf-hub into the same cache layout so a
     // subsequent run finds it through the local scan above.
-    download_via_hf_hub(&cache_dir)
+    download_via_hf_hub(cache_dir)
 }
 
 /// fastembed read `FASTEMBED_CACHE_DIR`; the bridge/warmup set it to
@@ -354,31 +352,40 @@ fn scan_local_snapshot(cache_dir: &std::path::Path) -> Option<(PathBuf, PathBuf)
 }
 
 fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
-    use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::HFClientSync;
 
     slog_info!(
         "downloading all-MiniLM-L6-v2 ({}) to {}",
         MINILM_REPO,
         cache_dir.display()
     );
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .with_cache_dir(cache_dir.to_path_buf())
+
+    let async_client = hf_hub::HFClient::builder()
+        .cache_dir(cache_dir.to_path_buf())
         .build()
         .map_err(|e| format!("failed to init hf-hub api: {e}"))?;
-    let repo = api.model(MINILM_REPO.to_string());
+    let client = HFClientSync::from_inner(async_client)
+        .map_err(|e| format!("failed to create hf-hub sync client: {e}"))?;
+    // Split "Qdrant/all-MiniLM-L6-v2-onnx" into owner/name for the 1.0 API.
+    let (owner, name) = crate::repo_id::split_hf_repo_id(MINILM_REPO)
+        .map_err(|e| format!("MiniLM download failed: {e}"))?;
+    let repo = client.model(owner, name);
     let model = repo
-        .get(MINILM_MODEL_FILE)
+        .download_file()
+        .filename(MINILM_MODEL_FILE)
+        .send()
         .map_err(|e| format!("failed to download {MINILM_MODEL_FILE}: {e}"))?;
     let tokenizer = repo
-        .get(MINILM_TOKENIZER_FILE)
+        .download_file()
+        .filename(MINILM_TOKENIZER_FILE)
+        .send()
         .map_err(|e| format!("failed to download {MINILM_TOKENIZER_FILE}: {e}"))?;
     Ok((model, tokenizer))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::MINILM_MAX_LENGTH;
+    use super::{resolve_model_files, MINILM_MAX_LENGTH};
     use std::io::Write;
     use tokenizers::Tokenizer;
 
@@ -460,5 +467,45 @@ mod tests {
         file.write_all(&json).unwrap();
         file.flush().unwrap();
         assert_load_encode_parity(Tokenizer::from_file(file.path()).unwrap());
+    }
+
+    /// End-to-end test: download the MiniLM model files via hf-hub 1.0 and then
+    /// confirm the second call reuses the cached files without network traffic.
+    /// Ignored by default because it downloads ~24 MB over the network.
+    #[test]
+    #[ignore = "downloads ~24 MB from HuggingFace"]
+    fn resolve_model_files_downloads_and_reuses_cache() {
+        let cache = tempfile::tempdir().unwrap();
+
+        let (model1, tokenizer1) =
+            resolve_model_files(cache.path()).expect("first call should download model files");
+        assert!(model1.exists(), "model.onnx should exist after download");
+        assert!(
+            tokenizer1.exists(),
+            "tokenizer.json should exist after download"
+        );
+
+        // The second call should find the cached files and return the same paths,
+        // without hitting the network.
+        let (model2, tokenizer2) =
+            resolve_model_files(cache.path()).expect("second call should reuse cached files");
+        assert_eq!(
+            model1, model2,
+            "second call should return the same cached model.onnx path"
+        );
+        assert_eq!(
+            tokenizer1, tokenizer2,
+            "second call should return the same cached tokenizer.json path"
+        );
+
+        // Both files should live in the snapshot layout that scan_local_snapshot expects.
+        let snapshots = cache
+            .path()
+            .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
+            .join("snapshots");
+        assert!(
+            snapshots.exists(),
+            "cache should contain the snapshot directory"
+        );
     }
 }

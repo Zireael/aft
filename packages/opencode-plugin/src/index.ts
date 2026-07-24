@@ -68,6 +68,7 @@ import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
+import { fts5Tools } from "./tools/fts5.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
 import {
@@ -75,6 +76,7 @@ import {
   inspectToolSurfaceEnabled,
   inspectTools,
 } from "./tools/inspect.js";
+import { modelCacheTools } from "./tools/model-cache.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
 import { refactoringTools } from "./tools/refactoring.js";
@@ -83,7 +85,6 @@ import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import { semanticDoctorTools } from "./tools/semantic-doctor.js";
 import { semanticEvalTools } from "./tools/semantic-eval.js";
-import { fts5Tools } from "./tools/fts5.js";
 import { verifyTools } from "./tools/verify.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
@@ -901,6 +902,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticDoctorTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticEvalTools(ctx)),
+    ...(surface !== "minimal" && aftConfig.semantic_search === true && modelCacheTools(ctx)),
     ...(surface !== "minimal" && aftConfig.fts5?.enabled === true && fts5Tools(ctx)),
     ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
     ...(surface !== "minimal" && verifyTools(ctx)),

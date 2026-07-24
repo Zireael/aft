@@ -92,6 +92,7 @@ pub mod pattern_compile;
 pub mod protocol;
 pub mod query_shape;
 pub mod refactor_plan;
+mod repo_id;
 pub mod retrieval;
 pub mod ril_indexer;
 pub mod search_index;

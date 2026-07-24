@@ -89,6 +89,7 @@ import { registerFts5Tool } from "./tools/fts5.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
+import { registerModelCacheTools } from "./tools/model-cache.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
@@ -761,6 +762,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     registerSemanticTool(pi, ctx);
     registerSemanticDoctorTool(pi, ctx);
     registerSemanticEvalTool(pi, ctx);
+    registerModelCacheTools(pi, ctx);
   }
   if (config.fts5?.enabled) {
     registerFts5Tool(pi, ctx);

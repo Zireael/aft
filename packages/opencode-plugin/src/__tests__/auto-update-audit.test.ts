@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createLoggerMock } from "./helpers/logger-mock.js";
 
 const logMock = mock(() => {});
 const warnMock = mock(() => {});
@@ -22,12 +23,19 @@ const cacheMocks = {
   runNpmInstallSafe: mock(async () => ({ ok: true })),
 };
 
-mock.module("../logger.js", () => ({
-  log: logMock,
-  debug: mock(() => {}),
-  warn: warnMock,
-  error: mock(() => {}),
-}));
+mock.module("../logger.js", () =>
+  createLoggerMock({
+    log: logMock,
+    warn: warnMock,
+    getLogFilePath: () => "/tmp/aft-plugin-test.log",
+    bridgeLogger: {
+      log: () => {},
+      warn: () => {},
+      error: () => {},
+      getLogFilePath: () => "/tmp/aft-plugin-test.log",
+    },
+  }),
+);
 mock.module("../hooks/auto-update-checker/checker.js", () => checkerMocks);
 mock.module("../hooks/auto-update-checker/cache.js", () => cacheMocks);
 

@@ -42,6 +42,7 @@ pub mod lsp_hover;
 pub mod lsp_inspect;
 pub mod lsp_prepare_rename;
 pub mod lsp_rename;
+pub mod model_cache;
 pub mod move_file;
 pub mod move_symbol;
 pub mod multi_path;

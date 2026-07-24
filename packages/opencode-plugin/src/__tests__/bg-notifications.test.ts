@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createLoggerMock } from "./helpers/logger-mock.js";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names, wake_client_path metadata,
@@ -16,23 +17,13 @@ const sessionWarnSpy = mock(
 const sessionDebugSpy = mock(
   (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
 );
-mock.module("../logger.js", () => ({
-  sessionLog: sessionLogSpy,
-  sessionDebug: sessionDebugSpy,
-  sessionWarn: sessionWarnSpy,
-  log: () => {},
-  debug: () => {},
-  warn: () => {},
-  error: () => {},
-  sessionError: () => {},
-  bridgeLogger: {
-    log: () => {},
-    warn: () => {},
-    error: () => {},
-    getLogFilePath: () => "",
-  },
-  getLogFilePath: () => "",
-}));
+mock.module("../logger.js", () =>
+  createLoggerMock({
+    sessionLog: sessionLogSpy,
+    sessionDebug: sessionDebugSpy,
+    sessionWarn: sessionWarnSpy,
+  }),
+);
 
 // Mock the live-server client factory + wake-availability decision so
 // unit tests don't need a real HTTP listener. Each test sets up its own

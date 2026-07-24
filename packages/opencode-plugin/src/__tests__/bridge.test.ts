@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -247,9 +247,13 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("multiple sequential requests return correct responses (ID correlation)", async () => {
+    // Use an isolated temp cwd so the real aft binary doesn't pay the cost
+    // of scanning / locking the shared repo .aft directory while other tests
+    // are running in parallel in containerized environments.
+    const projectCwd = mkdtempSync(join(tmpdir(), "aft-id-corr-"));
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
+      projectCwd,
       {
         timeoutMs: TEST_TIMEOUT_MS,
       },
@@ -272,15 +276,20 @@ describe("BinaryBridge lifecycle", () => {
     // IDs should be unique (ascending)
     const ids = [r1.id, r2.id, r3.id];
     expect(new Set(ids).size).toBe(3);
-  });
+  }, 30_000);
 
   test("bridge recovers via lazy respawn after external SIGKILL", async () => {
     // Issue #14: SIGKILL/SIGTERM are external kills, not crashes — we explicitly
     // do NOT auto-restart to avoid process avalanches when many bridges receive
     // SIGTERM together. Recovery still works: the next send() lazy-spawns.
+    //
+    // Use an isolated temp cwd so a SIGKILLed aft binary does not leave a stale
+    // lock in the shared repo .aft directory, which can delay the next spawn
+    // beyond the test timeout in containerized environments.
+    const projectCwd = mkdtempSync(join(tmpdir(), "aft-sigkill-"));
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
+      projectCwd,
       {
         timeoutMs: TEST_TIMEOUT_MS,
         maxRestarts: 3,
