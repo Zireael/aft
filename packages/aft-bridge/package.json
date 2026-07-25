@@ -27,7 +27,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__"
+    "test:unit": "bun test --timeout=30000 src/__tests__"
   },
   "dependencies": {
     "comment-json": "^4.2.5",

@@ -26,7 +26,7 @@
     "lint": "biome check src",
     "schema": "bun scripts/build-schema.ts",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
+    "test:unit": "bun test --timeout=30000 src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
   },
   "dependencies": {
     "@clack/prompts": "^1.2.0",

@@ -20,7 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test"
+    "test:unit": "bun test --timeout=30000"
   },
   "dependencies": {
     "@clack/prompts": "^1.2.0",

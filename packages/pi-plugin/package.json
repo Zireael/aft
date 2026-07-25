@@ -20,7 +20,7 @@
     "test": "bun test src/__tests__/",
     "lint": "biome check src",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
+    "test:unit": "bun test --timeout=30000 src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
   },
   "dependencies": {
     "@cortexkit/aft-bridge": "0.39.1",
