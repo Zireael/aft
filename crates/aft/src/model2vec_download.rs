@@ -236,6 +236,11 @@ pub fn model_dir_size(path: &Path) -> Result<u64, String> {
 }
 
 /// List all cached model2vec models.
+///
+/// Only returns models whose directory name, when reverse-transformed
+/// (`--` → `/`), produces a valid HuggingFace repo ID (owner/name).
+/// Manually-created directories or stale caches that don't round-trip
+/// through [`crate::repo_id::split_hf_repo_id`] are silently skipped.
 pub fn list_cached_models() -> Vec<(String, PathBuf, u64)> {
     let cache_dir = model2vec_cache_dir();
     let mut models = Vec::new();
@@ -253,6 +258,13 @@ pub fn list_cached_models() -> Vec<(String, PathBuf, u64)> {
                     .file_name()
                     .map(|n| n.to_string_lossy().replace("--", "/"))
                     .unwrap_or_default();
+                // Guard: skip entries that don't round-trip through our
+                // validation.  A manually-created directory like "evil"
+                // (no slash) would pass the cache check but then confuse
+                // downstream commands that expect a valid repo_id.
+                if crate::repo_id::split_hf_repo_id(&name).is_err() {
+                    continue;
+                }
                 let size = model_dir_size(&path).unwrap_or(0);
                 models.push((name, path, size));
             }
