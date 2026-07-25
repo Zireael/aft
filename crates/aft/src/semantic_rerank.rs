@@ -401,7 +401,7 @@ fn parse_cross_encoder_response(text: &str, _candidate_count: usize) -> RerankOu
             .filter_map(|(i, s)| s.as_f64().map(|score| (i, score)))
             .collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
+        let mut indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
         if !indices.is_empty() {
             // Deduplicate while preserving order.
             let mut seen = std::collections::HashSet::new();
