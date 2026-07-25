@@ -11,7 +11,6 @@
 
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
-import { stripJsoncSymbols } from "./jsonc.js";
 /**
  * Minimal log/warn callback surface consumed by shared helpers.
  * Callers pass their own host-specific logger (OpenCode or Pi).
