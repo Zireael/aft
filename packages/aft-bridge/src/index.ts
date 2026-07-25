@@ -36,6 +36,47 @@ export type {
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
 export { coerceOptionalInt, coerceStringArray, isEmptyParam } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
+export type {
+  BashAwareConfig,
+  ConfigureExperimentalOverrides,
+  ConfigureLspOverrides,
+  ConfigureLspServer,
+  InspectLikeConfig,
+  LspAwareConfig,
+  LspLikeConfig,
+  LspServerEntryConfig,
+  MergeableConfig,
+  MigrationTarget,
+  ResolvedBashConfig,
+  SemanticLikeConfig,
+} from "./config-resolver.js";
+// --- shared config resolution (bash, lsp, migration, merge) ---
+export {
+  CONFIG_MIGRATIONS,
+  DEFAULT_BRIDGE_HANG_THRESHOLD,
+  DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS,
+  detectConfigFile,
+  ensureRecordAtPath,
+  extractCommentsForPreservation,
+  FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
+  FOREGROUND_WAIT_WINDOW_MIN_MS,
+  getProjectLspStrippedKeys,
+  hasPath,
+  mergeBashConfig,
+  mergeExperimentalConfig,
+  mergeInspectConfig,
+  mergeLspConfig,
+  mergeSemanticConfig,
+  migrateAftConfigFile,
+  migrateExperimentalBashBlock,
+  migrateRawConfig,
+  normalizeLspExtension,
+  resolveBashConfig,
+  resolveBridgePoolTransportOptions,
+  resolveExperimentalConfigForConfigure,
+  resolveLspConfigForConfigure,
+  setPath,
+} from "./config-resolver.js";
 // --- binary resolution ---
 export {
   downloadBinary,

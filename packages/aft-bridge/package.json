@@ -30,6 +30,7 @@
     "test:unit": "bun test src/__tests__"
   },
   "dependencies": {
+    "comment-json": "^4.2.5",
     "undici": "^7.25.0"
   },
   "devDependencies": {
