@@ -21,7 +21,8 @@ import { mock } from "bun:test";
  *   );
  */
 
-export type LoggerMockFn = ReturnType<typeof mock<() => void>>;
+/** Concrete function type — avoids the portability hazard of `ReturnType<typeof mock<...>>`. */
+export type LoggerMockFn = () => void;
 
 export interface LoggerMock {
   log: LoggerMockFn;

@@ -1421,6 +1421,13 @@ fn collect_degraded_grep_files(project_root: &Path) -> (Vec<PathBuf>, bool) {
                         // reports that are never source code.  Without this
                         // filter, `read_searchable_text` reads multi-GB of
                         // binary data and the handler times out.
+                        //
+                        // NOTE: This list is hardcoded and cannot cover every
+                        // project.  Repos with other large binary directories
+                        // (e.g. custom artifact stores, ML model folders) may
+                        // still see degraded-grep timeouts unless those dirs
+                        // are git-ignored (which ignore::WalkBuilder respects)
+                        // or listed in a .aftignore at the project root.
                         | ".aft"
                         | ".bench-cache"
                         | ".aft-bench"

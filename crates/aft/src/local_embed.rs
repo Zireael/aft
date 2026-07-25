@@ -471,10 +471,13 @@ mod tests {
 
     /// End-to-end test: download the MiniLM model files via hf-hub 1.0 and then
     /// confirm the second call reuses the cached files without network traffic.
-    /// Ignored by default because it downloads ~24 MB over the network.
+    /// Skipped unless `AFT_TEST_ONLINE=1` (or `true`) is set — downloads ~24 MB.
     #[test]
-    #[ignore = "downloads ~24 MB from HuggingFace"]
     fn resolve_model_files_downloads_and_reuses_cache() {
+        if std::env::var("AFT_TEST_ONLINE").map_or(true, |v| v != "1" && v != "true") {
+            eprintln!("skipping online test (set AFT_TEST_ONLINE=1 to run)");
+            return;
+        }
         let cache = tempfile::tempdir().unwrap();
 
         let (model1, tokenizer1) =
