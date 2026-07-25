@@ -184,6 +184,11 @@ mod tests {
     // This test simulates that two-process structure with a shell pipeline:
     // a parent shell that forks a child `sleep`. The parent stays attached
     // (via wait), so both die when the group is killed.
+    //
+    // SAFETY: Uses pre_exec → fork()+setsid() which is safe because cargo
+    // test runs single-threaded within each binary. Under nextest or other
+    // multi-threaded runners, this test should be skipped or run in its own
+    // process. Only #[cfg(unix)] compiled.
     #[cfg(unix)]
     #[test]
     fn kill_all_kills_process_group_not_just_wrapper_pid() {

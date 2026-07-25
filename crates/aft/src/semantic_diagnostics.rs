@@ -765,7 +765,9 @@ fn format_warning_verbose(w: &SearchWarning) -> String {
 pub struct WarningDedup {
     /// Dedup window: warnings seen within this duration are suppressed.
     window: Duration,
-    /// Warning key → (first_seen, occurrence_count).
+    /// Warning key → (first_seen, suppressed_count).
+    /// suppressed_count tracks how many times the warning was suppressed
+    /// after its first occurrence; resets when the dedup window expires.
     seen: HashMap<String, (Instant, usize)>,
 }
 
@@ -791,13 +793,15 @@ impl WarningDedup {
         for w in warnings {
             let key = warning_dedup_key(w);
             match self.seen.get(&key) {
-                Some((first_seen, _count)) => {
+                Some((first_seen, count)) => {
                     if now.duration_since(*first_seen) > self.window {
                         // Window expired — treat as new occurrence.
                         self.seen.insert(key, (now, 1));
                         result.push(w.clone());
+                    } else {
+                        // Already shown within window — increment suppression count.
+                        self.seen.insert(key, (*first_seen, count + 1));
                     }
-                    // else: already shown within window — suppress.
                 }
                 None => {
                     // Never seen — show it.
