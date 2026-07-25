@@ -1,0 +1,11 @@
+# Workspace-level Bun configuration.
+# Applied to all `bun test` commands across packages in this repository.
+
+[test]
+# Default per-test timeout in milliseconds. Bun's built-in default is 5_000 (5s).
+# The aft binary can take longer to cold-start inside Docker containers (Docker
+# Desktop CPU/memory limits, filesystem overhead for database initialization),
+# and bridge/integration tests that spawn the real binary need the extra headroom.
+# Local development on fast machines sees no downside — tests that finish early
+# still report immediately.
+timeout = 30_000
