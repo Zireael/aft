@@ -244,7 +244,14 @@ fn rerank_chat(
         });
 
     match indices {
-        Ok(indices) => RerankOutcome::ReRanked(indices),
+        Ok(mut indices) => {
+            // Deduplicate while preserving order — some LLMs return repeated
+            // indices in their reranked output, which produces duplicate
+            // entries in search results.
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
+            RerankOutcome::ReRanked(indices)
+        }
         Err(e) => RerankOutcome::Failed(e),
     }
 }
@@ -370,14 +377,18 @@ fn parse_cross_encoder_response(text: &str, _candidate_count: usize) -> RerankOu
 
     // Try {results: [...]} format with various item shapes.
     if let Some(results_arr) = v.get("results").and_then(|r| r.as_array()) {
-        if let Some(indices) = extract_indices_from_rerank_results(results_arr) {
+        if let Some(mut indices) = extract_indices_from_rerank_results(results_arr) {
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
             return RerankOutcome::ReRanked(indices);
         }
     }
 
     // Try {data: [...]} format.
     if let Some(data_arr) = v.get("data").and_then(|d| d.as_array()) {
-        if let Some(indices) = extract_indices_from_rerank_results(data_arr) {
+        if let Some(mut indices) = extract_indices_from_rerank_results(data_arr) {
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
             return RerankOutcome::ReRanked(indices);
         }
     }
@@ -392,18 +403,23 @@ fn parse_cross_encoder_response(text: &str, _candidate_count: usize) -> RerankOu
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
         if !indices.is_empty() {
+            // Deduplicate while preserving order.
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
             return RerankOutcome::ReRanked(indices);
         }
     }
 
     // Try direct array of indices.
     if let Some(arr) = v.as_array() {
-        if let Some(indices) = arr
+        if let Some(mut indices) = arr
             .iter()
             .map(|v| v.as_u64().map(|i| i as usize))
             .collect::<Option<Vec<usize>>>()
         {
             if !indices.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                indices.retain(|i| seen.insert(*i));
                 return RerankOutcome::ReRanked(indices);
             }
         }
@@ -441,7 +457,10 @@ fn extract_indices_from_rerank_results(arr: &[serde_json::Value]) -> Option<Vec<
             if indexed.iter().any(|(_, s)| !s.is_nan()) {
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             }
-            let indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
+            let mut indices: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
+            // Deduplicate while preserving order.
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
             return Some(indices);
         }
     }
@@ -457,7 +476,10 @@ fn extract_indices_from_rerank_results(arr: &[serde_json::Value]) -> Option<Vec<
             })
             .collect();
         if !indices.is_empty() {
-            return Some(indices);
+            let mut seen = std::collections::HashSet::new();
+            let mut deduped = indices;
+            deduped.retain(|i| seen.insert(*i));
+            return Some(deduped);
         }
     }
 

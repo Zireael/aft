@@ -621,6 +621,11 @@ install_cargo_tool_cmd() {
 
 cargo_features_flag() {
   if [[ -n "$CARGO_FEATURES" ]]; then
+    # Validate features to prevent shell injection. Cargo features are
+    # comma-separated identifiers (alphanumeric + hyphen/underscore).
+    if [[ ! "$CARGO_FEATURES" =~ ^[a-zA-Z0-9_,.+\\-]+$ ]]; then
+      fatal "--features value contains invalid characters: $CARGO_FEATURES"
+    fi
     printf '%s' "--features '$CARGO_FEATURES'"
   fi
 }
@@ -874,11 +879,14 @@ main() {
 
   # Ensure CRLF line endings don't cause test failures inside Linux Docker containers.
   # Golden/fixture files with \r\n produce byte-comparison failures when the Rust
-  # process (running inside Linux Docker) outputs LF. Setting this once here is safe
-  # because the repo is bind-mounted into Docker.
-  if [[ "$(git -C "$REPO_ROOT" config core.autocrlf 2>/dev/null)" != "false" ]]; then
-    log "Setting core.autocrlf=false for Docker test compatibility"
+  # process (running inside Linux Docker) outputs LF. Save the original value and
+  # restore it when the script exits so we don't silently mutate the user's repo config.
+  _ORIGINAL_AUTOCRLF="$(git -C "$REPO_ROOT" config core.autocrlf 2>/dev/null || true)"
+  if [[ "$_ORIGINAL_AUTOCRLF" != "false" ]]; then
+    log "Temporarily setting core.autocrlf=false for Docker test compatibility"
     git -C "$REPO_ROOT" config core.autocrlf false
+    # Restore original value on exit (best-effort).
+    trap '_cleanup_temps; if [[ -n "$_ORIGINAL_AUTOCRLF" ]]; then git -C "$REPO_ROOT" config core.autocrlf "$_ORIGINAL_AUTOCRLF" 2>/dev/null || true; fi' EXIT
   fi
 
   case "$TASK" in
