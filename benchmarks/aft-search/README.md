@@ -174,6 +174,72 @@ python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_missing_exa
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_recorded_include_tests_changes_ranked_paths
 ```
 
+### Concept recall
+
+`run_concept_recall.py` replays the 28 cases in `fixtures.json` through the
+public `search` tool on the same pinned tree, served by the same fixture server
+as the real-query replay. The chunk vectors come from `real-query-vectors.bin`.
+The concept queries have their own pack, `concept-query-vectors.bin`, which
+uses the same format and model. It records the digest of the chunk pack it was
+captured against, so the real-query pack and the manifest rows bound to its
+digest never change for a concept edit. Each case sends one `topK=50`,
+`includeTests: false` request. It scores the rank of the first of its
+`expected_top_files` among the first ten distinct files returned. The router
+decides which lanes run, as it does for users; each row records `lanes_run`.
+On the pinned tree 15 of the 28 cases run the semantic lane: every mixed,
+natural-language and generic-file case, and both error-code cases. The ten
+identifier and three path cases do not.
+
+It refuses rather than guesses. A fixture query with no stored vector stops the
+run before AFT starts. A text the fixture server refused during the run fails
+it (`vector_missing`), because AFT would otherwise have ranked that query
+without its semantic lane. A query pack from another model, pin or chunk pack
+is rejected. Like the real-query replay, it is not repeatable on macOS. Record
+it on Linux.
+
+Until 2026-09 the runner never started AFT. It wrote 1.0 for every metric of
+every case that had a hashed stand-in vector in `concept-vectors.json`, so the
+gate's concept family could not move.
+
+After changing `fixtures.json`, recapture the query pack in the authoring
+environment the real-query capture uses:
+
+```bash
+cd benchmarks/aft-search
+uv run --with onnxruntime==1.24.4 --with tokenizers==0.22.2 --with numpy \
+  python3 run_concept_recall.py --capture
+```
+
+The capture only records texts that are fixture queries. A chunk missing from
+the real-query pack fails it, because recording that chunk here would hide a
+stale pack.
+
+Some answers in `fixtures.json` could not be confirmed against the pinned tree.
+They are left as written, and their scores should be read with that in mind:
+
+- `subagent_type`: neither expected file (`tools/hoisted.ts`,
+  `tools/hoisted-internals.ts`) mentions subagents at the pin. The identifier
+  itself appears only in `crates/aft/tests/integration/query_shape_test.rs`.
+  The case can score only if the tree changes.
+- `process group already terminated`: the phrase occurs nowhere.
+  `bash_background/registry.rs` does handle process-group termination, but
+  `bash_background/watchdog.rs` has no termination code. The shared
+  termination helpers, `bash_background/process.rs`, rank first and are not
+  listed.
+- `semantic_search unavailable renderer`: neither expected `semantic.ts`
+  contains "unavailable". They are the semantic renderers, so only the
+  renderer half of the query supports them.
+- `useState hook examples`: one answer is a test fixture
+  (`tests/fixtures/imports_ts.ts`), which `includeTests: false` excludes.
+  The other, `commands/add_import.rs`, mentions `useState` only in a doc
+  comment and a unit test.
+
+The pinned tree also carries `.alfonso/reports/search-fusion-quality.md`,
+which quotes these fixture queries. It is ranked first for `aft_safety_history`
+and `subagent_type`. `.aftignore` does not exclude it. Excluding it would
+change the real-query candidate pool as well, so it is left for a change that
+re-records both.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
@@ -230,6 +296,51 @@ Re-records so far:
   `lexical_score_from_postings`), which calls the platform's libm (glibc
   `logf`, which has an FMA variant on x86_64). A CI-only mismatch on
   lexical-heavy rows would point there first.
+- 2026-09-26, when concept recall began running AFT (see Concept recall
+  above). Only the concept family and its fixture groups moved. The engine
+  was unchanged. Recorded in a Linux aarch64 container on one release build
+  of the base commit (`aft 0.57.2`, binary sha256 `17fba2ca8c9b...`), with
+  `search_quality.py --mode record-reference --manifest-changed`. The
+  manifest itself did not change; that mode is used because it also checks
+  that a score taken with the old harness on the same binary is green against
+  the old reference, and it was: all 49 real-query rows were byte-equal.
+  Three replays with the new harness were byte-identical (concept score and
+  full score). Concept MRR@10 1.000 -> 0.542857, hit@1 1.000 -> 0.428571,
+  hit@5 1.000 -> 0.678571. By fixture group, MRR@10 is identifier 0.753333,
+  mixed 0.425, natural-language 0.283333, path 1.000, error-code 0.5625,
+  generic-file 0.000. Every case scored 1.000 before; the table gives each
+  case's answer rank after. Real-query and exact-recall numbers are unchanged.
+
+  | Case | Group | Rank | MRR@10 |
+  | --- | --- | --- | --- |
+  | `useState` | identifier | 3 | 0.333 |
+  | `aft_safety_history` | identifier | 5 | 0.200 |
+  | `subagent_type` | identifier | none | 0.000 |
+  | `LSPManager` | identifier | 1 | 1.000 |
+  | `handle_grep` | identifier | 1 | 1.000 |
+  | `BinaryBridge` | identifier | 1 | 1.000 |
+  | `validate_storage_dir` | identifier | 1 | 1.000 |
+  | `SemanticIndexFingerprint` | identifier | 1 | 1.000 |
+  | `renderSemanticResult` | identifier | 1 | 1.000 |
+  | `trust_project` | identifier | 1 | 1.000 |
+  | `useState hook examples` | mixed | none | 0.000 |
+  | `LSPManager initialization timeout` | mixed | 1 | 1.000 |
+  | `semantic_search unavailable renderer` | mixed | 2 | 0.500 |
+  | `bash long running reminder config` | mixed | 8 | 0.125 |
+  | `workspace permission prompt flow` | mixed | 2 | 0.500 |
+  | `how does semantic indexing persist across configure runs` | natural-language | 4 | 0.250 |
+  | `where are background bash tasks restored after restart` | natural-language | 6 | 0.167 |
+  | `how are configure warnings delivered asynchronously` | natural-language | 6 | 0.167 |
+  | `where does lsp diagnostic polling wait for server responses` | natural-language | 3 | 0.333 |
+  | `how are imports organized after edits` | natural-language | 2 | 0.500 |
+  | `crates/aft/src/commands/grep.rs` | path | 1 | 1.000 |
+  | `packages/opencode-plugin/src/tools/bash.ts` | path | 1 | 1.000 |
+  | `packages/aft-bridge/src/bridge.ts` | path | 1 | 1.000 |
+  | `ERR_PNPM_` | error-code | 1 | 1.000 |
+  | `process group already terminated` | error-code | 8 | 0.125 |
+  | `AFT plugin entry point` | generic-file | none | 0.000 |
+  | `command module exports list` | generic-file | none | 0.000 |
+  | `crate public API modules` | generic-file | none | 0.000 |
 
 ## Prefrontal search-miss rows
 
