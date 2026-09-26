@@ -1,24 +1,21 @@
-import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
+import {
+  type AftProjectTransport,
+  type AftTransportPool,
+  containsStandaloneDetachKeyword,
+  shouldInterruptWaitsForMessage,
+  stripStandaloneDetachKeywords,
+} from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
 import { debug, log, warn } from "./logger.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { BASH_TRANSPORT_TIMEOUT_MS } from "./tools/_shared.js";
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
 
-export const BASH_WAIT_DETACH_MAGIC_KEYWORD = "&detach";
+export { BASH_WAIT_DETACH_MAGIC_KEYWORD } from "@cortexkit/aft-bridge";
+
 const EMPTY_DETACH_MESSAGE = "(requested background detach)";
-const STANDALONE_DETACH_KEYWORD_SOURCE = `(^|[^\\p{L}\\p{N}_])${BASH_WAIT_DETACH_MAGIC_KEYWORD}(?![\\p{L}\\p{N}_])`;
-const STANDALONE_DETACH_KEYWORD_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "u");
-const STANDALONE_DETACH_KEYWORDS_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "gu");
-
-function containsStandaloneDetachKeyword(messageText: string): boolean {
-  return STANDALONE_DETACH_KEYWORD_PATTERN.test(messageText);
-}
-
-function stripStandaloneDetachKeywords(messageText: string): string {
-  return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");
-}
 
 type UserTextPart = { type?: unknown; text?: unknown; synthetic?: unknown; ignored?: unknown };
 
@@ -67,13 +64,40 @@ export function stripUserMessageDetachKeyword(output: unknown): string {
 }
 
 /**
- * Decide whether a user message should signal an active wait:true bash call.
- * The keyword is checked before the host hook strips it from mutable text parts.
+ * Decide whether a message should detach an active wait:true bash call and
+ * abort a sync bash_watch. `messageText` is the operator-typed text from
+ * `extractUserMessageText`, read before the keyword is stripped from it.
  */
 export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText: string): boolean {
-  return (
-    resolveBashConfig(config).detach_on_user_message || containsStandaloneDetachKeyword(messageText)
+  return shouldInterruptWaitsForMessage(
+    resolveBashConfig(config).detach_on_user_message,
+    messageText,
   );
+}
+
+/**
+ * Handle OpenCode's chat.message output for the session's blocking waits:
+ * decide, strip the `&detach` token from the mutable text parts, then (only
+ * when the decision says so) abort any sync bash_watch and detach any
+ * wait:true bash. Both waits follow the same decision, so
+ * `bash.detach_on_user_message: false` protects a sync bash_watch as well.
+ * Returns whether the waits were interrupted.
+ */
+export function interruptBashWaitsForChatMessage(
+  pool: ActiveBridgePool,
+  config: AftConfig,
+  projectRoot: string,
+  sessionID: string | undefined,
+  output: unknown,
+): boolean {
+  // Decide before stripping: stripping removes the token the decision reads.
+  const interrupt = shouldDetachBashWaitOnUserMessage(config, extractUserMessageText(output));
+  stripUserMessageDetachKeyword(output);
+  if (interrupt) {
+    signalSyncWatchAbort(sessionID);
+    void signalBashWaitDetachForProject(pool, projectRoot, sessionID);
+  }
+  return interrupt;
 }
 
 async function sendBashWaitDetach(

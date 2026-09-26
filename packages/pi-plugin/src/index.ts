@@ -91,16 +91,11 @@ import {
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
-import {
-  shouldDetachBashWaitOnUserMessage,
-  signalBashWaitDetachForProject,
-  stripUserMessageDetachKeyword,
-} from "./bash-wait-detach.js";
+import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { recordActiveExtensionApi } from "./harness.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
-import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import {
   piHashlineDowngrade,
   piHashlineEffective,
@@ -983,9 +978,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   });
 
-  // User-message abort: when the user sends a message while the agent is
-  // blocked in a sync bash_watch wait or a wait:true foreground bash, signal
-  // the wait to detach so the user is not locked out.
+  // User-message abort: when a message arrives while the agent is blocked in a
+  // sync bash_watch wait or a wait:true foreground bash, signal the wait to
+  // detach so the new message is not held up behind it.
   (
     pi.on as (
       event: "input",
@@ -997,13 +992,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   )("input", (event, extCtx) => {
     const sessionId = resolveSessionId(extCtx);
     setActiveSessionId(sessionId);
-    signalSyncWatchAbort(sessionId);
     const originalText = event.text;
-    const transformedText = stripUserMessageDetachKeyword(originalText);
-    const shouldDetach = shouldDetachBashWaitOnUserMessage(config, originalText);
-    if (shouldDetach) {
-      void signalBashWaitDetachForProject(pool, extCtx.cwd, sessionId);
-    }
+    const transformedText = interruptBashWaitsForInput(pool, config, extCtx.cwd, sessionId, event);
     if (transformedText !== originalText) {
       return { action: "transform", text: transformedText };
     }

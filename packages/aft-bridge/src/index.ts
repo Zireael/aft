@@ -168,6 +168,13 @@ export {
   sampleBridgeLifecycleCensus,
 } from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
+// --- which incoming messages interrupt a blocking bash wait ---
+export {
+  BASH_WAIT_DETACH_MAGIC_KEYWORD,
+  containsStandaloneDetachKeyword,
+  shouldInterruptWaitsForMessage,
+  stripStandaloneDetachKeywords,
+} from "./message-detach.js";
 export type {
   AftConfigFileMigrationOptions,
   AftConfigFileMigrationResult,

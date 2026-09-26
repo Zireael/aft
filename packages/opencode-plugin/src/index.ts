@@ -10,12 +10,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import {
-  extractUserMessageText,
-  shouldDetachBashWaitOnUserMessage,
-  signalBashWaitDetachForProject,
-  stripUserMessageDetachKeyword,
-} from "./bash-wait-detach.js";
+import { interruptBashWaitsForChatMessage } from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
   extractSessionID,
@@ -81,7 +76,6 @@ import {
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "./shared/status.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
-import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
@@ -920,21 +914,16 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
-      // Signal any in-flight sync bash_watch or wait:true foreground bash to
-      // detach so the user's message is not blocked by a long-running wait.
-      signalSyncWatchAbort(sid);
-      if (!sid) return;
-      const sessionDir =
-        getSessionDirectoryCached(sid) ??
-        (await getSessionDirectory(input.client, sid, input.directory)) ??
-        input.directory;
+      const sessionDir = sid
+        ? (getSessionDirectoryCached(sid) ??
+          (await getSessionDirectory(input.client, sid, input.directory)) ??
+          input.directory)
+        : input.directory;
       const projectConfig = loadAftConfigOrLastGood(sessionDir);
-      const messageText = extractUserMessageText(messageOutput);
-      const shouldDetach = shouldDetachBashWaitOnUserMessage(projectConfig, messageText);
-      stripUserMessageDetachKeyword(messageOutput);
-      if (shouldDetach) {
-        void signalBashWaitDetachForProject(pool, sessionDir, sid);
-      }
+      // Abort any in-flight sync bash_watch and detach any wait:true foreground
+      // bash so a new message (typed, or a completion the agent should act on)
+      // is not blocked by a long-running wait.
+      interruptBashWaitsForChatMessage(pool, projectConfig, sessionDir, sid, messageOutput);
     },
     "tool.execute.before": async (
       toolInput: { tool: string; sessionID?: string },

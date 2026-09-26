@@ -1,25 +1,22 @@
-import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
+import {
+  type AftProjectTransport,
+  type AftTransportPool,
+  containsStandaloneDetachKeyword,
+  shouldInterruptWaitsForMessage,
+  stripStandaloneDetachKeywords,
+} from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
 import { warn } from "./logger.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot">;
 
-export const BASH_WAIT_DETACH_MAGIC_KEYWORD = "&detach";
+export { BASH_WAIT_DETACH_MAGIC_KEYWORD } from "@cortexkit/aft-bridge";
+
 const EMPTY_DETACH_MESSAGE = "(requested background detach)";
-const STANDALONE_DETACH_KEYWORD_SOURCE = `(^|[^\\p{L}\\p{N}_])${BASH_WAIT_DETACH_MAGIC_KEYWORD}(?![\\p{L}\\p{N}_])`;
-const STANDALONE_DETACH_KEYWORD_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "u");
-const STANDALONE_DETACH_KEYWORDS_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "gu");
-
-function containsStandaloneDetachKeyword(messageText: string): boolean {
-  return STANDALONE_DETACH_KEYWORD_PATTERN.test(messageText);
-}
-
-function stripStandaloneDetachKeywords(messageText: string): string {
-  return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");
-}
 
 /** Strip the `&detach` control token before Pi's input transform delivers the user message to the model. */
 export function stripUserMessageDetachKeyword(messageText: string): string {
@@ -28,11 +25,42 @@ export function stripUserMessageDetachKeyword(messageText: string): string {
   return stripped.trim() === "" ? EMPTY_DETACH_MESSAGE : stripped;
 }
 
-/** Decide whether a user message should signal an active wait:true bash call. */
+/**
+ * Decide whether a message should detach an active wait:true bash call and
+ * abort a sync bash_watch. `messageText` is read before the keyword is
+ * stripped from it.
+ */
 export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText: string): boolean {
-  return (
-    resolveBashConfig(config).detach_on_user_message || containsStandaloneDetachKeyword(messageText)
+  return shouldInterruptWaitsForMessage(
+    resolveBashConfig(config).detach_on_user_message,
+    messageText,
   );
+}
+
+/** The fields of Pi's `input` event this module reads. */
+export interface PiInputEvent {
+  text: string;
+}
+
+/**
+ * Handle Pi's `input` event for the session's blocking waits: decide before
+ * the `&detach` token is stripped, then (only when the decision says so) abort
+ * any sync bash_watch and detach any wait:true bash. Both waits follow the same
+ * decision, so `bash.detach_on_user_message: false` protects a sync bash_watch
+ * as well. Returns the text to deliver to the model.
+ */
+export function interruptBashWaitsForInput(
+  pool: ActiveBridgePool,
+  config: AftConfig,
+  projectRoot: string,
+  sessionID: string | undefined,
+  event: PiInputEvent,
+): string {
+  if (shouldDetachBashWaitOnUserMessage(config, event.text)) {
+    signalSyncWatchAbort(sessionID);
+    void signalBashWaitDetachForProject(pool, projectRoot, sessionID);
+  }
+  return stripUserMessageDetachKeyword(event.text);
 }
 
 async function sendBashWaitDetach(bridge: AftProjectTransport, sessionID: string): Promise<void> {

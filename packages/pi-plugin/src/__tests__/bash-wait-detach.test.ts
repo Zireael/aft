@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
+  interruptBashWaitsForInput,
   shouldDetachBashWaitOnUserMessage,
   stripUserMessageDetachKeyword,
 } from "../bash-wait-detach.js";
+import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../sync-watch-abort.js";
 
 describe("bash wait detach helper (Pi)", () => {
   test("default config detaches on a plain user message", () => {
@@ -52,5 +54,57 @@ describe("bash wait detach helper (Pi)", () => {
       expect(shouldDetachBashWaitOnUserMessage(config, message)).toBe(false);
       expect(stripUserMessageDetachKeyword(message)).toBe(message);
     }
+  });
+});
+
+// A new input interrupts both blocking waits (a wait:true bash and a sync
+// bash_watch) while detach_on_user_message is on, whoever sent it; with the
+// setting off, both are protected and only &detach interrupts them.
+describe("Pi input interrupts waits by one decision", () => {
+  const sessionID = "session-pi";
+
+  afterEach(() => __resetSyncWatchAbortForTests());
+
+  async function deliver(config: Record<string, unknown>, text: string) {
+    __resetSyncWatchAbortForTests();
+    const sends: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        sends.push(`${command}:${String(params.session_id)}`);
+        return { success: true };
+      },
+    };
+    const pool = { getActiveBridgeForRoot: () => bridge } as unknown as Parameters<
+      typeof interruptBashWaitsForInput
+    >[0];
+    const delivered = interruptBashWaitsForInput(pool, config, "/repo", sessionID, { text });
+    // Let the fire-and-forget detach reach the bridge.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { detached: sends.includes(`bash_wait_detach:${sessionID}`), delivered };
+  }
+
+  test("input detaches and aborts with the default config", async () => {
+    const { detached, delivered } = await deliver({}, "subagent finished");
+
+    expect(detached).toBe(true);
+    expect(isSyncWatchAborted(sessionID)).toBe(true);
+    expect(delivered).toBe("subagent finished");
+  });
+
+  test("with detach_on_user_message off input interrupts nothing", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached } = await deliver(config, "please continue");
+
+    expect(detached).toBe(false);
+    expect(isSyncWatchAborted(sessionID)).toBe(false);
+  });
+
+  test("with detach_on_user_message off &detach still detaches and aborts", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached, delivered } = await deliver(config, "&detach");
+
+    expect(detached).toBe(true);
+    expect(isSyncWatchAborted(sessionID)).toBe(true);
+    expect(delivered).toBe("(requested background detach)");
   });
 });

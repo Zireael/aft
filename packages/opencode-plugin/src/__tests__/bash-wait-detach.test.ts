@@ -1,17 +1,19 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   extractUserMessageText,
+  interruptBashWaitsForChatMessage,
   shouldDetachBashWaitOnUserMessage,
   signalBashWaitDetachForProject,
   stripUserMessageDetachKeyword,
 } from "../bash-wait-detach.js";
 import * as logger from "../logger.js";
+import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../sync-watch-abort.js";
 
 let projectRoot: string;
 
@@ -193,5 +195,100 @@ describe("bash wait detach helper", () => {
     );
 
     expect(sends.sort()).toEqual(["a:bash_wait_detach:session-3", "b:bash_wait_detach:session-3"]);
+  });
+});
+
+// A new message interrupts both blocking waits (a wait:true bash and a sync
+// bash_watch) while detach_on_user_message is on, including a machine-generated
+// one such as AFT's own background-completion wake: the agent should act on it
+// instead of sitting out the rest of the wait. With the setting off, both waits
+// are protected and only &detach interrupts them.
+describe("chat.message interrupts waits by one decision", () => {
+  const sessionID = "session-chat";
+
+  afterEach(() => __resetSyncWatchAbortForTests());
+
+  function recordingPool() {
+    const sends: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        sends.push(`${command}:${String(params.session_id)}`);
+        return { success: true, detached: true };
+      },
+    };
+    const pool = {
+      getActiveBridgeForRoot: () => bridge,
+      activeBridges: () => [bridge],
+    } as unknown as Parameters<typeof interruptBashWaitsForChatMessage>[0];
+    return { pool, sends };
+  }
+
+  async function deliver(config: Record<string, unknown>, parts: unknown[]) {
+    __resetSyncWatchAbortForTests();
+    const { pool, sends } = recordingPool();
+    const output = { parts };
+    interruptBashWaitsForChatMessage(pool, config, projectRoot, sessionID, output);
+    // Let the fire-and-forget detach reach the bridge.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { detached: sends.includes(`bash_wait_detach:${sessionID}`), output };
+  }
+
+  test("an all-synthetic wake message detaches and aborts with the default config", async () => {
+    // Same part shape the background-completion wake sends through promptAsync.
+    const { detached } = await deliver({}, [
+      {
+        type: "text",
+        text: "<system-reminder>bash task finished</system-reminder>",
+        synthetic: true,
+      },
+    ]);
+
+    expect(detached).toBe(true);
+    expect(isSyncWatchAborted(sessionID)).toBe(true);
+  });
+
+  test("with detach_on_user_message off a wake message interrupts nothing", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached } = await deliver(config, [
+      { type: "text", text: "bash task finished", synthetic: true },
+    ]);
+
+    expect(detached).toBe(false);
+    expect(isSyncWatchAborted(sessionID)).toBe(false);
+  });
+
+  test("a typed message detaches and aborts with the default config", async () => {
+    const { detached } = await deliver({}, [{ type: "text", text: "please continue" }]);
+
+    expect(detached).toBe(true);
+    expect(isSyncWatchAborted(sessionID)).toBe(true);
+  });
+
+  test("with detach_on_user_message off a typed message interrupts nothing", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached } = await deliver(config, [{ type: "text", text: "please continue" }]);
+
+    expect(detached).toBe(false);
+    expect(isSyncWatchAborted(sessionID)).toBe(false);
+  });
+
+  test("with detach_on_user_message off &detach still detaches and aborts", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached, output } = await deliver(config, [{ type: "text", text: "&detach" }]);
+
+    expect(detached).toBe(true);
+    expect(isSyncWatchAborted(sessionID)).toBe(true);
+    // The bare token is replaced after the decision, not before it.
+    expect(output.parts).toEqual([{ type: "text", text: "(requested background detach)" }]);
+  });
+
+  test("a synthetic &detach does not count as the operator's token", async () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const { detached } = await deliver(config, [
+      { type: "text", text: "&detach", synthetic: true },
+    ]);
+
+    expect(detached).toBe(false);
+    expect(isSyncWatchAborted(sessionID)).toBe(false);
   });
 });
