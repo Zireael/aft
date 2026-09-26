@@ -123,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
     if args.self_test:
         command([sys.executable, str(HERE / "search_quality.py"), "--self-test"])
         command(
-            [sys.executable, "-m", "unittest", "-v", "test_run_real_query.py", "test_search_quality.py", "test_harness_integrity.py"],
+            [sys.executable, "-m", "unittest", "-v", "test_run_real_query.py", "test_run_concept_recall.py", "test_search_quality.py", "test_harness_integrity.py"],
             cwd=HERE,
         )
         return 0
@@ -156,7 +156,20 @@ def run(args: argparse.Namespace) -> int:
             str(args.ready_timeout),
         ]
     )
-    command([sys.executable, str(HERE / "run_concept_recall.py"), "--output", str(concept_score)])
+    command(
+        [
+            sys.executable,
+            str(HERE / "run_concept_recall.py"),
+            "--manifest",
+            args.manifest,
+            "--binary",
+            str(binary),
+            "--output",
+            str(concept_score),
+            "--ready-timeout",
+            str(args.ready_timeout),
+        ]
+    )
     command(
         [
             sys.executable,
