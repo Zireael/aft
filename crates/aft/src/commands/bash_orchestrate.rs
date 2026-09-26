@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::bash_background::registry::BgTaskSnapshot;
 use crate::bash_background::BgTaskStatus;
+use crate::command_tool_name::CommandToolName;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
@@ -52,9 +53,11 @@ pub fn format_seconds(ms: u64) -> String {
     format!("{seconds}s")
 }
 
-fn format_background_handoff_tail(task_id: &str) -> String {
+fn format_background_handoff_tail(task_id: &str, names: CommandToolName) -> String {
     format!(
-        "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+        "{task_id}. A completion reminder will be delivered automatically; use {status}({{ taskId: \"{task_id}\" }}) to inspect output or {kill}({{ taskId: \"{task_id}\" }}) to terminate.",
+        status = names.status(),
+        kill = names.kill(),
     )
 }
 
@@ -63,40 +66,46 @@ pub fn format_promotion_message(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    names: CommandToolName,
 ) -> String {
     let waited = timeout
         .map(|timeout| timeout.min(wait_window_ms))
         .unwrap_or(wait_window_ms);
     format!(
-        "Foreground bash didn't finish within {} and was promoted to background: {}",
+        "Foreground {} didn't finish within {} and was promoted to background: {}",
+        names.command(),
         format_seconds(waited),
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, names)
     )
 }
 
-pub fn format_wait_detach_message(task_id: &str) -> String {
+pub fn format_wait_detach_message(task_id: &str, names: CommandToolName) -> String {
     format!(
-        "Foreground bash is running in background as {}\nDetached because a user message arrived.",
-        format_background_handoff_tail(task_id)
+        "Foreground {} is running in background as {}\nDetached because a user message arrived.",
+        names.command(),
+        format_background_handoff_tail(task_id, names)
     )
 }
 
-pub fn format_module_drain_detach_message(task_id: &str) -> String {
+pub fn format_module_drain_detach_message(task_id: &str, names: CommandToolName) -> String {
     format!(
-        "Foreground bash is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
-        format_background_handoff_tail(task_id)
+        "Foreground {} is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
+        names.command(),
+        format_background_handoff_tail(task_id, names)
     )
 }
 
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatBackgroundLaunch` (lines 593-601).
-pub fn format_background_launch(task_id: &str, pty: bool) -> String {
+pub fn format_background_launch(task_id: &str, pty: bool, names: CommandToolName) -> String {
+    let status = names.status();
     if pty {
+        let write = names.write();
         return format!(
-            "PTY task started: {task_id}. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, bash_write({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. A completion reminder fires automatically when the task exits."
+            "PTY task started: {task_id}. Use {status}({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, {write}({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. A completion reminder fires automatically when the task exits."
         );
     }
     format!(
-        "Background task started: {task_id}. A completion reminder will be delivered automatically; don't poll bash_status."
+        "Background task started: {task_id}. A completion reminder will be delivered automatically; don't poll {status}."
     )
 }
 
@@ -116,6 +125,8 @@ pub fn build_bash_outcome(
     }
 
     let params = parse_params(req).unwrap_or_default();
+    // The bash handler already refused an unknown name before spawning.
+    let names = CommandToolName::from_params(&req.params).unwrap_or_default();
     let Some(task_id) = spawn_response
         .data
         .get("task_id")
@@ -135,7 +146,9 @@ pub fn build_bash_outcome(
         .unwrap_or("pipes");
     let is_pty = mode == "pty" || params.pty;
     if is_pty || params.background {
-        return DispatchOutcome::Immediate(background_launch_response(&req.id, &task_id, is_pty));
+        return DispatchOutcome::Immediate(background_launch_response(
+            &req.id, &task_id, is_pty, names,
+        ));
     }
 
     let request_id = req.id.clone();
@@ -186,6 +199,7 @@ pub fn build_bash_outcome(
                     &task_id_for_poll,
                     &session_id_for_poll,
                     &request_id_for_poll,
+                    names,
                 ))
             } else {
                 match decide_bash_step(
@@ -203,6 +217,7 @@ pub fn build_bash_outcome(
                         timeout,
                         wait_window_ms,
                         &request_id_for_poll,
+                        names,
                     )),
                     BashStep::Wait => None,
                 }
@@ -211,6 +226,7 @@ pub fn build_bash_outcome(
             Some(task_not_found_response(
                 &request_id_for_poll,
                 &task_id_for_poll,
+                names,
             ))
         };
 
@@ -263,11 +279,15 @@ pub(crate) enum BashStep {
     Wait,
 }
 
-pub(crate) fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
+pub(crate) fn task_not_found_response(
+    request_id: &str,
+    task_id: &str,
+    names: CommandToolName,
+) -> Response {
     Response::error(
         request_id,
         "task_not_found",
-        crate::commands::bash_status::format_unknown_task_message(task_id),
+        crate::commands::bash_status::format_unknown_task_message(task_id, names),
     )
 }
 
@@ -294,13 +314,14 @@ pub(crate) fn promote_bash(
     timeout: Option<u64>,
     wait_window_ms: u64,
     request_id: &str,
+    names: CommandToolName,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
+        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms, names),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
-            crate::commands::bash_status::format_unknown_task_message(task_id),
+            crate::commands::bash_status::format_unknown_task_message(task_id, names),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
     }
@@ -311,13 +332,14 @@ pub(crate) fn detach_wait_mode_bash(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    names: CommandToolName,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => wait_detach_response(request_id, task_id),
+        Ok(_) => wait_detach_response(request_id, task_id, names),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
-            crate::commands::bash_status::format_unknown_task_message(task_id),
+            crate::commands::bash_status::format_unknown_task_message(task_id, names),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
     }
@@ -331,12 +353,13 @@ pub(crate) fn detach_bash_for_module_drain(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    names: CommandToolName,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => Response::success(
             request_id,
             json!({
-                "output": format_module_drain_detach_message(task_id),
+                "output": format_module_drain_detach_message(task_id, names),
                 "task_id": task_id,
                 "status": "running",
             }),
@@ -344,7 +367,7 @@ pub(crate) fn detach_bash_for_module_drain(
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
-            crate::commands::bash_status::format_unknown_task_message(task_id),
+            crate::commands::bash_status::format_unknown_task_message(task_id, names),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
     }
@@ -410,11 +433,16 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     Response::success(request_id, data)
 }
 
-fn background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+fn background_launch_response(
+    request_id: &str,
+    task_id: &str,
+    is_pty: bool,
+    names: CommandToolName,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_background_launch(task_id, is_pty),
+            "output": format_background_launch(task_id, is_pty, names),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -427,22 +455,23 @@ fn promotion_response(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    names: CommandToolName,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_promotion_message(task_id, timeout, wait_window_ms),
+            "output": format_promotion_message(task_id, timeout, wait_window_ms, names),
             "task_id": task_id,
             "status": "running",
         }),
     )
 }
 
-fn wait_detach_response(request_id: &str, task_id: &str) -> Response {
+fn wait_detach_response(request_id: &str, task_id: &str, names: CommandToolName) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_wait_detach_message(task_id),
+            "output": format_wait_detach_message(task_id, names),
             "task_id": task_id,
             "status": "running",
         }),
@@ -672,7 +701,7 @@ mod tests {
     #[test]
     fn promotion_message_matches_opencode_copy() {
         assert_eq!(
-            format_promotion_message("bash-123", Some(5_500), 8_000),
+            format_promotion_message("bash-123", Some(5_500), 8_000, CommandToolName::Bash),
             "Foreground bash didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate."
         );
     }
@@ -680,7 +709,7 @@ mod tests {
     #[test]
     fn wait_detach_message_mentions_user_message() {
         assert_eq!(
-            format_wait_detach_message("bash-123"),
+            format_wait_detach_message("bash-123", CommandToolName::Bash),
             "Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate.\nDetached because a user message arrived."
         );
     }
@@ -688,12 +717,49 @@ mod tests {
     #[test]
     fn background_launch_messages_match_opencode_copy() {
         assert_eq!(
-            format_background_launch("bash-bg", false),
+            format_background_launch("bash-bg", false, CommandToolName::Bash),
             "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status."
         );
         assert_eq!(
-            format_background_launch("bash-pty", true),
+            format_background_launch("bash-pty", true, CommandToolName::Bash),
             "PTY task started: bash-pty. Use bash_status({ taskId: \"bash-pty\", outputMode: \"screen\" }) to see the visible terminal, bash_write({ taskId: \"bash-pty\", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits."
+        );
+    }
+
+    /// A session whose host registered the command tool as `shell` must be
+    /// pointed at `shell_status`/`shell_kill`/`shell_write`, never at the
+    /// `bash_*` names that host does not have.
+    #[test]
+    fn shell_sessions_are_told_the_shell_tool_names() {
+        let shell = CommandToolName::Shell;
+        let messages = [
+            format_promotion_message("bash-123", Some(5_500), 8_000, shell),
+            format_wait_detach_message("bash-123", shell),
+            format_module_drain_detach_message("bash-123", shell),
+            format_background_launch("bash-bg", false, shell),
+            format_background_launch("bash-pty", true, shell),
+        ];
+        for message in &messages {
+            for bash_name in [
+                "bash_status",
+                "bash_kill",
+                "bash_write",
+                "bash_watch",
+                "Foreground bash",
+            ] {
+                assert!(
+                    !message.contains(bash_name),
+                    "{bash_name} leaked into {message}"
+                );
+            }
+        }
+        assert_eq!(
+            messages[0],
+            "Foreground shell didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use shell_status({ taskId: \"bash-123\" }) to inspect output or shell_kill({ taskId: \"bash-123\" }) to terminate."
+        );
+        assert_eq!(
+            messages[4],
+            "PTY task started: bash-pty. Use shell_status({ taskId: \"bash-pty\", outputMode: \"screen\" }) to see the visible terminal, shell_write({ taskId: \"bash-pty\", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits."
         );
     }
 }

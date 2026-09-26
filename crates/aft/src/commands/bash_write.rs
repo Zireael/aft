@@ -1,3 +1,4 @@
+use crate::command_tool_name::CommandToolName;
 use crate::commands::bash_status::format_unknown_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -56,6 +57,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let names = CommandToolName::from_params(&req.params).unwrap_or_default();
     let bytes = match expand_input(&params.input) {
         Ok(bytes) => bytes,
         Err(message) => {
@@ -67,7 +69,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(
             &req.id,
             "input_too_large",
-            "bash_write input exceeds 1 MiB limit",
+            format!("{} input exceeds 1 MiB limit", names.write()),
         );
     }
 
@@ -79,7 +81,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(code) if code == "task_not_found" => Response::error(
             &req.id,
             "task_not_found",
-            format_unknown_task_message(&params.task_id),
+            format_unknown_task_message(&params.task_id, names),
         ),
         Err(code) if code == "task_not_pty" => Response::error(
             &req.id,

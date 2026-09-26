@@ -24,6 +24,12 @@ import {
   registerAftTools,
 } from "../tool-registration.js";
 
+// OpenCode 2 has its own command tool named `shell`, and AFT replaces it under
+// that name (the registration renames `bash` and its companions to `shell` and
+// `shell_*`). Every description and hint the shared definitions render names
+// the command tool from the tool context, so it has to say `shell` here.
+const COMMAND_TOOL_NAME = "shell";
+
 // The bridge environment (binary, storage migration, configure overrides, ONNX
 // Runtime, LSP installs) comes from the bootstrap shared with the OpenCode 1
 // entry; every one of those steps can be replaced here through overrides.
@@ -62,6 +68,7 @@ async function bootLocation(context, location, dependencies) {
         bootstrap.message,
         context,
         dependencies.buildToolMap,
+        COMMAND_TOOL_NAME,
       ),
     };
   }
@@ -103,6 +110,7 @@ async function bootLocation(context, location, dependencies) {
     hashlineEffective: openCodeHashlineEffective(config),
     storageDir: environment.storageDir,
     isProjectEnabled,
+    commandToolName: COMMAND_TOOL_NAME,
   };
   const tools = dependencies.buildToolMap(
     toolContext,

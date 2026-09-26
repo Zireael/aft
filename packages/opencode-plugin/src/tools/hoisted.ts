@@ -20,6 +20,7 @@ import type { PluginContext } from "../types.js";
 import {
   callToolCall,
   coerceOptionalInt,
+  commandToolNamesFor,
   optionalInt,
   resolvePathFromProjectRoot,
   resolveProjectRoot,
@@ -1148,7 +1149,7 @@ function deleteDescription(ctx: PluginContext): string {
   const backupText =
     ctx.config.backup?.enabled === false
       ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. "
-      : "Each file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would copy more than 2,000 files or 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. ";
+      : `Each file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would copy more than 2,000 files or 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use ${commandToolNamesFor(ctx).command} \`rm -rf\` when no undo is needed. `;
   return (
     "Delete one or more files (or directories).\n\n" +
     backupText +
@@ -1215,10 +1216,13 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
       );
 
       // Single batched call so every file shares one op_id; one `aft_safety
-      // undo` then restores the whole delete atomically.
+      // undo` then restores the whole delete atomically. A size refusal names
+      // the command tool, so a host that renamed it passes its own name.
+      const commandTool = commandToolNamesFor(ctx).command;
       const response = await callToolCall(ctx, context, "delete", {
         files: absolutePaths,
         recursive,
+        ...(commandTool === "bash" ? {} : { command_tool_name: commandTool }),
       });
 
       if (response.success === false) {

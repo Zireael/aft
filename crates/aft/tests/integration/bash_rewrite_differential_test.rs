@@ -361,6 +361,7 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
         None,
         &ctx,
         &AuthenticatedPrincipal::FirstParty,
+        aft::command_tool_name::CommandToolName::Bash,
     )
     .is_none());
     assert!(matches!(

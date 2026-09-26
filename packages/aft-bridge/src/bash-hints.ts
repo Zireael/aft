@@ -2,6 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { CommandToolName } from "./command-tool-names.js";
+
 // Helpers for the bash-output hint nudges appended to bash tool results.
 //
 // Shared across harnesses (OpenCode applies it in `tool.execute.after`; Pi
@@ -61,13 +63,20 @@ export function watchTimeoutSteer(
 const CONFLICT_HINT =
   "\n\n[Hint] Use aft_conflicts to see all conflict regions across files in a single call.";
 
-const GREP_SEARCH_AFT_SEARCH_HINT =
-  "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";
+/**
+ * The grep-search nudge names the command tool the agent actually called, so
+ * the prefix (also used to spot a hint that is already present) depends on it.
+ */
+function grepSearchHintPrefix(commandTool: CommandToolName): string {
+  return `DO NOT search code by running grep/rg in ${commandTool} —`;
+}
 
-const GREP_SEARCH_GREP_HINT =
-  "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked).";
-
-const GREP_SEARCH_HINT_PREFIX = "DO NOT search code by running grep/rg in bash —";
+function grepSearchHint(aftSearchRegistered: boolean, commandTool: CommandToolName): string {
+  const steer = aftSearchRegistered
+    ? "Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
+    : "Use the `grep` tool instead (indexed and ranked).";
+  return `${grepSearchHintPrefix(commandTool)} it is unindexed, unranked, and serial. ${steer}`;
+}
 const GREP_SEARCH_FRESHNESS_WINDOW_MS = 60_000;
 
 type Quote = "none" | "single" | "double";
@@ -133,14 +142,14 @@ export function maybeAppendGrepSearchHint(
   command: string,
   aftSearchRegistered: boolean,
   projectRoot?: string,
+  commandTool: CommandToolName = "bash",
 ): string {
   if (output === "") return output;
   if (!commandInvokesCodeSearch(command)) return output;
-  if (output.includes(GREP_SEARCH_HINT_PREFIX)) return output;
+  if (output.includes(grepSearchHintPrefix(commandTool))) return output;
   if (shouldSuppressGrepSearchHint(command, projectRoot)) return output;
 
-  const hint = aftSearchRegistered ? GREP_SEARCH_AFT_SEARCH_HINT : GREP_SEARCH_GREP_HINT;
-  return `${output}\n\n${hint}`;
+  return `${output}\n\n${grepSearchHint(aftSearchRegistered, commandTool)}`;
 }
 
 function shouldSuppressGrepSearchHint(command: string, projectRoot: string | undefined): boolean {

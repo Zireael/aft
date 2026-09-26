@@ -1,4 +1,4 @@
-import type { AftTransportPool } from "@cortexkit/aft-bridge";
+import type { AftTransportPool, CommandToolName } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { AftConfig } from "./config.js";
 
@@ -25,4 +25,11 @@ export interface PluginContext {
   storageDir: string;
   /** Returns false when user and project config merge to `enabled: false` for this project. */
   isProjectEnabled?: (projectRoot: string) => boolean;
+  /**
+   * The name the command tool is registered under: `shell` on OpenCode 2,
+   * where AFT replaces the host's own shell tool, and `bash` (the default)
+   * everywhere else. Tool descriptions and every hint that names the command
+   * tool or its companions are rendered from it.
+   */
+  commandToolName?: CommandToolName;
 }

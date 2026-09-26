@@ -1184,6 +1184,27 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
         message.contains("smaller pieces"),
         "names the undo-preserving alternative: {message}"
     );
+    assert!(
+        message.contains("remove it with bash `rm -rf`"),
+        "a caller that names no command tool is told bash: {message}"
+    );
+
+    // OpenCode 2 registers the command tool as `shell`, and its refusal must
+    // name the tool that agent actually has.
+    let shell_delete = serde_json::json!({
+        "id": "delete-over-budget-tree-shell",
+        "command": "delete_file",
+        "file": tree.display().to_string(),
+        "recursive": true,
+        "command_tool_name": "shell",
+    });
+    let shell_resp = aft.send(&serde_json::to_string(&shell_delete).unwrap());
+    assert_eq!(shell_resp["code"], "recursive_delete_backup_too_large");
+    let shell_message = shell_resp["message"].as_str().unwrap();
+    assert!(
+        shell_message.contains("remove it with shell `rm -rf`"),
+        "{shell_message}"
+    );
 
     let remaining = fs::read_dir(&tree)
         .unwrap()

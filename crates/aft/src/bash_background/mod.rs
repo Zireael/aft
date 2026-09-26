@@ -163,6 +163,7 @@ pub fn spawn(
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
     host_escalation: Option<HostEscalationAttempt>,
+    command_tool_name: crate::command_tool_name::CommandToolName,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -335,6 +336,7 @@ pub fn spawn(
             notify_on_completion,
             compressed,
             project_root,
+            command_tool_name,
             pty_rows,
             pty_cols,
         )
@@ -353,6 +355,7 @@ pub fn spawn(
             notify_on_completion,
             compressed,
             project_root,
+            command_tool_name,
         )
     };
 

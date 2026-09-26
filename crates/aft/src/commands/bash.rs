@@ -71,6 +71,10 @@ struct BashParams {
     permissions_requested: bool,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// The host's name for the command tool; the started task keeps it so its
+    /// later notices name the tools that host registered.
+    #[serde(default)]
+    command_tool_name: crate::command_tool_name::CommandToolName,
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -305,6 +309,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             req.session_id.as_deref(),
             ctx,
             &principal,
+            params.command_tool_name,
         ) {
             // The typed rewrite request already carries the public request ID,
             // so the bridge can correlate the handler response without a
@@ -368,6 +373,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         pty_cols,
         scanner_report,
         host_escalation,
+        params.command_tool_name,
     )
 }
 

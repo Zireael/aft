@@ -224,6 +224,8 @@ pub(super) struct BashDetachTarget {
     pub(super) ver: u8,
     pub(super) flags: Flags,
     pub(super) format_context: crate::subc_format::FormatContext,
+    /// The calling host's name for the command tool, used by the detach notice.
+    pub(super) command_tool_name: crate::command_tool_name::CommandToolName,
 }
 
 /// Why the module loop answered a held bash call itself.

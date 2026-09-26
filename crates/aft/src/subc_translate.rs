@@ -1310,6 +1310,17 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         }
         out.insert("sandbox".to_string(), sandbox.clone());
     }
+    // The caller's name for the command tool (`shell` on OpenCode 2). It only
+    // changes the tool names in text AFT renders for this command and its task.
+    let command_tool_name =
+        crate::command_tool_name::CommandToolName::from_params(&Value::Object(map_in.clone()))
+            .map_err(|message| invalid_request(format!("bash: {message}")))?;
+    if !command_tool_name.is_bash() {
+        out.insert(
+            crate::command_tool_name::COMMAND_TOOL_NAME_PARAM.to_string(),
+            Value::String(command_tool_name.command().to_string()),
+        );
+    }
 
     Ok(Translated {
         command: "bash".into(),
@@ -1823,6 +1834,17 @@ fn translate_delete(args: Value, project_root: &Path) -> Result<Translated, Tran
         "recursive".to_string(),
         Value::Bool(map_in.get("recursive").is_some_and(coerce_boolean)),
     );
+    // A refusal names the command tool as the way to delete without undo, in
+    // the caller's spelling of it.
+    let command_tool_name =
+        crate::command_tool_name::CommandToolName::from_params(&Value::Object(map_in.clone()))
+            .map_err(|message| invalid_request(format!("delete: {message}")))?;
+    if !command_tool_name.is_bash() {
+        out.insert(
+            crate::command_tool_name::COMMAND_TOOL_NAME_PARAM.to_string(),
+            Value::String(command_tool_name.command().to_string()),
+        );
+    }
 
     Ok(Translated {
         command: "delete_file".into(),
@@ -3741,5 +3763,40 @@ mod tests {
             Value::Object(translated.args),
             serde_json::json!({ "task_id": "bash-4" })
         );
+    }
+
+    /// The OpenCode 2 plugin names its command tool `shell` on each bash and
+    /// delete call. The name must survive translation so the reply text can
+    /// use it, a missing name stays absent (bash), and an unknown one is
+    /// refused rather than quietly read as bash.
+    #[test]
+    fn command_tool_name_survives_bash_and_delete_translation() {
+        let project = Path::new("/project");
+        let shell = subc_translate_owned(
+            "bash",
+            serde_json::json!({ "command": "ls", "command_tool_name": "shell" }),
+            project,
+        )
+        .expect("bash must translate");
+        assert_eq!(shell.args["command_tool_name"], "shell");
+
+        let bash = subc_translate_owned("bash", serde_json::json!({ "command": "ls" }), project)
+            .expect("bash must translate");
+        assert!(!bash.args.contains_key("command_tool_name"));
+
+        assert!(subc_translate_owned(
+            "bash",
+            serde_json::json!({ "command": "ls", "command_tool_name": "zsh" }),
+            project,
+        )
+        .is_err());
+
+        let delete = subc_translate_owned(
+            "delete",
+            serde_json::json!({ "files": ["a.txt"], "command_tool_name": "shell" }),
+            project,
+        )
+        .expect("delete must translate");
+        assert_eq!(delete.args["command_tool_name"], "shell");
     }
 }

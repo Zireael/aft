@@ -51,8 +51,8 @@ describe("OpenCode V2 permission inventory", () => {
       "apply_patch",
       "aft_delete",
       "aft_move",
-      "bash:withPermissionLoop",
-      "bash:host-fallback",
+      "shell:withPermissionLoop",
+      "shell:host-fallback",
     ]);
   });
 

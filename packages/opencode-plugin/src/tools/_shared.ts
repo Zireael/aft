@@ -22,12 +22,14 @@ import * as path from "node:path";
 import type {
   AftProjectTransport,
   BridgeRequestOptions,
+  CommandToolNames,
   ToolCallOptions,
   ToolCallResult,
 } from "@cortexkit/aft-bridge";
 import {
   adaptToolError,
   canonicalizeProjectRoot,
+  commandToolNames,
   decodeFileUrl,
   isBashTransportDeadError,
   timeoutForCommand,
@@ -39,6 +41,14 @@ import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 
 const z = tool.schema;
+
+/** The command tool and companion names this registration shows the agent. */
+export function commandToolNamesFor(ctx: Pick<PluginContext, "commandToolName">): CommandToolNames {
+  return commandToolNames(ctx.commandToolName ?? "bash");
+}
+
+/** Bash-family bridge commands whose replies can name the command tool. */
+const NAME_BEARING_BASH_COMMANDS = new Set(["bash", "bash_status", "bash_kill", "bash_write"]);
 
 /**
  * Optional integer with bounds.
@@ -275,7 +285,7 @@ export async function callBridge(
     // The break-glass gate must receive the original transport failure. In
     // particular, do not append recovery text before gate-off callers rethrow it.
     if (command === "bash" && isBashTransportDeadError(error)) throw error;
-    throw adaptToolError(command, error);
+    throw adaptToolError(command, error, commandToolNamesFor(ctx).status);
   } finally {
     markBridgeEnd();
   }
@@ -320,7 +330,7 @@ export async function callToolCall(
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
   } catch (error) {
-    throw adaptToolError(name, error);
+    throw adaptToolError(name, error, commandToolNamesFor(ctx).status);
   } finally {
     markBridgeEnd();
   }
@@ -341,7 +351,18 @@ export async function callBashBridge(
   params: Record<string, unknown> = {},
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  return await callBridge(ctx, runtime, command, params, {
+  // Rust renders some of the bash reply text itself (promotion, background
+  // launch and detach notices, unknown-task guidance, the recovery hint that
+  // names the status tool) and keeps the name with the task for text rendered
+  // after this call, such as a completion's live-descendants note. It only
+  // needs telling when the host registered the tool under a name other than
+  // `bash`, so requests from every other host stay exactly as they were.
+  const names = commandToolNamesFor(ctx);
+  const sent =
+    NAME_BEARING_BASH_COMMANDS.has(command) && names.command !== "bash"
+      ? { ...params, command_tool_name: names.command }
+      : params;
+  return await callBridge(ctx, runtime, command, sent, {
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
     ...options,
     // Bash execution maps Effect interruption to bash_abort_inflight instead of

@@ -2914,6 +2914,17 @@ fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
 }
 
 #[test]
+fn subc_bridge_bash_promotion_names_follow_each_route_on_one_root() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_promotion_names_follow_each_route_on_one_root",
+        Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(200)],
+        drive_bash_promotion_per_route_names_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promotes_after_wait_window_and_remains_tracked",
@@ -3905,6 +3916,59 @@ async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
     assert_eq!(response["task_id"].as_str(), Some(task_id.as_str()));
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// One daemon and one project root serve an OpenCode 2 session (which names
+/// the command tool `shell`) and an OpenCode 1 session (`bash`) side by side.
+/// Each promotion notice must name the status and kill tools of the session
+/// whose route asked, not of whichever session configured the root last.
+async fn drive_bash_promotion_per_route_names_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
+
+    let mut outputs = Vec::new();
+    for (route, corr, name) in [
+        (1u16, 130u64, Some("shell")),
+        (4, 131, None),
+        (1, 132, None),
+    ] {
+        let mut args = json!({
+            "command": "sleep 2; printf 'promoted-done\\n'",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        });
+        if let Some(name) = name {
+            args["command_tool_name"] = json!(name);
+        }
+        send_tool_call(&mut stream, route, corr, "bash", args).await;
+        let frame = read_frame_timeout(&mut stream, "promoted bash response").await;
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame));
+        let response = tool_response_json(&frame);
+        let output = response["output"].as_str().unwrap_or_default().to_string();
+        assert!(
+            output.contains("promoted to background"),
+            "expected promotion text, got {output:?}"
+        );
+        outputs.push(output);
+    }
+
+    let (shell, bash, bash_again) = (&outputs[0], &outputs[1], &outputs[2]);
+    assert!(
+        shell.starts_with("Foreground shell didn't finish"),
+        "{shell}"
+    );
+    assert!(shell.contains("use shell_status({ taskId:"), "{shell}");
+    assert!(shell.contains("or shell_kill({ taskId:"), "{shell}");
+    assert!(!shell.contains("bash_"), "{shell}");
+    for bash in [bash, bash_again] {
+        assert!(bash.starts_with("Foreground bash didn't finish"), "{bash}");
+        assert!(bash.contains("use bash_status({ taskId:"), "{bash}");
+        assert!(!bash.contains("shell_"), "{bash}");
+    }
     send_connection_goodbye(&mut stream).await;
 }
 

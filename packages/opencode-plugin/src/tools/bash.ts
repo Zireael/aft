@@ -1,7 +1,9 @@
 import {
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_TOOL_NAMES,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
+  type CommandToolNames,
   classifyBashHostFallbackError,
   coerceBoolean,
   maybeAppendGrepSearchHint,
@@ -16,7 +18,13 @@ import { resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
+import {
+  callBashBridge,
+  coerceOptionalInt,
+  commandToolNamesFor,
+  optionalInt,
+  projectRootFor,
+} from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -176,12 +184,20 @@ function userMessageDetachDescription(detachOnUserMessage: boolean): string {
  * register `bash_watch` steer short waits to it; the subc module catalog has no
  * `bash_watch`, so its variant names only the tools a catalog consumer can call.
  */
-function backgroundWaitDescription(watchToolRegistered: boolean): string {
+function backgroundWaitDescription(
+  watchToolRegistered: boolean,
+  names: CommandToolNames,
+): string {
   return watchToolRegistered
-    ? "then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait."
-    : "the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else.";
+    ? `then ${names.watch} handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use ${names.command}({wait:true}) when the result is needed before anything else — never background a command and immediately ${names.watch} it (that wastes a turn for what foreground returns in one), and never loop ${names.status} to wait.`
+    : `the task keeps running after the call returns, a completion reminder arrives when it exits, and ${names.status} reports its state and output. Use ${names.command}({wait:true}) instead when the result is needed before anything else.`;
 }
 
+/**
+ * The command tool's description. `names` is the host's spelling of the tool
+ * and its companions: every host but OpenCode 2 registers them as `bash_*`, and
+ * OpenCode 2 as `shell_*`.
+ */
 export function bashToolDescription(
   aftSearchRegistered: boolean,
   compressionOn: boolean,
@@ -189,6 +205,7 @@ export function bashToolDescription(
   detachOnUserMessage = true,
   zoomEnabled = true,
   watchToolRegistered = true,
+  names: CommandToolNames = BASH_TOOL_NAMES,
 ): string {
   const searchSteer = aftSearchRegistered
     ? `use aft_search (concepts, identifiers, regex, literals), read, aft_outline${zoomEnabled ? ", or aft_zoom" : ""} instead`
@@ -197,11 +214,11 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, names)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with ${names.status}({ outputMode: "screen" }) plus ${names.write}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
-DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
+DO NOT use ${names.command} for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through ${names.command} to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
 }
 
 interface PermissionAsk {
@@ -272,7 +289,11 @@ async function withPermissionLoop(
     if (asks.length === 0) throw new Error("bash permission retry failed: no asks returned");
 
     for (const ask of groupBashPermissionAsks(asks)) {
-      const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
+      // The permission a command ask is filed under is the command tool's own
+      // name, because that is the name the host evaluates its rules under:
+      // `bash` on OpenCode 1, `shell` on OpenCode 2.
+      const permission =
+        ask.kind === "external_directory" ? "external_directory" : commandToolNamesFor(ctx).command;
       const escalation = ask.kind === "escalation";
       await runAsk(
         runtime.ask({
@@ -311,13 +332,14 @@ export function createBashTool(
   aftSearchRegisteredOverride?: boolean,
 ): ToolDefinition {
   const initialBashCfg = resolveBashConfig(ctx.config);
+  const names = commandToolNamesFor(ctx);
   const backgroundFlagArg = initialBashCfg.background
     ? {
         background: z
           .boolean()
           .optional()
           .describe(
-            "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+            `When true, spawn the command in the background and return a taskId for ${names.status}/${names.kill} instead of waiting for completion. Defaults to false.`,
           ),
       }
     : {};
@@ -327,7 +349,7 @@ export function createBashTool(
           .boolean()
           .optional()
           .describe(
-            'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
+            `When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with ${names.status}({ taskId, outputMode: "screen" }) and drive interactively with ${names.write} — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.`,
           ),
         ptyRows: optionalInt(1, 60).describe(
           "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
@@ -392,6 +414,8 @@ export function createBashTool(
       initialBashCfg.background,
       true,
       toolEnabled(ctx.config, "aft_zoom"),
+      true,
+      names,
     ),
     args: args as ToolDefinition["args"],
     execute: async (args, context) => {
@@ -529,7 +553,7 @@ export function createBashTool(
         const pattern = bashHostFallbackAskPattern(command, projectRoot, fallbackCause);
         await runAsk(
           context.ask({
-            permission: "bash",
+            permission: names.command,
             patterns: [pattern],
             always: [],
             metadata: { command, cwd: projectRoot, host_fallback: true },
@@ -549,7 +573,7 @@ export function createBashTool(
       }
 
       if (data.success === false) {
-        throw new Error((data.message as string) || "bash failed");
+        throw new Error((data.message as string) || `${names.command} failed`);
       }
       // The normal dispatch above is the foreground recovery probe. A successful
       // response means this command used the module, so do not retain its fallback banner.
@@ -561,7 +585,7 @@ export function createBashTool(
         trackBgTask(context.sessionID, taskId);
         let rendered = (data.output as string | undefined) ?? "";
         if (isSubagent && allowSubagentBg) {
-          rendered += subagentGuidance(taskId, bashCfg.watch_sync_max_ms);
+          rendered += subagentGuidance(taskId, bashCfg.watch_sync_max_ms, names);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
         metadata?.(metadataPayload);
@@ -571,7 +595,13 @@ export function createBashTool(
       const output = (data.output as string | undefined) ?? "";
       const rendered = usedHostFallback
         ? output
-        : maybeAppendGrepSearchHint(output, command, aftSearchRegistered, projectRootFor(context));
+        : maybeAppendGrepSearchHint(
+            output,
+            command,
+            aftSearchRegistered,
+            projectRootFor(context),
+            names.command,
+          );
       const metadataPayload = foregroundMetadata(description, data, rendered);
       metadata?.(metadataPayload);
       return {
@@ -584,14 +614,14 @@ export function createBashTool(
 }
 
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
+  const names = commandToolNamesFor(ctx);
   return {
-    description:
-      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+    description: `Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use ${names.watch}.`,
     args: {
       taskId: z
         .string()
         .describe(
-          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          `Background task ID returned by ${names.command}({ background: true }), e.g. bash-6b454047a1c39ded.`,
         ),
       outputMode: z
         .enum(["screen", "raw", "both"])
@@ -607,20 +637,20 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       // timeoutMs moved to bash_watch — if the agent passes them here, they're
       // silently ignored at the Zod schema layer (extra keys stripped).
       const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
-      return await formatBashStatusText(context, taskId, data, outputMode);
+      return await formatBashStatusText(context, taskId, data, outputMode, names);
     },
   };
 }
 
 export function createBashKillTool(ctx: PluginContext): ToolDefinition {
+  const names = commandToolNamesFor(ctx);
   return {
-    description:
-      "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+    description: `Terminate a running background bash task spawned with ${names.command}({ background: true }). Returns confirmation of kill or an error if the task already finished.`,
     args: {
       taskId: z
         .string()
         .describe(
-          "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          `Background task ID returned by ${names.command}({ background: true }), e.g. bash-6b454047a1c39ded.`,
         ),
     },
     execute: async (args, context) => {
@@ -628,7 +658,7 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
         task_id: args.taskId as string,
       });
       if (data.success === false) {
-        throw new Error((data.message as string | undefined) ?? "bash_kill failed");
+        throw new Error((data.message as string | undefined) ?? `${names.kill} failed`);
       }
       if (data.kill_signaled === true) {
         return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants`;
@@ -653,7 +683,7 @@ async function bashStatusSnapshot(
     options,
   );
   if (data.success === false) {
-    throw new Error((data.message as string | undefined) ?? "bash_status failed");
+    throw new Error((data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`);
   }
   return data;
 }
@@ -663,6 +693,7 @@ async function formatBashStatusText(
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
+  names: CommandToolNames,
 ): Promise<string> {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
@@ -675,7 +706,7 @@ async function formatBashStatusText(
   if (data.mode === "pty") {
     // PTY output is rendered from the raw terminal spill file; never feed it
     // through the piped-output compression/line renderer.
-    text += await formatPtyStatus(runtime, taskId, data, requestedOutputMode);
+    text += await formatPtyStatus(runtime, taskId, data, requestedOutputMode, names);
   } else {
     const preview = data.output_preview as string | undefined;
     if (preview && status !== "running") {
@@ -693,6 +724,7 @@ async function formatPtyStatus(
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
+  names: CommandToolNames,
 ): Promise<string> {
   const outputMode = requestedOutputMode ?? "screen";
   const raw = typeof data.pty_raw === "string" ? data.pty_raw : "";
@@ -706,7 +738,7 @@ async function formatPtyStatus(
     suffix = screen ? `\n${screen}` : "";
   }
   if (data.status === "running") {
-    suffix += `\nPTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
+    suffix += `\nPTY task is still running. Use ${names.status}({ taskId: "${taskId}", outputMode: "screen" }) to inspect, ${names.write}({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
   }
   return suffix;
 }
@@ -721,10 +753,10 @@ function preview(output: string): string {
  * defaults to the configured maximum (`bash.watch_sync_max_ms`), so naming any
  * smaller number would only make it wake and re-watch more often.
  */
-function subagentGuidance(taskId: string, watchSyncMaxMs: number): string {
+function subagentGuidance(taskId: string, watchSyncMaxMs: number, names: CommandToolNames): string {
   return `
 
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits up to ${watchSyncMaxMs} ms, the maximum. Subagents don't survive turn-end and won't receive the completion reminder.`;
+NOTE (subagent session): Continue with other work if you have it. If you don't, call ${names.watch}({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits up to ${watchSyncMaxMs} ms, the maximum. Subagents don't survive turn-end and won't receive the completion reminder.`;
 }
 
 function foregroundMetadata(

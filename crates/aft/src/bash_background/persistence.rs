@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
+use crate::command_tool_name::CommandToolName;
 use crate::db::bash_tasks::BashTaskRow;
 
 use super::process::LiveDescendant;
@@ -528,6 +529,11 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
+    /// The name the host that started this task gave its command tool, so text
+    /// rendered for the task later names that host's tools. Omitted for `bash`,
+    /// which keeps every record written before this field existed unchanged.
+    #[serde(default, skip_serializing_if = "CommandToolName::is_bash")]
+    pub command_tool_name: CommandToolName,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -589,6 +595,7 @@ impl PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            command_tool_name: CommandToolName::Bash,
         }
     }
 
@@ -706,6 +713,7 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            command_tool_name: CommandToolName::Bash,
         }
     }
 }

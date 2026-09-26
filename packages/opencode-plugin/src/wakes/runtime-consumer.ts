@@ -1,8 +1,9 @@
-import type {
-  AftProjectTransport,
-  BashCompletedPayload,
-  BashLongRunningPayload,
-  BridgeOptions,
+import {
+  type AftProjectTransport,
+  type BashCompletedPayload,
+  type BashLongRunningPayload,
+  type BridgeOptions,
+  SHELL_TOOL_NAMES,
 } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
@@ -22,6 +23,10 @@ interface WakeRoute {
 
 const sessionRoutes = new Map<string, WakeRoute>();
 
+// Only the OpenCode 2 entry installs this consumer, and on that host AFT's
+// command tool is registered as `shell`, so its wakes name `shell_status` and
+// `shell_kill` rather than the `bash_*` names that host does not have.
+
 async function routeCompletion(
   completion: BashCompletedPayload,
   bridge: AftProjectTransport,
@@ -33,7 +38,7 @@ async function routeCompletion(
     route.delivery.completion({
       sessionID: completion.session_id,
       taskIDs: [completion.task_id],
-      text: formatSystemReminder([completion]),
+      text: formatSystemReminder([completion], SHELL_TOOL_NAMES),
       metadata: {
         source: "aft",
         kind: "bash_completion",
@@ -60,8 +65,8 @@ async function routeLongRunning(
   await Effect.runPromise(
     route.delivery.status({
       sessionID: reminder.session_id,
-      text: formatLongRunningReminder([reminder]),
-      description: "Background bash status",
+      text: formatLongRunningReminder([reminder], SHELL_TOOL_NAMES),
+      description: "Background shell status",
       metadata: {
         source: "aft",
         kind: "bash_long_running",

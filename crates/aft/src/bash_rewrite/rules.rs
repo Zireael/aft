@@ -9,6 +9,7 @@ const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
 use crate::bash_rewrite::parser::parse;
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
+use crate::command_tool_name::CommandToolName;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -60,7 +61,7 @@ impl RewriteRule for GrepRule {
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
         let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
-        grep_footer_response(response, ctx, path)
+        grep_footer_response(response, ctx, path, request.command_tool_name)
     }
 }
 
@@ -102,7 +103,7 @@ impl RewriteRule for RgRule {
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
         let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
-        grep_footer_response(response, ctx, path)
+        grep_footer_response(response, ctx, path, request.command_tool_name)
     }
 }
 
@@ -152,6 +153,7 @@ impl RewriteRule for FindRule {
         call_and_footer(
             crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
             "glob",
+            request.command_tool_name,
         )
     }
 }
@@ -196,6 +198,7 @@ impl RewriteRule for CatRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request.command_tool_name,
         )
     }
 }
@@ -245,6 +248,7 @@ impl RewriteRule for HeadRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request.command_tool_name,
         )
     }
 }
@@ -303,6 +307,7 @@ impl RewriteRule for TailRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request.command_tool_name,
         )
     }
 }
@@ -355,6 +360,7 @@ impl RewriteRule for CatAppendRule {
                 ctx,
             ),
             "edit",
+            request.command_tool_name,
         )
     }
 }
@@ -400,6 +406,7 @@ impl RewriteRule for SedRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request.command_tool_name,
         )
     }
 }
@@ -434,6 +441,7 @@ impl RewriteRule for LsRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request.command_tool_name,
         )
     }
 }
@@ -455,6 +463,8 @@ fn accept(
         branch_id,
         decision_class_id,
         params,
+        // The dispatcher fills in the caller's name once a rule accepts.
+        command_tool_name: CommandToolName::Bash,
     })
 }
 
@@ -536,18 +546,31 @@ fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRe
 /// Add the normal tool footer while preserving a handler error as the final
 /// response. A handler error is not a permission to execute native bash: the
 /// request has already entered the internal handler.
-fn call_and_footer(response: Response, replacement_tool: &str) -> Response {
+fn call_and_footer(
+    response: Response,
+    replacement_tool: &str,
+    command_tool_name: CommandToolName,
+) -> Response {
     let output = response_output(&response.data);
-    let footered = add_footer(&output, replacement_tool);
+    let footered = add_footer(&output, replacement_tool, command_tool_name);
     apply_footer(response, footered)
 }
 
-fn grep_footer_response(response: Response, ctx: &AppContext, path: Option<&str>) -> Response {
+fn grep_footer_response(
+    response: Response,
+    ctx: &AppContext,
+    path: Option<&str>,
+    command_tool_name: CommandToolName,
+) -> Response {
     let output = response_output(&response.data);
     let footered = if should_suppress_grep_footer(path, &grep_project_root(ctx)) {
         output
     } else {
-        add_grep_footer(&output, ctx.config().aft_search_registered)
+        add_grep_footer(
+            &output,
+            ctx.config().aft_search_registered,
+            command_tool_name,
+        )
     };
     apply_footer(response, footered)
 }

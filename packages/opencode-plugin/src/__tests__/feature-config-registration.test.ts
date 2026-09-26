@@ -23,7 +23,7 @@ import {
   setFeatureConfigPolicyVersionForTests,
 } from "../config.js";
 import { buildOpenCodeToolMap, registerAftTools } from "../tool-registration.js";
-import type { V2ProviderTool } from "../tools/definitions/v2.js";
+import { type V2ProviderTool, v2ToolName } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
 
 const HOSTS = ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"];
@@ -138,7 +138,11 @@ describe("OpenCode feature-config registration", () => {
     });
 
     test(`V2 registers canonical tools minus resolved disables: ${name}`, () => {
-      expect(v2Names(loadWithUserConfig(user))).toEqual(expected(disabled));
+      // V2 registers the same canonical set, under its own names for the
+      // command tool family (`bash` is registered as `shell`).
+      expect(v2Names(loadWithUserConfig(user))).toEqual(
+        expected(disabled).map(v2ToolName).sort(),
+      );
     });
   }
 

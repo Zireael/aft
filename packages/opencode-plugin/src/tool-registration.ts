@@ -24,15 +24,12 @@ import type { PluginContext } from "./types.js";
 /**
  * Host tool names AFT removes before adding its own.
  *
- * `bash` is deliberately absent. Two things were observed on a real OpenCode 2
- * host rather than reasoned about: its own shell surface registers under the
- * name `shell`, so nothing the host owns is displaced by AFT taking `bash`;
- * and when a second plugin does claim `bash` first, the registry keeps the
- * later registration, because adding a tool overwrites any entry already under
- * that name. AFT's `bash` is the one the host holds either way, so a preceding
- * remove would change nothing. The load matrix keeps that observation as a row.
+ * `shell` is the host's own command tool. AFT's `bash` is registered under
+ * that name on OpenCode 2 (see `v2ToolName`), so the host's `shell` is
+ * removed first, the same way the file tools are replaced. The match is on the
+ * registered name, which is why `shell` rather than `bash` is listed.
  */
-const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
+const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch", "shell"]);
 
 export interface V2ToolEditor {
   add(definition: V2ProviderTool): void;

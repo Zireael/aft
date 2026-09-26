@@ -37,6 +37,15 @@ export {
   runBashHostFallback,
 } from "./bash-host-fallback.js";
 export { resolveBashKillTimeout } from "./bash-timeout.js";
+// --- command tool naming (bash on OpenCode 1 and Pi, shell on OpenCode 2) ---
+export {
+  BASH_TOOL_NAMES,
+  type CommandToolName,
+  type CommandToolNames,
+  commandToolNames,
+  isCommandToolName,
+  SHELL_TOOL_NAMES,
+} from "./command-tool-names.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
@@ -142,6 +151,7 @@ export {
   type AftToolErrorCause,
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
+  bashTransportDisposition,
   type BashHostFallbackCause,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,

@@ -1,3 +1,4 @@
+use crate::command_tool_name::CommandToolName;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -82,14 +83,23 @@ pub fn record_native(request_id: &str, role: ControlRole, branch_id: &str, reaso
 }
 
 pub fn dispatch(command: &str, session_id: Option<&str>, ctx: &AppContext) -> Option<Response> {
-    dispatch_for_request(command, "bash_rewrite", session_id, ctx)
+    dispatch_for_request(
+        command,
+        "bash_rewrite",
+        session_id,
+        ctx,
+        CommandToolName::Bash,
+    )
 }
 
+/// `command_tool_name` is the caller's name for the command tool; the footer a
+/// rewritten reply carries names it.
 pub fn dispatch_for_request(
     command: &str,
     request_id: &str,
     session_id: Option<&str>,
     ctx: &AppContext,
+    command_tool_name: CommandToolName,
 ) -> Option<Response> {
     if !ctx.config().experimental_bash_rewrite {
         record_native(
@@ -116,7 +126,8 @@ pub fn dispatch_for_request(
     for rule in rules {
         let decision = rule.decide(command, request_id, session_id, ctx);
         match decision {
-            crate::bash_rewrite::RewriteDecision::Accept(request) => {
+            crate::bash_rewrite::RewriteDecision::Accept(mut request) => {
+                request.command_tool_name = command_tool_name;
                 store_record(DispatchRecord {
                     request_id: request_id.to_string(),
                     route: DispatchRoute::Rewritten {

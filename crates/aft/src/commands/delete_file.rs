@@ -678,8 +678,11 @@ fn over_budget_response(
             "delete_file: refusing to delete '{original}': its undo backup would copy {counted} \
              (limit per call: {max_files} files and {}); counting stopped at the limit.{earlier} \
              Nothing was deleted. Delete it in smaller pieces to keep undo, or, when no undo \
-             is needed, remove it with bash `rm -rf`.",
-            format_mib(max_bytes)
+             is needed, remove it with {command_tool} `rm -rf`.",
+            format_mib(max_bytes),
+            command_tool = crate::command_tool_name::CommandToolName::from_params(&req.params)
+                .unwrap_or_default()
+                .command(),
         ),
         serde_json::json!({
             "limit": match exceeded.limit {

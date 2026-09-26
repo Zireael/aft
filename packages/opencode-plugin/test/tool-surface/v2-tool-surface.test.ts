@@ -14,6 +14,7 @@ import {
   providerDefinitionBytes,
   type V2ProviderTool,
   type V2ToolConsumers,
+  v2ToolName,
 } from "../../src/tools/definitions/v2.js";
 import type { PluginContext } from "../../src/types.js";
 
@@ -48,8 +49,13 @@ function resolved(config: AftConfig): AftConfig {
   return doc as AftConfig;
 }
 
+/**
+ * The tool context the OpenCode 2 entry builds: the command tool is `shell`
+ * there, so every description is rendered with the `shell_*` names.
+ */
 function stubContext(config: AftConfig = ALL_TOOLS_CONFIG): PluginContext {
   return {
+    commandToolName: "shell",
     pool: {
       getBridge: () => {
         throw new Error("tool projection must not start a bridge");
@@ -131,7 +137,7 @@ describe("OpenCode V2 tool surface", () => {
     const registration = await captureRegistration();
 
     expect(registration.added.map((definition) => definition.name)).toEqual(
-      Object.keys(definitions),
+      Object.keys(definitions).map(v2ToolName),
     );
     for (const definition of registration.added) {
       expect(definition.name).toMatch(TOOL_NAME);
@@ -162,7 +168,9 @@ describe("OpenCode V2 tool surface", () => {
     for (const config of profiles) {
       const definitions = sharedDefinitions(config);
       const { added } = await captureRegistration(config);
-      expect(added.map((definition) => definition.name)).toEqual(Object.keys(definitions));
+      expect(added.map((definition) => definition.name)).toEqual(
+        Object.keys(definitions).map(v2ToolName),
+      );
     }
   });
 
@@ -179,9 +187,9 @@ describe("OpenCode V2 tool surface", () => {
     const { added } = await captureRegistration();
     const projected = new Map(added.map((definition) => [definition.name, definition]));
 
-    expect([...projected.keys()]).toEqual(Object.keys(definitions));
+    expect([...projected.keys()]).toEqual(Object.keys(definitions).map(v2ToolName));
     for (const [name, definition] of Object.entries(definitions)) {
-      const v2 = projected.get(name);
+      const v2 = projected.get(v2ToolName(name));
       expect(v2?.description).toBe(definition.description);
       expect(jsonSchema(v2 as V2ProviderTool)).toEqual(canonicalV1Schema(name, definition.args));
     }
@@ -197,7 +205,9 @@ describe("OpenCode V2 tool surface", () => {
     expect(projected.get("read")?.options?.permission).toBe("read");
     expect(projected.get("glob")?.options?.permission).toBe("glob");
     expect(projected.get("apply_patch")?.options?.permission).toBe("edit");
-    expect(projected.get("bash")?.options?.permission).toBe("bash");
+    // OpenCode 2 evaluates command rules under `shell`, the action its own
+    // shell tool asks under and the one a legacy `bash` config key becomes.
+    expect(projected.get("shell")?.options?.permission).toBe("shell");
   });
 
   test("maps canonical V2 path input back to the shared executor field", async () => {
@@ -281,7 +291,9 @@ describe("OpenCode V2 tool surface", () => {
   test("transform replacement only removes built-ins and never installs execution hooks", async () => {
     const registration = await captureRegistration();
 
-    expect(registration.removed).toEqual(["read", "write", "edit", "apply_patch"]);
+    expect([...registration.removed].sort()).toEqual(
+      ["apply_patch", "edit", "read", "shell", "write"].sort(),
+    );
     expect(registration.updates).toBe(0);
     expect(registration.beforeHooks).toBe(0);
     expect(registration.afterHooks).toBe(0);
