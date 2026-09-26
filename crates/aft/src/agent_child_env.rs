@@ -139,6 +139,113 @@ if [ -n "$line" ]; then
 fi
 "#;
 
+/// Length, in hex characters, of the content key that names one hook set.
+const GIT_HOOK_SET_KEY_LEN: usize = 32;
+
+/// The complete dispatcher set and the key derived from its bytes. Every hook
+/// name and body feeds the key, so any template change yields a new directory
+/// while identical content always resolves to the same one.
+struct ManagedGitHookSet {
+    hooks: Vec<(&'static str, String)>,
+    key: String,
+}
+
+fn managed_git_hook_set() -> &'static ManagedGitHookSet {
+    static SET: OnceLock<ManagedGitHookSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        let hooks = MANAGED_GIT_HOOK_NAMES
+            .iter()
+            .map(|name| (*name, managed_git_hook_contents(name)))
+            .collect::<Vec<_>>();
+        let mut hasher = blake3::Hasher::new();
+        for (name, contents) in &hooks {
+            // Length-prefix both fields so no two different sets can serialize
+            // to the same byte stream.
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(contents.len() as u64).to_le_bytes());
+            hasher.update(contents.as_bytes());
+        }
+        let key = hasher.finalize().to_hex()[..GIT_HOOK_SET_KEY_LEN].to_string();
+        ManagedGitHookSet { hooks, key }
+    })
+}
+
+/// Directory that git's `core.hooksPath` points at for governed children.
+///
+/// The dispatchers are identical for every storage root, so they live once per
+/// user in a directory named by their content key rather than once per storage
+/// root. macOS scans every newly created executable on its first run; one
+/// shared copy costs one scan per hook version instead of one per storage root
+/// (and, in the test suite, one per test).
+pub fn managed_git_hooks_dir(storage_root: &Path) -> PathBuf {
+    managed_git_hooks_root_from(
+        crate::environment::non_empty_os_var,
+        cfg!(windows),
+        storage_root,
+    )
+    .join(&managed_git_hook_set().key)
+}
+
+/// Parent of the content-keyed hook directories. It follows the per-user AFT
+/// cache root the TypeScript side already uses for downloaded binaries
+/// (`getAftCacheRoot`): `AFT_CACHE_DIR` when set, then `%LOCALAPPDATA%\aft`
+/// on Windows, otherwise `$XDG_CACHE_HOME/aft` or `~/.cache/aft`. Only absolute
+/// values count, so a relative variable cannot move hooks under whatever
+/// directory a child happens to start in. With no usable home at all the set
+/// stays under the storage root, where it lived before.
+///
+/// The test gate (`scripts/rust-test-gate.sh`) exports one `XDG_CACHE_HOME`
+/// for the whole run, so every test shares the same hook set too.
+fn managed_git_hooks_root_from(
+    lookup: impl Fn(&str) -> Option<OsString>,
+    windows: bool,
+    storage_root: &Path,
+) -> PathBuf {
+    let absolute = |name: &str| {
+        lookup(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let cache_root = absolute("AFT_CACHE_DIR").or_else(|| {
+        let base = if windows {
+            absolute("LOCALAPPDATA")
+                .or_else(|| absolute("APPDATA"))
+                .or_else(|| {
+                    absolute("USERPROFILE")
+                        .or_else(|| absolute("HOME"))
+                        .map(|home| home.join("AppData").join("Local"))
+                })
+        } else {
+            absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|home| home.join(".cache")))
+        };
+        base.map(|base| base.join("aft"))
+    });
+    cache_root
+        .unwrap_or_else(|| storage_root.to_path_buf())
+        .join(GIT_HOOKS_DIR_NAME)
+}
+
+/// True when a `core.hooksPath` value was selected by AFT: either a
+/// content-keyed hook directory, or the per-storage-root directory that older
+/// daemons injected (an inherited environment may still carry that value).
+fn is_managed_git_hooks_path(value: &Path) -> bool {
+    if value.ends_with(GIT_HOOKS_DIR_NAME) {
+        return true;
+    }
+    let keyed = value
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == GIT_HOOK_SET_KEY_LEN && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    keyed
+        && value
+            .parent()
+            .is_some_and(|parent| parent.ends_with(GIT_HOOKS_DIR_NAME))
+}
+
 fn managed_git_hook_contents(hook_name: &str) -> String {
     let pre_dispatch = if hook_name == PREPARE_COMMIT_MSG {
         PREPARE_COMMIT_MSG_PRE_DISPATCH
@@ -180,7 +287,7 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     }
 
     if config.git.co_author != "off" {
-        ensure_managed_git_hooks(&storage_root.join(GIT_HOOKS_DIR_NAME))?;
+        ensure_managed_git_hooks(&managed_git_hooks_dir(storage_root))?;
     }
     Ok(())
 }
@@ -209,7 +316,7 @@ pub fn scrub_inherited_process_markers() {
     std::env::remove_var(GIT_CO_AUTHOR_ENV);
     std::env::remove_var(GH_SHIM_BINARY_ENV);
     let aft_hooks_value = std::env::var_os("GIT_CONFIG_VALUE_0")
-        .is_some_and(|value| Path::new(&value).ends_with(GIT_HOOKS_DIR_NAME));
+        .is_some_and(|value| is_managed_git_hooks_path(Path::new(&value)));
     if aft_hooks_value
         && std::env::var_os("GIT_CONFIG_KEY_0").as_deref()
             == Some(std::ffi::OsStr::new("core.hooksPath"))
@@ -338,7 +445,7 @@ pub fn inject(
         environment.remove(GH_SHIM_BINARY_ENV);
         let aft_hooks_value = environment
             .get("GIT_CONFIG_VALUE_0")
-            .is_some_and(|value| Path::new(value).ends_with(GIT_HOOKS_DIR_NAME));
+            .is_some_and(|value| is_managed_git_hooks_path(Path::new(value)));
         if aft_hooks_value
             && environment.get("GIT_CONFIG_KEY_0").map(String::as_str) == Some("core.hooksPath")
         {
@@ -398,8 +505,7 @@ pub fn inject(
         environment.insert("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string());
         environment.insert(
             "GIT_CONFIG_VALUE_0".to_string(),
-            storage_root
-                .join(GIT_HOOKS_DIR_NAME)
+            managed_git_hooks_dir(storage_root)
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -558,29 +664,98 @@ fn existing_gh_entry_is_valid(_shims_dir: &Path) -> bool {
 }
 
 fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(hooks_dir).map_err(|error| {
-        format!(
-            "failed to create child Git hooks directory {}: {error}",
-            hooks_dir.display()
-        )
-    })?;
-    let expected = MANAGED_GIT_HOOK_NAMES
-        .iter()
-        .map(|name| (*name, managed_git_hook_contents(name)))
-        .collect::<Vec<_>>();
-    quarantine_foreign_hook_entries(hooks_dir, &expected)?;
+    let expected = &managed_git_hook_set().hooks;
+    if fs::symlink_metadata(hooks_dir).is_err() {
+        install_managed_git_hook_set(hooks_dir, expected)?;
+    }
+    // The directory is shared by every storage root, so verify it before each
+    // child launch: tampering in one place would otherwise reach every agent.
+    // An intact set costs only reads here; nothing is rewritten or re-chmodded.
+    quarantine_foreign_hook_entries(hooks_dir, expected)?;
     for (name, contents) in expected {
-        let hook = hooks_dir.join(name);
-        write_if_changed(&hook, contents.as_bytes())?;
-        #[cfg(unix)]
-        set_executable(&hook)?;
+        write_hook_if_changed(&hooks_dir.join(name), contents.as_bytes())?;
     }
     Ok(())
 }
 
+/// Create a complete hook set in one step: fill a private staging directory
+/// beside the destination, then rename the whole directory into place. A
+/// concurrent process (or test) therefore either sees no directory or a full
+/// set of executable dispatchers, never a partly written one.
+fn install_managed_git_hook_set(
+    hooks_dir: &Path,
+    expected: &[(&'static str, String)],
+) -> Result<(), String> {
+    let parent = hooks_dir.parent().ok_or_else(|| {
+        format!(
+            "child Git hooks directory has no parent: {}",
+            hooks_dir.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create child Git hooks directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    // Threads of one process can install at once and the clock may not tick
+    // between them, so a per-process counter keeps every staging name unique.
+    static STAGING_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staging = parent.join(format!(
+        ".staging-{}-{}-{}-{}",
+        hooks_dir.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let populated = (|| {
+        fs::create_dir(&staging).map_err(|error| {
+            format!(
+                "failed to create Git hooks staging directory {}: {error}",
+                staging.display()
+            )
+        })?;
+        for (name, contents) in expected {
+            let hook = staging.join(name);
+            fs::write(&hook, contents.as_bytes()).map_err(|error| {
+                format!(
+                    "failed to write staged Git hook {}: {error}",
+                    hook.display()
+                )
+            })?;
+            #[cfg(unix)]
+            set_executable(&hook)?;
+        }
+        Ok::<(), String>(())
+    })();
+    let installed = populated.and_then(|()| {
+        fs::rename(&staging, hooks_dir).or_else(|error| {
+            // Losing the race to another installer is success: the winner
+            // renamed an equally complete set into place. Unix reports a
+            // non-empty destination and Windows reports an existing one with
+            // different error kinds, so check the destination instead.
+            if hooks_dir.is_dir() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failed to install Git hooks directory {}: {error}",
+                    hooks_dir.display()
+                ))
+            }
+        })
+    });
+    if fs::symlink_metadata(&staging).is_ok() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    installed
+}
+
 fn quarantine_foreign_hook_entries(
     hooks_dir: &Path,
-    expected: &[(&str, String)],
+    expected: &[(&'static str, String)],
 ) -> Result<(), String> {
     let mut foreign = Vec::new();
     for entry in fs::read_dir(hooks_dir).map_err(|error| {
@@ -838,10 +1013,39 @@ fn remove_gh_entry(shims_dir: &Path) -> Result<(), String> {
     }
 }
 
+/// Repair one dispatcher in an existing hook set. An intact hook is left
+/// completely untouched (no write, no chmod), so a verified set never looks
+/// like new content to a platform scanner. A replacement is made executable
+/// before it is renamed into place, so git never finds a non-executable hook.
+fn write_hook_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = fs::metadata(path)
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o755);
+            if !executable {
+                set_executable(path)?;
+            }
+        }
+        return Ok(());
+    }
+    install_managed_file(path, bytes, true)
+}
+
+// Only the Windows `gh.cmd` wrapper is a plain managed file; hooks go through
+// `write_hook_if_changed` so their executable bit is set before install.
+#[cfg(windows)]
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
     }
+    install_managed_file(path, bytes, false)
+}
+
+/// Replace one managed file through a temporary sibling and a rename, so a
+/// reader sees either the old or the new bytes.
+fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), String> {
     if path.is_dir() {
         return Err(format!(
             "cannot replace managed child file because it is a directory: {}",
@@ -857,10 +1061,15 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
             parent.display()
         )
     })?;
+    // The hook set is shared by every storage root, so two threads of one
+    // process may repair the same file at once; the counter keeps their
+    // temporary names apart.
+    static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = parent.join(format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::write(&temporary, bytes).map_err(|error| {
         format!(
@@ -868,6 +1077,14 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
             temporary.display()
         )
     })?;
+    #[cfg(unix)]
+    if executable {
+        set_executable(&temporary).inspect_err(|_| {
+            let _ = fs::remove_file(&temporary);
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
     // Windows rename does not replace an existing destination. Managed files
     // contain no user data, so remove only the exact stale file before install.
     #[cfg(windows)]
@@ -1394,7 +1611,7 @@ mod tests {
         let storage = temp.path().join("storage");
         initialize_repo(&repo);
         let environment = co_author_environment(&storage);
-        let hook = storage.join(GIT_HOOKS_DIR_NAME).join(PREPARE_COMMIT_MSG);
+        let hook = managed_git_hooks_dir(&storage).join(PREPARE_COMMIT_MSG);
         let message_file = repo.join("message");
         fs::write(&message_file, "rerun subject").unwrap();
 
@@ -1415,7 +1632,7 @@ mod tests {
         let storage = temp.path().join("storage");
         initialize_repo(&repo);
         let environment = co_author_environment(&storage);
-        let hook = storage.join(GIT_HOOKS_DIR_NAME).join(PREPARE_COMMIT_MSG);
+        let hook = managed_git_hooks_dir(&storage).join(PREPARE_COMMIT_MSG);
         let message_file = repo.join("message");
         let original = "existing subject\n\nCo-authored-by: Other Agent <other@example.test>\n";
         fs::write(&message_file, original).unwrap();
@@ -1502,6 +1719,203 @@ mod tests {
         assert_eq!(message.matches("Local-Hook: default").count(), 2);
     }
 
+    /// Every storage root (every test, every project) must share one hook set.
+    /// macOS scans each newly created executable on its first run, so a fresh
+    /// copy per storage root costs a security scan per hook per root.
+    #[cfg(unix)]
+    #[test]
+    fn separate_storage_roots_share_one_hook_set_without_rewriting_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_storage = temp.path().join("first-storage");
+        let second_storage = temp.path().join("second-storage");
+        let first = co_author_environment(&first_storage);
+        let first_dir = PathBuf::from(first.get("GIT_CONFIG_VALUE_0").unwrap());
+        let snapshot = |dir: &Path| {
+            // A quarantine directory is AFT's own and may persist in the shared
+            // set from an earlier repair; only the hook files matter here.
+            let mut entries = fs::read_dir(dir)
+                .unwrap()
+                .filter(|entry| {
+                    entry.as_ref().unwrap().file_name() != GIT_HOOKS_QUARANTINE_DIR_NAME
+                })
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                    (
+                        entry.file_name(),
+                        metadata.ino(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let before = snapshot(&first_dir);
+
+        let second = co_author_environment(&second_storage);
+        let second_dir = PathBuf::from(second.get("GIT_CONFIG_VALUE_0").unwrap());
+
+        assert_eq!(
+            second_dir, first_dir,
+            "two storage roots selected different hook directories"
+        );
+        assert!(
+            !first_dir.starts_with(&first_storage) && !second_dir.starts_with(&second_storage),
+            "the shared hook set must live outside every storage root: {}",
+            first_dir.display()
+        );
+        assert_eq!(before.len(), MANAGED_GIT_HOOK_NAMES.len());
+        assert_eq!(
+            snapshot(&second_dir),
+            before,
+            "the second install created, replaced, or touched a hook file"
+        );
+    }
+
+    #[test]
+    fn hook_set_root_follows_the_aft_cache_root_and_ignores_relative_values() {
+        let storage = Path::new("/storage");
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let root = |pairs, windows| managed_git_hooks_root_from(lookup(pairs), windows, storage);
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                root(
+                    &[("AFT_CACHE_DIR", "/explicit"), ("HOME", "/home/u")],
+                    false
+                ),
+                Path::new("/explicit/git-hooks")
+            );
+            assert_eq!(
+                root(&[("XDG_CACHE_HOME", "/xdg"), ("HOME", "/home/u")], false),
+                Path::new("/xdg/aft/git-hooks")
+            );
+            assert_eq!(
+                root(
+                    &[("XDG_CACHE_HOME", "relative"), ("HOME", "/home/u")],
+                    false
+                ),
+                Path::new("/home/u/.cache/aft/git-hooks")
+            );
+        }
+        assert_eq!(root(&[], false), Path::new("/storage/git-hooks"));
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                root(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")], true),
+                Path::new(r"C:\Users\u\AppData\Local\aft\git-hooks")
+            );
+            assert_eq!(
+                root(&[("USERPROFILE", r"C:\Users\u")], true),
+                Path::new(r"C:\Users\u\AppData\Local\aft\git-hooks")
+            );
+        }
+    }
+
+    #[test]
+    fn managed_hooks_path_recognition_covers_keyed_and_legacy_directories() {
+        let key = &managed_git_hook_set().key;
+        assert_eq!(key.len(), GIT_HOOK_SET_KEY_LEN);
+        assert!(is_managed_git_hooks_path(
+            &Path::new("/c/aft").join(GIT_HOOKS_DIR_NAME).join(key)
+        ));
+        assert!(is_managed_git_hooks_path(
+            &Path::new("/s").join(GIT_HOOKS_DIR_NAME)
+        ));
+        assert!(!is_managed_git_hooks_path(
+            &Path::new("/repo").join(GIT_HOOKS_DIR_NAME).join("custom")
+        ));
+        assert!(!is_managed_git_hooks_path(
+            &Path::new("/repo/.githooks").join(key)
+        ));
+    }
+
+    #[test]
+    fn disabled_attribution_strips_an_inherited_keyed_hooks_path() {
+        let mut config = Config::default();
+        config.github.shim = false;
+        config.git = GitConfig::default();
+        let keyed = Path::new("/c/aft")
+            .join(GIT_HOOKS_DIR_NAME)
+            .join(&managed_git_hook_set().key);
+        let mut environment = HashMap::from([
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
+            (
+                "GIT_CONFIG_VALUE_0".to_string(),
+                keyed.to_string_lossy().into_owned(),
+            ),
+        ]);
+        inject(&config, Path::new("/unused"), &mut environment, None).unwrap();
+        assert!(environment.is_empty(), "{environment:?}");
+    }
+
+    /// Many processes and tests install the same shared set at once; each must
+    /// succeed and the result must be one complete, executable set with no
+    /// staging leftovers.
+    #[test]
+    fn concurrent_installers_produce_one_complete_hook_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks_dir = temp
+            .path()
+            .join(GIT_HOOKS_DIR_NAME)
+            .join(&managed_git_hook_set().key);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let hooks_dir = hooks_dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_managed_git_hooks(&hooks_dir)
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        for (name, contents) in &managed_git_hook_set().hooks {
+            assert_eq!(fs::read_to_string(hooks_dir.join(name)).unwrap(), *contents);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(hooks_dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o755, "{name} is not executable");
+            }
+        }
+        assert_eq!(
+            fs::read_dir(&hooks_dir).unwrap().count(),
+            MANAGED_GIT_HOOK_NAMES.len()
+        );
+        let siblings = fs::read_dir(hooks_dir.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "staging directories were left behind: {siblings:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn maintenance_generates_the_complete_posix_dispatcher_set() {
@@ -1513,10 +1927,13 @@ mod tests {
 
         maintain(&config, &storage).unwrap();
 
-        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
+        let hooks_dir = managed_git_hooks_dir(&storage);
+        // The set is shared per user, so an earlier repair may have left AFT's
+        // own quarantine directory beside the dispatchers.
         let mut generated = fs::read_dir(&hooks_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != GIT_HOOKS_QUARANTINE_DIR_NAME)
             .collect::<Vec<_>>();
         generated.sort();
         let mut expected = MANAGED_GIT_HOOK_NAMES
@@ -1544,12 +1961,13 @@ mod tests {
     #[test]
     fn maintenance_quarantines_contamination_logs_and_regenerates() {
         let temp = tempfile::tempdir().unwrap();
-        let storage = temp.path().join("storage");
-        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
-        let mut config = Config::default();
-        config.github.shim = false;
-        config.git.co_author = TEST_CO_AUTHOR.to_string();
-        maintain(&config, &storage).unwrap();
+        // Contaminating the shared per-user set would disturb concurrently
+        // running tests, so this exercises a private copy of the same layout.
+        let hooks_dir = temp
+            .path()
+            .join(GIT_HOOKS_DIR_NAME)
+            .join(&managed_git_hook_set().key);
+        ensure_managed_git_hooks(&hooks_dir).unwrap();
         fs::write(
             hooks_dir.join("pre-commit"),
             "#!/bin/sh\necho foreign lefthook fallback\n",
@@ -1557,7 +1975,7 @@ mod tests {
         .unwrap();
         fs::write(hooks_dir.join("unknown-manager-hook"), "foreign\n").unwrap();
 
-        maintain(&config, &storage).unwrap();
+        ensure_managed_git_hooks(&hooks_dir).unwrap();
 
         assert_eq!(
             fs::read_to_string(hooks_dir.join("pre-commit")).unwrap(),
@@ -1593,7 +2011,7 @@ mod tests {
         assert_eq!(warning_count, 1, "the contamination sweep did not log once");
 
         fs::write(hooks_dir.join("another-foreign-hook"), "foreign again\n").unwrap();
-        maintain(&config, &storage).unwrap();
+        ensure_managed_git_hooks(&hooks_dir).unwrap();
         let warning_count = quarantine_test_logs()
             .lock()
             .unwrap()
@@ -1610,19 +2028,20 @@ mod tests {
     #[test]
     fn quarantine_content_guard_detects_a_one_byte_managed_hook_mutation() {
         let temp = tempfile::tempdir().unwrap();
-        let storage = temp.path().join("storage");
-        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
-        let mut config = Config::default();
-        config.github.shim = false;
-        config.git.co_author = TEST_CO_AUTHOR.to_string();
-        maintain(&config, &storage).unwrap();
+        // Contaminating the shared per-user set would disturb concurrently
+        // running tests, so this exercises a private copy of the same layout.
+        let hooks_dir = temp
+            .path()
+            .join(GIT_HOOKS_DIR_NAME)
+            .join(&managed_git_hook_set().key);
+        ensure_managed_git_hooks(&hooks_dir).unwrap();
         assert!(!hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME).exists());
 
         let hook = hooks_dir.join("commit-msg");
         let mut mutated = fs::read(&hook).unwrap();
         mutated.push(b' ');
         fs::write(&hook, mutated).unwrap();
-        maintain(&config, &storage).unwrap();
+        ensure_managed_git_hooks(&hooks_dir).unwrap();
 
         let quarantine = hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME);
         assert_eq!(fs::read_dir(quarantine).unwrap().count(), 1);
@@ -1669,7 +2088,7 @@ mod tests {
         let storage = temp.path().join("storage");
         initialize_repo(&repo);
         let environment = co_author_environment(&storage);
-        let managed = storage.join(GIT_HOOKS_DIR_NAME);
+        let managed = managed_git_hooks_dir(&storage);
         run_git(
             &repo,
             &["config", "core.hooksPath", managed.to_str().unwrap()],

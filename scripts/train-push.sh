@@ -673,8 +673,11 @@ warn_repo_local_pre_push() {
       # AFT's managed dispatcher is not a gate: it chains to the repo-local
       # hook, which is already a candidate above. Its presence alone says
       # nothing about whether a gate runs. Matched by path shape rather than an
-      # absolute location because the data directory moves with XDG settings.
+      # absolute location because the data and cache directories move with XDG
+      # settings. The first pair is the older per-storage-root location; newer
+      # releases share one content-addressed set under the AFT cache directory.
       */cortexkit/aft/git-hooks | */cortexkit/aft/git-hooks/*) : ;;
+      */aft/git-hooks/*) : ;;
       *)
         if [ "$configured/pre-push" != "$repo_local" ]; then
           candidates+=("$configured/pre-push")

@@ -39,6 +39,12 @@ fn gate_resolves_every_user_config_and_state_path_under_the_gate_homes() {
             crate::local_embed::embedding_cache_dir().expect("model cache resolves"),
         ),
         (
+            "shared managed Git hooks",
+            crate::agent_child_env::managed_git_hooks_dir(&crate::bash_background::storage_dir(
+                None,
+            )),
+        ),
+        (
             "gh credential wrapper config dirs",
             PathBuf::from(crate::gh_shim::wrapper_config_dir_pattern_from_process(
                 "~/.config/gh-alfonso-*/",

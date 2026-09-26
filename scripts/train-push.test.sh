@@ -562,6 +562,18 @@ run_train "$dir" dispatcher
 expect_rc 0 "the managed dispatcher does not block a train"
 expect_no_out "pre-push hook" "the managed dispatcher alone is not warned about"
 
+# --- no warning: the shared content-addressed dispatcher set either --------
+dir="$(new_fixture keyed-dispatcher)"
+add_train_commit "$dir/work" "keyed-dispatcher"
+managed_hooks="$TMP_ROOT/fake-cache/aft/git-hooks/0123456789abcdef0123456789abcdef"
+mkdir -p "$managed_hooks"
+printf '#!/bin/sh\nexit 0\n' > "$managed_hooks/pre-push"
+chmod +x "$managed_hooks/pre-push"
+git -C "$dir/work" config core.hooksPath "$managed_hooks"
+run_train "$dir" keyed-dispatcher
+expect_rc 0 "the shared managed dispatcher does not block a train"
+expect_no_out "pre-push hook" "the shared managed dispatcher alone is not warned about"
+
 # --- red that is dependency skew: named, and never re-queued ---------------
 dir="$(new_fixture skew)"
 add_train_commit "$dir/work" "skew"
