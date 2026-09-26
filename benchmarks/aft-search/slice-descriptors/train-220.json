@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "concept-recall-real-vectors"
+  ],
+  "note": "Concept recall used to write 1.0 for every case without running AFT. It now runs AFT's semantic lane on real MiniLM query vectors and scores answer ranks; the reference's concept family is re-recorded on the unchanged engine and all 49 real-query rows are unchanged. No ranking-fence file touched."
+}
