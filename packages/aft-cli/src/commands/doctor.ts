@@ -1036,6 +1036,9 @@ export function buildDoctorFixPlan(
     const adapter = adaptersByKind.get(harness.kind);
     if (!adapter || !harness.hostInstalled) continue;
     if (!adapter.ensureTuiPluginEntry || !adapter.hasTuiPluginEntry) continue;
+    // OpenCode 2 reads no TUI config: a missing entry is not a planned change,
+    // and ensureTuiPluginEntry would write nothing for it.
+    if (adapter.tuiPluginEntryApplies?.() === false) continue;
     const hasTuiEntry = adapter.hasTuiPluginEntry();
     if (hasTuiEntry && !adapterConfigNeedsUpdate(adapter, true)) continue;
     items.push({
@@ -1638,7 +1641,11 @@ async function maybeFixPlugin(
   }
   // TUI sidebar entry is setup/doctor-owned, so runtime startup never reverses
   // a user's deliberate removal. Explicit --fix may register or update it.
-  if (adapter.ensureTuiPluginEntry && adapter.hasTuiPluginEntry) {
+  if (
+    adapter.ensureTuiPluginEntry &&
+    adapter.hasTuiPluginEntry &&
+    adapter.tuiPluginEntryApplies?.() !== false
+  ) {
     const hasTuiEntry = adapter.hasTuiPluginEntry();
     if (!hasTuiEntry || adapterConfigNeedsUpdate(adapter, true)) {
       const result = await adapter.ensureTuiPluginEntry();

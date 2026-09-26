@@ -320,6 +320,10 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return this.ensureConfigEntry(paths.tuiConfig, paths.tuiConfigFormat ?? "none", "TUI config");
   }
 
+  tuiPluginEntryApplies(): boolean {
+    return this.configGeneration() !== "v2";
+  }
+
   needsTuiPluginEntryUpdate(): boolean {
     // V2 has no TUI config to update: the host loads the plugin from its own
     // entrypoint, so reporting work here would make doctor offer a repair that

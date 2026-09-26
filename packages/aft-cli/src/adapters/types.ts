@@ -81,6 +81,12 @@ export interface HarnessAdapter {
    */
   hasTuiPluginEntry?(): boolean;
   ensureTuiPluginEntry?(): Promise<PluginEntryResult>;
+  /**
+   * Whether this host reads a TUI config entry at all. OpenCode 2 loads the
+   * TUI plugin from the package's own entrypoint, so a missing tui.json entry
+   * there is not something to repair. Absent means the entry applies.
+   */
+  tuiPluginEntryApplies?(): boolean;
 
   getPluginCacheInfo(): PluginCacheInfo;
   getStorageDir(): string;

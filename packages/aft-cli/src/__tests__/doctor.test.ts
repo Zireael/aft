@@ -171,6 +171,35 @@ describe("buildDoctorFixPlan plugin-update", () => {
   });
 });
 
+describe("buildDoctorFixPlan TUI sidebar entry", () => {
+  const tuiAdapter = (applies: boolean | undefined) =>
+    makeAdapter({
+      hasTuiPluginEntry: () => false,
+      ensureTuiPluginEntry: async () => ({
+        ok: true,
+        action: "already_present",
+        message: "no TUI config entry needed",
+        configPath: "/tmp/aft-test/tui.json",
+      }),
+      ...(applies === undefined ? {} : { tuiPluginEntryApplies: () => applies }),
+    });
+
+  test("plans adding the TUI entry when the host reads a TUI config", () => {
+    const plan = buildDoctorFixPlan([tuiAdapter(true)], makeReport(makeHarness()));
+    expect(plan.some((p) => p.message.includes("(TUI sidebar)"))).toBe(true);
+  });
+
+  test("keeps planning it for adapters that do not say", () => {
+    const plan = buildDoctorFixPlan([tuiAdapter(undefined)], makeReport(makeHarness()));
+    expect(plan.some((p) => p.message.includes("(TUI sidebar)"))).toBe(true);
+  });
+
+  test("does NOT plan a TUI entry on a host that reads none (OpenCode 2)", () => {
+    const plan = buildDoctorFixPlan([tuiAdapter(false)], makeReport(makeHarness()));
+    expect(plan.some((p) => p.message.includes("(TUI sidebar)"))).toBe(false);
+  });
+});
+
 describe("doctor cache clear targets", () => {
   test("lists the interactive clear categories in prompt order", () => {
     expect(DOCTOR_CLEAR_TARGET_OPTIONS).toEqual([
