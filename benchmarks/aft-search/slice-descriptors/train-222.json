@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "concept-recall-answer-keys"
+  ],
+  "note": "Concept-recall answer keys corrected from evidence at the pin, two unanswerable cases removed, and a report quoting benchmark queries excluded from the evidence copy; the reference is re-recorded on the unchanged engine. Benchmarks only; no ranking-fence file touched."
+}
