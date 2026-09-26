@@ -460,6 +460,20 @@ exact-match oracle. `run_real_query.py` copies the same list into the runtime
 copy of the evidence tree, after the pinned digest has been verified, so the
 digest is unaffected.
 
+The pinned tree also carries `.alfonso/reports/search-fusion-quality.md`, a
+report that quotes the concept fixtures' queries. It ranked first for
+`aft_safety_history` and `subagent_type`. The list above cannot reach it: an
+`.aftignore` only applies below its own directory, as a `.gitignore` does.
+The repository's `.gitignore` covers `.alfonso/`, but the evidence-tree copy
+has no `.git` directory, so AFT does not apply it there. (The comment in this
+directory's `.aftignore` says otherwise; it holds for the live checkout, not
+the copy. That file is left unchanged here: it is copied into the evidence
+tree, so editing it could change the indexed corpus too.) `evidence-root.aftignore` lists the
+report, and `run_real_query.py` writes it as `.aftignore` at the root of the
+same runtime copy. Concept recall, the real-query replay and every other
+runner that uses `runtime_evidence_tree` get the exclusion together. The file
+also lists itself, so the only change to the candidate pool is the report.
+
 Changing what the harness indexes is a ranking change, even when the query sets
 do not intersect. The evidence-tree copy was added on the reasoning that no
 real-query row shares a query with a fusion fixture, so it could not matter; that

@@ -269,7 +269,27 @@ class AnswerKeyExclusionTests(unittest.TestCase):
                 copied = root / "benchmarks" / "aft-search" / ".aftignore"
                 self.assertTrue(copied.is_file())
                 self.assertEqual(copied.read_bytes(), (HERE / ".aftignore").read_bytes())
+                root_ignore = root / ".aftignore"
+                self.assertEqual(root_ignore.read_bytes(), (HERE / "evidence-root.aftignore").read_bytes())
             self.assertEqual(evidence_tree_sha256(tree), pinned_digest)
+            self.assertFalse((tree / ".aftignore").exists())
+
+    def test_evidence_root_ignore_excludes_the_report_that_quotes_fixture_queries(self) -> None:
+        # The report sits outside this directory, so only a root-level list
+        # can reach it; the entry must be anchored to the tree root.
+        lines = (HERE / "evidence-root.aftignore").read_text(encoding="utf-8").splitlines()
+        entries = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+        self.assertIn("/.alfonso/reports/search-fusion-quality.md", entries)
+
+    def test_evidence_root_ignore_keeps_an_existing_root_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "aft-evidence"
+            tree.mkdir()
+            (tree / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+            (tree / ".aftignore").write_text("vendored/", encoding="utf-8")
+            with runtime_evidence_tree(tree) as root:
+                merged = (root / ".aftignore").read_bytes()
+            self.assertEqual(merged, b"vendored/\n" + (HERE / "evidence-root.aftignore").read_bytes())
 
 
 if __name__ == "__main__":

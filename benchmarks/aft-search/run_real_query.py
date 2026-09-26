@@ -563,6 +563,7 @@ def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
         root = Path(directory) / "tree"
         shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
         copy_answer_key_ignore(root)
+        copy_evidence_root_ignore(root)
         yield root
 
 
@@ -585,6 +586,30 @@ def copy_answer_key_ignore(root: Path) -> Optional[Path]:
     destination = root / BENCH_IGNORE_RELATIVE
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(source.read_bytes())
+    return destination
+
+
+# Ignore list for answer-key files that live outside this benchmark directory,
+# such as the report under .alfonso/. An .aftignore only applies to paths below
+# its own directory, so this list is written to the root of the evidence-tree
+# copy instead of sitting next to this directory's own .aftignore.
+EVIDENCE_ROOT_IGNORE_SOURCE = HERE / "evidence-root.aftignore"
+
+
+def copy_evidence_root_ignore(root: Path) -> Path:
+    """Keep answer-key files elsewhere in the tree out of the index AFT builds.
+
+    The pinned tree has a report under `.alfonso/` that quotes the concept
+    fixtures' queries; see `evidence-root.aftignore` for why it is excluded.
+    The pinned tree has no root `.aftignore` today. If a later pin adds one,
+    its entries are kept and this list is appended, so the tree's own
+    exclusions still apply.
+    """
+    destination = root / ".aftignore"
+    existing = destination.read_bytes() if destination.is_file() else b""
+    if existing and not existing.endswith(b"\n"):
+        existing += b"\n"
+    destination.write_bytes(existing + EVIDENCE_ROOT_IGNORE_SOURCE.read_bytes())
     return destination
 
 

@@ -1,0 +1,18 @@
+# Ignore list for the ROOT of the runtime copy of the pinned evidence tree.
+#
+# run_real_query.py writes this file to `.aftignore` at the top of the copied
+# tree, beside the copy of this directory's own .aftignore. It is needed
+# because an .aftignore only applies below its own directory, the way a
+# .gitignore does, so the list in benchmarks/aft-search/ cannot reach files
+# elsewhere in the tree.
+#
+# The pinned tree carries a report under .alfonso/ that quotes the concept
+# fixtures' queries. Indexed, it becomes a self-fulfilling exact hit for those
+# queries, the same answer-key problem this directory's .aftignore solves for
+# the fixture files. The repository's .gitignore would normally hide it, but
+# the copy has no .git directory, so AFT does not apply .gitignore there.
+#
+# The last entry keeps this file itself out of the index, so the only change
+# to the candidate pool is the removal of the report.
+/.alfonso/reports/search-fusion-quality.md
+/.aftignore
