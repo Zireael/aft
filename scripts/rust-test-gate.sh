@@ -59,6 +59,12 @@ export XDG_CONFIG_HOME="$gate_home_root/config"
 export XDG_STATE_HOME="$gate_home_root/state"
 export XDG_CACHE_HOME="$gate_home_root/cache"
 mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+# On Windows the per-user AFT cache (the shared managed git hooks, among
+# others) follows %LOCALAPPDATA% rather than XDG_CACHE_HOME, so isolate it too.
+if command -v cygpath >/dev/null 2>&1; then
+  export LOCALAPPDATA="$gate_home_root/localappdata"
+  mkdir -p "$LOCALAPPDATA"
+fi
 # The in-suite hermeticity check asserts every resolved config, state, cache
 # and storage path lies under this root.
 export AFT_GATE_HERMETIC_HOME_ROOT="$gate_home_root"
