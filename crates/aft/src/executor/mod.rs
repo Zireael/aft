@@ -1886,9 +1886,11 @@ impl SchedulerState {
         if actor.has_queued_mutating_job(request_id) {
             return "queued";
         }
-        if self.running_jobs.values().any(|job| {
-            job.side_bind && job.root_id == *root_id && job.request_id == request_id
-        }) {
+        if self
+            .running_jobs
+            .values()
+            .any(|job| job.side_bind && job.root_id == *root_id && job.request_id == request_id)
+        {
             return "running_beside_writer";
         }
         if actor.writer_inflight {
