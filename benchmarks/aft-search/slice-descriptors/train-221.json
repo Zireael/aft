@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "shared-content-addressed-git-hooks"
+  ],
+  "note": "Managed git hooks move to one content-addressed per-user directory. agent_child_env.rs, docs and train-push only; no ranking-fence file touched."
+}
