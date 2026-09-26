@@ -320,9 +320,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // optional default PowerShell tool is enabled. OpenCode never registers it.
     "powershell_tool": false,
 
-    // Whether a new user message detaches a blocking `wait: true` bash call to
-    // the background. Default true. Set false to keep the call blocking through
-    // steering messages; even then, a message containing `&detach` forces the
+    // Whether any new message (typed, or one such as a subagent's completion)
+    // detaches a blocking `wait: true` bash call to the background and ends a
+    // waiting `bash_watch`. Default true. Set false to keep both blocking
+    // through such messages; even then, a message containing `&detach` forces the
     // detach (the token is stripped before the model sees the message).
     "detach_on_user_message": true,
 

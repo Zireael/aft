@@ -167,8 +167,8 @@ function listenForForegroundAbort(
  */
 function userMessageDetachDescription(detachOnUserMessage: boolean): string {
   return detachOnUserMessage
-    ? "A new user message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`."
-    : "Because `bash.detach_on_user_message` is false, a new user message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`.";
+    ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`."
+    : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`.";
 }
 
 /**
