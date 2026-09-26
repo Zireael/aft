@@ -176,7 +176,7 @@ python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_recorded_in
 
 ### Concept recall
 
-`run_concept_recall.py` replays the 28 cases in `fixtures.json` through the
+`run_concept_recall.py` replays the 26 cases in `fixtures.json` through the
 public `search` tool on the same pinned tree, served by the same fixture server
 as the real-query replay. The chunk vectors come from `real-query-vectors.bin`.
 The concept queries have their own pack, `concept-query-vectors.bin`, which
@@ -186,8 +186,8 @@ digest never change for a concept edit. Each case sends one `topK=50`,
 `includeTests: false` request. It scores the rank of the first of its
 `expected_top_files` among the first ten distinct files returned. The router
 decides which lanes run, as it does for users; each row records `lanes_run`.
-On the pinned tree 15 of the 28 cases run the semantic lane: every mixed,
-natural-language and generic-file case, and both error-code cases. The ten
+On the pinned tree 14 of the 26 cases run the semantic lane: every mixed,
+natural-language and generic-file case, and both error-code cases. The nine
 identifier and three path cases do not.
 
 It refuses rather than guesses. A fixture query with no stored vector stops the
@@ -214,31 +214,57 @@ The capture only records texts that are fixture queries. A chunk missing from
 the real-query pack fails it, because recording that chunk here would hide a
 stale pack.
 
-Some answers in `fixtures.json` could not be confirmed against the pinned tree.
-They are left as written, and their scores should be read with that in mind:
+#### Answer keys checked against the pinned tree
 
-- `subagent_type`: neither expected file (`tools/hoisted.ts`,
-  `tools/hoisted-internals.ts`) mentions subagents at the pin. The identifier
-  itself appears only in `crates/aft/tests/integration/query_shape_test.rs`.
-  The case can score only if the tree changes.
-- `process group already terminated`: the phrase occurs nowhere.
-  `bash_background/registry.rs` does handle process-group termination, but
-  `bash_background/watchdog.rs` has no termination code. The shared
-  termination helpers, `bash_background/process.rs`, rank first and are not
-  listed.
-- `semantic_search unavailable renderer`: neither expected `semantic.ts`
-  contains "unavailable". They are the semantic renderers, so only the
-  renderer half of the query supports them.
-- `useState hook examples`: one answer is a test fixture
-  (`tests/fixtures/imports_ts.ts`), which `includeTests: false` excludes.
-  The other, `commands/add_import.rs`, mentions `useState` only in a doc
-  comment and a unit test.
+Four answer keys were found not to hold at the pinned evidence tree
+(`30d4a64f99b3`). Each was re-read there and either corrected or removed. An
+answer is chosen because it answers the question, not because it ranks well;
+the corrected cases carry their evidence (file and line) in their `notes` in
+`fixtures.json`.
+
+- `semantic_search unavailable renderer`, corrected. It listed the two
+  plugin `tools/semantic.ts` files, and neither contains "unavailable". The
+  text a user sees when the semantic lane is unavailable is rendered in
+  `crates/aft/src/commands/semantic_search/mod.rs`
+  (`format_lexical_unavailable_text`, line 3792, and
+  `format_grep_lexical_unavailable_text`, line 3811). The Pi renderer
+  `packages/pi-plugin/src/tools/semantic.ts` stays: it shows a non-ready
+  `semantic_status` as a warning and prints "Semantic index is not ready."
+  (lines 86-105). The OpenCode `tools/semantic.ts` is dropped; it passes the
+  engine's text through and renders nothing itself.
+- `process group already terminated`, corrected. The phrase occurs nowhere.
+  The code that handles an already-terminated process group is
+  `terminate_pgid` in `crates/aft/src/bash_background/process.rs`
+  (lines 92-113; lines 100-104 say killpg on an already-empty group is a
+  harmless ESRCH). It replaces `registry.rs`, which only calls it
+  (line 4145), and `watchdog.rs`, which only asks the registry to kill a
+  timed-out task (line 61).
+- `subagent_type`, removed. The identifier occurs in no source file. Outside
+  the benchmark's own answer keys it appears only as a sample query string in
+  `crates/aft/tests/integration/query_shape_test.rs` (line 47), a test file
+  the case's `includeTests: false` request excludes, and it is not an answer
+  there either. The listed files, `tools/hoisted.ts` and
+  `tools/hoisted-internals.ts`, do not mention subagents. The subagent code
+  that does exist, `packages/opencode-plugin/src/shared/subagent-detect.ts`,
+  identifies a subagent by its session's parent ID and has no notion of a
+  subagent type, so someone looking up that field would not find it there.
+- `useState hook examples`, removed. The only example of the hook in use is
+  the test fixture `crates/aft/tests/fixtures/imports_ts.ts` (lines 5 and 14),
+  which `includeTests: false` excludes. The other listed file,
+  `commands/add_import.rs`, uses `useState` only as a sample import name in a
+  doc comment (line 161) and a unit test (line 865). The remaining mentions
+  are the same kind: sample import names in `imports/mod.rs` docs, and unit
+  tests in `imports/mod.rs`, `query_shape.rs` and
+  `commands/semantic_search/mod.rs`. No file the request can return shows
+  the hook being used.
+
+Removing a case also removes its vector from `concept-query-vectors.bin`, so
+the pack keeps exactly one vector per case. The remaining vectors are the
+captured ones, byte for byte.
 
 The pinned tree also carries `.alfonso/reports/search-fusion-quality.md`,
-which quotes these fixture queries. It is ranked first for `aft_safety_history`
-and `subagent_type`. `.aftignore` does not exclude it. Excluding it would
-change the real-query candidate pool as well, so it is left for a change that
-re-records both.
+which quotes these fixture queries. Both replays exclude it from the index;
+see the corpus hygiene section below.
 
 ### Re-recording the reference
 

@@ -66,11 +66,13 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SCHEMA = "aft-search-concept-score-v2"
 DEFAULT_QUERY_PACK = HERE / "concept-query-vectors.bin"
-# The product default. Several concept queries (LSPManager, subagent_type,
-# aft_safety_history) appear verbatim in the pinned tree's query-shape test
-# files, which would answer them by string match. Three cases also list a test
-# file among their answers (the useState pair and SemanticIndexFingerprint);
-# each of them lists a non-test file too, so every case stays answerable.
+# The product default. Several concept queries (LSPManager, aft_safety_history)
+# appear verbatim in the pinned tree's query-shape test files, which would
+# answer them by string match. Two cases also list a test file among their
+# answers (useState and SemanticIndexFingerprint); each of them lists a
+# non-test file too, so every case stays answerable. A case whose only real
+# answer is a test file cannot be scored under this setting and is removed
+# from fixtures.json instead (see the README's concept-recall answer keys).
 INCLUDE_TESTS = False
 JsonObject = dict[str, Any]
 

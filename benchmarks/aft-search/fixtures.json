@@ -17,15 +17,6 @@
     "notes": "Tool-shaped identifier for the safety history operation; currently represented as aft_safety op=history."
   },
   {
-    "query": "subagent_type",
-    "shape": "identifier",
-    "expected_top_files": [
-      "packages/opencode-plugin/src/tools/hoisted.ts",
-      "packages/opencode-plugin/src/tools/hoisted-internals.ts"
-    ],
-    "notes": "Dogfood identifier shape from agent/task tooling; expected files are the plugin's hoisted tool plumbing."
-  },
-  {
     "query": "LSPManager",
     "shape": "identifier",
     "expected_top_files": [
@@ -85,15 +76,6 @@
     "notes": "Filter trust helper used by project filter commands."
   },
   {
-    "query": "useState hook examples",
-    "shape": "mixed",
-    "expected_top_files": [
-      "crates/aft/tests/fixtures/imports_ts.ts",
-      "crates/aft/src/commands/add_import.rs"
-    ],
-    "notes": "Identifier plus natural words."
-  },
-  {
     "query": "LSPManager initialization timeout",
     "shape": "mixed",
     "expected_top_files": [
@@ -106,10 +88,10 @@
     "query": "semantic_search unavailable renderer",
     "shape": "mixed",
     "expected_top_files": [
-      "packages/pi-plugin/src/tools/semantic.ts",
-      "packages/opencode-plugin/src/tools/semantic.ts"
+      "crates/aft/src/commands/semantic_search/mod.rs",
+      "packages/pi-plugin/src/tools/semantic.ts"
     ],
-    "notes": "Protocol command name plus UI behavior."
+    "notes": "Protocol command name plus UI behavior. Answers read at the pinned evidence tree: semantic_search/mod.rs renders the reply text when the semantic lane is unavailable (format_lexical_unavailable_text, line 3792, and format_grep_lexical_unavailable_text, line 3811: 'Semantic search unavailable; returning lexical-only fallback results') and flags it (semantic_unavailable_extras, line 2644). The Pi renderer, pi-plugin tools/semantic.ts, shows a non-ready semantic_status as a warning and prints 'Semantic index is not ready.' (buildSemanticSections, lines 86-105). The OpenCode tools/semantic.ts was listed before but is dropped: it registers the tool and passes the engine's text through, it never mentions unavailability and renders nothing itself."
   },
   {
     "query": "bash long running reminder config",
@@ -211,10 +193,9 @@
     "query": "process group already terminated",
     "shape": "error-code",
     "expected_top_files": [
-      "crates/aft/src/bash_background/registry.rs",
-      "crates/aft/src/bash_background/watchdog.rs"
+      "crates/aft/src/bash_background/process.rs"
     ],
-    "notes": "Dogfood error-message shape for process lifecycle cleanup; expected files own background process termination."
+    "notes": "Dogfood error-message shape for process lifecycle cleanup. The phrase itself occurs nowhere in the pinned evidence tree. The code that handles a process group which has already terminated is terminate_pgid in bash_background/process.rs (lines 92-113): it stops waiting once the group leader has exited and still sends SIGKILL, noting that killpg on an already-empty group is a harmless ESRCH (lines 100-104). registry.rs and watchdog.rs were listed before and are dropped: registry.rs only calls terminate_pgid (line 4145) and watchdog.rs only asks the registry to kill a timed-out task (line 61); neither handles the already-terminated case."
   },
   {
     "query": "AFT plugin entry point",
