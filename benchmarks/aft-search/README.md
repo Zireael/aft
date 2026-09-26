@@ -367,6 +367,49 @@ Re-records so far:
   | `AFT plugin entry point` | generic-file | none | 0.000 |
   | `command module exports list` | generic-file | none | 0.000 |
   | `crate public API modules` | generic-file | none | 0.000 |
+- 2026-09-26, after four concept answer keys were corrected or removed and
+  `.alfonso/reports/search-fusion-quality.md` was excluded from the
+  evidence-tree index (see Concept recall and the corpus hygiene section).
+  The engine was unchanged: one release build in a Linux aarch64 container
+  (`aft 0.57.2`, binary sha256 `17fba2ca8c9b...`, the same binary as the
+  previous entry), `paged` profile. The base harness reproduced the old
+  reference: every real-query row equal, and a concept score byte-identical
+  to the one recorded in the previous entry. Two runs of
+  `cost-gate.sh --search-quality --mode record-reference --dry-run
+  --manifest-changed` on this harness gave byte-identical scores, recorded
+  with `search_quality.py --mode record-reference --manifest-changed`; the
+  second run evaluates `real_query_behavior:equal` against the new pair.
+
+  Concept recall, 28 cases -> 26: MRR@10 0.542857 -> 0.639423, hit@1
+  0.428571 -> 0.538462, hit@5 0.678571 -> 0.769231. The answer-key step
+  alone gives 0.618269 (hit@1 0.5, hit@5 0.769231), the exclusion the rest.
+  By group, MRR@10: identifier 0.753333 -> 0.842593 (nine cases), mixed
+  0.425 -> 0.65625 (four), error-code 0.5625 -> 1.000; natural-language,
+  path and generic-file unchanged. Rows that moved, with the answer rank
+  before the change, after the answer-key fix, and after the exclusion:
+
+  | Case | Before | Keys fixed | Report excluded | Why |
+  | --- | --- | --- | --- | --- |
+  | `process group already terminated` | 8 | 1 | 1 | answer is now `process.rs` |
+  | `semantic_search unavailable renderer` | 2 | 2 | 1 | `readonly_artifacts.rs` went from 1 to 2; the report was not in this top ten, so this is the smaller candidate pool at work |
+  | `aft_safety_history` | 5 | 5 | 4 | the report was ranked 1 |
+  | `subagent_type` | none | removed | removed | |
+  | `useState hook examples` | none | removed | removed | |
+
+  The report also sat in the top ten for `useState` (at 5, answer at 3) and
+  `LSPManager` (at 3, answer at 1); neither answer moved.
+
+  Real query: no row's opened file moved, and every metric is unchanged
+  (`paged` MRR@10 0.220238, census-weighted MRR 0.162052). Seven of 49 rows
+  changed bytes. In each the report had been one of the candidates, and
+  `retrieval_depth` drops by one: `followup-census:3184`, `10215`, `10672`,
+  `17208`, `18091`, `19696` and `900002`. Two of them changed their ranked
+  list as well. `900002` had the report at 5 and its opened file at 1
+  (still 1). `18091` swapped two files at 5 and 6, and its opened file
+  stays at 2. The drop of exactly one candidate in each changed row also
+  shows that the root `.aftignore` written into the copy did not itself
+  enter the index. Exact recall is unchanged at 1.000; it scores against the
+  pinned external clones, not the evidence tree.
 
 ## Prefrontal search-miss rows
 
