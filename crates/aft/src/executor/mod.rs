@@ -874,6 +874,9 @@ struct RunningJob {
     execution_started: Arc<AtomicBool>,
     completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
+    /// A route bind running beside a tool mutation without the epoch gate
+    /// (see `ActorState::side_bind_inflight`).
+    side_bind: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -890,7 +893,19 @@ pub(crate) struct LongRunningInteractiveJobSnapshot {
 struct RunningMutatingJob {
     request_id: String,
     command: String,
+    job_class: JobClass,
     started_at: Instant,
+}
+
+impl RunningMutatingJob {
+    /// True for an interactive writer that is not a route-bind configure: an
+    /// edit, a delete, a bash call. Over subc, `configure` reaches the executor
+    /// only as a route bind (the tool gate refuses it as a tool call), so such
+    /// a writer never republishes the root's configuration, and an
+    /// unchanged-root rebind can run beside it.
+    fn is_tool_mutation(&self) -> bool {
+        self.job_class == JobClass::Interactive && !is_configure_request(&self.request_id)
+    }
 }
 
 /// Concurrent scheduler-dispatch executor.
@@ -1871,6 +1886,11 @@ impl SchedulerState {
         if actor.has_queued_mutating_job(request_id) {
             return "queued";
         }
+        if self.running_jobs.values().any(|job| {
+            job.side_bind && job.root_id == *root_id && job.request_id == request_id
+        }) {
+            return "running_beside_writer";
+        }
         if actor.writer_inflight {
             return "blocked_by_other_mutating";
         }
@@ -1910,6 +1930,16 @@ impl SchedulerState {
         let mut blockers = Vec::new();
         if let Some(actor) = actor {
             if configure_state == "queued" {
+                // Name the writer that holds the root, with its age, so a bind
+                // queued behind a long tool mutation says which one.
+                if let Some(writer) = actor.mutating_inflight.as_ref() {
+                    blockers.push(format!(
+                        "running_writer(job={} command={} age_ms={})",
+                        writer.request_id,
+                        writer.command,
+                        duration_millis_u64(now.saturating_duration_since(writer.started_at))
+                    ));
+                }
                 let configure_count = actor.pending_configure_count();
                 if configure_count > 0 {
                     blockers.push(format!("queued_behind_configure({configure_count})"));
@@ -2068,6 +2098,12 @@ struct ActorState {
     /// The running writer is a route bind that started with a shared epoch
     /// hold beside running maintenance (see `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
+    /// A route bind is running beside a tool mutation (an edit, a delete)
+    /// that holds the epoch gate for writing. Such a bind takes no gate at
+    /// all, so while it runs the scheduler keeps every other writer and
+    /// maintenance commit out, exactly as for a shared-hold bind, even after
+    /// the mutation it started beside has finished.
+    side_bind_inflight: bool,
     maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
@@ -2095,6 +2131,7 @@ impl ActorState {
             actor_total_inflight: 0,
             writer_inflight: false,
             shared_bind_inflight: false,
+            side_bind_inflight: false,
             maintenance_commit_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
@@ -2629,6 +2666,10 @@ struct RunJob {
     /// A route bind admitted while a maintenance job held the epoch gate: it
     /// runs with a shared hold (see [`current_bind_gate_is_shared`]).
     shared_bind_gate: bool,
+    /// A route bind admitted while a tool mutation held the epoch gate for
+    /// writing: it runs with no hold, as a shared bind, and hands back any run
+    /// that must change the root.
+    side_bind: bool,
     /// How to run this bind again if it has to be queued again.
     rerun: Option<RepeatableJob>,
     /// When the job first queued; a requeued bind keeps its age so its
@@ -2834,6 +2875,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
         request_id,
         job_class,
         lane,
+        side_bind,
         ..
     } = running;
     log::debug!(
@@ -2862,6 +2904,9 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
                 actor.lsp_inflight = false;
             }
             Lane::HeavyInit => {}
+            Lane::Mutating if side_bind => {
+                actor.side_bind_inflight = false;
+            }
             Lane::Mutating => {
                 actor.writer_inflight = false;
                 actor.shared_bind_inflight = false;
@@ -3140,6 +3185,7 @@ fn launch_run_job(
             execution_started: Arc::clone(&run_job.execution_started),
             completion_ownership: Arc::downgrade(&ownership),
             occupancy_reported: false,
+            side_bind: run_job.side_bind,
         },
     );
     debug_assert!(replaced.is_none());
@@ -3217,15 +3263,39 @@ fn try_admit_actor(
     };
     let mut heavy_permit = None;
 
-    // A bind that runs with a shared hold (see `current_bind_gate_is_shared`)
-    // blocks other writers and maintenance like any running writer, but
-    // readers may keep coming: it never waits for exclusive use in place.
-    let shared_bind_admits_lane = actor.shared_bind_inflight
-        && matches!(
-            lane,
-            Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
-        );
-    if (actor.writer_inflight && !shared_bind_admits_lane)
+    // A repeatable bind that has not already been sent back may also start
+    // while a tool mutation holds the gate for writing. A delete that backs up
+    // a large tree or a long bash call can hold it for minutes, and a rebind
+    // queued behind it misses its relay deadline and costs the session the
+    // module. Beside a writer the bind cannot take even a shared hold, so it
+    // runs with none: it runs as a shared bind (see
+    // `current_bind_gate_is_shared`), whose equivalent-rebind path only reads
+    // the published configuration, which a tool mutation never changes, and
+    // whose every path that would change the root hands the worker back to
+    // be queued as an exclusive writer behind the mutation instead.
+    let bind_beside_writer = bind_pass
+        && actor.writer_inflight
+        && !actor.side_bind_inflight
+        && actor
+            .mutating_inflight
+            .as_ref()
+            .is_some_and(RunningMutatingJob::is_tool_mutation)
+        && actor
+            .interactive
+            .first_bind_job()
+            .is_some_and(|job| job.rerun.is_some() && !job.force_exclusive);
+
+    // A bind that runs with a shared hold (see `current_bind_gate_is_shared`),
+    // or with none beside a tool mutation, blocks other writers and
+    // maintenance like any running writer, but readers may keep coming: it
+    // never waits for exclusive use in place.
+    let reader_lane = matches!(
+        lane,
+        Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
+    );
+    let shared_bind_admits_lane = actor.shared_bind_inflight && reader_lane;
+    if (actor.writer_inflight && !shared_bind_admits_lane && !bind_beside_writer)
+        || (actor.side_bind_inflight && !reader_lane)
         || actor.higher_priority_writer_barrier_blocks(job_class)
     {
         return None;
@@ -3320,10 +3390,11 @@ fn try_admit_actor(
     if !bind_pass {
         actor.deficit -= JOB_COST;
     }
-    if lane == Lane::Mutating {
+    if lane == Lane::Mutating && !bind_beside_writer {
         actor.mutating_inflight = Some(RunningMutatingJob {
             request_id: queued.request_id.clone(),
             command: queued.command.clone(),
+            job_class,
             started_at: Instant::now(),
         });
     }
@@ -3337,6 +3408,12 @@ fn try_admit_actor(
             actor.actor_total_inflight += 1;
         }
         Lane::HeavyInit => {
+            actor.actor_total_inflight += 1;
+        }
+        Lane::Mutating if bind_beside_writer => {
+            // The running tool mutation keeps `writer_inflight` and
+            // `mutating_inflight`; the bind is tracked on its own.
+            actor.side_bind_inflight = true;
             actor.actor_total_inflight += 1;
         }
         Lane::Mutating => {
@@ -3367,6 +3444,7 @@ fn try_admit_actor(
         waiting_writers: Arc::clone(&actor.waiting_writers),
         detached_writers: Arc::clone(&actor.detached_writers),
         shared_bind_gate,
+        side_bind: bind_beside_writer,
         rerun: queued.rerun,
         queued_at: queued.queued_at,
         exclusive_attempts: queued.exclusive_attempts,
@@ -3592,6 +3670,21 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
         // constructs its response would delay completion behind maintenance and
         // park later readers behind an otherwise unnecessary writer.
         Lane::HeavyInit => run(job),
+        // A bind admitted beside a tool mutation that holds the gate for
+        // writing takes no hold at all; the scheduler keeps other writers out
+        // until it ends. As a shared bind it hands back any run that must
+        // change the root, to be queued again as an exclusive writer.
+        Lane::Mutating if run_job.side_bind => {
+            if cancel_requested() {
+                return LaneRun::Finished(cancelled_before_execution());
+            }
+            let scope = SharedBindScope::install();
+            let response = run(job);
+            if scope.rerun_requested() {
+                return LaneRun::RerunExclusive { retry_after: None };
+            }
+            response
+        }
         Lane::Mutating if run_job.shared_bind_gate => {
             // A cancelled bind never touches the gate.
             if cancel_requested() {

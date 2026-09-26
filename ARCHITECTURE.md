@@ -46,6 +46,10 @@ the maintenance queue is bounded and idempotent drains coalesce. Long work
 checks a `JobCancellation` token at phase boundaries. Process-wide heavy builds
 share slots through `cold_build_limiter.rs`, and `build_breaker.rs` suspends a
 build domain that keeps crashing.
+A route bind for a root whose configuration is unchanged does not wait for
+that barrier: it starts beside a running maintenance job with a shared hold,
+or beside a running tool mutation with none, and a run that finds it must
+change the root is queued again as an exclusive writer.
 
 **Indexes.** Three background indexes, each on by default (`indexes.*` in
 config):

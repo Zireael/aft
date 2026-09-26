@@ -3907,3 +3907,282 @@ fn reserved_bind_workers_run_only_binds_and_the_bind_jumps_a_queued_edit() {
     );
     assert_eq!(dirs.len(), pool_size);
 }
+
+/// Write `files` small files under `root`, the shape of a dependency or build
+/// output tree an agent may delete in one call.
+fn write_small_file_tree(root: &std::path::Path, files: usize) {
+    for index in 0..files {
+        let dir = root.join(format!("pkg-{:03}", index / 50));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        std::fs::write(dir.join(format!("f{index}.js")), [b'x'; 1_024]).expect("fixture file");
+    }
+}
+
+/// A tool mutation that copies every file of `tree` into `backup`, the way a
+/// recursive delete snapshots a tree before removing it. Each copy is followed
+/// by a 1 ms pause, so 1 KiB files move at no more than about 1 MB/s: slower
+/// than the 4 MB/s a real undo-store copy was once measured at, never faster.
+fn slow_copy_tree(tree: &std::path::Path, backup: &std::path::Path) -> usize {
+    let mut copied = 0;
+    let mut dirs = vec![tree.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read fixture dir") {
+            let path = entry.expect("fixture entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            std::fs::copy(&path, backup.join(format!("{copied}.bak"))).expect("copy");
+            copied += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    copied
+}
+
+/// A long tool mutation holds its root's write lane. A session re-attaching to
+/// that root with an unchanged configuration only reads the published
+/// configuration and records itself in state behind that state's own locks,
+/// so its route bind must be answered while the mutation is still copying,
+/// not after it: the bind relay gives up after a few seconds and the session
+/// then loses the module entirely.
+#[test]
+fn bind_for_unchanged_root_is_answered_while_a_long_tool_mutation_runs() {
+    const FILES: usize = 3_000;
+    let executor = test_executor(4, 2, 2, 2);
+    let (dir, root) = test_root("bind-beside-long-mutation");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let tree = dir.path().join("node_modules");
+    let backup = dir.path().join("backup");
+    std::fs::create_dir_all(&backup).expect("backup dir");
+    write_small_file_tree(&tree, FILES);
+
+    let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let mutation_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_flag = Arc::clone(&mutation_done);
+    let mutation = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "tool-delete-large-tree".to_string(),
+        Box::new(move |_| {
+            mutation_started_tx.send(()).expect("signal mutation start");
+            let copied = slow_copy_tree(&tree, &backup);
+            done_flag.store(true, Ordering::SeqCst);
+            ok(format!("copied-{copied}"))
+        }),
+    );
+    mutation_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mutation starts");
+
+    let submitted_at = Instant::now();
+    let (bind, _token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-beside-mutation", move |_| {
+            assert!(
+                current_bind_gate_is_shared(),
+                "a bind beside a tool mutation runs as a shared bind that must hand back \
+                 any change to the root"
+            );
+            ok("subc-bind-beside-mutation")
+        });
+    let (answered_tx, answered_rx) = crossbeam_channel::bounded::<(Response, Duration, bool)>(1);
+    let done_when_answered = Arc::clone(&mutation_done);
+    let waiter = thread::spawn(move || {
+        let response = bind.blocking_recv().expect("bind response");
+        let _ = answered_tx.send((
+            response,
+            submitted_at.elapsed(),
+            done_when_answered.load(Ordering::SeqCst),
+        ));
+    });
+    let answered = answered_rx.recv_timeout(Duration::from_secs(1));
+
+    let mutation_response = recv_async(mutation, "long mutation");
+    waiter.join().expect("bind waiter");
+    assert_eq!(mutation_response.id, format!("copied-{FILES}"));
+    let (response, waited, mutation_finished_first) = answered.unwrap_or_else(|_| {
+        panic!("the bind was not answered within 1s while a same-root tool mutation ran")
+    });
+    assert!(response.success, "{:?}", response.data);
+    assert!(
+        !mutation_finished_first,
+        "the bind must be answered while the mutation is still running (waited {waited:?})"
+    );
+}
+
+/// A bind that finds it must change the root cannot run beside a tool
+/// mutation. It is queued again as an exclusive writer, and while it waits the
+/// pending-bind diagnostics name the mutation holding the root, with its age,
+/// so the wait is visible. Its wait is bounded by the route's bind deadline,
+/// which cancels a bind still queued.
+#[test]
+fn bind_needing_exclusive_use_waits_for_a_tool_mutation_and_names_it() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("bind-exclusive-behind-mutation");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_mutation_tx, release_mutation_rx) = crossbeam_channel::bounded::<()>(1);
+    let mutation = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "tool-edit-held".to_string(),
+        Box::new(move |_| {
+            mutation_started_tx.send(()).expect("signal mutation start");
+            let _ = release_mutation_rx.recv_timeout(Duration::from_secs(30));
+            ok("tool-edit-held")
+        }),
+    );
+    mutation_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mutation starts");
+
+    let runs = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let recorded = Arc::clone(&runs);
+    let (bind, _token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-changes-root", move |_| {
+            recorded.lock().push(current_bind_gate_is_shared());
+            if request_exclusive_rerun() {
+                return Response::error("subc-bind-changes-root", "configure_needs_exclusive", "");
+            }
+            ok("subc-bind-changes-root")
+        });
+
+    let snapshot = wait_for_bind_snapshot(
+        &executor,
+        &root,
+        "subc-bind-changes-root",
+        Duration::from_secs(2),
+        |snapshot| {
+            snapshot.configure_state == "queued"
+                && snapshot
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.starts_with("running_writer("))
+        },
+    );
+    let _ = release_mutation_tx.send(());
+    assert!(recv_async(mutation, "held mutation").success);
+    let response = recv_async(bind, "exclusive bind");
+
+    let snapshot = snapshot.expect("a queued bind names the tool mutation holding its root");
+    let running_writer = snapshot
+        .blockers
+        .iter()
+        .find(|blocker| blocker.starts_with("running_writer("))
+        .expect("running writer blocker");
+    assert!(
+        running_writer.contains("job=tool-edit-held") && running_writer.contains("age_ms="),
+        "{running_writer}"
+    );
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(
+        *runs.lock(),
+        vec![true, false],
+        "shared attempt beside the mutation, then an exclusive run after it"
+    );
+}
+
+/// Only a tool mutation lets a bind start beside it. A running route-bind
+/// configure may be republishing the root's configuration, which the next
+/// bind's equivalence check reads, so the next bind waits for it.
+#[test]
+fn bind_does_not_start_beside_a_running_route_bind_configure() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("bind-behind-bind");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (first_started_tx, first_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_first_tx, release_first_rx) = crossbeam_channel::bounded::<()>(1);
+    let (first, _first_token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-configuring", move |_| {
+            let _ = first_started_tx.send(());
+            let _ = release_first_rx.recv_timeout(Duration::from_secs(30));
+            ok("subc-bind-configuring")
+        });
+    first_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first bind starts");
+
+    let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_flag = Arc::clone(&second_started);
+    let (second, _second_token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-next", move |_| {
+            second_flag.store(true, Ordering::SeqCst);
+            ok("subc-bind-next")
+        });
+    thread::sleep(Duration::from_millis(150));
+    let second_ran_beside_first = second_started.load(Ordering::SeqCst);
+    let _ = release_first_tx.send(());
+    assert!(recv_async(first, "first bind").success);
+    assert!(recv_async(second, "second bind").success);
+
+    assert!(
+        !second_ran_beside_first,
+        "a bind must not start beside a running route-bind configure"
+    );
+}
+
+/// A bind running beside a tool mutation holds no epoch gate, so the executor
+/// itself must keep other writers out until it ends, even when the mutation
+/// it started beside has finished first.
+#[test]
+fn writer_waits_for_a_bind_that_started_beside_a_finished_tool_mutation() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("writer-after-side-bind");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_mutation_tx, release_mutation_rx) = crossbeam_channel::bounded::<()>(1);
+    let mutation = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "tool-write-first".to_string(),
+        Box::new(move |_| {
+            mutation_started_tx.send(()).expect("signal mutation start");
+            let _ = release_mutation_rx.recv_timeout(Duration::from_secs(30));
+            ok("tool-write-first")
+        }),
+    );
+    mutation_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mutation starts");
+
+    let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_bind_tx, release_bind_rx) = crossbeam_channel::bounded::<()>(1);
+    let (bind, _token) = submit_repeatable_bind(&executor, &root, "subc-bind-held", move |_| {
+        let _ = bind_started_tx.send(());
+        let _ = release_bind_rx.recv_timeout(Duration::from_secs(30));
+        ok("subc-bind-held")
+    });
+    let bind_started = bind_started_rx.recv_timeout(Duration::from_secs(1));
+
+    let _ = release_mutation_tx.send(());
+    assert!(recv_async(mutation, "first mutation").success);
+
+    let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_flag = Arc::clone(&second_started);
+    let second = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "tool-write-second".to_string(),
+        Box::new(move |_| {
+            second_flag.store(true, Ordering::SeqCst);
+            ok("tool-write-second")
+        }),
+    );
+    thread::sleep(Duration::from_millis(150));
+    let second_ran_beside_bind = second_started.load(Ordering::SeqCst);
+    let _ = release_bind_tx.send(());
+    assert!(recv_async(bind, "held bind").success);
+    assert!(recv_async(second, "second mutation").success);
+
+    assert!(
+        bind_started.is_ok(),
+        "the bind must start beside the running tool mutation"
+    );
+    assert!(
+        !second_ran_beside_bind,
+        "a writer must not start while a bind admitted beside a tool mutation still runs"
+    );
+}
