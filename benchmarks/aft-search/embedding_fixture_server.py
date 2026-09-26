@@ -31,6 +31,10 @@ class Server(ThreadingHTTPServer):
         if recorder is not None and not isinstance(vectors, MutableMapping):
             raise InputFault("vector_capture_needs_mutable_store")
         super().__init__(address, Handler); self.vectors=vectors; self.template=template; self.log=log; self.recorder=recorder; self.query_texts=query_texts or set()
+        # Every key refused with vector_missing. AFT may answer a refused query
+        # embedding by ranking without its semantic lane, which looks like an
+        # ordinary result; a runner reads this list to fail the run instead.
+        self.refused: list[str] = []
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None: pass
@@ -49,6 +53,7 @@ class Handler(BaseHTTPRequestHandler):
                 key=qkey if qkey in server.vectors else ckey
                 if key not in server.vectors:
                     if server.recorder is None:
+                        server.refused.append(f"{qkey}|{ckey}")
                         self._json(422,{"error":f"vector_missing:{qkey}|{ckey}"}); return
                     key = qkey if text in server.query_texts else ckey
                     # Server.__init__ only accepts a recorder with a mutable store.
