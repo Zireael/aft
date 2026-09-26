@@ -140,9 +140,7 @@ describe("OpenCode feature-config registration", () => {
     test(`V2 registers canonical tools minus resolved disables: ${name}`, () => {
       // V2 registers the same canonical set, under its own names for the
       // command tool family (`bash` is registered as `shell`).
-      expect(v2Names(loadWithUserConfig(user))).toEqual(
-        expected(disabled).map(v2ToolName).sort(),
-      );
+      expect(v2Names(loadWithUserConfig(user))).toEqual(expected(disabled).map(v2ToolName).sort());
     });
   }
 

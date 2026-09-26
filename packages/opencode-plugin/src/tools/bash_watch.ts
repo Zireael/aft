@@ -299,7 +299,9 @@ async function bashStatusSnapshot(
     options,
   );
   if (data.success === false)
-    throw new Error((data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`);
+    throw new Error(
+      (data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`,
+    );
   return data;
 }
 

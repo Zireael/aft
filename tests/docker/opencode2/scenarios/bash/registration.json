@@ -265,7 +265,7 @@
       },
       "metadata": {
         "permission": {
-          "operation": "bash:withPermissionLoop",
+          "operation": "shell:withPermissionLoop",
           "reply": "once"
         }
       }
@@ -303,7 +303,7 @@
       ],
       "metadata": {
         "permission": {
-          "operation": "bash:withPermissionLoop",
+          "operation": "shell:withPermissionLoop",
           "reply": "reject"
         },
         "accepted_exit_codes": [
@@ -353,7 +353,7 @@
       ],
       "metadata": {
         "permission": {
-          "operation": "bash:withPermissionLoop",
+          "operation": "shell:withPermissionLoop",
           "reply": "config_deny"
         }
       }
@@ -405,7 +405,7 @@
       ],
       "metadata": {
         "permission": {
-          "operation": "bash:host-fallback",
+          "operation": "shell:host-fallback",
           "reply": "once"
         },
         "dead_transport": {
@@ -465,7 +465,7 @@
       ],
       "metadata": {
         "permission": {
-          "operation": "bash:host-fallback",
+          "operation": "shell:host-fallback",
           "reply": "reject"
         },
         "dead_transport": {
@@ -525,7 +525,7 @@
       ],
       "metadata": {
         "permission": {
-          "operation": "bash:host-fallback",
+          "operation": "shell:host-fallback",
           "reply": "config_deny"
         },
         "dead_transport": {

@@ -770,7 +770,7 @@ async function runOneScenario(options: {
           controlPromises.push(controlPromise);
         }
       },
-    });
+    }, hostGeneration);
     await mock.start();
     isolation = await createScenarioIsolation({
       parent: join(config.runRoot, "scenarios"),

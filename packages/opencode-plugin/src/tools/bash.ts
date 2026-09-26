@@ -184,10 +184,7 @@ function userMessageDetachDescription(detachOnUserMessage: boolean): string {
  * register `bash_watch` steer short waits to it; the subc module catalog has no
  * `bash_watch`, so its variant names only the tools a catalog consumer can call.
  */
-function backgroundWaitDescription(
-  watchToolRegistered: boolean,
-  names: CommandToolNames,
-): string {
+function backgroundWaitDescription(watchToolRegistered: boolean, names: CommandToolNames): string {
   return watchToolRegistered
     ? `then ${names.watch} handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use ${names.command}({wait:true}) when the result is needed before anything else — never background a command and immediately ${names.watch} it (that wastes a turn for what foreground returns in one), and never loop ${names.status} to wait.`
     : `the task keeps running after the call returns, a completion reminder arrives when it exits, and ${names.status} reports its state and output. Use ${names.command}({wait:true}) instead when the result is needed before anything else.`;
@@ -683,7 +680,9 @@ async function bashStatusSnapshot(
     options,
   );
   if (data.success === false) {
-    throw new Error((data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`);
+    throw new Error(
+      (data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`,
+    );
   }
   return data;
 }

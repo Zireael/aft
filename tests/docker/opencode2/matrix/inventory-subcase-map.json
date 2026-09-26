@@ -25,11 +25,11 @@
       "tool": "move",
       "subcase_prefix": "move"
     },
-    "bash:withPermissionLoop": {
+    "shell:withPermissionLoop": {
       "tool": "bash",
       "subcase_prefix": "loop"
     },
-    "bash:host-fallback": {
+    "shell:host-fallback": {
       "tool": "bash",
       "subcase_prefix": "fallback"
     }

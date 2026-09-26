@@ -15,12 +15,13 @@ import { asRecord } from "./util.js";
  * runs.
  *
  * Every mutating tool routes through one `edit` ask, so a rule naming the tool
- * would never match anything; `read` and `bash` ask under their own names. The
+ * would never match anything; `read` asks under its own name, and the command
+ * tool under `shell`, the action OpenCode 2 evaluates command rules under. The
  * input is the inventory operation, which is the scenario's own label for the
  * ask site under test.
  */
 export function permissionAction(operation: string): string {
-  if (operation.startsWith("bash:")) return "bash";
+  if (operation.startsWith("shell:")) return "shell";
   if (operation === "read") return "read";
   return "edit";
 }

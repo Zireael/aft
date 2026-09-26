@@ -424,7 +424,12 @@ function sourceFiles(directory: string): string[] {
 
 /** Every string and template-literal fragment in one source file. */
 function literals(file: string): string[] {
-  const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  const source = ts.createSourceFile(
+    file,
+    readFileSync(file, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
   const found: string[] = [];
   const visit = (node: ts.Node): void => {
     // Module specifiers such as "./bash_watch.js" are file names, not text.

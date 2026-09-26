@@ -26,11 +26,11 @@
       "classification": "applicable"
     },
     {
-      "operation": "bash:withPermissionLoop",
+      "operation": "shell:withPermissionLoop",
       "classification": "applicable"
     },
     {
-      "operation": "bash:host-fallback",
+      "operation": "shell:host-fallback",
       "classification": "applicable"
     }
   ]

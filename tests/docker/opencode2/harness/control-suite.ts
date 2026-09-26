@@ -469,7 +469,7 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
         },
       ],
       metadata: {
-        permission: { operation: "bash:host-fallback", reply: "once" },
+        permission: { operation: "shell:host-fallback", reply: "once" },
         dead_transport: {
           outcome: "refusal",
           refusal_names: ["Binary (crashed|killed)", "outcome is UNKNOWN"],

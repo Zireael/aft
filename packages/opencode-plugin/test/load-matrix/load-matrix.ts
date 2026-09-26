@@ -1351,13 +1351,13 @@ function expectPaintedBadge(
 }
 
 /**
- * A second plugin that claims the `bash` tool name before AFT loads.
+ * A second plugin that claims the `shell` tool name before AFT loads.
  *
  * Its subject is what the host does when two registrations want one name. It
  * also registers `aft_load_matrix_rival` under a name nobody contests, so a
- * census that is missing its `bash` but still holds that tool says the rival
- * plugin really did register and was overwritten -- as opposed to never having
- * registered at all, which looks the same from the `bash` entry alone.
+ * census that is missing its `shell` but still holds that tool says the rival
+ * plugin really did register and was replaced -- as opposed to never having
+ * registered at all, which looks the same from the `shell` entry alone.
  *
  * The census runs from inside the host, through the same `tool.list` the host
  * gives every plugin, so it reports the registry the host actually holds
@@ -1393,7 +1393,7 @@ const stub = (name, description) => ({
   name,
   description,
   input: Schema.Struct({ command: Schema.optionalKey(Schema.String) }),
-  options: { codemode: false, permission: "bash" },
+  options: { codemode: false, permission: "shell" },
   execute: () => Effect.succeed({ content: [{ type: "text", text: description }] }),
 });
 
@@ -1401,10 +1401,10 @@ export default {
   id: "aft.load-matrix.tool-ownership-rival",
   effect: (context) => Effect.gen(function* () {
     yield* context.tool.transform((editor) => {
-      editor.add(stub("bash", "RIVAL BASH"));
+      editor.add(stub("shell", "RIVAL SHELL"));
       editor.add(stub("aft_load_matrix_rival", "RIVAL CONTROL"));
     });
-    record("ownership-claimed:bash");
+    record("ownership-claimed:shell");
     yield* Effect.forkScoped(Effect.gen(function* () {
       const deadline = Date.now() + 90_000;
       let tools = yield* context.tool.list();
@@ -1538,7 +1538,9 @@ function permissionRules() {
     { action: "read", resource: "*.env", effect: "ask" },
     { action: "edit", resource: "*permission-edit-denied.ts", effect: "deny" },
     { action: "edit", resource: "*permission-delete-denied.ts", effect: "deny" },
-    { action: "bash", resource: "*", effect: "deny" },
+    // OpenCode 2 evaluates command rules under "shell", the name AFT's
+    // command tool is registered under there.
+    { action: "shell", resource: "*", effect: "deny" },
   ];
 }
 
@@ -1823,8 +1825,8 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     id: "bash-abort",
     progress: () => Effect.succeed(undefined),
   };
-  const bash = reloaded.tools.find((tool) => tool.name === "bash");
-  if (!bash) throw new Error("enabled V2 effect did not register bash");
+  const bash = reloaded.tools.find((tool) => tool.name === "shell");
+  if (!bash) throw new Error("enabled V2 effect did not register shell");
   const abortExit = yield* Effect.exit(
     bash.execute({ command: "sleep 30", description: "cancellation probe" }, executionContext),
   );
@@ -2674,7 +2676,7 @@ export default { id: original.id, effect };
     expect(events).toBe("");
   }, 240_000);
 
-  test("GA host holds AFT's bash when another plugin claimed that name first", async () => {
+  test("GA host holds AFT's shell when another plugin claimed that name first", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tool-ownership");
     const rivalRoot = await writeV2ToolOwnershipRival(v2, "v2-tool-ownership-rival");
@@ -2701,7 +2703,7 @@ export default { id: original.id, effect };
       timeoutMs: 240_000,
     });
 
-    expect(events).toContain("ownership-claimed:bash\n");
+    expect(events).toContain("ownership-claimed:shell\n");
     expect(events).toContain("ownership-census-complete\n");
 
     const census = new Map<string, Set<string>>();
@@ -2720,23 +2722,22 @@ export default { id: original.id, effect };
     );
 
     // The rival's uncontested tool is the control: it proves the rival plugin
-    // registered successfully here, so its `bash` was overwritten by AFT's
+    // registered successfully here, so its `shell` was replaced by AFT's
     // rather than never having been registered at all.
     expect(describe("aft_load_matrix_rival")).toEqual(["RIVAL CONTROL"]);
     expect(census.has("aft_outline")).toBe(true);
 
-    // The answer this row exists for: the host holds AFT's bash, not the
-    // registration that claimed the name first.
-    const bash = describe("bash");
-    expect(bash).toHaveLength(1);
-    expect(bash[0]).toStartWith("Execute shell commands.");
-    expect(bash).not.toContain("RIVAL BASH");
-
-    // The host's own shell surface is registered as `shell`, so nothing the
-    // host owns is displaced by AFT taking `bash`.
+    // The answer this row exists for: the host holds AFT's shell, not the
+    // host's own shell tool and not the registration that claimed the name
+    // first. AFT registers no `bash` on this host at all.
     const shell = describe("shell");
     expect(shell).toHaveLength(1);
-    expect(shell[0]).toStartWith("Execute a shell command");
+    expect(shell[0]).toStartWith("Execute shell commands.");
+    expect(shell).not.toContain("RIVAL SHELL");
+    expect(census.has("bash")).toBe(false);
+    for (const companion of ["shell_status", "shell_watch", "shell_kill", "shell_write"]) {
+      expect(census.has(companion)).toBe(true);
+    }
   }, 300_000);
 
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {

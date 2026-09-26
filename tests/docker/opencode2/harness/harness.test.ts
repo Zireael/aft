@@ -528,6 +528,19 @@ describe("scenario isolation and liveness", () => {
     expect(hostToolName("ast_search")).toBe("ast_grep_search");
     expect(hostToolName("ast_replace")).toBe("ast_grep_replace");
     expect(hostToolName("read")).toBe("read");
+    // OpenCode 2 offers the command tool family as shell and shell_*; the
+    // pinned OpenCode 1 host keeps bash and bash_*.
+    for (const [canonical, v2] of [
+      ["bash", "shell"],
+      ["bash_status", "shell_status"],
+      ["bash_watch", "shell_watch"],
+      ["bash_kill", "shell_kill"],
+      ["bash_write", "shell_write"],
+    ]) {
+      expect(hostToolName(canonical)).toBe(v2);
+      expect(hostToolName(canonical, "v2")).toBe(v2);
+      expect(hostToolName(canonical, "v1")).toBe(canonical);
+    }
     expect(hostToolArguments("read", { filePath: "sample.txt", limit: 10 })).toEqual({
       path: "sample.txt",
       limit: 10,
@@ -1162,8 +1175,8 @@ describe("source-of-truth derivation", () => {
       "apply_patch",
       "aft_delete",
       "aft_move",
-      "bash:withPermissionLoop",
-      "bash:host-fallback",
+      "shell:withPermissionLoop",
+      "shell:host-fallback",
     ]);
   });
 });
@@ -1650,13 +1663,13 @@ describe("permission scenarios reach the host's own rules", () => {
     expect(rules).toEqual([{ action: "edit", resource: "*", effect: "ask" }]);
   });
 
-  test("every mutating operation asks under edit; read and bash ask under their own names", () => {
+  test("every mutating operation asks under edit; read under its own name, the command tool under shell", () => {
     expect(permissionAction("apply_patch")).toBe("edit");
     expect(permissionAction("write")).toBe("edit");
     expect(permissionAction("aft_move")).toBe("edit");
     expect(permissionAction("read")).toBe("read");
-    expect(permissionAction("bash:withPermissionLoop")).toBe("bash");
-    expect(permissionAction("bash:host-fallback")).toBe("bash");
+    expect(permissionAction("shell:withPermissionLoop")).toBe("shell");
+    expect(permissionAction("shell:host-fallback")).toBe("shell");
   });
 
   test("a configured denial installs a deny rule and leaves nothing to answer", () => {
