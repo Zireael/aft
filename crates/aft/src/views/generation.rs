@@ -383,7 +383,7 @@ pub(super) fn schedule_derived_checkpoint(
 /// Copy a coherent SQLite snapshot without opening the source file directly.
 /// The backup API includes committed WAL content while preserving every lock
 /// SQLite holds for other live connections in this process.
-pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
+pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<BackupCopy> {
     let started = Instant::now();
     let source_connection = crate::db::file_identity::IdentityConnection::open(
         source,
@@ -416,16 +416,76 @@ pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
     };
     destination_connection.busy_timeout(Duration::from_secs(5))?;
     let backup = rusqlite::backup::Backup::new(&source_connection, &mut destination_connection)?;
-    backup.run_to_completion(256, Duration::from_millis(5), None)?;
+    let copy = copy_all_pages(&backup)?;
     drop(backup);
 
     log::info!(
-        "view derived clone mechanism=sqlite_backup ms={} source={} destination={}",
+        "view derived clone mechanism=sqlite_backup ms={} steps={} busy_retries={} source={} destination={}",
         started.elapsed().as_millis(),
+        copy.steps,
+        copy.busy_retries,
         source.display(),
         destination.display()
     );
-    Ok(())
+    Ok(copy)
+}
+
+/// How a backup reached completion, for the clone log line and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BackupCopy {
+    pub steps: u32,
+    pub busy_retries: u32,
+}
+
+const BACKUP_BUSY_RETRY_PAUSE: Duration = Duration::from_millis(5);
+const BACKUP_BUSY_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Copy every page in one `sqlite3_backup_step(-1)` call.
+///
+/// The source is a published generation. Nothing writes its logical content
+/// again; only checkpoints touch it. Stepping in small batches with a pause
+/// only helps when other connections need to write the source between
+/// steps, and here there are none. In WAL mode the backup's read lock does
+/// not block readers. The only thing that waits on it is a TRUNCATE
+/// checkpoint of the source, which waits under its own 5 s busy timeout.
+/// One step holds that lock for roughly 0.3 s per 257 MiB. The previous
+/// setting (256 pages per step, 5 ms sleep between steps) spent about 1.25 s
+/// of every 1.8 s copy sleeping. One step also copies from a single read
+/// snapshot, so the backup never has to restart because the source changed.
+///
+/// `SQLITE_BUSY` or `SQLITE_LOCKED` leaves the copy position unchanged, so
+/// retrying the same all-pages step after a short pause is correct. The
+/// retries are bounded so that a stuck lock fails the clone instead of
+/// spinning forever.
+pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<BackupCopy> {
+    use rusqlite::backup::StepResult;
+    let started = Instant::now();
+    let mut copy = BackupCopy {
+        steps: 0,
+        busy_retries: 0,
+    };
+    loop {
+        copy.steps += 1;
+        match backup.step(-1)? {
+            StepResult::Done => return Ok(copy),
+            // A negative page count asks for every remaining page, so SQLite
+            // should not report partial progress. Continue without sleeping
+            // if it ever does.
+            StepResult::More => {}
+            StepResult::Busy | StepResult::Locked => {
+                copy.busy_retries += 1;
+                if started.elapsed() >= BACKUP_BUSY_DEADLINE {
+                    return Err(ViewError::InvalidManifest(format!(
+                        "derived clone stayed busy for {} ms after {} attempt(s)",
+                        started.elapsed().as_millis(),
+                        copy.steps
+                    )));
+                }
+                std::thread::sleep(BACKUP_BUSY_RETRY_PAUSE);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +610,51 @@ mod tests {
                 .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
                 .unwrap(),
             "committed-in-wal"
+        );
+    }
+
+    #[test]
+    fn clone_copies_a_multi_batch_database_in_one_backup_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            &source,
+            "views generation one-step clone test source",
+        )
+        .unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE payload (value BLOB NOT NULL);\
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)\
+                 INSERT INTO payload SELECT zeroblob(4096) FROM n;",
+            )
+            .unwrap();
+        let pages: i64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        // More pages than the old 256-page batch, so a stepped copy would
+        // need several steps.
+        assert!(pages > 1_000, "fixture too small: {pages} pages");
+
+        let copy = clone_derived(&source, &destination).unwrap();
+
+        assert_eq!(
+            copy,
+            BackupCopy {
+                steps: 1,
+                busy_retries: 0
+            }
+        );
+        assert_eq!(
+            Connection::open(&destination)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM payload", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2000
         );
     }
 
