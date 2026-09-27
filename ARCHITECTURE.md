@@ -70,9 +70,12 @@ markers, and publish epochs so a superseded worker cannot publish stale data.
 Another live checkout of the same repository, typically a linked worktree,
 runs **borrow-only**: it opens the owner's search and semantic indexes through
 read-only openers (`readonly_artifacts.rs`) and the callgraph through
-`ReadonlyCallGraphStore`, and never builds or repairs them. `worktree.ram_overlay`
-lets a borrow-only checkout layer its own edits into private in-RAM search
-deltas. Optional content-addressed views (`views/`, `blob_store/`, `pins/`,
+`ReadonlyCallGraphStore`, and never builds or repairs them. With
+`worktree.ram_overlay` (on by default), a borrow-only checkout first compares
+the borrowed search index with its own files, then layers its own edits into
+private in-RAM search deltas. Path-listing answers (glob, `aft_search`) also
+drop any returned path that is missing on disk and report the count, as a guard
+against a stale index. Optional content-addressed views (`views/`, `blob_store/`, `pins/`,
 `gc/`, `refresh/`; off by default) assemble semantic and callgraph artifacts
 from per-file blobs behind an atomic manifest. User-configured standing roots
 (`index.roots`, `standing_roots.rs`, `scoped_key.rs`) are indexed by the subc

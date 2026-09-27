@@ -10635,19 +10635,19 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Reproduction: a second checkout of an OLDER commit of the same
-    // repository borrows the live checkout's search snapshot and serves the
-    // live checkout's file list and contents as if they were its own.
+    // A second checkout of an OLDER commit of the same repository borrows the
+    // live checkout's search snapshot.
     //
     // All roots whose HEAD history shares a root commit derive the same
     // artifact key (`artifact_cache_key` hashes the root commit set), so a
     // clone, a `cp -R` copy or a linked worktree opens the live checkout's
-    // `cache.bin`. With `worktree.ram_overlay` off (the default), a borrow-only
-    // root adopts that snapshot without comparing it with its own files.
-    //
-    // These tests assert the CORRECT behavior and are ignored because they
-    // fail today; see docs/investigations/borrowed-index-phantom-paths-2026-09.md.
-    // Run with: cargo test -p agent-file-tools --lib phantom_ -- --ignored --nocapture
+    // `cache.bin`. With `worktree.ram_overlay` on (the default), the borrow-only
+    // root reconciles that snapshot with its own files before reporting ready,
+    // so it answers with its own files and contents. With the escape hatch
+    // (`ram_overlay: false`) the snapshot is served as it is, and only the
+    // on-disk backstop in glob and aft_search keeps the live checkout's files
+    // out of the results. See
+    // docs/investigations/borrowed-index-phantom-paths-2026-09.md.
     // ---------------------------------------------------------------------
 
     /// How the second, older checkout of the live repository is produced.
@@ -10689,6 +10689,11 @@ mod tests {
         /// `aft_search` for this checkout's own token: whether it finds
         /// `shared.ts`.
         search_own_token_finds_shared: bool,
+        /// `missing_on_disk_dropped` reported by glob (0 when absent).
+        glob_missing_on_disk_dropped: u64,
+        /// `missing_on_disk_dropped` reported by the `aft_search` for the
+        /// phantom file's name (0 when absent).
+        search_by_name_missing_on_disk_dropped: u64,
     }
 
     impl PhantomProbe {
@@ -10812,12 +10817,32 @@ mod tests {
         (owner, scratch, storage)
     }
 
-    fn probe_older_checkout(scratch: &Path, storage: &Path, ram_overlay: bool) -> PhantomProbe {
+    fn configure_ram_overlay_escape_hatch(root: &Path, storage: &Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "worktree": { "ram_overlay": false }
+            }))]
+        }))
+    }
+
+    /// `ram_overlay`: `None` leaves the key unset (the default), `Some(value)`
+    /// sets it explicitly.
+    fn probe_older_checkout(
+        scratch: &Path,
+        storage: &Path,
+        ram_overlay: Option<bool>,
+    ) -> PhantomProbe {
         let ctx = test_context();
-        let request = if ram_overlay {
-            configure_ram_overlay_worktree(scratch, storage)
-        } else {
-            configure_with_storage(scratch, storage)
+        let request = match ram_overlay {
+            None => configure_with_storage(scratch, storage),
+            Some(true) => configure_ram_overlay_worktree(scratch, storage),
+            Some(false) => configure_ram_overlay_escape_hatch(scratch, storage),
         };
         let response = handle_configure_for_test(&request, &ctx);
         assert!(
@@ -10856,10 +10881,16 @@ mod tests {
                 "aft_search {query} failed: {:?}",
                 response.data
             );
-            response.data.to_string()
+            response.data
         };
-        let search_by_name_mentions_phantom = aft_search("phantom.ts").contains(PHANTOM_REL_PATH);
-        let search_own_token_finds_shared = aft_search("OLDER_COMMIT_TOKEN").contains("shared.ts");
+        let search_by_name = aft_search("phantom.ts");
+        let search_by_name_mentions_phantom = search_by_name.to_string().contains(PHANTOM_REL_PATH);
+        let search_by_name_missing_on_disk_dropped = search_by_name["missing_on_disk_dropped"]
+            .as_u64()
+            .unwrap_or_default();
+        let search_own_token_finds_shared = aft_search("OLDER_COMMIT_TOKEN")
+            .to_string()
+            .contains("shared.ts");
         let probe = PhantomProbe {
             owner_mode: ctx.artifact_owner_status().map(|status| status.mode),
             shared_artifacts_read_only: ctx.shared_artifacts_read_only(),
@@ -10871,13 +10902,25 @@ mod tests {
             grep_index_status,
             search_by_name_mentions_phantom,
             search_own_token_finds_shared,
+            glob_missing_on_disk_dropped: glob.data["missing_on_disk_dropped"]
+                .as_u64()
+                .unwrap_or_default(),
+            search_by_name_missing_on_disk_dropped,
         };
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
         probe
     }
 
-    fn assert_older_checkout_sees_only_its_own_files(kind: OlderCheckoutKind, ram_overlay: bool) {
+    /// Builds the live owner and the older checkout of `kind`, probes the older
+    /// checkout with the given `ram_overlay` setting (see `probe_older_checkout`)
+    /// and checks the preconditions every probe shares: the older checkout
+    /// really borrowed the live owner's snapshot and both tools answered from
+    /// that index, not a disk walk.
+    fn borrowed_older_checkout_probe(
+        kind: OlderCheckoutKind,
+        ram_overlay: Option<bool>,
+    ) -> PhantomProbe {
         let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -10888,9 +10931,7 @@ mod tests {
         let probe = probe_older_checkout(&scratch, &storage, ram_overlay);
         owner.mark_subc_unbound();
         owner.cancel_unbound_artifact_work();
-        eprintln!("phantom probe {kind:?} ram_overlay={ram_overlay}: {probe:#?}");
-        // Preconditions: the older checkout really borrowed the live owner's
-        // snapshot and both tools answered from that index, not a disk walk.
+        eprintln!("phantom probe {kind:?} ram_overlay={ram_overlay:?}: {probe:#?}");
         assert_eq!(
             probe.owner_mode,
             Some(crate::artifact_owner::ArtifactOwnerMode::ReadOnly),
@@ -10902,45 +10943,163 @@ mod tests {
             "glob must answer from the index"
         );
         assert_eq!(probe.grep_index_status, "Ready");
+        probe
+    }
+
+    fn assert_older_checkout_sees_only_its_own_files(
+        kind: OlderCheckoutKind,
+        ram_overlay: Option<bool>,
+    ) {
+        let probe = borrowed_older_checkout_probe(kind, ram_overlay);
         assert!(
             probe.is_correct(),
-            "{kind:?} (ram_overlay={ram_overlay}) served the live checkout's files: \
+            "{kind:?} (ram_overlay={ram_overlay:?}) served the live checkout's files: \
              glob lists {PHANTOM_REL_PATH}={}, probe={probe:#?}",
             probe.glob_lists_phantom()
+        );
+        // The reconciled index itself must be right: the on-disk backstop
+        // must have had nothing to drop.
+        assert_eq!(
+            (
+                probe.glob_missing_on_disk_dropped,
+                probe.search_by_name_missing_on_disk_dropped
+            ),
+            (0, 0),
+            "{kind:?}: the reconciled index still listed paths missing on disk: {probe:#?}"
         );
     }
 
     #[test]
-    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
     fn phantom_paths_shared_clone_of_older_commit() {
-        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, false);
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, None);
     }
 
     #[test]
-    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
     fn phantom_paths_plain_clone_of_older_commit() {
-        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::PlainClone, false);
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::PlainClone, None);
     }
 
     #[test]
-    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
     fn phantom_paths_linked_worktree_at_older_commit() {
-        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::LinkedWorktree, false);
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::LinkedWorktree, None);
     }
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
     fn phantom_paths_copied_tree_at_older_commit() {
-        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::CopiedTree, false);
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::CopiedTree, None);
     }
 
-    /// Control: the same shared clone with `worktree.ram_overlay` on goes
-    /// through the borrowed-snapshot reconciliation and is expected to pass.
+    /// Control: the same shared clone with `worktree.ram_overlay` set on
+    /// explicitly behaves exactly like the default.
     #[test]
-    #[ignore = "control for the borrowed-index phantom path reproductions"]
     fn phantom_paths_shared_clone_with_ram_overlay_control() {
-        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, true);
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, Some(true));
+    }
+
+    /// With the escape hatch (`ram_overlay: false`) the borrowed snapshot is
+    /// not reconciled and still lists the live checkout's `extra/phantom.ts`.
+    /// The on-disk backstop must keep that path out of glob and aft_search
+    /// and report that it dropped it.
+    #[test]
+    fn phantom_paths_backstop_drops_missing_paths_when_reconcile_is_off() {
+        let probe = borrowed_older_checkout_probe(OlderCheckoutKind::SharedClone, Some(false));
+        assert!(
+            !probe.glob_lists_phantom(),
+            "glob returned a path that is not on disk: {probe:#?}"
+        );
+        assert_eq!(
+            probe.glob_missing_on_disk_dropped, 1,
+            "glob must count the dropped phantom path: {probe:#?}"
+        );
+        assert!(
+            !probe.search_by_name_mentions_phantom,
+            "aft_search named a path that is not on disk: {probe:#?}"
+        );
+        assert!(
+            probe.search_by_name_missing_on_disk_dropped >= 1,
+            "aft_search must count the dropped phantom path: {probe:#?}"
+        );
+    }
+
+    /// A borrowing checkout keeps its index current after bind: the watcher
+    /// feeds its own edits into the RAM overlay, so grep finds a file created
+    /// and a line added after the index reported ready.
+    #[test]
+    fn borrowed_checkout_edit_after_bind_is_found_by_grep() {
+        let _watcher_guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let (owner, scratch, storage) = {
+            // Only the borrowing checkout needs a real watcher.
+            let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+            older_checkout_beside_live_owner(&temp_root, OlderCheckoutKind::SharedClone)
+        };
+        let _enable_watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let _sync_watcher = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+
+        let ctx = test_context();
+        let response = handle_configure_for_test(&configure_with_storage(&scratch, &storage), &ctx);
+        assert!(
+            response.success,
+            "scratch configure failed: {:?}",
+            response.data
+        );
+        ctx.mark_subc_bound();
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            ctx.ram_overlay_active(),
+            "the default config must reconcile and overlay a borrow-only root"
+        );
+        assert!(
+            ctx.watcher_runtime_active(),
+            "a borrow-only root must run a file watcher"
+        );
+        assert_eq!(
+            grep_matches_and_status(&ctx, "AFTER_BIND_NEW_FILE_TOKEN"),
+            (0, "Ready".to_string())
+        );
+
+        std::fs::write(
+            scratch.join("after_bind.ts"),
+            "export const AFTER_BIND_NEW_FILE_TOKEN = 4;\n",
+        )
+        .unwrap();
+        let mut shared = std::fs::read_to_string(scratch.join("shared.ts")).unwrap();
+        shared.push_str("export const AFTER_BIND_EDIT_TOKEN = 5;\n");
+        std::fs::write(scratch.join("shared.ts"), shared).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            crate::runtime_drain::drain_watcher_events(&ctx);
+            let new_file = grep_matches_and_status(&ctx, "AFTER_BIND_NEW_FILE_TOKEN");
+            let edit = grep_matches_and_status(&ctx, "AFTER_BIND_EDIT_TOKEN");
+            let ready = (1, "Ready".to_string());
+            if new_file == ready && edit == ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "edits after bind never reached the borrowed index: new file {new_file:?}, edit {edit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            grep_matches_and_status(&ctx, "OLDER_COMMIT_TOKEN"),
+            (1, "Ready".to_string()),
+            "the checkout's own pre-existing content stays searchable"
+        );
+
+        ctx.stop_watcher_runtime();
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        owner.mark_subc_unbound();
+        owner.cancel_unbound_artifact_work();
     }
 
     #[test]

@@ -6837,7 +6837,7 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn ram_overlay_is_off_by_default_and_transport_independent() {
+    fn ram_overlay_is_on_by_default_and_transport_independent() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _) = context_with_watcher(temp.path());
         ctx.set_cache_role(true, None);
@@ -6845,17 +6845,20 @@ mod watcher_slice_tests {
             ctx.shared_artifacts_read_only(),
             "worktree role is borrow-only"
         );
-        assert!(
-            !ctx.ram_overlay_active(),
-            "worktree.ram_overlay defaults off"
-        );
-
-        ctx.update_config(|config| config.worktree.ram_overlay = true);
+        // A borrowed snapshot describes another checkout, so every borrow-only
+        // root reconciles and overlays it unless the escape hatch turns it off.
         assert!(
             ctx.ram_overlay_active(),
+            "worktree.ram_overlay defaults on for borrow-only roots"
+        );
+
+        ctx.update_config(|config| config.worktree.ram_overlay = false);
+        assert!(
+            !ctx.ram_overlay_active(),
             "overlay follows config + borrow-only, not bind/transport identity"
         );
 
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
         ctx.set_cache_role(false, None);
         assert!(
             !ctx.ram_overlay_active(),
@@ -6880,6 +6883,9 @@ mod watcher_slice_tests {
             b"old overlay token\n",
         );
         mark_borrow_only(&ctx, &canonical, &cache_dir);
+        // Exercise the escape hatch: with the overlay turned off, the watcher
+        // arms must leave the borrowed snapshot alone.
+        ctx.update_config(|config| config.worktree.ram_overlay = false);
         assert!(ctx.shared_artifacts_read_only());
         assert!(!ctx.ram_overlay_active());
         assert!(

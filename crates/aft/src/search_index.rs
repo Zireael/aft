@@ -988,6 +988,10 @@ pub struct GrepResult {
     pub walk_truncated: bool,
     /// Foreign filesystem mounts skipped by a fallback walk before they were opened.
     pub skipped_foreign_mounts: usize,
+    /// Indexed candidate files that were not on disk when grep went to read
+    /// them: stale index entries. They can never produce a match; the count
+    /// only discloses that the index listed them.
+    pub missing_on_disk: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2590,6 +2594,7 @@ impl SearchIndexSnapshot {
         let files_searched = AtomicUsize::new(0);
         let files_with_matches = AtomicUsize::new(0);
         let bytes_verified = AtomicUsize::new(0);
+        let missing_on_disk = AtomicUsize::new(0);
         let truncated = AtomicBool::new(false);
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
@@ -2638,6 +2643,7 @@ impl SearchIndexSnapshot {
                         &bytes_verified,
                         &truncated,
                         &engine_capped,
+                        &missing_on_disk,
                         Some(&stop_scan),
                         job_cancellation.as_ref(),
                     )
@@ -2668,6 +2674,7 @@ impl SearchIndexSnapshot {
                     &bytes_verified,
                     &truncated,
                     &engine_capped,
+                    &missing_on_disk,
                     None,
                     job_cancellation.as_ref(),
                 ));
@@ -2715,6 +2722,7 @@ impl SearchIndexSnapshot {
             engine_capped: engine_capped.load(Ordering::Relaxed),
             walk_truncated: false,
             skipped_foreign_mounts: 0,
+            missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
         };
         let post_filter = candidate_filter + post_filter_started.elapsed();
         let phases = GrepQueryPhaseTimings {
@@ -2743,6 +2751,7 @@ impl SearchIndexSnapshot {
             engine_capped: false,
             walk_truncated: false,
             skipped_foreign_mounts: 0,
+            missing_on_disk: 0,
         }
     }
 
@@ -2982,6 +2991,7 @@ fn search_candidate_file(
     bytes_verified: &AtomicUsize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
+    missing_on_disk: &AtomicUsize,
     stop_scan: Option<&Arc<AtomicBool>>,
     job_cancellation: Option<&crate::executor::JobCancellation>,
 ) -> Vec<SharedGrepMatch> {
@@ -2997,8 +3007,13 @@ fn search_candidate_file(
     }
 
     let content = match read_indexed_file_bytes(&file.path) {
-        Some(content) => content,
-        None => return Vec::new(),
+        Ok(content) => content,
+        Err(missing) => {
+            if missing {
+                missing_on_disk.fetch_add(1, Ordering::Relaxed);
+            }
+            return Vec::new();
+        }
     };
     bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
     // Defense in depth: even though indexing tries to filter binaries via
@@ -5000,8 +5015,101 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn read_indexed_file_bytes(path: &Path) -> Option<Vec<u8>> {
-    fs::read(path).ok()
+/// Read an indexed file for grep verification. `Err(true)` means the file is
+/// not on disk in this checkout, so the index entry is stale; `Err(false)` is any
+/// other read failure.
+fn read_indexed_file_bytes(path: &Path) -> Result<Vec<u8>, bool> {
+    fs::read(path).map_err(|error| io_error_means_missing_on_disk(&error))
+}
+
+/// Whether an I/O error says the path does not exist (including a path whose
+/// parent is now a regular file). Permission and other errors do not count:
+/// a path that could not be checked is never reported as missing.
+fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether `path` is known to be absent from disk. One `stat`; an unreadable
+/// path counts as present.
+pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
+    fs::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
+}
+
+/// Extra paths one listing may `stat` beyond its page while replacing entries
+/// that turned out to be missing on disk. Keeps the check bounded even when an
+/// index is badly out of date.
+pub(crate) const MISSING_ON_DISK_REFILL_BUDGET: usize = 256;
+
+/// Result of checking a ranked list against the disk, see
+/// [`take_present_on_disk`].
+#[derive(Debug)]
+pub(crate) struct PresentOnDisk<T> {
+    /// Up to `limit` items whose path exists, in their original order.
+    pub present: Vec<T>,
+    /// Items dropped because their path is not on disk.
+    pub dropped: usize,
+    /// Items after the last one examined. They were neither checked nor
+    /// returned: either the page was full or the `stat` budget ran out.
+    pub unexamined: usize,
+    /// True when the `stat` budget ran out before the page was full, so
+    /// `unexamined` items may hold present paths that were not returned.
+    pub budget_exhausted: bool,
+}
+
+/// Backstop against a stale index: keep the first `limit` items whose path
+/// is on disk, dropping the ones that are not. Only items that would be
+/// returned are checked (one `stat` each, never a walk), plus at most
+/// [`MISSING_ON_DISK_REFILL_BUDGET`] replacements. Order among present items
+/// is unchanged, so ranking is unaffected. Drops are logged at debug level
+/// with the reason; callers report `dropped` in their result.
+pub(crate) fn take_present_on_disk<T>(
+    items: impl IntoIterator<Item = T>,
+    limit: usize,
+    path_of: impl Fn(&T) -> &Path,
+    surface: &str,
+) -> PresentOnDisk<T> {
+    let stat_budget = limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET);
+    let mut present = Vec::new();
+    let mut dropped = 0usize;
+    let mut unexamined = 0usize;
+    let mut stats = 0usize;
+    let mut budget_exhausted = false;
+    let mut dropped_examples = Vec::new();
+    for item in items {
+        if present.len() >= limit {
+            unexamined += 1;
+            continue;
+        }
+        if stats >= stat_budget {
+            budget_exhausted = true;
+            unexamined += 1;
+            continue;
+        }
+        stats += 1;
+        if path_missing_on_disk(path_of(&item)) {
+            dropped += 1;
+            if dropped_examples.len() < 3 {
+                dropped_examples.push(path_of(&item).display().to_string());
+            }
+        } else {
+            present.push(item);
+        }
+    }
+    if dropped > 0 {
+        crate::slog_debug!(
+            "{surface}: dropped {dropped} indexed path(s) that are not on disk in this checkout (stale index entry), e.g. {}",
+            dropped_examples.join(", ")
+        );
+    }
+    PresentOnDisk {
+        present,
+        dropped,
+        unexamined,
+        budget_exhausted,
+    }
 }
 
 pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {

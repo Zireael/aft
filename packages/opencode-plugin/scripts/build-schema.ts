@@ -301,14 +301,14 @@ function buildSchema(): Record<string, unknown> {
         properties: {
           ram_overlay: {
             type: "boolean",
-            default: false,
+            default: true,
             description:
-              "When true, a linked worktree applies local file-watcher events to the in-RAM trigram delta (and symbol-cache invalidation) so search reflects edits in that worktree. Default false. Never writes the shared on-disk index. Semantic search and callgraph stay frozen. User and project tiers may both set this; it only spends that machine's RAM.",
+              "When true (the default), a borrow-only checkout (a linked worktree, or a clone or copy of a repository whose live checkout owns the shared index) compares the borrowed search index with its own files before reporting ready, then applies its own file-watcher events to an in-RAM delta (and symbol-cache invalidation) so search reflects edits in that checkout. Never writes the shared on-disk index. Semantic embeddings are added only for files changed after bind; the callgraph stays frozen. Setting false serves the borrowed index as it is, listing the live checkout's files; it is kept only as an escape hatch. User and project tiers may both set this; it only spends that machine's RAM.",
           },
         },
         additionalProperties: false,
         description:
-          "Linked-worktree RAM overlay for the borrowed trigram index. Default off. A repo may opt its worktrees in at project tier.",
+          "Borrow-only checkout reconciliation and RAM overlay for the borrowed trigram index. Default on.",
       },
 
       backup: {

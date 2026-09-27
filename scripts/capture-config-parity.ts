@@ -456,6 +456,12 @@ const CASES: ParityCase[] = [
     project: { worktree: { ram_overlay: true } },
   },
   {
+    // `ram_overlay` defaults on; `false` is the escape hatch and must resolve
+    // the same way on both sides.
+    name: "worktree_ram_overlay_escape_hatch_project_safe",
+    project: { worktree: { ram_overlay: false } },
+  },
+  {
     name: "inspect_expected_mirrors_project_safe",
     project: {
       inspect: {

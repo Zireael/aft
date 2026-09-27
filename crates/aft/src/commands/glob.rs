@@ -151,15 +151,25 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
     sort_paths_by_mtime_desc(&mut files, &project_root);
-    let total = files.len();
-    let result_truncated = total > DEFAULT_MAX_RESULTS;
-    if result_truncated {
-        files.truncate(DEFAULT_MAX_RESULTS);
-    }
+    // Backstop against a stale index (for example a borrowed snapshot that
+    // still lists another checkout's files): only paths present on disk in this
+    // checkout are returned. Only the page is checked, and the page is refilled
+    // from the following matches, so present files keep their order.
+    let presence = crate::search_index::take_present_on_disk(
+        files,
+        DEFAULT_MAX_RESULTS,
+        |path| path.as_path(),
+        "glob",
+    );
+    let missing_on_disk = presence.dropped;
+    let presence_budget_exhausted = presence.budget_exhausted;
+    let files = presence.present;
+    let total = files.len() + presence.unexamined;
+    let result_truncated = total > DEFAULT_MAX_RESULTS || presence_budget_exhausted;
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
-        "complete": !walk_truncated && skipped_foreign_mounts == 0,
+        "complete": !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
@@ -168,6 +178,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     });
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
+    }
+    if missing_on_disk > 0 {
+        body["missing_on_disk_dropped"] = serde_json::json!(missing_on_disk);
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n{}",
+            body["text"].as_str().unwrap_or_default(),
+            missing_on_disk_note(missing_on_disk, presence_budget_exhausted)
+        ));
     }
     // Disclose the trigram index state and whether any root was answered by a
     // filesystem walk rather than the index.
@@ -209,6 +227,18 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     Response::success(&req.id, body)
+}
+
+/// Text disclosure for index entries dropped because they are not on disk.
+fn missing_on_disk_note(dropped: usize, budget_exhausted: bool) -> String {
+    let mut note = format!(
+        "({dropped} indexed path(s) no longer on disk in this checkout were left out; the index is out of date."
+    );
+    if budget_exhausted {
+        note.push_str(" The check stopped early, so more results may exist.");
+    }
+    note.push(')');
+    note
 }
 
 fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {

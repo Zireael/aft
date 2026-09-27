@@ -163,15 +163,21 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "callgraph": true
   },
 
-  // Linked-worktree RAM overlay. Default: false.
-  // When true, a borrow-only worktree applies its own file-watcher events to
-  // private in-RAM search and semantic deltas (and invalidates the symbol cache)
+  // Borrow-only checkout reconciliation and RAM overlay. Default: true.
+  // A linked worktree, or a clone or copy of a repository whose live checkout
+  // owns the shared indexes, borrows that checkout's search index read-only.
+  // With this on, the borrowed index is compared with this checkout's own files
+  // before search reports ready, and this checkout's file-watcher events go to
+  // private in-RAM search and semantic deltas (and invalidate the symbol cache)
   // so search sees local edits. Semantic embeddings are created only for files
   // changed after bind; corpus catch-up remains disabled. RAM cost scales with
-  // the number of changed files. The shared indexes are never written, and the
-  // callgraph stays frozen. User and project tiers may both set this.
+  // the number of files that differ. The shared indexes are never written, and
+  // the callgraph stays frozen. Setting it false serves the borrowed index as
+  // it is, so glob and search can list the live checkout's files instead of
+  // this one's; it is kept only as an escape hatch. User and project tiers may
+  // both set this.
   "worktree": {
-    "ram_overlay": false
+    "ram_overlay": true
   },
 
   // Content-addressed index views. When enabled, semantic and callgraph artifacts

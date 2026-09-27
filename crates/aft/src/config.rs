@@ -442,21 +442,28 @@ pub struct ViewsConfig {
     pub enabled: bool,
 }
 
-/// Linked-worktree behavior that never writes shared on-disk artifacts.
+/// Borrow-only checkout behavior that never writes shared on-disk artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeConfig {
-    /// When true, a borrow-only (linked worktree) root applies its own
-    /// file-watcher events to the in-RAM trigram delta and invalidates the
-    /// symbol cache so search reflects local edits. Default false. Semantic
-    /// search and the callgraph stay frozen. Never persists to the shared
-    /// `cache.bin`.
+    /// When true (the default), a borrow-only root (a linked worktree, or a
+    /// clone or copy of a repository whose live checkout owns the shared
+    /// artifacts) compares the borrowed search snapshot with its own files
+    /// before reporting ready, then applies its own file-watcher events to the
+    /// in-RAM trigram delta and invalidates the symbol cache so search
+    /// reflects local edits. Semantic embeddings are added only for files
+    /// changed after bind, and the callgraph stays frozen. Never persists to the
+    /// shared `cache.bin`.
+    ///
+    /// Setting it false serves the borrowed snapshot as it is, which lists the
+    /// owner's files instead of this checkout's. It remains only as an escape
+    /// hatch while the default is soaked.
     pub ram_overlay: bool,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
-        Self { ram_overlay: false }
+        Self { ram_overlay: true }
     }
 }
 

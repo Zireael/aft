@@ -415,6 +415,7 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         engine_capped: false,
         walk_truncated: false,
         skipped_foreign_mounts: 0,
+        missing_on_disk: 0,
     }
 }
 
@@ -463,6 +464,7 @@ fn grep_explicit_file(
         engine_capped: engine_capped.load(Ordering::Relaxed),
         walk_truncated: false,
         skipped_foreign_mounts: 0,
+        missing_on_disk: 0,
     }
 }
 
@@ -481,6 +483,7 @@ pub fn merge_grep_results(
     let mut engine_capped = false;
     let mut walk_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
+    let mut missing_on_disk = 0usize;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -493,6 +496,7 @@ pub fn merge_grep_results(
         engine_capped |= result.engine_capped;
         walk_truncated |= result.walk_truncated;
         skipped_foreign_mounts += result.skipped_foreign_mounts;
+        missing_on_disk += result.missing_on_disk;
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -519,6 +523,7 @@ pub fn merge_grep_results(
         engine_capped,
         walk_truncated,
         skipped_foreign_mounts,
+        missing_on_disk,
     }
 }
 
@@ -846,6 +851,7 @@ fn fallback_grep(
         engine_capped: engine_capped.load(Ordering::Relaxed),
         walk_truncated,
         skipped_foreign_mounts: progress.skipped_foreign_mounts,
+        missing_on_disk: 0,
     }
 }
 
@@ -1112,6 +1118,7 @@ mod tests {
             engine_capped: false,
             walk_truncated: false,
             skipped_foreign_mounts: 0,
+            missing_on_disk: 0,
         }
     }
 

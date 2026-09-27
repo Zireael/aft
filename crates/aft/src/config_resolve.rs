@@ -3258,10 +3258,10 @@ mod tests {
 
     #[test]
     fn worktree_ram_overlay_resolves_at_user_and_project_tiers() {
-        assert!(!resolve_config(&[]).config.worktree.ram_overlay);
+        assert!(resolve_config(&[]).config.worktree.ram_overlay);
 
-        let user = resolve_config(&[tier("user", r#"{ "worktree": { "ram_overlay": true } }"#)]);
-        assert!(user.config.worktree.ram_overlay);
+        let user = resolve_config(&[tier("user", r#"{ "worktree": { "ram_overlay": false } }"#)]);
+        assert!(!user.config.worktree.ram_overlay);
         assert!(user.dropped.is_empty());
 
         let project = resolve_config(&[

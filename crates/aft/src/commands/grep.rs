@@ -123,7 +123,9 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let mut body = serde_json::json!({
         "text": text,
-        "complete": !result.walk_truncated && result.skipped_foreign_mounts == 0,
+        "complete": !result.walk_truncated
+            && result.skipped_foreign_mounts == 0
+            && result.missing_on_disk == 0,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": result.skipped_foreign_mounts,
         "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
@@ -146,6 +148,16 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
             "{}\n\n(Fallback directory walk skipped {} foreign filesystem mount(s); results may be incomplete.)",
             body["text"].as_str().unwrap_or_default(),
             result.skipped_foreign_mounts
+        ));
+    }
+    if result.missing_on_disk > 0 {
+        // The index listed files this checkout does not have, so it is out of
+        // date and may also be missing content this checkout does have.
+        body["missing_on_disk_dropped"] = serde_json::json!(result.missing_on_disk);
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n({} indexed file(s) were not on disk in this checkout; the index is out of date, so matches in files it has not seen may be missing.)",
+            body["text"].as_str().unwrap_or_default(),
+            result.missing_on_disk
         ));
     }
 
@@ -416,6 +428,7 @@ mod tests {
             engine_capped: false,
             walk_truncated: false,
             skipped_foreign_mounts: 0,
+            missing_on_disk: 0,
         }
     }
 

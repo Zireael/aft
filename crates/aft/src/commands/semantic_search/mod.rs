@@ -1747,6 +1747,7 @@ fn handle_external_semantic_or_hybrid_search(
         "lexical_engine_capped".to_string(),
         serde_json::json!(ranked.engine_capped),
     );
+    disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
 
     search_response(
         req,
@@ -2379,6 +2380,27 @@ struct EngineRanking {
     /// Present only when the benchmark-only recall audit is switched on in the
     /// process environment; see `recall_audit`.
     recall_audit: Option<serde_json::Value>,
+    /// Page entries dropped because their file is not on disk (stale index).
+    missing_on_disk: usize,
+}
+
+/// Report page entries that were dropped because their file is not on disk,
+/// in the JSON extras and as a note appended to the text.
+fn disclose_missing_on_disk(
+    missing_on_disk: usize,
+    text: &mut String,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if missing_on_disk == 0 {
+        return;
+    }
+    extras.insert(
+        "missing_on_disk_dropped".to_string(),
+        serde_json::json!(missing_on_disk),
+    );
+    text.push_str(&format!(
+        "\n\n({missing_on_disk} indexed path(s) no longer on disk in this checkout were left out of this page; the index is out of date.)"
+    ));
 }
 
 fn matching_line_from_source(
@@ -2958,6 +2980,19 @@ fn run_engine_ranking(
             .cloned()
             .collect();
     }
+    // Backstop against a stale index (for example a borrowed snapshot that
+    // still lists another checkout's files): drop page entries whose file is
+    // not on disk. Only the returned page is checked, and nothing is re-ranked
+    // or refilled, so the order of present files and the offsets of later
+    // pages stay the same. The count is reported with the results.
+    let presence = crate::search_index::take_present_on_disk(
+        std::mem::take(&mut page.reply.page),
+        usize::MAX,
+        |entry| entry.result.path.as_path(),
+        "aft_search",
+    );
+    page.reply.page = presence.present;
+    let missing_on_disk = presence.dropped;
     let confidence = ConfidenceEngine::running()
         .evaluate_reply(&page.reply)
         .map_err(|error| error.to_string())?;
@@ -3098,6 +3133,7 @@ fn run_engine_ranking(
         confidence_line: confidence.flat_head_line,
         structured_content,
         recall_audit,
+        missing_on_disk,
     })
 }
 
@@ -3228,6 +3264,7 @@ fn handle_engine_only_search(
     } else if let Some(disclosure) = lane_disclosure.as_ref() {
         extras.insert("note".to_string(), serde_json::json!(disclosure.note));
     }
+    disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     search_response(
         req,
         SearchResponseParts {
@@ -3642,6 +3679,7 @@ fn handle_semantic_or_hybrid_search(
         text = format!("{disclosure}\n\n{text}");
         extras.insert("note".to_string(), serde_json::json!(disclosure));
     }
+    disclose_missing_on_disk(engine_ranking.missing_on_disk, &mut text, &mut extras);
 
     search_response(
         req,
@@ -3774,6 +3812,7 @@ fn zero_result_escalation_response(
         serde_json::json!(true),
     );
     extras.insert("escalation_target".to_string(), serde_json::json!("hybrid"));
+    disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     search_response(
         req,
@@ -3952,6 +3991,7 @@ fn semantic_unavailable_or_fallback_response(
             &ranked.results_list_envelope,
         );
         extras.insert("structuredContent".to_string(), ranked.structured_content);
+        disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
 
         return search_response(
             req,
@@ -4286,6 +4326,7 @@ fn execute_degraded_grep_fallback(
             engine_capped,
             walk_truncated: walk_budget_reached,
             skipped_foreign_mounts,
+            missing_on_disk: 0,
         },
         file_cap_reached,
         file_limit: DEGRADED_GREP_FILE_LIMIT,
@@ -6799,6 +6840,7 @@ mod tests {
             engine_capped: false,
             walk_truncated: false,
             skipped_foreign_mounts: 0,
+            missing_on_disk: 0,
         };
         let text = format_grep_lexical_unavailable_text(
             "Semantic index is loading.",
