@@ -1,6 +1,9 @@
 # Views: incremental `derived.sqlite` materialization
 
-Status: design for review, 2026-09-27. Nothing here has been implemented. Companion finding:
+Status: design for review, 2026-09-27. Implemented since: P1 (one-step clone), the P3 fallbacks
+and measured size cutoff (§6.4, §4.3), and the §3.2 comparator fix with a differential test.
+Not implemented: P2 (recycling), which awaits an independent review of its crash windows; the
+dispatch fix proposed in §8. Companion finding:
 `docs/investigations/views-soak-2026-09/parity-divergence-2026-09-27.md`.
 
 ## 0. Premise correction: the incremental materializer already exists
@@ -89,9 +92,8 @@ legacy cold build inserts method-dispatch edges (`insert_method_dispatch_edges_c
 `callgraph_store/mod.rs:13397`). This design adds no dispatch cost. If dispatch edges are added
 to views, they need their own pseudo-domain per method name, for example
 `\0view:dispatch:<method>`. Its seeds would be files whose method set or receiver types changed,
-mirroring the legacy refresh (`eeda14a10`, `c3c2716fe`). Whether views-on `callers` misses
-dispatch-only callers that legacy returns is **a separate parity question this note does not
-answer**. It should be checked before views become the default.
+mirroring the legacy refresh (`eeda14a10`, `c3c2716fe`). Views-on `callers` does miss
+dispatch-only callers that legacy returns; §8 measures the gap on opencode and proposes a fix.
 
 ### 1.3 How the re-resolved set is bounded
 
@@ -351,21 +353,26 @@ The decision is logged as `view manifest diff: ... path=cold reason=large_diff` 
 
 - **G1 — the clone became a full copy (and a full-size temporary file) again.** Cause:
   `generation.rs:418-419`, since 2026-09-20. It adds ~1.8 s per 257 MiB with the current step
-  parameters, and roughly 257–428 MiB of writes per graph-changing switch.
+  parameters, and roughly 257–428 MiB of writes per graph-changing switch. *Fixed: one-step clone
+  (§6.1).*
 - **G2 — no fallback when the base is unusable.** A fingerprint mismatch returns
   `"…cold materialization required"` (`materialization.rs:189-192`), but no caller acts on it:
   `assembly.rs:525` turns it into `InvalidManifest` and the publication fails. The same happens if
   the base is corrupt: backup or open errors propagate. The only fallbacks are a missing base file
   (cold), missing diff metadata, or a version mismatch (cold inside the clone,
-  `materialization.rs:185-194`).
+  `materialization.rs:185-194`). *Fixed: cold fallback (§6.4).*
 - **G3 — no size cutoff.** Any diff takes the incremental path. At the extreme (a rebase touching
   most files) it pays deletions plus a near-full join, which is more than cold. Debug
   measurements already showed incremental slower than cold on wall time for the 285-entry pair
-  before the surface work (MEASUREMENTS §Offline measurement: 291 s vs 263 s).
-- **G4 — gaps in the equivalence comparator** (§3.2).
+  before the surface work (MEASUREMENTS §Offline measurement: 291 s vs 263 s). *Fixed: measured
+  cutoff (§4.3).*
+- **G4 — gaps in the equivalence comparator** (§3.2). *Fixed: `materialization::parity` compares
+  schema and the union of tables with typed values; the differential test in §3.3 covers adjacent,
+  chained and non-adjacent diffs (generated configuration and symlink edits are not yet covered).*
 - **G5 — a switch-back pays the reverse diff.** A→HEAD re-applies the ~285-entry diff (5–8 s),
   even though a HEAD-content derived file existed until the sweep removed it.
-- **G6 — dispatch edges are absent from views** (§1.2). Parity status unknown.
+- **G6 — dispatch edges are absent from views** (§1.2). Measured in §8: views-on `callers` drops
+  every dispatch-only caller, 13,992 legacy edges on opencode.
 
 ## 6. Proposal
 
@@ -377,6 +384,14 @@ pause exists to let concurrent writers make progress, and there are none here. H
 source's read lock for ~0.3 s blocks nobody. Expected saving: ~1.5 s per switch. The full-size
 write is unchanged. Guard: a unit test asserting a single `step` call, or a timing bound on a
 fixture.
+
+*Implemented.* `1c8e5df50` gave no reason for the 256-page step with a 5 ms pause; it is the
+SQLite "online backup of a running database" example, and the commit was about avoiding a
+second descriptor on the live source. In WAL mode the backup's read lock blocks no reader; the
+only waiter is a TRUNCATE checkpoint of the source, under its own 5 s busy timeout, for the
+~0.3–1 s of the copy. `clone_derived` now copies in one `sqlite3_backup_step(-1)`, retrying
+`BUSY`/`LOCKED` every 5 ms for up to 5 s, and logs the step count; a test asserts one step for a
+2,000-page source. Measured on opencode's 390 MiB derived file: 0.44–0.97 s at load 6–11 (§4.3).
 
 ### 6.2 P2: recycle the retired generation's file instead of cloning
 
@@ -476,8 +491,8 @@ Decide in `prepare_checkout` before materializing, and again on error:
 |---|---|
 | no current generation, or its derived file is missing | cold (as today) |
 | base lacks diff metadata, or `view_materialization_version` differs | cold inside the clone (as today) |
-| **fingerprint mismatch** | discard the clone and cold-materialize into a fresh file; log `reason=base_fingerprint_mismatch` (closes G2) |
-| **base unreadable**: backup or open fails with `SQLITE_CORRUPT`/`SQLITE_NOTADB`, or `quick_check` fails | cold into a fresh file; quarantine the base (keep it for inspection, never reuse it); log the reason. Do not run `integrity_check` on the hot path: it scans the whole file |
+| **fingerprint mismatch** | discard the clone and cold-materialize into a fresh file; log `reason=base_fingerprint_mismatch` (closes G2). *Implemented; counted in health as `views.cold_builds.base_fingerprint_mismatch`* |
+| **base unreadable**: backup or open fails with `SQLITE_CORRUPT`/`SQLITE_NOTADB`, or `quick_check` fails | cold into a fresh file; quarantine the base (keep it for inspection, never reuse it); log the reason. Do not run `integrity_check` on the hot path: it scans the whole file. *Implemented for `SQLITE_CORRUPT`/`SQLITE_NOTADB` from the backup, the keeper's schema read, or the patch (`views.cold_builds.base_unreadable`). No `quick_check` (it also scans the whole file) and no quarantine: the base is a published, possibly live file set that must not be renamed; it is never reused because the new generation does not reference it, and the sweep reclaims it* |
 | missing blob during the diff | **not** a fallback: the transaction rolls back and the path is reported pending (cold would fail the same way) |
 | **diff too large** | cold (closes G3). Implemented with measured constants, see §4.3: cold above 10% changed entries when a resolver input, symlink, gitlink or synthetic entry changed, otherwise above 40%, never below 100 changed entries. The original proposal (25%, or 10% with forced full resolution, from a linear model of ≈1.2 s fixed + ≈15 ms per entry against a ≈24 s cold build) did not match the measurement |
 | recycle is ineligible | clone path |
@@ -501,5 +516,77 @@ Every fallback is observable: extend the existing `view manifest diff` log line 
    switched within a time window.
 2. Confirm that the "diff too large" constants may be set from measurement (§6.4) rather than
    fixed in the design.
-3. G6 (dispatch edges in views) is outside this note. Decide whether it gets its own parity
-   check before views ship as the default.
+3. G6 (dispatch edges in views): §8 measures the gap and proposes a fix. Decide whether views
+   may become the default before it lands.
+
+## 8. Method-dispatch parity (measured 2026-09-27, nothing built)
+
+Probe: `views::dispatch_parity_probe::probe_method_dispatch_callers_views_vs_legacy` (ignored,
+release). It shares-clones opencode at `f7d5a1cbc725` into `/tmp`, runs the legacy cold build
+(4,132 files) and a views publication into the same isolated storage, and asks both stores the
+same `callers` question through `callgraph_store_adapter::callers_result` (depth 1, tests
+included), the code path the `callers` command uses.
+
+**Edge totals.** Legacy: 57,320 resolver `call` edges plus **13,992 `name_match` dispatch edges**
+(19.6% of its call edges; no `type_match` edges on this corpus: receiver-type inference found no
+typed receiver). Views: 51,665 resolver edges and **no dispatch edges**. (The resolver totals also
+differ; the file sets differ, since legacy walks the project and views take the Git manifest. That
+difference is not investigated here.) The legacy dispatch edges reach 1,139 distinct targets; 86
+of them are methods in a file that has a `class … implements …` or an `impl Trait for Type`.
+
+`callers` totals, legacy versus views (views-on returns only the resolver edges):
+
+| target (method) | dispatch edges | legacy total | views total | legacy call-site example |
+|---|---:|---:|---:|---|
+| `effect/bridge.ts::Shape::promise` | 1,209 | 1,189 | 0 | `yield* Effect.promise(() => response.text())` |
+| `e2e/…/analyzer.ts::includes` (function) | 792 | 662 | 5 | `c.body.includes(…)` |
+| `effect/instance-state.ts::has` (function) | 583 | 521 | 42 | `seen.has(normalizedName)` |
+| `effect/app-runtime.ts::AppRuntime::runPromise` | 382 | 349 | 0 | `await Effect.runPromise(` |
+| `tui/test/util/error.test.ts::err::toString` | 373 | 343 | 0 | `e.stderr.toString()` |
+| `…/dsl.ts::ScenarioBuilder::at` | 326 | 315 | 0 | `fixture.expected.sourceMessageIDs.at(-1)` |
+| `plugin/src/shell.ts::BunShellPromise::quiet` | 160 | 160 | 0 | ``await $`git init`.cwd(tmp.path).quiet()`` |
+| `cli/cmd/run/footer.ts::RunFooter::event` | 21 | 15 | 0 | `input.footer.event(next)` |
+| `cli/cmd/run/footer.ts::RunFooter::append` | 15 | 11 | 0 | `input.footer.append(commit)` |
+| `effect-drizzle-sqlite/…/delete.ts::SQLiteEffectDeleteBase::where` | 36 | 34 | 0 | `tx.delete(AuthTable).where(eq(…))` |
+| `…/session.ts::SQLiteEffectPreparedQuery::executeWithCache` | 16 | 8 | 0 | `return this.executeWithCache<…>(placeholderValues, "run")` |
+| `app/src/addons/serialize.ts::IBuffer::getLine` | 31 | 27 | 0 | `term.buffer.active.getLine(0)` |
+| `app/src/utils/persist.test.ts::MemoryStorage::getItem` | 16 | 16 | 0 | `localStorage.getItem("opencode-theme-id")` |
+
+What the examples show:
+
+1. **Views-on loses every dispatch-only caller.** For a method that is reached only through a
+   receiver (`obj.method()`, `this.method()`), views-on `callers` returns 0 where views-off returns
+   the call sites. This includes genuine interface and class dispatch: `this.executeWithCache(…)`
+   inside its own class, `input.footer.event(…)` on a `RunFooter`, drizzle builder chains ending in
+   `.where(…)` and `.onConflictDoNothing()`.
+2. **Much of what legacy returns is wrong.** Name matching pairs a call with the only project symbol
+   of that name, whatever the receiver: `Effect.promise`, `Effect.runPromise`, `Effect.die`,
+   `Array.prototype.includes`, `Set.prototype.has`, `Object.keys`, `.toString()`, `.at()`,
+   `localStorage.getItem` and JSX `<Kobalte.Content>` all land on unrelated project functions. The
+   legacy denylist (`method_name_match_denylisted`) is Rust-std oriented and has none of these
+   JavaScript names. So the parity gap is real, but copying legacy would also copy thousands of
+   false callers.
+
+**Fix proposal** (for review; not implemented):
+
+1. Carry dispatch hints in the callgraph blob. The legacy extractor already produces them; the view
+   extract drops them (`join.rs:1117`). Adding them changes the blob format, so bump
+   `CALLGRAPH_PRODUCER_VERSION`; existing blobs re-extract lazily.
+2. Resolve dispatch during view materialization in precision order, each edge tagged with its
+   provenance so `callers` can mark it approximate, as legacy does:
+   - `this.m()` / `self.m()` inside a class or `impl`: the enclosing type's method (exact);
+   - a receiver whose declared type or constructor is a project class or interface (a local
+     `const x = new C()`, a typed parameter, a class field): that type's method, and for an
+     interface or trait, every project implementation (`type_match`);
+   - otherwise a unique name match, but only when the receiver is not a known non-project value
+     (an imported package namespace such as `Effect`, a global such as `Object`, `localStorage`,
+     `JSON`) and the name is not a builtin prototype method for the caller's language (a
+     per-language denylist: `includes`, `has`, `keys`, `toString`, `at`, `map`, `get`, …).
+3. Invalidation: one pseudo-domain per method name, `\0view:dispatch:<name>`, recorded in
+   `file_dependencies` for every caller with a hint of that name. Seed it with files whose set of
+   methods or implementations named `<name>` changed (the legacy refresh computes the same thing in
+   `changed_dispatch_candidate_names`). The dependent closure and surface replay then work
+   unchanged.
+4. Parity gate before views become the default: rerun this probe and require views-on to return
+   every legacy caller whose provenance is exact or `type_match`, and report the name-match
+   callers it drops, with their receivers, as intended precision gains.

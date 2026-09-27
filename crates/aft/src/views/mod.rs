@@ -19,6 +19,9 @@ pub mod materialization;
 mod profile;
 pub(crate) mod read;
 
+#[cfg(test)]
+mod dispatch_parity_probe;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};

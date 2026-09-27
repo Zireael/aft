@@ -420,5 +420,5 @@ fn incremental_cutoff_boundaries() {
             "below the floor always patches, even at 100% (full={may_force_full_resolution})"
         );
     }
-    assert!(INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION < INCREMENTAL_CUTOFF_PERCENT);
+    const _: () = assert!(INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION < INCREMENTAL_CUTOFF_PERCENT);
 }
