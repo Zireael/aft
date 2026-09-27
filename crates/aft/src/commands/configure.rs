@@ -10552,6 +10552,315 @@ mod tests {
         ctx.cancel_unbound_artifact_work();
     }
 
+    // ---------------------------------------------------------------------
+    // Reproduction: a second checkout of an OLDER commit of the same
+    // repository borrows the live checkout's search snapshot and serves the
+    // live checkout's file list and contents as if they were its own.
+    //
+    // All roots whose HEAD history shares a root commit derive the same
+    // artifact key (`artifact_cache_key` hashes the root commit set), so a
+    // clone, a `cp -R` copy or a linked worktree opens the live checkout's
+    // `cache.bin`. With `worktree.ram_overlay` off (the default), a borrow-only
+    // root adopts that snapshot without comparing it with its own files.
+    //
+    // These tests assert the CORRECT behavior and are ignored because they
+    // fail today; see docs/investigations/borrowed-index-phantom-paths-2026-09.md.
+    // Run with: cargo test -p agent-file-tools --lib phantom_ -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+
+    /// How the second, older checkout of the live repository is produced.
+    #[derive(Clone, Copy, Debug)]
+    enum OlderCheckoutKind {
+        /// `git clone --shared live scratch`, then detach at the older commit.
+        SharedClone,
+        /// `git clone live scratch`, then detach at the older commit.
+        PlainClone,
+        /// `git worktree add --detach scratch <older commit>` from the live repo.
+        LinkedWorktree,
+        /// `cp -R live scratch`, then detach at the older commit.
+        CopiedTree,
+    }
+
+    /// File that exists only at the live checkout's HEAD.
+    const PHANTOM_REL_PATH: &str = "extra/phantom.ts";
+
+    /// What a borrowing checkout's glob and grep report about paths and
+    /// contents that differ between it and the live checkout.
+    #[derive(Debug)]
+    struct PhantomProbe {
+        owner_mode: Option<crate::artifact_owner::ArtifactOwnerMode>,
+        shared_artifacts_read_only: bool,
+        glob_source_is_index: bool,
+        glob_files: Vec<String>,
+        /// Matches for a token that exists only in the live checkout's new file.
+        grep_phantom_file_token: u64,
+        /// Matches for a token that exists only in the live checkout's copy of
+        /// a file both checkouts have.
+        grep_live_content_token: u64,
+        /// Matches for a token that exists only in this checkout's copy of
+        /// that same file.
+        grep_own_content_token: u64,
+        grep_index_status: String,
+        /// `aft_search` (the `semantic_search` command) for the phantom file's
+        /// name: whether the response names the phantom path anywhere.
+        search_by_name_mentions_phantom: bool,
+        /// `aft_search` for this checkout's own token: whether it finds
+        /// `shared.ts`.
+        search_own_token_finds_shared: bool,
+    }
+
+    impl PhantomProbe {
+        fn glob_lists_phantom(&self) -> bool {
+            self.glob_files
+                .iter()
+                .any(|file| file.ends_with(PHANTOM_REL_PATH))
+        }
+
+        fn is_correct(&self) -> bool {
+            !self.glob_lists_phantom()
+                && self.grep_phantom_file_token == 0
+                && self.grep_live_content_token == 0
+                && self.grep_own_content_token == 1
+                && !self.search_by_name_mentions_phantom
+                && self.search_own_token_finds_shared
+        }
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let status = git_command(root).args(args).status().unwrap();
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            root.display()
+        );
+    }
+
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let output = git_command(root).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Builds a live repository whose HEAD adds `extra/phantom.ts` and
+    /// rewrites `shared.ts`, publishes its search snapshot as the artifact
+    /// owner, and then produces a second checkout of the previous commit.
+    /// Returns the still-alive owner context (its process owns the manifest),
+    /// the older checkout and the shared storage directory.
+    fn older_checkout_beside_live_owner(
+        temp: &Path,
+        kind: OlderCheckoutKind,
+    ) -> (TestContext, PathBuf, PathBuf) {
+        let storage = temp.join("storage");
+        let live = temp.join("live");
+        init_git_fixture(&live);
+        std::fs::write(
+            live.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\n",
+        )
+        .unwrap();
+        git_commit_all(&live, "older");
+        let older = git_stdout(&live, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            live.join("shared.ts"),
+            "export const LIVE_HEAD_TOKEN = 2;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(live.join("extra")).unwrap();
+        std::fs::write(
+            live.join(PHANTOM_REL_PATH),
+            "export const PHANTOM_FILE_TOKEN = 3;\n",
+        )
+        .unwrap();
+        git_commit_all(&live, "live head");
+
+        let owner = test_context();
+        let response = handle_configure_for_test(&configure_with_storage(&live, &storage), &owner);
+        assert!(
+            response.success,
+            "owner configure failed: {:?}",
+            response.data
+        );
+        wait_for_search_index_ready(&owner, Duration::from_secs(10));
+        assert_eq!(
+            owner.artifact_owner_status().map(|status| status.mode),
+            Some(crate::artifact_owner::ArtifactOwnerMode::Owner),
+            "the live checkout must own the shared artifacts"
+        );
+        owner.flush_search_index_on_graceful_shutdown();
+
+        let scratch = temp.join("scratch");
+        let temp_str = temp.to_str().unwrap();
+        match kind {
+            OlderCheckoutKind::SharedClone => {
+                git_ok(temp, &["clone", "--quiet", "--shared", "live", "scratch"]);
+                git_ok(&scratch, &["checkout", "--quiet", "--detach", &older]);
+            }
+            OlderCheckoutKind::PlainClone => {
+                git_ok(temp, &["clone", "--quiet", "live", "scratch"]);
+                git_ok(&scratch, &["checkout", "--quiet", "--detach", &older]);
+            }
+            OlderCheckoutKind::LinkedWorktree => {
+                let scratch_str = scratch.to_str().unwrap();
+                git_ok(
+                    &live,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "--detach",
+                        scratch_str,
+                        &older,
+                    ],
+                );
+            }
+            OlderCheckoutKind::CopiedTree => {
+                assert!(Command::new("cp")
+                    .args(["-R", "live", "scratch"])
+                    .current_dir(temp_str)
+                    .status()
+                    .unwrap()
+                    .success());
+                git_ok(&scratch, &["checkout", "--quiet", "--detach", &older]);
+            }
+        }
+        assert!(
+            !scratch.join(PHANTOM_REL_PATH).exists(),
+            "fixture: the older checkout must not contain the live-only file"
+        );
+        (owner, scratch, storage)
+    }
+
+    fn probe_older_checkout(scratch: &Path, storage: &Path, ram_overlay: bool) -> PhantomProbe {
+        let ctx = test_context();
+        let request = if ram_overlay {
+            configure_ram_overlay_worktree(scratch, storage)
+        } else {
+            configure_with_storage(scratch, storage)
+        };
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(
+            response.success,
+            "scratch configure failed: {:?}",
+            response.data
+        );
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+
+        let glob_request: RawRequest = serde_json::from_value(json!({
+            "id": "phantom-glob",
+            "command": "glob",
+            "pattern": "**/*.ts"
+        }))
+        .unwrap();
+        let glob = crate::commands::glob::handle_glob(&glob_request, &ctx);
+        assert!(glob.success, "glob failed: {:?}", glob.data);
+        let glob_files = glob.data["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file.as_str().unwrap().to_string())
+            .collect();
+        let (grep_phantom_file_token, grep_index_status) =
+            grep_matches_and_status(&ctx, "PHANTOM_FILE_TOKEN");
+        let aft_search = |query: &str| {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": "phantom-search",
+                "command": "semantic_search",
+                "query": query
+            }))
+            .unwrap();
+            let response = crate::commands::semantic_search::handle_semantic_search(&request, &ctx);
+            assert!(
+                response.success,
+                "aft_search {query} failed: {:?}",
+                response.data
+            );
+            response.data.to_string()
+        };
+        let search_by_name_mentions_phantom = aft_search("phantom.ts").contains(PHANTOM_REL_PATH);
+        let search_own_token_finds_shared = aft_search("OLDER_COMMIT_TOKEN").contains("shared.ts");
+        let probe = PhantomProbe {
+            owner_mode: ctx.artifact_owner_status().map(|status| status.mode),
+            shared_artifacts_read_only: ctx.shared_artifacts_read_only(),
+            glob_source_is_index: glob.data["fallback"].is_null(),
+            glob_files,
+            grep_phantom_file_token,
+            grep_live_content_token: grep_matches_and_status(&ctx, "LIVE_HEAD_TOKEN").0,
+            grep_own_content_token: grep_matches_and_status(&ctx, "OLDER_COMMIT_TOKEN").0,
+            grep_index_status,
+            search_by_name_mentions_phantom,
+            search_own_token_finds_shared,
+        };
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        probe
+    }
+
+    fn assert_older_checkout_sees_only_its_own_files(kind: OlderCheckoutKind, ram_overlay: bool) {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let (owner, scratch, storage) = older_checkout_beside_live_owner(&temp_root, kind);
+        let probe = probe_older_checkout(&scratch, &storage, ram_overlay);
+        owner.mark_subc_unbound();
+        owner.cancel_unbound_artifact_work();
+        eprintln!("phantom probe {kind:?} ram_overlay={ram_overlay}: {probe:#?}");
+        // Preconditions: the older checkout really borrowed the live owner's
+        // snapshot and both tools answered from that index, not a disk walk.
+        assert_eq!(
+            probe.owner_mode,
+            Some(crate::artifact_owner::ArtifactOwnerMode::ReadOnly),
+            "fixture must exercise a borrow-only root"
+        );
+        assert!(probe.shared_artifacts_read_only);
+        assert!(
+            probe.glob_source_is_index,
+            "glob must answer from the index"
+        );
+        assert_eq!(probe.grep_index_status, "Ready");
+        assert!(
+            probe.is_correct(),
+            "{kind:?} (ram_overlay={ram_overlay}) served the live checkout's files: \
+             glob lists {PHANTOM_REL_PATH}={}, probe={probe:#?}",
+            probe.glob_lists_phantom()
+        );
+    }
+
+    #[test]
+    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
+    fn phantom_paths_shared_clone_of_older_commit() {
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, false);
+    }
+
+    #[test]
+    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
+    fn phantom_paths_plain_clone_of_older_commit() {
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::PlainClone, false);
+    }
+
+    #[test]
+    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
+    fn phantom_paths_linked_worktree_at_older_commit() {
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::LinkedWorktree, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "reproduces borrowed-index phantom paths; fails until the borrow is reconciled"]
+    fn phantom_paths_copied_tree_at_older_commit() {
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::CopiedTree, false);
+    }
+
+    /// Control: the same shared clone with `worktree.ram_overlay` on goes
+    /// through the borrowed-snapshot reconciliation and is expected to pass.
+    #[test]
+    #[ignore = "control for the borrowed-index phantom path reproductions"]
+    fn phantom_paths_shared_clone_with_ram_overlay_control() {
+        assert_older_checkout_sees_only_its_own_files(OlderCheckoutKind::SharedClone, true);
+    }
+
     #[test]
     fn ram_overlay_worktree_rescan_rebuilds_overlay_instead_of_dropping_it() {
         let _artifact_guard = artifact_owner_test_lock();
