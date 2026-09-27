@@ -479,56 +479,94 @@ pub fn prepare_checkout(
     }
     prepared.profile.io.enter(super::io::Phase::Clone);
     let derived = view.derived_path(&next_generation)?;
-    let mut cloned_base = false;
     if !reused_derived {
         let clone_started = Instant::now();
-        if let Some(base) = current_generation.as_deref() {
-            let base_path = view.derived_path(base)?;
-            if base_path.is_file() {
-                super::generation::clone_derived(&base_path, &derived)?;
-                cloned_base = true;
+        let base = match current_generation.as_deref() {
+            Some(base) => {
+                let base_path = view.derived_path(base)?;
+                if base_path.is_file() {
+                    let base_manifest = view
+                        .derived_owner(base)
+                        .and_then(|owner| view.load_manifest(&owner))?;
+                    Some((base_path, base_manifest))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let mut cold_build: Option<(ColdBuildReason, String)> = None;
+        let mut incremental_base = None;
+        if let Some((base_path, base_manifest)) = base {
+            match super::generation::clone_derived(&base_path, &derived) {
+                Ok(_) => incremental_base = Some(base_manifest),
+                Err(error) if view_error_is_unreadable_database(&error) => {
+                    cold_build = Some((ColdBuildReason::BaseUnreadable, error.to_string()));
+                    super::generation::remove_unpublished_derived(&derived)?;
+                }
+                Err(error) => return Err(error),
             }
         }
         prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
-        // Keep one connection alive so SQLite does not checkpoint the committed WAL
-        // when the materializer closes its writer before pointer publication.
-        let derived_keeper = crate::db::file_identity::IdentityConnection::open(
-            &derived,
-            "views::assembly::assemble",
-        )?;
-        derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
-        // Opening a handle or setting journal_mode alone does not attach its
-        // pager to the WAL. Read the schema so closing the materializer is not
-        // the last WAL connection and cannot checkpoint before publication.
-        derived_keeper.pragma_update(None, "journal_mode", "WAL")?;
-        derived_keeper.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
         prepared.profile.io.enter(super::io::Phase::Materialize);
         let materialization_started = Instant::now();
-        let derived_manifest = current_generation
-            .as_deref()
-            .filter(|_| cloned_base)
-            .map(|base| {
-                view.derived_owner(base)
-                    .and_then(|owner| view.load_manifest(&owner))
-            })
-            .transpose()?;
-        if let Some(base_manifest) = derived_manifest.as_ref() {
-            let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
-                &derived,
-                base_manifest,
-                &manifest,
-                callgraph.path(),
-            )
-            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-            prepared.profile.materialization = timings;
-            log::info!(
-                "view manifest diff: generation={} stats={stats:?}",
-                next_generation
-            );
-        } else {
+        let mut patched = false;
+        if let Some(base_manifest) = incremental_base.as_ref() {
+            // Both the keeper (which reads the clone's schema) and the patch
+            // can be the first to find that the copied base is unusable.
+            let outcome = match open_derived_keeper(&derived) {
+                Ok(keeper) => {
+                    prepared.derived_checkpoint = Some((derived.clone(), keeper));
+                    super::materialization::apply_manifest_diff_profiled(
+                        &derived,
+                        base_manifest,
+                        &manifest,
+                        callgraph.path(),
+                    )
+                    .map_err(|error| {
+                        match cold_build_reason_for_diff_error(&error) {
+                            Some(reason) => PatchFailure::Fallback(reason, error.to_string()),
+                            None => {
+                                PatchFailure::Fatal(ViewError::InvalidManifest(error.to_string()))
+                            }
+                        }
+                    })
+                }
+                Err(error) if view_error_is_unreadable_database(&error) => Err(
+                    PatchFailure::Fallback(ColdBuildReason::BaseUnreadable, error.to_string()),
+                ),
+                Err(error) => Err(PatchFailure::Fatal(error)),
+            };
+            match outcome {
+                Ok((stats, timings)) => {
+                    prepared.profile.materialization = timings;
+                    patched = true;
+                    log::info!(
+                        "view manifest diff: generation={} path=incremental stats={stats:?}",
+                        next_generation
+                    );
+                }
+                Err(PatchFailure::Fatal(error)) => return Err(error),
+                Err(PatchFailure::Fallback(reason, detail)) => {
+                    // The clone cannot seed this generation. Close the keeper so
+                    // no connection remains on the file set, delete it, and build
+                    // the target from scratch at the same unpublished path.
+                    prepared.derived_checkpoint = None;
+                    super::generation::remove_unpublished_derived(&derived)?;
+                    cold_build = Some((reason, detail));
+                }
+            }
+        }
+        if !patched {
+            prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));
+            if let Some((reason, detail)) = &cold_build {
+                record_cold_build(view.view_dir(), *reason);
+                log::warn!(
+                    "view manifest diff: generation={} path=cold reason={} error={detail}",
+                    next_generation,
+                    reason.as_str()
+                );
+            }
             crate::callgraph_store::materialize_manifest_view_database(
                 &derived,
                 callgraph.path(),
@@ -783,6 +821,118 @@ mod tests {
         assert!(line.contains("semantic_fill=false generation=none concurrent_publications=0"));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }
+}
+
+/// Why a graph-changing publication built its derived database from scratch
+/// even though a current generation existed to patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColdBuildReason {
+    /// The current generation's database records a different manifest than
+    /// the one its generation names, so its rows cannot seed the diff.
+    BaseFingerprintMismatch,
+    /// SQLite reported the current generation's database as corrupt or not a
+    /// database while copying or patching it.
+    BaseUnreadable,
+}
+
+impl ColdBuildReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BaseFingerprintMismatch => "base_fingerprint_mismatch",
+            Self::BaseUnreadable => "base_unreadable",
+        }
+    }
+}
+
+/// Why patching a cloned base did not produce the next generation.
+enum PatchFailure {
+    /// The base is unusable; build the target cold instead.
+    Fallback(ColdBuildReason, String),
+    /// A cold build would fail the same way; fail the publication.
+    Fatal(ViewError),
+}
+
+/// Per-view counts of cold derived builds that replaced an incremental patch,
+/// by reason, since this process started. Reported in view health.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ColdBuildCounts {
+    pub base_fingerprint_mismatch: u64,
+    pub base_unreadable: u64,
+}
+
+static COLD_BUILDS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, ColdBuildCounts>>> =
+    std::sync::OnceLock::new();
+
+fn record_cold_build(view_dir: &Path, reason: ColdBuildReason) {
+    let mut counts = COLD_BUILDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = counts.entry(view_dir.to_path_buf()).or_default();
+    match reason {
+        ColdBuildReason::BaseFingerprintMismatch => entry.base_fingerprint_mismatch += 1,
+        ColdBuildReason::BaseUnreadable => entry.base_unreadable += 1,
+    }
+}
+
+pub fn cold_build_counts(view_dir: &Path) -> ColdBuildCounts {
+    COLD_BUILDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(view_dir)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn sqlite_error_is_unreadable_database(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
+}
+
+fn view_error_is_unreadable_database(error: &ViewError) -> bool {
+    matches!(error, ViewError::Sqlite(error) if sqlite_error_is_unreadable_database(error))
+}
+
+/// Map an `apply_manifest_diff` failure to a cold-build fallback, or `None`
+/// when a cold build would not help. A missing callgraph blob, for example,
+/// fails a cold build the same way, so it stays an error.
+fn cold_build_reason_for_diff_error(
+    error: &crate::callgraph_store::CallGraphStoreError,
+) -> Option<ColdBuildReason> {
+    if super::materialization::is_base_fingerprint_mismatch(error) {
+        return Some(ColdBuildReason::BaseFingerprintMismatch);
+    }
+    match error {
+        crate::callgraph_store::CallGraphStoreError::Sqlite(error)
+            if sqlite_error_is_unreadable_database(error) =>
+        {
+            Some(ColdBuildReason::BaseUnreadable)
+        }
+        _ => None,
+    }
+}
+
+/// Keep one connection alive so SQLite does not checkpoint the committed WAL
+/// when the materializer closes its writer before pointer publication.
+fn open_derived_keeper(derived: &Path) -> Result<crate::db::file_identity::IdentityConnection> {
+    let keeper =
+        crate::db::file_identity::IdentityConnection::open(derived, "views::assembly::assemble")?;
+    keeper.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Opening a handle or setting journal_mode alone does not attach its
+    // pager to the WAL. Read the schema so closing the materializer is not
+    // the last WAL connection and cannot checkpoint before publication.
+    keeper.pragma_update(None, "journal_mode", "WAL")?;
+    keeper.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(keeper)
 }
 
 fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
@@ -1050,3 +1200,7 @@ mod closure_connection_tests;
 #[cfg(test)]
 #[path = "semantic_fill_tests.rs"]
 mod semantic_fill_tests;
+
+#[cfg(test)]
+#[path = "cold_fallback_tests.rs"]
+mod cold_fallback_tests;

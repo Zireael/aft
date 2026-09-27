@@ -181,6 +181,7 @@ mod tests {
             pinned: true,
             pending_paths: 0,
             failed_paths: 0,
+            cold_builds: Default::default(),
         };
         assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);
         assert_eq!(

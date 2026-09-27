@@ -98,6 +98,16 @@ mod resolution_facts;
 
 const MATERIALIZATION_VERSION: &str = "6";
 
+const BASE_FINGERPRINT_MISMATCH: &str =
+    "derived manifest fingerprint mismatch; cold materialization required";
+
+/// True when [`apply_manifest_diff`] refused its database because the manifest
+/// fingerprint recorded in it is not the supplied base manifest's. The
+/// database was left unchanged; the caller should build the target cold.
+pub(crate) fn is_base_fingerprint_mismatch(error: &CallGraphStoreError) -> bool {
+    matches!(error, CallGraphStoreError::Unavailable(message) if message == BASE_FINGERPRINT_MISMATCH)
+}
+
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
         .to_json_bytes()
@@ -188,7 +198,7 @@ fn materialize(
             base = None;
         } else if recorded.as_deref() != Some(fingerprint(base_manifest)?.as_str()) {
             return Err(CallGraphStoreError::Unavailable(
-                "derived manifest fingerprint mismatch; cold materialization required".into(),
+                BASE_FINGERPRINT_MISMATCH.into(),
             ));
         } else if version.as_deref() != Some(MATERIALIZATION_VERSION) {
             base = None;

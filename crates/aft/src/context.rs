@@ -498,6 +498,9 @@ pub struct ViewHealthSnapshot {
     pub pinned: bool,
     pub pending_paths: usize,
     pub failed_paths: usize,
+    /// Graph-changing publications that built `derived.sqlite` cold instead of
+    /// patching the current generation, by reason, since this process started.
+    pub cold_builds: crate::views::assembly::ColdBuildCounts,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -5195,6 +5198,7 @@ impl AppContext {
                     status.pending_count
                 }),
             failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
+            cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
         })
     }
 

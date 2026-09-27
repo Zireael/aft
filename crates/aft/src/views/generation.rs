@@ -393,22 +393,7 @@ pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<BackupC
 
     let mut destination_connection = {
         let _files = crate::db::file_identity::filesystem_guard();
-        let open = crate::db::file_identity::open_connections(destination);
-        if open != 0 {
-            return Err(ViewError::InvalidManifest(format!(
-                "derived clone destination has {open} live SQLite connection(s): {}",
-                destination.display()
-            )));
-        }
-        for suffix in ["", "-wal", "-shm"] {
-            let mut candidate = destination.as_os_str().to_owned();
-            candidate.push(suffix);
-            match fs::remove_file(PathBuf::from(candidate)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
+        remove_unpublished_derived_locked(destination)?;
         crate::db::file_identity::IdentityConnection::open(
             destination,
             "views::generation::clone_derived destination",
@@ -428,6 +413,37 @@ pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<BackupC
         destination.display()
     );
     Ok(copy)
+}
+
+/// Delete an unpublished derived file set (main file, `-wal`, `-shm`) so the
+/// caller can build a fresh database at the same path. Refuses while this
+/// process has any SQLite connection on the path: deleting a file set under a
+/// live connection would detach it from its locks and shared-memory index.
+pub(super) fn remove_unpublished_derived(path: &Path) -> Result<()> {
+    let _files = crate::db::file_identity::filesystem_guard();
+    remove_unpublished_derived_locked(path)
+}
+
+/// [`remove_unpublished_derived`] for callers that already hold the
+/// file-set mutation guard.
+fn remove_unpublished_derived_locked(path: &Path) -> Result<()> {
+    let open = crate::db::file_identity::open_connections(path);
+    if open != 0 {
+        return Err(ViewError::InvalidManifest(format!(
+            "derived clone destination has {open} live SQLite connection(s): {}",
+            path.display()
+        )));
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate = path.as_os_str().to_owned();
+        candidate.push(suffix);
+        match fs::remove_file(PathBuf::from(candidate)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 /// How a backup reached completion, for the clone log line and tests.
@@ -652,7 +668,8 @@ mod tests {
         assert_eq!(
             Connection::open(&destination)
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM payload", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM payload", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             2000
         );

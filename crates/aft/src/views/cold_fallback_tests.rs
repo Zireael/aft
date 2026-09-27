@@ -1,0 +1,320 @@
+//! Publications that cannot or should not patch the current generation build
+//! the derived database cold instead of failing.
+use super::*;
+
+const FAMILY: &str = "cold-family";
+const SCOPE: &str = "cold-scope";
+
+fn git(project: &Path, args: &[&str]) {
+    assert!(std::process::Command::new("git")
+        .current_dir(project)
+        .args(args)
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// A committed TypeScript repository with one cross-file call per pair.
+fn repository(files: usize) -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    for index in 0..files {
+        fs::write(
+            project.path().join(format!("file_{index}.ts")),
+            format!(
+                "import {{ target_{next} }} from './file_{next}';\n\
+                 export function target_{index}() {{ return {index}; }}\n\
+                 export function caller_{index}() {{ return target_{next}(); }}\n",
+                next = (index + 1) % files
+            ),
+        )
+        .unwrap();
+    }
+    git(project.path(), &["init", "--quiet"]);
+    git(project.path(), &["add", "."]);
+    git(
+        project.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+    );
+    project
+}
+
+fn request(project: &Path, storage: &Path, head: &str, changed: &[String]) -> AssemblyRequest {
+    AssemblyRequest {
+        storage: storage.to_path_buf(),
+        project_root: project.to_path_buf(),
+        family: FAMILY.into(),
+        scope: SCOPE.into(),
+        desired_head: head.into(),
+        changed_paths: changed
+            .iter()
+            .map(|path| path.as_bytes().to_vec())
+            .collect(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+    }
+}
+
+/// Publish the initial generation and plant a marker table in its derived
+/// database. A patched clone keeps the marker; a cold build starts from an
+/// empty file and does not have it.
+fn publish_marked_base(project: &Path, storage: &Path) -> (ViewStore, PathBuf) {
+    let initial = publish_checkout(&request(project, storage, "head-1", &[])).unwrap();
+    assert!(initial.published);
+    let view = ViewStore::open(storage, SCOPE).unwrap();
+    let owner = view
+        .derived_path(initial.generation.as_deref().unwrap())
+        .unwrap();
+    wait_for_no_connections(&owner);
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute_batch("CREATE TABLE cold_fallback_marker(value); PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(connection);
+    (view, owner)
+}
+
+/// The deferred checkpoint keeps the published generation's keeper open for a
+/// short idle delay. Tests that rewrite the file must wait until it closes.
+fn wait_for_no_connections(path: &Path) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while crate::db::file_identity::open_connections(path) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "keeper stayed open on {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn edit(project: &Path, index: usize) -> String {
+    let name = format!("file_{index}.ts");
+    let path = project.join(&name);
+    let mut source = fs::read_to_string(&path).unwrap();
+    source.insert_str(0, &format!("export function inserted_{index}() {{}}\n"));
+    fs::write(path, source).unwrap();
+    name
+}
+
+struct Published {
+    derived: PathBuf,
+    manifest: Manifest,
+    counts: ColdBuildCounts,
+}
+
+fn publish_edit(project: &Path, storage: &Path, view: &ViewStore, edited: &[usize]) -> Published {
+    let changed = edited
+        .iter()
+        .map(|index| edit(project, *index))
+        .collect::<Vec<_>>();
+    let report = publish_checkout(&request(project, storage, "head-2", &changed)).unwrap();
+    assert!(
+        report.published,
+        "publication must not fail on an unusable base"
+    );
+    let generation = report.generation.unwrap();
+    let derived = view.derived_path(&generation).unwrap();
+    wait_for_no_connections(&derived);
+    Published {
+        derived,
+        manifest: report.manifest.unwrap(),
+        counts: cold_build_counts(view.view_dir()),
+    }
+}
+
+fn has_marker(path: &Path) -> bool {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'cold_fallback_marker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        == 1
+}
+
+/// The published database must equal a cold build of its own manifest.
+fn assert_matches_cold(storage: &Path, published: &Published) {
+    let callgraph = BlobStore::open(storage, FAMILY.to_string(), BlobPlane::Callgraph).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let cold = directory.path().join("cold.sqlite");
+    crate::callgraph_store::materialize_manifest_view_database(
+        &cold,
+        callgraph.path(),
+        &published.manifest,
+    )
+    .unwrap();
+    let rows = |path: &Path| {
+        let connection = Connection::open(path).unwrap();
+        let tables = connection
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map(|values| format!("{values:?}"))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows.sort();
+                (table, rows)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(rows(&published.derived), rows(&cold));
+}
+
+#[test]
+fn corrupt_base_falls_back_to_a_cold_build() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    // Overwrite the header: SQLite reports SQLITE_NOTADB when the clone reads it.
+    fs::write(&owner, vec![0x5a_u8; 8192]).unwrap();
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+
+    assert_eq!(
+        published.counts,
+        ColdBuildCounts {
+            base_unreadable: 1,
+            ..ColdBuildCounts::default()
+        }
+    );
+    assert!(!has_marker(&published.derived), "corrupt base was reused");
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn truncated_base_falls_back_to_a_cold_build() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    // Keep the header page only. The header still claims the full page
+    // count, so the clone's backup reports SQLITE_CORRUPT on the short file.
+    let file = fs::OpenOptions::new().write(true).open(&owner).unwrap();
+    file.set_len(4096).unwrap();
+    drop(file);
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+
+    assert_eq!(
+        published.counts,
+        ColdBuildCounts {
+            base_unreadable: 1,
+            ..ColdBuildCounts::default()
+        }
+    );
+    assert!(!has_marker(&published.derived), "truncated base was reused");
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn damaged_meta_page_in_the_base_falls_back_to_a_cold_build() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    // Overwrite only the root page of `meta`. The schema stays readable, so
+    // the backup (which copies pages without parsing them) and the keeper
+    // both succeed, and the patch is what reports SQLITE_CORRUPT when it
+    // reads the base fingerprint.
+    let meta_root: i64 = Connection::open(&owner)
+        .unwrap()
+        .query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'meta'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut bytes = fs::read(&owner).unwrap();
+    let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+    let start = (meta_root as usize - 1) * page_size;
+    assert!(meta_root > 1 && start + page_size <= bytes.len());
+    bytes[start..start + page_size].fill(0xa5);
+    fs::write(&owner, bytes).unwrap();
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+
+    assert_eq!(
+        published.counts,
+        ColdBuildCounts {
+            base_unreadable: 1,
+            ..ColdBuildCounts::default()
+        }
+    );
+    assert!(!has_marker(&published.derived), "damaged base was reused");
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn fingerprint_mismatch_falls_back_to_a_cold_build() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET v = 'not-the-base-manifest' WHERE k = 'view_manifest_fingerprint'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(connection);
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+
+    assert_eq!(
+        published.counts,
+        ColdBuildCounts {
+            base_fingerprint_mismatch: 1,
+            ..ColdBuildCounts::default()
+        }
+    );
+    assert!(
+        !has_marker(&published.derived),
+        "mismatched base was reused"
+    );
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn small_diff_patches_a_clone_of_the_base() {
+    let project = repository(8);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, _) = publish_marked_base(project.path(), storage.path());
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+
+    assert_eq!(published.counts, ColdBuildCounts::default());
+    assert!(
+        has_marker(&published.derived),
+        "a small diff must patch the clone"
+    );
+}
