@@ -172,7 +172,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         mode: "",
         list_id: "payload.matches",
         unit: Unit::Rows,
-        narrow: &["path", "include", "exclude"],
+        narrow: &["offset", "path", "include", "exclude"],
         reasons: &[
             ReasonEntry {
                 reason: Reason::Walk,
@@ -182,7 +182,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_MATCHES_PER_FILE, MAX_DISPLAY_MATCHES, handle_grep, format_grep_text, rendered_grep_match_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, GREP_MAX_OUTPUT_BYTES, MAX_DISPLAY_MATCHES_PER_FILE, handle_grep, format_grep_text, render_grep_page, rendered_grep_match_count",
             },
         ],
     },

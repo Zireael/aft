@@ -34,7 +34,7 @@ fn seam_grep_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
         Total::AtLeast(100),
         Unit::Rows,
         vec![Reason::Cap],
-        &["path", "include", "exclude"],
+        &["offset", "path", "include", "exclude"],
     );
     data["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap();
     let resp_present = Response {
@@ -44,9 +44,8 @@ fn seam_grep_suppresses_legacy_clause_and_renders_trailer_when_envelope_present(
     };
     let formatted_present = format_response_with_context("grep", &resp_present, &ctx);
     assert!(!formatted_present.contains("(capped)"));
-    assert!(
-        formatted_present.contains("shown 100 of ≥100 rows (cap) · narrow: path, include, exclude")
-    );
+    assert!(formatted_present
+        .contains("shown 100 of ≥100 rows (cap) · narrow: offset, path, include, exclude"));
 }
 
 #[test]
@@ -162,8 +161,9 @@ fn seam_bash_passes_through_unchanged_so_no_trailer_renders_twice() {
 
 #[test]
 fn seam_reports_rendered_row_counts_back_to_producers() {
-    // Grep display selector: MAX_DISPLAY_MATCHES_PER_FILE = 5
-    let grep_data = json!({
+    // Grep prints every row of the page unless the output byte budget stopped
+    // it early, which the producer records as `rendered_matches`.
+    let mut grep_data = json!({
         "matches": [
             { "file": "src/a.rs", "line": 1 },
             { "file": "src/a.rs", "line": 2 },
@@ -176,7 +176,9 @@ fn seam_reports_rendered_row_counts_back_to_producers() {
             { "file": "src/b.rs", "line": 2 },
         ]
     });
-    // 7 matches in a.rs (capped to 5) + 2 matches in b.rs = 7 rendered rows
+    // No budget cut: all 9 rows, including 7 from one file, are rendered.
+    assert_eq!(rendered_grep_match_count(&grep_data), 9);
+    grep_data["rendered_matches"] = json!(7);
     assert_eq!(rendered_grep_match_count(&grep_data), 7);
     assert_eq!(report_rendered_row_count("grep", &grep_data), Some(7));
 

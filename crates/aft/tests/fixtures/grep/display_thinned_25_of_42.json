@@ -298,6 +298,8 @@
     }
   ],
   "total_matches": 42,
+  "rendered_matches": 25,
+  "output_byte_capped": true,
   "files_searched": 10,
   "files_with_matches": 5,
   "index_status": "ready",
@@ -317,6 +319,7 @@
       "cap"
     ],
     "narrow": [
+      "offset",
       "path",
       "include",
       "exclude"

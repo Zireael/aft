@@ -217,7 +217,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         mode: "",
         list_id: "payload.matches",
         unit: Unit::Rows,
-        narrow: &["path", "include", "exclude"],
+        narrow: &["offset", "path", "include", "exclude"],
         reasons: WALK_CAP,
     },
     SurfaceSpec {

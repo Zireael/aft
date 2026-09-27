@@ -1735,6 +1735,9 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
     let mut out = Map::new();
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
     out.insert("case_sensitive".to_string(), Value::Bool(true));
+    if let Some(offset) = coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)? {
+        out.insert("offset".to_string(), Value::Number(offset.into()));
+    }
     if let Some(include) = map_in.get("include") {
         if !is_empty_param(include) {
             let include_arg = include.as_str().ok_or_else(|| {

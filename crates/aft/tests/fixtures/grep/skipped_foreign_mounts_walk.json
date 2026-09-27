@@ -107,6 +107,7 @@
       "walk"
     ],
     "narrow": [
+      "offset",
       "path",
       "include",
       "exclude"

@@ -3156,31 +3156,21 @@ pub(crate) fn render_envelope_trailer(
     crate::list_envelope::render_trailer(envelope)
 }
 
-/// Count of rendered match rows in a grep response after applying display-only selectors (R24).
+/// Count of rendered match rows in a grep response (R24).
+///
+/// `matches` holds the whole requested page; `rendered_matches` says how many
+/// of those rows fit the output byte budget and were printed. Replies without
+/// that field printed every row in `matches`.
 pub fn rendered_grep_match_count(data: &Value) -> usize {
-    let matches = data.get("matches").and_then(Value::as_array);
-    let Some(matches) = matches else {
-        return 0;
-    };
-    let mut counts_by_file: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut file_order: Vec<String> = Vec::new();
-    for m in matches {
-        let file = m
-            .get("file")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if !counts_by_file.contains_key(&file) {
-            file_order.push(file.clone());
-        }
-        *counts_by_file.entry(file).or_default() += 1;
-    }
-    const MAX_DISPLAY_MATCHES: usize = 5;
-    file_order
-        .iter()
-        .map(|f| counts_by_file[f].min(MAX_DISPLAY_MATCHES))
-        .sum()
+    let matches_len = data
+        .get("matches")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    data.get("rendered_matches")
+        .and_then(Value::as_u64)
+        .map(|rendered| (rendered as usize).min(matches_len))
+        .unwrap_or(matches_len)
 }
 
 /// Count of rendered file rows in a glob response after applying display-only selectors (R24).

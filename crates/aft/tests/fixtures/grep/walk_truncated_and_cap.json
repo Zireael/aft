@@ -724,6 +724,7 @@
       "cap"
     ],
     "narrow": [
+      "offset",
       "path",
       "include",
       "exclude"

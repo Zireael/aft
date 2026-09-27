@@ -2,8 +2,8 @@
 //!
 //! Produces the truncation envelope for grep match lists (`payload.matches`),
 //! accounting for directory walk boundaries (such as search timeouts or skipped
-//! filesystem mounts) and match caps (such as executor result limits or
-//! per-file display thinning).
+//! filesystem mounts) and match caps (such as the page size, `offset` paging,
+//! or the output byte budget).
 
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use serde_json::Value;
@@ -11,7 +11,7 @@ use serde_json::Value;
 pub const COMMAND: &str = "grep";
 pub const LIST_ID: &str = "payload.matches";
 pub const UNIT: Unit = Unit::Rows;
-pub const NARROW: &[&str] = &["path", "include", "exclude"];
+pub const NARROW: &[&str] = &["offset", "path", "include", "exclude"];
 
 /// Build the list truncation envelope for a grep response from its component parts.
 ///
@@ -24,8 +24,36 @@ pub fn build_grep_envelope_from_parts(
     walk_truncated: bool,
     skipped_foreign_mounts: usize,
 ) -> Option<ListEnvelope> {
+    build_grep_envelope_for_page(
+        0,
+        shown,
+        total_matches,
+        matches_count,
+        truncated,
+        walk_truncated,
+        skipped_foreign_mounts,
+    )
+}
+
+/// Build the list truncation envelope for one page of grep matches.
+///
+/// `offset` is how many matching lines earlier pages covered, `matches_count`
+/// is how many matches this page held and `shown` how many of them were
+/// printed (the output byte budget can stop rendering early). A page that
+/// skipped earlier rows, left rows unprinted, or has rows after it is not the
+/// complete list, so it gets a `cap` envelope.
+pub fn build_grep_envelope_for_page(
+    offset: usize,
+    shown: usize,
+    total_matches: usize,
+    matches_count: usize,
+    truncated: bool,
+    walk_truncated: bool,
+    skipped_foreign_mounts: usize,
+) -> Option<ListEnvelope> {
     let walk_cause = walk_truncated || skipped_foreign_mounts > 0;
-    let cap_cause = truncated || shown < matches_count;
+    let seen = offset.saturating_add(matches_count);
+    let cap_cause = truncated || shown < matches_count || offset > 0 || total_matches > seen;
 
     if !walk_cause && !cap_cause {
         return None;
@@ -41,13 +69,14 @@ pub fn build_grep_envelope_from_parts(
 
     let total = if walk_cause {
         // Any traversal cut means the true total is unknown, making the count a lower bound.
-        Total::AtLeast(total_matches.max(shown))
+        Total::AtLeast(total_matches.max(offset.saturating_add(shown)))
     } else if truncated {
         // When the executor hits its result cap, the match count is a lower bound.
-        Total::AtLeast(total_matches)
+        Total::AtLeast(total_matches.max(seen))
     } else {
-        // When enumeration completed and only display thinning was applied, the total count is exact.
-        Total::Exact(total_matches)
+        // When enumeration completed and only paging or the output budget cut
+        // the printed rows, the total count is exact.
+        Total::Exact(total_matches.max(seen))
     };
 
     Some(ListEnvelope::new(shown, total, UNIT, causes, NARROW))
@@ -65,8 +94,12 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
         .get("total_matches")
         .and_then(Value::as_u64)
         .map(|v| v as usize)
-        .unwrap_or(matches_count)
-        .max(matches_count);
+        .unwrap_or(matches_count);
+    let offset = data
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(0);
     let truncated = data
         .get("truncated")
         .and_then(Value::as_bool)
@@ -83,7 +116,8 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
 
     let shown = crate::subc_format::rendered_grep_match_count(data);
 
-    build_grep_envelope_from_parts(
+    build_grep_envelope_for_page(
+        offset,
         shown,
         total_matches,
         matches_count,

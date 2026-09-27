@@ -584,7 +584,7 @@ grep would have used.
 ```
 
 Returns matches grouped by file with relative paths, sorted by modification time (newest first),
-capped at 100 matches:
+100 matching lines per call:
 
 ```
 src/server.ts
@@ -597,11 +597,20 @@ src/test/server.test.ts
 Found 3 match(es) across 2 file(s). [index: ready]
 ```
 
-Files with more than 5 matches show the first 5 and `... and N more matches`. Lines are truncated
-at 200 characters.
+Every matching line of the page is printed. Lines longer than 500 characters are cut and marked
+`… [line truncated]`, and a page stops early once its rows reach 50 KB. When more matches remain,
+the reply names the next `offset` and ends with the standard
+`shown N of M rows (cap) · narrow: offset, path, include, exclude` trailer.
+
+Paging with `offset` is exact for a single file and for any search that saw every match. When a
+search over several files stops at the match limit, the engine keeps the first matches it reaches
+before sorting them, so later pages may overlap or skip rows; the reply says so, and narrowing with
+`path` or `include` restores exact paging.
 
 Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path),
-`include` (glob filter, e.g. `"*.ts"`), `exclude` (negate glob), `case_sensitive` (default true).
+`include` (glob filter, e.g. `"*.ts"`), `offset` (zero-based count of matching lines to skip,
+default 0). The bridge command also accepts `exclude` (negate glob), `case_sensitive`
+(default true) and `max_results` (page size, default 100).
 
 ---
 

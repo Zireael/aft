@@ -9,10 +9,21 @@ use crate::search_index::{build_path_filters, GrepMatch, GrepResult, IndexStatus
 
 pub(crate) use crate::grep_executor::ripgrep_glob;
 
+/// Matching lines the grep tool shows per page unless the caller asks for a
+/// different page size through `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 100;
 const MAX_LINE_CHARS: usize = 200;
 const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
+/// Longest matching line, in characters, the grep tool prints before cutting
+/// it and appending `GREP_LINE_TRUNCATED_MARKER`.
+const GREP_MAX_LINE_CHARS: usize = 500;
+/// Byte budget for the match rows of one grep reply (file headers included).
+/// Rows past the budget are left for the next page instead of being printed.
+const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+/// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
+/// knows the printed text is not the whole line.
+const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
@@ -33,12 +44,24 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(true);
     let include = string_array_param(&req.params, "include");
     let exclude = string_array_param(&req.params, "exclude");
-    let max_results = req
+    // `max_results` is the page size; `offset` skips that many matching lines
+    // of the ordered result. The engine collects at most `offset + page_size`
+    // matches, so the cap applies while matches are gathered rather than to a
+    // full list afterwards.
+    let page_size = req
         .params
         .get("max_results")
         .and_then(|value| value.as_u64())
         .map(|value| value as usize)
+        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_RESULTS);
+    let offset = req
+        .params
+        .get("offset")
+        .and_then(|value| value.as_u64())
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    let max_results = offset.saturating_add(page_size);
 
     let compiled = match pattern_compile::compile(
         pattern,
@@ -89,6 +112,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
     let project_root = grep_executor::project_root(ctx);
+    let single_file_scope = scope.roots.len() == 1 && scope.roots[0].search_root.is_file();
     let total_started = std::time::Instant::now();
     let search_start = std::time::Instant::now();
     let params = GrepParams {
@@ -106,7 +130,11 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| grep_executor::scope_has_files(&project_root, &scope));
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();
-    let text = format_grep_text(&result, &project_root);
+    let page_matches: Vec<&GrepMatch> =
+        result.matches.iter().skip(offset).take(page_size).collect();
+    let page = render_grep_page(&page_matches, &project_root, GREP_MAX_OUTPUT_BYTES);
+    let next_offset = grep_next_offset(&result, &page, offset);
+    let text = grep_page_text(&result, &page, offset, single_file_scope);
     let post_filter_format = phases.query.post_filter + format_started.elapsed();
     crate::slog_debug!(
         "perf grep phases: snapshot_acquire={:.3}ms query_decomposition={:.3}ms trigram_lookup={:.3}ms pread_verify={:.3}ms candidates={} bytes={} post_filter/format={:.3}ms scope_probe={:.3}ms total={:.3}ms",
@@ -128,7 +156,12 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
             && result.missing_on_disk == 0,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": result.skipped_foreign_mounts,
-        "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
+        "matches": page_matches.iter().map(|m| match_to_json(m)).collect::<Vec<_>>(),
+        "rendered_matches": page.rendered,
+        "offset": offset,
+        "output_byte_capped": page.byte_capped,
+        "lines_truncated": page.lines_truncated,
+        "next_offset": next_offset,
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
         "files_with_matches": result.files_with_matches,
@@ -270,6 +303,16 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
         sections.push(section);
     }
 
+    let footer = grep_footer(result);
+
+    if sections.is_empty() {
+        footer
+    } else {
+        format!("{}\n\n{}", sections.join("\n\n"), footer)
+    }
+}
+
+fn grep_footer(result: &GrepResult) -> String {
     // Wholesale-singular ("40 match across 4 file") — the `(es)`/`(s)` plural
     // parentheticals were pure per-call token tax for zero agent value. The
     // `[index: ready]` tag is dropped on the common ready path (absence == ready,
@@ -280,7 +323,7 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
     // true total — say so in the agent-facing text (the JSON already carries
     // `truncated`). Otherwise the agent reads "Found N match" as exhaustive.
     let cap_note = if result.truncated { " (capped)" } else { "" };
-    let footer = match result.index_status {
+    match result.index_status {
         IndexStatus::Ready => format!(
             "Found {} match across {} file{}",
             result.total_matches, result.files_with_matches, cap_note
@@ -292,12 +335,154 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
             cap_note,
             index_status_label(other)
         ),
-    };
+    }
+}
 
-    if sections.is_empty() {
+/// One rendered page of grep output: the match rows that fit the byte budget,
+/// grouped under their file path.
+#[derive(Debug)]
+pub(crate) struct GrepPage {
+    /// File headers and match rows, without the footer.
+    pub rows_text: String,
+    /// Number of page matches printed; the rest of the page did not fit.
+    pub rendered: usize,
+    /// Number of page matches the page held before the byte budget applied.
+    pub page_len: usize,
+    /// Printed lines cut at `GREP_MAX_LINE_CHARS`.
+    pub lines_truncated: usize,
+    /// True when the byte budget stopped rendering before the page ended.
+    pub byte_capped: bool,
+}
+
+/// Render one page of matches in result order, stopping before the first row
+/// that would push the text past `max_bytes`. Every match is printed on its
+/// own row; a file header is printed whenever the file changes, so the rows
+/// stay in exactly the order used for `offset` paging.
+pub(crate) fn render_grep_page(
+    page: &[&GrepMatch],
+    project_root: &Path,
+    max_bytes: usize,
+) -> GrepPage {
+    let mut rows_text = String::new();
+    let mut rendered = 0usize;
+    let mut lines_truncated = 0usize;
+    let mut byte_capped = false;
+    let mut current_file: Option<&Path> = None;
+
+    for grep_match in page {
+        let (line_text, cut) = truncate_grep_line(&grep_match.line_text);
+        let row = format!("{}: {}", grep_match.line, line_text);
+        let new_file = current_file != Some(grep_match.file.as_path());
+        let mut chunk = String::new();
+        if new_file {
+            if !rows_text.is_empty() {
+                chunk.push_str("\n\n");
+            }
+            chunk.push_str(
+                &grep_match
+                    .file
+                    .strip_prefix(project_root)
+                    .unwrap_or(&grep_match.file)
+                    .display()
+                    .to_string(),
+            );
+        }
+        chunk.push('\n');
+        chunk.push_str(&row);
+
+        // Always print at least one row so a page never comes back empty
+        // while matches remain; a single row is bounded by the line cap.
+        if rendered > 0 && rows_text.len() + chunk.len() > max_bytes {
+            byte_capped = true;
+            break;
+        }
+        rows_text.push_str(&chunk);
+        rendered += 1;
+        if cut {
+            lines_truncated += 1;
+        }
+        current_file = Some(grep_match.file.as_path());
+    }
+
+    GrepPage {
+        rows_text,
+        rendered,
+        page_len: page.len(),
+        lines_truncated,
+        byte_capped,
+    }
+}
+
+/// Assemble the grep reply text: the page rows, the "Found N match" footer,
+/// then one-line notes telling the reader how to get the rest.
+pub(crate) fn grep_page_text(
+    result: &GrepResult,
+    page: &GrepPage,
+    offset: usize,
+    single_file_scope: bool,
+) -> String {
+    let footer = grep_footer(result);
+    let mut text = if page.rows_text.is_empty() {
         footer
     } else {
-        format!("{}\n\n{}", sections.join("\n\n"), footer)
+        format!("{}\n\n{}", page.rows_text, footer)
+    };
+
+    let next_offset = grep_next_offset(result, page, offset);
+    if page.byte_capped {
+        text.push_str(&format!(
+            "\n\n(Output reached the {GREP_MAX_OUTPUT_BYTES}-byte limit after {} of {} rows on this page; continue with offset={}.)",
+            page.rendered,
+            page.page_len,
+            offset.saturating_add(page.rendered)
+        ));
+    } else if let Some(next) = next_offset {
+        text.push_str(&format!("\n\n(More matches; continue with offset={next}.)"));
+    } else if offset > 0 && page.page_len == 0 {
+        text.push_str(&format!(
+            "\n\n(offset={offset} is past the last match; nothing left to show.)"
+        ));
+    }
+
+    // The engine keeps the first matches it reaches and only then sorts them,
+    // so when a search over several files stops at the collection bound, a
+    // later page (collected with a larger bound) is not guaranteed to line up
+    // with an earlier one. A single file is scanned in line order, and a
+    // search that saw every match is sorted as a whole, so both page exactly.
+    if result.truncated
+        && !single_file_scope
+        && (result.files_with_matches > 1 || result.engine_capped)
+    {
+        text.push_str(
+            "\n\n(This search stopped at the match limit across several files, so pages fetched with offset may overlap or skip rows; narrow with path or include for exact paging.)",
+        );
+    }
+    text
+}
+
+/// Offset of the first matching line not shown yet, when more remain.
+pub(crate) fn grep_next_offset(
+    result: &GrepResult,
+    page: &GrepPage,
+    offset: usize,
+) -> Option<usize> {
+    let next = offset.saturating_add(page.rendered);
+    let more = page.rendered < page.page_len
+        || result.truncated
+        || result.total_matches > next
+        || result.matches.len() > next;
+    (more && page.page_len > 0).then_some(next)
+}
+
+/// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
+/// Returns the printable text and whether it was cut.
+fn truncate_grep_line(text: &str) -> (String, bool) {
+    match text.char_indices().nth(GREP_MAX_LINE_CHARS) {
+        None => (text.to_string(), false),
+        Some((byte_index, _)) => (
+            format!("{}{}", &text[..byte_index], GREP_LINE_TRUNCATED_MARKER),
+            true,
+        ),
     }
 }
 
@@ -500,6 +685,24 @@ mod tests {
         assert!(text.contains("5: line 5"));
         assert!(!text.contains("6: line 6"));
         assert!(text.contains("... and 6 more matches"));
+    }
+
+    #[test]
+    fn grep_line_cut_counts_characters_not_bytes() {
+        let line = "é".repeat(GREP_MAX_LINE_CHARS + 100);
+        let (printed, cut) = truncate_grep_line(&line);
+        assert!(cut);
+        assert_eq!(
+            printed,
+            format!(
+                "{}{}",
+                "é".repeat(GREP_MAX_LINE_CHARS),
+                GREP_LINE_TRUNCATED_MARKER
+            )
+        );
+
+        let exact = "é".repeat(GREP_MAX_LINE_CHARS);
+        assert_eq!(truncate_grep_line(&exact), (exact.clone(), false));
     }
 
     #[test]
