@@ -10787,6 +10787,7 @@ mod tests {
         owner.flush_search_index_on_graceful_shutdown();
 
         let scratch = temp.join("scratch");
+        #[cfg(unix)]
         let temp_str = temp.to_str().unwrap();
         match kind {
             OlderCheckoutKind::SharedClone => {
