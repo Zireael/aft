@@ -10,6 +10,7 @@ The unified `@cortexkit/aft` CLI works across every supported harness:
 | `npx @cortexkit/aft@latest doctor lsp <file>` | Show exactly which LSP servers AFT would spawn for a file, where each binary resolves, and why a server failed to start |
 | `npx @cortexkit/aft@latest doctor --clear` | Interactive cache cleanup — pick which caches to clear (plugin packages, binary, LSP, semantic) |
 | `npx @cortexkit/aft@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
+| `npx @cortexkit/aft@latest backups purge --path <p> [--session <id>] [--yes]` | Remove undo backups early for a file or directory, a session, or both (dry run unless `--yes`) |
 
 Add `--harness opencode` or `--harness pi` to any command to target one harness explicitly.
 
@@ -62,3 +63,47 @@ and home path out of the logs. It always writes the report to `./aft-issue-<time
 first and prompts you to review it. Only after you confirm does it submit via `gh` (when
 installed); otherwise it opens the prefilled new-issue page in your browser. Nothing is sent
 without your explicit confirmation.
+
+**`backups purge`** — Removes undo backups before they would expire on their own. Backups
+normally go away only when a file's undo history passes 20 entries or when a session has been
+idle for 72 hours, so a long-running session keeps every backup it made, including the copies
+taken by a large delete. The native binary runs the same command as `aft backups purge`.
+
+```
+aft backups purge [--path <file-or-dir>] [--session <id>] [--harness <name>] [--yes] [--json]
+```
+
+- `--path` selects every backup recorded for that file, or for anything under that directory,
+  in every session and harness. Paths are resolved the way AFT records them (absolute,
+  symlinks in parent directories resolved) and compared by whole path components, so
+  `--path /a/b` never matches `/a/bc`.
+- `--session` selects every backup of one session. With `--path` too, only that session's
+  backups under the path are selected.
+- `--harness` narrows to one harness storage namespace (`opencode`, `pi`, `runner`, or an
+  `mcp--…`/`fed--…` directory name). The default is all of them.
+- At least one of `--path` or `--session` is required.
+- Without `--yes` the command is a dry run: it prints what it examined and what it would
+  remove (backup stacks, entries, files, bytes, database rows, the sessions affected, and a
+  few sample paths) and removes nothing. With `--yes` it also prints what it removed.
+- `--json` prints the same report as JSON.
+
+The command exits non-zero when any selected backup could not be fully removed and lists
+each one, saying whether undo can still see it or only leftover files remain.
+
+When an AFT daemon is running it holds backup history in memory, so the command sends the
+purge to the daemon, which clears its memory, the backup files and the database rows
+together. With no daemon the command performs the purge itself using the same locks. If a
+daemon is running but the purge through it fails, the command stops rather than purging
+behind its back. Afterwards, undo for a purged file reports that there is no undo history.
+
+```
+$ aft backups purge --path ~/projects/engram/keystore
+aft backups purge: dry run, nothing removed (rerun with --yes to remove)
+ran by: daemon
+storage: /Users/me/.local/share/cortexkit/aft
+filter: path=/Users/me/projects/engram/keystore session=any harness=any
+examined: 2 namespace(s) [opencode, pi], 9 session dir(s), 12410 disk stack(s), 12410 database stack(s), 12130 cached stack(s), 0 skipped
+matched: 12124 stack(s), 12124 entries, 24248 file(s), 3214567890 byte(s), 12124 database row(s), 1 session(s) [ses_abc]
+sample paths:
+  /Users/me/projects/engram/keystore/a.key
+```

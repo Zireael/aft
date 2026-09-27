@@ -1,3 +1,4 @@
+pub mod backups;
 pub mod fix_config;
 pub mod index;
 pub mod probe_login_shell_path;

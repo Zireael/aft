@@ -10369,6 +10369,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "writes.census",
             "gh_shim.bot_request",
             "gh_shim.bindings_read",
+            "backups.purge",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(

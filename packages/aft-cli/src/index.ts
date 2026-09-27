@@ -24,6 +24,9 @@ function printHelp(): void {
   console.log("    setup --yes      Save proposed feature defaults without prompting");
   console.log("    setup --answers <file>  Save feature choices from an answers file");
   console.log("    index            Build one configured index snapshot (no scheduler)");
+  console.log(
+    "    backups purge    Remove undo backups by --path and/or --session (dry run unless --yes)",
+  );
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor --profile [seconds]  Profile a running AFT daemon");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
@@ -49,6 +52,7 @@ function printHelp(): void {
   console.log("  Usage:");
   console.log(`    ${CLI} setup`);
   console.log(`    ${CLI} index`);
+  console.log(`    ${CLI} backups purge --path ./build --yes`);
   console.log(`    ${CLI} doctor`);
   console.log(`    ${CLI} doctor --profile 4`);
   console.log(`    ${CLI} doctor lsp ./src/main.py`);
@@ -72,6 +76,10 @@ async function main(): Promise<number> {
   if (command === "index") {
     const { runIndex } = await import("./commands/index.js");
     return runIndex(args);
+  }
+  if (command === "backups") {
+    const { runBackups } = await import("./commands/backups.js");
+    return runBackups(args);
   }
   if (command === "doctor") {
     if (args.includes("--profile")) {

@@ -412,6 +412,14 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         kind: ManagementOperationKind::Query,
                         description: None,
                     },
+                    // Operator-only early removal of undo backups (`aft backups
+                    // purge`). The daemon owns live backup caches, so the purge
+                    // runs here to change memory, disk and database together.
+                    ManagementOperation {
+                        name: crate::backup::purge::BACKUPS_PURGE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
                 ],
                 config_schema: json!({
                     "type": "object",
@@ -614,6 +622,10 @@ mod tests {
                     crate::gh_shim_relay::BINDINGS_READ_OPERATION,
                     &ManagementOperationKind::Query,
                 ),
+                (
+                    crate::backup::purge::BACKUPS_PURGE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
             ]
         );
         for operation in operations {
@@ -809,8 +821,8 @@ mod tests {
             management.insert("concurrency".to_string(), json!("module_managed")),
             None
         );
-        // The snapshot predates the gh shim relay operations, so they are
-        // appended to its management operation list here.
+        // The snapshot predates the gh shim relay operations and the backup
+        // purge, so they are appended to its management operation list here.
         management
             .get_mut("operations")
             .and_then(Value::as_array_mut)
@@ -818,6 +830,7 @@ mod tests {
             .extend([
                 json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
                 json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
+                json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
             ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.

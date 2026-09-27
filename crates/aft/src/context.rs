@@ -2354,6 +2354,18 @@ impl App {
         self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
     }
 
+    /// The resident handle only when it was opened for `path`. Callers that must
+    /// not open a second connection to a file this process already holds use
+    /// this to tell "holding it" from "holding some other database".
+    pub fn db_for_path(&self, path: &Path) -> Option<Arc<Mutex<TrackedConnection>>> {
+        let key = database_path_key(path);
+        self.db
+            .lock()
+            .as_ref()
+            .filter(|(existing_path, _)| existing_path == &key)
+            .map(|(_, conn)| Arc::clone(conn))
+    }
+
     pub(crate) fn watcher_started(&self) {
         self.active_watchers.fetch_add(1, Ordering::SeqCst);
     }

@@ -5795,12 +5795,12 @@ async fn handle_control_request(
 async fn handle_management_request(
     tx: &WriterSender,
     frame: &Frame,
-    shared_app: &App,
-    executor: &Executor,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     health_rollup_cache: &HealthRollupCache,
-    metrics: &DispatchPathMetrics,
+    metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
@@ -5821,6 +5821,15 @@ async fn handle_management_request(
     };
 
     let result = match operation {
+        crate::backup::purge::BACKUPS_PURGE_OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            spawn_backups_purge(tx, frame, shared_app, executor, metrics, params);
+            return Ok(());
+        }
         crate::commands::memory_census::MEMORY_CENSUS_OPERATION => Response::success(
             "management-memory-census",
             memory_census_with_lifecycle(
@@ -6086,6 +6095,64 @@ fn spawn_gh_relay(
             send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
         {
             log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
+}
+
+/// Run a backup purge off the frame loop. Removing a large tree of backups can
+/// take seconds, and the loop must keep serving other routes meanwhile.
+///
+/// Every bound root's backup store is passed in, so the purge clears their
+/// in-memory copies under the same locks that guard disk and database; the
+/// process-shared database handle is reused rather than opened a second time.
+fn spawn_backups_purge(
+    tx: &WriterSender,
+    frame: &Frame,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+    metrics: &Arc<DispatchPathMetrics>,
+    params: Value,
+) {
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let shared_app = Arc::clone(shared_app);
+    let executor = Arc::clone(executor);
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            let contexts = executor.actor_contexts();
+            let stores = contexts.iter().map(|ctx| ctx.backup()).collect::<Vec<_>>();
+            match crate::backup::purge::purge_as_owner(&params, &stores, |db_path| {
+                shared_app.db_for_path(db_path)
+            }) {
+                Ok(report) => Response::success(
+                    "management-backups-purge",
+                    serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+                ),
+                Err(refusal) => {
+                    Response::error("management-backups-purge", refusal.code, refusal.message)
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Response::error(
+                "management-backups-purge",
+                "internal_error",
+                format!("backups.purge task failed: {error}"),
+            )
+        });
+        if let Err(error) = send_management_response(
+            &tx,
+            &frame,
+            crate::backup::purge::BACKUPS_PURGE_OPERATION,
+            result,
+            &metrics,
+        )
+        .await
+        {
+            log::warn!("backups.purge: could not queue the reply: {error}");
         }
     });
 }

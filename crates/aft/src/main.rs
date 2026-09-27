@@ -172,6 +172,20 @@ fn main() {
         std::process::exit(cli::fix_config::run(args));
     }
 
+    // `aft backups purge` removes undo backups early. It runs before logging
+    // and the application start: it either hands the purge to the running
+    // daemon or performs it once and exits.
+    if std::env::args().nth(1).as_deref() == Some("backups") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::backups::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();

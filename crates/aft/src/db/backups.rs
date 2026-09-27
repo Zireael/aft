@@ -164,6 +164,68 @@ pub fn delete_backups_for_path(
     )
 }
 
+/// One backup stack as the database records it: the rows that share one
+/// `(harness, session, path_hash)` identity, summarized without their content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupStackSummary {
+    pub harness: String,
+    pub session_id: String,
+    pub path_hash: String,
+    pub file_path: String,
+    pub rows: usize,
+}
+
+/// List every recorded backup stack, optionally narrowed to one harness and/or
+/// one session. The purge command uses this to find stacks whose rows outlived
+/// their files as well as ordinary ones.
+pub fn list_backup_stacks(
+    conn: &Connection,
+    harness: Option<&str>,
+    session_id: Option<&str>,
+) -> rusqlite::Result<Vec<BackupStackSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, path_hash, MIN(file_path), COUNT(*)
+         FROM backups
+         WHERE (?1 IS NULL OR harness = ?1) AND (?2 IS NULL OR session_id = ?2)
+         GROUP BY harness, session_id, path_hash
+         ORDER BY harness, session_id, path_hash",
+    )?;
+    let rows = stmt
+        .query_map(params![harness, session_id], |row| {
+            Ok(BackupStackSummary {
+                harness: row.get(0)?,
+                session_id: row.get(1)?,
+                path_hash: row.get(2)?,
+                file_path: row.get(3)?,
+                rows: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        })?
+        .collect();
+    rows
+}
+
+/// Distinct harness segments that have at least one backup row.
+pub fn list_backup_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT harness FROM backups ORDER BY harness")?;
+    let rows = stmt.query_map([], |row| row.get(0))?.collect();
+    rows
+}
+
+/// Number of rows recorded for one `(harness, session, path_hash)` stack.
+pub fn count_backups_for_path(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    path_hash: &str,
+) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM backups WHERE harness = ?1 AND session_id = ?2 AND path_hash = ?3",
+        params![harness, session_id, path_hash],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
+}
+
 fn map_backup_row(row: &Row<'_>) -> rusqlite::Result<BackupRow> {
     let order_blob: Vec<u8> = row.get(5)?;
     let order = order_from_blob(&order_blob).unwrap_or_default();

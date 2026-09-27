@@ -12,6 +12,8 @@ use crate::db::backups::BackupRow;
 use crate::error::AftError;
 use sha2::{Digest, Sha256};
 
+pub mod purge;
+
 pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 /// Default upper bound for one automatic undo snapshot (64 MiB).
 pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
@@ -3163,7 +3165,8 @@ impl BackupStore {
     }
 
     fn remove_disk_backups_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
-        self.remove_db_backups(session, key);
+        // Failures are logged inside; disk stays authoritative for this caller.
+        let _ = self.remove_db_backups(session, key);
         let removed = self.disk_index.get_mut(session).and_then(|s| s.remove(key));
         if let Some(meta) = removed {
             if let Err(error) = std::fs::remove_dir_all(&meta.dir) {
@@ -3198,9 +3201,12 @@ impl BackupStore {
         Ok(())
     }
 
-    fn remove_db_backups(&self, session: &str, key: &Path) {
+    /// Delete the SQLite rows mirroring `(session, key)`. Returns the failure so
+    /// callers that must not remove disk content after a failed row delete (the
+    /// purge command) can stop; ordinary callers log and continue.
+    fn remove_db_backups(&self, session: &str, key: &Path) -> Result<(), String> {
         let Some((pool, harness)) = self.db_pool_and_harness() else {
-            return;
+            return Ok(());
         };
         let conn = match pool.lock() {
             Ok(conn) => conn,
@@ -3210,14 +3216,17 @@ impl BackupStore {
                     "delete backup DB rows failed for {}: db mutex poisoned",
                     key.display()
                 );
-                return;
+                return Err("db mutex poisoned".to_string());
             }
         };
         let path_hash = Self::path_hash(key);
         match crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash) {
             // Do not retain synchronization state for an absent stack. A future
             // first append can cheaply establish its one-row baseline again.
-            Ok(_) => self.set_db_mirror_synced(session, key, false),
+            Ok(_) => {
+                self.set_db_mirror_synced(session, key, false);
+                Ok(())
+            }
             Err(error) => {
                 self.set_db_mirror_synced(session, key, false);
                 crate::slog_warn!(
@@ -3225,6 +3234,7 @@ impl BackupStore {
                     key.display(),
                     error
                 );
+                Err(error.to_string())
             }
         }
     }
