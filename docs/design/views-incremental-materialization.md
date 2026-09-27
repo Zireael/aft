@@ -277,6 +277,76 @@ AST ordinals, so any structural edit early in a file renumbers every later row. 
 ordinal-free IDs would turn most owned-row churn into no-ops. That would change the ID contract
 shared with legacy readers, so it is listed as a lever, not proposed here.
 
+### 4.3 Incremental versus cold: measured crossover (2026-09-27)
+
+Harness: `views::materialization::tests::bench_incremental_cutoff_crossover` (ignored, macOS,
+release). It clones opencode with `git clone --shared` into `/tmp` (the source checkout is only
+read), publishes the base and each target into isolated view storage to get real manifests and
+blobs, then per target times (a) a cold build into a new file and (b) a one-step clone of the cold
+base plus `apply_manifest_diff`. Both keep a keeper connection open, as publication does, so
+neither pays the checkpoint. Every first repetition passed the parity check against the cold
+build.
+
+Base `f7d5a1cbc725` (opencode, 6,288 manifest entries, derived file 408,887,296 bytes). Real
+targets are first-parent ancestors; synthetic targets insert one exported function at the top of
+evenly spread `.ts`/`.tsx` files (renumbering every later ordinal in those files) and change no
+resolver configuration. `full` is `MaterializeStats::full_resolution`. Host load average was 6–21
+(other workers), so wall time is noisy; CPU seconds are the steadier column.
+
+| target | changed / entries | config changed | full | cold wall / CPU s | clone + patch wall / CPU s |
+|---|---:|:---:|:---:|---:|---:|
+| `3238daa8` | 13 / 6,284 (0.2%) | no | no | 8.98 / 8.86 | 0.51 + 0.36 / 0.83 |
+| `95ebf50a` | 62 / 6,281 (1.0%) | no | no | 9.22 / 8.83 | 0.50 + 0.58 / 1.13 |
+| `27734409` | 257 / 6,254 (4.1%) | yes | no | 8.77–10.72 / 8.65–10.21 | 0.48 + 2.13 – 0.76 + 2.47 / 2.72–3.07 |
+| `373cd08b` | 588 / 6,108 (9.6%) | yes | **yes** | 8.91–9.85 / 8.35–9.26 | 8.09–9.70 / 8.15–9.37 |
+| `b5f92c9f` | 1,020 / 6,022 (16.9%) | yes | **yes** | 8.14–10.59 / 8.01–9.79 | 9.25–11.20 / 8.80–10.59 |
+| `31b58b47` | 1,428 / 5,848 (24.4%) | yes | **yes** | 7.80 / 7.67 | 9.97 / 9.73 |
+| `ca8db315` | 2,010 / 5,739 (35.0%) | yes | **yes** | 7.86 / 7.72 | 8.97 / 8.96 |
+| `a78adb1b` | 2,867 / 5,380 (53.3%) | yes | **yes** | 7.13 / 6.85 | 9.31 / 8.70 |
+| `0c9cfe92` | 3,358 / 4,931 (68.1%) | yes | **yes** | 5.86 / 5.75 | 8.01 / 7.72 |
+| `91bd2952` | 4,360 / 4,654 (93.7%) | yes | **yes** | 4.91 / 4.80 | 6.71 / 6.56 |
+| synthetic 2% | 125 / 6,288 | no | no | 12.66 / 11.26 | 2.97 / 2.88 |
+| synthetic 5% | 314 / 6,288 | no | no | 11.71 / 10.91 | 4.66 / 4.46 |
+| synthetic 10% | 628 / 6,288 | no | no | 13.45 / 12.15 | 7.11 / 6.11 |
+| synthetic 20% | 1,257 / 6,288 | no | no | 10.68 / 10.14 | 7.61 / 6.82 |
+| synthetic 25% | 1,572 / 6,288 | no | no | 10.62 / 10.23 | 8.24 / 7.97 |
+| synthetic 30% | 1,886 / 6,288 | no | no | 12.53–19.31 / 11.53–14.86 | 11.48–27.90 / 10.39–11.87 |
+| synthetic 40% | 2,515 / 6,288 | no | no | 9.81–13.73 / 9.15–14.17 | 8.82–14.12 / 8.17–11.68 |
+| synthetic 45% | 2,829 / 6,288 | no | no | 8.66–9.28 / 8.26–8.89 | 9.04–9.20 / 8.54–8.71 |
+
+Ranges are two repetitions or separate runs. The 30% row's upper incremental wall includes a
+13.4 s clone during a load spike; its CPU columns stay close.
+
+Findings:
+
+1. **The crossover depends on full resolution, not only on diff size.** With pruned resolution the
+   patch stays cheaper than cold up to about 40% changed entries and ties at 45%. Once the patch
+   re-resolves every caller (3,900–4,000 resolved files here, triggered by `package.json` changes
+   whose consulted facts were unattributed), it costs about as much as a cold build at 9.6% and
+   more above that.
+2. **The 25% linear model was wrong in both directions.** Patch cost is not linear in changed
+   entries: resolved callers saturate (2,000–3,000 files between 20% and 45%), so pruned patches
+   stay cheap longer than the model predicted, while forced full resolution costs ~8 s even for a
+   moderate diff.
+3. **Full resolution cannot be predicted exactly before patching** (unattributed callers are only
+   known after loading bindings), so the cutoff uses a manifest-only proxy: a changed resolver
+   configuration file (`view_resolution_config`, or an entry marked `resolution_input`) or a
+   changed symlink, gitlink or synthetic entry. `27734409` shows the proxy is conservative: it
+   changed configuration without forcing full resolution, and at 4.1% it stays incremental anyway.
+4. **One-step clone of a 390 MiB derived file took 0.44–0.97 s** at load 6–11, against the
+   ~3 s the stepped backup was projected to take at this size (§4.1).
+
+Implemented cutoff (`views::assembly::diff_exceeds_incremental_cutoff`), decided before cloning so
+an oversized diff also skips the copy:
+
+- fewer than 100 changed entries: always patch;
+- a resolver input, symlink, gitlink or synthetic entry changed: cold above **10%**;
+- otherwise: cold above **40%**.
+
+The decision is logged as `view manifest diff: ... path=cold reason=large_diff` and counted in
+`views.cold_builds.large_diff`. The constants are calibrated on one corpus (TypeScript-heavy,
+~6,300 entries); a much larger or Rust-heavy root may move both crossovers.
+
 ## 5. Gaps found
 
 - **G1 — the clone became a full copy (and a full-size temporary file) again.** Cause:
@@ -409,7 +479,7 @@ Decide in `prepare_checkout` before materializing, and again on error:
 | **fingerprint mismatch** | discard the clone and cold-materialize into a fresh file; log `reason=base_fingerprint_mismatch` (closes G2) |
 | **base unreadable**: backup or open fails with `SQLITE_CORRUPT`/`SQLITE_NOTADB`, or `quick_check` fails | cold into a fresh file; quarantine the base (keep it for inspection, never reuse it); log the reason. Do not run `integrity_check` on the hot path: it scans the whole file |
 | missing blob during the diff | **not** a fallback: the transaction rolls back and the path is reported pending (cold would fail the same way) |
-| **diff too large**: changed callgraph entries > 25 % of manifest entries, or `full_resolution` would be forced **and** changed entries > 10 % | cold (closes G3). Calibrate both constants with a sweep of the real-pair benchmark at 1 %, 5 %, 10 %, 25 % and 50 % synthetic change, and set them at the measured crossover. The 25 % starting point comes from a linear model: ≈1.2 s fixed + ≈15 ms per entry, against a ≈24 s cold build |
+| **diff too large** | cold (closes G3). Implemented with measured constants, see §4.3: cold above 10% changed entries when a resolver input, symlink, gitlink or synthetic entry changed, otherwise above 40%, never below 100 changed entries. The original proposal (25%, or 10% with forced full resolution, from a linear model of ≈1.2 s fixed + ≈15 ms per entry against a ≈24 s cold build) did not match the measurement |
 | recycle is ineligible | clone path |
 
 Every fallback is observable: extend the existing `view manifest diff` log line with

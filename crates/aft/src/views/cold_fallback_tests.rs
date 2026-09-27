@@ -318,3 +318,138 @@ fn small_diff_patches_a_clone_of_the_base() {
         "a small diff must patch the clone"
     );
 }
+
+#[test]
+fn diff_above_the_cutoff_builds_cold() {
+    // Enough files that editing just over the cutoff share also clears the
+    // minimum changed-entry floor.
+    let files = (INCREMENTAL_CUTOFF_MIN_CHANGED * 100).div_ceil(INCREMENTAL_CUTOFF_PERCENT) + 8;
+    let edited = files * INCREMENTAL_CUTOFF_PERCENT / 100 + 1;
+    assert!(edited >= INCREMENTAL_CUTOFF_MIN_CHANGED && edited <= files);
+    let project = repository(files);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, _) = publish_marked_base(project.path(), storage.path());
+
+    let published = publish_edit(
+        project.path(),
+        storage.path(),
+        &view,
+        &(0..edited).collect::<Vec<_>>(),
+    );
+
+    assert_eq!(
+        published.counts,
+        ColdBuildCounts {
+            large_diff: 1,
+            ..ColdBuildCounts::default()
+        }
+    );
+    assert!(
+        !has_marker(&published.derived),
+        "an oversized diff must not patch"
+    );
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn configuration_change_lowers_the_cutoff() {
+    // Between the two cutoff shares: this many edits patch when no resolver
+    // input changed and build cold when package.json changed as well.
+    let files = INCREMENTAL_CUTOFF_MIN_CHANGED * 4;
+    let edited =
+        files * (INCREMENTAL_CUTOFF_PERCENT + INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION) / 200;
+    assert!(edited >= INCREMENTAL_CUTOFF_MIN_CHANGED);
+    for configuration_changed in [false, true] {
+        let project = repository(files);
+        fs::write(
+            project.path().join("package.json"),
+            "{\"name\":\"fixture\"}\n",
+        )
+        .unwrap();
+        git(project.path(), &["add", "package.json"]);
+        git(
+            project.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "package",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let (view, _) = publish_marked_base(project.path(), storage.path());
+        let mut changed = (0..edited)
+            .map(|index| edit(project.path(), index))
+            .collect::<Vec<_>>();
+        if configuration_changed {
+            fs::write(
+                project.path().join("package.json"),
+                "{\"name\":\"fixture-renamed\"}\n",
+            )
+            .unwrap();
+            changed.push("package.json".to_string());
+        }
+        let report =
+            publish_checkout(&request(project.path(), storage.path(), "head-2", &changed)).unwrap();
+        assert!(report.published);
+        let derived = view
+            .derived_path(report.generation.as_deref().unwrap())
+            .unwrap();
+        wait_for_no_connections(&derived);
+        let counts = cold_build_counts(view.view_dir());
+        if configuration_changed {
+            assert_eq!(
+                counts,
+                ColdBuildCounts {
+                    large_diff: 1,
+                    ..ColdBuildCounts::default()
+                }
+            );
+            assert!(!has_marker(&derived));
+        } else {
+            assert_eq!(counts, ColdBuildCounts::default());
+            assert!(
+                has_marker(&derived),
+                "no resolver input changed; the diff must patch"
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_cutoff_boundaries() {
+    use super::super::materialization::ManifestDiffSize;
+    let entries = 10_000;
+    for (may_force_full_resolution, percent) in [
+        (false, INCREMENTAL_CUTOFF_PERCENT),
+        (true, INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION),
+    ] {
+        let at = |changed, entries| {
+            diff_exceeds_incremental_cutoff(ManifestDiffSize {
+                changed,
+                entries,
+                may_force_full_resolution,
+            })
+        };
+        let threshold = entries * percent / 100;
+        assert!(
+            !at(threshold, entries),
+            "exactly at the share still patches (full={may_force_full_resolution})"
+        );
+        assert!(
+            at(threshold + 1, entries),
+            "above the share builds cold (full={may_force_full_resolution})"
+        );
+        assert!(!at(0, entries));
+        let small = INCREMENTAL_CUTOFF_MIN_CHANGED - 1;
+        assert!(
+            !at(small, small),
+            "below the floor always patches, even at 100% (full={may_force_full_resolution})"
+        );
+    }
+    assert!(INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION < INCREMENTAL_CUTOFF_PERCENT);
+}

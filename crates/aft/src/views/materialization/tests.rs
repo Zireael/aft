@@ -486,6 +486,263 @@ fn bench_real_manifest_diff() {
     }
 }
 
+/// Calibrates the incremental-versus-cold cutoff in `views::assembly`.
+///
+/// Clones `AFT_VIEW_CUTOFF_SOURCE` with `git clone --shared` into a fresh
+/// directory (the source checkout is only read), publishes
+/// `AFT_VIEW_CUTOFF_BASE` and every comma-separated revision in
+/// `AFT_VIEW_CUTOFF_TARGETS` into isolated view storage to obtain real
+/// manifests and blobs, then times, per target, a cold build into a new file
+/// against a clone of the cold base plus `apply_manifest_diff`. Both paths
+/// keep a keeper connection open, as publication does, so neither pays a
+/// checkpoint on close.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "offline cutoff calibration; builds its own clone and isolated view storage"]
+fn bench_incremental_cutoff_crossover() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let source = var("AFT_VIEW_CUTOFF_SOURCE");
+    let base_revision = var("AFT_VIEW_CUTOFF_BASE");
+    let targets = std::env::var("AFT_VIEW_CUTOFF_TARGETS").unwrap_or_default();
+    let repetitions = std::env::var("AFT_VIEW_BENCH_REPETITIONS")
+        .map(|value| value.parse::<usize>().expect("benchmark repetitions"))
+        .unwrap_or(1);
+    let out = tempfile::tempdir_in(
+        std::env::var_os("AFT_VIEW_CUTOFF_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir),
+    )
+    .unwrap();
+    println!("cutoff calibration directory: {}", out.path().display());
+    let checkout = out.path().join("checkout");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&[
+        "clone",
+        "--shared",
+        "--quiet",
+        "--no-checkout",
+        &source,
+        checkout.to_str().unwrap(),
+    ]);
+    let storage = out.path().join("storage");
+    let publish = |revision: &str| -> Manifest {
+        git(&[
+            "-C",
+            checkout.to_str().unwrap(),
+            "checkout",
+            "--quiet",
+            "--force",
+            revision,
+        ]);
+        let started = std::time::Instant::now();
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: checkout.clone(),
+                family: "cutoff".into(),
+                scope: "cutoff".into(),
+                desired_head: revision.into(),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+            })
+            .unwrap();
+        println!(
+            "published {revision} in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        report
+            .manifest
+            .expect("distinct revisions publish a manifest")
+    };
+    let base = publish(&base_revision);
+    let mut targets = targets
+        .split(',')
+        .filter(|revision| !revision.is_empty())
+        .map(|revision| (revision.to_string(), publish(revision)))
+        .collect::<Vec<_>>();
+    // Synthetic targets edit a share of the base's TypeScript files and change
+    // no resolver configuration, so they measure the pruned incremental path
+    // at diff sizes where real history also changed configuration.
+    for percent in std::env::var("AFT_VIEW_CUTOFF_SYNTHETIC")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.is_empty())
+    {
+        let percent = percent.parse::<usize>().expect("synthetic percent");
+        let candidates = base
+            .entries()
+            .filter_map(|(path, entry)| {
+                let path = std::str::from_utf8(path.as_bytes()).ok()?;
+                let typescript = path.ends_with(".ts") || path.ends_with(".tsx");
+                matches!(entry, ManifestEntry::Regular { planes, resolution_input: false, .. } if planes.callgraph.is_some())
+                    .then_some(path.to_string())
+                    .filter(|_| typescript)
+            })
+            .collect::<Vec<_>>();
+        let wanted = base.entries().count() * percent / 100;
+        assert!(
+            wanted <= candidates.len(),
+            "{percent}% needs {wanted} files; only {} TypeScript files",
+            candidates.len()
+        );
+        git(&[
+            "-C",
+            checkout.to_str().unwrap(),
+            "checkout",
+            "--quiet",
+            "--force",
+            &base_revision,
+        ]);
+        // Spread the edits across the tree instead of taking one directory.
+        for index in 0..wanted {
+            let path = checkout.join(&candidates[index * candidates.len() / wanted]);
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!("export function cutoff_probe_{index}() {{}}\n{source}"),
+            )
+            .unwrap();
+        }
+        let label = format!("synthetic-{percent}pct");
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: checkout.clone(),
+                family: "cutoff".into(),
+                scope: "cutoff".into(),
+                desired_head: label.clone(),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+            })
+            .unwrap();
+        targets.push((label, report.manifest.expect("synthetic manifest")));
+    }
+    let blobs = crate::blob_store::BlobStore::open(
+        &storage,
+        "cutoff".to_string(),
+        crate::blob_store::BlobPlane::Callgraph,
+    )
+    .unwrap()
+    .path()
+    .to_path_buf();
+    let keeper = |path: &Path| {
+        let keeper =
+            crate::db::file_identity::IdentityConnection::open(path, "cutoff calibration keeper")
+                .unwrap();
+        keeper.pragma_update(None, "journal_mode", "WAL").unwrap();
+        keeper
+            .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        keeper
+    };
+    let remove = |path: &Path| {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    };
+    let wal_bytes = |path: &Path| {
+        std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    let base_db = out.path().join("base.sqlite");
+    materialize_manifest_view_database(&base_db, &blobs, &base).unwrap();
+    let base_bytes = std::fs::metadata(&base_db).unwrap().len();
+    println!(
+        "base entries={} derived_bytes={base_bytes}",
+        base.entries().count()
+    );
+    for (index, (revision, target)) in targets.iter().enumerate() {
+        let size = manifest_diff_size(&base, target);
+        let callgraph_changed = base
+            .entries()
+            .chain(target.entries())
+            .filter(|(path, _)| base.get(path) != target.get(path))
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| {
+                let key = |manifest: &Manifest| match manifest.get(path) {
+                    Some(ManifestEntry::Regular { planes, .. }) => planes.callgraph.clone(),
+                    _ => None,
+                };
+                key(&base).is_some() || key(target).is_some()
+            })
+            .count();
+        let changed_paths = base
+            .entries()
+            .chain(target.entries())
+            .filter(|(path, _)| base.get(path) != target.get(path))
+            .map(|(path, _)| path.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+        let special_entry_changed = requires_full_resolution(&base, target, &changed_paths);
+        let configuration_changed = changed_paths
+            .iter()
+            .any(|path| join::view_resolution_config(path));
+        for run in 1..=repetitions {
+            let mut load = [0.0; 3];
+            unsafe {
+                libc::getloadavg(load.as_mut_ptr(), 3);
+            }
+            let cold = out.path().join(format!("cold-{index}-{run}.sqlite"));
+            let cold_keeper = keeper(&cold);
+            let before = usage();
+            let started = std::time::Instant::now();
+            materialize_manifest_view_database(&cold, &blobs, target).unwrap();
+            let cold_s = started.elapsed().as_secs_f64();
+            let cold_cpu = usage().2 - before.2;
+            let cold_wal = wal_bytes(&cold);
+
+            let incremental = out.path().join(format!("incremental-{index}-{run}.sqlite"));
+            let before = usage();
+            let started = std::time::Instant::now();
+            crate::views::generation::clone_derived(&base_db, &incremental).unwrap();
+            let clone_s = started.elapsed().as_secs_f64();
+            let incremental_keeper = keeper(&incremental);
+            let started = std::time::Instant::now();
+            let (stats, _) = materialize(&incremental, &blobs, target, Some(&base)).unwrap();
+            let patch_s = started.elapsed().as_secs_f64();
+            let incremental_cpu = usage().2 - before.2;
+            let incremental_wal = wal_bytes(&incremental);
+            println!(
+                "cutoff target={revision} run={run} changed={} callgraph_changed={callgraph_changed} entries={} changed_pct={:.1} cold_s={cold_s:.2} clone_s={clone_s:.2} patch_s={patch_s:.2} incremental_s={:.2} cold_cpu_s={cold_cpu:.2} incremental_cpu_s={incremental_cpu:.2} cold_wal={cold_wal} incremental_wal={incremental_wal} full_resolution={} special_entry_changed={special_entry_changed} configuration_changed={configuration_changed} may_force_full_resolution={} cutoff_decision={} resolved_files={} load={:.1}",
+                size.changed,
+                size.entries,
+                size.changed as f64 * 100.0 / size.entries as f64,
+                clone_s + patch_s,
+                stats.full_resolution,
+                size.may_force_full_resolution,
+                if crate::views::assembly::diff_exceeds_incremental_cutoff(size) {
+                    "cold"
+                } else {
+                    "incremental"
+                },
+                stats.resolved_files,
+                load[0],
+            );
+            drop(cold_keeper);
+            drop(incremental_keeper);
+            if run == 1 && std::env::var_os("AFT_VIEW_CUTOFF_SKIP_PARITY").is_none() {
+                assert_snapshot_parity(&snapshot(&cold), &snapshot(&incremental));
+            }
+            remove(&cold);
+            remove(&incremental);
+        }
+    }
+}
+
 #[test]
 fn added_and_removed_targets_relink_previously_unresolved_callers() {
     let f = fixture();

@@ -108,6 +108,61 @@ pub(crate) fn is_base_fingerprint_mismatch(error: &CallGraphStoreError) -> bool 
     matches!(error, CallGraphStoreError::Unavailable(message) if message == BASE_FINGERPRINT_MISMATCH)
 }
 
+/// Size of the manifest change an incremental materialization would apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManifestDiffSize {
+    /// Paths whose entry was added, removed or changed. This is the same set
+    /// `apply_manifest_diff` rewrites as owned rows.
+    pub changed: usize,
+    /// Entries in the target manifest.
+    pub entries: usize,
+    /// A changed path is resolver configuration (`package.json`,
+    /// `tsconfig*.json`, `Cargo.toml`, ...) or a symlink, gitlink or synthetic
+    /// entry. Those are the changes that can force `apply_manifest_diff` to
+    /// re-resolve every caller instead of only the affected ones.
+    pub may_force_full_resolution: bool,
+}
+
+pub(crate) fn manifest_diff_size(
+    base: &crate::views::Manifest,
+    next: &crate::views::Manifest,
+) -> ManifestDiffSize {
+    let forces_full_resolution =
+        |path: &crate::views::RelPath, entry: &crate::views::ManifestEntry| {
+            join::view_resolution_config(path.as_bytes())
+                || matches!(
+                    entry,
+                    crate::views::ManifestEntry::Regular {
+                        resolution_input: true,
+                        ..
+                    } | crate::views::ManifestEntry::Symlink { .. }
+                        | crate::views::ManifestEntry::Gitlink { .. }
+                        | crate::views::ManifestEntry::Synthetic { .. }
+                )
+        };
+    let mut changed = 0;
+    let mut may_force_full_resolution = false;
+    for (path, entry) in base.entries() {
+        let next_entry = next.get(path);
+        if next_entry != Some(entry) {
+            changed += 1;
+            may_force_full_resolution |= forces_full_resolution(path, entry)
+                || next_entry.is_some_and(|next_entry| forces_full_resolution(path, next_entry));
+        }
+    }
+    for (path, entry) in next.entries() {
+        if base.get(path).is_none() {
+            changed += 1;
+            may_force_full_resolution |= forces_full_resolution(path, entry);
+        }
+    }
+    ManifestDiffSize {
+        changed,
+        entries: next.entries().count(),
+        may_force_full_resolution,
+    }
+}
+
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
         .to_json_bytes()

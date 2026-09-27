@@ -498,13 +498,25 @@ pub fn prepare_checkout(
         let mut cold_build: Option<(ColdBuildReason, String)> = None;
         let mut incremental_base = None;
         if let Some((base_path, base_manifest)) = base {
-            match super::generation::clone_derived(&base_path, &derived) {
-                Ok(_) => incremental_base = Some(base_manifest),
-                Err(error) if view_error_is_unreadable_database(&error) => {
-                    cold_build = Some((ColdBuildReason::BaseUnreadable, error.to_string()));
-                    super::generation::remove_unpublished_derived(&derived)?;
+            let size = super::materialization::manifest_diff_size(&base_manifest, &manifest);
+            if diff_exceeds_incremental_cutoff(size) {
+                // Decided before cloning, so an oversized diff also skips the copy.
+                cold_build = Some((
+                    ColdBuildReason::LargeDiff,
+                    format!(
+                        "changed={} entries={} may_force_full_resolution={}",
+                        size.changed, size.entries, size.may_force_full_resolution
+                    ),
+                ));
+            } else {
+                match super::generation::clone_derived(&base_path, &derived) {
+                    Ok(_) => incremental_base = Some(base_manifest),
+                    Err(error) if view_error_is_unreadable_database(&error) => {
+                        cold_build = Some((ColdBuildReason::BaseUnreadable, error.to_string()));
+                        super::generation::remove_unpublished_derived(&derived)?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
         prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
@@ -561,11 +573,19 @@ pub fn prepare_checkout(
             prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));
             if let Some((reason, detail)) = &cold_build {
                 record_cold_build(view.view_dir(), *reason);
-                log::warn!(
-                    "view manifest diff: generation={} path=cold reason={} error={detail}",
-                    next_generation,
-                    reason.as_str()
-                );
+                if *reason == ColdBuildReason::LargeDiff {
+                    log::info!(
+                        "view manifest diff: generation={} path=cold reason={} {detail}",
+                        next_generation,
+                        reason.as_str()
+                    );
+                } else {
+                    log::warn!(
+                        "view manifest diff: generation={} path=cold reason={} error={detail}",
+                        next_generation,
+                        reason.as_str()
+                    );
+                }
             }
             crate::callgraph_store::materialize_manifest_view_database(
                 &derived,
@@ -833,6 +853,9 @@ enum ColdBuildReason {
     /// SQLite reported the current generation's database as corrupt or not a
     /// database while copying or patching it.
     BaseUnreadable,
+    /// The manifest diff is large enough that patching costs more than a
+    /// cold build.
+    LargeDiff,
 }
 
 impl ColdBuildReason {
@@ -840,6 +863,7 @@ impl ColdBuildReason {
         match self {
             Self::BaseFingerprintMismatch => "base_fingerprint_mismatch",
             Self::BaseUnreadable => "base_unreadable",
+            Self::LargeDiff => "large_diff",
         }
     }
 }
@@ -858,6 +882,7 @@ enum PatchFailure {
 pub struct ColdBuildCounts {
     pub base_fingerprint_mismatch: u64,
     pub base_unreadable: u64,
+    pub large_diff: u64,
 }
 
 static COLD_BUILDS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, ColdBuildCounts>>> =
@@ -872,6 +897,7 @@ fn record_cold_build(view_dir: &Path, reason: ColdBuildReason) {
     match reason {
         ColdBuildReason::BaseFingerprintMismatch => entry.base_fingerprint_mismatch += 1,
         ColdBuildReason::BaseUnreadable => entry.base_unreadable += 1,
+        ColdBuildReason::LargeDiff => entry.large_diff += 1,
     }
 }
 
@@ -883,6 +909,34 @@ pub fn cold_build_counts(view_dir: &Path) -> ColdBuildCounts {
         .get(view_dir)
         .copied()
         .unwrap_or_default()
+}
+
+// Calibrated on opencode (about 6,300 manifest entries); the measurements are
+// in docs/design/views-incremental-materialization.md, section 4.3.
+
+/// Diffs with fewer changed entries than this always patch. Patching 62
+/// changed entries took about 1 s on opencode, so small diffs never need the
+/// cutoff, and small repositories keep exercising the incremental path.
+const INCREMENTAL_CUTOFF_MIN_CHANGED: usize = 100;
+/// Share of the target manifest's entries (in percent) above which a cold
+/// build replaces patching when no resolver input changed. Patching used
+/// about 10% less CPU than a cold build at 40% changed entries and the same
+/// at 45%.
+const INCREMENTAL_CUTOFF_PERCENT: usize = 40;
+/// The same share when resolver configuration or a symlink, gitlink or
+/// synthetic entry changed. Such a diff can make the patch re-resolve every
+/// caller, and then it cost as much as a cold build at about 10%.
+const INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION: usize = 10;
+
+pub(crate) fn diff_exceeds_incremental_cutoff(
+    size: super::materialization::ManifestDiffSize,
+) -> bool {
+    let percent = if size.may_force_full_resolution {
+        INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION
+    } else {
+        INCREMENTAL_CUTOFF_PERCENT
+    };
+    size.changed >= INCREMENTAL_CUTOFF_MIN_CHANGED && size.changed * 100 > size.entries * percent
 }
 
 fn sqlite_error_is_unreadable_database(error: &rusqlite::Error) -> bool {
