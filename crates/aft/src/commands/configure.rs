@@ -10666,7 +10666,9 @@ mod tests {
         PlainClone,
         /// `git worktree add --detach scratch <older commit>` from the live repo.
         LinkedWorktree,
-        /// `cp -R live scratch`, then detach at the older commit.
+        /// `cp -R live scratch`, then detach at the older commit. Unix only,
+        /// like the test that uses it.
+        #[cfg(unix)]
         CopiedTree,
     }
 
@@ -10809,6 +10811,7 @@ mod tests {
                     ],
                 );
             }
+            #[cfg(unix)]
             OlderCheckoutKind::CopiedTree => {
                 assert!(Command::new("cp")
                     .args(["-R", "live", "scratch"])
