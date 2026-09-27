@@ -290,12 +290,18 @@ fn glob_root(
     });
 
     match indexed {
-        Some(discovery) if discovery.scope_has_files => discovery,
-        // The index is ready but holds no file under this root: the caller
-        // named a directory an ignore rule keeps out of the index (a gitignored
-        // `node_modules/pkg`, for example) or a symlinked directory the index
-        // walk never follows. Walk it rather than report zero files; the walk
-        // applies ignore rules only to entries nested inside the named root.
+        Some(discovery)
+            if discovery.scope_has_files
+                || crate::grep_executor::is_same_directory(&search_scope.root, project_root) =>
+        {
+            discovery
+        }
+        // The index is ready but holds no file under this explicitly named
+        // subdirectory: an ignore rule keeps it out of the index (a gitignored
+        // `node_modules/pkg`, for example) or it is a symlinked directory the
+        // index walk never follows. Walk it rather than report zero files; the
+        // walk applies ignore rules only to entries nested inside the named
+        // root. A project-wide glob answers from the index even when empty.
         Some(_) => fallback_glob(project_root, &search_scope.root, pattern),
         None => {
             if search_scope.use_index {

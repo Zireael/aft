@@ -354,7 +354,10 @@ fn execute_root_profiled(
         let scope_started = Instant::now();
         let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
         let scope_elapsed = scope_started.elapsed();
-        if indexed_scope_has_files {
+        // A project-wide search always answers from the index, even when it
+        // holds no files (everything ignored, or an empty project): that is a
+        // real, complete answer, not a missing scope.
+        if indexed_scope_has_files || is_same_directory(&root.search_root, project_root) {
             let (result, mut query_timings) = snapshot.search_grep_profiled_with_filters_and_query(
                 pattern,
                 query,
@@ -374,7 +377,7 @@ fn execute_root_profiled(
                 },
             );
         }
-        // The index holds no file under this root. That is the case when the
+        // The index holds no file under this explicitly named subdirectory. That is the case when the
         // caller named a directory an ignore rule keeps out of the index (a
         // gitignored `node_modules/pkg`, for example) or a symlinked directory
         // the index walk never follows. Answering from the index would report
@@ -415,6 +418,16 @@ fn execute_root_profiled(
             ..GrepExecutionPhaseTimings::default()
         },
     )
+}
+
+/// True when both paths name the same directory, comparing the given forms
+/// first and then their canonical forms (symlinks, `\\?\` prefixes).
+pub(crate) fn is_same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepResult {
