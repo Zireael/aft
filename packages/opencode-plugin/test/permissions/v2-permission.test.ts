@@ -777,7 +777,8 @@ describe("OpenCode V2 permission consumer binding", () => {
     const bash = projectV2Tool("bash", definition as never, LOCATION);
 
     await expect(execute(bash, {})).rejects.toThrow(
-      'The "bash" operation was refused because this AFT runtime has no permission evaluator bound',
+      // On OpenCode 2 a bash ask is filed under the host's shell action.
+      'The "shell" operation was refused because this AFT runtime has no permission evaluator bound',
     );
   });
 });

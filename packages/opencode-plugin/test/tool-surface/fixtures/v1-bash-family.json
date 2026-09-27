@@ -1,0 +1,228 @@
+{
+  "bash": {
+    "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "workdir": {
+          "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+          "type": "string"
+        },
+        "wait": {
+          "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+          "type": "boolean"
+        },
+        "sandbox": {
+          "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+          "type": "string",
+          "const": "host"
+        },
+        "background": {
+          "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+          "type": "boolean"
+        },
+        "compressed": {
+          "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+          "type": "boolean"
+        },
+        "pty": {
+          "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+          "type": "boolean"
+        },
+        "ptyRows": {
+          "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "ptyCols": {
+          "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 140
+        }
+      },
+      "required": [
+        "command"
+      ]
+    }
+  },
+  "bash_status": {
+    "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          "type": "string"
+        },
+        "outputMode": {
+          "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
+          "type": "string",
+          "enum": [
+            "screen",
+            "raw",
+            "both"
+          ]
+        }
+      },
+      "required": [
+        "taskId"
+      ]
+    }
+  },
+  "bash_watch": {
+    "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "description": "Background task ID returned by bash({ background: true }).",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Substring or regex pattern. Optional in sync mode; required with background:true. Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "regex": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "regex"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "background": {
+          "description": "When true, register an async watch and return immediately. Defaults to false (sync wait).",
+          "type": "boolean"
+        },
+        "timeoutMs": {
+          "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800000
+        },
+        "once": {
+          "description": "Async-only. Defaults true; false keeps the watch sticky until task exit.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "taskId"
+      ]
+    }
+  },
+  "bash_kill": {
+    "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId"
+      ]
+    }
+  },
+  "bash_write": {
+    "description": "Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: \"pty\" first. Input is either a string (verbatim bytes) or an array mixing strings and { key: \"esc\" | \"enter\" | \"up\" | \"ctrl-c\" | ... } objects for atomic text+key sequences such as [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ]. Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. Maximum 1 MiB per call (post-expansion).",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "description": "Background PTY task ID returned by bash({ pty: true, background: true }).",
+          "type": "string"
+        },
+        "input": {
+          "description": "Either a string of verbatim bytes (e.g. 'print(1)\\n') OR an array mixing strings and { key: '<name>' } objects for atomic text+key sequences. Example: [ 'iHello', { key: 'esc' }, ':wq', { key: 'enter' } ].",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "key": {
+                        "description": "Named control key, e.g. 'esc', 'enter', 'up', 'ctrl-c'. Case-insensitive.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "key"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "taskId",
+        "input"
+      ]
+    }
+  },
+  "aft_delete": {
+    "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would copy more than 2,000 files or 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "files": {
+          "description": "Paths to delete (one or more). May include directories when recursive=true.",
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recursive": {
+          "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "files"
+      ]
+    }
+  }
+}

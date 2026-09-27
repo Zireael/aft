@@ -8,7 +8,7 @@ import { nativeRunnerFor } from "../lib/feature-plan.js";
 import { formatFsError } from "../lib/fs-errors.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import { ensureAftSchemaUrl } from "../lib/jsonc.js";
-import { intro, log, note, outro } from "../lib/prompts.js";
+import { confirm, intro, log, note, outro } from "../lib/prompts.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import {
   type FeatureSetupDeps,
@@ -27,6 +27,10 @@ export interface SetupOptions {
   findBinary?: (version: string) => string | null;
   /** Binary downloader (tests stub it; defaults to the one doctor --fix uses). */
   downloadBinary?: BinaryDownloader;
+  /** Answers the OpenCode 2 host-shell question (tests stub it; defaults to a prompt). */
+  confirmHostShell?: (message: string, defaultYes: boolean) => Promise<boolean>;
+  /** Whether setup may prompt; defaults to whether stdin is a terminal. */
+  interactive?: boolean;
 }
 
 export async function runSetup(argv: string[], options: SetupOptions = {}): Promise<number> {
@@ -67,6 +71,13 @@ export async function runSetup(argv: string[], options: SetupOptions = {}): Prom
   } else {
     const featureStatus = await runFeatureSetup(argv, features);
     if (featureStatus !== 0) anyFailure = true;
+  }
+
+  // Asked after the feature step, which can turn bash on or off: the answer
+  // depends on whether AFT's bash is there to replace the host's shell.
+  for (const adapter of nextSteps) {
+    if (!(adapter instanceof OpenCodeAdapter)) continue;
+    if ((await offerHostShellDisable(adapter, argv, options)) === "failed") anyFailure = true;
   }
 
   // Restart instructions come last, after every choice has been saved.
@@ -164,6 +175,51 @@ async function configureAdapter(
     failed = true;
   }
   return failed ? "failed" : "ok";
+}
+
+export const HOST_SHELL_QUESTION =
+  "OpenCode's own shell tool: disable it so agents use AFT's bash?";
+
+/**
+ * Offer to remove OpenCode 2's built-in shell tool plugin.
+ *
+ * OpenCode 2 registers its own command tool, `shell`, beside AFT's `bash`, and
+ * rewrites the description of anything named `shell`. Removing the host's
+ * shell plugin (`-opencode.tool.shell` under `plugins`) leaves AFT's bash as
+ * the one command tool. The default follows whether AFT's bash is enabled: with
+ * bash disabled, removing the host's shell would leave no command tool at all.
+ * A terminal run asks; `--yes` and non-terminal runs apply the default. Either
+ * way the write is idempotent. Other hosts are skipped.
+ */
+export async function offerHostShellDisable(
+  adapter: OpenCodeAdapter,
+  argv: string[],
+  options: SetupOptions = {},
+): Promise<"ok" | "failed" | "skipped"> {
+  if (adapter.hostShellState() === "not_applicable") return "skipped";
+  const bashOn = adapter.aftBashEnabled();
+  const interactive =
+    !argv.includes("--yes") &&
+    !argv.includes("-y") &&
+    (options.interactive ?? Boolean(process.stdin.isTTY));
+  const disable = interactive
+    ? await (options.confirmHostShell ?? confirm)(HOST_SHELL_QUESTION, bashOn)
+    : bashOn;
+  const result = adapter.setHostShellDisabled(disable);
+  if (!result.ok) {
+    log.error(`${adapter.displayName}: ${result.message}`);
+    return "failed";
+  }
+  if (result.action === "already_present") {
+    log.info(
+      `${adapter.displayName}: OpenCode's own shell tool is ${disable ? "already disabled" : "enabled"}${
+        disable ? "; agents use AFT's bash" : bashOn ? "" : " (AFT's bash is disabled)"
+      }`,
+    );
+  } else {
+    log.success(`${adapter.displayName}: ${result.message}`);
+  }
+  return "ok";
 }
 
 /**
