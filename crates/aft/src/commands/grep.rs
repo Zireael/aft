@@ -24,6 +24,9 @@ const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
 const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
+/// Text note for a grep or glob whose search path holds no searchable file.
+pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
+    "(No searchable files exist under the searched path, so nothing was searched.)";
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
@@ -174,6 +177,15 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
             text
+        ));
+    }
+    if !scope_has_files {
+        // Say in the text itself that nothing was searched, so an empty scope
+        // never reads as a searched directory with zero matches.
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n{}",
+            body["text"].as_str().unwrap_or_default(),
+            NO_FILES_IN_SCOPE_NOTE
         ));
     }
     if result.skipped_foreign_mounts > 0 {

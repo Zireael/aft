@@ -331,6 +331,13 @@ fn grep_reports_empty_scope_separately() {
     );
     assert_eq!(response["complete"], true);
     assert_eq!(response["no_files_matched_scope"], true);
+    assert!(
+        response["text"]
+            .as_str()
+            .expect("text")
+            .contains("nothing was searched"),
+        "grep text must say an empty scope searched nothing: {response:?}"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -394,6 +401,13 @@ fn glob_reports_empty_scope_separately() {
     );
     assert_eq!(response["complete"], true);
     assert_eq!(response["no_files_matched_scope"], true);
+    assert!(
+        response["text"]
+            .as_str()
+            .expect("text")
+            .contains("nothing was searched"),
+        "glob text must say an empty scope searched nothing: {response:?}"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -1217,6 +1231,248 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
         vec![expected_b],
         "**/b.rs must match nested file under path (indexed): {files:?}"
     );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ---------------------------------------------------------------------------
+// Explicitly named ignored / symlinked directories (ripgrep convention): a
+// directory the caller names in `path` is searched even when an ignore rule
+// matches it, and a symlinked root is resolved and walked. Without `path`,
+// the ignored directory stays out of project-wide results.
+// ---------------------------------------------------------------------------
+
+const DEP_NEEDLE: &str = "createBindingNeedle";
+
+/// Project with a gitignored `node_modules/pkg/` holding a matching file, a
+/// package directory `node_modules/linked` that is a symlink into a store
+/// folder (the bun layout), and one tracked source file that also matches.
+#[cfg(unix)]
+fn setup_dependency_project(fixture_id: &str) -> tempfile::TempDir {
+    let project = setup_project(&[
+        (".fixture-id", fixture_id),
+        (".gitignore", "node_modules/\n"),
+        ("src/app.js", "export const createBindingNeedle = 0;\n"),
+        (
+            "node_modules/pkg/index.js",
+            "export function createBindingNeedle() { return 1; }\n",
+        ),
+        (
+            "node_modules/.store/linked@1.0.0/node_modules/linked/index.cjs",
+            "exports.createBindingNeedle = function () { return 2; };\n",
+        ),
+    ]);
+    std::os::unix::fs::symlink(
+        ".store/linked@1.0.0/node_modules/linked",
+        project.path().join("node_modules/linked"),
+    )
+    .expect("create package symlink");
+    project
+}
+
+#[cfg(unix)]
+fn grep_in(aft: &mut AftProcess, id: &str, path: Option<&str>) -> Value {
+    let mut request = json!({
+        "id": id,
+        "command": "grep",
+        "pattern": DEP_NEEDLE,
+    });
+    if let Some(path) = path {
+        request["path"] = json!(path);
+    }
+    let response = send(aft, request);
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    response
+}
+
+#[cfg(unix)]
+fn matched_file_names(response: &Value) -> Vec<String> {
+    let mut names: Vec<String> = response["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|entry| {
+            entry["file"]
+                .as_str()
+                .expect("match file")
+                .replace('\\', "/")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+fn assert_explicit_dependency_dirs_searched(aft: &mut AftProcess, mode: &str) {
+    let ignored = grep_in(
+        aft,
+        &format!("grep-ignored-dir-{mode}"),
+        Some("node_modules/pkg"),
+    );
+    let files = matched_file_names(&ignored);
+    assert_eq!(
+        ignored["total_matches"], 1,
+        "{mode}: an explicitly named gitignored directory must be searched: {ignored:?}"
+    );
+    assert!(
+        files[0].ends_with("node_modules/pkg/index.js"),
+        "{mode}: unexpected match file {files:?}"
+    );
+    assert_eq!(
+        ignored["no_files_matched_scope"], false,
+        "{mode}: {ignored:?}"
+    );
+
+    let linked = grep_in(
+        aft,
+        &format!("grep-linked-dir-{mode}"),
+        Some("node_modules/linked"),
+    );
+    let files = matched_file_names(&linked);
+    assert_eq!(
+        linked["total_matches"], 1,
+        "{mode}: an explicitly named symlinked package directory must be searched: {linked:?}"
+    );
+    assert!(files[0].ends_with("index.cjs"), "{mode}: {files:?}");
+    assert_eq!(
+        linked["no_files_matched_scope"], false,
+        "{mode}: {linked:?}"
+    );
+
+    let ignored_glob = glob_files(
+        aft,
+        &format!("glob-ignored-dir-{mode}"),
+        "*",
+        Some("node_modules/pkg"),
+    );
+    assert_eq!(ignored_glob.len(), 1, "{mode}: {ignored_glob:?}");
+    assert!(
+        ignored_glob[0].ends_with("node_modules/pkg/index.js"),
+        "{mode}: {ignored_glob:?}"
+    );
+
+    let linked_glob = glob_files(
+        aft,
+        &format!("glob-linked-dir-{mode}"),
+        "*",
+        Some("node_modules/linked"),
+    );
+    assert_eq!(linked_glob.len(), 1, "{mode}: {linked_glob:?}");
+    assert!(
+        linked_glob[0].ends_with("index.cjs"),
+        "{mode}: {linked_glob:?}"
+    );
+
+    // Project-wide search keeps the ignored directory out.
+    let project_wide = grep_in(aft, &format!("grep-project-wide-{mode}"), None);
+    let files = matched_file_names(&project_wide);
+    assert_eq!(
+        files.len(),
+        1,
+        "{mode}: project-wide grep must not search the ignored directory: {project_wide:?}"
+    );
+    assert!(files[0].ends_with("src/app.js"), "{mode}: {files:?}");
+    let project_glob = glob_files(
+        aft,
+        &format!("glob-project-wide-{mode}"),
+        "**/index.*",
+        None,
+    );
+    assert!(
+        project_glob.is_empty(),
+        "{mode}: project-wide glob must not list the ignored directory: {project_glob:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_ignored_and_symlinked_dirs_are_searched_fallback() {
+    let project = setup_dependency_project("explicit_ignored_dirs_fallback\n");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    assert_explicit_dependency_dirs_searched(&mut aft, "fallback");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_ignored_and_symlinked_dirs_are_searched_indexed() {
+    let project = setup_dependency_project("explicit_ignored_dirs_indexed\n");
+    let mut aft = AftProcess::spawn();
+    configure_with_index(&mut aft, project.path());
+    wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "explicit-ignored-index-probe",
+            "command": "grep",
+            "pattern": DEP_NEEDLE,
+        })
+    });
+
+    assert_explicit_dependency_dirs_searched(&mut aft, "indexed");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_symlink_escaping_root_is_refused_when_restricted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let outside = dir.path().join("outside-store/pkg");
+    fs::create_dir_all(root.join("node_modules")).expect("create project");
+    fs::create_dir_all(&outside).expect("create outside store");
+    fs::write(root.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(
+        outside.join("index.js"),
+        "export const createBindingNeedle = 3;\n",
+    )
+    .expect("write outside file");
+    std::os::unix::fs::symlink(&outside, root.join("node_modules/escape"))
+        .expect("create escaping symlink");
+
+    let mut aft = AftProcess::spawn();
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "cfg-restricted",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(json!({
+                "restrict_to_project_root": true,
+                "indexes": { "trigram": false }
+            })),
+        }),
+    );
+    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+
+    for command in ["grep", "glob"] {
+        let response = send(
+            &mut aft,
+            json!({
+                "id": format!("{command}-escaping-symlink"),
+                "command": command,
+                "pattern": if command == "grep" { DEP_NEEDLE } else { "*" },
+                "path": "node_modules/escape",
+            }),
+        );
+        assert_eq!(
+            response["success"], false,
+            "{command}: a symlink resolving outside the root must be refused: {response:?}"
+        );
+        assert_eq!(
+            response["code"], "path_outside_root",
+            "{command}: {response:?}"
+        );
+    }
 
     let status = aft.shutdown();
     assert!(status.success());

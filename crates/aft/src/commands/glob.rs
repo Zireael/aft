@@ -179,6 +179,15 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
+    if !scope_has_files {
+        // Say in the text itself that nothing was searched, so an empty scope
+        // never reads as a searched directory with zero files.
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n{}",
+            body["text"].as_str().unwrap_or_default(),
+            crate::commands::grep::NO_FILES_IN_SCOPE_NOTE
+        ));
+    }
     if missing_on_disk > 0 {
         body["missing_on_disk_dropped"] = serde_json::json!(missing_on_disk);
         body["text"] = serde_json::Value::String(format!(
@@ -281,7 +290,13 @@ fn glob_root(
     });
 
     match indexed {
-        Some(discovery) => discovery,
+        Some(discovery) if discovery.scope_has_files => discovery,
+        // The index is ready but holds no file under this root: the caller
+        // named a directory an ignore rule keeps out of the index (a gitignored
+        // `node_modules/pkg`, for example) or a symlinked directory the index
+        // walk never follows. Walk it rather than report zero files; the walk
+        // applies ignore rules only to entries nested inside the named root.
+        Some(_) => fallback_glob(project_root, &search_scope.root, pattern),
         None => {
             if search_scope.use_index {
                 super::configure::trigger_search_index_reload_if_evicted(ctx);

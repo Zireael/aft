@@ -349,34 +349,48 @@ fn execute_root_profiled(
             }
         };
     let snapshot_acquire = snapshot_started.elapsed();
+    let mut index_lacks_scope = false;
     if let Some(snapshot) = indexed_snapshot {
         let scope_started = Instant::now();
         let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
         let scope_elapsed = scope_started.elapsed();
-        let (result, mut query_timings) = snapshot.search_grep_profiled_with_filters_and_query(
-            pattern,
-            query,
-            filters,
-            &root.search_root,
-            max_results,
-            params.path_exclusion,
-        );
-        query_timings.post_filter += scope_elapsed;
-        return (
-            result,
-            GrepExecutionPhaseTimings {
-                snapshot_acquire,
-                query_decomposition: Duration::ZERO,
-                query: query_timings,
-                indexed_scope_has_files: Some(indexed_scope_has_files),
-            },
-        );
+        if indexed_scope_has_files {
+            let (result, mut query_timings) = snapshot.search_grep_profiled_with_filters_and_query(
+                pattern,
+                query,
+                filters,
+                &root.search_root,
+                max_results,
+                params.path_exclusion,
+            );
+            query_timings.post_filter += scope_elapsed;
+            return (
+                result,
+                GrepExecutionPhaseTimings {
+                    snapshot_acquire,
+                    query_decomposition: Duration::ZERO,
+                    query: query_timings,
+                    indexed_scope_has_files: Some(indexed_scope_has_files),
+                },
+            );
+        }
+        // The index holds no file under this root. That is the case when the
+        // caller named a directory an ignore rule keeps out of the index (a
+        // gitignored `node_modules/pkg`, for example) or a symlinked directory
+        // the index walk never follows. Answering from the index would report
+        // zero matches for a directory that may be full of files, so walk it
+        // instead. This follows ripgrep: the walk never applies ignore rules to
+        // the named root itself, only to entries nested inside it. The walk
+        // keeps its usual file-count and time bounds.
+        index_lacks_scope = true;
     }
 
-    if root.use_index {
+    if root.use_index && !index_lacks_scope {
         crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
     }
-    let index_status = if root.use_index {
+    // A walk that replaces a ready index reports `Fallback`, so the response
+    // discloses that these results came from the filesystem, not the index.
+    let index_status = if root.use_index && !index_lacks_scope {
         if snapshot_timed_out {
             IndexStatus::Fallback
         } else {
