@@ -521,6 +521,17 @@ describe("exact OpenCode config pins", () => {
     ]);
   });
 
+  // Doctor plans "add the TUI sidebar entry" from this answer. OpenCode 2 has
+  // no TUI config, so planning that change there offered a repair that writes
+  // nothing.
+  test("a TUI config entry applies to V1 only", () => {
+    for (const generation of ["v1", "v2"] as const) {
+      const adapter = new ConfiguredOpenCodeAdapter(tempRoot(`aft-cli-tui-applies-${generation}-`));
+      adapter.useHostDetection(detection(generation));
+      expect(adapter.tuiPluginEntryApplies()).toBe(generation === "v1");
+    }
+  });
+
   test("setup detects V1 and V2, writes each host's key, and is idempotent", async () => {
     for (const generation of ["v1", "v2"] as const) {
       const key = openCodePluginKey(generation);
