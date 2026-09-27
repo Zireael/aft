@@ -27,6 +27,7 @@ import {
   AFT_OPENCODE_PACKAGE,
   ensurePinnedPluginConfig,
   MODERN_V1_VERSION,
+  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
   openCodePluginKey,
   pinnedPluginEntry,
 } from "../setup/opencode-config.js";
@@ -537,7 +538,14 @@ describe("exact OpenCode config pins", () => {
       const serverPath = join(root, "opencode.json");
       const tuiPath = join(root, "tui.json");
       const server = readConfig(serverPath);
-      expect(server).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
+      // On OpenCode 2 setup also removes the host's own shell tool plugin, the
+      // default while AFT's bash is enabled; OpenCode 1 has no such plugin.
+      expect(server).toEqual({
+        [key]: [
+          pinnedPluginEntry(getSelfVersion()),
+          ...(generation === "v2" ? [OPENCODE_HOST_SHELL_DISABLE_ENTRY] : []),
+        ],
+      });
       expect(server[other]).toBeUndefined();
       // V1 needs the TUI sidebar registered in its own config; OpenCode 2
       // loads that plugin from the package's `tui` entrypoint and never reads
@@ -1065,7 +1073,10 @@ describe("OpenCode plugin registration follows the host's key", () => {
       plugins: ["other-plugin", entry],
     });
 
-    expect(result.server).toEqual({ plugins: ["other-plugin", entry] });
+    // --fix also removes OpenCode 2's own shell tool while AFT's bash is on.
+    expect(result.server).toEqual({
+      plugins: ["other-plugin", entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
+    });
     expect(result.server.plugin).toBeUndefined();
     expect(result.adapter.hasPluginEntry()).toBe(true);
     // No TUI config on V2: the host loads that plugin from the package's own
@@ -1097,9 +1108,10 @@ describe("OpenCode plugin registration follows the host's key", () => {
 
     // Both hosts may be run against this file, so --fix repairs the key of the
     // host in front of it and leaves the other host's registration alone.
+    // The host-shell entry goes only into the key the V2 host reads.
     expect(result.server).toEqual({
       plugin: ["v1-only-plugin", entry],
-      plugins: ["v2-only-plugin", entry],
+      plugins: ["v2-only-plugin", entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
     });
   });
 
@@ -1124,7 +1136,7 @@ describe("OpenCode plugin registration follows the host's key", () => {
 
     expect(result.server).toEqual({
       plugin: ["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`],
-      plugins: [entry],
+      plugins: [entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
     });
     expect(result.adapter.hasPluginEntry()).toBe(true);
   });
