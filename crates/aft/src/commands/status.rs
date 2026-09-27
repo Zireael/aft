@@ -725,6 +725,55 @@ mod tests {
         assert_eq!(semantic["state"], "failed");
     }
 
+    /// A project with no source files still finishes its semantic build: the
+    /// index holds zero entries and a small persisted file. That is ready with
+    /// a real disk size, not an index still loading. A build that is genuinely
+    /// still running for the same project keeps reporting `loading`.
+    #[test]
+    fn status_reports_an_empty_finished_semantic_index_as_ready_with_its_disk_size() {
+        let project = tempfile::tempdir().expect("project dir");
+        let storage = tempfile::tempdir().expect("storage dir");
+        let root = std::fs::canonicalize(project.path()).expect("canonical project");
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.update_config(|config| {
+            config.project_root = Some(root.clone());
+            config.storage_dir = Some(storage.path().to_path_buf());
+        });
+        ctx.set_canonical_cache_root(root.clone());
+        let key = ctx.memoized_artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+
+        let index = crate::semantic_index::SemanticIndex::new(root.clone(), 384);
+        assert!(
+            index.write_to_disk(storage.path(), &key),
+            "empty index persists"
+        );
+        *ctx.semantic_index().write().unwrap() = Some(index);
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+
+        let ready = ctx.build_status_snapshot();
+        assert_eq!(ready["semantic_index"]["status"], "ready");
+        assert_eq!(ready["semantic_index"]["entries"], 0);
+        assert!(
+            ready["disk"]["semantic_disk_bytes"].as_u64().unwrap_or(0) > 0,
+            "a persisted empty index has a real size: {}",
+            ready["disk"]
+        );
+
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Building {
+                stage: "embedding_symbols".to_string(),
+                files: Some(0),
+                entries_done: Some(0),
+                entries_total: Some(0),
+            };
+        assert_eq!(
+            ctx.build_status_snapshot()["semantic_index"]["status"],
+            "loading"
+        );
+    }
+
     #[test]
     fn status_status_bar_is_null_until_every_independent_producer_is_populated() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());

@@ -220,7 +220,32 @@ fn project_snapshot(
         if let Some(reason) = path_identity_mismatch_reason(&tx)? {
             return Err(CallGraphStoreError::Unavailable(reason));
         }
-        let root = project_root_from_backend_state(&tx)?;
+        let Some(root) = project_root_from_backend_state(&tx)? else {
+            // A project with no source files builds a ready store that has no
+            // backend rows, so no row names the workspace root. That is a
+            // complete graph with nothing in it, and dead code for it is zero;
+            // reporting it unavailable kept the dead-code count unknown
+            // forever in an empty project. Rows without a root are still a
+            // broken store.
+            if store_file_count(&tx)? > 0 {
+                return Err(CallGraphStoreError::Unavailable(
+                    "database has no workspace root rows".to_string(),
+                ));
+            }
+            record_full_projection();
+            tx.commit()?;
+            let snapshot = CallgraphSnapshot {
+                generated_at: Some(SystemTime::now()),
+                ..CallgraphSnapshot::default()
+            };
+            let verdict = ProjectionVerdict {
+                kind: ProjectionKind::Full,
+                reason: Some("cold"),
+                journal_bytes: 0,
+                changed_files: 0,
+            };
+            return Ok((write_revision, snapshot, verdict, Duration::ZERO));
+        };
         // Mutable legacy stores can be ready while backend rows still await
         // refresh; projecting those rows would turn stale data into a verdict.
         if stale_backend_file_count(&tx, &root)? > 0 {
@@ -537,7 +562,9 @@ fn record_full_projection() {
     });
 }
 
-fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
+/// The single workspace root named by the store's backend rows, or `None`
+/// when there are no rows at all (a store built from zero files).
+fn project_root_from_backend_state(conn: &Connection) -> Result<Option<PathBuf>> {
     let mut statement = conn.prepare(
         "SELECT DISTINCT workspace_root
          FROM backend_file_state
@@ -549,15 +576,18 @@ fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     match roots.as_slice() {
-        [root] => Ok(PathBuf::from(root)),
-        [] => Err(CallGraphStoreError::Unavailable(
-            "database has no workspace root rows".to_string(),
-        )),
+        [root] => Ok(Some(PathBuf::from(root))),
+        [] => Ok(None),
         _ => Err(CallGraphStoreError::Unavailable(format!(
             "database has multiple workspace roots: {}",
             roots.join(", ")
         ))),
     }
+}
+
+fn store_file_count(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .map_err(Into::into)
 }
 
 fn stale_backend_file_count(conn: &Connection, project_root: &Path) -> Result<i64> {
@@ -1035,6 +1065,63 @@ mod tests {
         );
         assert_eq!(snapshot.files.len(), 1);
         assert!(store.stale_files().expect("read stale files").is_empty());
+    }
+
+    /// A project with no source files still builds a ready callgraph. Its
+    /// dead-code projection must be an empty, successful snapshot: calling it
+    /// unavailable left the dead-code count unknown for as long as the project
+    /// stayed empty, and the Tier-2 refresh logged a failed build every time.
+    #[test]
+    fn dead_code_projection_of_an_empty_project_is_ready_with_zero_files() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let root = fs::canonicalize(&root).expect("canonical project root");
+
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(&[])
+            .expect("cold build of an empty project");
+
+        let (_, snapshot, verdict) =
+            project_dead_code_snapshot_incremental(store.sqlite_path(), None)
+                .expect("an empty ready callgraph projects to an empty snapshot");
+        assert!(snapshot.files.is_empty());
+        assert!(snapshot.exported_symbols.is_empty());
+        assert!(snapshot.outbound_calls.is_empty());
+        assert!(snapshot.entry_points.is_empty());
+        assert!(snapshot.generated_at.is_some());
+        assert_eq!(verdict.kind, ProjectionKind::Full);
+    }
+
+    /// The empty-store allowance must not cover a store that has files but has
+    /// lost the backend rows naming their root: that store is still broken.
+    #[test]
+    fn dead_code_projection_with_files_but_no_root_rows_stays_unavailable() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let source = root.join("lib.ts");
+        fs::write(&source, "export function used(): number { return 1; }\n")
+            .expect("write fixture");
+        let root = fs::canonicalize(&root).expect("canonical project root");
+        let source = fs::canonicalize(&source).expect("canonical source");
+
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build fixture");
+        Connection::open(store.sqlite_path())
+            .expect("open store database")
+            .execute("DELETE FROM backend_file_state", [])
+            .expect("drop backend rows");
+
+        match project_dead_code_snapshot(store.sqlite_path()) {
+            Err(CallGraphStoreError::Unavailable(message)) => {
+                assert_eq!(message, "database has no workspace root rows")
+            }
+            other => panic!("expected Unavailable for a store without root rows, got {other:?}"),
+        }
     }
 
     #[test]
