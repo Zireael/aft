@@ -43,8 +43,9 @@ export function cachedExecutable(source: string): string {
   return path;
 }
 
-// A hard link retains the fixture's per-test realpath when resolution inspects
-// neighboring package metadata; it reuses the cached inode instead of copying it.
+// A hard link reuses the cached inode instead of copying it. Do not use it for
+// fixtures whose code under test calls realpath: on macOS, realpath of a file
+// with several hard links may return any one of the links' paths.
 export function hardlinkCachedExecutable(path: string, source: string): string {
   mkdirSync(dirname(path), { recursive: true });
   linkSync(cachedExecutable(source), path);
