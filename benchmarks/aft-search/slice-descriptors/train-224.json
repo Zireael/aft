@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "grep-100-offset",
+    "opencode2-host-shell-offer"
+  ],
+  "note": "grep prints up to 100 matching lines per page with an offset parameter, a 50 KB output budget and 500-character line cuts; OpenCode 2 setup offers to disable the host's shell tool and AFT's bash asks under the shell permission there. No ranking-fence file touched."
+}
