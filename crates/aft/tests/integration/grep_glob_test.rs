@@ -1243,6 +1243,7 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
 // the ignored directory stays out of project-wide results.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 const DEP_NEEDLE: &str = "createBindingNeedle";
 
 /// Project with a gitignored `node_modules/pkg/` holding a matching file, a
