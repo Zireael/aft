@@ -90,6 +90,10 @@ pub struct RootMemorySnapshot {
     pub bash: MemoryEstimate,
     pub lsp: MemoryEstimate,
     pub parser_pool: MemoryEstimate,
+    /// Finished artifact loads handed off by their loader but not yet
+    /// installed. Zero almost always; it is a label of its own so a load that
+    /// waits is never invisible.
+    pub pending_install: MemoryEstimate,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -170,7 +174,18 @@ impl RootMemorySnapshot {
             bash,
             lsp,
             parser_pool,
+            pending_install: MemoryEstimate::estimated(0),
         }
+    }
+
+    /// Attach the finished-but-uninstalled load estimate and fold it into the
+    /// root's status and attributed total.
+    pub fn with_pending_install(mut self, pending_install: MemoryEstimate) -> Self {
+        self.pending_install = pending_install;
+        let rollup = self.rollup();
+        self.status = rollup.status;
+        self.attributed_bytes = rollup.attributed_bytes;
+        self
     }
 
     fn rollup(&self) -> RootMemoryRollup {
@@ -184,6 +199,7 @@ impl RootMemorySnapshot {
             &self.bash,
             &self.lsp,
             &self.parser_pool,
+            &self.pending_install,
         ])
     }
 
@@ -530,7 +546,9 @@ pub struct MemorySnapshot {
     /// Attributed bytes carried by the omitted roots (already included in
     /// `process.total_attributed_bytes`).
     pub roots_omitted_bytes: u64,
-    /// Immutable borrowed semantic snapshots, attributed once process-wide.
+    /// Immutable shared semantic bases, attributed once process-wide: the
+    /// snapshots borrowed loads share and the indexes owner roots froze when
+    /// they installed them. Root rows count zero for a view of such a base.
     pub shared_semantic_bases: MemoryEstimate,
     pub process: ProcessMemorySnapshot,
 }

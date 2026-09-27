@@ -762,6 +762,9 @@ pub fn drain_search_index_events(ctx: &AppContext) {
             ctx.search_index_rx_epoch(),
         )
     };
+    let recorded_bytes = latest
+        .as_ref()
+        .and_then(|_| ctx.take_search_pending_install(receiver_epoch));
 
     let mut installed_index = false;
     if let Some(mut index) = latest {
@@ -780,6 +783,16 @@ pub fn drain_search_index_events(ctx: &AppContext) {
             })
             .unwrap_or(false);
         if !installed_index {
+            crate::context::log_discarded_finished_load(
+                "search index",
+                ctx.canonical_cache_root_opt().as_deref(),
+                recorded_bytes,
+                ctx.finished_load_discard_reason(
+                    receiver_generation,
+                    receiver_epoch,
+                    ctx.search_index_rx_epoch(),
+                ),
+            );
             return;
         }
         ctx.note_search_index_load_succeeded();
@@ -1015,6 +1028,29 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
     if events.is_empty() && !disconnected {
         return;
     }
+    let carries_finished_load = events
+        .iter()
+        .any(|event| matches!(event, SemanticIndexEvent::Ready(_)));
+    let recorded_bytes = carries_finished_load
+        .then(|| ctx.take_semantic_pending_install(receiver_epoch))
+        .flatten();
+    // A dequeued finished load that cannot be committed is dropped when this
+    // function returns; say so and why, so the memory it held is accounted for
+    // in the log rather than vanishing silently.
+    let log_discarded_load = || {
+        if carries_finished_load {
+            crate::context::log_discarded_finished_load(
+                "semantic index",
+                ctx.canonical_cache_root_opt().as_deref(),
+                recorded_bytes,
+                ctx.finished_load_discard_reason(
+                    receiver_generation,
+                    receiver_epoch,
+                    ctx.semantic_index_rx_epoch(),
+                ),
+            );
+        }
+    };
 
     wait_on_artifact_drain_commit_gate_for_test(ctx);
     let mut terminal = false;
@@ -1050,6 +1086,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     )
                     .unwrap_or(false);
                 if !committed {
+                    log_discarded_load();
                     return;
                 }
                 status_changed = true;
@@ -1061,6 +1098,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     |_receiver| ctx.take_semantic_cold_seed_resume(true),
                 );
                 let Some(resume) = resume else {
+                    log_discarded_load();
                     return;
                 };
                 cold_seed_resumes.push(resume);
@@ -1103,6 +1141,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     },
                 );
                 let Some((resume, refresh_paths, corpus_refresh)) = committed else {
+                    log_discarded_load();
                     return;
                 };
                 cold_seed_resumes.push(resume);
@@ -2303,7 +2342,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if ctx.ram_overlay_active() {
-                ctx.retire_search_index_rx();
+                ctx.retire_search_index_rx("a watcher rescan retired the in-flight load");
             }
             if config.indexes.semantic {
                 ctx.semantic_index()
@@ -5269,6 +5308,372 @@ mod tests {
                 .is_none(),
             "a dequeued completion must re-check lifecycle admission at commit"
         );
+    }
+
+    /// A real, owner-loaded semantic index: enough entries that its size is
+    /// unmistakable next to the tiny indexes other tests build, and a
+    /// fingerprint matching the context's backend so the drain freezes it into
+    /// a shared base exactly as it does in the daemon.
+    fn owner_semantic_index_fixture(
+        ctx: &AppContext,
+        root: &Path,
+        files: usize,
+        seed: usize,
+    ) -> crate::semantic_index::SemanticIndex {
+        const DIMENSION: usize = 96;
+        let paths = (0..files)
+            .map(|file| {
+                let path = root.join(format!("file_{seed}_{file}.rs"));
+                let text = (0..8)
+                    .map(|function| {
+                        format!(
+                            "/// Doc for f_{seed}_{file}_{function}.\npub fn f_{seed}_{file}_{function}(value: u64) -> u64 {{\n    value.wrapping_mul({function})\n}}\n"
+                        )
+                    })
+                    .collect::<String>();
+                std::fs::write(&path, text).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut embed = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|_| vec![0.25f32; DIMENSION]).collect())
+        };
+        let mut index =
+            crate::semantic_index::SemanticIndex::build(root, &paths, &mut embed, 64).unwrap();
+        index.set_fingerprint(
+            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(
+                &ctx.config().semantic,
+                DIMENSION,
+            ),
+        );
+        index
+    }
+
+    fn semantic_owner_context(root: &Path) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: false,
+                },
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx
+    }
+
+    /// The daemon reproduction in `tests/daemon_malloc_small_growth_repro.rs`
+    /// found hundreds of MB of semantic indexes live but missing from the
+    /// memory census. The cause: when the drain installs a load on its owner
+    /// root it freezes the index into a shared base, a shared-base view reports
+    /// zero bytes on the root's row (the base is meant to be counted once,
+    /// process-wide), and the process-wide total only walked bases registered
+    /// by borrowed loads. The owner's own base was counted nowhere.
+    #[test]
+    fn semantic_index_installed_by_the_drain_is_attributed_by_the_census() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+        let index = owner_semantic_index_fixture(&ctx, &root, 300, 1);
+        let entries = index.entry_count() as u64;
+        let loaded = index.estimated_memory();
+        let loaded_vector_bytes = *loaded
+            .counts
+            .get("vector_bytes")
+            .expect("a private index reports its vector bytes");
+        assert!(
+            loaded_vector_bytes > 512 * 1024,
+            "fixture too small: {loaded_vector_bytes}"
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_index_rx(rx, ctx.configure_generation());
+        tx.send(SemanticIndexEvent::Ready(index)).unwrap();
+        drain_semantic_index_events(&ctx);
+
+        let row = ctx.memory_root_snapshot();
+        assert_eq!(
+            row.semantic.counts.get("shared_base_entries"),
+            Some(&entries),
+            "the drain installs the load and freezes it into a shared base"
+        );
+        // Freezing moves the vectors into the base unchanged (only entry paths
+        // are rewritten relative to the root), so whatever counts the base must
+        // count at least the vectors that were loaded.
+        let census = ctx.memory_snapshot(Some(&root));
+        let shared = census.shared_semantic_bases.estimated_bytes.unwrap_or(0);
+        assert!(
+            row.attributed_bytes.saturating_add(shared) >= loaded_vector_bytes,
+            "installed semantic index holding {loaded_vector_bytes} bytes of vectors is not attributed: root row {} bytes, shared semantic bases {shared} bytes",
+            row.attributed_bytes,
+        );
+    }
+
+    /// Hand a finished semantic load to a receiver the way the configure loader
+    /// does: a lifecycle-gated send followed by the hand-off bookkeeping that
+    /// records its size for the census or logs why it was dropped.
+    fn hand_off_semantic_load(
+        ctx: &AppContext,
+        tx: &crossbeam_channel::Sender<SemanticIndexEvent>,
+        receiver_epoch: u64,
+        generation: u64,
+        index: crate::semantic_index::SemanticIndex,
+    ) -> Option<bool> {
+        let bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
+        let lifecycle = ctx.subc_lifecycle_admission();
+        let generation_flag = ctx.configure_generation_flag();
+        let published = lifecycle.run_if_current(generation_flag.as_ref(), generation, || {
+            tx.send(SemanticIndexEvent::Ready(index)).is_ok()
+        });
+        crate::commands::configure::note_finished_load_handoff(
+            "semantic index",
+            &ctx.canonical_cache_root_opt().unwrap(),
+            &lifecycle,
+            published,
+            &ctx.semantic_pending_install(),
+            receiver_epoch,
+            bytes,
+        );
+        published
+    }
+
+    fn installed_semantic_entries(ctx: &AppContext) -> Option<usize> {
+        ctx.semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(crate::semantic_index::SemanticIndex::entry_count)
+    }
+
+    #[test]
+    fn waiting_semantic_load_is_counted_under_pending_install_until_installed_or_dropped() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+
+        // Waiting, then installed by the drain.
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_semantic_index_rx(rx, generation);
+        let index = owner_semantic_index_fixture(&ctx, &root, 60, 2);
+        let bytes = index.estimated_memory().estimated_bytes.unwrap();
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &tx, epoch, generation, index),
+            Some(true)
+        );
+        let waiting = ctx.memory_root_snapshot();
+        assert_eq!(waiting.pending_install.estimated_bytes, Some(bytes));
+        assert_eq!(
+            waiting.pending_install.counts.get("semantic_loads"),
+            Some(&1)
+        );
+        assert!(
+            waiting.attributed_bytes >= bytes,
+            "the waiting load counts toward the root's attributed bytes"
+        );
+        drain_semantic_index_events(&ctx);
+        assert!(installed_semantic_entries(&ctx).is_some());
+        let installed = ctx.memory_root_snapshot();
+        assert_eq!(installed.pending_install.estimated_bytes, Some(0));
+        assert_eq!(
+            installed.pending_install.counts.get("semantic_loads"),
+            Some(&0)
+        );
+
+        // Waiting, then dropped: the root unbinds before any drain runs and
+        // the unbind cleanup retires the receiver with the load in it.
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_semantic_index_rx(rx, generation);
+        let index = owner_semantic_index_fixture(&ctx, &root, 30, 3);
+        let bytes = index.estimated_memory().estimated_bytes.unwrap();
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &tx, epoch, generation, index),
+            Some(true)
+        );
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(bytes)
+        );
+        ctx.mark_subc_unbound();
+        crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0)
+        );
+        assert_eq!(tx.len(), 0, "retiring the receiver freed the waiting load");
+    }
+
+    /// A record written after the drain already took its load (the loader
+    /// records right after its send, so the drain can win that race) must not
+    /// be counted: the bytes are then installed, not waiting.
+    #[test]
+    fn pending_install_record_for_a_taken_load_is_not_counted() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_semantic_index_rx(rx, generation);
+        let index = owner_semantic_index_fixture(&ctx, &root, 20, 4);
+        let bytes = index.estimated_memory().estimated_bytes.unwrap();
+        tx.send(SemanticIndexEvent::Ready(index)).unwrap();
+        // A drain has dequeued the load (the receiver is still installed and
+        // now empty) before the loader gets to record it.
+        let dequeued = ctx
+            .semantic_index_rx()
+            .lock()
+            .as_ref()
+            .expect("receiver installed")
+            .try_recv()
+            .expect("the load is in the receiver");
+        ctx.semantic_pending_install().record(epoch, bytes);
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0),
+            "a load no longer in the receiver is not waiting"
+        );
+        drop(dequeued);
+        drain_semantic_index_events(&ctx);
+        ctx.semantic_pending_install().record(epoch, bytes);
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn semantic_load_finishing_after_unbind_is_dropped_and_root_stays_unbound() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+
+        // The load finishes after the unbind: the gated send refuses it, so it
+        // never reaches the receiver and nothing is recorded as waiting.
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_semantic_index_rx(rx, generation);
+        ctx.mark_subc_unbound();
+        let index = owner_semantic_index_fixture(&ctx, &root, 20, 5);
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &tx, epoch, generation, index),
+            None
+        );
+        assert_eq!(tx.len(), 0);
+        drain_semantic_index_events(&ctx);
+        assert_eq!(installed_semantic_entries(&ctx), None);
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0)
+        );
+        assert!(
+            ctx.subc_unbound_quiesced(),
+            "late async work must not reactivate an unbound root"
+        );
+
+        // The load was handed off while bound, the root unbinds, and a drain
+        // still runs before the unbind cleanup: it must drop the load, not
+        // install it, and leave the root unbound.
+        ctx.mark_subc_bound();
+        let generation = ctx.advance_configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_semantic_index_rx(rx, generation);
+        let index = owner_semantic_index_fixture(&ctx, &root, 20, 6);
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &tx, epoch, generation, index),
+            Some(true)
+        );
+        ctx.mark_subc_unbound();
+        drain_semantic_index_events(&ctx);
+        assert_eq!(installed_semantic_entries(&ctx), None);
+        assert_eq!(tx.len(), 0, "the drain took the load and dropped it");
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0)
+        );
+        assert!(ctx.subc_unbound_quiesced());
+        assert!(!matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_semantic_load_never_replaces_a_newer_one() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+        let old_generation = ctx.configure_generation();
+        let (old_tx, old_rx) = crossbeam_channel::unbounded();
+        let old_epoch = ctx.install_semantic_index_rx(old_rx, old_generation);
+        let old_index = owner_semantic_index_fixture(&ctx, &root, 30, 7);
+        let new_index = owner_semantic_index_fixture(&ctx, &root, 10, 8);
+        let new_entries = new_index.entry_count();
+        assert_ne!(old_index.entry_count(), new_entries);
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &old_tx, old_epoch, old_generation, old_index),
+            Some(true)
+        );
+
+        // A drain dequeues the old load and pauses before committing it; a
+        // newer configure generation installs its own receiver meanwhile.
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_index_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old semantic load was not dequeued");
+        let new_generation = ctx.advance_configure_generation();
+        let (new_tx, new_rx) = crossbeam_channel::unbounded();
+        let new_epoch = ctx.install_semantic_index_rx(new_rx, new_generation);
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        assert_eq!(
+            installed_semantic_entries(&ctx),
+            None,
+            "a superseded load must not be installed"
+        );
+
+        // Another load finishing on the old receiver after the replacement is
+        // refused at the send and never counted as waiting.
+        let late_index = owner_semantic_index_fixture(&ctx, &root, 5, 9);
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &old_tx, old_epoch, new_generation, late_index),
+            Some(false)
+        );
+        assert_eq!(
+            ctx.memory_root_snapshot().pending_install.estimated_bytes,
+            Some(0)
+        );
+
+        assert_eq!(
+            hand_off_semantic_load(&ctx, &new_tx, new_epoch, new_generation, new_index),
+            Some(true)
+        );
+        drain_semantic_index_events(&ctx);
+        assert_eq!(installed_semantic_entries(&ctx), Some(new_entries));
     }
 
     #[test]

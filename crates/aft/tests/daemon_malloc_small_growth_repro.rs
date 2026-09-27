@@ -12,14 +12,18 @@
 //! the `aft` binary this package builds as its module, and opens one short
 //! session per root: bind, run a 15 s command, close the route, the way agent
 //! sessions come and go. Each bind runs configure, which reloads that root's
-//! semantic index from disk on a background thread. When the load finishes
-//! while the route is open but the route closes before the next completion
-//! drain, the loaded index is never installed: it stays alive (most likely as
-//! the pending event in the context's semantic receiver) until the idle-TTL
-//! reaper drops the root, but the census counts only an installed index, so
-//! the bytes show up as "unattributed" and the reaper's log reports freeing
-//! 0 MB of semantic data. The assertion states the property the daemon should
-//! have (live index bytes are attributed) and fails today.
+//! semantic index from disk on a background thread, and the next completion
+//! drain installs it. The name reflects the first hypothesis (a finished load
+//! parked in its channel); that turned out not to hold, because unbinding a
+//! root drops the receiver and with it any undelivered load. The real cause:
+//! on install the drain freezes an owner root's index into a shared base, a
+//! view of a shared base reports zero bytes on its root's row, and the
+//! process-wide shared-base total counted only bases registered by borrowed
+//! loads, so the owner's index was counted nowhere until the idle-TTL reaper
+//! dropped it. The assertion states the property the daemon should have (live
+//! index bytes are attributed). The deterministic in-process version of this
+//! check is
+//! `runtime_drain::tests::semantic_index_installed_by_the_drain_is_attributed_by_the_census`.
 //!
 //! The two `control_*` tests drive the other workloads the daemon log showed
 //! most often, in-process, and pass: cold search-index rebuilds after watcher
@@ -584,12 +588,11 @@ fn parked_semantic_loads_are_unattributed() {
     let loads_before = logged_semantic_loads(&home).len();
     let baseline = census(&probe_bin, &daemon, &meter_root);
     row("baseline", baseline);
-    // A load is parked when it finishes while the route is still open but the
-    // route closes before the next completion drain installs it. A session
-    // that runs one 15 s command does exactly that: the load takes about 10 s
-    // here. A session shorter than the load is harmless (the finished load is
-    // discarded because the root is unbound), which is why the command, not a
-    // quick search, is used.
+    // The load must finish while the route is still open so that it gets
+    // installed: it takes about 10 s here, so each session runs one 15 s
+    // command. A session shorter than the load is harmless (the finished load
+    // is discarded because the root is unbound), which is why the command, not
+    // a quick search, is used.
     for round in 0..env_usize("AFT_REPRO_ROUNDS", 1) {
         for (index, root) in roots.iter().enumerate() {
             // One short session: bind, run one command, close the route.
@@ -649,9 +652,8 @@ fn parked_semantic_loads_are_unattributed() {
     assert!(
         semantic_live <= attributed_growth + 32 * 1024 * 1024,
         "{:.1} MB of semantic indexes loaded from disk are still live but the \
-         census attributed only {:.1} MB more than at baseline: the loads were \
-         parked for roots whose routes had closed, where the census does not \
-         count them (unattributed grew {:.1} MB)",
+         census attributed only {:.1} MB more than at baseline (unattributed \
+         grew {:.1} MB)",
         semantic_live as f64 / MB,
         attributed_growth as f64 / MB,
         unattributed_growth as f64 / MB,

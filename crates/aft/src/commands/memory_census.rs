@@ -29,12 +29,14 @@ pub fn render_memory_census(
         let callgraph = detail.callgraph.estimated_bytes.unwrap_or(0);
         let callgraph_projection = detail.callgraph_projection.estimated_bytes.unwrap_or(0);
         let inspect = detail.inspect.estimated_bytes.unwrap_or(0);
+        let pending_install = detail.pending_install.estimated_bytes.unwrap_or(0);
         let planes_total = search
             .saturating_add(semantic)
             .saturating_add(symbols)
             .saturating_add(callgraph)
             .saturating_add(callgraph_projection)
-            .saturating_add(inspect);
+            .saturating_add(inspect)
+            .saturating_add(pending_install);
         let mut row = json!({
             "root": root,
             "root_id": root,
@@ -50,6 +52,7 @@ pub fn render_memory_census(
                 "callgraph": callgraph,
                 "callgraph_projection": callgraph_projection,
                 "inspect": inspect,
+                "pending_install": pending_install,
             },
             "attributed_bytes": planes_total,
             "evictable_bytes": detail.evictable_bytes(),
@@ -102,6 +105,9 @@ pub fn render_memory_census(
             "allocator_slack_measured": process.allocator_slack_measured,
             "allocator_observation_age_ms": process.allocator_observation_age_ms,
             "sqlite_bytes": process.sqlite.memory_used_bytes,
+            // Shared semantic bases are attributed once for the whole process,
+            // not on any root row; show them so the total adds up.
+            "shared_semantic_base_bytes": snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0),
             "total_attributed_bytes": process.total_attributed_bytes,
             "unattributed_bytes": unattributed_bytes,
             "last_relief_at_ms": crate::memory::last_allocator_relief_at_ms(),

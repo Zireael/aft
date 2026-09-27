@@ -255,6 +255,35 @@ SPIMI block).
    mimalloc with its own purge) is possible but changes behaviour everywhere
    and does not address live retention.
 
+## Correction after the fix (2026-09-27)
+
+The mechanism named in point 3 and suspect 1 was wrong. A finished load cannot
+stay parked in its channel: unbinding a root runs
+`cancel_unbound_artifact_work`, which drops the search, semantic and
+callgraph receivers, and crossbeam discards undelivered messages when the last
+receiver goes. While the root is bound, the 250 ms maintenance tick drains any
+non-empty receiver. The real cause: `drain_semantic_index_events` installs the
+load and then calls `adopt_frozen_base_for_root`, which moves an owner root's
+entries into an `Arc<SharedSemanticBase>`. A view of a shared base reports
+0 bytes on its root's row, and `shared_semantic_bases_memory` walked only the
+registry of bases that borrowed loads create, so an installed owner index was
+counted nowhere. The fix records owner-frozen bases in a census-only list (not
+the lookup registry, so sharing behaviour is unchanged) and counts every live
+base once. It also adds a `pending_install` plane that counts a finished load
+waiting in its receiver, and a log line for every finished load that is
+dropped without being installed.
+
+The same reproduction, 4 roots of 27,000 entries each:
+
+| build | attributed growth | unattributed growth | live under `read_from_disk` |
+| --- | ---: | ---: | ---: |
+| before the fix | 37.5 MB | 715.6 MB | 613.1 MB |
+| after the fix | 539.6 MB | 218.3 MB | 613.1 MB |
+
+The remaining gap between 613 MB live and 513 MB estimated (4 × 128.2 MB) is
+the estimate counting `len()` rather than capacity and allocator rounding
+(suspect 5), so the daemon test still misses its 32 MB tolerance.
+
 ## Reproducing
 
 - Live observation, safe: `footprint <pid>`,

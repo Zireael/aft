@@ -3687,6 +3687,50 @@ fn shared_semantic_bases() -> &'static Mutex<SharedSemanticBaseRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Bases an owner root froze out of its own installed index
+/// (`adopt_frozen_base_for_root`). They are kept apart from the lookup
+/// registry above on purpose: that registry is how a borrowed load finds a
+/// base to reuse, and an owner's base must not become reusable that way. This
+/// list exists only so the memory census can count those bases. A view of a
+/// shared base reports zero bytes on its root's row, so without this list an
+/// owner's frozen index was counted nowhere.
+fn frozen_owner_semantic_bases() -> &'static Mutex<Vec<Weak<SharedSemanticBase>>> {
+    static FROZEN: OnceLock<Mutex<Vec<Weak<SharedSemanticBase>>>> = OnceLock::new();
+    FROZEN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn note_frozen_owner_semantic_base(base: &Arc<SharedSemanticBase>) {
+    let mut frozen = frozen_owner_semantic_bases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    frozen.retain(|base| base.strong_count() > 0);
+    frozen.push(Arc::downgrade(base));
+}
+
+/// Every live shared base, each exactly once: the bases borrowed loads
+/// registered plus the bases owners froze. The same base can be reachable from
+/// both lists and from any number of root views, so identity is the pointer.
+fn live_shared_semantic_bases() -> Vec<Arc<SharedSemanticBase>> {
+    let mut bases = Vec::new();
+    {
+        let mut registry = shared_semantic_bases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, base| base.strong_count() > 0);
+        bases.extend(registry.values().filter_map(Weak::upgrade));
+    }
+    {
+        let mut frozen = frozen_owner_semantic_bases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        frozen.retain(|base| base.strong_count() > 0);
+        bases.extend(frozen.iter().filter_map(Weak::upgrade));
+    }
+    let mut seen = HashSet::new();
+    bases.retain(|base| seen.insert(Arc::as_ptr(base)));
+    bases
+}
+
 static SHARED_SEMANTIC_BASE_LOADS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_SEMANTIC_BASE_HITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -3750,14 +3794,20 @@ impl SharedSemanticBase {
 }
 
 pub(crate) fn shared_semantic_bases_memory() -> crate::memory::MemoryEstimate {
-    let mut registry = shared_semantic_bases()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    registry.retain(|_, base| base.strong_count() > 0);
-    let bases = registry
-        .values()
-        .filter_map(Weak::upgrade)
-        .collect::<Vec<_>>();
+    let bases = live_shared_semantic_bases();
+    let frozen_owner_bases = {
+        let frozen = frozen_owner_semantic_bases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bases
+            .iter()
+            .filter(|base| {
+                frozen
+                    .iter()
+                    .any(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(base)))
+            })
+            .count()
+    };
     let estimates = bases
         .iter()
         .map(|base| base.estimated_memory())
@@ -3772,6 +3822,7 @@ pub(crate) fn shared_semantic_bases_memory() -> crate::memory::MemoryEstimate {
     };
     crate::memory::MemoryEstimate::estimated(bytes)
         .count("bases", bases.len())
+        .count("frozen_owner_bases", frozen_owner_bases)
         .count("entries", bases.iter().map(|base| base.entries.len()).sum())
         .count_u64("vector_bytes", count_bytes("vector_bytes"))
         .count_u64("text_bytes", count_bytes("text_bytes"))
@@ -4281,7 +4332,11 @@ impl SemanticIndex {
         let placeholder = Self::new(owner_root.clone(), self.dimension());
         let private = std::mem::replace(self, placeholder);
         let base = match private.into_shared_base() {
-            Ok(base) => Arc::new(base),
+            Ok(base) => {
+                let base = Arc::new(base);
+                note_frozen_owner_semantic_base(&base);
+                base
+            }
             Err(private) => {
                 // Unreachable after the shareability check (this index is held
                 // exclusively, so no path can appear between the check and the
@@ -11424,6 +11479,69 @@ public class Greeter {
             .adopt_frozen_base_for_root(&borrower, &config)
             .is_some());
         assert!(shareable.shared_base.is_some());
+    }
+
+    #[test]
+    fn owner_frozen_base_is_counted_once_across_owner_and_borrower_views() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("owner");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+        let borrower = temp.path().join("borrower");
+        fs::create_dir_all(&borrower).unwrap();
+        let mut index = SemanticIndex::new(project_root.clone(), 2);
+        for ordinal in 0..16 {
+            let file = project_root.join(format!("file_{ordinal}.rs"));
+            fs::write(&file, format!("fn symbol_{ordinal}() {{}}\n")).unwrap();
+            add_invalidation_fixture_entry(&mut index, file, ordinal);
+        }
+        let config = SemanticBackendConfig::default();
+        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
+        let private_bytes = index.estimated_memory().estimated_bytes.unwrap();
+
+        // The drain freezes the owner's installed index for its own root; a
+        // borrower adopting it later gets a second view of the same base.
+        let owner_view = index
+            .adopt_frozen_base_for_root(&project_root, &config)
+            .expect("a shareable owner index freezes");
+        let borrower_view = index
+            .adopt_frozen_base_for_root(&borrower, &config)
+            .expect("a frozen base can be adopted");
+        let base = Arc::clone(index.shared_base.as_ref().unwrap());
+        let base_bytes = base.estimated_memory().estimated_bytes.unwrap();
+        assert!(
+            base_bytes >= private_bytes / 2,
+            "{base_bytes} vs {private_bytes}"
+        );
+
+        for view in [&index, &owner_view, &borrower_view] {
+            assert_eq!(
+                view.estimated_memory().estimated_bytes,
+                Some(0),
+                "a view of a shared base must not count the base on its root's row"
+            );
+        }
+        let occurrences = live_shared_semantic_bases()
+            .iter()
+            .filter(|live| Arc::ptr_eq(live, &base))
+            .count();
+        assert_eq!(occurrences, 1, "the owner's base is counted exactly once");
+        assert!(shared_semantic_bases_memory().estimated_bytes.unwrap() >= base_bytes);
+
+        // The base must not become findable by borrowed loads: the lookup
+        // registry used by `read_from_disk_borrow_tolerant` stays untouched.
+        assert!(!shared_semantic_bases()
+            .lock()
+            .unwrap()
+            .values()
+            .any(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&base))));
+
+        let weak = Arc::downgrade(&base);
+        drop((index, owner_view, borrower_view, base));
+        assert_eq!(weak.strong_count(), 0);
+        assert!(!live_shared_semantic_bases()
+            .iter()
+            .any(|live| std::ptr::eq(Arc::as_ptr(live), weak.as_ptr())));
     }
 
     #[test]

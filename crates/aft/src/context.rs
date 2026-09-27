@@ -1846,6 +1846,109 @@ impl Drop for ReceiverTerminalGuard {
 
 pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 
+/// A finished artifact load that its loader has sent to the receiver but that
+/// no completion drain has installed yet. `epoch` is the receiver epoch the
+/// load was sent to and `bytes` is the estimate the census uses for the same
+/// artifact once installed, computed once by the loader thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingInstall {
+    pub(crate) epoch: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Records the size of a finished load between its hand-off and its install,
+/// so the memory census never loses track of it. The loader records after its
+/// send; the drain, a receiver retirement and a receiver replacement clear it.
+/// The census counts the record only while the receiver it names is still the
+/// current one and still holds undelivered events, so a record whose load was
+/// already taken (the drain can take it between the send and the record) is
+/// never counted.
+#[derive(Debug, Default)]
+pub(crate) struct PendingInstallSlot(parking_lot::Mutex<Option<PendingInstall>>);
+
+impl PendingInstallSlot {
+    pub(crate) fn record(&self, epoch: u64, bytes: u64) {
+        *self.0.lock() = Some(PendingInstall { epoch, bytes });
+    }
+
+    fn get(&self) -> Option<PendingInstall> {
+        *self.0.lock()
+    }
+
+    /// Remove and return the record when it belongs to receiver `epoch`.
+    fn take_for_epoch(&self, epoch: u64) -> Option<PendingInstall> {
+        let mut slot = self.0.lock();
+        if slot.is_some_and(|pending| pending.epoch == epoch) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// Log a finished load that is dropped without being installed, with the
+/// estimate its loader recorded when there is one.
+pub(crate) fn log_discarded_finished_load(
+    plane: &str,
+    root: Option<&Path>,
+    bytes: Option<u64>,
+    reason: &str,
+) {
+    let size = bytes.map_or_else(
+        || "size not recorded".to_string(),
+        |bytes| format!("~{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    );
+    crate::slog_info!(
+        "discarded finished {} load for {} ({}) without installing it: {}",
+        plane,
+        root.map_or_else(
+            || "<unconfigured root>".to_string(),
+            |root| root.display().to_string()
+        ),
+        size,
+        reason
+    );
+}
+
+/// Log a finished load that is dropped with its receiver. `pending` is the
+/// record for the receiver being dropped; nothing is logged when the receiver
+/// held no finished load.
+fn log_discarded_pending_install(
+    plane: &str,
+    root: Option<&Path>,
+    pending: Option<PendingInstall>,
+    reason: &str,
+) {
+    if let Some(pending) = pending {
+        log_discarded_finished_load(plane, root, Some(pending.bytes), reason);
+    }
+}
+
+/// The record of a finished load still sitting undelivered in `receiver`,
+/// the receiver whose epoch is `epoch`.
+fn undelivered_install<T>(
+    slot: &PendingInstallSlot,
+    epoch: u64,
+    receiver: Option<&crossbeam_channel::Receiver<T>>,
+) -> Option<PendingInstall> {
+    slot.get().filter(|pending| {
+        pending.epoch == epoch && receiver.is_some_and(|receiver| !receiver.is_empty())
+    })
+}
+
+/// Like [`undelivered_install`], but also clears the record: the caller is
+/// about to drop or drain the receiver.
+fn take_undelivered_install<T>(
+    slot: &PendingInstallSlot,
+    epoch: u64,
+    receiver: Option<&crossbeam_channel::Receiver<T>>,
+) -> Option<PendingInstall> {
+    let pending = slot.take_for_epoch(epoch)?;
+    receiver
+        .is_some_and(|receiver| !receiver.is_empty())
+        .then_some(pending)
+}
+
 struct PathRestrictionContext {
     raw_root: PathBuf,
     resolved_root: PathBuf,
@@ -2540,6 +2643,8 @@ pub struct AppContext {
     search_index_rx_generation: AtomicU64,
     search_index_rx_epoch: AtomicU64,
     search_index_rx_terminal_epoch: Arc<AtomicU64>,
+    /// Size of a finished search-index load waiting in `search_index_rx`.
+    search_pending_install: Arc<PendingInstallSlot>,
     /// `(configure_generation, automatic_replacement_attempts)`. Caps the
     /// drain-path replacement of a search-index load whose worker disconnected
     /// without delivering an index, so a persistently failing worker cannot be
@@ -2559,6 +2664,8 @@ pub struct AppContext {
     semantic_index_rx_generation: AtomicU64,
     semantic_index_rx_epoch: AtomicU64,
     semantic_index_rx_terminal_epoch: Arc<AtomicU64>,
+    /// Size of a finished semantic-index load waiting in `semantic_index_rx`.
+    semantic_pending_install: Arc<PendingInstallSlot>,
     semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
@@ -3041,6 +3148,7 @@ impl AppContext {
             search_index_rx_generation: AtomicU64::new(0),
             search_index_rx_epoch: AtomicU64::new(0),
             search_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
+            search_pending_install: Arc::default(),
             search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
@@ -3056,6 +3164,7 @@ impl AppContext {
             semantic_index_rx_generation: AtomicU64::new(0),
             semantic_index_rx_epoch: AtomicU64::new(0),
             semantic_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
+            semantic_pending_install: Arc::default(),
             semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
@@ -6550,10 +6659,27 @@ impl AppContext {
             .search_index_rx
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replaced = take_undelivered_install(
+            &self.search_pending_install,
+            self.search_index_rx_epoch(),
+            slot.as_ref(),
+        );
         self.note_search_index_rx_generation(generation);
         let epoch = self.next_search_index_rx_epoch();
         *slot = Some(receiver);
+        drop(slot);
+        log_discarded_pending_install(
+            "search index",
+            self.canonical_cache_root_opt().as_deref(),
+            replaced,
+            "a newer load replaced it",
+        );
         epoch
+    }
+
+    /// The slot a search-index loader records its finished load's size in.
+    pub(crate) fn search_pending_install(&self) -> Arc<PendingInstallSlot> {
+        Arc::clone(&self.search_pending_install)
     }
 
     pub(crate) fn search_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
@@ -6584,13 +6710,27 @@ impl AppContext {
         .flatten()
     }
 
-    pub(crate) fn retire_search_index_rx(&self) {
+    /// Drop the search-index receiver. A finished load still waiting in it is
+    /// freed with it and logged with `reason`.
+    pub(crate) fn retire_search_index_rx(&self, reason: &str) {
         let mut receiver = self
             .search_index_rx
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let discarded = take_undelivered_install(
+            &self.search_pending_install,
+            self.search_index_rx_epoch(),
+            receiver.as_ref(),
+        );
         *receiver = None;
         self.next_search_index_rx_epoch();
+        drop(receiver);
+        log_discarded_pending_install(
+            "search index",
+            self.canonical_cache_root_opt().as_deref(),
+            discarded,
+            reason,
+        );
     }
 
     pub(crate) fn note_search_index_rx_generation(&self, generation: u64) {
@@ -6789,7 +6929,7 @@ impl AppContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        self.retire_search_index_rx();
+        self.retire_search_index_rx("the root was unbound");
         if search_refresh_cancelled {
             let mut resident = self
                 .search_index
@@ -6801,7 +6941,7 @@ impl AppContext {
         }
         self.retire_callgraph_store_rx();
         let semantic_cancelled = self.semantic_index_rx.lock().is_some();
-        self.retire_semantic_index_rx();
+        self.retire_semantic_index_rx("the root was unbound");
         let semantic_refresh_cancelled = self.semantic_refresh_event_rx.lock().is_some();
         self.clear_semantic_refresh_worker();
         self.reset_semantic_cold_seed_gate_for_configure();
@@ -7350,10 +7490,27 @@ impl AppContext {
         generation: u64,
     ) -> u64 {
         let mut slot = self.semantic_index_rx.lock();
+        let replaced = take_undelivered_install(
+            &self.semantic_pending_install,
+            self.semantic_index_rx_epoch(),
+            slot.as_ref(),
+        );
         self.note_semantic_index_rx_generation(generation);
         let epoch = self.next_semantic_index_rx_epoch();
         *slot = Some(receiver);
+        drop(slot);
+        log_discarded_pending_install(
+            "semantic index",
+            self.canonical_cache_root_opt().as_deref(),
+            replaced,
+            "a newer load replaced it",
+        );
         epoch
+    }
+
+    /// The slot a semantic-index loader records its finished load's size in.
+    pub(crate) fn semantic_pending_install(&self) -> Arc<PendingInstallSlot> {
+        Arc::clone(&self.semantic_pending_install)
     }
 
     pub(crate) fn semantic_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
@@ -7381,10 +7538,24 @@ impl AppContext {
         .flatten()
     }
 
-    pub(crate) fn retire_semantic_index_rx(&self) {
+    /// Drop the semantic-index receiver. A finished load still waiting in it
+    /// is freed with it and logged with `reason`.
+    pub(crate) fn retire_semantic_index_rx(&self, reason: &str) {
         let mut receiver = self.semantic_index_rx.lock();
+        let discarded = take_undelivered_install(
+            &self.semantic_pending_install,
+            self.semantic_index_rx_epoch(),
+            receiver.as_ref(),
+        );
         *receiver = None;
         self.next_semantic_index_rx_epoch();
+        drop(receiver);
+        log_discarded_pending_install(
+            "semantic index",
+            self.canonical_cache_root_opt().as_deref(),
+            discarded,
+            reason,
+        );
     }
 
     /// Rebind a live semantic build to a newer configure generation when the
@@ -8944,7 +9115,7 @@ impl AppContext {
         })
     }
 
-    fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 9] {
+    fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
         let semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
@@ -9003,6 +9174,7 @@ impl AppContext {
         let parser_pool = crate::memory::MemoryEstimate::not_estimated()
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");
+        let pending_install = self.pending_install_estimate();
         [
             semantic,
             trigram,
@@ -9013,14 +9185,85 @@ impl AppContext {
             bash,
             lsp,
             parser_pool,
+            pending_install,
         ]
+    }
+
+    /// Finished semantic and search loads handed to their receivers but not
+    /// yet installed by a completion drain. They are live memory like an
+    /// installed index, so they are attributed under their own label rather
+    /// than disappearing between hand-off and install.
+    fn pending_install_estimate(&self) -> crate::memory::MemoryEstimate {
+        let Some(semantic_receiver) = self.semantic_index_rx.try_lock() else {
+            return crate::memory::MemoryEstimate::busy();
+        };
+        let semantic = undelivered_install(
+            &self.semantic_pending_install,
+            self.semantic_index_rx_epoch(),
+            semantic_receiver.as_ref(),
+        );
+        drop(semantic_receiver);
+        let search = match self.search_index_rx.try_read() {
+            Ok(receiver) => undelivered_install(
+                &self.search_pending_install,
+                self.search_index_rx_epoch(),
+                receiver.as_ref(),
+            ),
+            Err(TryLockError::Poisoned(error)) => undelivered_install(
+                &self.search_pending_install,
+                self.search_index_rx_epoch(),
+                error.into_inner().as_ref(),
+            ),
+            Err(TryLockError::WouldBlock) => return crate::memory::MemoryEstimate::busy(),
+        };
+        let semantic_bytes = semantic.map_or(0, |pending| pending.bytes);
+        let search_bytes = search.map_or(0, |pending| pending.bytes);
+        crate::memory::MemoryEstimate::estimated(semantic_bytes.saturating_add(search_bytes))
+            .count("semantic_loads", usize::from(semantic.is_some()))
+            .count_u64("semantic_bytes", semantic_bytes)
+            .count("search_loads", usize::from(search.is_some()))
+            .count_u64("search_bytes", search_bytes)
+    }
+
+    /// Remove the pending-install record for receiver `epoch` once a drain has
+    /// taken that receiver's events, returning the recorded size.
+    pub(crate) fn take_semantic_pending_install(&self, epoch: u64) -> Option<u64> {
+        self.semantic_pending_install
+            .take_for_epoch(epoch)
+            .map(|pending| pending.bytes)
+    }
+
+    pub(crate) fn take_search_pending_install(&self, epoch: u64) -> Option<u64> {
+        self.search_pending_install
+            .take_for_epoch(epoch)
+            .map(|pending| pending.bytes)
+    }
+
+    /// Why a finished load dequeued from the receiver `receiver_generation` /
+    /// `receiver_epoch` could not be installed. Unbound comes first: an
+    /// unbound root must not install anything, whatever else changed.
+    pub(crate) fn finished_load_discard_reason(
+        &self,
+        receiver_generation: u64,
+        receiver_epoch: u64,
+        current_receiver_epoch: u64,
+    ) -> &'static str {
+        if self.subc_unbound_quiesced() {
+            "the root was unbound"
+        } else if self.configure_generation() != receiver_generation
+            || current_receiver_epoch != receiver_epoch
+        {
+            "a newer load superseded it"
+        } else {
+            "its receiver was retired"
+        }
     }
 
     /// Build one root's memory estimate using only non-blocking lock attempts.
     /// A contended subsystem is represented as `busy` rather than delaying the
     /// status control path.
     pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
-        let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool] =
+        let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool, pending_install] =
             self.memory_estimates();
         crate::memory::RootMemorySnapshot::new(
             semantic,
@@ -9033,6 +9276,7 @@ impl AppContext {
             lsp,
             parser_pool,
         )
+        .with_pending_install(pending_install)
     }
 
     /// Pre-aggregate root memory for capped health diagnostics without building
@@ -9049,6 +9293,7 @@ impl AppContext {
             &estimates[6],
             &estimates[7],
             &estimates[8],
+            &estimates[9],
         ])
     }
 

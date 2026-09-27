@@ -3597,7 +3597,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        ctx.retire_search_index_rx();
+        ctx.retire_search_index_rx("a reconfigure with different settings superseded it");
         if semantic_build_adopted {
             let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
             debug_assert!(
@@ -3608,7 +3608,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             *ctx.semantic_index()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            ctx.retire_semantic_index_rx();
+            ctx.retire_semantic_index_rx(
+                "a reconfigure with different semantic settings superseded it",
+            );
             ctx.set_semantic_build_progress(None);
         }
         if equivalent_callgraph_build {
@@ -4210,6 +4212,7 @@ fn schedule_artifact_loads(
         let (tx, rx) = unbounded::<SearchIndex>();
         let search_rx_epoch = ctx.install_search_index_rx(rx, search_generation);
         let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
+        let search_pending_install = ctx.search_pending_install();
         let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         search_artifact_load_start = Some(start_tx);
@@ -4288,11 +4291,13 @@ fn schedule_artifact_loads(
                         }
                     }
                     let symbol_files = search_index_symbol_files(&index);
-                    let _ = search_lifecycle.run_if_current(
+                    let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
+                    let root_for_log = root_for_search.clone();
+                    let published = search_lifecycle.run_if_current(
                         search_generation_flag.as_ref(),
                         search_generation,
                         || {
-                            let _ = tx.send(index);
+                            let sent = tx.send(index).is_ok();
                             spawn_symbol_cache_prewarm(
                                 root_for_search,
                                 symbol_cache,
@@ -4303,7 +4308,17 @@ fn schedule_artifact_loads(
                                 true,
                                 log_ctx::current_session(),
                             );
+                            sent
                         },
+                    );
+                    note_finished_load_handoff(
+                        "search index",
+                        &root_for_log,
+                        &search_lifecycle,
+                        published,
+                        &search_pending_install,
+                        search_rx_epoch,
+                        pending_bytes,
                     );
                     return;
                 }
@@ -4443,9 +4458,13 @@ fn schedule_artifact_loads(
                     );
                 }
                 let symbol_files = search_index_symbol_files(&index);
-                if search_lifecycle
-                    .run_if_current(search_generation_flag.as_ref(), search_generation, || {
-                        let _ = tx.send(index);
+                let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
+                let root_for_log = root_for_search.clone();
+                let published = search_lifecycle.run_if_current(
+                    search_generation_flag.as_ref(),
+                    search_generation,
+                    || {
+                        let sent = tx.send(index).is_ok();
                         spawn_symbol_cache_prewarm(
                             root_for_search,
                             symbol_cache,
@@ -4456,14 +4475,18 @@ fn schedule_artifact_loads(
                             false,
                             log_ctx::current_session(),
                         );
-                    })
-                    .is_none()
-                {
-                    slog_info!(
-                        "search index build result discarded for stale generation {}",
-                        search_generation
-                    );
-                }
+                        sent
+                    },
+                );
+                note_finished_load_handoff(
+                    "search index",
+                    &root_for_log,
+                    &search_lifecycle,
+                    published,
+                    &search_pending_install,
+                    search_rx_epoch,
+                    pending_bytes,
+                );
             });
         });
     }
@@ -4482,6 +4505,7 @@ fn schedule_artifact_loads(
         let (tx, rx) = unbounded::<SemanticIndexEvent>();
         let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
         let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
+        let semantic_pending_install = ctx.semantic_pending_install();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         semantic_artifact_load_start = Some(start_tx);
         let semantic_root = canonical_cache_root.clone();
@@ -4540,13 +4564,28 @@ fn schedule_artifact_loads(
                         )
                     }
                 };
-                let _ = semantic_load_lifecycle.run_if_current(
+                let finished_bytes = match &event {
+                    SemanticIndexEvent::Ready(index) => {
+                        Some(index.estimated_memory().estimated_bytes.unwrap_or(0))
+                    }
+                    _ => None,
+                };
+                let published = semantic_load_lifecycle.run_if_current(
                     semantic_load_generation_flag.as_ref(),
                     semantic_load_generation,
-                    || {
-                        let _ = tx.send(event);
-                    },
+                    || tx.send(event).is_ok(),
                 );
+                if let Some(bytes) = finished_bytes {
+                    note_finished_load_handoff(
+                        "semantic index",
+                        &semantic_root,
+                        &semantic_load_lifecycle,
+                        published,
+                        &semantic_pending_install,
+                        semantic_rx_epoch,
+                        bytes,
+                    );
+                }
             });
         });
     } else if load_semantic {
@@ -4566,6 +4605,7 @@ fn schedule_artifact_loads(
         ) = unbounded();
         let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
         let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
+        let semantic_pending_install = ctx.semantic_pending_install();
         let semantic_persist_epoch_flag = ctx.semantic_persist_epoch_flag();
         let semantic_persist_lock = ctx.semantic_persist_lock();
         let semantic_verify_ticket = cache_freshness::capture_verify_ticket(&canonical_cache_root);
@@ -5338,6 +5378,7 @@ fn schedule_artifact_loads(
                 // generation. Publish against the receiver's current generation
                 // instead of the generation captured when the thread started.
                 let publish_generation = semantic_generation_flag.load(Ordering::SeqCst);
+                let mut finished_bytes = None;
                 let event = match outcome {
                     SemanticBuildOutcome::Ready(ready) => {
                         let SemanticBuildReady {
@@ -5356,6 +5397,8 @@ fn schedule_artifact_loads(
                                 verified_artifact_generation,
                             );
                         }
+                        finished_bytes =
+                            Some(index.estimated_memory().estimated_bytes.unwrap_or(0));
                         semantic_lifecycle.run_if_current(
                             semantic_generation_flag.as_ref(),
                             publish_generation,
@@ -5394,14 +5437,53 @@ fn schedule_artifact_loads(
                     ),
                 };
 
-                if event.is_none_or(|event| tx.send(event).is_err()) {
+                let published = event.map(|event| tx.send(event).is_ok());
+                if published != Some(true) {
                     clear_cold_seed_active();
+                }
+                if let Some(bytes) = finished_bytes {
+                    note_finished_load_handoff(
+                        "semantic index",
+                        &root_clone,
+                        &semantic_lifecycle,
+                        published,
+                        &semantic_pending_install,
+                        semantic_rx_epoch,
+                        bytes,
+                    );
                 }
             });
         });
     }
 
     (search_artifact_load_start, semantic_artifact_load_start)
+}
+
+/// Account for a finished artifact load at its hand-off to the receiver.
+/// `published` is the outcome of the lifecycle-gated send: `None` when the
+/// root was unbound or a newer configure generation took over, so the load is
+/// dropped right here; `Some(false)` when its receiver was already gone;
+/// `Some(true)` when it now waits for a completion drain, and the census
+/// reports its size under `pending_install` until the drain takes it.
+pub(crate) fn note_finished_load_handoff(
+    plane: &str,
+    root: &Path,
+    lifecycle: &crate::context::SubcLifecycleAdmission,
+    published: Option<bool>,
+    pending_install: &crate::context::PendingInstallSlot,
+    receiver_epoch: u64,
+    bytes: u64,
+) {
+    let reason = match published {
+        Some(true) => {
+            pending_install.record(receiver_epoch, bytes);
+            return;
+        }
+        Some(false) => "its receiver was retired or replaced before the load finished",
+        None if lifecycle.is_bound() => "a newer configure generation superseded it",
+        None => "the root was unbound",
+    };
+    crate::context::log_discarded_finished_load(plane, Some(root), Some(bytes), reason);
 }
 
 fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, storage_root: &Path) {
@@ -9231,7 +9313,7 @@ mod tests {
             false,
         );
         assert!(handle_configure_for_test(&request, &owner_ctx).success);
-        owner_ctx.retire_semantic_index_rx();
+        owner_ctx.retire_semantic_index_rx("test replaces the configure load");
         let mut owner_index = SemanticIndex::new(canonical_main.clone(), 3);
         owner_index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
             &owner_ctx.config().semantic,
