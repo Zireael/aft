@@ -1,0 +1,21 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "borrowed-index-reconcile-default",
+    "os-metadata-file-skip",
+    "semantic-memory-census",
+    "setup-bash-github-options",
+    "issue-write-never-touches-files",
+    "bash-timeout-passthrough",
+    "empty-project-dead-code",
+    "views-gaps",
+    "backups-purge",
+    "pr-368-doctor-tui-json"
+  ],
+  "note": "Ranking-fence files touched: search_index.rs and semantic_search/mod.rs drop indexed paths that are no longer on disk in this checkout and disclose the count; search_index.rs and semantic_index.rs skip operating-system metadata files (.DS_Store, .localized, Thumbs.db, AppleDouble) in project walks; semantic_index.rs reports memory for owner-frozen semantic bases; lib.rs adds the os_metadata module. The benchmark corpus has every indexed path on disk and no metadata files, and no ranking, fusion, lane admission or truncation changed, so ranked rows should be byte-equal to the reference."
+}
