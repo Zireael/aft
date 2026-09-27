@@ -493,6 +493,14 @@ fn wait_for_semantic_result(aft: &mut AftProcess, expected_suffix: &str) -> Valu
                 "top_k": 5,
             }),
         );
+        // With the trigram index off, aft_search refuses with
+        // search_lanes_unavailable while the semantic lane is still building;
+        // that is "not ready yet", so keep polling. Any other failure is real.
+        if response["success"] == false && response["code"] == "search_lanes_unavailable" {
+            last_response = Some(response);
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         assert_eq!(
             response["success"], true,
             "semantic_search should succeed: {response:?}"

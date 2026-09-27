@@ -1,13 +1,13 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "grep-100-offset",
     "opencode2-host-shell-offer"
   ],
-  "note": "grep prints up to 100 matching lines per page with an offset parameter, a 50 KB output budget and 500-character line cuts; OpenCode 2 setup offers to disable the host's shell tool and AFT's bash asks under the shell permission there. No ranking-fence file touched."
+  "note": "The only ranking-fence file touched is the subc tool-schema artifact: the grep tool gains an offset parameter and a reworded description. grep's own page size, output budget and line cuts live outside the fence, and aft_search ranking, fusion, lane admission and truncation are unchanged, so ranked rows should be byte-equal to the reference (CI run 36342222723 already reported real_query_behavior:equal)."
 }
