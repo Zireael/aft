@@ -244,6 +244,336 @@ fn assert_grandchild_killed(pidfile: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// (e) `timeout` is a hard kill cap in every mode, not only for held calls.
+//
+// Each command sleeps in a grandchild, then touches a marker file. A timeout
+// kill of the whole process group means the marker never appears; killing only
+// the shell, or not killing at all, lets `touch` run once the sleep ends. The
+// sleep outlasts `TIMEOUT_MS` by several seconds, so a command that ran to
+// completion also answers `completed` instead of `timed_out`.
+// ---------------------------------------------------------------------------
+
+/// How long the capped commands sleep before touching their marker.
+const CAPPED_SLEEP: Duration = Duration::from_secs(5);
+/// Foreground wait window for the promotion tests: far shorter than
+/// `TIMEOUT_MS`, so the call is promoted to the background before the cap.
+const SHORT_FOREGROUND_WAIT_MS: &str = "300";
+/// Extra time past `CAPPED_SLEEP` before checking the marker is still absent.
+/// The marker would be written right as the sleep ends, so a short slack is
+/// enough; a slow host can only make this check pass, never fail it wrongly.
+const MARKER_SLACK: Duration = Duration::from_millis(750);
+
+#[test]
+fn foreground_without_wait_is_killed_at_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let files = CappedFiles::new(dir.path());
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path(), &storage);
+
+    let started = Instant::now();
+    let response = aft.send_with_timeout(
+        &bash_request(
+            "foreground-timeout",
+            json!({
+                "command": files.command(),
+                "foreground_orchestrate": true,
+                "timeout": TIMEOUT_MS,
+                "compressed": false,
+            }),
+        ),
+        HANG_CATCH,
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(response["success"], true, "response: {response:?}");
+    assert_timed_out_reply("foreground", &response);
+    assert_reply_window("foreground", elapsed);
+    files.assert_command_killed(started);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn promoted_foreground_is_killed_at_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let files = CappedFiles::new(dir.path());
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_FOREGROUND_WAIT_MS",
+        std::ffi::OsStr::new(SHORT_FOREGROUND_WAIT_MS),
+    )]);
+    configure(&mut aft, dir.path(), &storage);
+
+    let started = Instant::now();
+    let response = aft.send_with_timeout(
+        &bash_request(
+            "promoted-timeout",
+            json!({
+                "command": files.command(),
+                "foreground_orchestrate": true,
+                "timeout": TIMEOUT_MS,
+                "compressed": false,
+            }),
+        ),
+        HANG_CATCH,
+    );
+    assert_eq!(response["success"], true, "response: {response:?}");
+    assert_eq!(
+        response["status"], "running",
+        "the call should be promoted before its timeout: {response:?}"
+    );
+    let task_id = response["task_id"].as_str().expect("task_id").to_string();
+
+    let status = standalone_status_until_terminal(&mut aft, &task_id);
+    assert_timed_out_status("promoted foreground", &status, started.elapsed());
+    files.assert_command_killed(started);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn background_is_killed_at_its_timeout() {
+    assert_standalone_launched_task_is_capped("background");
+}
+
+#[test]
+fn pty_is_killed_at_its_timeout() {
+    assert_standalone_launched_task_is_capped("pty");
+}
+
+#[test]
+fn subc_foreground_without_wait_is_killed_at_its_timeout() {
+    run_subc(|mut harness| async move {
+        let files = CappedFiles::new(harness.project.path());
+        let started = Instant::now();
+        send_tool_call(
+            &mut harness.stream,
+            40,
+            "bash",
+            json!({
+                "command": files.command(),
+                "timeout": TIMEOUT_MS,
+                "compressed": false,
+            }),
+        )
+        .await;
+        let frame = read_tool_response(&mut harness.stream, 40, HANG_CATCH).await;
+        let elapsed = started.elapsed();
+
+        assert_timed_out_reply("subc foreground", &tool_response_json(&frame));
+        assert_reply_window("subc foreground", elapsed);
+        files.assert_command_killed(started);
+        harness
+    });
+}
+
+#[test]
+fn subc_promoted_foreground_is_killed_at_its_timeout() {
+    run_subc_with_env(
+        &[("AFT_TEST_FOREGROUND_WAIT_MS", SHORT_FOREGROUND_WAIT_MS)],
+        |mut harness| async move {
+            let files = CappedFiles::new(harness.project.path());
+            let started = Instant::now();
+            send_tool_call(
+                &mut harness.stream,
+                50,
+                "bash",
+                json!({
+                    "command": files.command(),
+                    "timeout": TIMEOUT_MS,
+                    "compressed": false,
+                }),
+            )
+            .await;
+            let frame = read_tool_response(&mut harness.stream, 50, HANG_CATCH).await;
+            assert_eq!(
+                tool_response_json(&frame)["status"],
+                "running",
+                "the call should be promoted before its timeout: {}",
+                frame_body(&frame)
+            );
+            let task_id = extract_task_id(&frame);
+
+            let status = subc_status_until_terminal(&mut harness.stream, 51, &task_id).await;
+            assert_timed_out_status("subc promoted foreground", &status, started.elapsed());
+            files.assert_command_killed(started);
+            harness
+        },
+    );
+}
+
+#[test]
+fn subc_background_is_killed_at_its_timeout() {
+    assert_subc_launched_task_is_capped("background", 60);
+}
+
+#[test]
+fn subc_pty_is_killed_at_its_timeout() {
+    assert_subc_launched_task_is_capped("pty", 70);
+}
+
+/// Launches a `background: true` or `pty: true` task with a timeout, then
+/// polls its status until the timeout kill lands.
+fn assert_standalone_launched_task_is_capped(flag: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let files = CappedFiles::new(dir.path());
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path(), &storage);
+
+    let mut params = json!({
+        "command": files.command(),
+        "foreground_orchestrate": true,
+        "timeout": TIMEOUT_MS,
+        "compressed": false,
+    });
+    params[flag] = json!(true);
+    let started = Instant::now();
+    let response = aft.send_with_timeout(&bash_request("launched-timeout", params), HANG_CATCH);
+    assert_eq!(response["success"], true, "{flag}: response: {response:?}");
+    let task_id = response["task_id"].as_str().expect("task_id").to_string();
+
+    let status = standalone_status_until_terminal(&mut aft, &task_id);
+    assert_timed_out_status(flag, &status, started.elapsed());
+    files.assert_command_killed(started);
+    assert!(aft.shutdown().success());
+}
+
+fn assert_subc_launched_task_is_capped(flag: &'static str, corr: u64) {
+    run_subc(move |mut harness| async move {
+        let files = CappedFiles::new(harness.project.path());
+        let mut arguments = json!({
+            "command": files.command(),
+            "timeout": TIMEOUT_MS,
+            "compressed": false,
+        });
+        arguments[flag] = json!(true);
+        let started = Instant::now();
+        send_tool_call(&mut harness.stream, corr, "bash", arguments).await;
+        let launch = read_tool_response(&mut harness.stream, corr, HANG_CATCH).await;
+        assert!(
+            !tool_result_is_error(&launch),
+            "subc {flag} launch: {}",
+            frame_body(&launch)
+        );
+        let task_id = extract_task_id(&launch);
+
+        let status = subc_status_until_terminal(&mut harness.stream, corr + 1, &task_id).await;
+        assert_timed_out_status(flag, &status, started.elapsed());
+        files.assert_command_killed(started);
+        harness
+    });
+}
+
+/// The pid file and marker file a capped command writes.
+struct CappedFiles {
+    pidfile: PathBuf,
+    marker: PathBuf,
+}
+
+impl CappedFiles {
+    fn new(dir: &Path) -> Self {
+        Self {
+            pidfile: dir.join("capped-grandchild.pid"),
+            marker: dir.join("capped-command-finished"),
+        }
+    }
+
+    /// Sleeps in a grandchild that shares the shell's process group, records
+    /// its pid, waits for it, and only then touches the marker.
+    fn command(&self) -> String {
+        format!(
+            "sleep {} & echo $! > {}; wait; touch {}",
+            CAPPED_SLEEP.as_secs(),
+            shell_quote(&self.pidfile),
+            shell_quote(&self.marker)
+        )
+    }
+
+    /// The sleeping grandchild died, and the command after the sleep never ran.
+    fn assert_command_killed(&self, started: Instant) {
+        assert_grandchild_killed(&self.pidfile);
+        let marker_due = started + CAPPED_SLEEP + MARKER_SLACK;
+        let now = Instant::now();
+        if marker_due > now {
+            std::thread::sleep(marker_due - now);
+        }
+        assert!(
+            !self.marker.exists(),
+            "the command after the sleep ran; the timeout did not kill the command"
+        );
+    }
+}
+
+/// A held reply reports the kill exactly like a `wait: true` call does.
+fn assert_timed_out_reply(label: &str, reply: &Value) {
+    assert_eq!(reply["status"], "timed_out", "{label}: reply: {reply:?}");
+    assert_eq!(reply["timed_out"], true, "{label}: reply: {reply:?}");
+    assert_eq!(reply["exit_code"], 124, "{label}: reply: {reply:?}");
+    let output = reply["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("[command timed out]"),
+        "{label}: output lacks the timed-out marker: {reply:?}"
+    );
+}
+
+/// A background task's final status reports the kill with the same status and
+/// exit code a held call's reply carries, within the timeout's reply window.
+fn assert_timed_out_status(label: &str, status: &Value, observed_after: Duration) {
+    assert_eq!(status["status"], "timed_out", "{label}: status: {status:?}");
+    assert_eq!(status["exit_code"], 124, "{label}: status: {status:?}");
+    assert_reply_window(label, observed_after);
+}
+
+/// How often the status loops below re-read a running task.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn standalone_status_until_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
+    let deadline = Instant::now() + HANG_CATCH;
+    loop {
+        let status = aft.send(
+            &json!({
+                "id": "capped-status",
+                "method": "bash_status",
+                "session_id": SESSION_ID,
+                "params": { "task_id": task_id },
+            })
+            .to_string(),
+        );
+        assert_eq!(status["success"], true, "bash_status: {status:?}");
+        if status["status"] != "running" {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} still running after {HANG_CATCH:?}"
+        );
+        std::thread::sleep(STATUS_POLL_INTERVAL);
+    }
+}
+
+async fn subc_status_until_terminal(stream: &mut TcpStream, corr: u64, task_id: &str) -> Value {
+    let deadline = Instant::now() + HANG_CATCH;
+    loop {
+        send_tool_call(stream, corr, "bash_status", json!({ "task_id": task_id })).await;
+        let frame = read_tool_response(stream, corr, HANG_CATCH).await;
+        assert!(
+            !tool_result_is_error(&frame),
+            "bash_status: {}",
+            frame_body(&frame)
+        );
+        let status = tool_response_json(&frame);
+        if status["status"] != "running" {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} still running after {HANG_CATCH:?}"
+        );
+        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (d) bash.watch_sync_max_ms: default 120,000, clamped to 1,000..=1,800,000.
 // ---------------------------------------------------------------------------
 
@@ -352,6 +682,15 @@ where
     F: FnOnce(SubcHarness) -> Fut,
     Fut: std::future::Future<Output = SubcHarness>,
 {
+    run_subc_with_env(&[], body);
+}
+
+/// [`run_subc`] with extra environment variables for the module process.
+fn run_subc_with_env<F, Fut>(env: &[(&str, &str)], body: F)
+where
+    F: FnOnce(SubcHarness) -> Fut,
+    Fut: std::future::Future<Output = SubcHarness>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -368,6 +707,7 @@ where
             &conn_dir.path().join("subc-connection.json"),
             config_home.path(),
             data_home.path(),
+            env,
         );
         let mut stream = accept_module(&listener).await;
         bind_route(&mut stream, project.path()).await;
@@ -433,7 +773,7 @@ struct ModuleProcess {
 }
 
 impl ModuleProcess {
-    fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path) -> Self {
+    fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path, env: &[(&str, &str)]) -> Self {
         use std::os::unix::process::CommandExt;
 
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
@@ -451,6 +791,7 @@ impl ModuleProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        command.envs(env.iter().copied());
         // Own process group, so Drop can kill the module and any bash children.
         unsafe {
             command.pre_exec(|| {

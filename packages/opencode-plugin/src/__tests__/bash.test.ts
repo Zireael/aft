@@ -594,11 +594,13 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
   });
 
-  test("foreground sub-window timeout is dropped so the bridge applies its default (#102)", async () => {
-    // A model passing timeout: 100 must NOT become the bridge kill cap (that
-    // killed commands at 100ms). On the foreground path, a timeout below the
-    // wait window is incoherent, so it's sent as undefined and Rust uses its
-    // 30-minute default.
+  test("foreground forwards a timeout shorter than the wait window as the hard kill cap", async () => {
+    // `timeout` is a hard kill cap in every mode. A cap below the foreground
+    // wait window used to be dropped here, so the engine applied its
+    // 30-minute default and a command meant to die after 100 ms ran to
+    // completion. The engine kills it at the cap and answers timed out, and
+    // the wait window stays the configured one rather than shrinking to the
+    // cap, so forwarding the cap verbatim is safe.
     const { calls, tool: bash } = createHarness(() => ({
       success: true,
       output: "done",
@@ -609,7 +611,27 @@ describe("OpenCode bash adapter", () => {
     bashText(await bash.execute({ command: "echo hi", timeout: 100 }, createMockSdkContext()));
 
     expect(calls[0].command).toBe("bash");
-    expect(calls[0].params.timeout).toBeUndefined();
+    expect(calls[0].params.timeout).toBe(100);
+    expect(calls[0].params.wait).toBe(false);
+    expect(calls[0].params.background).toBe(false);
+  });
+
+  test("foreground forwards a numeric-string timeout as the hard kill cap", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "done",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    bashText(
+      await bash.execute(
+        { command: "echo hi", timeout: "1000" as unknown as number },
+        createMockSdkContext(),
+      ),
+    );
+
+    expect(calls[0].params.timeout).toBe(1000);
   });
 
   test("explicit background honors a small timeout verbatim as a real kill cap", async () => {

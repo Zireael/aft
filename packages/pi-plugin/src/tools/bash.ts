@@ -9,7 +9,6 @@ import {
   isTerminalStatus,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
-  resolveBashKillTimeout,
   resolveWatchTimeoutMs,
   runBashHostFallback,
   sleep,
@@ -533,6 +532,12 @@ export function registerBashTool(
       // Pi-side spawn payload also reflects the auto-promotion. When background
       // is disabled these params are omitted from the schema and defensively
       // ignored if a stale caller sends them anyway.
+      //
+      // `timeout` is the command's hard kill cap in every mode, forwarded
+      // unchanged. On the default foreground path a cap shorter than the
+      // foreground wait window kills the command before it would be promoted,
+      // and the call answers with the timed-out result. Omitting it lets the
+      // engine apply its 30-minute default.
       const timeout = coerceOptionalInt(params.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
       const ptyRows = backgroundDisabled
         ? undefined
@@ -568,18 +573,6 @@ export function registerBashTool(
       }
       const blockToCompletion = backgroundDisabled || requestedWait || workerForcedForeground;
       const effectiveBackground = !blockToCompletion && (rawRequestedBackground || requestedPty);
-      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
-      // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
-      // FOREGROUND auto-promote path a `timeout` below the foreground wait
-      // window is incoherent (the task would be killed before we promote it to
-      // background), so treat it as unset and let the bridge apply its
-      // 30-minute default. When background is disabled,
-      // or when `wait:true` asks to block, there is no promotion window, so
-      // `timeout` remains the hard cap.
-      const effectiveTimeout =
-        requestedWait || effectiveBackground || backgroundDisabled
-          ? timeout
-          : resolveBashKillTimeout(timeout, foregroundWaitMs);
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -609,7 +602,7 @@ export function registerBashTool(
           bridge,
           {
             command: bridgeCommand,
-            timeout: effectiveTimeout,
+            timeout,
             workdir: spawnContext.cwd ?? params.workdir,
             env: spawnContext.env,
             description: params.description,
@@ -630,7 +623,7 @@ export function registerBashTool(
             transportTimeoutMs: orchestratedTransportTimeoutMs(
               blockToCompletion,
               requestedWait,
-              effectiveTimeout,
+              timeout,
               foregroundWaitMs,
             ),
             onProgress: ({ text }) => {

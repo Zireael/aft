@@ -434,6 +434,38 @@ describe("bash tool adapter", () => {
     expect(result.details.task_id).toBe("bash-123");
   });
 
+  test("foreground bash forwards a timeout shorter than the wait window as the kill cap", async () => {
+    // `timeout` is a hard kill cap in every mode. A cap below the foreground
+    // wait window used to be dropped here, so the engine applied its
+    // 30-minute default and the command ran to completion.
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({
+      status: "timed_out",
+      task_id: "bash-capped",
+      exit_code: 124,
+      duration_ms: 1_000,
+      output: "[command timed out]\n[exit code: 124]",
+    });
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    await tools
+      .get("bash")!
+      .execute("test-call", { command: "sleep 5", timeout: 1_000 }, undefined, undefined, {
+        cwd: projectRoot,
+      });
+
+    const callArgs = calls[0] as [string, Record<string, unknown>];
+    expect(callArgs[0]).toBe("bash");
+    expect(callArgs[1]).toMatchObject({
+      timeout: 1_000,
+      background: false,
+      wait: false,
+    });
+  });
+
   test("foreground command returns server-orchestrated inline output without client polling", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

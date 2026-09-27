@@ -36,7 +36,6 @@ export {
   bashHostFallbackAskPattern,
   runBashHostFallback,
 } from "./bash-host-fallback.js";
-export { resolveBashKillTimeout } from "./bash-timeout.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {

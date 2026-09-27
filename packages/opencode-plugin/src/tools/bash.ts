@@ -5,7 +5,6 @@ import {
   classifyBashHostFallbackError,
   coerceBoolean,
   maybeAppendGrepSearchHint,
-  resolveBashKillTimeout,
   runBashHostFallback,
   sleep,
 } from "@cortexkit/aft-bridge";
@@ -440,23 +439,16 @@ export function createBashTool(
       const blockToCompletion = subagentForcedForeground || backgroundDisabled || requestedWait;
       const effectiveBackground = blockToCompletion ? false : requestedBackground;
 
-      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
-      // small `timeout` is a legitimate kill cap (kill after N ms), so honor it
-      // verbatim. For the FOREGROUND auto-promote path a `timeout` below the
-      // foreground wait window is incoherent (the task would be killed before we
-      // promote it to background), so treat it as unset and let the bridge apply
-      // its 30-minute default. When background is
-      // disabled, or when `wait:true` asks to block, there is no promotion
-      // window, so `timeout` remains the hard cap.
+      // `timeout` is the command's hard kill cap in every mode, forwarded
+      // unchanged. On the default foreground path a cap shorter than the
+      // foreground wait window kills the command before it would be promoted,
+      // and the call answers with the timed-out result. Omitting it lets the
+      // engine apply its 30-minute default.
       const rawTimeout = coerceOptionalInt(args.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
-      const effectiveTimeout =
-        requestedWait || effectiveBackground || backgroundDisabled
-          ? rawTimeout
-          : resolveBashKillTimeout(rawTimeout, foregroundWaitMs);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
       // majority of calls and produces no useful log signal.
@@ -485,7 +477,7 @@ export function createBashTool(
           context,
           {
             command,
-            timeout: effectiveTimeout,
+            timeout: rawTimeout,
             workdir: args.workdir,
             env: shellEnv?.env ?? {},
             description,
@@ -506,7 +498,7 @@ export function createBashTool(
             transportTimeoutMs: orchestratedTransportTimeoutMs(
               blockToCompletion,
               requestedWait,
-              effectiveTimeout,
+              rawTimeout,
               foregroundWaitMs,
             ),
             onProgress: ({ text }) => {
