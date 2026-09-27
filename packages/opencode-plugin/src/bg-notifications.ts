@@ -1,9 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   type AftProjectTransport,
-  BASH_TOOL_NAMES,
   type BgNudgeRef,
-  type CommandToolNames,
   resolveBridgeForNudge,
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
@@ -1319,31 +1317,25 @@ async function triggerWakeIfPending(
   );
 }
 
-export function formatSystemReminder(
-  completions: readonly BgCompletion[],
-  names: CommandToolNames = BASH_TOOL_NAMES,
-): string {
+export function formatSystemReminder(completions: readonly BgCompletion[]): string {
   const bullets = completions.map((completion) => formatCompletion(completion)).join("\n");
-  // Only point at the status tool when at least one completion is truncated;
+  // Only point at bash_status when at least one completion is truncated;
   // for fully-captured short outputs the agent already has the full result.
   const anyTruncated = completions.some((c) => c.output_truncated === true);
   const tail = anyTruncated
-    ? `\n\nFor truncated tasks, use ${names.status}({ taskId: "..." }) to retrieve full output.`
+    ? `\n\nFor truncated tasks, use bash_status({ taskId: "..." }) to retrieve full output.`
     : "";
   return `<system-reminder>\n[BACKGROUND BASH COMPLETED]\n${bullets}${tail}\n</system-reminder>`;
 }
 
-export function formatLongRunningReminder(
-  reminders: readonly BgLongRunningReminder[],
-  names: CommandToolNames = BASH_TOOL_NAMES,
-): string {
+export function formatLongRunningReminder(reminders: readonly BgLongRunningReminder[]): string {
   const bullets = reminders
     .map(
       (reminder) =>
         `- ${reminder.task_id} still running after ${formatDurationMs(reminder.elapsed_ms)}: ${shorten(reminder.command, 120)}`,
     )
     .join("\n");
-  return `<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n${bullets}\nUse ${names.status}({ taskId: "..." }) to inspect output or ${names.kill}({ taskId: "..." }) to terminate.\n</system-reminder>`;
+  return `<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n${bullets}\nUse bash_status({ taskId: "..." }) to inspect output or bash_kill({ taskId: "..." }) to terminate.\n</system-reminder>`;
 }
 
 export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]): string {

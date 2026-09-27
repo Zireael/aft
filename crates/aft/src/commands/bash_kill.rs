@@ -1,4 +1,3 @@
-use crate::command_tool_name::CommandToolName;
 use crate::commands::bash_status::format_unknown_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -72,10 +71,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) if message.contains("not found") => Response::error(
             &req.id,
             "task_not_found",
-            format_unknown_task_message(
-                &task_id,
-                CommandToolName::from_params(&req.params).unwrap_or_default(),
-            ),
+            format_unknown_task_message(&task_id),
         ),
         Err(message) => Response::error(&req.id, "kill_failed", message),
     }

@@ -1022,9 +1022,7 @@ export async function deriveMutatingTools(repoRoot: string): Promise<Set<string>
     }
   }
   const permissionInventory = await readPermissionAskInventory(repoRoot);
-  // The command tool's ask sites are filed under `shell`, the action OpenCode
-  // 2 evaluates them under; the tool itself is still the canonical `bash`.
-  if (permissionInventory.some((operation) => operation.startsWith("shell:"))) derived.add("bash");
+  if (permissionInventory.some((operation) => operation.startsWith("bash:"))) derived.add("bash");
   return derived;
 }
 

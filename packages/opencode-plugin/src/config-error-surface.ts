@@ -4,11 +4,7 @@
  * failing with the configuration error instead of reaching a bridge.
  */
 
-import {
-  AftConfigError,
-  type CommandToolName,
-  ConfigErrorTransportPool,
-} from "@cortexkit/aft-bridge";
+import { AftConfigError, ConfigErrorTransportPool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 
 import type { AftConfig } from "./config.js";
@@ -42,15 +38,12 @@ export function failEveryToolCall(
  * Build the tool surface `config` selects, with every call failing with
  * `message`. The tool factories receive a transport pool that never starts a
  * bridge, so building the surface cannot spawn anything either.
- * `commandToolName` is the host's name for the command tool, as in
- * `PluginContext.commandToolName`.
  */
 export function buildConfigErrorToolMap(
   config: AftConfig,
   message: string,
   client: unknown,
   buildToolMap: ToolMapBuilder = buildAftToolDefinitions,
-  commandToolName?: CommandToolName,
 ): Record<string, ToolDefinition> {
   const ctx: PluginContext = {
     pool: new ConfigErrorTransportPool(message),
@@ -59,7 +52,6 @@ export function buildConfigErrorToolMap(
     hashlineEffective: openCodeHashlineEffective(config),
     storageDir: "",
     isProjectEnabled: () => false,
-    ...(commandToolName ? { commandToolName } : {}),
   };
   return failEveryToolCall(buildToolMap(ctx, config), message);
 }

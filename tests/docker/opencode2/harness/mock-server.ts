@@ -71,27 +71,9 @@ export function materializeTurnPlaceholders(
   }
 }
 
-/**
- * AFT registers its command tool family under OpenCode 2's own name for it:
- * `bash` is the host's `shell` there and the companions follow. The pinned
- * OpenCode 1 host keeps `bash` and `bash_*`. Scenarios keep the canonical
- * names, which are what `disabled_tools` and the module catalog use.
- */
-const V2_COMMAND_TOOL_NAMES: Readonly<Record<string, string>> = {
-  bash: "shell",
-  bash_status: "shell_status",
-  bash_watch: "shell_watch",
-  bash_kill: "shell_kill",
-  bash_write: "shell_write",
-};
-
-export type HostGeneration = "v1" | "v2";
-
-/** The name the given host generation offers a scenario's tool under. */
-export function hostToolName(name: string, generation: HostGeneration = "v2"): string {
+export function hostToolName(name: string): string {
   if (name === "ast_search") return "ast_grep_search";
   if (name === "ast_replace") return "ast_grep_replace";
-  if (generation === "v2") return V2_COMMAND_TOOL_NAMES[name] ?? name;
   return name;
 }
 
@@ -105,12 +87,12 @@ export function hostToolArguments(
   return { path: filePath, ...rest };
 }
 
-function mockResponse(turn: ScriptedTurn, generation: HostGeneration): Record<string, unknown> {
+function mockResponse(turn: ScriptedTurn): Record<string, unknown> {
   if (turn.response.kind === "text") return { content: turn.response.content };
   return {
     toolCalls: turn.response.calls.map((call) => ({
       id: call.id,
-      name: hostToolName(call.name, generation),
+      name: hostToolName(call.name),
       arguments: JSON.stringify(hostToolArguments(call.name, call.arguments)),
     })),
   };
@@ -121,7 +103,6 @@ export async function observeThenRespond(
   request: unknown,
   index: number,
   hooks: DeterministicMockHooks,
-  generation: HostGeneration = "v2",
 ): Promise<{ exchange: RecordedMockExchange; response: Record<string, unknown> }> {
   await hooks.beforeTurn?.(turn, request);
   const exchange: RecordedMockExchange = {
@@ -132,7 +113,7 @@ export async function observeThenRespond(
     observed_at: new Date().toISOString(),
   };
   await hooks.afterRequest?.(exchange, turn);
-  const response = mockResponse(turn, generation);
+  const response = mockResponse(turn);
   exchange.response = response;
   await hooks.afterResponse?.(exchange);
   return { exchange, response };
@@ -156,20 +137,16 @@ export class DeterministicScenarioMock {
   readonly turnLogPath: string;
   readonly exchanges: RecordedMockExchange[] = [];
   readonly hooks: DeterministicMockHooks;
-  /** The host generation the scripted tool calls are addressed to. */
-  readonly generation: HostGeneration;
   #mock?: LLMockLike;
 
   constructor(
     scenario: ScenarioDefinition,
     turnLogPath: string,
     hooks: DeterministicMockHooks = {},
-    generation: HostGeneration = "v2",
   ) {
     this.scenario = scenario;
     this.turnLogPath = turnLogPath;
     this.hooks = hooks;
-    this.generation = generation;
   }
 
   get url(): string {
@@ -207,7 +184,6 @@ export class DeterministicScenarioMock {
             request,
             index,
             this.hooks,
-            this.generation,
           );
           appendFileSync(this.turnLogPath, `${turn.label}\n`);
           this.exchanges.push(exchange);

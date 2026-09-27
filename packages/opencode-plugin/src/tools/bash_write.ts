@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBashBridge, commandToolNamesFor } from "./_shared.js";
+import { callBashBridge } from "./_shared.js";
 
 const z = tool.schema;
 
@@ -40,10 +40,9 @@ const z = tool.schema;
  * `mode: "pty"`.
  */
 export function createBashWriteTool(ctx: PluginContext): ToolDefinition {
-  const names = commandToolNamesFor(ctx);
   return {
     description:
-      `Write input bytes to a running PTY bash task. PTY-only; check ${names.status} reports mode: "pty" first. ` +
+      'Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: "pty" first. ' +
       'Input is either a string (verbatim bytes) or an array mixing strings and { key: "esc" | "enter" | "up" | "ctrl-c" | ... } objects ' +
       'for atomic text+key sequences such as [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ]. ' +
       "Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. " +
@@ -51,9 +50,7 @@ export function createBashWriteTool(ctx: PluginContext): ToolDefinition {
     args: {
       taskId: z
         .string()
-        .describe(
-          `Background PTY task ID returned by ${names.command}({ pty: true, background: true }).`,
-        ),
+        .describe("Background PTY task ID returned by bash({ pty: true, background: true })."),
       input: z
         .union([
           z.string(),
@@ -82,7 +79,7 @@ export function createBashWriteTool(ctx: PluginContext): ToolDefinition {
         input: args.input as unknown,
       });
       if (data.success === false) {
-        throw new Error((data.message as string | undefined) ?? `${names.write} failed`);
+        throw new Error((data.message as string | undefined) ?? "bash_write failed");
       }
       return JSON.stringify({ bytes_written: data.bytes_written }, null, 2);
     },

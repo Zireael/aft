@@ -98,15 +98,6 @@ export {
   isEmptyParam,
 } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
-// --- command tool naming (bash on OpenCode 1 and Pi, shell on OpenCode 2) ---
-export {
-  BASH_TOOL_NAMES,
-  type CommandToolName,
-  type CommandToolNames,
-  commandToolNames,
-  isCommandToolName,
-  SHELL_TOOL_NAMES,
-} from "./command-tool-names.js";
 // --- config error state (a plugin that loads but fails every tool call) ---
 export {
   AftConfigError,
@@ -153,7 +144,6 @@ export {
   BASH_TRANSPORT_DISPOSITION,
   type BashHostFallbackCause,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
-  bashTransportDisposition,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
   toolErrorFromResponse,

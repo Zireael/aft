@@ -1,24 +1,13 @@
-use crate::command_tool_name::CommandToolName;
-
 /// Add the bash-rewrite footer to a tool's human-readable output.
 ///
 /// We intentionally keep this a single short line. The agent already wrote
 /// the original bash command in their tool call so we don't repeat it; the
 /// only signal we need to surface is "next time, use the dedicated tool"
 /// because that's what changes their behavior on the next turn.
-///
-/// `command_tool_name` is the caller's name for the command tool the agent
-/// used, so the footer names the tool that agent actually has.
-pub fn add_footer(
-    response_output: &str,
-    replacement_tool: &str,
-    command_tool_name: CommandToolName,
-) -> String {
+pub fn add_footer(response_output: &str, replacement_tool: &str) -> String {
     format!(
-        "{}\n\nPrefer `{}` tool over {}.",
-        response_output,
-        replacement_tool,
-        command_tool_name.command()
+        "{}\n\nPrefer `{}` tool over bash.",
+        response_output, replacement_tool
     )
 }
 
@@ -30,43 +19,11 @@ pub fn add_footer(
 /// registered `aft_search` for this surface (`aft_search_registered`), the
 /// footer points there (it auto-routes concepts, identifiers, regex, AND
 /// literals); otherwise it points at the indexed `grep` tool.
-pub fn add_grep_footer(
-    response_output: &str,
-    aft_search_registered: bool,
-    command_tool_name: CommandToolName,
-) -> String {
-    let steer = if aft_search_registered {
-        "Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
+pub fn add_grep_footer(response_output: &str, aft_search_registered: bool) -> String {
+    let hint = if aft_search_registered {
+        "DO NOT search code by running grep/rg in bash \u{2014} it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
     } else {
-        "Use the `grep` tool instead (indexed and ranked)."
+        "DO NOT search code by running grep/rg in bash \u{2014} it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked)."
     };
-    format!(
-        "{response_output}\n\nDO NOT search code by running grep/rg in {} \u{2014} it is unindexed, unranked, and serial. {steer}",
-        command_tool_name.command()
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn footers_name_the_callers_command_tool() {
-        assert_eq!(
-            add_footer("out", "read", CommandToolName::Bash),
-            "out\n\nPrefer `read` tool over bash."
-        );
-        assert_eq!(
-            add_footer("out", "read", CommandToolName::Shell),
-            "out\n\nPrefer `read` tool over shell."
-        );
-        assert_eq!(
-            add_grep_footer("out", true, CommandToolName::Bash),
-            "out\n\nDO NOT search code by running grep/rg in bash \u{2014} it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."
-        );
-        assert_eq!(
-            add_grep_footer("out", false, CommandToolName::Shell),
-            "out\n\nDO NOT search code by running grep/rg in shell \u{2014} it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked)."
-        );
-    }
+    format!("{response_output}\n\n{hint}")
 }

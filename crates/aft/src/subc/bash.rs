@@ -1,7 +1,6 @@
 //! Deferred bash orchestration and trust-gated shell helpers for subc route calls.
 
 use super::*;
-use crate::command_tool_name::CommandToolName;
 
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
@@ -64,7 +63,6 @@ enum BashSpawnControl {
         timeout: Option<u64>,
         wait_window_ms: u64,
         detach_on_user_message: bool,
-        command_tool_name: CommandToolName,
     },
 }
 
@@ -188,7 +186,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 let response = Response::success(
                     &target.request_id,
                     json!({
-                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.command_tool_name),
+                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
@@ -316,16 +314,11 @@ fn bash_result_from_response(
     ToolCallResult { text, response }
 }
 
-fn bash_background_launch_response(
-    request_id: &str,
-    task_id: &str,
-    is_pty: bool,
-    names: CommandToolName,
-) -> Response {
+fn bash_background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, names),
+            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -409,10 +402,6 @@ pub(super) fn submit_deferred_bash(
     permissions_granted: Option<Vec<String>>,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
-    // The calling host's name for the command tool. The notices this call
-    // renders itself (launch, promotion, detach) use it; the spawned task also
-    // records it for text rendered after this call returns.
-    let names = CommandToolName::from_params(&arguments).unwrap_or_default();
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
     let root_for_spawn = root.clone();
@@ -545,12 +534,8 @@ pub(super) fn submit_deferred_bash(
                     .unwrap_or("pipes");
                 let is_pty = mode == "pty" || settings.pty;
                 if is_pty || settings.background {
-                    let response = bash_background_launch_response(
-                        &request_id_for_spawn,
-                        &task_id,
-                        is_pty,
-                        names,
-                    );
+                    let response =
+                        bash_background_launch_response(&request_id_for_spawn, &task_id, is_pty);
                     return finish_bash_spawn_immediate(
                         response,
                         ctx,
@@ -594,7 +579,6 @@ pub(super) fn submit_deferred_bash(
                         timeout: settings.timeout,
                         wait_window_ms,
                         detach_on_user_message,
-                        command_tool_name: names,
                     });
                 }
                 response
@@ -649,7 +633,6 @@ pub(super) fn submit_deferred_bash(
                 timeout,
                 wait_window_ms,
                 detach_on_user_message,
-                command_tool_name,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -683,7 +666,6 @@ pub(super) fn submit_deferred_bash(
                     format_context,
                     cancel,
                     claim,
-                    command_tool_name,
                 )
                 .await;
             }
@@ -732,7 +714,6 @@ async fn run_deferred_bash_wait(
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
-    names: CommandToolName,
 ) {
     let Some(wait_ctx) = executor.actor_context(&root) else {
         send_bash_deferred_completion(
@@ -765,7 +746,6 @@ async fn run_deferred_bash_wait(
             ver,
             flags,
             format_context: format_context.clone(),
-            command_tool_name: names,
         },
     );
     loop {
@@ -890,7 +870,6 @@ async fn run_deferred_bash_wait(
                                     crate::commands::bash_orchestrate::task_not_found_response(
                                         &request_id_for_poll,
                                         &task_id_for_poll,
-                                        names,
                                     ),
                                     ctx,
                                     &session_for_poll,
@@ -911,7 +890,6 @@ async fn run_deferred_bash_wait(
                                         &task_id_for_poll,
                                         &session_for_poll,
                                         &request_id_for_poll,
-                                        names,
                                     );
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
@@ -948,7 +926,6 @@ async fn run_deferred_bash_wait(
                                     &task_id_for_poll,
                                     &session_for_poll,
                                     &request_id_for_poll,
-                                    names,
                                 );
                                 ctx.bash_background().end_wait_mode_session(
                                     &session_for_poll,
@@ -1117,7 +1094,6 @@ async fn run_deferred_bash_wait(
                             timeout,
                             wait_window_ms,
                             format_context.clone(),
-                            names,
                         )
                         .await;
                         let fatal = response_is_fatal_panic(&result.response);
@@ -1152,7 +1128,6 @@ async fn submit_bash_promote(
     timeout: Option<u64>,
     wait_window_ms: u64,
     format_context: crate::subc_format::FormatContext,
-    names: CommandToolName,
 ) -> ToolCallResult {
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let request_id_for_promote = request_id.clone();
@@ -1184,7 +1159,6 @@ async fn submit_bash_promote(
                         timeout,
                         wait_window_ms,
                         &request_id_for_promote,
-                        names,
                     )
                 };
                 let result = finalized_bash_result(
@@ -1412,7 +1386,6 @@ mod grant_path_tests {
             80,
             Vec::new(),
             None,
-            crate::command_tool_name::CommandToolName::Bash,
         )
     }
 
@@ -1606,10 +1579,7 @@ mod grant_path_tests {
             .load(Ordering::Relaxed)
             < 1
         {
-            assert!(
-                Instant::now() < started_by,
-                "deferred bash wait never started"
-            );
+            assert!(Instant::now() < started_by, "deferred bash wait never started");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let registry = executor
@@ -1658,12 +1628,6 @@ mod grant_path_tests {
             .await
             .expect("deferred completion deadline")
             .expect("deferred completion");
-        assert!(
-            completion
-                .result
-                .expect("terminal bash result")
-                .response
-                .success
-        );
+        assert!(completion.result.expect("terminal bash result").response.success);
     }
 }

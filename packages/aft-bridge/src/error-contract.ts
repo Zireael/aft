@@ -63,12 +63,8 @@ export function toolErrorFromResponse(
 }
 
 /** Agent-facing guidance for a bash request whose transport outcome is unknown. */
-export function bashTransportDisposition(statusTool: string): string {
-  return `The transport to the AFT daemon was interrupted; no background task was created for this command and no task ID exists. Re-run the command. Do not poll ${statusTool} for it.`;
-}
-
-/** {@link bashTransportDisposition} for hosts whose status tool is `bash_status`. */
-export const BASH_TRANSPORT_DISPOSITION = bashTransportDisposition("bash_status");
+export const BASH_TRANSPORT_DISPOSITION =
+  "The transport to the AFT daemon was interrupted; no background task was created for this command and no task ID exists. Re-run the command. Do not poll bash_status for it.";
 
 /**
  * Agent-facing guidance for a call the daemon GOODBYE'd mid-flight.
@@ -236,14 +232,9 @@ function isTransportClassError(error: unknown): boolean {
  * Append agent-facing recovery guidance without changing the original error
  * object, class, code, or retry behavior. Unknown-outcome errors append safety
  * guidance on every command; proven bash transport failures append re-run
- * guidance that names `statusTool`, the host's name for the status companion.
- * Commands matching neither retain their errors untouched.
+ * guidance. Commands matching neither retain their errors untouched.
  */
-export function adaptToolError(
-  command: string,
-  error: unknown,
-  statusTool = "bash_status",
-): unknown {
+export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
 
   if (error instanceof BridgeTransportUnknownOutcomeError) {
@@ -266,8 +257,9 @@ export function adaptToolError(
   }
 
   if (command !== "bash" || !isTransportClassError(error)) return error;
-  const disposition = bashTransportDisposition(statusTool);
-  if (error.message.includes(disposition)) return error;
-  error.message = error.message ? `${error.message} ${disposition}` : disposition;
+  if (error.message.includes(BASH_TRANSPORT_DISPOSITION)) return error;
+  error.message = error.message
+    ? `${error.message} ${BASH_TRANSPORT_DISPOSITION}`
+    : BASH_TRANSPORT_DISPOSITION;
   return error;
 }

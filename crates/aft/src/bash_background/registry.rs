@@ -17,7 +17,6 @@ use crate::db::TrackedConnection;
 use serde::Serialize;
 
 use crate::bash_permissions::PermissionAsk;
-use crate::command_tool_name::CommandToolName;
 use crate::compress::caps::DropClass;
 #[cfg(unix)]
 use crate::compress::single_top_level_pipeline;
@@ -193,9 +192,6 @@ struct TerminalOutputCache {
 struct ArtifactRecoveryAccess {
     task_id: String,
     readable: bool,
-    /// The owning session's name for the command tool, which decides how the
-    /// status-tool recovery hint is spelled.
-    command_tool_name: CommandToolName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1017,7 +1013,6 @@ impl BgTaskRegistry {
         let artifact_access = ArtifactRecoveryAccess {
             task_id: metadata.task_id.clone(),
             readable: output_readable && stderr_readable,
-            command_tool_name: metadata.command_tool_name,
         };
 
         if metadata.mode == BgMode::Pty {
@@ -1352,9 +1347,7 @@ impl BgTaskRegistry {
             return false;
         };
         #[cfg(test)]
-        self.inner
-            .gc_db_liveness_queries
-            .fetch_add(1, Ordering::SeqCst);
+        self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
         crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
             .map(|rows| {
                 rows.into_iter().any(|row| {
@@ -1381,9 +1374,7 @@ impl BgTaskRegistry {
                 return HashSet::new();
             };
             #[cfg(test)]
-            self.inner
-                .gc_db_liveness_queries
-                .fetch_add(1, Ordering::SeqCst);
+            self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
             // Same fallback as the per-task lookup: a failed query reads as
             // no live row.
             crate::db::bash_tasks::list_bash_task_process_ids(&conn, &harness, task_ids)
@@ -1840,7 +1831,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
-            CommandToolName::Bash,
         )
     }
 
@@ -1861,7 +1851,6 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
-        command_tool_name: CommandToolName,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -1927,7 +1916,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
-        metadata.command_tool_name = command_tool_name;
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
         // bash/zsh PIPESTATUS and a dedicated inherited fd, neither of which
         // exists on the Windows spawn path.
@@ -2066,7 +2054,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
-            CommandToolName::Bash,
             rows,
             cols,
         )
@@ -2088,7 +2075,6 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
-        command_tool_name: CommandToolName,
         rows: u16,
         cols: u16,
     ) -> Result<String, String> {
@@ -2150,7 +2136,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
-        metadata.command_tool_name = command_tool_name;
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -2261,7 +2246,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
-            CommandToolName::Bash,
         )
     }
 
@@ -2282,7 +2266,6 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
-        command_tool_name: CommandToolName,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -2314,7 +2297,6 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
-        metadata.command_tool_name = command_tool_name;
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -2507,12 +2489,7 @@ impl BgTaskRegistry {
     /// it, and a request within [`PERSISTED_GC_COALESCE_WINDOW`] of a finished
     /// sweep is covered by that one.
     fn request_persisted_gc(&self, storage_dir: &Path) {
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = self.inner.db_harness.read().ok().and_then(|slot| slot.clone());
         let key = (canonicalized_path(storage_dir), harness);
         {
             let mut slots = persisted_gc_slots()
@@ -2671,8 +2648,7 @@ impl BgTaskRegistry {
     ) {
         if let Some((harness, pool)) = self.db_harness_and_pool() {
             // Fenced so a queued row snapshot cannot re-insert the row.
-            with_task_db_fence(originating_session_id, task_id, || {
-                match pool.lock() {
+            with_task_db_fence(originating_session_id, task_id, || match pool.lock() {
                 Ok(conn) => {
                     if let Err(error) = crate::db::bash_tasks::delete_bash_task(
                         &conn,
@@ -2688,7 +2664,6 @@ impl BgTaskRegistry {
                 Err(_) => crate::slog_warn!(
                     "failed to delete already-reaped orphaned background completion row: task_id={task_id} error=database_lock_poisoned"
                 ),
-            }
             });
         }
         let _ = self.remove_pending_completion(task_id);
@@ -2875,11 +2850,7 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "ignoring persisted background task with invalid id {:?}: reason={}",
                         metadata.task_id,
-                        if old_id {
-                            "process_alive"
-                        } else {
-                            "unrecognized_id"
-                        }
+                        if old_id { "process_alive" } else { "unrecognized_id" }
                     );
                     continue;
                 }
@@ -2911,20 +2882,12 @@ impl BgTaskRegistry {
                     continue;
                 }
                 if let Some((harness, pool)) = self.db_harness_and_pool() {
-                    let result =
-                        with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
-                            pool.lock()
-                                .map_err(|_| "database_lock_poisoned".to_string())
-                                .and_then(|conn| {
-                                    crate::db::bash_tasks::delete_bash_task(
-                                        &conn,
-                                        &harness,
-                                        &metadata.session_id,
-                                        &metadata.task_id,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                })
-                        });
+                    let result = with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+                        pool.lock().map_err(|_| "database_lock_poisoned".to_string())
+                            .and_then(|conn| crate::db::bash_tasks::delete_bash_task(
+                                &conn, &harness, &metadata.session_id, &metadata.task_id,
+                            ).map_err(|error| error.to_string()))
+                    });
                     match result {
                         Ok(removed) if removed > 0 => crate::slog_warn!(
                             "retired old-id background task {}: reason=invalid_legacy_id",
@@ -3985,7 +3948,8 @@ impl BgTaskRegistry {
                     if !(metadata.status.is_terminal() && metadata.completion_delivered) {
                         continue;
                     }
-                    if Self::persisted_task_process_is_alive(&metadata) || live_in_db(self, task_id)
+                    if Self::persisted_task_process_is_alive(&metadata)
+                        || live_in_db(self, task_id)
                     {
                         crate::slog_warn!(
                             "refusing to delete terminal background task bundle {task_id}: recorded process is still alive"
@@ -6318,10 +6282,7 @@ fn recovery_marker(recovery: &RecoveryContext) -> Option<String> {
 fn bash_status_recovery_hint(access: &ArtifactRecoveryAccess) -> String {
     let task_id = serde_json::to_string(&access.task_id)
         .unwrap_or_else(|_| format!("\"{}\"", access.task_id));
-    format!(
-        "use {}({{taskId: {task_id}}})",
-        access.command_tool_name.status()
-    )
+    format!("use bash_status({{taskId: {task_id}}})")
 }
 
 fn recovery_hint(recovery: &RecoveryContext) -> String {
@@ -6405,7 +6366,6 @@ fn is_recovery_marker(line: &str) -> bool {
             || line.contains("retained output: read ")
             || line.contains("see remaining: tail -n +")
             || line.contains("use bash_status({taskId:")
-            || line.contains("use shell_status({taskId:")
             || line.contains("full output unavailable"))
 }
 
@@ -6751,8 +6711,7 @@ fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
         .map(|name| format!(" ({name})"))
         .unwrap_or_default();
     Some(format!(
-        "{total} live descendants still running: {processes}{workload} — they keep the task's process group; {}({}) stops them",
-        metadata.command_tool_name.kill(),
+        "{total} live descendants still running: {processes}{workload} — they keep the task's process group; bash_kill({}) stops them",
         metadata.task_id
     ))
 }
@@ -7876,73 +7835,6 @@ mod tests {
         assert!(!cache.output_preview.contains("full output: read "));
     }
 
-    /// A task started by a host that calls the command tool `shell` keeps that
-    /// name, so text rendered for it long after the request returned (the
-    /// recovery footer, a completion's live-descendants note) still points at
-    /// `shell_status` and `shell_kill`. A task that was never told a name, and
-    /// every record written before the name existed, stays `bash`.
-    #[test]
-    fn a_shell_task_renders_its_later_notices_with_the_shell_tool_names() {
-        let registry = BgTaskRegistry::default();
-        let dir = tempfile::tempdir().unwrap();
-        let task_id = "bash-2222222222222223";
-        let paths = task_paths(dir.path(), "session", task_id).unwrap();
-        fs::create_dir_all(&paths.dir).unwrap();
-        fs::write(
-            &paths.stdout,
-            format!("{}tail\n", "output-line\n".repeat(2_000)),
-        )
-        .unwrap();
-        fs::write(&paths.stderr, "").unwrap();
-        let mut metadata = PersistedTask::starting(
-            task_id.to_string(),
-            "session".to_string(),
-            "printf output".to_string(),
-            dir.path().to_path_buf(),
-            Some(dir.path().to_path_buf()),
-            Some(30_000),
-            true,
-            true,
-        );
-        metadata.command_tool_name = CommandToolName::Shell;
-        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-        metadata.live_descendants = Some(vec![LiveDescendant {
-            pid: 42,
-            comm: "node".to_string(),
-            argv0: "node".to_string(),
-        }]);
-        write_task(&paths.json, &metadata).unwrap();
-
-        let cache = registry
-            .render_terminal_output_from_paths(&metadata, &paths)
-            .expect("terminal render");
-        assert!(
-            cache
-                .output_preview
-                .contains("use shell_status({taskId: \"bash-2222222222222223\"})"),
-            "{}",
-            cache.output_preview
-        );
-        assert!(!cache.output_preview.contains("bash_status"));
-
-        let summary = live_descendants_summary(&metadata).expect("descendants summary");
-        assert!(
-            summary.ends_with("shell_kill(bash-2222222222222223) stops them"),
-            "{summary}"
-        );
-
-        let persisted = serde_json::to_value(&metadata).unwrap();
-        assert_eq!(persisted["command_tool_name"], "shell");
-        metadata.command_tool_name = CommandToolName::Bash;
-        let persisted = serde_json::to_value(&metadata).unwrap();
-        assert!(persisted.get("command_tool_name").is_none());
-        let legacy: PersistedTask = serde_json::from_value(persisted).unwrap();
-        assert_eq!(legacy.command_tool_name, CommandToolName::Bash);
-        assert!(live_descendants_summary(&metadata)
-            .unwrap()
-            .ends_with("bash_kill(bash-2222222222222223) stops them"));
-    }
-
     fn insert_terminal_pty_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
@@ -8159,7 +8051,6 @@ mod tests {
             artifact_access: ArtifactRecoveryAccess {
                 task_id: "bash-test".to_string(),
                 readable: true,
-                command_tool_name: CommandToolName::Bash,
             },
         };
 
@@ -9162,10 +9053,7 @@ mod tests {
         assert_eq!(registry.inner.tasks.lock().unwrap().len(), 3);
         registry.cleanup_finished(Duration::ZERO);
         let tasks = registry.inner.tasks.lock().unwrap();
-        let retained: Vec<&String> = task_ids
-            .iter()
-            .filter(|id| tasks.contains_key(*id))
-            .collect();
+        let retained: Vec<&String> = task_ids.iter().filter(|id| tasks.contains_key(*id)).collect();
         assert!(
             retained.is_empty(),
             "foreground tasks outlived retention: {retained:?}"
@@ -9283,7 +9171,13 @@ mod tests {
         task_ids.push(killed);
         task_ids.push(pty);
         for task_id in &task_ids {
-            wait_for_terminal_snapshot(&registry, task_id, session, project.path(), storage.path());
+            wait_for_terminal_snapshot(
+                &registry,
+                task_id,
+                session,
+                project.path(),
+                storage.path(),
+            );
         }
 
         // The watchdog thread may be finishing a transition that a status
@@ -9811,10 +9705,7 @@ mod tests {
             .map(|metadata| metadata.status.is_terminal())
             .unwrap_or(false)
         {
-            assert!(
-                Instant::now() < json_by,
-                "finalize never wrote the terminal JSON"
-            );
+            assert!(Instant::now() < json_by, "finalize never wrote the terminal JSON");
             std::thread::sleep(Duration::from_millis(5));
         }
         let state_by = Instant::now() + Duration::from_millis(1_000);
@@ -10364,7 +10255,13 @@ mod tests {
             "a running task's ticket redeems to its own session"
         );
 
-        wait_for_terminal_snapshot(&registry, &task_id, session, project.path(), storage.path());
+        wait_for_terminal_snapshot(
+            &registry,
+            &task_id,
+            session,
+            project.path(),
+            storage.path(),
+        );
         assert_eq!(
             crate::gh_shim_ticket::redeem(&ticket),
             None,
@@ -10778,21 +10675,13 @@ mod tests {
             )
             .unwrap();
         let row = |db: &Mutex<TrackedConnection>| {
-            crate::db::bash_tasks::get_bash_task(
-                &db.lock().unwrap(),
-                "opencode",
-                "session",
-                &task_id,
-            )
-            .unwrap()
-            .expect("bash_tasks row")
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "opencode", "session", &task_id)
+                .unwrap()
+                .expect("bash_tasks row")
         };
         let terminal_by = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
         while row(&db).status != "completed" {
-            assert!(
-                Instant::now() < terminal_by,
-                "task row never reached completed"
-            );
+            assert!(Instant::now() < terminal_by, "task row never reached completed");
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!row(&db).completion_delivered);
@@ -10921,10 +10810,7 @@ mod tests {
             .iter()
             .any(|registry| registry.persisted_gc_thread().is_none())
         {
-            assert!(
-                Instant::now() < deadline,
-                "a replay's persisted GC never finished"
-            );
+            assert!(Instant::now() < deadline, "a replay's persisted GC never finished");
             std::thread::sleep(Duration::from_millis(10));
         }
 

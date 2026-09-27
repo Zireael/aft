@@ -5,28 +5,6 @@ import { Effect } from "effect";
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const V2_PATH_HEADER_TOOLS = new Set(["read", "write", "edit"]);
 const V2_BASH_TOOLS = new Set(["bash"]);
-
-/**
- * Registered names that differ from the shared inventory's canonical names.
- *
- * OpenCode 2 ships its own command tool as `shell` and AFT replaces it there,
- * so AFT's `bash` is registered as `shell` and its companions follow. The
- * shared definitions stay keyed by the canonical names, which are also the
- * names `disabled_tools` accepts, so only this projection knows about the
- * rename. OpenCode 1 and Pi never go through it and keep `bash` and `bash_*`.
- */
-const V2_TOOL_NAMES: Readonly<Record<string, string>> = {
-  bash: "shell",
-  bash_status: "shell_status",
-  bash_watch: "shell_watch",
-  bash_kill: "shell_kill",
-  bash_write: "shell_write",
-};
-
-/** The name a shared definition is registered under on OpenCode 2. */
-export function v2ToolName(canonical: string): string {
-  return V2_TOOL_NAMES[canonical] ?? canonical;
-}
 const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
 
 export interface V2Location {
@@ -229,19 +207,10 @@ function executionArguments(name: string, input: Record<string, unknown>): Recor
   return { filePath: path, ...rest };
 }
 
-/**
- * The permission action the host evaluates a tool's rules under.
- *
- * OpenCode 2's own shell tool asks under the action `shell`, and the host also
- * rewrites a legacy `bash` key in a user's permission config to `shell`, so
- * `shell` is the one action that carries the user's rules for running
- * commands. AFT's command tool declares that action, which is also what the
- * host consults when a wholly denied action hides a tool.
- */
 function hostPermission(name: string): string | undefined {
   const bare = bareToolName(name);
   if (new Set(["read", "glob", "grep"]).has(bare)) return bare;
-  if (V2_BASH_TOOLS.has(name)) return "shell";
+  if (V2_BASH_TOOLS.has(name)) return "bash";
   if (
     new Set([
       "write",
@@ -318,28 +287,21 @@ function runtimeFor(
   };
 }
 
-/**
- * Project one shared V1 definition into the V2 provider-tool contract.
- *
- * `name` is the canonical inventory name; the tool is registered under
- * {@link v2ToolName} of it, while argument mapping, permission and execution
- * routing keep reading the canonical name.
- */
+/** Project one shared V1 definition into the V2 provider-tool contract. */
 export function projectV2Tool(
   name: string,
   definition: ToolDefinition,
   location: V2Location,
   consumers: V2ToolConsumers = {},
 ): V2ProviderTool {
-  const registeredName = v2ToolName(name);
   const input = tool.schema.object(projectArguments(name, definition));
-  assertV2Contract(registeredName, input);
+  assertV2Contract(name, input);
   const sharedOptions = (definition as ToolDefinition & { options?: Record<string, unknown> })
     .options;
   const permission = hostPermission(name);
 
   return {
-    name: registeredName,
+    name,
     description: definition.description,
     input,
     options: {

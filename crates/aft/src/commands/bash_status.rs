@@ -1,7 +1,6 @@
 use crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
 use crate::bash_background::persistence::BgMode;
 use crate::bash_background::registry::BgTaskSnapshot;
-use crate::command_tool_name::CommandToolName;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use base64::Engine;
@@ -10,20 +9,10 @@ use serde_json::json;
 
 const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
-/// Guidance for an unknown task ID. `names` is the calling host's spelling of
-/// the command tool, which is where task IDs come from.
-pub(crate) fn unknown_task_guidance(names: CommandToolName) -> String {
-    format!(
-        "Task IDs only come from a {} tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.",
-        names.command()
-    )
-}
+pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.";
 
-pub(crate) fn format_unknown_task_message(task_id: &str, names: CommandToolName) -> String {
-    format!(
-        "background task not found: {task_id}. {}",
-        unknown_task_guidance(names)
-    )
+pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
+    format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
 }
 
 pub(crate) fn format_erased_task_message(task_id: &str) -> String {
@@ -174,10 +163,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         None => Response::error(
             &req.id,
             "task_not_found",
-            format_unknown_task_message(
-                &task_id,
-                CommandToolName::from_params(&req.params).unwrap_or_default(),
-            ),
+            format_unknown_task_message(&task_id),
         ),
     }
 }
@@ -217,16 +203,11 @@ fn maybe_render_pty_screen(
 #[cfg(test)]
 mod tests {
     use super::{format_erased_task_message, format_unknown_task_message};
-    use crate::command_tool_name::CommandToolName;
 
     #[test]
     fn unknown_task_message_steers_agents_to_rerun() {
         assert_eq!(
-            format_unknown_task_message("bash-unknown", CommandToolName::Shell),
-            "background task not found: bash-unknown. Task IDs only come from a shell tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
-        );
-        assert_eq!(
-            format_unknown_task_message("bash-unknown", CommandToolName::Bash),
+            format_unknown_task_message("bash-unknown"),
             "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
         );
     }
@@ -236,6 +217,6 @@ mod tests {
         let message = format_erased_task_message("bash-erased");
         assert!(message.contains("background task row was erased: bash-erased"));
         assert!(message.contains("stop polling this ID"));
-        assert!(!message.contains(&super::unknown_task_guidance(CommandToolName::Bash)));
+        assert!(!message.contains(super::UNKNOWN_TASK_GUIDANCE));
     }
 }

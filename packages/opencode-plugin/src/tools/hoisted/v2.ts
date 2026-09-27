@@ -2,18 +2,9 @@ import { requestPermission, type V2PermissionHostContext } from "../../permissio
 import { createV2PromptChannel, type V2PromptChannel } from "../../permissions/v2-service.js";
 import type { V2ToolConsumers } from "../definitions/v2.js";
 
-/**
- * Host tools AFT replaces on OpenCode 2, by the name the host registered them
- * under. `shell` is replaced by AFT's `bash`, registered under the host's name.
- */
-export const V2_BUILTIN_REPLACEMENTS = ["read", "edit", "write", "apply_patch", "shell"] as const;
+export const V2_BUILTIN_REPLACEMENTS = ["read", "edit", "write", "apply_patch"] as const;
 export const V2_AFT_FILESYSTEM_TOOLS = ["aft_delete", "aft_move"] as const;
 
-/**
- * Every place a V2 tool can ask the host for permission. The command tool's
- * two ask sites are listed under `shell`, the action the host evaluates their
- * rules under.
- */
 export const V2_PERMISSION_ASK_INVENTORY = [
   "read",
   "edit",
@@ -21,8 +12,8 @@ export const V2_PERMISSION_ASK_INVENTORY = [
   "apply_patch",
   "aft_delete",
   "aft_move",
-  "shell:withPermissionLoop",
-  "shell:host-fallback",
+  "bash:withPermissionLoop",
+  "bash:host-fallback",
 ] as const;
 
 function domainMethod(host: object, domain: string, method: string): boolean {

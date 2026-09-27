@@ -81,13 +81,11 @@ describe("bash abort ordering", () => {
 describe("a configured denial hides the tool it names", () => {
   const denied = scenario("bash/T3/loop_config_deny");
 
-  // On OpenCode 2 AFT's command tool is offered as `shell`, having replaced
-  // the host's own; there is no `bash` on that host to hide.
   test("accepts a tool the host offered before the rule and dropped after it", () => {
     expect(() =>
       assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["shell", "read", "shell_status"]),
-        exchange("finish", ["read", "shell_status"]),
+        exchange("call-tool", ["bash", "read", "shell"]),
+        exchange("finish", ["read", "shell"]),
       ]),
     ).not.toThrow();
   });
@@ -95,19 +93,19 @@ describe("a configured denial hides the tool it names", () => {
   test("rejects a tool the host never offered, which never registered rather than being hidden", () => {
     expect(() =>
       assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["read", "bash"]),
-        exchange("finish", ["read", "bash"]),
+        exchange("call-tool", ["read", "shell"]),
+        exchange("finish", ["read", "shell"]),
       ]),
-    ).toThrow("the host never offered shell");
+    ).toThrow("the host never offered bash");
   });
 
   test("rejects a tool the host kept offering under the rule", () => {
     expect(() =>
       assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["shell", "read"]),
-        exchange("finish", ["shell", "read"]),
+        exchange("call-tool", ["bash", "read"]),
+        exchange("finish", ["bash", "read"]),
       ]),
-    ).toThrow("kept offering shell");
+    ).toThrow("kept offering bash");
   });
 
   test("rejects a run that never reached the model", () => {

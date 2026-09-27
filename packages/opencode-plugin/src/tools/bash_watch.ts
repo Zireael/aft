@@ -1,6 +1,5 @@
 import {
   type BridgeRequestOptions,
-  type CommandToolNames,
   coerceBoolean,
   isBridgeTransportTimeout,
   isTerminalStatus,
@@ -24,13 +23,7 @@ import { resolveBashConfig } from "../config.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
-import {
-  callBashBridge,
-  coerceOptionalInt,
-  commandToolNamesFor,
-  optionalInt,
-  projectRootFor,
-} from "./_shared.js";
+import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
@@ -71,13 +64,11 @@ function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | und
 }
 
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
-  const names = commandToolNamesFor(ctx);
   return {
-    description: `Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max \`bash.watch_sync_max_ms\`, 120s by default); for anything longer end the turn on \`${names.command}({background:true})\` and let the completion reminder wake you, or use \`${names.command}({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop ${names.status} to wait.`,
+    description:
+      "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
     args: {
-      taskId: z
-        .string()
-        .describe(`Background task ID returned by ${names.command}({ background: true }).`),
+      taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z
         .union([z.string(), z.object({ regex: z.string() })])
         .optional()
@@ -109,7 +100,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       if (asyncMode) {
         if (!waitFor) {
           throw new Error(
-            `invalid_request: Use auto-reminder; ${names.watch} without pattern in async mode is redundant`,
+            "invalid_request: Use auto-reminder; bash_watch without pattern in async mode is redundant",
           );
         }
         const notifyParams: Record<string, unknown> = {
@@ -175,7 +166,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       }
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
       if (waited) metadata?.({ taskId, status: data.status, waited, effectiveWaitMs });
-      return formatWatchResultText(taskId, data, waited, role, syncWaitCap, names);
+      return formatWatchResultText(taskId, data, waited, role, syncWaitCap);
     },
   };
 }
@@ -200,7 +191,7 @@ async function convertToAsyncWatchOnAbort(
     return (
       `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
       `The task is still running in the background. A completion reminder will be ` +
-      `delivered automatically when the task exits; don't poll ${commandToolNamesFor(ctx).status}.`
+      `delivered automatically when the task exits; don't poll bash_status.`
     );
   }
   // Register the equivalent async watch so the pattern/exit notification
@@ -247,7 +238,6 @@ function formatWatchResultText(
   waited: BashStatusWaited | undefined,
   role: WatchCallerRole,
   syncWaitCap: number,
-  names: CommandToolNames,
 ): string {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
@@ -264,7 +254,7 @@ function formatWatchResultText(
       // the caller what it is and the move that fits its own role.
       text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match. ${watchTimeoutSteer(role, syncWaitCap)}`;
     } else if (waited.reason === "unavailable") {
-      text += `\nWaited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one ${names.status} snapshot on the next normal tool call.`;
+      text += `\nWaited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
     } else {
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
@@ -299,9 +289,7 @@ async function bashStatusSnapshot(
     options,
   );
   if (data.success === false)
-    throw new Error(
-      (data.message as string | undefined) ?? `${commandToolNamesFor(ctx).status} failed`,
-    );
+    throw new Error((data.message as string | undefined) ?? "bash_status failed");
   return data;
 }
 

@@ -1103,10 +1103,7 @@ mod tests {
     /// i.e. what a catalog consumer shows the model after a `bash`/`powershell`
     /// call hands back a task id and the model follows up on it.
     fn server_rendered_bash_reply_texts() -> Vec<String> {
-        use crate::command_tool_name::CommandToolName;
         use crate::commands::bash_orchestrate as orchestrate;
-        // The subc catalog advertises the `bash_*` names, so its consumers are
-        // shown the bash spelling.
         let task = "bash-0123456789abcdef";
         let running_status = |mode: &str| {
             crate::subc_format::format_response(
@@ -1119,11 +1116,11 @@ mod tests {
             )
         };
         vec![
-            orchestrate::format_background_launch(task, false, CommandToolName::Bash),
-            orchestrate::format_background_launch(task, true, CommandToolName::Bash),
-            orchestrate::format_promotion_message(task, None, 30_000, CommandToolName::Bash),
-            orchestrate::format_wait_detach_message(task, CommandToolName::Bash),
-            orchestrate::format_module_drain_detach_message(task, CommandToolName::Bash),
+            orchestrate::format_background_launch(task, false),
+            orchestrate::format_background_launch(task, true),
+            orchestrate::format_promotion_message(task, None, 30_000),
+            orchestrate::format_wait_detach_message(task),
+            orchestrate::format_module_drain_detach_message(task),
             running_status("pty"),
             running_status("pipes"),
         ]

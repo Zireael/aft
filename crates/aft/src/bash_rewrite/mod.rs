@@ -15,7 +15,6 @@ pub mod rules;
 
 use serde_json::Value;
 
-use crate::command_tool_name::CommandToolName;
 use crate::context::AppContext;
 use crate::protocol::Response;
 use crate::sandbox_spawn::{native_sandbox_enforced, AuthenticatedPrincipal};
@@ -29,8 +28,6 @@ pub struct RewriteRequest {
     pub branch_id: &'static str,
     pub decision_class_id: &'static str,
     pub params: Value,
-    /// The caller's name for the command tool, named by the reply's footer.
-    pub command_tool_name: CommandToolName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,14 +68,7 @@ pub fn try_rewrite(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
-    try_rewrite_for_request(
-        command,
-        "bash_rewrite",
-        session_id,
-        ctx,
-        principal,
-        CommandToolName::Bash,
-    )
+    try_rewrite_for_request(command, "bash_rewrite", session_id, ctx, principal)
 }
 
 /// Make the rewrite decision for one public bash request. A native route is
@@ -91,7 +81,6 @@ pub fn try_rewrite_for_request(
     session_id: Option<&str>,
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
-    command_tool_name: CommandToolName,
 ) -> Option<Response> {
     if native_sandbox_enforced(ctx, principal) {
         dispatch::record_native(
@@ -102,5 +91,5 @@ pub fn try_rewrite_for_request(
         );
         return None;
     }
-    dispatch::dispatch_for_request(command, request_id, session_id, ctx, command_tool_name)
+    dispatch::dispatch_for_request(command, request_id, session_id, ctx)
 }
