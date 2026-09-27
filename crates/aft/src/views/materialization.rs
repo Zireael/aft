@@ -93,6 +93,8 @@ pub(crate) fn apply_manifest_diff_profiled(
     )
 }
 
+#[cfg(test)]
+pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
 

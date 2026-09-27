@@ -155,38 +155,7 @@ fn assert_matches_cold(storage: &Path, published: &Published) {
         &published.manifest,
     )
     .unwrap();
-    let rows = |path: &Path| {
-        let connection = Connection::open(path).unwrap();
-        let tables = connection
-            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        tables
-            .into_iter()
-            .map(|table| {
-                let mut statement = connection
-                    .prepare(&format!("SELECT * FROM {table}"))
-                    .unwrap();
-                let columns = statement.column_count();
-                let mut rows = statement
-                    .query_map([], |row| {
-                        (0..columns)
-                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                            .map(|values| format!("{values:?}"))
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                rows.sort();
-                (table, rows)
-            })
-            .collect::<BTreeMap<_, _>>()
-    };
-    assert_eq!(rows(&published.derived), rows(&cold));
+    crate::views::materialization::parity::assert_logical_parity(&published.derived, &cold);
 }
 
 #[test]

@@ -1,6 +1,5 @@
 use super::*;
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
-use rusqlite::types::Value;
 use tempfile::TempDir;
 
 thread_local! {
@@ -84,29 +83,10 @@ fn fixture() -> Fixture {
     }
 }
 
-fn snapshot(path: &Path) -> BTreeMap<String, Vec<String>> {
-    let conn = Connection::open(path).unwrap();
-    let tables = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
-        .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-    tables
-        .into_iter()
-        .map(|table| {
-            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
-            let columns = stmt.column_count();
-            let mut rows = stmt
-                .query_map([], |row| {
-                    (0..columns)
-                        .map(|i| row.get::<_, Value>(i))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                        .map(|values| format!("{values:?}"))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            rows.sort();
-            (table, rows)
-        })
-        .collect()
+/// Logical content of a derived database: schema rows plus sorted, typed rows
+/// of every table. See [`parity`] for the definition.
+fn snapshot(path: &Path) -> parity::LogicalSnapshot {
+    parity::logical_snapshot(path)
 }
 
 fn prepare(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -165,9 +145,7 @@ fn incremental_rows_match_cold_with_cross_file_relink() {
     let cold = f.dir.path().join("cold.sqlite");
     materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
     let actual = snapshot(&copy);
-    for (table, expected) in snapshot(&cold) {
-        assert_eq!(actual[&table], expected, "table {table}");
-    }
+    assert_snapshot_parity(&snapshot(&cold), &actual);
     assert!(
         stats.relinked_inserted > 0,
         "fixture must exercise incoming edges"
@@ -835,9 +813,7 @@ fn new_reexport_target_invalidates_transitive_unchanged_importer() {
     let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
     materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
     let actual = snapshot(&db);
-    for (table, expected) in snapshot(&cold) {
-        assert_eq!(actual[&table], expected, "table {table}");
-    }
+    assert_snapshot_parity(&snapshot(&cold), &actual);
     assert_eq!(stats.dependent_files, 1);
     assert_eq!(stats.resolved_files, 2);
     assert!(!stats.full_resolution);
@@ -1024,29 +1000,10 @@ fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
     assert_eq!(target, "two.ts");
 }
 
-fn assert_snapshot_parity(
-    expected: &BTreeMap<String, Vec<String>>,
-    actual: &BTreeMap<String, Vec<String>>,
-) {
-    for (table, rows) in expected {
-        if rows != &actual[table] {
-            let expected = rows.iter().collect::<BTreeSet<_>>();
-            let actual = actual[table].iter().collect::<BTreeSet<_>>();
-            let missing = expected.difference(&actual).collect::<Vec<_>>();
-            let extra = actual.difference(&expected).collect::<Vec<_>>();
-            panic!(
-                "table {table}: missing={} extra={}; first missing={:?}; first extra={:?}",
-                missing.len(),
-                extra.len(),
-                missing
-                    .first()
-                    .map(|row| row.chars().take(1000).collect::<String>()),
-                extra
-                    .first()
-                    .map(|row| row.chars().take(1000).collect::<String>())
-            );
-        }
-    }
+/// Compares schema and every table in either snapshot, so an extra table,
+/// a missing or different index, or a changed column type is a failure.
+fn assert_snapshot_parity(expected: &parity::LogicalSnapshot, actual: &parity::LogicalSnapshot) {
+    parity::assert_snapshots_equal(expected, actual);
 }
 
 #[test]
@@ -1146,9 +1103,7 @@ fn used_export_surface_change_reresolves_unchanged_binding_caller() {
     let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
     materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
     let actual = snapshot(&db);
-    for (table, expected) in snapshot(&cold) {
-        assert_eq!(actual[&table], expected, "table {table}");
-    }
+    assert_snapshot_parity(&snapshot(&cold), &actual);
     assert_eq!(stats.dependent_files, 1);
     assert_eq!(stats.resolved_refs, 2);
 }
@@ -1433,4 +1388,224 @@ fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
     assert!(foo_rows.iter().any(|row| {
         row.kind == join::BlobRefKind::ValueRef && row.status == join::ResolutionStatus::Unresolved
     }));
+}
+
+/// A deterministic mixed TypeScript and Rust corpus that a seeded sequence of
+/// edits walks through. Each version is a full path-to-source map.
+struct DifferentialCorpus {
+    files: BTreeMap<String, String>,
+    next_id: usize,
+    state: u64,
+}
+
+impl DifferentialCorpus {
+    fn new(seed: u64) -> Self {
+        let mut files = BTreeMap::new();
+        for index in 0..4 {
+            files.insert(
+                format!("mod_{index}.ts"),
+                format!("export function target_{index}() {{ return {index}; }}\n"),
+            );
+        }
+        files.insert(
+            "barrel.ts".into(),
+            "export * from './mod_0';\nexport * from './mod_1';\n".into(),
+        );
+        files.insert(
+            "caller.ts".into(),
+            "import { target_0, target_1 } from './barrel';\n\
+             import * as two from './mod_2';\n\
+             export default function main() { return target_0() + target_1() + two.target_2(); }\n"
+                .into(),
+        );
+        files.insert(
+            "uses_default.ts".into(),
+            "import main from './caller';\nexport function wrapper() { return main(); }\n".into(),
+        );
+        files.insert(
+            "src/lib.rs".into(),
+            "mod util;\npub use util::helper;\npub fn entry() { helper(); }\n".into(),
+        );
+        files.insert("src/util.rs".into(), "pub fn helper() {}\n".into());
+        Self {
+            files,
+            next_id: 100,
+            // Never zero, so the generator does not get stuck.
+            state: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+        }
+    }
+
+    fn next(&mut self, bound: usize) -> usize {
+        // xorshift64: small, deterministic, and good enough to pick edits.
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state % bound as u64) as usize
+    }
+
+    fn typescript_modules(&self) -> Vec<String> {
+        self.files
+            .keys()
+            .filter(|path| path.starts_with("mod_"))
+            .cloned()
+            .collect()
+    }
+
+    /// Apply one randomly chosen edit and describe it.
+    fn step(&mut self) -> String {
+        let id = self.next_id;
+        self.next_id += 1;
+        let modules = self.typescript_modules();
+        match self.next(7) {
+            0 => {
+                // Insert a symbol before the others, renumbering every ordinal
+                // after it, so incoming references must be relinked.
+                let path = &modules[self.next(modules.len())];
+                let source = self.files.get_mut(path).unwrap();
+                source.insert_str(
+                    0,
+                    &format!("export function inserted_{id}() {{ return {id}; }}\n"),
+                );
+                format!("insert symbol in {path}")
+            }
+            1 => {
+                let path = &modules[self.next(modules.len())];
+                let source = self.files.get_mut(path).unwrap();
+                source.push_str(&format!("// edit {id}\n"));
+                format!("edit body of {path}")
+            }
+            2 => {
+                let target = modules[self.next(modules.len())]
+                    .trim_end_matches(".ts")
+                    .to_string();
+                let name = target.trim_start_matches("mod_").to_string();
+                self.files.insert(
+                    format!("mod_{id}.ts"),
+                    format!(
+                        "import {{ target_{name} }} from './{target}';\n\
+                         export function target_{id}() {{ return target_{name}(); }}\n"
+                    ),
+                );
+                format!("add mod_{id}.ts calling {target}")
+            }
+            3 if modules.len() > 2 => {
+                let path = modules[self.next(modules.len())].clone();
+                self.files.remove(&path);
+                format!("remove {path}")
+            }
+            4 => {
+                let path = &modules[self.next(modules.len())];
+                let line = format!("export * from './{}';\n", path.trim_end_matches(".ts"));
+                let barrel = self.files.get_mut("barrel.ts").unwrap();
+                if barrel.contains(&line) {
+                    *barrel = barrel.replace(&line, "");
+                    format!("drop re-export of {path}")
+                } else {
+                    barrel.push_str(&line);
+                    format!("add re-export of {path}")
+                }
+            }
+            5 => {
+                let module = format!("extra_{id}");
+                self.files.insert(
+                    format!("src/{module}.rs"),
+                    format!("pub fn fresh_{id}() {{}}\n"),
+                );
+                let lib = self.files.get_mut("src/lib.rs").unwrap();
+                lib.insert_str(0, &format!("mod {module};\n"));
+                lib.push_str(&format!(
+                    "pub fn use_{id}() {{ {module}::fresh_{id}(); }}\n"
+                ));
+                format!("add rust module {module}")
+            }
+            _ => {
+                // Rename a target: callers that imported the old name stop
+                // resolving and must be relinked as unresolved.
+                let path = &modules[self.next(modules.len())];
+                let source = self.files.get_mut(path).unwrap();
+                *source = source.replacen("export function target_", "export function renamed_", 1);
+                format!("rename first target in {path}")
+            }
+        }
+    }
+}
+
+/// Incremental materialization equals a cold build for adjacent steps, for a
+/// chain of steps applied to one database, and for non-adjacent pairs in both
+/// directions (which include switching back to an earlier version).
+#[test]
+fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    for seed in 1..=6_u64 {
+        let mut corpus = DifferentialCorpus::new(seed);
+        let mut versions = Vec::new();
+        let mut steps = Vec::new();
+        for step in 0..5 {
+            if step > 0 {
+                steps.push(corpus.step());
+            }
+            let files = corpus
+                .files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect::<Vec<_>>();
+            versions.push(manifest(&conn, &files));
+        }
+        let context = format!("seed={seed} steps={steps:?}");
+        let cold = versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| {
+                let path = f
+                    .dir
+                    .path()
+                    .join(format!("differential-{seed}-cold-{index}.sqlite"));
+                materialize_manifest_view_database(&path, &f.blobs, version).unwrap();
+                snapshot(&path)
+            })
+            .collect::<Vec<_>>();
+        let check = |from: usize, to: usize, label: &str| {
+            let path = f
+                .dir
+                .path()
+                .join(format!("differential-{seed}-{label}-{from}-{to}.sqlite"));
+            materialize_manifest_view_database(&path, &f.blobs, &versions[from]).unwrap();
+            let stats = apply_manifest_diff(&path, &versions[from], &versions[to], &f.blobs)
+                .unwrap_or_else(|error| panic!("{context} {from}->{to}: {error}"));
+            assert!(!stats.full_resolution, "{context} {from}->{to}: {stats:?}");
+            let differences = parity::snapshot_differences(&cold[to], &snapshot(&path));
+            assert!(
+                differences.is_empty(),
+                "{context} {label} {from}->{to}:\n{}",
+                differences.join("\n")
+            );
+        };
+        for from in 0..versions.len() {
+            for to in 0..versions.len() {
+                match from.abs_diff(to) {
+                    0 => {}
+                    1 if to > from => check(from, to, "adjacent"),
+                    1 => check(from, to, "adjacent-back"),
+                    _ => check(from, to, "non-adjacent"),
+                }
+            }
+        }
+        // Chained: every step patches the previous step's output, so an error
+        // in one step would seed a wrong base for the next.
+        let chained = f
+            .dir
+            .path()
+            .join(format!("differential-{seed}-chained.sqlite"));
+        materialize_manifest_view_database(&chained, &f.blobs, &versions[0]).unwrap();
+        for step in 1..versions.len() {
+            apply_manifest_diff(&chained, &versions[step - 1], &versions[step], &f.blobs).unwrap();
+            let differences = parity::snapshot_differences(&cold[step], &snapshot(&chained));
+            assert!(
+                differences.is_empty(),
+                "{context} chained step {step}:\n{}",
+                differences.join("\n")
+            );
+        }
+    }
 }
