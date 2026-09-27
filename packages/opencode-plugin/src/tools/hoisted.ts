@@ -565,7 +565,7 @@ function getWriteDescription(ctx: PluginContext, editToolName: string): string {
   const githubText = resolveGithubConfig(ctx.config).write
     ? ' When enabled, `write("issue://N", content)` or `write("pr://N", content)` publishes a new comment.'
     : "";
-  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.${githubText}`;
+  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubText}`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {

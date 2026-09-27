@@ -654,7 +654,7 @@ export function registerHoistedTools(
       withPathAliasPreparation({
         name: writeName,
         label: writeName,
-        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool.${githubWriteDescription}`,
+        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubWriteDescription}`,
         promptSnippet: "Create or overwrite files (uses path; auto-formats)",
         promptGuidelines: [`Use ${writeName} only for new files or complete rewrites.`],
         parameters: WriteParams,
