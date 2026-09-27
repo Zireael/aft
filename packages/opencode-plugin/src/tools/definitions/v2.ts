@@ -5,6 +5,17 @@ import { Effect } from "effect";
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const V2_PATH_HEADER_TOOLS = new Set(["read", "write", "edit"]);
 const V2_BASH_TOOLS = new Set(["bash"]);
+
+/**
+ * The permission action OpenCode 2 evaluates shell-command rules under.
+ *
+ * The host's own command tool asks under `shell`, and the host rewrites a
+ * legacy `bash` key in a user's permission config to `shell` when it loads
+ * it. A rule for shell commands is therefore only ever stored under `shell`,
+ * and a request filed under `bash` matches none of them. AFT's bash keeps its
+ * name; only the action its permission requests carry is translated on V2.
+ */
+const V2_SHELL_PERMISSION = "shell";
 const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
 
 export interface V2Location {
@@ -210,7 +221,7 @@ function executionArguments(name: string, input: Record<string, unknown>): Recor
 function hostPermission(name: string): string | undefined {
   const bare = bareToolName(name);
   if (new Set(["read", "glob", "grep"]).has(bare)) return bare;
-  if (V2_BASH_TOOLS.has(name)) return "bash";
+  if (V2_BASH_TOOLS.has(name)) return V2_SHELL_PERMISSION;
   if (
     new Set([
       "write",
@@ -246,7 +257,20 @@ function assertV2Contract(name: string, input: ReturnType<typeof tool.schema.obj
   }
 }
 
+/**
+ * The permission request as OpenCode 2 must see it. The shared bash
+ * definition asks under `bash`, which is the action OpenCode 1 evaluates;
+ * on V2 that request is filed under `shell`, the action the host's rules for
+ * shell commands use. Every other request, including bash's
+ * `external_directory` asks, passes through unchanged.
+ */
+function v2PermissionRequest(name: string, request: V2PermissionRequest): V2PermissionRequest {
+  if (!V2_BASH_TOOLS.has(name) || request.permission !== "bash") return request;
+  return { ...request, permission: V2_SHELL_PERMISSION };
+}
+
 function runtimeFor(
+  name: string,
   location: V2Location,
   context: V2ExecutionContext,
   signal: AbortSignal,
@@ -272,7 +296,8 @@ function runtimeFor(
         ),
       );
     },
-    ask: (request) => {
+    ask: (asked) => {
+      const request = v2PermissionRequest(name, asked);
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
       // Only our own wiring is observable here, so say that and nothing more:
       // the previous wording blamed the host for a missing endpoint it was
@@ -312,7 +337,7 @@ export function projectV2Tool(
     execute: (rawInput, context) =>
       Effect.tryPromise({
         try: async (signal) => {
-          const runtime = runtimeFor(location, context, signal, consumers);
+          const runtime = runtimeFor(name, location, context, signal, consumers);
           const input = executionArguments(name, rawInput);
           const result =
             consumers.executeBash && V2_BASH_TOOLS.has(name)

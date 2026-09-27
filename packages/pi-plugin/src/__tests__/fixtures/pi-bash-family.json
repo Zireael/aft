@@ -1,0 +1,245 @@
+{
+  "bash": {
+    "label": "bash",
+    "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute. Supports pipes, redirections, and shell syntax."
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Hard kill timeout in milliseconds"
+        },
+        "workdir": {
+          "type": "string",
+          "description": "Working directory for command execution. Relative paths resolve against the project root. Defaults to the current session's working directory."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax."
+        },
+        "wait": {
+          "type": "boolean",
+          "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else."
+        },
+        "sandbox": {
+          "type": "string",
+          "const": "host",
+          "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled."
+        },
+        "background": {
+          "type": "boolean",
+          "description": "Spawn command in background and return immediately with a task_id. Use bash_watch to wait for completion or output patterns; bash_status for a one-shot snapshot only. Use bash_kill to terminate. Ideal for long-running tasks like builds or dev servers."
+        },
+        "compressed": {
+          "type": "boolean",
+          "description": "Compress output by removing ANSI codes, carriage returns, and excessive blank lines. Default: true. Set to false for raw terminal output including color codes."
+        },
+        "pty": {
+          "type": "boolean",
+          "description": "Spawn the command in a real PTY for interactive programs. Implies background: true automatically. Inspect with bash_status({ task_id, output_mode: \"screen\" }) and send input with bash_write."
+        },
+        "ptyRows": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "PTY terminal height in rows (minimum 1, maximum 60)"
+        },
+        "ptyCols": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 140
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "PTY terminal width in columns (minimum 1, maximum 140)"
+        }
+      }
+    },
+    "promptSnippet": "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
+    "promptGuidelines": [
+      "DO NOT use bash for code search or exploration — use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead.",
+      "Set compressed: false when you need ANSI color codes in the output.",
+      "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary."
+    ]
+  },
+  "bash_status": {
+    "label": "bash_status",
+    "description": "Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "task_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Background bash task id returned by bash({ background: true })."
+        },
+        "output_mode": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "screen"
+            },
+            {
+              "type": "string",
+              "const": "raw"
+            },
+            {
+              "type": "string",
+              "const": "both"
+            }
+          ],
+          "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted."
+        }
+      }
+    },
+    "promptSnippet": "Inspect a background bash task by task_id"
+  },
+  "bash_watch": {
+    "label": "bash_watch",
+    "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "task_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Background bash task id returned by bash({ background: true })."
+        },
+        "pattern": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "required": [
+                "regex"
+              ],
+              "properties": {
+                "regex": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        "background": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1800000
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default)."
+        },
+        "once": {
+          "type": "boolean"
+        }
+      }
+    },
+    "promptSnippet": "Wait for or watch a background bash task"
+  },
+  "bash_write": {
+    "label": "bash_write",
+    "description": "Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: \"pty\" first. Input is either a string (verbatim bytes) or an array mixing strings and { key: \"esc\" | \"enter\" | \"up\" | \"ctrl-c\" | ... } objects for atomic text+key sequences such as [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ]. Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. Maximum 1 MiB per call (post-expansion).",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "input"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Background PTY task id returned by bash({ pty: true, background: true })."
+        },
+        "input": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "key"
+                    ],
+                    "properties": {
+                      "key": {
+                        "type": "string",
+                        "description": "Named control key, e.g. 'esc', 'enter', 'up', 'ctrl-c'. Case-insensitive."
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "description": "Either a string of verbatim bytes (e.g. 'print(1)\\n') OR an array mixing strings and { key: '<name>' } objects for atomic text+key sequences. Example: [ 'iHello', { key: 'esc' }, ':wq', { key: 'enter' } ]. Allowed key names: enter, return, tab, space, backspace, esc, escape, up, down, left, right, home, end, page-up, page-down, delete, insert, f1..f12, ctrl-a..ctrl-z."
+        }
+      }
+    },
+    "promptSnippet": "Write keystrokes/input to a PTY bash task"
+  },
+  "bash_kill": {
+    "label": "bash_kill",
+    "description": "Terminate a running background bash task spawned with bash({ background: true }).",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "task_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Background bash task id returned by bash({ background: true })."
+        }
+      }
+    },
+    "promptSnippet": "Kill a background bash task by task_id"
+  }
+}

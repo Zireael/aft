@@ -337,7 +337,11 @@ describe("scenario isolation and liveness", () => {
     );
     expect(userAftConfig).toEqual({ disabled_tools: [] });
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
-    expect(hostConfig.plugin[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
+    // A V2 host reads `plugins`, configured the way `aft setup` writes it: AFT's
+    // entry and the entry removing the host's own shell tool.
+    expect(hostConfig.plugin).toBeUndefined();
+    expect(hostConfig.plugins[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
+    expect(hostConfig.plugins.slice(1)).toEqual(["-opencode.tool.shell"]);
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
     expect(hostConfig.provider).toBeUndefined();
     const serverWrapper = await readFile(
@@ -1650,13 +1654,13 @@ describe("permission scenarios reach the host's own rules", () => {
     expect(rules).toEqual([{ action: "edit", resource: "*", effect: "ask" }]);
   });
 
-  test("every mutating operation asks under edit; read and bash ask under their own names", () => {
+  test("every mutating operation asks under edit; read under its own name, bash under shell", () => {
     expect(permissionAction("apply_patch")).toBe("edit");
     expect(permissionAction("write")).toBe("edit");
     expect(permissionAction("aft_move")).toBe("edit");
     expect(permissionAction("read")).toBe("read");
-    expect(permissionAction("bash:withPermissionLoop")).toBe("bash");
-    expect(permissionAction("bash:host-fallback")).toBe("bash");
+    expect(permissionAction("bash:withPermissionLoop")).toBe("shell");
+    expect(permissionAction("bash:host-fallback")).toBe("shell");
   });
 
   test("a configured denial installs a deny rule and leaves nothing to answer", () => {

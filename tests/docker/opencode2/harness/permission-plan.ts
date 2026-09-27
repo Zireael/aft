@@ -15,12 +15,13 @@ import { asRecord } from "./util.js";
  * runs.
  *
  * Every mutating tool routes through one `edit` ask, so a rule naming the tool
- * would never match anything; `read` and `bash` ask under their own names. The
- * input is the inventory operation, which is the scenario's own label for the
- * ask site under test.
+ * would never match anything; `read` asks under its own name, and AFT's bash
+ * under `shell`, the action OpenCode 2 evaluates every shell-command rule
+ * under. The input is the inventory operation, which is the scenario's own
+ * label for the ask site under test.
  */
 export function permissionAction(operation: string): string {
-  if (operation.startsWith("bash:")) return "bash";
+  if (operation.startsWith("bash:")) return "shell";
   if (operation === "read") return "read";
   return "edit";
 }
@@ -511,4 +512,43 @@ export function assertBashAftExecutionIdentity(
  */
 export function controlPlans(scenario: ScenarioDefinition): ApiControlPlan[] {
   return [...(scenario.controls ?? [])];
+}
+
+/**
+ * Assert the V2 host offered AFT's bash and not its own shell tool.
+ *
+ * Every V2 scenario is configured the way `aft setup` configures an OpenCode 2
+ * host, with `-opencode.tool.shell` under `plugins`. The host's shell plugin
+ * would otherwise register a second command tool and rewrite the description
+ * of anything named `shell`, so each request the model received must list no
+ * `shell`, and every `bash` it lists must carry AFT's own description.
+ */
+export function assertHostShellDisabled(
+  scenario: ScenarioDefinition,
+  exchanges: readonly RecordedMockExchange[],
+): void {
+  for (const exchange of exchanges) {
+    const tools = asRecord(exchange.request)?.tools;
+    if (!Array.isArray(tools)) continue;
+    for (const entry of tools) {
+      const record = asRecord(entry);
+      const fn = asRecord(record?.function) ?? record;
+      if (fn?.name === "shell") {
+        fail(
+          "host_failed",
+          `${scenario.id}: the host offered its own shell tool although -opencode.tool.shell is configured`,
+          { turn: exchange.label },
+        );
+      }
+      if (
+        fn?.name === "bash" &&
+        !(typeof fn.description === "string" && fn.description.startsWith("Execute shell commands."))
+      ) {
+        fail("host_failed", `${scenario.id}: the bash tool the host offered does not carry AFT's description`, {
+          turn: exchange.label,
+          description: fn.description,
+        });
+      }
+    }
+  }
 }

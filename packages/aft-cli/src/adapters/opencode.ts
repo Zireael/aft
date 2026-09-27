@@ -21,14 +21,18 @@ import {
 } from "../setup/host-generation.js";
 import {
   AFT_OPENCODE_PACKAGE,
+  aftBashEnabled,
   ensurePinnedPluginConfig,
+  hostShellPluginDisabled,
   isAftNpmEntry,
+  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
   type OpenCodeConfigGeneration,
   openCodePluginKey,
   openCodePluginReadKeys,
   pinnedPluginEntry,
   pluginConfigNeedsUpdate,
   pluginEntryPackage,
+  setHostShellPluginDisabled,
 } from "../setup/opencode-config.js";
 import type {
   HarnessAdapter,
@@ -386,6 +390,86 @@ export class OpenCodeAdapter implements HarnessAdapter {
       ok: true,
       action: update.action,
       message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} under \`${update.key}\` in ${configPath} (${label})`,
+      configPath,
+    };
+  }
+
+  /**
+   * Whether OpenCode 2's built-in shell tool plugin is removed in the server
+   * config. `not_applicable` on any host that is not known to be OpenCode 2:
+   * OpenCode 1 has no such plugin, and an unresolved generation must not be
+   * guessed at.
+   */
+  hostShellState(): "disabled" | "enabled" | "not_applicable" {
+    if (this.configGeneration() !== "v2") return "not_applicable";
+    const { value } = readJsoncFile(this.detectConfigPaths().harnessConfig);
+    return hostShellPluginDisabled(value) ? "disabled" : "enabled";
+  }
+
+  /** Whether the user AFT config leaves AFT's bash registered and runnable. */
+  aftBashEnabled(): boolean {
+    const { value } = readJsoncFile(this.detectConfigPaths().aftConfig);
+    return aftBashEnabled(value as Record<string, unknown> | null);
+  }
+
+  /**
+   * Add (`disabled: true`) or remove the `-opencode.tool.shell` entry in the
+   * OpenCode 2 server config. Idempotent; refuses on any other generation.
+   */
+  setHostShellDisabled(disabled: boolean): PluginEntryResult {
+    const configPath = this.detectConfigPaths().harnessConfig;
+    const format = this.detectConfigPaths().harnessConfigFormat;
+    if (this.configGeneration() !== "v2") {
+      return {
+        ok: false,
+        action: "error",
+        message: "only OpenCode 2 has a built-in shell tool plugin to disable",
+        configPath,
+      };
+    }
+    if (format === "none") {
+      if (!disabled) {
+        return { ok: true, action: "already_present", message: "no config to change", configPath };
+      }
+      const failed = this.tryWrite(configPath, () =>
+        writeJsoncFile(configPath, { plugins: [OPENCODE_HOST_SHELL_DISABLE_ENTRY] }, "json"),
+      );
+      if (failed) return failed;
+      return {
+        ok: true,
+        action: "added",
+        message: `Created ${configPath} with ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} under \`plugins\``,
+        configPath,
+      };
+    }
+    const { value, error } = readJsoncFile(configPath);
+    if (error || !value) {
+      return {
+        ok: false,
+        action: "error",
+        message: `Could not parse ${configPath}: ${error ?? "unknown error"}`,
+        configPath,
+      };
+    }
+    const { changed } = setHostShellPluginDisabled(value, disabled);
+    if (!changed) {
+      return {
+        ok: true,
+        action: "already_present",
+        message: disabled
+          ? `${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is already set in ${configPath}`
+          : `${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is not set in ${configPath}`,
+        configPath,
+      };
+    }
+    const failed = this.tryWrite(configPath, () => writeJsoncFile(configPath, value, format));
+    if (failed) return failed;
+    return {
+      ok: true,
+      action: disabled ? "added" : "updated",
+      message: disabled
+        ? `Added ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} under \`plugins\` in ${configPath}: OpenCode's own shell tool is disabled, so agents use AFT's bash`
+        : `Removed ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} from ${configPath}: OpenCode's own shell tool is enabled again`,
       configPath,
     };
   }

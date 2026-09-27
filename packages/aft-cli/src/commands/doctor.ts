@@ -101,6 +101,7 @@ import {
   formatHostGenerations,
   type OpenCodeHostDetection,
 } from "../setup/host-generation.js";
+import { OPENCODE_HOST_SHELL_DISABLE_ENTRY } from "../setup/opencode-config.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -378,6 +379,8 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
         log.error(`  expected load path: ${opencodeDoctor.expectedLoadPath}`);
       }
       for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
+      const hostShell = hostShellDoctorLine(opencodeAdapter);
+      if (hostShell) log[hostShell.level](`  ${hostShell.text}`);
     }
     const blockers = h.pluginLoad?.blockers ?? [];
     if (h.pluginRegistered && blockers.length > 0) {
@@ -809,6 +812,42 @@ export function clearOldBinaries(): BinaryCacheClearResult {
   return result;
 }
 
+/**
+ * The doctor line for OpenCode 2's built-in shell tool plugin, or null on any
+ * other host. A warning only when AFT's bash is enabled and the host's shell is
+ * still there beside it; `doctor --fix` and `aft setup` disable it then.
+ */
+export function hostShellDoctorLine(
+  adapter: HarnessAdapter | undefined,
+): { level: "info" | "warn"; text: string } | null {
+  if (!(adapter instanceof OpenCodeAdapter)) return null;
+  const state = adapter.hostShellState();
+  if (state === "not_applicable") return null;
+  if (state === "disabled") {
+    return {
+      level: "info",
+      text: `OpenCode's own shell tool: disabled (${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is set); agents use AFT's bash`,
+    };
+  }
+  if (!adapter.aftBashEnabled()) {
+    return {
+      level: "info",
+      text: "OpenCode's own shell tool: enabled (AFT's bash is disabled, so it stays)",
+    };
+  }
+  return {
+    level: "warn",
+    text: `OpenCode's own shell tool: enabled beside AFT's bash — run \`${CLI} doctor --fix\` or \`${CLI} setup\` to disable it (${OPENCODE_HOST_SHELL_DISABLE_ENTRY})`,
+  };
+}
+
+/** The OpenCode 2 adapter whose host shell `doctor --fix` would disable, if any. */
+function hostShellFixTarget(adapters: HarnessAdapter[]): OpenCodeAdapter | null {
+  const adapter = openCodeAdapter(adapters);
+  if (!(adapter instanceof OpenCodeAdapter)) return null;
+  return adapter.hostShellState() === "enabled" && adapter.aftBashEnabled() ? adapter : null;
+}
+
 export interface DoctorFixPlanItem {
   kind: "plugin" | "plugin-update" | "binary" | "onnx" | "storage" | "schema" | "config";
   message: string;
@@ -1047,6 +1086,14 @@ export function buildDoctorFixPlan(
     });
   }
 
+  const hostShellTarget = hostShellFixTarget(adapters);
+  if (hostShellTarget) {
+    items.push({
+      kind: "plugin",
+      message: `Will add ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} to ${hostShellTarget.detectConfigPaths().harnessConfig} so agents use AFT's bash instead of OpenCode's own shell tool`,
+    });
+  }
+
   for (const target of findPluginUpdateTargets(adapters, report)) {
     items.push({
       kind: "plugin-update",
@@ -1232,6 +1279,19 @@ async function runFixFlow(
   const pluginEntrySummary = configWritesRefused
     ? { changed: 0, errors: 0 }
     : await fixPluginEntries(adapters);
+  // --fix only ever disables the host's shell (when AFT's bash can replace
+  // it); turning it back on is a choice made in `aft setup`.
+  const hostShellTarget = configWritesRefused ? null : hostShellFixTarget(adapters);
+  if (hostShellTarget) {
+    const result = hostShellTarget.setHostShellDisabled(true);
+    if (result.ok) {
+      if (result.action !== "already_present") log.success(`OpenCode: ${result.message}`);
+      pluginEntrySummary.changed += result.action === "already_present" ? 0 : 1;
+    } else {
+      log.error(`OpenCode: ${result.message}`);
+      pluginEntrySummary.errors += 1;
+    }
+  }
   const pluginUpdateSummary = await applyPluginUpdates(findPluginUpdateTargets(adapters, report));
   const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
 

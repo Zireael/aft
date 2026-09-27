@@ -242,3 +242,78 @@ export function pluginConfigNeedsUpdate(
   if (local) return !pluginEntryFitsKey(list[local.index], key);
   return true;
 }
+
+/**
+ * The `plugins` entry that removes OpenCode 2's built-in shell tool plugin.
+ *
+ * OpenCode 2 ships its own command tool, `shell`, and its plugin rewrites the
+ * description of whatever tool is named `shell` on every request. With AFT's
+ * `bash` registered beside it the agent is offered two command tools. A
+ * `plugins` entry starting with `-` removes a plugin by id, built-ins included,
+ * so this one entry removes the host's shell tool and its hooks together and
+ * leaves AFT's `bash` as the only command tool. OpenCode 1 has no such plugin.
+ */
+export const OPENCODE_HOST_SHELL_DISABLE_ENTRY = "-opencode.tool.shell";
+
+/** True when the OpenCode 2 `plugins` list removes the host's shell tool plugin. */
+export function hostShellPluginDisabled(value: Record<string | symbol, unknown> | null): boolean {
+  const list = value?.plugins;
+  return Array.isArray(list) && list.includes(OPENCODE_HOST_SHELL_DISABLE_ENTRY);
+}
+
+/**
+ * Add or remove the host-shell removal entry in the OpenCode 2 `plugins` list.
+ *
+ * Idempotent in both directions: enabling leaves exactly one entry, disabling
+ * leaves none, and a list already in the requested state is not touched.
+ * Every other entry keeps its position. The array is edited in place so the
+ * JSONC writer keeps the file's comments.
+ */
+export function setHostShellPluginDisabled(
+  value: Record<string | symbol, unknown>,
+  disabled: boolean,
+): { changed: boolean } {
+  const existing = Array.isArray(value.plugins) ? (value.plugins as unknown[]) : null;
+  const indexes: number[] = [];
+  existing?.forEach((entry, index) => {
+    if (entry === OPENCODE_HOST_SHELL_DISABLE_ENTRY) indexes.push(index);
+  });
+  if (disabled ? indexes.length === 1 : indexes.length === 0) return { changed: false };
+
+  const list = existing ?? [];
+  if (!existing) value.plugins = list;
+  // Enabling keeps the first copy (if any) and removes the rest; disabling
+  // removes every copy. Removal runs from the end so indexes stay valid.
+  const remove = disabled ? indexes.slice(1) : indexes;
+  for (let index = remove.length - 1; index >= 0; index -= 1) {
+    list.splice(remove[index] as number, 1);
+  }
+  if (disabled && indexes.length === 0) list.push(OPENCODE_HOST_SHELL_DISABLE_ENTRY);
+  return { changed: true };
+}
+
+/**
+ * Whether the user config leaves AFT's `bash` tool registered and runnable.
+ *
+ * The tool is registered unless `disabled_tools` names it, and a registered
+ * tool refuses every command when the `bash` runtime gate is off (`bash:
+ * false` or `bash.enabled: false`). Disabling the host's shell only makes
+ * sense when AFT's bash can take its place, so this is the offer's default.
+ * AFT disabled as a whole (`enabled: false`) counts as bash disabled.
+ */
+export function aftBashEnabled(userConfig: Record<string, unknown> | null): boolean {
+  if (!userConfig) return true;
+  if (userConfig.enabled === false) return false;
+  const disabled = userConfig.disabled_tools;
+  if (Array.isArray(disabled) && disabled.includes("bash")) return false;
+  const bash = userConfig.bash;
+  if (bash === false) return false;
+  if (
+    typeof bash === "object" &&
+    bash !== null &&
+    (bash as { enabled?: unknown }).enabled === false
+  ) {
+    return false;
+  }
+  return true;
+}

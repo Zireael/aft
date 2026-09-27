@@ -197,7 +197,8 @@ describe("OpenCode V2 tool surface", () => {
     expect(projected.get("read")?.options?.permission).toBe("read");
     expect(projected.get("glob")?.options?.permission).toBe("glob");
     expect(projected.get("apply_patch")?.options?.permission).toBe("edit");
-    expect(projected.get("bash")?.options?.permission).toBe("bash");
+    // OpenCode 2 evaluates shell-command rules under `shell`.
+    expect(projected.get("bash")?.options?.permission).toBe("shell");
   });
 
   test("maps canonical V2 path input back to the shared executor field", async () => {

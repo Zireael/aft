@@ -5,6 +5,9 @@ import { basename, join, resolve } from "node:path";
 import { fail } from "./errors.js";
 import { runCommand } from "./util.js";
 
+
+/** The `plugins` entry `aft setup` writes to remove OpenCode 2's own shell tool. */
+export const OPENCODE_HOST_SHELL_DISABLE_ENTRY = "-opencode.tool.shell";
 export interface ScenarioIsolation {
   root: string;
   project: string;
@@ -239,7 +242,13 @@ export async function createScenarioIsolation(options: {
     `${JSON.stringify(
       {
         $schema: "https://opencode.ai/config.json",
-        plugin: [pluginDirectoryUrl],
+        // The V2 host reads `plugins`, and `aft setup` writes AFT's entry there
+        // together with `-opencode.tool.shell`, which removes the host's own
+        // shell tool so AFT's bash is the one command tool the model is
+        // offered. The V1 host reads `plugin` and has no such plugin.
+        ...(options.hostGeneration === "v2"
+          ? { plugins: [pluginDirectoryUrl, OPENCODE_HOST_SHELL_DISABLE_ENTRY] }
+          : { plugin: [pluginDirectoryUrl] }),
         // Which key holds the providers is part of the captured contract, not a
         // harness choice: V2 reads `providers`, V1 reads `provider` and logs
         // `["providers"]` as "unsupported" before leaving itself with no

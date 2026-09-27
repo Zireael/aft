@@ -1538,7 +1538,8 @@ function permissionRules() {
     { action: "read", resource: "*.env", effect: "ask" },
     { action: "edit", resource: "*permission-edit-denied.ts", effect: "deny" },
     { action: "edit", resource: "*permission-delete-denied.ts", effect: "deny" },
-    { action: "bash", resource: "*", effect: "deny" },
+    // OpenCode 2 evaluates shell-command rules, including AFT's bash, under "shell".
+    { action: "shell", resource: "*", effect: "deny" },
   ];
 }
 
