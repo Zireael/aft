@@ -4966,7 +4966,7 @@ fn project_walk_builder(search_root: &Path) -> WalkBuilder {
                         | "build"
                 );
             }
-            true
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         });
     builder
 }

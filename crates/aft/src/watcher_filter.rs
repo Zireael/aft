@@ -235,6 +235,11 @@ pub fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
 }
 
 pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
+    // Operating-system metadata files (a Finder `.DS_Store` rewrite, say) are
+    // never indexed by the project walks, so their events carry no change.
+    if crate::os_metadata::is_os_metadata_path(path) {
+        return true;
+    }
     path.components().any(|c| {
         matches!(c, Component::Normal(name) if matches!(
             name.to_str().unwrap_or(""),
@@ -1706,7 +1711,12 @@ impl WatcherFilterThread {
             // discard them later pegged this single watcher thread. The full
             // filter still drops these (watcher_path_is_infra_skip), so this is a
             // pure perf short-circuit with no behavior change.
-            if watcher_path_is_high_churn_infra(&path) {
+            // Operating-system metadata files are dropped here too: the check is
+            // a pure name comparison, and dropping them before they enter the
+            // batch keeps a lone `.DS_Store` write from arming a flush.
+            if watcher_path_is_high_churn_infra(&path)
+                || crate::os_metadata::is_os_metadata_path(&path)
+            {
                 continue;
             }
             // Canonicalize at intake so the set keys (and downstream consumers)
@@ -3340,6 +3350,71 @@ mod tests {
         assert_eq!(snapshot.invalidating_events_total, 1);
         assert_eq!(snapshot.paths_after_gitignore_total, 0);
         assert_eq!(snapshot.paths_dispatched_total, 0);
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn os_metadata_write_schedules_no_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ds_store = root.join("nested/.DS_Store");
+        let source = root.join("main.rs");
+        std::fs::create_dir_all(ds_store.parent().unwrap()).unwrap();
+        std::fs::write(&ds_store, [0u8; 16]).unwrap();
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let matcher = shared_matcher(&root);
+
+        // The shared path filter drops it even without the thread's intake check.
+        let filtered = filter_watcher_raw_paths_for_test(
+            &config,
+            &matcher,
+            [ds_store.clone(), source.clone()],
+        );
+        assert_eq!(filtered.changed, BTreeSet::from([source.clone()]));
+        assert!(!filtered.ignore_file_changed);
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let mut filter = WatcherFilterThread::new(
+            config,
+            matcher,
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        let mut write = notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
+        write.paths.push(ds_store);
+        raw_tx.send(Ok(write)).unwrap();
+        assert!(
+            dispatch_rx
+                .recv_timeout(WATCHER_FLUSH_WINDOW + Duration::from_millis(250))
+                .is_err(),
+            "a .DS_Store write must not dispatch a refresh"
+        );
+
+        // The same thread still dispatches a real source change, so the silence
+        // above is the metadata skip rather than a stalled filter.
+        let mut write = notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
+        write.paths.push(source.clone());
+        raw_tx.send(Ok(write)).unwrap();
+        assert_eq!(
+            dispatch_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("source change dispatch"),
+            WatcherDispatchEvent::Paths(vec![source])
+        );
 
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);

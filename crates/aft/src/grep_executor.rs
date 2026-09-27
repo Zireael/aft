@@ -571,7 +571,7 @@ fn fallback_project_walk_builder(
                         | "build"
                 );
             }
-            true
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         });
     builder
 }

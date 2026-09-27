@@ -3543,7 +3543,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
                         | ".tox" | "dist" | "build"
                 );
             }
-            true
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         })
         .build();
 
