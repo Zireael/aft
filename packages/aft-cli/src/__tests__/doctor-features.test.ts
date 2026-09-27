@@ -200,7 +200,9 @@ describe("doctor feature report", () => {
           "Set github.read to true, or github.write to false, so the config says what AFT does.",
       },
     ]);
-    // Read left out (an older write-only save) says why read is on, with no note.
+    // An older config may set github.write without github.read. The group
+    // line still explains that read is on because write needs it, and no
+    // note is added, since nothing in the config contradicts what happens.
     const absent = renderFeatureStatus(
       migratedPlan({
         "github.read": { ...implied, source: "default" },
