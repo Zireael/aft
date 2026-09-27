@@ -10733,6 +10733,15 @@ mod tests {
         );
     }
 
+    /// Canonical temp root in a form `git worktree add` accepts: on Windows,
+    /// `fs::canonicalize` returns a `\\?\` verbatim path, which git rejects.
+    fn git_friendly_canonical(path: &Path) -> PathBuf {
+        let canonical = std::fs::canonicalize(path).unwrap();
+        #[cfg(windows)]
+        let canonical = crate::windows_path::normalize_windows_path(&canonical);
+        canonical
+    }
+
     fn git_stdout(root: &Path, args: &[&str]) -> String {
         let output = git_command(root).args(args).output().unwrap();
         assert!(output.status.success(), "git {args:?} failed");
@@ -10939,7 +10948,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let temp = tempfile::tempdir().unwrap();
-        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let temp_root = git_friendly_canonical(temp.path());
         let (owner, scratch, storage) = older_checkout_beside_live_owner(&temp_root, kind);
         let probe = probe_older_checkout(&scratch, &storage, ram_overlay);
         owner.mark_subc_unbound();
@@ -11047,7 +11056,7 @@ mod tests {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
-        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let temp_root = git_friendly_canonical(temp.path());
         let (owner, scratch, storage) = {
             // Only the borrowing checkout needs a real watcher.
             let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");

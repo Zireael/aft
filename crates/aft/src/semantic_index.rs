@@ -11498,6 +11498,12 @@ public class Greeter {
         let config = SemanticBackendConfig::default();
         index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
         let private_bytes = index.estimated_memory().estimated_bytes.unwrap();
+        let vector_bytes: usize = index
+            .entries
+            .iter()
+            .map(|entry| entry.vector.len() * std::mem::size_of::<f32>())
+            .sum();
+        assert!(private_bytes > 0 && vector_bytes > 0);
 
         // The drain freezes the owner's installed index for its own root; a
         // borrower adopting it later gets a second view of the same base.
@@ -11509,9 +11515,14 @@ public class Greeter {
             .expect("a frozen base can be adopted");
         let base = Arc::clone(index.shared_base.as_ref().unwrap());
         let base_bytes = base.estimated_memory().estimated_bytes.unwrap();
+        // The base holds every vector the private index held. Path-derived
+        // bytes vary with the platform's path forms (the base came out at
+        // well under half the private estimate on Windows CI), so compare the
+        // vector payload, which does not.
+        assert_eq!(base.entries.len(), 16);
         assert!(
-            base_bytes >= private_bytes / 2,
-            "{base_bytes} vs {private_bytes}"
+            base_bytes >= vector_bytes as u64,
+            "{base_bytes} vs vector payload {vector_bytes}"
         );
 
         for view in [&index, &owner_view, &borrower_view] {

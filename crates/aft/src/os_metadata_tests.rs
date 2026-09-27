@@ -154,7 +154,14 @@ fn metadata_only_folder_indexes_and_globs_nothing() {
 
 #[test]
 fn nested_metadata_files_are_skipped_at_any_depth() {
-    let (_dir, root) = fixture(&["a/b/.DS_Store", "a/desktop.ini", "a/b/c/Icon\r"]);
+    // Windows forbids `\r` in file names, so the macOS folder-icon file can
+    // only be created on Unix; the name check itself is covered on every
+    // platform by the unit test above.
+    #[cfg(unix)]
+    let files: &[&str] = &["a/b/.DS_Store", "a/desktop.ini", "a/b/c/Icon\r"];
+    #[cfg(not(unix))]
+    let files: &[&str] = &["a/b/.DS_Store", "a/desktop.ini", "a/b/c/._notes.rs"];
+    let (_dir, root) = fixture(files);
 
     assert_eq!(SearchIndex::build(&root).file_count(), 0);
     assert_eq!(glob_all(&root, false), Vec::<String>::new());
