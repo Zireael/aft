@@ -9385,9 +9385,16 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(borrower_ctx.cache_role(), "worktree");
+        // The RAM overlay is on by default, so the borrow-only root runs a
+        // refresh worker that embeds only files it changes after bind; the
+        // adopted resident base itself is never rebuilt (checked below).
         assert!(
-            borrower_ctx.semantic_refresh_sender().is_none(),
-            "borrow-only resident adoption must not spawn a semantic refresh worker"
+            borrower_ctx.ram_overlay_active(),
+            "the default config overlays borrow-only roots"
+        );
+        assert!(
+            borrower_ctx.semantic_refresh_sender().is_some(),
+            "with the RAM overlay on, resident adoption keeps a changed-files-only semantic refresh worker"
         );
         assert!(
             borrower_ctx.semantic_index_rx().lock().is_none(),
