@@ -456,8 +456,8 @@ const CASES: ParityCase[] = [
     project: { worktree: { ram_overlay: true } },
   },
   {
-    // `ram_overlay` defaults on; `false` is the escape hatch and must resolve
-    // the same way on both sides.
+    // `ram_overlay` defaults on; `false` is the escape hatch, and the
+    // TypeScript plugins and the Rust resolver must both keep it.
     name: "worktree_ram_overlay_escape_hatch_project_safe",
     project: { worktree: { ram_overlay: false } },
   },

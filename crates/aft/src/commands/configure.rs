@@ -10696,10 +10696,12 @@ mod tests {
         /// `aft_search` for this checkout's own token: whether it finds
         /// `shared.ts`.
         search_own_token_finds_shared: bool,
-        /// `missing_on_disk_dropped` reported by glob (0 when absent).
+        /// Indexed paths glob left out because they are not on disk in this
+        /// checkout (its `missing_on_disk_dropped`, 0 when absent).
         glob_missing_on_disk_dropped: u64,
-        /// `missing_on_disk_dropped` reported by the `aft_search` for the
-        /// phantom file's name (0 when absent).
+        /// Indexed paths the `aft_search` for the phantom file's name left
+        /// out because they are not on disk in this checkout (its
+        /// `missing_on_disk_dropped`, 0 when absent).
         search_by_name_missing_on_disk_dropped: u64,
     }
 
@@ -10922,8 +10924,8 @@ mod tests {
     /// Builds the live owner and the older checkout of `kind`, probes the older
     /// checkout with the given `ram_overlay` setting (see `probe_older_checkout`)
     /// and checks the preconditions every probe shares: the older checkout
-    /// really borrowed the live owner's snapshot and both tools answered from
-    /// that index, not a disk walk.
+    /// really borrowed the live owner's snapshot, and glob and grep answered
+    /// from that index rather than a disk walk.
     fn borrowed_older_checkout_probe(
         kind: OlderCheckoutKind,
         ram_overlay: Option<bool>,

@@ -6884,7 +6884,8 @@ mod watcher_slice_tests {
         );
         mark_borrow_only(&ctx, &canonical, &cache_dir);
         // Exercise the escape hatch: with the overlay turned off, the watcher
-        // arms must leave the borrowed snapshot alone.
+        // drain's search and symbol-cache handlers must leave the borrowed
+        // snapshot alone.
         ctx.update_config(|config| config.worktree.ram_overlay = false);
         assert!(ctx.shared_artifacts_read_only());
         assert!(!ctx.ram_overlay_active());

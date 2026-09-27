@@ -1,7 +1,8 @@
 # Borrowed search index serves another checkout's files (phantom paths), 2026-09
 
-Status: research and reproduction only. No product code changed. The fix
-direction needs operator approval before anything is built.
+Status: options E and C are built (see section 5). The reproductions below are
+regular tests that pass with the default config. B and the ownership hazard in
+2.5 are still open.
 
 ## Summary
 
@@ -272,3 +273,52 @@ which the code already does.
 A (HEAD match) is not recommended as the primary fix. It is both too strict
 (no sharing across branches) and too weak (dirty state). D is correct but gives
 up the sharing design and costs a full build plus disk for every checkout.
+
+## 5. What was built, and what it costs
+
+- **E:** `worktree.ram_overlay` defaults to true, so every borrow-only root runs
+  `reconcile_borrowed_snapshot_with_disk` before search reports ready, and its
+  watcher events reach the RAM delta afterwards. Borrow-only roots already get a
+  file watcher like any other root (the configure maintenance `Watcher` stage
+  does not look at the owner mode). Only the events were being thrown away. The
+  key stays as an escape hatch (`false` serves the snapshot as it is).
+- **C:** glob and every `aft_search` route that goes through the engine ranking
+  drop returned paths that are not on disk. They make one `stat` per returned
+  path and report the count as `missing_on_disk_dropped` plus a note in the text
+  and a debug log. Glob refills its page from the next matches (at most 256
+  extra `stat`s). `aft_search` shortens the page instead of refilling it, so
+  later pages keep their offsets and present files keep their rank. Grep reports
+  indexed candidates it could not read because they were missing
+  (`missing_on_disk_dropped`, `complete: false`). With the escape hatch, glob's
+  `total` can still count stale entries after the page, because only the page
+  is checked.
+
+Tests: `phantom_paths_*` (default config, all four checkout kinds, plus the
+explicit-on control), `phantom_paths_backstop_drops_missing_paths_when_reconcile_is_off`
+and `borrowed_checkout_edit_after_bind_is_found_by_grep` (real watcher).
+
+Measured cost (release build, isolated storage dir, owner and borrower as two
+`aft` stdio processes). The live checkout is a shared clone of this repository
+at `0dcebd7eb` (3,947 files). The borrower is a linked worktree 300 commits
+older (3,834 files, 439 files differ). Three rounds each:
+
+| | overlay off (escape hatch) | overlay on (default) |
+|---|---|---|
+| configure to search `Ready` | 0.36-0.41 s | 1.01-1.12 s |
+| reconcile (log) | none | walked=3798, hashed_unchanged=3473, reindexed=319, added=6, removed=113; walk 107-118 ms, verify 30-33 ms, apply 523-548 ms |
+| borrower RSS at ready | 58.4-59.5 MB | 82.2-85.9 MB (+23-27 MB) |
+| trigram estimate (`status`) | 2.6 MB, no delta | 14.6 MB: delta 5.85 MB packed, 975,004 postings over 66,869 trigrams, 432 superseded files |
+| glob `**/*` total | 843 (includes the owner's files) | 809 |
+
+A new linked worktree gets fresh mtimes, so every file is hashed
+(`hashed_unchanged`). Most of the time goes to re-indexing the 319 changed files
+into the delta.
+
+`~/Work/OSS/opencode` (7,060 files) could not be measured this way. Its
+borrowed load stops at the existing `BORROWED_INDEX_LOAD_MAX_RECORDS` budget
+(100,000 file plus lookup records). The borrower logs `search index is
+read-only and the shared snapshot was not adopted
+(borrowed_search_index_load_budget)` and serves grep from the fallback walk
+(status `Fallback`) with or without the overlay. This repository's snapshot has
+94,724 lookup entries, just under that budget. So larger repositories never
+borrow today, and neither the phantom paths nor the reconcile cost reach them.

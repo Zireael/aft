@@ -457,7 +457,7 @@ pub struct WorktreeConfig {
     ///
     /// Setting it false serves the borrowed snapshot as it is, which lists the
     /// owner's files instead of this checkout's. It remains only as an escape
-    /// hatch while the default is soaked.
+    /// hatch while the new default is tried in daily use.
     pub ram_overlay: bool,
 }
 
