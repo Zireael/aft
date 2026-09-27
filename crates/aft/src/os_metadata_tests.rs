@@ -137,7 +137,11 @@ fn matches_exact_metadata_names_only() {
 fn metadata_only_folder_indexes_and_globs_nothing() {
     let (_dir, root) = fixture(&METADATA_ONLY);
 
-    assert_eq!(SearchIndex::build(&root).file_count(), 0, "search index files");
+    assert_eq!(
+        SearchIndex::build(&root).file_count(),
+        0,
+        "search index files"
+    );
     assert_eq!(semantic_entry_count(&root), 0, "semantic entries");
     assert_eq!(glob_all(&root, true), Vec::<String>::new(), "indexed glob");
     assert_eq!(glob_all(&root, false), Vec::<String>::new(), "walked glob");
@@ -162,7 +166,11 @@ fn source_file_beside_metadata_is_still_indexed() {
     files.push("src/lib.rs");
     let (_dir, root) = fixture(&files);
 
-    assert_eq!(SearchIndex::build(&root).file_count(), 1, "search index files");
+    assert_eq!(
+        SearchIndex::build(&root).file_count(),
+        1,
+        "search index files"
+    );
     assert!(semantic_entry_count(&root) > 0, "semantic entries");
     assert_eq!(glob_all(&root, true), vec!["src/lib.rs".to_string()]);
     assert_eq!(glob_all(&root, false), vec!["src/lib.rs".to_string()]);
