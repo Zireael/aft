@@ -983,6 +983,9 @@ fn format_error(bare_name: &str, data: &Value, ctx: &FormatContext) -> String {
 
 // Mirrors packages/opencode-plugin/src/tools/hoisted.ts createWriteTool.
 fn format_write_response(data: &Value) -> String {
+    if let Some(text) = github_comment_text(data) {
+        return text;
+    }
     if data.get("rolled_back").and_then(Value::as_bool) == Some(true) {
         return "Write rolled back: the content produced invalid syntax, so the file was left unchanged."
             .to_string();
@@ -1008,6 +1011,9 @@ fn format_write_response(data: &Value) -> String {
 
 // Mirrors packages/opencode-plugin/src/tools/hoisted.ts createEditTool.
 fn format_edit_response(data: &Value) -> String {
+    if let Some(text) = github_comment_text(data) {
+        return text;
+    }
     if data.get("hashline").and_then(Value::as_bool) == Some(true) {
         return data
             .get("output")
@@ -1029,6 +1035,15 @@ fn format_edit_response(data: &Value) -> String {
     append_lsp_error_lines(&mut result, data, false);
     append_lsp_server_notes(&mut result, data);
     result
+}
+
+/// A posted or edited GitHub comment carries its own rendered text (comment
+/// URL, ordinal, and the no-undo notice). The file summaries ("Created new
+/// file.", "File updated.") would tell the agent the opposite of what
+/// happened, so that text is shown as-is.
+fn github_comment_text(data: &Value) -> Option<String> {
+    data.get("comment_url").and_then(Value::as_str)?;
+    data.get("text").and_then(Value::as_str).map(str::to_string)
 }
 
 fn format_glob_skip_reasons_note(reasons: Option<&Value>) -> Option<String> {

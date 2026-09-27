@@ -58,6 +58,17 @@ function isGithubResourcePath(value: string): boolean {
   return value.startsWith("issue://") || value.startsWith("pr://");
 }
 
+/**
+ * Refusal for a GitHub address while github.write is off in this plugin's
+ * config. Raised locally, without contacting AFT: the daemon could hold a
+ * different config and would then publish without the confirmation prompt.
+ */
+function githubWriteDisabledError(tool: "write" | "edit", address: string): Error {
+  return new Error(
+    `${tool}: '${address}' is a GitHub address and GitHub comment writes are off (github.write is not enabled), so nothing was posted and no local file was written. To enable them, set "github": { "write": true } in the user config (~/.config/cortexkit/aft.jsonc) and restart the host.`,
+  );
+}
+
 type ReadAttachment = {
   kind?: unknown;
   mime?: unknown;
@@ -656,8 +667,7 @@ export function registerHoistedTools(
               content: params.content,
             };
             if (!resolveGithubConfig(ctx.config).write) {
-              const response = await callToolCall(bridge, "write", rawArgs, extCtx);
-              throw toolErrorFromResponse("write", response);
+              throw githubWriteDisabledError("write", filePathArg);
             }
             if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
               throw new Error(
@@ -816,8 +826,7 @@ export function registerHoistedTools(
             const bridge = bridgeFor(ctx, extCtx.cwd);
             const rawArgs: Record<string, unknown> = { path: filePathArg, edits };
             if (!resolveGithubConfig(ctx.config).write) {
-              const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
-              throw toolErrorFromResponse("edit", response);
+              throw githubWriteDisabledError("edit", filePathArg);
             }
             const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
             if (preview.success === false) throw toolErrorFromResponse("edit", preview);

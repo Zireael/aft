@@ -1167,6 +1167,30 @@ describe("GitHub resource mutation permissions", () => {
     expect(confirmations).toEqual([{ title: "Publish GitHub comment?", body }]);
     expect(calls).toEqual([]);
   });
+
+  test("with github.write off, write and edit refuse GitHub addresses without contacting AFT", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "published" }));
+    registerHoistedTools(api, makePluginContext(bridge, { config: { github: { write: false } } }), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: false,
+    });
+
+    await expect(
+      executeTool(tools.get("write")!, { path: "issue://369", content: "x" }, makeExtContext()),
+    ).rejects.toThrow(/github\.write.*no local file was written/);
+    await expect(
+      executeTool(
+        tools.get("edit")!,
+        { path: "issue://7/comments/1", edits: [{ oldString: "a", newString: "b" }] },
+        makeExtContext(),
+      ),
+    ).rejects.toThrow(/github\.write/);
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("conditional GitHub mutation descriptions", () => {

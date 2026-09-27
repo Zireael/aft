@@ -1040,7 +1040,23 @@ fn insert_file_or_github_target(
 }
 
 fn is_github_resource_target(target: &str) -> bool {
-    target.starts_with("issue://") || target.starts_with("pr://")
+    crate::commands::github_comments::is_github_resource_path(target)
+}
+
+/// Refuses a GitHub address given to a tool that only touches local files.
+/// Resolving the address against the project root would turn `issue://7` into
+/// `<root>/issue:/7`, which the file handlers would then happily create,
+/// move, or delete.
+fn reject_github_file_target(tool: &str, target: &str) -> Result<(), TranslateError> {
+    if is_github_resource_target(target) {
+        return Err(TranslateError {
+            code: crate::commands::github_comments::GITHUB_RESOURCE_NOT_FILE,
+            message: crate::commands::github_comments::github_resource_not_file_message(
+                tool, target,
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub fn subc_translate(
@@ -1479,7 +1495,9 @@ fn translate_write(
     };
 
     let mut out = Map::new();
-    insert_resolved_file(&mut out, project_root, &file_path);
+    // A GitHub address stays unresolved so the write handler posts a comment
+    // (or refuses when github.write is off) instead of creating a local file.
+    insert_file_or_github_target(&mut out, project_root, &file_path);
     out.insert("content".to_string(), Value::String(content));
     out.insert("create_dirs".to_string(), Value::Bool(true));
     insert_common_mutation_flags(&mut out, ctx);
@@ -1511,9 +1529,17 @@ fn translate_edit(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("'path' is required"))?;
 
-    let file_str = resolve_path_from_project_root(project_root, file_path)
-        .to_string_lossy()
-        .into_owned();
+    let github_target = is_github_resource_target(file_path);
+    // A GitHub address stays unresolved so the edit handlers route it to the
+    // comment editor (or refuse it) instead of treating `<root>/issue:/N` as
+    // a file.
+    let file_str = if github_target {
+        file_path.to_string()
+    } else {
+        resolve_path_from_project_root(project_root, file_path)
+            .to_string_lossy()
+            .into_owned()
+    };
 
     if let Some(append) = map_in.get("appendContent").and_then(Value::as_str) {
         let mut out = Map::new();
@@ -1532,6 +1558,27 @@ fn translate_edit(
     }
 
     if let Some(edits) = map_in.get("edits").and_then(Value::as_array) {
+        // A GitHub comment takes exactly one find/replace, which the
+        // `edit_match` command applies to the addressed comment. The `batch`
+        // command is file-only and must never see a GitHub address.
+        if github_target {
+            if let [single] = edits.as_slice() {
+                if let Some(obj) = single.as_object() {
+                    let is_find_replace = obj.get("oldString").is_some_and(Value::is_string)
+                        && !obj.contains_key("startLine")
+                        && !obj.contains_key("endLine")
+                        && !obj.contains_key("content");
+                    if is_find_replace {
+                        return translate_single_edit_match(obj, file_str, ctx);
+                    }
+                }
+            }
+            return Err(invalid_request(format!(
+                "edit: '{file_path}' is a GitHub address; GitHub comments accept exactly one \
+                 edits[] find/replace entry (oldString and optional newString) on \
+                 issue://N/comments/K or pr://N/comments/K. Nothing was changed."
+            )));
+        }
         // The batch command is single-file only; glob targets are an
         // edit_match capability. A glob path with one find/replace item
         // (the folded single-edit form included) must keep routing to
@@ -1769,6 +1816,11 @@ fn translate_ast_replace(args: Value) -> Result<Translated, TranslateError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("ast_replace: missing required param 'lang'"))?;
+    if let Some(paths) = map_in.get("paths").and_then(Value::as_array) {
+        for path in paths.iter().filter_map(Value::as_str) {
+            reject_github_file_target("ast_replace", path)?;
+        }
+    }
 
     let mut out = Map::new();
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
@@ -1813,6 +1865,7 @@ fn translate_delete(args: Value, project_root: &Path) -> Result<Translated, Tran
             .as_str()
             .filter(|path| !path.is_empty())
             .ok_or_else(|| invalid_request("delete: 'files' must be a non-empty array of paths"))?;
+        reject_github_file_target("delete", file)?;
         let resolved = resolve_path_from_project_root(project_root, file);
         resolved_files.push(Value::String(resolved.to_string_lossy().into_owned()));
     }
@@ -1843,6 +1896,8 @@ fn translate_move(args: Value, project_root: &Path) -> Result<Translated, Transl
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("aft_move: missing required param 'destination'"))?;
 
+    reject_github_file_target("aft_move", file_path)?;
+    reject_github_file_target("aft_move", destination)?;
     let file_path = resolve_path_from_project_root(project_root, file_path);
     let destination = resolve_path_from_project_root(project_root, destination);
 
@@ -1884,6 +1939,7 @@ fn translate_import(args: Value) -> Result<Translated, TranslateError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("aft_import: missing required param 'filePath'"))?;
+    reject_github_file_target("aft_import", file_path)?;
 
     if matches!(op, "add" | "remove") && map_in.get("module").map_or(true, is_empty_param) {
         return Err(invalid_request(format!(
@@ -1943,6 +1999,7 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
             .as_str()
             .filter(|path| !path.is_empty())
             .ok_or_else(|| invalid_request("aft_safety: paths must be non-empty strings"))?;
+        reject_github_file_target("aft_safety", path)?;
         Ok(Value::String(
             resolve_path_from_project_root(project_root, path)
                 .to_string_lossy()
@@ -2649,6 +2706,141 @@ mod tests {
             Some(expected.to_string_lossy().as_ref()),
             "a plain relative target must still resolve against the project root"
         );
+    }
+
+    #[test]
+    fn github_addresses_reach_write_and_edit_handlers_unresolved() {
+        // Resolving `issue://369` against the root produced `/project/issue:/369`,
+        // which the write handler no longer recognised as a GitHub address and
+        // created as a local file.
+        let project = Path::new("/project");
+        let write = subc_translate_owned(
+            "write",
+            serde_json::json!({ "path": "issue://369", "content": "body" }),
+            project,
+        )
+        .expect("write");
+        assert_eq!(write.command, "write");
+        assert_eq!(write.args["file"].as_str(), Some("issue://369"));
+
+        let edit = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "pr://owner/repo/9/comments/2",
+                "edits": [{ "oldString": "a", "newString": "b" }],
+            }),
+            project,
+        )
+        .expect("single find/replace edit");
+        assert_eq!(edit.command, "edit_match");
+        assert_eq!(
+            edit.args["file"].as_str(),
+            Some("pr://owner/repo/9/comments/2")
+        );
+        assert_eq!(edit.args["match"].as_str(), Some("a"));
+        assert_eq!(edit.args["replacement"].as_str(), Some("b"));
+
+        for (label, args) in [
+            (
+                "append",
+                serde_json::json!({ "path": "issue://7", "appendContent": "x" }),
+            ),
+            (
+                "symbol",
+                serde_json::json!({ "path": "issue://7", "symbol": "f", "content": "x" }),
+            ),
+            (
+                "top-level find/replace",
+                serde_json::json!({ "path": "issue://7/comments/1", "oldString": "a", "newString": "b" }),
+            ),
+        ] {
+            let translated = subc_translate_owned("edit", args, project).expect(label);
+            assert_eq!(
+                translated.args["file"]
+                    .as_str()
+                    .map(|file| file.starts_with("issue://")),
+                Some(true),
+                "{label}: GitHub address was resolved as a path"
+            );
+            assert_ne!(translated.command, "batch", "{label}");
+        }
+
+        for (label, args) in [
+            (
+                "line range",
+                serde_json::json!({
+                    "path": "issue://7",
+                    "edits": [{ "startLine": 1, "endLine": 1, "content": "x" }],
+                }),
+            ),
+            (
+                "two entries",
+                serde_json::json!({
+                    "path": "issue://7/comments/1",
+                    "edits": [
+                        { "oldString": "a", "newString": "b" },
+                        { "oldString": "c", "newString": "d" },
+                    ],
+                }),
+            ),
+        ] {
+            let error = subc_translate_owned("edit", args, project).expect_err(label);
+            assert_eq!(error.code, "invalid_request", "{label}");
+            assert!(
+                error.message.contains("GitHub"),
+                "{label}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn file_only_mutation_tools_refuse_github_addresses() {
+        let project = Path::new("/project");
+        for (tool, args) in [
+            (
+                "delete",
+                serde_json::json!({ "files": ["src/a.rs", "issue://7"] }),
+            ),
+            (
+                "move",
+                serde_json::json!({ "path": "src/a.rs", "destination": "pr://3" }),
+            ),
+            (
+                "move",
+                serde_json::json!({ "path": "issue://7", "destination": "src/a.rs" }),
+            ),
+            (
+                "import",
+                serde_json::json!({ "op": "organize", "path": "issue://7" }),
+            ),
+            (
+                "safety",
+                serde_json::json!({ "op": "checkpoint", "name": "c", "files": ["issue://7"] }),
+            ),
+            (
+                "safety",
+                serde_json::json!({ "op": "undo", "path": "pr://3" }),
+            ),
+            (
+                "ast_replace",
+                serde_json::json!({
+                    "pattern": "a",
+                    "rewrite": "b",
+                    "lang": "rust",
+                    "paths": ["issue://7"],
+                }),
+            ),
+        ] {
+            let error = subc_translate_owned(tool, args.clone(), project)
+                .expect_err(&format!("{tool} {args}"));
+            assert_eq!(error.code, "github_resource_not_file", "{tool} {args}");
+            assert!(
+                error.message.contains("github.write"),
+                "{tool}: refusal must say how GitHub writes work: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

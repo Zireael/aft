@@ -151,6 +151,343 @@ impl Fixture {
     }
 }
 
+/// Every file and directory under `root`, relative and sorted, so a test can
+/// prove a refused call left the project byte-for-byte untouched in shape.
+fn project_entries(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("entry under root")
+                .to_string_lossy()
+                .into_owned();
+            let contents = fs::read(&path).map(|bytes| bytes.len()).unwrap_or(0);
+            out.push(format!("{relative} ({contents} bytes)"));
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn tool_call(
+    aft: &mut AftProcess,
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    aft.send(
+        &json!({
+            "id": id,
+            "command": "tool_call",
+            "session_id": "github-write-session",
+            "name": name,
+            "arguments": arguments,
+        })
+        .to_string(),
+    )
+}
+
+/// The agent-facing tool surface (the `tool_call` translation shared by the
+/// plugin bridge and subc routes) once resolved `issue://369` against the
+/// project root and wrote `<project>/issue:/369`. With github.write off, every
+/// mutating tool that takes a path must refuse a GitHub address and leave the
+/// project exactly as it was.
+#[test]
+fn mutating_tools_refuse_github_addresses_without_touching_the_project_when_write_is_off() {
+    let fixture = Fixture::new(json!({ "write": false }));
+    fs::write(fixture.project.join("seed.txt"), "seed\n").expect("seed project file");
+    let mut aft = fixture.spawn(false);
+    let before = project_entries(&fixture.project);
+
+    // (label, tool, arguments, required error code when the refusal must name
+    // the github.write setting)
+    let cases: Vec<(&str, &str, serde_json::Value, Option<&str>)> = vec![
+        (
+            "write issue",
+            "write",
+            json!({ "path": "issue://369", "content": "comment body" }),
+            Some("github_write_disabled"),
+        ),
+        (
+            "write pr via filePath",
+            "write",
+            json!({ "filePath": "pr://owner/repo/12", "content": "comment body" }),
+            Some("github_write_disabled"),
+        ),
+        (
+            "edit comment find/replace",
+            "edit",
+            json!({
+                "path": "issue://7/comments/1",
+                "edits": [{ "oldString": "stale target", "newString": "fresh target" }],
+            }),
+            Some("github_write_disabled"),
+        ),
+        (
+            "edit append",
+            "edit",
+            json!({ "path": "issue://7", "appendContent": "more" }),
+            None,
+        ),
+        (
+            "edit symbol",
+            "edit",
+            json!({ "path": "issue://7", "symbol": "main", "content": "fn main() {}" }),
+            None,
+        ),
+        (
+            "edit line range",
+            "edit",
+            json!({
+                "path": "pr://3",
+                "edits": [{ "startLine": 1, "endLine": 1, "content": "x" }],
+            }),
+            None,
+        ),
+        (
+            "edit two find/replace entries",
+            "edit",
+            json!({
+                "path": "issue://7/comments/1",
+                "edits": [
+                    { "oldString": "a", "newString": "b" },
+                    { "oldString": "c", "newString": "d" },
+                ],
+            }),
+            None,
+        ),
+        (
+            "apply_patch add",
+            "apply_patch",
+            json!({ "patchText": "*** Begin Patch\n*** Add File: issue://7\n+body\n*** End Patch" }),
+            None,
+        ),
+        (
+            "apply_patch move destination",
+            "apply_patch",
+            json!({ "patchText": "*** Begin Patch\n*** Update File: seed.txt\n*** Move to: pr://3\n@@\n-seed\n+seed moved\n*** End Patch" }),
+            None,
+        ),
+        ("delete", "delete", json!({ "files": ["issue://7"] }), None),
+        (
+            "move destination",
+            "move",
+            json!({ "path": "seed.txt", "destination": "issue://7" }),
+            None,
+        ),
+        (
+            "move source",
+            "move",
+            json!({ "path": "pr://3", "destination": "moved.txt" }),
+            None,
+        ),
+        (
+            "import add",
+            "import",
+            json!({ "op": "add", "path": "issue://7", "module": "std::fmt" }),
+            None,
+        ),
+        (
+            "safety checkpoint",
+            "safety",
+            json!({ "op": "checkpoint", "name": "gh", "path": "issue://7" }),
+            None,
+        ),
+        (
+            "safety restore",
+            "safety",
+            json!({ "op": "restore", "name": "gh", "files": ["issue://7"] }),
+            None,
+        ),
+        (
+            "safety undo",
+            "safety",
+            json!({ "op": "undo", "path": "issue://7" }),
+            None,
+        ),
+        (
+            "ast_replace",
+            "ast_replace",
+            json!({
+                "pattern": "foo($A)",
+                "rewrite": "bar($A)",
+                "lang": "rust",
+                "paths": ["issue://7"],
+            }),
+            None,
+        ),
+    ];
+
+    for (index, (label, tool, arguments, code)) in cases.into_iter().enumerate() {
+        let response = tool_call(&mut aft, &format!("gh-refuse-{index}"), tool, arguments);
+        assert_eq!(
+            response["success"], false,
+            "{label}: a GitHub address must be refused: {response:#}"
+        );
+        if let Some(code) = code {
+            assert_eq!(response["code"], code, "{label}: {response:#}");
+            assert!(
+                response.to_string().contains("github.write"),
+                "{label}: refusal must name the setting: {response:#}"
+            );
+        }
+        assert!(
+            response["message"].as_str().unwrap_or_default().contains("GitHub"),
+            "{label}: refusal must say the address is a GitHub one, not fail incidentally: {response:#}"
+        );
+        assert_eq!(
+            project_entries(&fixture.project),
+            before,
+            "{label}: refused call changed the project directory"
+        );
+    }
+    assert!(!fixture.argv.exists(), "a refused write reached gh");
+    assert!(!fixture.edit_argv.exists(), "a refused edit reached gh");
+    assert!(aft.shutdown().success());
+}
+
+/// Native protocol commands are a second way in. The raw `issue://` spelling
+/// must never reach the filesystem through any of them either.
+#[test]
+fn native_mutation_commands_refuse_github_addresses_without_touching_the_project() {
+    let fixture = Fixture::new(json!({ "write": false }));
+    fs::write(fixture.project.join("seed.txt"), "seed\n").expect("seed project file");
+    let mut aft = fixture.spawn(false);
+    let before = project_entries(&fixture.project);
+    let seed = fixture.project.join("seed.txt");
+
+    let cases = vec![
+        json!({ "command": "write", "file": "issue://369", "content": "body" }),
+        json!({
+            "command": "batch",
+            "file": "issue://7",
+            "edits": [{ "line_start": 1, "line_end": 1, "content": "x" }],
+        }),
+        json!({
+            "command": "edit_match",
+            "file": "issue://7",
+            "op": "append",
+            "append_content": "x",
+        }),
+        json!({ "command": "delete_file", "files": ["issue://7"] }),
+        json!({ "command": "move_file", "file": seed, "destination": "issue://7" }),
+        json!({ "command": "add_import", "file": "issue://7", "module": "std::fmt" }),
+        json!({
+            "command": "apply_patch",
+            "patch_text": "*** Begin Patch\n*** Add File: pr://3\n+body\n*** End Patch",
+        }),
+        json!({ "command": "checkpoint", "name": "gh", "files": ["issue://7"] }),
+        json!({ "command": "undo", "file": "pr://3" }),
+    ];
+    for (index, mut request) in cases.into_iter().enumerate() {
+        request["id"] = json!(format!("native-gh-refuse-{index}"));
+        let response = aft.send(&request.to_string());
+        assert_eq!(
+            response["success"], false,
+            "native {}: a GitHub address must be refused: {response:#}",
+            request["command"]
+        );
+        assert!(
+            response["message"].as_str().unwrap_or_default().contains("GitHub"),
+            "native {}: refusal must say the address is a GitHub one, not fail incidentally: {response:#}",
+            request["command"]
+        );
+        assert_eq!(
+            project_entries(&fixture.project),
+            before,
+            "native {}: refused call changed the project directory",
+            request["command"]
+        );
+    }
+    assert!(!fixture.argv.exists(), "a refused native write reached gh");
+    assert!(aft.shutdown().success());
+}
+
+/// With github.write on, the agent-facing `write` tool posts the comment and
+/// returns its URL instead of writing a local file. `tool_call` is the path the
+/// plugin bridge and every subc route take (both call `prepare_tool_call`).
+#[test]
+fn write_tool_call_posts_comment_and_returns_url_when_write_is_on() {
+    let fixture = Fixture::new(json!({ "write": true }));
+    let mut aft = fixture.spawn(false);
+    let before = project_entries(&fixture.project);
+
+    let response = tool_call(
+        &mut aft,
+        "github-write-tool-call",
+        "write",
+        json!({ "filePath": "issue://owner/repo/7", "content": "tool call body" }),
+    );
+
+    assert_eq!(response["success"], true, "write failed: {response:#}");
+    assert_eq!(
+        response["comment_url"],
+        "https://github.com/owner/repo/issues/7#issuecomment-901"
+    );
+    assert!(
+        response["text"]
+            .as_str()
+            .expect("response text")
+            .contains("https://github.com/owner/repo/issues/7#issuecomment-901"),
+        "the agent-visible text must carry the comment URL: {response:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.stdin).expect("read stdin"),
+        "tool call body"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.argv).expect("read argv"),
+        "issue\ncomment\n7\n-R\nowner/repo\n--body-file\n-\n"
+    );
+    assert_eq!(project_entries(&fixture.project), before);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_tool_call_patches_the_addressed_comment_when_write_is_on() {
+    let fixture = Fixture::new(json!({ "write": true, "read": true }));
+    let mut aft = fixture.spawn(false);
+    let before = project_entries(&fixture.project);
+
+    let response = tool_call(
+        &mut aft,
+        "github-edit-tool-call",
+        "edit",
+        json!({
+            "path": "issue://owner/repo/7/comments/1",
+            "edits": [{ "oldString": "stale target", "newString": "fresh target" }],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "edit failed: {response:#}");
+    assert!(
+        response["text"]
+            .as_str()
+            .expect("response text")
+            .contains("https://github.com/owner/repo/issues/7#issuecomment-901"),
+        "the agent-visible text must carry the comment URL: {response:#}"
+    );
+    assert_eq!(
+        response["comment_url"],
+        "https://github.com/owner/repo/issues/7#issuecomment-901"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.edit_stdin).expect("read edit stdin"),
+        r#"{"body":"exact body with fresh target"}"#
+    );
+    assert_eq!(project_entries(&fixture.project), before);
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn write_posts_exact_stdin_through_managed_shim_and_reports_live_ordinal() {
     let fixture = Fixture::new(json!({ "write": true }));

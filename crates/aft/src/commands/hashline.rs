@@ -212,6 +212,13 @@ fn resolve_write_path(
     project_root: &Path,
     requested: &str,
 ) -> Result<PathBuf, HashlineRejection> {
+    // Checked on the raw spelling: once joined onto the project root below,
+    // `issue://7` no longer looks like a GitHub address.
+    if crate::commands::github_comments::is_github_resource_path(requested) {
+        return Err(HashlineRejection::untaggable_path(
+            crate::commands::github_comments::github_resource_not_file_message("edit", requested),
+        ));
+    }
     let path = crate::subc_translate::resolve_path_from_project_root(project_root, requested);
     // Hashline handles are keyed by the symlink-resolved file identity. Following
     // the final component here keeps two requested spellings of one existing file
@@ -615,6 +622,27 @@ mod tests {
         assert!(undo.success, "{}", undo.data);
         assert_eq!(std::fs::read(&source).unwrap(), b"alpha\nbeta\n");
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn github_address_mv_destination_rejects_before_mutation() {
+        let (_temp, root, source, ctx, tag) = registered_fixture("alpha\n");
+        let patch = format!("[sample.txt#{tag}]\nMV issue://7");
+
+        let rejection = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(!rejection.success, "{}", rejection.data);
+        assert!(
+            rejection.data["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("GitHub issue or pull-request address"),
+            "{}",
+            rejection.data
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"alpha\n");
+        assert!(!root.join("issue:").exists());
+        let edit_request = request("hashline_edit", json!({}));
+        assert!(resolve_write_path(&edit_request, &ctx, &root, "pr://3").is_err());
     }
 
     #[test]

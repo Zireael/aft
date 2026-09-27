@@ -1401,6 +1401,28 @@ describe("GitHub resource mutation permissions", () => {
     });
     expect(result).toBe("comment published");
   });
+
+  test("with github.write off, write and edit refuse GitHub addresses without contacting AFT", async () => {
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness((ctx) => {
+      ctx.config = { github: { write: false } } as PluginContext["config"];
+      return hoistedTools(ctx);
+    });
+    const sdkCtx = createSdkContext(process.cwd(), recordingAsk(askCalls));
+
+    await expect(
+      tools.write.execute({ filePath: "issue://369", content: "must not land" }, sdkCtx),
+    ).rejects.toThrow(/github\.write.*no local file was written/);
+    await expect(
+      tools.edit.execute(
+        { filePath: "issue://7/comments/1", edits: [{ oldString: "a", newString: "b" }] },
+        sdkCtx,
+      ),
+    ).rejects.toThrow(/github\.write/);
+
+    expect(calls).toEqual([]);
+    expect(askCalls).toEqual([]);
+  });
 });
 
 /**

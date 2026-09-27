@@ -124,6 +124,9 @@ fn resolve_path(
     path: &str,
     preserve_final_component: bool,
 ) -> Result<ResolvedPath, Response> {
+    // Checked on the raw spelling: once joined onto the project root below,
+    // `issue://7` no longer looks like a GitHub address.
+    crate::commands::github_comments::reject_github_resource_path(&req.id, "apply_patch", path)?;
     let input = resolve_patch_input(ctx, path);
     let validated = if preserve_final_component {
         ctx.validate_write_location(&req.id, &input)?

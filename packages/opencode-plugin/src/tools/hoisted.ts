@@ -546,6 +546,17 @@ function isGithubResourcePath(value: string): boolean {
   return value.startsWith("issue://") || value.startsWith("pr://");
 }
 
+/**
+ * Refusal for a GitHub address while github.write is off in this plugin's
+ * config. Raised locally, without contacting AFT: the daemon could hold a
+ * different config and would then publish without the permission ask.
+ */
+function githubWriteDisabledError(tool: "write" | "edit", address: string): Error {
+  return new Error(
+    `${tool}: '${address}' is a GitHub address and GitHub comment writes are off (github.write is not enabled), so nothing was posted and no local file was written. To enable them, set "github": { "write": true } in the user config (~/.config/cortexkit/aft.jsonc) and restart the host.`,
+  );
+}
+
 function getWriteDescription(ctx: PluginContext, editToolName: string): string {
   const backupText =
     ctx.config.backup?.enabled === false
@@ -574,8 +585,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       if (isGithubResourcePath(file)) {
         const rawArgs: Record<string, unknown> = { filePath: file, content };
         if (!resolveGithubConfig(ctx.config).write) {
-          const data = await callToolCall(ctx, context, "write", rawArgs);
-          throw toolErrorFromResponse("write", data);
+          throw githubWriteDisabledError("write", file);
         }
         const denial = await askEditPermission(context, [file], {
           filepath: file,
@@ -896,8 +906,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         }
         const rawArgs: Record<string, unknown> = { path: file, edits };
         if (!resolveGithubConfig(ctx.config).write) {
-          const data = await callToolCall(ctx, context, "edit", rawArgs);
-          throw toolErrorFromResponse("edit", data);
+          throw githubWriteDisabledError("edit", file);
         }
         const preview = await callToolCall(ctx, context, "edit", rawArgs, { preview: true });
         if (preview.success === false) throw toolErrorFromResponse("edit", preview);

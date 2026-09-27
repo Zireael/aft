@@ -2025,6 +2025,21 @@ fn path_error_response(
     )
 }
 
+/// A GitHub address (`issue://…`, `pr://…`) is never a filesystem path. The
+/// handlers that serve GitHub resources route those spellings before path
+/// validation, so one arriving here was meant for GitHub and handed to a file
+/// operation; accepting it would create or change `<root>/issue:/N` locally.
+fn reject_github_address(req_id: &str, path: &Path) -> Result<(), crate::protocol::Response> {
+    match path.to_str() {
+        Some(raw) => crate::commands::github_comments::reject_github_resource_path(
+            req_id,
+            "file operation",
+            raw,
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Walk `candidate` component-by-component. For any component that is a
 /// symlink on disk, iteratively follow the full chain (up to 40 hops) and
 /// reject if any hop's resolved target lies outside `resolved_root`.
@@ -8973,7 +8988,14 @@ impl AppContext {
     /// When no `project_root` is configured (direct CLI usage), relative paths
     /// fall back to the current working directory, matching `canonicalize_key`.
     pub fn resolve_relative_path(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
+        // A GitHub address is left as spelled so the path validator that
+        // follows recognises and refuses it; joined onto the root it would
+        // look like an ordinary `<root>/issue:/N` file.
+        if path.is_absolute()
+            || path
+                .to_str()
+                .is_some_and(crate::commands::github_comments::is_github_resource_path)
+        {
             return path.to_path_buf();
         }
         if let Some(root) = &self.config().project_root {
@@ -9011,6 +9033,7 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        reject_github_address(req_id, path)?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
@@ -9060,6 +9083,7 @@ impl AppContext {
         path: &Path,
         artifact_session_id: Option<&str>,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        reject_github_address(req_id, path)?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
