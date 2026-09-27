@@ -43,6 +43,9 @@ pub const UNKNOWN_DISABLED_TOOLS: &str = "unknown_disabled_tools";
 pub const REASON_DEFAULT: &str = "default";
 pub const REASON_CONFIGURED: &str = "configured";
 pub const REASON_IMPLIED_BY_WRITE: &str = "implied by github.write";
+/// A bash setting that is on but has nothing to act on, because AFT does not
+/// run the bash tool (`bash` is in `disabled_tools`).
+pub const REASON_REQUIRES_BASH: &str = "requires bash";
 
 /// Feature kinds, serialized as the plan's `kind` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,6 +54,10 @@ pub enum FeatureKind {
     Tool,
     Index,
     Capability,
+    /// A boolean setting of an AFT tool (`bash.compress`, `bash.rewrite`,
+    /// `bash.background`). Its prerequisite is the tool it configures, and it
+    /// has no effect while that tool is disabled.
+    Setting,
 }
 
 /// One catalog row. IDs and order are stable for plan version 1 and mirror
@@ -108,8 +115,30 @@ const SHELL: &str = "Shell";
 const INDEXES: &str = "Indexes";
 const GITHUB: &str = "GitHub";
 
+const fn bash_setting(
+    id: &'static str,
+    order: u32,
+    label: &'static str,
+    description: &'static str,
+) -> CatalogEntry {
+    CatalogEntry {
+        id,
+        kind: FeatureKind::Setting,
+        group: SHELL,
+        order,
+        label,
+        description,
+        cost_note: None,
+        prerequisites: &["bash"],
+    }
+}
+
 /// The complete v1 catalog in plan order.
-pub const CATALOG: [CatalogEntry; 28] = [
+///
+/// The bash companions (`bash_status`, `bash_write`, `bash_watch`,
+/// `bash_kill`) are not rows: they follow the `bash` row, and setup never
+/// writes them to `disabled_tools`. Existing entries naming them are kept.
+pub const CATALOG: [CatalogEntry; 27] = [
     tool(
         "aft_search",
         SEARCH,
@@ -262,43 +291,29 @@ pub const CATALOG: [CatalogEntry; 28] = [
         "AFT takes over the host bash tool.",
         &[],
     ),
-    tool(
-        "bash_status",
-        SHELL,
+    bash_setting(
+        "bash.compress",
         20,
-        "bash_status",
-        "Inspect a background shell task.",
-        &[],
+        "Output compression",
+        "Shortens command output before the agent reads it: test, build and install logs keep their errors and summaries and drop progress noise, so each command uses fewer tokens.",
     ),
-    tool(
-        "bash_write",
-        SHELL,
+    bash_setting(
+        "bash.rewrite",
         21,
-        "bash_write",
-        "Send input to a background or interactive shell task.",
-        &[],
+        "Command rewrites",
+        "Simple reads and searches such as cat, grep, find and ls run through AFT's own read, grep and glob tools instead of the shell.",
     ),
-    tool(
-        "bash_watch",
-        SHELL,
+    bash_setting(
+        "bash.background",
         22,
-        "bash_watch",
-        "Wait on a background shell task's output.",
-        &[],
-    ),
-    tool(
-        "bash_kill",
-        SHELL,
-        23,
-        "bash_kill",
-        "Terminate a background shell task.",
-        &[],
+        "Background commands",
+        "Long commands move to the background instead of blocking the agent, and the agent gets a notice when they finish.",
     ),
     CatalogEntry {
         id: "indexes.trigram",
         kind: FeatureKind::Index,
         group: INDEXES,
-        order: 24,
+        order: 23,
         label: "Trigram index",
         description: "Background index for fast exact and regex search (grep, glob and the lexical aft_search lane).",
         cost_note: Some("Uses disk space and CPU while the index builds."),
@@ -308,7 +323,7 @@ pub const CATALOG: [CatalogEntry; 28] = [
         id: "indexes.semantic",
         kind: FeatureKind::Index,
         group: INDEXES,
-        order: 25,
+        order: 24,
         label: "Semantic index",
         description: "Background embedding index for meaning-based search (the semantic aft_search lane).",
         cost_note: Some("The local backend may download an ONNX runtime and an embedding model, and uses CPU while indexing."),
@@ -318,7 +333,7 @@ pub const CATALOG: [CatalogEntry; 28] = [
         id: "indexes.callgraph",
         kind: FeatureKind::Index,
         group: INDEXES,
-        order: 26,
+        order: 25,
         label: "Callgraph index",
         description: "Persisted call graph used by aft_callgraph, zoom annotations, dead-code hints and search enrichment.",
         cost_note: Some("Uses disk space and CPU while the index builds."),
@@ -328,9 +343,9 @@ pub const CATALOG: [CatalogEntry; 28] = [
         id: "github.read",
         kind: FeatureKind::Capability,
         group: GITHUB,
-        order: 27,
-        label: "GitHub read",
-        description: "Structured issue:// and pr:// reads. Always on while GitHub write is on.",
+        order: 26,
+        label: "Read",
+        description: "The agent can open issues and pull requests with read, aft_outline and aft_zoom using issue://N and pr://N addresses. Uses the GitHub CLI (gh), signed in to your account.",
         cost_note: None,
         prerequisites: &[],
     },
@@ -338,9 +353,9 @@ pub const CATALOG: [CatalogEntry; 28] = [
         id: "github.write",
         kind: FeatureKind::Capability,
         group: GITHUB,
-        order: 28,
-        label: "GitHub write",
-        description: "Post issue and pull-request comments. Turning it on also turns GitHub read on.",
+        order: 27,
+        label: "Write",
+        description: "The agent can post a comment with write(\"issue://N\") or write(\"pr://N\") and edit its comments with edit(\"issue://N/comments/K\"). You are asked before each post. Comments go through AFT's gh shim: as the repository's bot where a signed GitHub routing setup is installed, otherwise as your own gh account. Needs Read.",
         cost_note: None,
         prerequisites: &["github.read"],
     },
@@ -602,6 +617,28 @@ fn nested_bool(block: &Map<String, Value>, container: &str, leaf: &str) -> Optio
     block.get(container)?.as_object()?.get(leaf)?.as_bool()
 }
 
+/// The explicit value one block gives a bash setting (`compress`, `rewrite`,
+/// `background`), following the resolver's precedence: a boolean `bash` sets
+/// every setting to that value, an object sets the leaves it names, and only
+/// when `bash` is absent does a legacy `experimental.bash` block with any
+/// feature flag count, where an unnamed flag means off.
+fn bash_setting_value(block: &Map<String, Value>, leaf: &str) -> Option<bool> {
+    match block.get("bash") {
+        Some(Value::Bool(value)) => return Some(*value),
+        Some(Value::Object(bash)) => return bash.get(leaf).and_then(Value::as_bool),
+        _ => {}
+    }
+    let legacy = block
+        .get("experimental")?
+        .as_object()?
+        .get("bash")?
+        .as_object()?;
+    let has_flag = ["rewrite", "compress", "background"]
+        .iter()
+        .any(|flag| legacy.contains_key(*flag));
+    has_flag.then(|| legacy.get(leaf).and_then(Value::as_bool) == Some(true))
+}
+
 /// Result of deriving a plan.
 #[derive(Debug, Clone)]
 pub struct PlanOutcome {
@@ -615,11 +652,7 @@ fn tool_runtime_block(tool: &str, config: &Config) -> Option<&'static str> {
     match tool {
         "aft_safety" if config.backup.enabled == Some(false) => Some("backup_disabled"),
         "aft_inspect" if !config.inspect.enabled => Some("inspect_disabled"),
-        "bash" | "bash_status" | "bash_write" | "bash_watch" | "bash_kill"
-            if !config.bash.enabled =>
-        {
-            Some("bash_disabled")
-        }
+        "bash" if !config.bash.enabled => Some("bash_disabled"),
         _ => None,
     }
 }
@@ -853,6 +886,57 @@ pub fn derive_plan(
                 feature.unavailable_reason = cause;
                 feature
             }
+            FeatureKind::Setting => {
+                let leaf = entry.id.trim_start_matches("bash.");
+                let base_value = bash_setting_value(&user.base, leaf);
+                let explicit = base_value.is_some()
+                    || [&user.harness, &project.base, &project.harness]
+                        .iter()
+                        .any(|block| bash_setting_value(block, leaf).is_some());
+                let enabled = match leaf {
+                    "compress" => config.experimental_bash_compress,
+                    "rewrite" => config.experimental_bash_rewrite,
+                    _ => config.experimental_bash_background,
+                };
+                let configured = base_value.unwrap_or(true);
+                // A setting of the bash tool does nothing while AFT does not
+                // run that tool; the runtime gate (`bash.enabled`) is a
+                // separate cause, reported the same way as on the tool row.
+                let bash_registered = !resolved_disabled.contains("bash");
+                let (effective, reason, block) = if !enabled {
+                    (
+                        Effective::Off,
+                        if explicit {
+                            REASON_CONFIGURED
+                        } else {
+                            REASON_DEFAULT
+                        },
+                        None,
+                    )
+                } else if !bash_registered {
+                    (Effective::Off, REASON_REQUIRES_BASH, None)
+                } else {
+                    (
+                        Effective::Ready,
+                        if explicit {
+                            REASON_CONFIGURED
+                        } else {
+                            REASON_DEFAULT
+                        },
+                        (!config.bash.enabled).then(|| "bash_disabled".to_string()),
+                    )
+                };
+                row(
+                    entry,
+                    true,
+                    configured,
+                    base_value.is_some(),
+                    configured,
+                    effective,
+                    reason,
+                    block,
+                )
+            }
         };
         features.push(feature);
     }
@@ -936,6 +1020,14 @@ pub fn parse_answers(text: &str) -> Result<BTreeMap<String, bool>, String> {
         }
     }
     if errors.is_empty() {
+        // Write needs read: an answer that turns write on and read off asks
+        // for a state the resolver would silently override, so refuse it.
+        if parsed.get("github.write") == Some(&true) && parsed.get("github.read") == Some(&false) {
+            return Err(
+                "conflicting_selections:github.write:github.read: github.write needs github.read; select github.read too, or leave github.write off"
+                    .to_string(),
+            );
+        }
         Ok(parsed)
     } else {
         Err(errors.join("\n"))
@@ -956,7 +1048,13 @@ pub struct SetupWrite {
 /// comment and formatting are left as they are. `disabled_tools` is always
 /// written (an explicit `[]` included, because omission would restore the
 /// default disables); unknown existing entries are kept verbatim and
-/// historical aliases are written under their canonical names.
+/// historical aliases are written under their canonical names. Existing
+/// entries for known tools that have no row (the bash companions) are kept
+/// as they are, and setup never adds one.
+///
+/// Every chosen feature value is written explicitly, even when it equals the
+/// default or follows from another choice, so the file shows each setting
+/// and the user can edit either GitHub key directly.
 pub fn render_setup(
     user_text: Option<&str>,
     plan: &SetupPlan,
@@ -970,14 +1068,21 @@ pub fn render_setup(
     };
     let fill_missing = matches!(selections, SetupSelections::Yes);
 
-    // Existing entries: canonicalize aliases, then split off unknown names.
+    // Existing entries: canonicalize aliases, then split off unknown names
+    // and known names that no row controls.
     let mut unknown = Vec::new();
+    let mut unmanaged = Vec::new();
     if let Some(Value::Array(entries)) = raw.get("disabled_tools") {
         for name in entries.iter().filter_map(Value::as_str) {
             let canonical = feature_config::legacy_tool_alias(name).unwrap_or(name);
-            if !feature_config::is_known_tool(canonical) && !unknown.iter().any(|n| n == canonical)
+            if !feature_config::is_known_tool(canonical) {
+                if !unknown.iter().any(|n| n == canonical) {
+                    unknown.push(canonical.to_string());
+                }
+            } else if catalog_entry(canonical).is_none()
+                && !unmanaged.iter().any(|n| n == canonical)
             {
-                unknown.push(canonical.to_string());
+                unmanaged.push(canonical.to_string());
             }
         }
     }
@@ -987,6 +1092,7 @@ pub fn render_setup(
         .filter(|feature| feature.kind == FeatureKind::Tool)
         .filter(|feature| !choice(feature.id).unwrap_or(feature.configured))
         .map(|feature| feature.id.to_string())
+        .chain(unmanaged)
         .collect();
     disabled.sort();
     disabled.extend(unknown.iter().cloned());
@@ -1008,26 +1114,58 @@ pub fn render_setup(
         }
     }
 
-    let write = plan.feature("github.write");
-    let read = plan.feature("github.read");
-    let mut final_write = write.is_some_and(|feature| feature.configured);
-    if let Some(write) = write {
-        if let Some(value) = choice(write.id) {
-            doc.set(&["github", "write"], &Value::Bool(value))?;
-            final_write = value;
-        } else if fill_missing && write.source == "default" {
-            doc.set(&["github", "write"], &Value::Bool(write.configured))?;
+    let mut bash_expanded = false;
+    for feature in plan
+        .features
+        .iter()
+        .filter(|feature| feature.kind == FeatureKind::Setting)
+    {
+        let value = match choice(feature.id) {
+            Some(value) => value,
+            None if fill_missing && feature.source == "default" => feature.proposed,
+            None => continue,
+        };
+        // A boolean `bash` cannot hold a leaf. Spell it out as the object it
+        // resolves to (the runtime gate plus every setting at that value)
+        // before changing one setting, so the others keep their meaning.
+        if let (false, Some(Value::Bool(all))) = (bash_expanded, raw.get("bash")) {
+            let mut object = Map::new();
+            object.insert("enabled".to_string(), Value::Bool(*all));
+            for leaf in ["compress", "rewrite", "background"] {
+                object.insert(leaf.to_string(), Value::Bool(*all));
+            }
+            doc.set(&["bash"], &Value::Object(object))?;
         }
+        bash_expanded = true;
+        let path: Vec<&str> = feature.id.split('.').collect();
+        doc.set(&path, &Value::Bool(value))?;
     }
-    if let Some(read) = read {
-        if let Some(value) = choice(read.id) {
-            doc.set(&["github", "read"], &Value::Bool(value))?;
-        } else if fill_missing && read.source == "default" && !final_write {
-            // Under write the read choice stays absent: write implies read at
-            // resolution time, and writing the derived value (true or false)
-            // would turn an implication into an explicit choice.
-            doc.set(&["github", "read"], &Value::Bool(read.configured))?;
-        }
+
+    // GitHub: write needs read. An answer that turns write on also records
+    // read on, and an answer that turns read off also records write off.
+    let read_choice = choice("github.read");
+    let write_choice = choice("github.write");
+    let read_value = match (read_choice, write_choice) {
+        (Some(read), _) => Some(read),
+        (None, Some(true)) => Some(true),
+        (None, _) => plan
+            .feature("github.read")
+            .filter(|read| fill_missing && read.source == "default")
+            .map(|read| read.proposed),
+    };
+    let write_value = match (write_choice, read_choice) {
+        (Some(write), _) => Some(write),
+        (None, Some(false)) => Some(false),
+        (None, _) => plan
+            .feature("github.write")
+            .filter(|write| fill_missing && write.source == "default")
+            .map(|write| write.configured),
+    };
+    if let Some(value) = read_value {
+        doc.set(&["github", "read"], &Value::Bool(value))?;
+    }
+    if let Some(value) = write_value {
+        doc.set(&["github", "write"], &Value::Bool(value))?;
     }
 
     Ok(SetupWrite {

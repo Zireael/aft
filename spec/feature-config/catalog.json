@@ -225,54 +225,49 @@
       "prerequisites": []
     },
     {
-      "id": "bash_status",
-      "kind": "tool",
+      "id": "bash.compress",
+      "kind": "setting",
       "group": "Shell",
       "order": 20,
       "binding": {
-        "path": "disabled_tools",
-        "tool_name": "bash_status"
+        "path": "bash.compress",
+        "tool_name": null
       },
-      "prerequisites": []
+      "prerequisites": [
+        "bash"
+      ]
     },
     {
-      "id": "bash_write",
-      "kind": "tool",
+      "id": "bash.rewrite",
+      "kind": "setting",
       "group": "Shell",
       "order": 21,
       "binding": {
-        "path": "disabled_tools",
-        "tool_name": "bash_write"
+        "path": "bash.rewrite",
+        "tool_name": null
       },
-      "prerequisites": []
+      "prerequisites": [
+        "bash"
+      ]
     },
     {
-      "id": "bash_watch",
-      "kind": "tool",
+      "id": "bash.background",
+      "kind": "setting",
       "group": "Shell",
       "order": 22,
       "binding": {
-        "path": "disabled_tools",
-        "tool_name": "bash_watch"
+        "path": "bash.background",
+        "tool_name": null
       },
-      "prerequisites": []
-    },
-    {
-      "id": "bash_kill",
-      "kind": "tool",
-      "group": "Shell",
-      "order": 23,
-      "binding": {
-        "path": "disabled_tools",
-        "tool_name": "bash_kill"
-      },
-      "prerequisites": []
+      "prerequisites": [
+        "bash"
+      ]
     },
     {
       "id": "indexes.trigram",
       "kind": "index",
       "group": "Indexes",
-      "order": 24,
+      "order": 23,
       "binding": {
         "path": "indexes.trigram",
         "tool_name": null
@@ -283,7 +278,7 @@
       "id": "indexes.semantic",
       "kind": "index",
       "group": "Indexes",
-      "order": 25,
+      "order": 24,
       "binding": {
         "path": "indexes.semantic",
         "tool_name": null
@@ -294,7 +289,7 @@
       "id": "indexes.callgraph",
       "kind": "index",
       "group": "Indexes",
-      "order": 26,
+      "order": 25,
       "binding": {
         "path": "indexes.callgraph",
         "tool_name": null
@@ -305,7 +300,7 @@
       "id": "github.read",
       "kind": "capability",
       "group": "GitHub",
-      "order": 27,
+      "order": 26,
       "binding": {
         "path": "github.read",
         "tool_name": null
@@ -316,7 +311,7 @@
       "id": "github.write",
       "kind": "capability",
       "group": "GitHub",
-      "order": 28,
+      "order": 27,
       "binding": {
         "path": "github.write",
         "tool_name": null
@@ -331,9 +326,7 @@
     "gh_shim.binary_path",
     "git.co_author",
     "sandbox",
-    "bash.rewrite",
-    "bash.compress",
-    "bash.background",
+    "bash.enabled",
     "bash.host_fallback",
     "bash.subagent_background",
     "configure_warnings_delivery",
@@ -350,7 +343,11 @@
     "aft_glob",
     "aft_bash",
     "powershell",
-    "aft_powershell"
+    "aft_powershell",
+    "bash_status",
+    "bash_write",
+    "bash_watch",
+    "bash_kill"
   ],
   "runtime_prerequisites_not_catalog_rows": {
     "aft_safety": "backup.enabled",

@@ -330,7 +330,6 @@ fn registered_runtime_blocked_tools_stay_ready_with_a_separate_cause() {
         ("aft_safety", "backup_disabled"),
         ("aft_inspect", "inspect_disabled"),
         ("bash", "bash_disabled"),
-        ("bash_kill", "bash_disabled"),
     ] {
         assert_eq!(
             matrix(&plan, id),
@@ -338,6 +337,11 @@ fn registered_runtime_blocked_tools_stay_ready_with_a_separate_cause() {
             "{id}"
         );
     }
+    // The bash settings name the same runtime cause as the tool they configure.
+    assert_eq!(
+        matrix(&plan, "bash.compress"),
+        json!({"configured": true, "source": "default", "effective": "ready", "available": false, "reason": "default", "unavailable_reason": "bash_disabled"})
+    );
 }
 
 /// Same user base under two harness ids and inside/outside a project: the
@@ -531,6 +535,7 @@ fn yes_on_a_missing_file_writes_the_proposed_defaults() {
         json!({
             "disabled_tools": ["aft_delete", "aft_move"],
             "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+            "bash": {"compress": true, "rewrite": true, "background": true},
             "github": {"write": false, "read": false}
         })
     );
@@ -553,26 +558,45 @@ fn yes_on_an_existing_file_keeps_explicit_choices_and_fills_the_rest() {
     );
     assert_eq!(value["github"], json!({"read": true, "write": false}));
     assert_eq!(value["disabled_tools"], json!(["aft_delete", "aft_move"]));
+    assert_eq!(
+        value["bash"],
+        json!({"compress": true, "rewrite": true, "background": true})
+    );
 }
 
-/// Interactive/yes saving of a write-only choice writes `github.write:true`
-/// and leaves `github.read` absent: write implies read at resolution time.
+/// Saving a write choice writes `github.read: true` next to it, so the file
+/// shows both keys and the user can edit either. The resolver would turn read
+/// on under write anyway; leaving the key absent hid that.
 #[test]
-fn write_only_github_leaves_read_absent() {
+fn write_choice_records_read_explicitly() {
     let (value, _) = written(Some(r#"{"github": {"write": true}}"#), SetupSelections::Yes);
-    let github: BTreeSet<&str> = value["github"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(github, BTreeSet::from(["write"]));
-    assert_eq!(value["github"]["write"], json!(true));
+    assert_eq!(value["github"], json!({"read": true, "write": true}));
 
     let (value, _) = written(None, answers(&[("github.write", true)]));
-    assert_eq!(value["github"], json!({"write": true}));
+    assert_eq!(value["github"], json!({"read": true, "write": true}));
 
-    // An independently explicit read choice survives unless edited.
+    let (value, _) = written(
+        None,
+        answers(&[("github.write", true), ("github.read", true)]),
+    );
+    assert_eq!(value["github"], json!({"read": true, "write": true}));
+
+    // Turning read off turns write off with it.
+    let (value, _) = written(
+        Some(r#"{"github": {"read": true, "write": true}}"#),
+        answers(&[("github.read", false)]),
+    );
+    assert_eq!(value["github"], json!({"read": false, "write": false}));
+
+    // Both off are written too, not left out because they are the default.
+    let (value, _) = written(
+        None,
+        answers(&[("github.write", false), ("github.read", false)]),
+    );
+    assert_eq!(value["github"], json!({"read": false, "write": false}));
+
+    // A hand-written read false under write true is kept as written by yes;
+    // the resolver still turns read on, which doctor reports.
     let (value, _) = written(
         Some(r#"{"github": {"read": false, "write": true}}"#),
         SetupSelections::Yes,
@@ -583,6 +607,22 @@ fn write_only_github_leaves_read_absent() {
         resolved.feature("github.read").unwrap().effective,
         Effective::Ready
     );
+}
+
+#[test]
+fn answers_that_turn_write_on_and_read_off_are_refused() {
+    let error = parse_answers(
+        r#"{"plan_version": 1, "selections": {"github.write": true, "github.read": false}}"#,
+    )
+    .unwrap_err();
+    assert!(
+        error.starts_with("conflicting_selections:github.write:github.read"),
+        "{error}"
+    );
+    assert!(parse_answers(
+        r#"{"plan_version": 1, "selections": {"github.write": false, "github.read": false}}"#,
+    )
+    .is_ok());
 }
 
 #[test]
@@ -701,4 +741,249 @@ fn setup_writes_only_the_base_and_keeps_comments_and_unrelated_keys() {
         value["harnesses"],
         json!({"opencode": {"indexes": {"semantic": false}}})
     );
+}
+
+#[test]
+fn bash_companions_are_not_rows_and_bash_settings_are() {
+    for companion in ["bash_status", "bash_write", "bash_watch", "bash_kill"] {
+        assert!(catalog_entry(companion).is_none(), "{companion}");
+        assert_eq!(
+            parse_answers(&format!(
+                r#"{{"plan_version": 1, "selections": {{"{companion}": true}}}}"#
+            ))
+            .unwrap_err(),
+            format!("unknown_feature_id:{companion}")
+        );
+    }
+    let plan = plan(&ConfigInputs::default(), None);
+    let shell: Vec<(&str, FeatureKind)> = plan
+        .features
+        .iter()
+        .filter(|feature| feature.group == "Shell")
+        .map(|feature| (feature.id, feature.kind))
+        .collect();
+    assert_eq!(
+        shell,
+        vec![
+            ("bash", FeatureKind::Tool),
+            ("bash.compress", FeatureKind::Setting),
+            ("bash.rewrite", FeatureKind::Setting),
+            ("bash.background", FeatureKind::Setting),
+        ]
+    );
+    for id in ["bash.compress", "bash.rewrite", "bash.background"] {
+        let row = row_json(&plan, id);
+        assert_eq!(row["kind"], json!("setting"));
+        assert_eq!(row["binding"], json!({"path": id, "tool_name": null}));
+        assert_eq!(row["prerequisites"], json!(["bash"]));
+        assert_eq!(row["default"], json!(true));
+        assert_eq!(row["proposed"], json!(true));
+        assert_eq!(
+            matrix(&plan, id),
+            json!({"configured": true, "source": "default", "effective": "ready", "available": true, "reason": "default", "unavailable_reason": null}),
+            "{id}"
+        );
+    }
+    // GitHub rows describe what each lets the agent do, and write needs read.
+    let read = row_json(&plan, "github.read");
+    let write = row_json(&plan, "github.write");
+    assert_eq!(read["label"], json!("Read"));
+    assert_eq!(write["label"], json!("Write"));
+    assert!(read["description"].as_str().unwrap().contains("issue://N"));
+    assert!(write["description"]
+        .as_str()
+        .unwrap()
+        .contains("issue://N/comments/K"));
+    assert_eq!(write["prerequisites"], json!(["github.read"]));
+    assert_eq!(read["prerequisites"], json!([]));
+}
+
+#[test]
+fn bash_settings_follow_every_config_shape() {
+    let cases = [
+        (
+            r#"{"bash": {"compress": false}}"#,
+            false,
+            true,
+            "configured",
+        ),
+        (r#"{"bash": false}"#, false, false, "configured"),
+        (r#"{"bash": true}"#, true, true, "configured"),
+        (
+            r#"{"experimental": {"bash": {"rewrite": true}}}"#,
+            false,
+            true,
+            "configured",
+        ),
+    ];
+    for (text, compress, rewrite, reason) in cases {
+        let plan = plan(&user(text), None);
+        let row = plan.feature("bash.compress").unwrap();
+        assert_eq!(row.configured, compress, "{text}");
+        assert_eq!(row.source, "config", "{text}");
+        assert_eq!(row.reason, Some(reason), "{text}");
+        assert_eq!(
+            row.effective,
+            if compress {
+                Effective::Ready
+            } else {
+                Effective::Off
+            },
+            "{text}"
+        );
+        assert_eq!(
+            plan.feature("bash.rewrite").unwrap().configured,
+            rewrite,
+            "{text}"
+        );
+    }
+    // A project that turns a setting off makes it configured without
+    // changing the user's base choice.
+    let project = plan(
+        &with_project(ConfigInputs::default(), r#"{"bash": {"rewrite": false}}"#),
+        None,
+    );
+    let rewrite = project.feature("bash.rewrite").unwrap();
+    assert_eq!(
+        (
+            rewrite.configured,
+            rewrite.source,
+            rewrite.effective,
+            rewrite.reason
+        ),
+        (true, "default", Effective::Off, Some(REASON_CONFIGURED))
+    );
+}
+
+#[test]
+fn bash_settings_are_off_while_the_bash_tool_is_disabled() {
+    let plan = plan(&user(r#"{"disabled_tools": ["bash"]}"#), None);
+    assert_eq!(plan.feature("bash").unwrap().effective, Effective::Off);
+    for id in ["bash.compress", "bash.rewrite", "bash.background"] {
+        assert_eq!(
+            matrix(&plan, id),
+            json!({"configured": true, "source": "default", "effective": "off", "available": true, "reason": "requires bash", "unavailable_reason": null}),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn setup_writes_bash_settings_explicitly() {
+    let (value, _) = written(
+        None,
+        answers(&[
+            ("bash", true),
+            ("bash.compress", true),
+            ("bash.rewrite", false),
+            ("bash.background", true),
+        ]),
+    );
+    assert_eq!(
+        value["bash"],
+        json!({"compress": true, "rewrite": false, "background": true})
+    );
+    // Existing bash keys that setup does not manage are kept.
+    let (value, _) = written(
+        Some(r#"{"bash": {"linux_scope": true, "compress": false}}"#),
+        answers(&[("bash.compress", true)]),
+    );
+    assert_eq!(
+        value["bash"],
+        json!({"linux_scope": true, "compress": true})
+    );
+    // Yes keeps an explicit choice and fills the rest.
+    let (value, _) = written(
+        Some(r#"{"bash": {"background": false}}"#),
+        SetupSelections::Yes,
+    );
+    assert_eq!(
+        value["bash"],
+        json!({"background": false, "compress": true, "rewrite": true})
+    );
+}
+
+/// A boolean `bash` is spelled out as the object it resolves to before one
+/// setting changes, so the runtime gate and the other settings keep their
+/// meaning.
+#[test]
+fn a_boolean_bash_is_expanded_before_a_setting_changes() {
+    let (value, _) = written(
+        Some(r#"{"disabled_tools": [], "bash": false}"#),
+        answers(&[("bash.compress", true)]),
+    );
+    assert_eq!(
+        value["bash"],
+        json!({"enabled": false, "compress": true, "rewrite": false, "background": false})
+    );
+    let (value, _) = written(
+        Some(r#"{"disabled_tools": [], "bash": true}"#),
+        answers(&[("bash.rewrite", false)]),
+    );
+    assert_eq!(
+        value["bash"],
+        json!({"enabled": true, "compress": true, "rewrite": false, "background": true})
+    );
+    // Yes leaves a boolean alone: every setting is already an explicit choice.
+    let (value, _) = written(
+        Some(r#"{"disabled_tools": [], "bash": true}"#),
+        SetupSelections::Yes,
+    );
+    assert_eq!(value["bash"], json!(true));
+}
+
+/// The companions follow `bash`: setup never adds one to `disabled_tools`,
+/// and an existing entry stays as the user wrote it.
+#[test]
+fn setup_never_adds_bash_companions_and_keeps_existing_ones() {
+    let companions = ["bash_kill", "bash_status", "bash_watch", "bash_write"];
+    let no_companion = |value: &Value| {
+        value["disabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|name| !companions.contains(&name))
+    };
+    for selections in [
+        SetupSelections::Yes,
+        answers(&[("bash", false)]),
+        answers(&[
+            ("bash", false),
+            ("bash.background", false),
+            ("bash.compress", false),
+            ("bash.rewrite", false),
+        ]),
+    ] {
+        let (value, _) = written(None, selections.clone());
+        assert!(no_companion(&value), "{value}");
+        let (value, _) = written(Some(r#"{"disabled_tools": ["bash"]}"#), selections);
+        assert!(no_companion(&value), "{value}");
+    }
+    let (value, _) = written(None, answers(&[("bash", false)]));
+    assert_eq!(
+        value["disabled_tools"],
+        json!(["aft_delete", "aft_move", "bash"])
+    );
+
+    let existing = r#"{"disabled_tools": ["bash_status", "aft_move", "bash_kill", "typo_name"]}"#;
+    for selections in [
+        SetupSelections::Yes,
+        answers(&[("bash", true)]),
+        answers(&[("bash", false), ("aft_move", true)]),
+    ] {
+        let (value, write) = written(Some(existing), selections);
+        let list: Vec<&str> = value["disabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            list.contains(&"bash_status") && list.contains(&"bash_kill"),
+            "{list:?}"
+        );
+        assert!(!list.contains(&"bash_watch") && !list.contains(&"bash_write"));
+        assert_eq!(write.unknown_disabled_tools, vec!["typo_name"]);
+    }
 }

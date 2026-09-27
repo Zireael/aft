@@ -345,7 +345,7 @@ mod tests {
         result.unwrap();
         let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(plan["plan_version"], 1);
-        assert_eq!(plan["features"].as_array().unwrap().len(), 28);
+        assert_eq!(plan["features"].as_array().unwrap().len(), 27);
         assert_eq!(stderr.matches("unknown_disabled_tools").count(), 1);
         assert!(stderr.contains("typo_name"));
         let (_, _, quiet) = invoke(&fixture, &["--plan", "--no-load-warnings"], None, "");
@@ -439,6 +439,8 @@ mod tests {
             r#"{"plan_version": 1, "selections": {"aft_nope": true}}"#,
             r#"{"plan_version": 1, "selections": {"aft_move": 1}}"#,
             r#"{"plan_version": 9, "selections": {}}"#,
+            r#"{"plan_version": 1, "selections": {"github.write": true, "github.read": false}}"#,
+            r#"{"plan_version": 1, "selections": {"bash_status": false}}"#,
         ] {
             let (result, stdout, _) = invoke(&fixture, &["--answers", "-"], None, bad);
             assert!(result.is_err(), "{bad}");
@@ -481,5 +483,13 @@ mod tests {
             serde_json::json!(["aft_delete", "aft_move"])
         );
         assert_eq!(written["indexes"]["semantic"], true);
+        assert_eq!(
+            written["bash"],
+            serde_json::json!({"compress": true, "rewrite": true, "background": true})
+        );
+        assert_eq!(
+            written["github"],
+            serde_json::json!({"read": false, "write": false})
+        );
     }
 }
