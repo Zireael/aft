@@ -187,7 +187,6 @@ function autoIO(seen: string[] = []): WizardIO {
       seen.push("wizard");
       return initial;
     },
-    confirm: async (_message, initial) => initial,
     info: () => {},
     note: () => {},
   };
@@ -566,7 +565,6 @@ async function firstFrame(columns: number): Promise<string> {
         initial = selected.filter((id) => id !== "read");
         return selected;
       },
-      confirm: async () => false,
       info: () => {},
       note: () => {},
     },

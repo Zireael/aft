@@ -23,16 +23,24 @@ const CATALOG: [string, string][] = [
   ["ast_grep_search", "Editing"],
   ["ast_grep_replace", "Editing"],
   ["bash", "Shell"],
-  ["bash_status", "Shell"],
-  ["bash_write", "Shell"],
-  ["bash_watch", "Shell"],
-  ["bash_kill", "Shell"],
+  ["bash.compress", "Shell"],
+  ["bash.rewrite", "Shell"],
+  ["bash.background", "Shell"],
   ["indexes.trigram", "Indexes"],
   ["indexes.semantic", "Indexes"],
   ["indexes.callgraph", "Indexes"],
   ["github.read", "GitHub"],
   ["github.write", "GitHub"],
 ];
+
+/** The wizard's labels for the rows whose label is not their id. */
+const LABELS: Record<string, string> = {
+  "bash.compress": "Output compression",
+  "bash.rewrite": "Command rewrites",
+  "bash.background": "Background commands",
+  "github.read": "Read",
+  "github.write": "Write",
+};
 
 /**
  * A plan the way the binary prints it for a migrated config that saved every
@@ -47,7 +55,9 @@ function migratedPlan(overrides: Record<string, Partial<PlanFeature>> = {}): Set
         ? "index"
         : id.startsWith("github.")
           ? "capability"
-          : "tool";
+          : id.startsWith("bash.")
+            ? "setting"
+            : "tool";
       const defaultOn = kind !== "capability" && id !== "aft_move" && id !== "aft_delete";
       const on = id === "github.read" ? true : defaultOn;
       return {
@@ -55,7 +65,7 @@ function migratedPlan(overrides: Record<string, Partial<PlanFeature>> = {}): Set
         kind,
         group,
         order: index + 1,
-        label: id,
+        label: LABELS[id] ?? id,
         description: id,
         binding: { path: id, tool_name: kind === "tool" ? id : null },
         default: defaultOn,
@@ -123,7 +133,7 @@ describe("doctor feature report", () => {
     expect(lines).toEqual([
       "Search/navigation: all 8 on",
       "Editing: 8 of 10 on; off: aft_move, aft_delete",
-      "Shell: all 5 on",
+      "Shell: all 4 on",
       "Indexes: all 3 on",
       "GitHub: read on (config), write off",
       "Index build state is only visible inside a running session (the AFT sidebar or /aft-status).",
@@ -141,7 +151,66 @@ describe("doctor feature report", () => {
       }),
     );
     expect(lines).toContain("Editing: 9 of 10 on; off: aft_delete; on: aft_move (config)");
-    expect(lines).toContain("Shell: 4 of 5 on; off: bash (config)");
+    expect(lines).toContain("Shell: 3 of 4 on; off: bash (config)");
+  });
+
+  test("bash settings use the wizard's names and say when bash is off", () => {
+    const compressOff = renderFeatureStatus(
+      migratedPlan({ "bash.compress": { configured: false, proposed: false, effective: "off" } }),
+    );
+    expect(compressOff.lines).toContain("Shell: 3 of 4 on; off: Output compression (config)");
+    const requiresBash = { effective: "off", reason: "requires bash" } as const;
+    const bashOff = renderFeatureStatus(
+      migratedPlan({
+        bash: { configured: false, proposed: false, effective: "off" },
+        "bash.compress": requiresBash,
+        "bash.rewrite": requiresBash,
+        "bash.background": requiresBash,
+      }),
+    );
+    expect(bashOff.lines).toContain(
+      "Shell: all 4 off (bash (config), Output compression (bash is off), Command rewrites (bash is off), Background commands (bash is off))",
+    );
+    expect(bashOff.lines.join("\n")).not.toMatch(/bash_(status|write|watch|kill)/);
+  });
+
+  test("read false written next to write true is explained in plain words", () => {
+    const implied = {
+      configured: false,
+      proposed: true,
+      effective: "ready",
+      source: "config",
+      reason: "implied by github.write",
+    } as const;
+    const report = renderFeatureStatus(
+      migratedPlan({
+        "github.read": implied,
+        "github.write": { configured: true, proposed: true, effective: "ready" },
+      }),
+      { checkGh: () => "ready" },
+    );
+    expect(report.lines).toContain(
+      "GitHub: read on (on because write needs it), write on (config)",
+    );
+    expect(report.problems).toEqual([]);
+    expect(report.notes).toEqual([
+      {
+        text: "github.read is false in your config but github.write is true, so AFT turns GitHub read on anyway: posting a comment needs reading.",
+        remedy:
+          "Set github.read to true, or github.write to false, so the config says what AFT does.",
+      },
+    ]);
+    // Read left out (an older write-only save) says why read is on, with no note.
+    const absent = renderFeatureStatus(
+      migratedPlan({
+        "github.read": { ...implied, source: "default" },
+        "github.write": { configured: true, proposed: true, effective: "ready" },
+      }),
+    );
+    expect(absent.lines).toContain(
+      "GitHub: read on (on because write needs it), write on (config)",
+    );
+    expect(absent.notes).toEqual([]);
   });
 
   test("a real unavailable cause is a problem", () => {

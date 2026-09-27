@@ -71,12 +71,18 @@ function isOn(feature: PlanFeature): boolean {
   return feature.effective !== "off";
 }
 
-/** A feature name as shown in a group line. */
+/** A feature name as shown in a group line: the wizard's label for a setting, a short id otherwise. */
 function shortName(feature: PlanFeature): string {
   if (feature.kind === "index") return feature.id.replace(/^indexes\./, "");
   if (feature.kind === "capability") return feature.id.replace(/^github\./, "");
+  if (feature.kind === "setting") return feature.label;
   return feature.id;
 }
+
+/** Plan reasons for a feature that is on only because another one is. */
+const REASON_IMPLIED_BY_WRITE = "implied by github.write";
+/** Plan reason for a bash setting that is off because AFT does not run bash. */
+const REASON_REQUIRES_BASH = "requires bash";
 
 /**
  * Where a feature's value came from, when it is worth saying. The default is
@@ -84,7 +90,8 @@ function shortName(feature: PlanFeature): string {
  * default, since a config that repeats the default changes nothing.
  */
 function sourceNote(feature: PlanFeature): string {
-  if (feature.reason?.startsWith("implied")) return ` (${feature.reason})`;
+  if (feature.reason === REASON_IMPLIED_BY_WRITE) return " (on because write needs it)";
+  if (feature.reason === REASON_REQUIRES_BASH) return " (bash is off)";
   if (feature.source === "config" && feature.configured !== feature.default) return " (config)";
   return "";
 }
@@ -169,6 +176,17 @@ export function renderFeatureStatus(
   }
 
   const notes: FeatureStatusFinding[] = [];
+  // A hand-written `github.read: false` next to `github.write: true`: the
+  // resolver keeps read on, because posting needs reading, and warns
+  // `github_write_requires_read`. Say so in plain words.
+  const read = plan.features.find((feature) => feature.id === "github.read");
+  if (read?.reason === REASON_IMPLIED_BY_WRITE && read.source === "config" && !read.configured) {
+    notes.push({
+      text: "github.read is false in your config but github.write is true, so AFT turns GitHub read on anyway: posting a comment needs reading.",
+      remedy:
+        "Set github.read to true, or github.write to false, so the config says what AFT does.",
+    });
+  }
   if (context.git && !context.git.available) {
     notes.push({
       text:

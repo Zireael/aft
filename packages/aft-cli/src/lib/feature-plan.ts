@@ -10,7 +10,11 @@ import { CLI } from "./cli.js";
 
 export const SETUP_PLAN_VERSION = 1;
 
-export type FeatureKind = "tool" | "index" | "capability";
+/**
+ * Row kinds. A `setting` is a boolean setting of a tool (the bash settings);
+ * its prerequisite is the tool it configures.
+ */
+export type FeatureKind = "tool" | "index" | "capability" | "setting";
 export type FeatureEffective = "off" | "building" | "ready" | "unavailable";
 
 export interface PlanFeature {

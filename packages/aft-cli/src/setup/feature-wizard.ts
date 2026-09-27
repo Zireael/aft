@@ -13,8 +13,13 @@ import {
   writeFeatureAnswers,
 } from "../lib/feature-plan.js";
 import { formatFsError, isPermissionError, tildePath } from "../lib/fs-errors.js";
-import { confirm, log, note } from "../lib/prompts.js";
-import { type FeatureRow, promptFeatureList } from "./feature-list.js";
+import { log, note } from "../lib/prompts.js";
+import {
+  type FeatureRow,
+  normalizeSelection,
+  promptFeatureList,
+  type SelectionRules,
+} from "./feature-list.js";
 
 /**
  * The feature wizard: a thin renderer of the binary's setup plan.
@@ -25,48 +30,39 @@ import { type FeatureRow, promptFeatureList } from "./feature-list.js";
  */
 
 const GITHUB_READ = "github.read";
-const GITHUB_WRITE = "github.write";
 
-/** GitHub read/write choice with the write-locks-read rule. */
-export interface GithubChoice {
-  /** The independent read choice, kept while write is on so it can be restored. */
-  read: boolean;
-  write: boolean;
-  /** Whether the user changed the read choice in this session. */
-  readEdited: boolean;
+/**
+ * How rows depend on each other, read from the plan's kinds and
+ * prerequisites. A setting row (bash compression, rewrites, background
+ * commands) requires the tool row it configures and does not apply while that
+ * tool is unchecked. A capability row that lists another capability as a
+ * prerequisite needs it checked: GitHub write needs GitHub read. A tool's
+ * prerequisites on indexes describe runtime dependencies only and never
+ * change the checklist.
+ */
+export function selectionRules(plan: SetupPlan): SelectionRules {
+  const byId = new Map(plan.features.map((feature) => [feature.id, feature]));
+  const requires = new Map<string, string>();
+  const implies = new Map<string, string>();
+  const labels = new Map<string, string>();
+  for (const feature of plan.features) {
+    for (const id of feature.prerequisites) {
+      const prerequisite = byId.get(id);
+      if (!prerequisite) continue;
+      if (feature.kind === "setting" && prerequisite.kind === "tool") {
+        requires.set(feature.id, id);
+        labels.set(id, prerequisite.label);
+      } else if (feature.kind === "capability" && prerequisite.kind === "capability") {
+        implies.set(feature.id, id);
+      }
+    }
+  }
+  return { requires, implies, labels };
 }
 
-export function initialGithubChoice(plan: SetupPlan): GithubChoice {
-  const read = plan.features.find((feature) => feature.id === GITHUB_READ);
-  const write = plan.features.find((feature) => feature.id === GITHUB_WRITE);
-  return {
-    // `configured` is the saved independent read choice; `proposed` may show
-    // it checked only because write implies it.
-    read: read?.configured ?? false,
-    write: write?.proposed ?? false,
-    readEdited: false,
-  };
-}
-
-/** How the read checkbox is shown: checked and locked while write is on. */
-export function githubReadDisplay(choice: GithubChoice): { checked: boolean; locked: boolean } {
-  return { checked: choice.write || choice.read, locked: choice.write };
-}
-
-/** Checking write locks read on; unchecking it restores the independent read choice. */
-export function setGithubWrite(choice: GithubChoice, write: boolean): GithubChoice {
-  return { ...choice, write };
-}
-
-/** Toggling read has no effect while write holds the lock. */
-export function setGithubRead(choice: GithubChoice, read: boolean): GithubChoice {
-  if (choice.write) return choice;
-  return { ...choice, read, readEdited: true };
-}
-
-/** Checkbox rows: everything except the GitHub pair, which has its own flow. */
+/** Checkbox rows: every row of the plan. */
 export function checkboxRows(plan: SetupPlan): PlanFeature[] {
-  return plan.features.filter((feature) => feature.kind !== "capability");
+  return plan.features;
 }
 
 /** Initial checkbox values: the plan's proposed value for each row. */
@@ -88,26 +84,18 @@ export function groupRows(plan: SetupPlan): Map<string, PlanFeature[]> {
 }
 
 /**
- * Answers for a completed wizard. Every checkbox row is sent as shown, so an
- * untouched save materializes the proposed values. GitHub read is omitted
- * while write is on unless the user edited it: write implies read when the
- * config is loaded, and saving the implied value would turn it into an
- * explicit choice.
+ * Answers for a completed wizard. Every row is sent as shown, so an untouched
+ * save writes the proposed values explicitly, including a setting whose tool
+ * is unchecked (its remembered value) and GitHub read next to GitHub write.
+ * A checked row whose prerequisite is unchecked gets the prerequisite too.
  */
-export function buildAnswers(
-  plan: SetupPlan,
-  selections: Record<string, boolean>,
-  github: GithubChoice,
-): SetupAnswers {
+export function buildAnswers(plan: SetupPlan, selections: Record<string, boolean>): SetupAnswers {
+  const picked = checkboxRows(plan)
+    .filter((feature) => selections[feature.id] ?? feature.proposed)
+    .map((feature) => feature.id);
+  const checked = new Set(normalizeSelection(picked, selectionRules(plan)));
   const answers: Record<string, boolean> = {};
-  for (const feature of checkboxRows(plan)) {
-    answers[feature.id] = selections[feature.id] ?? feature.proposed;
-  }
-  const ids = new Set(plan.features.map((feature) => feature.id));
-  if (ids.has(GITHUB_WRITE)) answers[GITHUB_WRITE] = github.write;
-  if (ids.has(GITHUB_READ) && (!github.write || github.readEdited)) {
-    answers[GITHUB_READ] = github.read;
-  }
+  for (const feature of checkboxRows(plan)) answers[feature.id] = checked.has(feature.id);
   return { plan_version: SETUP_PLAN_VERSION, selections: answers };
 }
 
@@ -138,20 +126,26 @@ export interface WizardIO {
     message: string,
     options: Record<string, FeatureRow[]>,
     initial: string[],
+    rules: SelectionRules,
   ): Promise<string[]>;
-  confirm(message: string, initial: boolean): Promise<boolean>;
   info(message: string): void;
   warn?(message: string): void;
   note(message: string, title: string): void;
 }
 
 const clackIO: WizardIO = {
-  selectRows: (message, options, initial) =>
-    promptFeatureList(message, options, initial, () => {
-      log.warn("Cancelled.");
-      process.exit(0);
-    }),
-  confirm: (message, initial) => confirm(message, initial),
+  selectRows: (message, options, initial, rules) =>
+    promptFeatureList(
+      message,
+      options,
+      initial,
+      () => {
+        log.warn("Cancelled.");
+        process.exit(0);
+      },
+      {},
+      rules,
+    ),
   info: (message) => log.info(message),
   warn: (message) => log.warn(message),
   note: (message, title) => note(message, title),
@@ -174,18 +168,6 @@ export function featureListGroups(plan: SetupPlan): Record<string, FeatureRow[]>
   }
   return groups;
 }
-
-/** GitHub read, described by what it lets the agent do rather than the URI schemes it serves. */
-const GITHUB_READ_PROMPT =
-  "Let the agent read GitHub issues and pull requests? (uses the GitHub CLI, gh, signed in to your account)";
-
-/**
- * GitHub write, asked in the same question form as read. It is asked only
- * after read is answered yes: write needs read, so offering it after a "no"
- * would either be pointless or silently turn read back on.
- */
-const GITHUB_WRITE_PROMPT =
-  "Also let the agent post comments on GitHub issues and pull requests? (uses the same gh account)";
 
 export type GhStatus = "ready" | "missing" | "signed_out";
 
@@ -216,34 +198,31 @@ export async function runFeatureWizard(
   const explanations = explanationLines(plan);
   if (explanations.length > 0) io.note(explanations.join("\n"), "About these features");
 
+  const rules = selectionRules(plan);
   const initial = Object.entries(initialSelections(plan))
     .filter(([, on]) => on)
     .map(([id]) => id);
   const picked = new Set(
-    await io.selectRows("Choose the AFT features to enable", featureListGroups(plan), initial),
+    normalizeSelection(
+      await io.selectRows(
+        "Choose the AFT features to enable",
+        featureListGroups(plan),
+        normalizeSelection(initial, rules),
+        rules,
+      ),
+      rules,
+    ),
   );
   const selections: Record<string, boolean> = {};
   for (const feature of checkboxRows(plan)) selections[feature.id] = picked.has(feature.id);
 
-  // Read is asked first: it is the base capability, and write builds on it.
-  // Declining read therefore also turns write off, since write implies read.
-  let github = initialGithubChoice(plan);
-  const write = plan.features.find((feature) => feature.id === GITHUB_WRITE);
-  const read = plan.features.find((feature) => feature.id === GITHUB_READ);
-  let wantRead = githubReadDisplay(github).checked;
-  if (read) wantRead = await io.confirm(GITHUB_READ_PROMPT, wantRead);
-  if (!wantRead) {
-    github = setGithubRead(setGithubWrite(github, false), false);
-  } else {
-    if (write) {
-      github = setGithubWrite(github, await io.confirm(GITHUB_WRITE_PROMPT, github.write));
-    }
-    // With write off, read stands on its own and must be saved as chosen.
-    if (!github.write) github = setGithubRead(github, true);
+  // GitHub read (and write, which needs it) runs through the GitHub CLI; say
+  // so now rather than at the agent's first failed read.
+  if (picked.has(GITHUB_READ)) {
     const warning = ghWarning(checkGh());
     if (warning) (io.warn ?? io.info)(warning);
   }
-  return buildAnswers(plan, selections, github);
+  return buildAnswers(plan, selections);
 }
 
 export interface FeatureSetupDeps {
