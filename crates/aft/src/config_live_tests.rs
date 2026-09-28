@@ -460,3 +460,177 @@ fn root_without_a_project_watcher_watches_its_config_files_itself() {
     assert_eq!(applied(&outcome), vec!["bash.enabled"]);
     assert!(!fixture.ctx.config().bash.enabled);
 }
+
+#[test]
+fn project_watcher_signals_a_config_edit_under_a_target_ancestor() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let temp = tempfile::tempdir().expect("temp dir");
+    // A root whose own path passes through `target`, which the corpus filters
+    // treat as build output.
+    let root = std::fs::canonicalize(temp.path())
+        .expect("canonical temp")
+        .join("target")
+        .join("repo");
+    let config_file = project_config_path(&root);
+    write(&config_file, "{}");
+    let signal = Arc::new(ConfigReloadSignal::default());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (dispatch_tx, _dispatch_rx) = crossbeam_channel::bounded(8);
+    let (raw_sender_tx, raw_sender_rx) = crossbeam_channel::bounded(1);
+    let filter_config = crate::watcher_filter::WatcherFilterConfig::new(root.clone(), None)
+        .with_config_reload_signal(Arc::clone(&signal));
+    let filter_shutdown = Arc::clone(&shutdown);
+    let filter = std::thread::spawn(move || {
+        crate::watcher_filter::run_watcher_thread(
+            filter_config,
+            Vec::new(),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            filter_shutdown,
+            move |_root, _extra, raw_tx| {
+                raw_sender_tx.send(raw_tx).unwrap();
+                Ok::<(), std::io::Error>(())
+            },
+        );
+    });
+    let raw_tx: std::sync::mpsc::Sender<notify::Result<notify::Event>> =
+        raw_sender_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    raw_tx
+        .send(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Any,
+        ))
+        .add_path(config_file)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !signal.is_pending() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(raw_tx);
+    filter.join().unwrap();
+    assert!(signal.is_pending(), "the config edit never raised a reload");
+}
+
+#[test]
+fn invalid_active_harness_block_keeps_the_last_good_config() {
+    let fixture = Fixture::new(
+        r#"{ "restrict_to_project_root": false, "harnesses": { "opencode": { "restrict_to_project_root": true } } }"#,
+        None,
+    );
+    assert!(fixture.ctx.config().restrict_to_project_root);
+
+    write(
+        &fixture.user_path,
+        r#"{ "restrict_to_project_root": false, "format_on_edit": true, "harnesses": { "opencode": { "restrict_to_project_root": true, "format_on_edit": "yes" } } }"#,
+    );
+    let outcome = fixture.reload();
+
+    assert!(
+        matches!(outcome, ReloadOutcome::Kept { .. }),
+        "expected the last good config to stay, got {outcome:?}"
+    );
+    assert!(fixture.ctx.config().restrict_to_project_root);
+
+    // A block for another harness is not applied here and is not checked.
+    write(
+        &fixture.user_path,
+        r#"{ "restrict_to_project_root": false, "format_on_edit": true, "harnesses": { "opencode": { "restrict_to_project_root": true }, "pi": { "format_on_edit": "yes" } } }"#,
+    );
+    assert_eq!(applied(&fixture.reload()), vec!["format_on_edit"]);
+    assert!(fixture.ctx.config().restrict_to_project_root);
+}
+
+fn held(outcome: &ReloadOutcome) -> Vec<&'static str> {
+    match outcome {
+        ReloadOutcome::Reloaded { held, .. } => held.clone(),
+        other => panic!("expected a reload, got {other:?}"),
+    }
+}
+
+#[test]
+fn project_edit_cannot_remove_project_hardening_until_the_next_connect() {
+    let fixture = Fixture::new(
+        r#"{ "sandbox": { "enabled": true } }"#,
+        Some(r#"{ "sandbox": { "read_deny": ["/secrets"] } }"#),
+    );
+    let secrets = PathBuf::from("/secrets");
+    assert!(fixture.ctx.config().sandbox.read_deny.contains(&secrets));
+
+    write(&fixture.project_path, r#"{ "format_on_edit": true }"#);
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["format_on_edit"]);
+    assert_eq!(held(&outcome), vec!["sandbox.read_deny"]);
+    assert!(fixture.ctx.config().sandbox.read_deny.contains(&secrets));
+
+    // A later user-file edit keeps holding it.
+    write(
+        &fixture.user_path,
+        r#"{ "sandbox": { "enabled": true }, "validate_on_edit": "syntax" }"#,
+    );
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["validate_on_edit"]);
+    assert!(fixture.ctx.config().sandbox.read_deny.contains(&secrets));
+
+    // A connect resolves the files afresh and applies the loosening.
+    fixture.configure();
+    assert!(!fixture.ctx.config().sandbox.read_deny.contains(&secrets));
+}
+
+#[test]
+fn project_edit_cannot_turn_off_a_sandbox_the_project_turned_on() {
+    let fixture = Fixture::new("{}", Some(r#"{ "sandbox": { "enabled": true } }"#));
+    assert!(fixture.ctx.config().sandbox.enabled);
+
+    write(&fixture.project_path, "{}");
+    let outcome = fixture.reload();
+
+    assert_eq!(held(&outcome), vec!["sandbox.enabled"]);
+    assert!(fixture.ctx.config().sandbox.enabled);
+}
+
+#[test]
+fn a_user_edit_can_still_loosen_what_the_user_set() {
+    let fixture = Fixture::new(r#"{ "sandbox": { "enabled": true } }"#, Some("{}"));
+    write(&fixture.user_path, r#"{ "sandbox": { "enabled": false } }"#);
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["sandbox.enabled"]);
+    assert!(held(&outcome).is_empty());
+    assert!(!fixture.ctx.config().sandbox.enabled);
+}
+
+#[test]
+fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(temp.path().join("storage")),
+            ..Config::default()
+        },
+    );
+    let relayed = r#"{ "sandbox": { "enabled": true } }"#;
+    let req: RawRequest = serde_json::from_value(json!({
+        "id": "configure-wire",
+        "command": "configure",
+        "project_root": root,
+        "harness": "opencode",
+        "config": [{ "tier": "project", "source": "wire", "doc": relayed }],
+    }))
+    .unwrap();
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    assert!(crate::commands::configure::handle_configure(&req, &ctx).success);
+    let project_path = project_config_path(&root);
+    write(&project_path, relayed);
+    ctx.config_live().signal().request_now();
+    assert_eq!(drain_config_reload(&ctx), Some(ReloadOutcome::Unchanged));
+
+    std::fs::remove_file(&project_path).unwrap();
+    ctx.config_live().signal().request_now();
+    match drain_config_reload(&ctx) {
+        Some(ReloadOutcome::Kept { reason }) => assert!(reason.contains("was deleted"), "{reason}"),
+        other => panic!("expected the deletion to be refused, got {other:?}"),
+    }
+}

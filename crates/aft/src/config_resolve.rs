@@ -885,14 +885,15 @@ fn parse_tier(
 /// Return why a tier would be accepted only by the lenient resolver, or
 /// `None` when it passes strict validation.
 ///
-/// [`resolve_config_for_harness`] skips a tier whose text does not parse and
-/// resolves a tier with one bad value by dropping that key to its default. A
-/// connect keeps that behaviour. A live reload must not: a typo would reset a
-/// key to its default while the root stays bound, so the reload calls this
-/// first and keeps the last valid configuration instead. Retired keys are left
-/// to the resolver, which rejects them with its own errors. The contents of
-/// `harnesses.<id>` blocks are checked by the resolver as it applies them.
-pub fn strict_tier_error(tier: &ConfigTier) -> Option<String> {
+/// [`resolve_config_for_harness`] skips a tier whose text does not parse,
+/// resolves a tier with one bad value by dropping that key to its default,
+/// and ignores an invalid block for the active harness with only a warning.
+/// A connect keeps that behaviour. A live reload must not: a typo would reset
+/// a key (possibly a security key the harness block set) to its default while
+/// the root stays bound, so the reload calls this first and keeps the last
+/// valid configuration instead. Retired keys are left to the resolver, which
+/// rejects them with its own errors.
+pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option<String> {
     let stripped = strip_jsonc(&tier.doc);
     let value = match serde_json::from_str::<Value>(&stripped) {
         Ok(value) => value,
@@ -914,9 +915,34 @@ pub fn strict_tier_error(tier: &ConfigTier) -> Option<String> {
     if !translation.errors.is_empty() {
         return None;
     }
-    serde_json::from_value::<RawAftConfig>(Value::Object(map))
+    let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Some(format!("{} has an invalid setting: {error}", tier.source));
+        }
+    };
+    // The block for the active harness is applied on top of this tier, so it
+    // must be as valid as the tier itself. Blocks for other harnesses are
+    // never applied here and stay unchecked, as at connect.
+    let label = harness?.wire_label();
+    let block = raw.harnesses.as_ref()?.get(&label)?;
+    let Value::Object(block) = block else {
+        return Some(format!(
+            "{} has an invalid harnesses.{label} block: it must be an object",
+            tier.source
+        ));
+    };
+    let mut block = block.clone();
+    // A nested `harnesses` key is ignored with a warning at connect as well.
+    block.remove("harnesses");
+    serde_json::from_value::<RawAftConfig>(Value::Object(block))
         .err()
-        .map(|error| format!("{} has an invalid setting: {error}", tier.source))
+        .map(|error| {
+            format!(
+                "{} has an invalid setting in harnesses.{label}: {error}",
+                tier.source
+            )
+        })
 }
 
 fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {

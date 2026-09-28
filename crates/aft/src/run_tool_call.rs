@@ -458,6 +458,9 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
+    // The preflight below and the dispatched command share one config
+    // snapshot, even if a live config reload publishes in between.
+    let _config_pin = app_ctx.pin_config();
     let semantic_key = crate::response_finalize::repeat_breaker::semantic_key(bare_name, &args);
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;

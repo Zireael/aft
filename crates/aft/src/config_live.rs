@@ -168,7 +168,22 @@ pub fn project_config_path(project_root: &Path) -> PathBuf {
 /// sibling of it. `path` and `root` must be spelled the same way (both
 /// canonical in the project watcher).
 pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
-    path.parent() == Some(root.join(".cortexkit").as_path()) && is_config_file_name(path)
+    if !is_config_file_name(path) {
+        return false;
+    }
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if dir.file_name() != Some(std::ffi::OsStr::new(".cortexkit")) {
+        return false;
+    }
+    let Some(dir_root) = dir.parent() else {
+        return false;
+    };
+    // Raw watcher events may spell the root differently from the configured
+    // canonical root (macOS reports `/private/var` for `/var`); resolve only
+    // the root directory, never the config file name itself.
+    dir_root == root || std::fs::canonicalize(dir_root).is_ok_and(|resolved| resolved == root)
 }
 
 fn is_config_file_name(path: &Path) -> bool {
@@ -332,6 +347,9 @@ pub enum ReloadOutcome {
         applied: Vec<&'static str>,
         deferred: Vec<&'static str>,
         dropped: Vec<String>,
+        /// Security keys a project edit would have loosened; they keep their
+        /// published value until the next connect.
+        held: Vec<&'static str>,
     },
 }
 
@@ -416,13 +434,27 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         }
     };
     if user.text == sources.user.text && project.text == sources.project.text {
+        // The texts match, but a tier relayed on the wire may now come from
+        // its file; record that so a later deletion of the file is noticed.
+        if let Some(record) = state.sources.lock().as_mut() {
+            record.user.from_file = user.from_file;
+            record.project.from_file = project.from_file;
+        }
         state.last_error.lock().take();
         return ReloadOutcome::Unchanged;
     }
+    let project_changed = project.text != sources.project.text;
+    // What the edit would resolve to if only the user file had changed. A
+    // project edit may tighten security keys relative to it, never loosen.
+    let user_only_tiers: Vec<ConfigTier> = [&user, &sources.project]
+        .into_iter()
+        .filter_map(tier_for)
+        .collect();
 
     let tiers: Vec<ConfigTier> = [&user, &project].into_iter().filter_map(tier_for).collect();
+    let harness = ctx.config_unpinned().harness.clone();
     for tier in &tiers {
-        if let Some(reason) = crate::config_resolve::strict_tier_error(tier) {
+        if let Some(reason) = crate::config_resolve::strict_tier_error(tier, harness.as_ref()) {
             return keep_last_good(ctx, &root_label, reason);
         }
     }
@@ -430,7 +462,7 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
     // A configure that publishes between the read and the swap wins; the
     // resolve is then repeated once against its snapshot.
     let mut attempts = 0;
-    let (applied, deferred, dropped) = loop {
+    let (applied, deferred, dropped, held) = loop {
         attempts += 1;
         let published = ctx.config_unpinned();
         let mut candidate = published.as_ref().clone();
@@ -451,13 +483,32 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             .iter()
             .map(|drop| format!("{} ({})", drop.key, drop.reason))
             .collect();
+        let held = if project_changed {
+            let mut user_only = published.as_ref().clone();
+            let user_only_diagnostics =
+                crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
+                    &user_only_tiers,
+                    published.harness.as_ref(),
+                    &mut user_only,
+                );
+            // The previous project text was accepted when it was applied; if
+            // it no longer resolves, the published config is the floor.
+            let floor = if user_only_diagnostics.errors.is_empty() {
+                &user_only
+            } else {
+                published.as_ref()
+            };
+            hold_project_loosening(&mut candidate, floor)
+        } else {
+            Vec::new()
+        };
         let live = apply_live_config(&published, &candidate, &sources.connected);
         if live.applied.is_empty() {
-            break (live.applied, live.deferred, dropped);
+            break (live.applied, live.deferred, dropped, held);
         }
         if ctx.publish_config_if_current(&published, live.next.clone()) {
             push_live_setters(ctx, &published, &live.next);
-            break (live.applied, live.deferred, dropped);
+            break (live.applied, live.deferred, dropped, held);
         }
         if attempts >= 2 {
             // Two configures in a row published meanwhile; each of them read
@@ -470,16 +521,64 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         let mut record = state.sources.lock();
         if let Some(record) = record.as_mut() {
             record.user = user;
-            record.project = project;
+            // While a project loosening is held, keep the project text the
+            // held values came from as the reference, so later reloads keep
+            // holding it until a connect resolves the files afresh.
+            if held.is_empty() {
+                record.project = project;
+            }
         }
     }
     state.last_error.lock().take();
-    log_reload(&root_label, &applied, &deferred, &dropped);
+    log_reload(&root_label, &applied, &deferred, &dropped, &held);
     ReloadOutcome::Reloaded {
         applied,
         deferred,
         dropped,
+        held,
     }
+}
+
+/// Keep every security key of `candidate` at least as strict as in `floor`,
+/// and name the keys that were held back.
+///
+/// `floor` is what the files would resolve to with the project file as it was
+/// before this edit, so a project edit can add hardening but not remove it.
+/// The next connect resolves the files afresh and applies a held loosening.
+fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'static str> {
+    let mut held = Vec::new();
+    if floor.restrict_to_project_root && !candidate.restrict_to_project_root {
+        candidate.restrict_to_project_root = true;
+        held.push("restrict_to_project_root");
+    }
+    if !floor.url_fetch_allow_private && candidate.url_fetch_allow_private {
+        candidate.url_fetch_allow_private = false;
+        held.push("url_fetch_allow_private");
+    }
+    if floor.sandbox.enabled && !candidate.sandbox.enabled {
+        candidate.sandbox.enabled = true;
+        held.push("sandbox.enabled");
+    }
+    let missing_denies: Vec<PathBuf> = floor
+        .sandbox
+        .read_deny
+        .iter()
+        .filter(|path| !candidate.sandbox.read_deny.contains(path))
+        .cloned()
+        .collect();
+    if !missing_denies.is_empty() {
+        candidate.sandbox.read_deny.extend(missing_denies);
+        held.push("sandbox.read_deny");
+    }
+    let before = candidate.sandbox.write_allow.len();
+    candidate
+        .sandbox
+        .write_allow
+        .retain(|path| floor.sandbox.write_allow.contains(path));
+    if candidate.sandbox.write_allow.len() != before {
+        held.push("sandbox.write_allow");
+    }
+    held
 }
 
 fn keep_last_good(ctx: &AppContext, root_label: &str, reason: String) -> ReloadOutcome {
@@ -495,9 +594,15 @@ fn keep_last_good(ctx: &AppContext, root_label: &str, reason: String) -> ReloadO
     ReloadOutcome::Kept { reason }
 }
 
-fn log_reload(root: &str, applied: &[&str], deferred: &[&str], dropped: &[String]) {
-    let line = reload_log_line(root, applied, deferred, dropped);
-    if applied.is_empty() && deferred.is_empty() {
+fn log_reload(root: &str, applied: &[&str], deferred: &[&str], dropped: &[String], held: &[&str]) {
+    let mut line = reload_log_line(root, applied, deferred, dropped);
+    if !held.is_empty() {
+        line.push_str(&format!(
+            " held=[{}] (a project edit cannot loosen these until the next connect)",
+            held.join(",")
+        ));
+    }
+    if applied.is_empty() && deferred.is_empty() && held.is_empty() {
         crate::slog_debug!("{}", line);
     } else {
         crate::slog_info!("{}", line);

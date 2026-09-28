@@ -7,6 +7,7 @@
 
 import {
   aftLiveConfigKeys,
+  aftLiveSecurityKeys,
   formatConfigParseErrorMessage,
   type LiveConfigLoad,
   type LiveConfigReload,
@@ -17,6 +18,8 @@ import {
 import {
   type AftConfig,
   getConfigLoadErrors,
+  getConfigLoadSources,
+  getConfigLoadTexts,
   getConfigValidationErrors,
   loadAftConfig,
   resolveBashConfig,
@@ -35,6 +38,11 @@ export const OPENCODE_LIVE_CONFIG_KEYS = aftLiveConfigKeys<AftConfig>(
  * the reload then keeps the last valid config. (Loading at host startup keeps
  * the valid part of such a file instead.)
  */
+function projectTextOf(directory: string): string | null {
+  const { projectConfigPath } = resolveCortexKitConfigPaths(directory);
+  return getConfigLoadTexts().get(projectConfigPath) ?? null;
+}
+
 export function loadOpenCodeConfigForLiveReload(directory: string): LiveConfigLoad<AftConfig> {
   try {
     const config = loadAftConfig(directory);
@@ -49,7 +57,12 @@ export function loadOpenCodeConfigForLiveReload(directory: string): LiveConfigLo
         message: `AFT config at ${invalid.path} has an invalid setting: ${invalid.message}`,
       };
     }
-    return { ok: true, config };
+    return {
+      ok: true,
+      config,
+      sources: [...getConfigLoadSources()],
+      projectText: projectTextOf(directory),
+    };
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) };
   }
@@ -58,6 +71,10 @@ export function loadOpenCodeConfigForLiveReload(directory: string): LiveConfigLo
 export interface OpenCodeLiveConfigReloadOptions {
   /** The directory whose project config applies. */
   directory: string;
+  /** The config files the startup load read (the bootstrap result's `sources`). */
+  initialSources: readonly string[];
+  /** Their texts (the bootstrap result's `sourceTexts`). */
+  initialSourceTexts?: Readonly<Record<string, string>>;
   getConfig(): AftConfig;
   setConfig(config: AftConfig): void;
   /** Show a config error to the user. */
@@ -74,6 +91,9 @@ export function startOpenCodeLiveConfigReload(
   return startLiveConfigReload<AftConfig>({
     paths: [userConfigPath, projectConfigPath],
     load: () => loadOpenCodeConfigForLiveReload(options.directory),
+    initialSources: options.initialSources,
+    initialProjectText: options.initialSourceTexts?.[projectConfigPath] ?? null,
+    securityKeys: aftLiveSecurityKeys(OPENCODE_LIVE_CONFIG_KEYS),
     keys: OPENCODE_LIVE_CONFIG_KEYS,
     getConfig: options.getConfig,
     setConfig: options.setConfig,

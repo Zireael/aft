@@ -1527,6 +1527,11 @@ impl WatcherFilterThread {
                         }
                         continue;
                     }
+                    // Config file edits are recognised on the raw event, before
+                    // the corpus filters below: those drop paths under any
+                    // `target`/`node_modules`/... component (which may be an
+                    // ancestor of the root) and resolve symlinked file names.
+                    self.config.note_config_file_events(&event.paths);
                     self.record_recent_paths(&event.paths);
                     if watcher_event_invalidates(&event.kind) {
                         self.config.counters.note_invalidating_event();
@@ -1786,7 +1791,6 @@ impl WatcherFilterThread {
 
         let raw_paths = std::mem::take(&mut self.raw_paths);
         self.flush_deadline = None;
-        self.config.note_config_file_events(&raw_paths);
         let initial = filter_canonical_paths(&self.config, &self.matcher, raw_paths.clone());
         let filtered = if initial.ignore_file_changed {
             let observed_generation = self.matcher_generation.load(Ordering::SeqCst);

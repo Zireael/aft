@@ -458,6 +458,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // and descriptions stay as loaded and follow the next restart.
   const liveConfigReload = startOpenCodeLiveConfigReload({
     directory: registrationRoot,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
     getConfig: () => ctx.config,
     setConfig: (config) => {
       ctx.config = config;

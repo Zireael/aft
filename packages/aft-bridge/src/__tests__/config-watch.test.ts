@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -86,14 +86,19 @@ describe("applyLiveConfigKeys", () => {
 });
 
 describe("startLiveConfigReload", () => {
-  function harness(initial: TestConfig, paths: string[] = []) {
+  function harness(initial: TestConfig, initialSources: string[] = []) {
     let config = initial;
-    let nextLoad: LiveConfigLoad<TestConfig> = { ok: true, config: initial };
+    let nextLoad: LiveConfigLoad<TestConfig> = {
+      ok: true,
+      config: initial,
+      sources: initialSources,
+    };
     const errors: string[] = [];
     const logs: string[] = [];
     const reload = startLiveConfigReload<TestConfig>({
-      paths,
+      paths: [],
       load: () => nextLoad,
+      initialSources,
       keys: KEYS,
       getConfig: () => config,
       setConfig: (next) => {
@@ -125,26 +130,33 @@ describe("startLiveConfigReload", () => {
     expect(h.errors).toEqual([`AFT config at /x failed to parse: bad. ${CONFIG_LIVE_KEEP_NOTE}`]);
   });
 
-  test("a deleted config file keeps the last valid config", () => {
-    const dir = tempDir();
-    const file = join(dir, "aft.jsonc");
-    writeFileSync(file, "{}");
-    const h = harness({ restrict_to_project_root: true }, [file]);
-    unlinkSync(file);
-    // The loader would resolve a missing file as empty; the reload must not
-    // get that far.
-    h.loads({ ok: true, config: { restrict_to_project_root: false } });
+  test("a load that no longer read a file it relied on keeps the last valid config", () => {
+    // The file vanished before the loader looked, so the loader resolved it as
+    // absent without any error; only its record of what it read tells.
+    const h = harness({ restrict_to_project_root: true }, ["/cfg/user/aft.jsonc"]);
+    h.loads({ ok: true, config: { restrict_to_project_root: false }, sources: [] });
 
     h.reload.reload();
 
     expect(h.config().restrict_to_project_root).toBe(true);
-    expect(h.errors[0]).toContain("was deleted");
+    expect(h.errors[0]).toContain("/cfg/user/aft.jsonc was deleted");
+  });
+
+  test("a file absent at startup may appear later", () => {
+    const h = harness({ restrict_to_project_root: false }, []);
+    h.loads({
+      ok: true,
+      config: { restrict_to_project_root: true },
+      sources: ["/cfg/user/aft.jsonc"],
+    });
+    h.reload.reload();
+    expect(h.config().restrict_to_project_root).toBe(true);
   });
 
   test("a valid edit swaps in a new config object", () => {
     const initial: TestConfig = { restrict_to_project_root: false };
     const h = harness(initial);
-    h.loads({ ok: true, config: { restrict_to_project_root: true } });
+    h.loads({ ok: true, config: { restrict_to_project_root: true }, sources: [] });
 
     h.reload.reload();
 
@@ -183,6 +195,96 @@ describe("watchAftConfigFiles", () => {
       await waitFor(seen + 1);
     } finally {
       stop();
+    }
+  });
+});
+
+async function waitUntil(
+  predicate: () => boolean,
+  label: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out: ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+describe("watchAftConfigFiles recovery", () => {
+  test("a replaced config directory is watched again", async () => {
+    const dir = tempDir();
+    const configDir = join(dir, ".cortexkit");
+    const file = join(configDir, "aft.jsonc");
+    mkdirSync(configDir);
+    writeFileSync(file, "{}");
+    let changes = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      rmSync(configDir, { recursive: true, force: true });
+      await waitUntil(() => changes >= 1, "deletion noticed");
+      mkdirSync(configDir);
+      writeFileSync(file, '{ "restrict_to_project_root": true }');
+      await waitUntil(() => changes >= 2, "recreated file noticed");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const seen = changes;
+      writeFileSync(file, '{ "restrict_to_project_root": false }');
+      await waitUntil(() => changes > seen, "edit in the recreated directory noticed");
+    } finally {
+      stop();
+    }
+  });
+
+  test("steady unrelated activity in the directory does not starve a config edit", async () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    writeFileSync(file, "{}");
+    let changes = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 150,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    let n = 0;
+    const noise = setInterval(() => writeFileSync(join(dir, "status"), String(n++)), 40);
+    try {
+      writeFileSync(file, '{ "restrict_to_project_root": true }');
+      await waitUntil(() => changes >= 1, "config edit applied under noise", 3_000);
+    } finally {
+      clearInterval(noise);
+      stop();
+    }
+  });
+});
+
+describe("startLiveConfigReload start-up", () => {
+  test("an edit made before the watch started is applied at once", () => {
+    let config: TestConfig = { restrict_to_project_root: false };
+    const reload = startLiveConfigReload<TestConfig>({
+      paths: [join(tempDir(), "aft.jsonc")],
+      // The host loaded its config before this edit; the file now says true.
+      load: () => ({ ok: true, config: { restrict_to_project_root: true }, sources: [] }),
+      initialSources: [],
+      keys: KEYS,
+      getConfig: () => config,
+      setConfig: (next) => {
+        config = next;
+      },
+      log: () => {},
+      reportError: () => {},
+    });
+    try {
+      expect(config.restrict_to_project_root).toBe(true);
+    } finally {
+      reload.stop();
     }
   });
 });

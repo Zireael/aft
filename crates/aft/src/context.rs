@@ -4993,13 +4993,24 @@ impl AppContext {
     /// reload switches over between requests and never in the middle of one.
     /// A nested pin for the same context keeps the outer snapshot.
     pub fn pin_config(&self) -> ConfigPinGuard {
+        self.pin_config_to(self.config())
+    }
+
+    /// Pin `snapshot` for the rest of the calling scope on this thread.
+    ///
+    /// Work a request hands to another thread (deferred LSP navigation,
+    /// inspect, offloaded validation) captures `ctx.config()` while the
+    /// request is being admitted and installs it here on the worker, so the
+    /// worker keeps the request's admitted snapshot even if a live config
+    /// reload publishes before the worker starts.
+    pub fn pin_config_to(&self, snapshot: Arc<Config>) -> ConfigPinGuard {
         let key = self.config_pin_key();
         let pushed = CONFIG_PINS.with(|pins| {
             let mut pins = pins.borrow_mut();
             if pins.iter().any(|(pinned_key, _)| *pinned_key == key) {
                 return false;
             }
-            pins.push((key, self.config_unpinned()));
+            pins.push((key, snapshot));
             true
         });
         ConfigPinGuard {

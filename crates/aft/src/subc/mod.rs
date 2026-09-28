@@ -6924,6 +6924,9 @@ async fn handle_tool_call(
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
+            // Admission for this deferred tool call: pin the config so the
+            // preflight and the deferred worker share one snapshot.
+            let _config_pin = ctx.pin_config();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || match prepare_tool_call(
                     &bare_name_for_run,
@@ -7393,8 +7396,15 @@ fn submit_maintenance_job(
                 }
             }
             MaintenanceDrainKind::ConfigReload => {
-                let reloaded =
-                    crate::config_live::drain_config_reload(ctx).is_some_and(|outcome| {
+                // Only a root still bound at the generation this job was
+                // queued for reloads; an unbinding root keeps the request
+                // pending and picks the edit up at its next bind anyway.
+                let reloaded = ctx
+                    .run_if_subc_bound_generation(maintenance_generation, || {
+                        crate::config_live::drain_config_reload(ctx)
+                    })
+                    .flatten()
+                    .is_some_and(|outcome| {
                         matches!(outcome, crate::config_live::ReloadOutcome::Reloaded { .. })
                     });
                 MaintenanceJobOutcome {
@@ -7865,6 +7875,51 @@ pub(crate) mod test_support {
             started.elapsed() < Duration::from_secs(8),
             "deferred inspect missed its terminal reserve: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn deferred_navigation_worker_keeps_the_admitted_config() {
+        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("deferred-navigation-admitted-config");
+        let (ctx, source) = cold_navigation_context(dir.path());
+        assert!(!ctx.config().restrict_to_project_root);
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started_rx, release_tx) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let _ = crate::commands::lsp_navigation::take_deferred_navigation_seen_restrict_for_test();
+        let (mut pending, cancellation) = submit_deferred_navigation_setup(
+            &executor,
+            &root,
+            &ctx,
+            &source,
+            "subc-navigation-admitted-config",
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached navigation reaches its gate");
+
+        // A live config reload publishes after admission, before the worker
+        // reads its config.
+        ctx.update_config(|config| config.restrict_to_project_root = true);
+        release_tx.send(()).expect("release navigation");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let seen = loop {
+            if let Some(seen) =
+                crate::commands::lsp_navigation::take_deferred_navigation_seen_restrict_for_test()
+            {
+                break seen;
+            }
+            assert!(Instant::now() < deadline, "worker never read its config");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        cancellation.request_cancel();
+        let _ = wait_for_navigation_terminal(&mut pending, &ctx);
+
+        assert!(
+            !seen,
+            "the worker must finish on the config its request was admitted with"
         );
     }
 

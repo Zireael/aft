@@ -1310,8 +1310,10 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let worker_session_id = req.session_id.clone();
     let disconnected_request_id = request_id.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    let admitted_config = ctx.config();
     thread::spawn(move || {
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let response = log_ctx::with_session(worker_session_id, || dispatch(req, &ctx));
         let _ = tx.send(response);
     });
@@ -1367,6 +1369,10 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 }
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    // The request is admitted here: pin the published config so every handler
+    // below, and every worker thread a deferred handler starts, uses this
+    // snapshot even if a live config reload publishes while it runs.
+    let _config_pin = ctx.pin_config();
     aft::commands::tool_call::register_dispatch(dispatch);
     if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
         return handle_dispatch_deferred(req, Arc::clone(ctx));
@@ -1488,7 +1494,9 @@ fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> 
     let worker_session_id = req.session_id.clone();
     let (tx, rx) = mpsc::channel::<OffloadedEditEvent>();
     let started_tx = tx.clone();
+    let admitted_config = ctx.config();
     thread::spawn(move || {
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let result = catch_unwind(AssertUnwindSafe(|| {
             aft::edit::with_full_validation_start_hook(
                 Box::new(move || {

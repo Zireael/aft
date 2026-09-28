@@ -1369,6 +1369,23 @@ export type ConfigLoadError = { path: string; message: string };
 
 let configLoadErrors: ConfigLoadError[] = [];
 let configValidationErrors: ConfigLoadError[] = [];
+let configLoadSources: string[] = [];
+let configLoadTexts = new Map<string, string>();
+
+/**
+ * The config files the last load actually read, in load order. A file that
+ * did not exist when the loader looked is not listed. A live config reload
+ * compares this with the previous accepted load to tell that a file it relied
+ * on has disappeared, rather than probing the filesystem separately.
+ */
+export function getConfigLoadSources(): readonly string[] {
+  return configLoadSources;
+}
+
+/** The text of each file the last load read, keyed by path. */
+export function getConfigLoadTexts(): ReadonlyMap<string, string> {
+  return configLoadTexts;
+}
 
 /**
  * Settings the last load dropped because their value did not validate. A
@@ -1463,6 +1480,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   try {
     if (!existsSync(configPath)) return null;
     const content = readFileSync(configPath, "utf-8");
+    configLoadSources.push(configPath);
+    configLoadTexts.set(configPath, content);
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
       recordConfigParseFailure(configPath, "root must be an object");
@@ -2000,6 +2019,8 @@ export function buildConfigTierConfigureParams(
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
   configValidationErrors = [];
+  configLoadSources = [];
+  configLoadTexts = new Map();
   configLoadNotices = [];
   semanticInputSupplied = false;
 

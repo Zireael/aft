@@ -13,7 +13,12 @@ import { join, resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
-import { loadAftConfig, resolveBashConfig } from "../config.js";
+import {
+  getConfigLoadSources,
+  getConfigLoadTexts,
+  loadAftConfig,
+  resolveBashConfig,
+} from "../config.js";
 import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import type { PluginContext } from "../types.js";
@@ -52,6 +57,8 @@ async function fixture(user: string, project?: string) {
   const notices: string[] = [];
   const reload = startOpenCodeLiveConfigReload({
     directory: projectDir,
+    initialSources: [...getConfigLoadSources()],
+    initialSourceTexts: Object.fromEntries(getConfigLoadTexts()),
     getConfig: () => ctx.config,
     setConfig: (next) => {
       ctx.config = next;
@@ -137,6 +144,28 @@ describe.serial("OpenCode live config reload", () => {
     f.reload.reload();
     expect(f.ctx.config.restrict_to_project_root).toBe(true);
     expect(f.notices[0]).toContain("was deleted");
+  });
+
+  test("a project edit cannot turn host fallback on until the next restart", async () => {
+    const f = await fixture("{}", '{ "bash": { "host_fallback": false } }');
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
+    writeFileSync(f.projectPath, '{ "bash": { "host_fallback": true } }');
+    const result = f.reload.reload();
+    expect(result?.held).toEqual(["bash.host_fallback"]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
+
+    // A later user-file edit keeps holding it.
+    writeFileSync(f.userPath, '{ "bash": { "watch_sync_max_ms": 5000 } }');
+    f.reload.reload();
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
+  });
+
+  test("a project edit can tighten host fallback", async () => {
+    const f = await fixture("{}", '{ "bash": { "host_fallback": true } }');
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(true);
+    writeFileSync(f.projectPath, '{ "bash": { "host_fallback": false } }');
+    expect(f.reload.reload()?.applied).toEqual(["bash.host_fallback"]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
   });
 
   test("the project tier still cannot loosen a user-only key", async () => {

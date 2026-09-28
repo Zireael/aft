@@ -12,8 +12,8 @@
  * and apply at the next host restart; they are reported as deferred.
  */
 
-import { existsSync, type FSWatcher, readFileSync, watch } from "node:fs";
-import { dirname } from "node:path";
+import { type FSWatcher, readFileSync, statSync, watch } from "node:fs";
+import { basename, dirname } from "node:path";
 
 /** How long a burst of file events must be quiet before the files are read. */
 export const CONFIG_WATCH_DEBOUNCE_MS = 150;
@@ -142,6 +142,8 @@ export interface LiveConfigApply<C> {
   config: C;
   applied: string[];
   deferred: string[];
+  /** Security keys a project edit would have loosened; they stay as they were. */
+  held?: string[];
 }
 
 /**
@@ -198,11 +200,52 @@ function readTextOrNull(path: string): string | null {
   }
 }
 
+/** How often the watches are checked against the directories on disk. */
+const CONFIG_WATCH_REVALIDATE_MS = 2_000;
+/** Longest a stream of events may postpone a check. */
+const CONFIG_WATCH_MAX_DELAY_MS = 1_000;
+
+function inodeOf(dir: string): number | null {
+  try {
+    return statSync(dir).ino;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The directory to watch for `file` and the entry name in it that matters:
+ * the file's own directory and the file name, or, while that directory does
+ * not exist, the nearest existing ancestor and the name of the child on the
+ * way down to it.
+ */
+function watchTarget(file: string): { dir: string; name: string } {
+  let child = file;
+  let dir = dirname(file);
+  while (dir !== dirname(dir) && inodeOf(dir) === null) {
+    child = dir;
+    dir = dirname(dir);
+  }
+  return { dir, name: basename(child) };
+}
+
+/** Whether a directory event for entry `filename` can concern `name`. */
+function eventConcerns(filename: string | null, name: string): boolean {
+  if (filename === null) return true;
+  const entry = basename(filename);
+  // Editors write a temporary sibling (`aft.jsonc.tmp`, `.aft.jsonc.swp`)
+  // and rename it over the file.
+  return entry === name || entry.startsWith(`${name}.`) || entry.startsWith(`.${name}`);
+}
+
 /**
  * Watch config files the way editors save them: the parent directory is
  * watched, because an editor replaces the file by renaming a temporary
  * sibling over it. A directory that does not exist yet is watched through its
- * own parent until it appears. `onChange` runs only when a file's text
+ * nearest existing ancestor until it appears, and a watch whose directory was
+ * replaced or failed is re-armed. Only events that can concern a config file
+ * wake the check, and a steady stream of them delays it at most
+ * {@link CONFIG_WATCH_MAX_DELAY_MS}. `onChange` runs only when a file's text
  * actually differs from what was last seen. Returns a function that stops
  * every watch.
  */
@@ -211,13 +254,18 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   const lastSeen = new Map<string, string | null>();
   for (const path of options.paths) lastSeen.set(path, readTextOrNull(path));
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let firstPendingAt: number | null = null;
   let stopped = false;
-  const watchers = new Map<string, FSWatcher>();
+  const watchers = new Map<
+    string,
+    { watcher: FSWatcher; ino: number | null; names: Set<string> }
+  >();
 
   const check = (): void => {
     timer = null;
+    firstPendingAt = null;
     if (stopped) return;
-    attachAll();
+    revalidate();
     let changed = false;
     for (const path of options.paths) {
       const text = readTextOrNull(path);
@@ -230,41 +278,134 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   };
   const schedule = (): void => {
     if (stopped) return;
+    const now = Date.now();
+    firstPendingAt ??= now;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(check, debounceMs);
+    const delay = Math.max(
+      0,
+      Math.min(debounceMs, firstPendingAt + CONFIG_WATCH_MAX_DELAY_MS - now),
+    );
+    timer = setTimeout(check, delay);
     timer.unref?.();
   };
 
-  const attach = (dir: string): void => {
-    if (watchers.has(dir)) return;
-    try {
-      const watcher = watch(dir, { persistent: false }, () => schedule());
-      watcher.on("error", () => {
-        watcher.close();
-        watchers.delete(dir);
-      });
-      watchers.set(dir, watcher);
-    } catch {
-      // The directory is missing or unreadable; its parent is tried instead.
-      const parent = dirname(dir);
-      if (parent !== dir) attach(parent);
+  /** Bring the watches in line with the directories on disk. */
+  function revalidate(): boolean {
+    const wanted = new Map<string, Set<string>>();
+    for (const path of options.paths) {
+      const target = watchTarget(path);
+      const names = wanted.get(target.dir) ?? new Set<string>();
+      names.add(target.name);
+      wanted.set(target.dir, names);
     }
-  };
-  function attachAll(): void {
-    for (const path of options.paths) attach(dirname(path));
+    let moved = false;
+    for (const [dir, entry] of watchers) {
+      // A directory that is no longer wanted (its child appeared) or that was
+      // replaced under the watch is dropped and, if still wanted, re-armed.
+      if (!wanted.has(dir) || inodeOf(dir) !== entry.ino) {
+        entry.watcher.close();
+        watchers.delete(dir);
+        moved = true;
+      }
+    }
+    for (const [dir, names] of wanted) {
+      const existing = watchers.get(dir);
+      if (existing) {
+        existing.names = names;
+        continue;
+      }
+      try {
+        const entry = {
+          watcher: watch(dir, { persistent: false }, (_event, filename) => {
+            const current = watchers.get(dir);
+            const name = typeof filename === "string" ? filename : null;
+            if (
+              current &&
+              [...current.names].some((wantedName) => eventConcerns(name, wantedName))
+            ) {
+              schedule();
+            }
+          }),
+          ino: inodeOf(dir),
+          names,
+        };
+        entry.watcher.on("error", () => {
+          entry.watcher.close();
+          if (watchers.get(dir) === entry) watchers.delete(dir);
+          // Re-arm on the next check rather than going silent.
+          schedule();
+        });
+        watchers.set(dir, entry);
+        moved = true;
+      } catch {
+        // The directory vanished between the check and the watch; the next
+        // revalidation finds its nearest existing ancestor.
+      }
+    }
+    return moved;
   }
-  attachAll();
+  revalidate();
+  // Some platforms stop reporting on a deleted or replaced directory without
+  // an error; a periodic check re-arms such a watch. Moving a watch (for
+  // example once `.cortexkit/` is created) may reveal a file, so it checks.
+  const revalidateTimer = setInterval(() => {
+    if (!stopped && revalidate()) schedule();
+  }, CONFIG_WATCH_REVALIDATE_MS);
+  revalidateTimer.unref?.();
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
-    for (const watcher of watchers.values()) watcher.close();
+    clearInterval(revalidateTimer);
+    for (const entry of watchers.values()) entry.watcher.close();
     watchers.clear();
   };
 }
 
-/** Result of loading the config files for a live reload. */
-export type LiveConfigLoad<C> = { ok: true; config: C } | { ok: false; message: string };
+/**
+ * Result of loading the config files for a live reload. `sources` lists the
+ * config files the load actually read; a file it relied on last time that is
+ * missing from it counts as deleted.
+ */
+export type LiveConfigLoad<C> =
+  | {
+      ok: true;
+      config: C;
+      sources: readonly string[];
+      /** The project config file's text as this load read it, or null when absent. */
+      projectText?: string | null;
+    }
+  | { ok: false; message: string };
+
+/**
+ * A security key and which of two values is the stricter one. A project-file
+ * edit may move these only towards strict while the host runs.
+ */
+export interface LiveSecurityKey<C> {
+  key: LiveConfigKey<C>;
+  /** Whether changing the value from `current` to `next` loosens it. */
+  loosens(current: unknown, next: unknown): boolean;
+}
+
+/** The plugin-read security keys: the path restriction and host fallback. */
+export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveSecurityKey<C>[] {
+  const byName = new Map(keys.map((key) => [key.name, key]));
+  const pick = (name: string) => {
+    const key = byName.get(name);
+    if (!key) throw new Error(`unknown live config key ${name}`);
+    return key;
+  };
+  return [
+    {
+      key: pick("restrict_to_project_root"),
+      loosens: (current, next) => current === true && next !== true,
+    },
+    {
+      key: pick("bash.host_fallback"),
+      loosens: (current, next) => current !== true && next === true,
+    },
+  ];
+}
 
 /** Options for {@link startLiveConfigReload}. */
 export interface LiveConfigReloadOptions<C> {
@@ -272,6 +413,12 @@ export interface LiveConfigReloadOptions<C> {
   paths: readonly string[];
   /** Load and resolve both files. Anything but a clean load is `ok: false`. */
   load(): LiveConfigLoad<C>;
+  /** The config files the startup load that produced `getConfig()` read. */
+  initialSources: readonly string[];
+  /** The project config text the startup load read, or null when absent. */
+  initialProjectText?: string | null;
+  /** Keys a project-file edit may only tighten; see {@link aftLiveSecurityKeys}. */
+  securityKeys?: readonly LiveSecurityKey<C>[];
   keys: readonly LiveConfigKey<C>[];
   getConfig(): C;
   setConfig(config: C): void;
@@ -304,21 +451,33 @@ export function liveConfigReloadLogLine(applied: string[], deferred: string[]): 
 /**
  * Watch the config files and keep `ctx.config` current for the live keys.
  * An invalid, unreadable or deleted file keeps the last valid config: the
- * error is reported and nothing else changes.
+ * error is reported and nothing else changes. Right after the watch starts
+ * the files are read once, so an edit made while the host was starting (after
+ * its config was loaded, before the watch existed) is not missed.
  */
 export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): LiveConfigReload {
   const baseline = options.getConfig();
   let lastError: string | null = null;
-  // Files that existed at the last valid load. A deleted one keeps the last
-  // valid config rather than resolving as empty: a security setting must not
-  // loosen because a file vanished mid-save or was deleted by mistake.
-  const present = new Map(options.paths.map((path) => [path, existsSync(path)]));
+  // The files the last accepted load read. A load that no longer reads one of
+  // them keeps the last valid config rather than resolving the file as empty:
+  // a security setting must not loosen because a file vanished mid-save or
+  // was deleted by mistake. The next host restart applies a real deletion.
+  let acceptedSources = new Set(options.initialSources);
+  // The project text the published security values rest on. A project edit
+  // that would loosen one of them is held until the next restart, and this
+  // stays at the older text so later reloads keep holding it.
+  let acceptedProjectText = options.initialProjectText ?? null;
   const reload = (): LiveConfigApply<C> | null => {
-    const deleted = options.paths.find((path) => present.get(path) === true && !existsSync(path));
-    const loaded: LiveConfigLoad<C> =
-      deleted !== undefined
-        ? { ok: false, message: `AFT config at ${deleted} was deleted` }
-        : options.load();
+    let loaded = options.load();
+    if (loaded.ok) {
+      const read = new Set(loaded.sources);
+      const deleted = [...acceptedSources].find((path) => !read.has(path));
+      if (deleted !== undefined) {
+        loaded = { ok: false, message: `AFT config at ${deleted} was deleted` };
+      } else {
+        acceptedSources = read;
+      }
+    }
     if (!loaded.ok) {
       const message = `${loaded.message.trim().replace(/[.!?]?$/, ".")} ${CONFIG_LIVE_KEEP_NOTE}`;
       if (message !== lastError) {
@@ -328,29 +487,48 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
       return null;
     }
     lastError = null;
-    for (const path of options.paths) present.set(path, existsSync(path));
-    const result = applyLiveConfigKeys(options.getConfig(), loaded.config, options.keys, baseline);
-    if (result.applied.length > 0) options.setConfig(result.config);
-    if (result.applied.length > 0 || result.deferred.length > 0) {
-      options.log(liveConfigReloadLogLine(result.applied, result.deferred));
+    const current = options.getConfig();
+    let next = loaded.config;
+    const held: string[] = [];
+    const projectText = loaded.projectText ?? null;
+    if (loaded.projectText !== undefined && projectText !== acceptedProjectText) {
+      for (const security of options.securityKeys ?? []) {
+        const now = security.key.read(current);
+        if (security.loosens(now, security.key.read(next))) {
+          next = security.key.write(next, now);
+          held.push(security.key.name);
+        }
+      }
+      if (held.length === 0) acceptedProjectText = projectText;
     }
-    return result;
+    const result = applyLiveConfigKeys(current, next, options.keys, baseline);
+    if (result.applied.length > 0) options.setConfig(result.config);
+    if (result.applied.length > 0 || result.deferred.length > 0 || held.length > 0) {
+      let line = liveConfigReloadLogLine(result.applied, result.deferred);
+      if (held.length > 0) {
+        line += ` held=[${held.join(",")}] (a project edit cannot loosen these until the next restart)`;
+      }
+      options.log(line);
+    }
+    return { ...result, held };
   };
-  const stop =
-    options.watch === false
-      ? () => {}
-      : watchAftConfigFiles({
-          paths: options.paths,
-          debounceMs: options.debounceMs,
-          onChange: () => {
-            try {
-              reload();
-            } catch (err) {
-              options.reportError(
-                `AFT config reload failed: ${err instanceof Error ? err.message : String(err)}`,
-              );
-            }
-          },
-        });
+  const safeReload = (): void => {
+    try {
+      reload();
+    } catch (err) {
+      options.reportError(
+        `AFT config reload failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+  if (options.watch === false) {
+    return { reload: reload as () => LiveConfigApply<unknown> | null, stop: () => {} };
+  }
+  const stop = watchAftConfigFiles({
+    paths: options.paths,
+    debounceMs: options.debounceMs,
+    onChange: safeReload,
+  });
+  safeReload();
   return { reload: reload as () => LiveConfigApply<unknown> | null, stop };
 }

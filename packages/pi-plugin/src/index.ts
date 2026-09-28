@@ -779,6 +779,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // descriptions stay as loaded and follow the next restart.
   const liveConfigReload = startPiLiveConfigReload({
     directory: projectRoot,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
     getConfig: () => ctx.config,
     setConfig: (next) => {
       ctx.config = next;

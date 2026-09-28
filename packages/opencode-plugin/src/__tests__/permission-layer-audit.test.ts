@@ -936,6 +936,82 @@ describe("permission audit regressions", () => {
     expect(promptCalls).toHaveLength(1);
   });
 
+  test("restrict_to_project_root denies an ordinary external read the server does not own", async () => {
+    // During a live config change this plugin may already restrict while the
+    // server does not yet, so the read exemption must be a positive
+    // ownership answer, not a hand-off to the server.
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(
+      (ctx) =>
+        hoistedTools({
+          ...ctx,
+          config: { ...ctx.config, restrict_to_project_root: true } as PluginContext["config"],
+        }),
+      (command) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: false }
+          : { success: true, text: "secret contents" },
+    );
+
+    const raw = await tools.read.execute(
+      { filePath: path.join(external, "secret.txt") },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(String(raw)).toContain("restrict_to_project_root");
+    expect(calls.map((call) => call.command)).not.toContain("read");
+  });
+
+  test("restrict_to_project_root still lets a session's own bash artifact be read", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const artifact = path.join(external, "bash-tasks", "bgb-1", "stdout");
+    const { calls, tools } = createHarness(
+      (ctx) =>
+        hoistedTools({
+          ...ctx,
+          config: { ...ctx.config, restrict_to_project_root: true } as PluginContext["config"],
+        }),
+      (command, params) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: params.path === artifact }
+          : { success: true, text: "task output" },
+    );
+
+    await tools.read.execute({ filePath: artifact }, createSdkContext(project, recordingAsk([])));
+
+    expect(calls.map((call) => call.command)).toContain("read");
+  });
+
+  test("restrict_to_project_root denies a worktree path outside the session directory", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const worktree = path.dirname(project);
+    const context = {
+      ...createSdkContext(project, recordingAsk(askCalls), "restrict-worktree-sess"),
+      worktree,
+      directory: project,
+    } as ToolContext;
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
+    ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+    // The session's own directory is the project; the OpenCode worktree
+    // around it is wider.
+    _resetSessionDirectoryCacheForTest();
+    const { getSessionDirectory } = await import("../shared/session-directory.js");
+    await getSessionDirectory(
+      { session: { get: async () => ({ data: { directory: project } }) } },
+      context.sessionID,
+      project,
+    );
+
+    const sibling = path.join(worktree, "sibling", "other.txt");
+    const denial = await assertExternalDirectoryPermission(ctx, context, sibling);
+    _resetSessionDirectoryCacheForTest();
+
+    expect(typeof denial).toBe("string");
+    expect(denial).toContain("restrict_to_project_root");
+  });
+
   test("restrict_to_project_root allows in-root paths untouched", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];

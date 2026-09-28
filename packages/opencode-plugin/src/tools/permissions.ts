@@ -418,11 +418,18 @@ export async function assertExternalDirectoryPermission(
   const rawWorktree = (context as { worktree?: string }).worktree;
   const worktree = rawWorktree && rawWorktree !== "/" ? normalizePath(rawWorktree) : rawWorktree;
 
+  // Read once: a live config reload may replace `ctx.config` while this
+  // check awaits the server.
+  const restrictToProjectRoot = ctx.config.restrict_to_project_root === true;
+
   if (directory && containsPath(directory, absoluteTarget)) return undefined;
   // Non-git projects set worktree to "/" which matches ANY absolute path.
   // Match opencode's behavior: skip the worktree check in that case so we
-  // still ask for external paths.
+  // still ask for external paths. Under the project restriction a worktree
+  // path outside the project root is outside AFT's root too, so it is denied
+  // below rather than let through.
   if (
+    !restrictToProjectRoot &&
     worktree &&
     worktree !== "/" &&
     worktree !== directory &&
@@ -438,11 +445,19 @@ export async function assertExternalDirectoryPermission(
   // boundary anyway — that produced the issue #125 "approved but still fails"
   // footgun). Instead the agent gets a clear denial and the user gets a
   // throttled informational panel explaining the restriction.
-  if (ctx.config.restrict_to_project_root === true) {
-    // A session-owned bash artifact lives outside the project by design. The
-    // plugin has no access to Rust's task registry, so read calls cross this
-    // boundary and let Rust apply its exact, session-scoped artifact check.
-    if (options?.serverValidatedRead === true) return undefined;
+  if (restrictToProjectRoot) {
+    // A session-owned bash artifact lives outside the project by design. Only
+    // a read the server confirms as one of this session's artifacts passes;
+    // every other external read is denied here even if the server's own
+    // restriction is momentarily off (a live config change reaches this
+    // plugin and the server at slightly different times, and each side must
+    // enforce its own `true`).
+    if (
+      options?.serverValidatedRead === true &&
+      (await isSessionOwnedBashArtifact(ctx, context, absoluteTarget))
+    ) {
+      return undefined;
+    }
     notifyRestrictBlocked(ctx, context, absoluteTarget);
     return restrictDenialMessage(absoluteTarget);
   }

@@ -11,7 +11,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
-import { loadAftConfig, resolveBashConfig } from "../config.js";
+import {
+  getConfigLoadSources,
+  getConfigLoadTexts,
+  loadAftConfig,
+  resolveBashConfig,
+} from "../config.js";
 import { startPiLiveConfigReload } from "../config-live-reload.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
 import {
@@ -44,6 +49,8 @@ async function fixture(user: string) {
   const notices: string[] = [];
   const reload = startPiLiveConfigReload({
     directory: projectDir,
+    initialSources: [...getConfigLoadSources()],
+    initialSourceTexts: Object.fromEntries(getConfigLoadTexts()),
     getConfig: () => ctx.config,
     setConfig: (next) => {
       ctx.config = next;

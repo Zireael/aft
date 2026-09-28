@@ -35,7 +35,7 @@ Input: [`docs/investigations/config-live-reload-inventory-2026-09.md`](../invest
 - **Standalone.** One `ConfigFileWatch` per context, on the `cortexkit_user_config_path` configure parameter. There is no watch when the parameter is absent.
 
 **Project file `<root>/.cortexkit/aft.jsonc`.**
-- **Primary: the root's project watcher.** `WatcherFilterConfig` carries the root's `ConfigReloadSignal` (`with_config_reload_signal`). The watcher thread raises it for any raw path under `<root>/.cortexkit/` named `aft.jsonc`, or for an editor sibling of it (`note_config_file_events`, run before any ignore filtering). An overflow/rescan event raises it too. Corpus handling of the path is unchanged.
+- **Primary: the root's project watcher.** `WatcherFilterConfig` carries the root's `ConfigReloadSignal` (`with_config_reload_signal`). The watcher thread raises it for any raw event path under `<root>/.cortexkit/` named `aft.jsonc`, or for an editor sibling of it (`note_config_file_events`). This runs on the raw event, before every corpus filter: the high-churn component filter (which drops any path with a `target`, `node_modules`, `.alfonso`, `.opencode` or `.gsd` component, possibly an ancestor of the root), canonicalization (which would resolve a symlinked file name away) and the ignore rules. Only the root directory of an event path is resolved when comparing it with the canonical root. An overflow/rescan event raises it too. Corpus handling of the path is unchanged.
 - **Ignored `.cortexkit`.** `start_project_watcher` adds `<root>/.cortexkit` to the watcher's existing non-recursive `extra_watch_paths` whenever the directory exists. So the file is seen whether or not the project ignores `.cortexkit`, on every backend. This is simpler than computing "covered" from the matcher, as the design first proposed, and is equivalent.
 - **Fallback: the root's own `ConfigFileWatch`.** It is used when no project watcher runs (a HOME root, `AFT_TEST_DISABLE_FILE_WATCHER`, a failed watcher), or when `.cortexkit/` did not exist at watcher start.
   - It watches `<root>/.cortexkit/` non-recursively, or `<root>` until `.cortexkit/` appears.
@@ -52,8 +52,10 @@ A plugin must swap its own snapshot, because the daemon cannot reach a plugin's 
 
 **Shared component** `BR:config-watch.ts`:
 - `watchAftConfigFiles`:
-  - watches each file's parent directory, or that directory's parent until it exists;
-  - uses a 150 ms trailing debounce;
+  - watches each file's parent directory, or its nearest existing ancestor until it exists, and retires the ancestor watch once the directory appears;
+  - wakes only for events that can concern a config file (the file, an editor sibling, or the missing directory on the way to it);
+  - uses a 150 ms trailing debounce, capped at 1 s so steady related activity cannot postpone a check indefinitely;
+  - re-arms a watch whose directory was replaced (inode changed) or that reported an error, checked on every event and every 2 s;
   - calls `onChange` only when a file's text changed.
 - `applyLiveConfigKeys` and `aftLiveConfigKeys`: one table of the TS group A keys:
   - `configure_warnings_delivery`, `restrict_to_project_root`, `inspect.diagnostics_timeout_ms` and `inspect.tier2_idle_minutes`;
@@ -61,6 +63,9 @@ A plugin must swap its own snapshot, because the daemon cannot reach a plugin's 
 
   Bash keys are read through the host's `resolveBashConfig`. A write turns `bash` into the equivalent object form, so non-live bash settings (`compress`, `background`, ...) resolve exactly as loaded. The swapped config is a new object.
 - `startLiveConfigReload`: load, keep last good on error (reported once per distinct message), swap, and log `config reload applied=[...] deferred=[...] (deferred keys apply on next connect/restart)`. Deferred keys are reported relative to the config loaded at startup.
+  - **Deletion** is decided from the loader's own record of the files it read (`getConfigLoadSources`, returned with every load). A load that no longer read a file the last accepted load read keeps the last valid config. The startup load's record (`sources` on the bootstrap result) is the starting point, so there are no separate existence probes to race.
+  - **Start-up reconciliation.** Right after the watch starts, the files are read once, so an edit made between the host's config load and the watch (OpenCode 2 awaits bridge setup in between) is applied.
+  - **Project edits only tighten** `restrict_to_project_root` and `bash.host_fallback` (`aftLiveSecurityKeys`). When the project file's text differs from the text the published values rest on, a change that would loosen either key is held (`held=[...]` in the log) until the next restart. The TS loader cannot re-resolve with the old project text, so a user-file loosening made together with a project edit is held too.
 
 **Per host.** Each host has a loader (`OC:config-live-reload.ts`, `PI:config-live-reload.ts`) that turns the following into `ok: false`:
 - a parse failure (`getConfigLoadErrors`);
@@ -81,7 +86,7 @@ A plugin in the startup config-error state starts no watch; that state still nee
 
 `reload_config_inner`:
 1. **Read** both files (`read_tier`). A read error, invalid UTF-8, or a **deleted** file that existed at the last apply keeps the last good config (§3).
-2. **Content gate.** Unchanged texts are a no-op.
+2. **Content gate.** Unchanged texts are a no-op, but a tier that was relayed on the wire and now reads the same text from its file is recorded as file-backed, so a later deletion of it is noticed.
 3. **Strict check.** `strict_tier_error` (`R:config_resolve.rs`) is applied to each tier (§3).
 4. **Re-resolve** with `resolve_config_onto_with_diagnostics_for_harness` onto a clone of the published config, with the published harness. The trust boundary is unchanged (`record_project_drops`, `merge_project_config`, harness disables only accumulate). Resolver errors keep the last good config.
 5. **Diff.** `apply_live_config(published, candidate, connected)`:
@@ -96,6 +101,7 @@ A plugin in the startup config-error state starts no watch; that state still nee
    - `inspect.enabled`: `reset_tier2_refresh_scheduler`;
    - `git.co_author` from `off` to on: `agent_child_env::ensure_git_hooks`, the hook half of `maintain` only (the gh shim is group B);
    - `lsp.diagnostics_on_edit` in the daemon: the maintenance completion carries the new value into `RootMeta`.
+7a. **Project edits only tighten.** When the project file's text changed, the files are also resolved with the new user file and the previous project text (`user_only`). Against that floor, `hold_project_loosening` keeps `restrict_to_project_root`, `url_fetch_allow_private`, `sandbox.enabled`, `sandbox.read_deny` and `sandbox.write_allow` at least as strict: a project edit can add hardening but never remove hardening a project file had put in place, while a user-file change still applies in both directions. A held key keeps its published value, is logged as `held=[...] (a project edit cannot loosen these until the next connect)`, and the previous project text stays the reference so later reloads keep holding it. The next connect resolves the files afresh and is authoritative.
 8. **Log** one line: `config reload root=<root> applied=[...] deferred=[...] (deferred keys apply on next connect/restart) dropped=[...] (project may only tighten)`. When sandbox keys change, it adds that running background tasks keep their spawn-time sandbox.
 
 **Not triggered:** `handle_configure`, `defer_to_exclusive_configure`, `agent_child_env::maintain`, the ONNX lookup, `note_configure_warm_key`, artifact drop or reload, hashline binding, and the configure maintenance stages. The configure generation does not change.
@@ -107,7 +113,8 @@ A plugin in the startup config-error state starts no watch; that state still nee
 **Live reload is conservative; connect is authoritative.** The live path keeps the last good config when any of these hold:
 - a file cannot be read, is not UTF-8, or **was deleted** (it existed when last applied). Deleting a file is not treated as `{}`: a security key must never loosen because a file vanished mid-save or was deleted by mistake. A file that was already absent at connect stays absent without error;
 - the text does not parse as a JSON object (`parse_tier` would silently skip the tier);
-- a value does not deserialize strictly into `RawAftConfig`. `parse_config_partially` would reset only that key to its default. The contents of `harnesses.<id>` blocks are still checked by the resolver as it applies them;
+- a value does not deserialize strictly into `RawAftConfig`. `parse_config_partially` would reset only that key to its default;
+- the block for the **active harness** (`harnesses.<id>`) is not an object or does not deserialize strictly. The resolver would ignore the whole block with a warning, dropping any security key it sets. Blocks for other harnesses are not applied and are not checked;
 - the resolver rejects the candidate (for example a retired key).
 
 Connect keeps today's behaviour: a missing file resolves as `{}`, and a bad value is dropped with the rest of the file applied. The two therefore disagree on purpose. The next connect after a deletion applies the deletion.
@@ -123,7 +130,19 @@ Connect keeps today's behaviour: a missing file resolves as `{}`, and a bad valu
 
 ## 4. Security keys: switch-over and enforcing side
 
-**Per-request pin.** `dispatch` in `R:main.rs` is the one entry for standalone and subc. At entry it takes `ctx.pin_config()`, a thread-local `(context, Arc<Config>)`.
+**Per-request pin.** A request pins the published config when it is admitted, as a thread-local `(context, Arc<Config>)`:
+- `dispatch` in `R:main.rs` pins at entry (inline standalone requests and every subc path that goes through it);
+- `dispatch_outcome` in `R:main.rs` pins before choosing a route, so the deferred and orchestrated routes (inspect, LSP navigation, foreground bash, GitHub reads, offloaded validation, deferred tool calls) share the admission snapshot;
+- `run_tool_call` pins before its preflight, and the subc deferred inspect/LSP job pins before `prepare_tool_call`.
+
+Work a request hands to another thread captures `ctx.config()` at admission and installs it on the worker with `pin_config_to`:
+- `handle_dispatch_deferred` (semantic search and deferred tool calls) and `dispatch_with_offloaded_validation` in `R:main.rs`;
+- the deferred LSP navigation worker (`R:commands/lsp_navigation.rs`);
+- the deferred inspect worker (`R:commands/inspect.rs`), including `run_blocking_inspect_body`.
+
+Other threads a request starts carry no config reads that matter for the switch-over: the inspect Tier-2 category workers read `inspect.tier2_pass_timeout_ms` from the manager's own snapshot (not a security key), `read`'s image worker reads no config, and background bash spawn decisions (`sandbox.*`) are made on the request thread before the child starts. Background maintenance (watcher drains, builds, Tier-2 refresh) is not a request and reads the live snapshot.
+
+Also:
 - `AppContext::config()` returns the pinned snapshot on that thread.
 - `publish_config` replaces the calling thread's own pin, so configure sees its own publication.
 - `update_config` reads the unpinned snapshot, so a pinned request can never republish an older config over a newer one.
@@ -142,11 +161,11 @@ Connect keeps today's behaviour: a missing file resolves as `{}`, and a bad valu
 - **Loosening:** whichever side has not published yet still denies.
 - **Tightening:** Rust denies as soon as it publishes. The only visible artifact is TS prompting before Rust refuses, and only for calls inside that window.
 
-Both checks must stay independent for this to hold.
+Both checks must stay independent for this to hold. In OpenCode the read path used to hand every external read to the server under the restriction, so during the gap (TS true, Rust false) an ordinary external read passed unchecked; now only a read the server positively confirms as a session-owned bash artifact passes, and the worktree shortcut does not apply under the restriction.
 
 ## 5. Concurrency
 
-- **Daemon.** The reload is the `MaintenanceDrainKind::ConfigReload` drain. It is probed with `config_live().reload_due()`, runs on `Lane::MaintenanceCommit` (actor epoch **read** gate), and is coalesced by `MaintenanceCoalesceKey::ConfigReload`. It runs alongside `PureRead`s and never becomes a writer barrier.
+- **Daemon.** The reload is the `MaintenanceDrainKind::ConfigReload` drain. It is probed with `config_live().reload_due()`, runs on `Lane::MaintenanceCommit` (actor epoch **read** gate), and is coalesced by `MaintenanceCoalesceKey::ConfigReload`. It runs alongside `PureRead`s and never becomes a writer barrier. It runs only while the root is still bound at the generation the job was queued for (`run_if_subc_bound_generation`); otherwise the request stays pending and the next bind reads the files anyway.
 - **Standalone.** The reload runs in the between-request drain (`drain_non_configure_runtime_events`), which is skipped while configure maintenance is pending.
 - **In-flight requests** keep their pinned `Arc`. Publication is one `RwLock` write.
 - **Configure racing a reload.** They exclude each other through the epoch lock (configure is `Mutating`). Each re-reads the files when it runs, and the reload publishes by compare-and-swap. Whichever runs last applies the newest text. A reload that runs after a configure which already applied the same text is a no-op through the content gate.
@@ -171,18 +190,24 @@ Rust unit tests (`R:config_live_tests.rs`):
 - `config_file_watch_sees_edits_and_a_directory_created_later`
 - `root_without_a_project_watcher_watches_its_config_files_itself`
 - `project_watcher_filter_recognises_the_config_file`
+- `project_watcher_signals_a_config_edit_under_a_target_ancestor`
+- `invalid_active_harness_block_keeps_the_last_good_config`
+- `project_edit_cannot_remove_project_hardening_until_the_next_connect`, `project_edit_cannot_turn_off_a_sandbox_the_project_turned_on`, `a_user_edit_can_still_loosen_what_the_user_set`
+- `a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed`
 
 Other Rust tests:
 - `R:main.rs` `config_pin_tests::dispatch_keeps_the_config_it_was_admitted_with`;
 - `R:commands/configure.rs` `warm_key_ignores_keys_a_live_config_reload_may_change`;
+- `R:subc/mod.rs` `deferred_navigation_worker_keeps_the_admitted_config`;
 - `crates/aft/tests/watcher_integration/config_live_reload_test.rs`: a real `aft` process and the real project watcher, with no reconnect:
   - `project_config_edit_applies_live_through_the_project_watcher`
   - `project_config_edit_applies_live_when_cortexkit_is_gitignored`
   - `user_config_edit_applies_live`
 
 TS tests:
-- `BR:__tests__/config-watch.test.ts`: key table, bash form, invalid and deleted files, watcher;
-- `OC:__tests__/config-live-reload.test.ts`: the `bash_watch` cap reaches the next call while `bash.background` is deferred; restrict; invalid parse; an invalid value; deletion; project tier clamped;
+- `BR:__tests__/config-watch.test.ts`: key table, bash form, invalid files, deletion from the loader's record, a file that appears later, watch recovery after directory replacement, no starvation under unrelated activity, start-up reconciliation;
+- `OC:__tests__/config-live-reload.test.ts`: the `bash_watch` cap reaches the next call while `bash.background` is deferred; restrict; invalid parse; an invalid value; deletion; project tier clamped; a project edit cannot turn host fallback on but can turn it off;
+- `OC:__tests__/permission-layer-audit.test.ts`: under the restriction an ordinary external read is denied unless the server confirms a session-owned artifact, and a worktree path outside the session directory is denied;
 - `OC:__tests__/v2-bridge-bootstrap.test.ts`: an OpenCode 2 Location swaps its tool context config and stops with the Location;
 - `PI:__tests__/config-live-reload.test.ts`: restrict reaches the registered hoisted tools; bash wait setting live and `compress` deferred; an invalid value.
 
@@ -191,4 +216,5 @@ TS tests:
 - **Deletion** keeps the last good config (operator decision; §3).
 - **Strictness** applies to the live path only; connect keeps lenient parsing (operator decision).
 - **Warm key**: the four keys were dropped, and `inspect.enabled` still resets Tier-2 (operator decision).
+- **Project monotonicity** (operator decision after review): a live reload never makes a security key looser than published because of a project edit; §2 step 7a and §1.2.
 - **`worktree.ram_overlay`** stays in group A. Finding: an edit made while the overlay is off is **not replayed** when it turns on. The watcher drain skips borrow-only RAM updates while it is off (`R:runtime_drain.rs`, `apply_ram_search_updates`; test `ram_overlay_is_on_by_default_and_transport_independent`). After a live switch to on, search reflects only later edits, or a rescan, until those files change again.

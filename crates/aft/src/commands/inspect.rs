@@ -741,7 +741,10 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let worker_cancellation = cancellation.clone();
     let root = snapshot.project_root.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    // The request's admitted config, installed on the worker below.
+    let admitted_config = ctx.config();
     std::thread::spawn(move || {
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
         // Queueing instead of sharing a response keeps request-specific scopes,

@@ -129,6 +129,7 @@ export type { ConfigTier } from "./config-tiers.js";
 export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";
 export {
   aftLiveConfigKeys,
+  aftLiveSecurityKeys,
   applyLiveConfigKeys,
   CONFIG_LIVE_KEEP_NOTE,
   CONFIG_WATCH_DEBOUNCE_MS,
@@ -137,6 +138,7 @@ export {
   type LiveConfigLoad,
   type LiveConfigReload,
   type LiveConfigReloadOptions,
+  type LiveSecurityKey,
   liveConfigReloadLogLine,
   type ResolvedBashForLiveReload,
   startLiveConfigReload,

@@ -55,6 +55,8 @@ import {
   deliverConfigLoadNotices,
   getConfigLoadErrors,
   getConfigLoadNotices,
+  getConfigLoadSources,
+  getConfigLoadTexts,
   loadAftConfig,
   migrateAftConfigLocations,
   resolvedIndexes,
@@ -89,6 +91,10 @@ export interface BridgeBootstrapDependencies {
    * not see failures left over from a real load.
    */
   configLoadErrors?(): readonly ConfigLoadError[];
+  /** The config files the most recent `loadConfig` call read. */
+  configLoadSources?(): readonly string[];
+  /** The text of each file the most recent `loadConfig` call read. */
+  configLoadTexts?(): ReadonlyMap<string, string>;
   /** Error for a configured subc connection file that does not exist, or null. */
   subcConnectionFileError?(subcConnectionFile: string | undefined): Promise<string | null>;
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
@@ -304,6 +310,8 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   loadConfig: loadAftConfig,
   deliverLoadNotices: (notify) => deliverConfigLoadNotices(notify, getConfigLoadNotices()),
   configLoadErrors: getConfigLoadErrors,
+  configLoadSources: getConfigLoadSources,
+  configLoadTexts: getConfigLoadTexts,
   subcConnectionFileError,
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
@@ -331,7 +339,14 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
  * {@link buildConfigErrorToolMap}).
  */
 export type BootstrapConfig =
-  | { ok: true; config: AftConfig }
+  | {
+      ok: true;
+      config: AftConfig;
+      /** The config files this load read; a live config reload starts from them. */
+      sources?: readonly string[];
+      /** The text of each file this load read, keyed by path. */
+      sourceTexts?: Readonly<Record<string, string>>;
+    }
   | {
       ok: false;
       /** The error, its fix, and the note that a restart is needed. */
@@ -390,8 +405,10 @@ export function loadBootstrapConfig(
     const config = dependencies.loadConfig(directory);
     const failure = parseFailure(dependencies);
     if (failure) return configErrorState(failure, notify);
+    const sources = dependencies.configLoadSources?.() ?? [];
+    const sourceTexts = Object.fromEntries(dependencies.configLoadTexts?.() ?? []);
     dependencies.deliverLoadNotices?.(notify);
-    return { ok: true, config };
+    return { ok: true, config, sources: [...sources], sourceTexts };
   } catch (err) {
     return configErrorState(err instanceof Error ? err.message : String(err), notify);
   }

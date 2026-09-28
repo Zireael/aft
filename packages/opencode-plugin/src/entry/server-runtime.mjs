@@ -119,6 +119,8 @@ async function bootLocation(context, location, dependencies) {
   // The finalizer that releases the bridge also stops the watch.
   const liveConfigReload = dependencies.startLiveConfigReload({
     directory,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
     getConfig: () => toolContext.config,
     setConfig: (next) => {
       toolContext.config = next;
