@@ -200,6 +200,8 @@ pub fn find_run_occurrences(text: &str, run: &str, run_idx: usize) -> Vec<Occurr
         return Vec::new();
     }
 
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.regex_compilations += 1);
     let matcher = regex::RegexBuilder::new(&regex::escape(run))
         .case_insensitive(true)
         .build()
@@ -498,6 +500,8 @@ pub fn verify_file_for_anchored(
     retained_runs: &[String],
     denominator: usize,
 ) -> Option<CandidateResult> {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read();
     let content = fs::read_to_string(file_path).ok()?;
     let canonical = find_canonical_alignment(&content, retained_runs)?;
     if !evaluate_threshold(

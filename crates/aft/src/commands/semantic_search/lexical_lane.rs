@@ -126,6 +126,10 @@ impl CanonicalLexicalLane {
         }
 
         let mut canonical = candidates;
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += canonical.len()
+        });
         canonical.sort_by(|left, right| {
             right
                 .raw_score

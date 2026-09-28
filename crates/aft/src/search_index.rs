@@ -761,6 +761,10 @@ impl SearchIndexSnapshot {
             }
         }
 
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += ranked.len()
+        });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(max_files);
         LexicalRankResult {
@@ -841,6 +845,10 @@ impl SearchIndexSnapshot {
             }
         }
 
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += ranked.len()
+        });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(depth);
         LexicalRankResult {
@@ -3242,6 +3250,8 @@ pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> Search
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read();
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(_) => return SearchCorpusEligibility::Skipped,
@@ -4729,6 +4739,8 @@ fn lexical_score_from_postings(
     postings_by_trigram: &HashMap<u32, Vec<u32>>,
     file_id: u32,
 ) -> f32 {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.score_evaluations += 1);
     if query_trigrams.is_empty() {
         return 0.0;
     }

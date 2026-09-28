@@ -1865,6 +1865,8 @@ fn lexical_candidate_exactness(
     query: &str,
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read();
     let Ok(bytes) = fs::read(file) else {
         return (false, 0, None);
     };
@@ -9393,4 +9395,36 @@ mod tests {
         );
         drop(receiver_guard);
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "opt-in lexical exactness allocation benchmark"]
+fn hot_path_lexical_exactness_work_counts() {
+    use crate::search_hot_path_measurements::measure;
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("distant.rs");
+    let tokens = vec!["common".to_string(), "rare".to_string()];
+    fs::write(
+        &file,
+        format!("common\n{}rare\n", "unrelated\n".repeat(1000)),
+    )
+    .unwrap();
+    assert_eq!(
+        measure("lexical_exactness/distant", || lexical_candidate_exactness(
+            &file,
+            "common rare",
+            &tokens
+        )),
+        (false, 0, None)
+    );
+    fs::write(&file, "common unrelated\n".repeat(1000)).unwrap();
+    assert_eq!(
+        measure("lexical_exactness/missing", || lexical_candidate_exactness(
+            &file,
+            "common rare",
+            &tokens
+        )),
+        (false, 0, None)
+    );
 }
