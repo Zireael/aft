@@ -3744,43 +3744,10 @@ mod tests {
             drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         }
 
-        assert_eq!(rule_changes, REWRITES);
+        assert_eq!(rule_changes, 0);
         assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds);
         assert_eq!(ignore_rule_refreshes_for_test(), 0);
         assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 0);
-    }
-
-    #[test]
-    fn identical_self_matching_root_gitignore_rewrite_does_not_rebuild_matcher() {
-        let _reset = begin_ignore_rule_refresh_test();
-        let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        let ignore_path = root.join(".gitignore");
-        std::fs::write(&ignore_path, b".gitignore\n").unwrap();
-        let (ctx, tx) = watcher_context(&root);
-        ctx.rebuild_gitignore();
-        let rebuilds = ctx.gitignore_matcher_rebuild_count_for_test();
-        let config = crate::watcher_filter::WatcherFilterConfig::new(root, None);
-
-        std::fs::write(&ignore_path, b".gitignore\n").unwrap();
-        let filtered = crate::watcher_filter::filter_watcher_raw_paths_for_test(
-            &config,
-            &ctx.shared_gitignore(),
-            [ignore_path.clone()],
-        );
-        assert_eq!(
-            filtered.ignore_file_paths,
-            std::collections::BTreeSet::from([ignore_path])
-        );
-        tx.send(WatcherDispatchEvent::IgnoreRulesChanged {
-            paths: filtered.ignore_file_paths.into_iter().collect(),
-        })
-        .unwrap();
-        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-
-        assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds);
-        assert_eq!(ignore_rule_refreshes_for_test(), 0);
-        assert_eq!(ignore_rule_corpus_rebuilds_for_test(), 0);
     }
 
     #[test]

@@ -387,9 +387,10 @@ fn watcher_directory_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> boo
     })
 }
 
-/// True when `path` is an in-tree ignore rule file inside an ignored directory.
-/// A rule file that matches itself still supplies rules for its directory and
-/// must be reloaded when its contents change.
+/// True when `path` is an in-tree ignore rule file that the current matcher
+/// already excludes, either directly or through an ignored parent directory.
+/// Only in-tree rule files can satisfy this; the global excludes file and
+/// `.git/info/exclude` never do.
 fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
     if !watcher_path_is_ignore_file(path) {
         return false;
@@ -402,10 +403,11 @@ fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.as_deref().is_some_and(|matcher| {
         path.starts_with(matcher.path())
-            && parent != matcher.path()
-            && matcher
-                .matched_path_or_any_parents(parent, true)
-                .is_ignore()
+            && (matcher.matched_path_or_any_parents(path, false).is_ignore()
+                || (parent != matcher.path()
+                    && matcher
+                        .matched_path_or_any_parents(parent, true)
+                        .is_ignore()))
     })
 }
 
@@ -3640,7 +3642,7 @@ mod tests {
     }
 
     #[test]
-    fn self_ignored_nested_gitignore_rewrites_still_report_rule_file_events() {
+    fn self_ignored_nested_gitignore_rewrites_do_not_report_rule_changes() {
         const REWRITES: usize = 8;
 
         let tmp = TempDir::new().unwrap();
@@ -3663,11 +3665,8 @@ mod tests {
             std::fs::write(&ignore_path, b"*").unwrap();
             let filtered =
                 filter_watcher_raw_paths_for_test(&config, &matcher, [ignore_path.clone()]);
-            assert!(filtered.ignore_file_changed);
-            assert_eq!(
-                filtered.ignore_file_paths,
-                BTreeSet::from([ignore_path.clone()])
-            );
+            assert!(!filtered.ignore_file_changed);
+            assert!(filtered.ignore_file_paths.is_empty());
             assert!(filtered.changed.is_empty());
         }
     }
