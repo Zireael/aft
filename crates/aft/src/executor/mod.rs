@@ -73,6 +73,9 @@ pub(crate) enum MaintenanceCoalesceKey {
     /// already scopes queue state by root, so this key cannot coalesce work for
     /// separate standing roots.
     StandingPass,
+    /// A live config reload re-reads the files, so one queued reload covers
+    /// every edit made before it runs.
+    ConfigReload,
 }
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;

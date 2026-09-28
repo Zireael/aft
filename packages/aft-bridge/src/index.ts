@@ -128,6 +128,22 @@ export {
 export type { ConfigTier } from "./config-tiers.js";
 export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";
 export {
+  aftLiveConfigKeys,
+  applyLiveConfigKeys,
+  CONFIG_LIVE_KEEP_NOTE,
+  CONFIG_WATCH_DEBOUNCE_MS,
+  type LiveConfigApply,
+  type LiveConfigKey,
+  type LiveConfigLoad,
+  type LiveConfigReload,
+  type LiveConfigReloadOptions,
+  liveConfigReloadLogLine,
+  type ResolvedBashForLiveReload,
+  startLiveConfigReload,
+  type WatchAftConfigFilesOptions,
+  watchAftConfigFiles,
+} from "./config-watch.js";
+export {
   downloadBinary,
   ensureBinary,
   getBinaryName,

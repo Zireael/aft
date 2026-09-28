@@ -1368,6 +1368,17 @@ export function migrateAftConfigFile(
 export type ConfigLoadError = { path: string; message: string };
 
 let configLoadErrors: ConfigLoadError[] = [];
+let configValidationErrors: ConfigLoadError[] = [];
+
+/**
+ * Settings the last load dropped because their value did not validate. A
+ * normal load keeps the rest of the file and uses defaults for these; a live
+ * config reload treats any of them as an invalid file and keeps the last valid
+ * config instead, so a typo cannot reset a key while the host runs.
+ */
+export function getConfigValidationErrors(): readonly ConfigLoadError[] {
+  return configValidationErrors;
+}
 
 export function getConfigLoadErrors(): readonly ConfigLoadError[] {
   return configLoadErrors;
@@ -1510,6 +1521,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   } else {
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    configValidationErrors.push({ path: configPath, message: errorMsg });
     parsed = parseConfigPartially(cleanConfig);
   }
   if (tier === "user" && parsed.disabled_tools === undefined) {
@@ -1987,6 +1999,7 @@ export function buildConfigTierConfigureParams(
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
+  configValidationErrors = [];
   configLoadNotices = [];
   semanticInputSupplied = false;
 

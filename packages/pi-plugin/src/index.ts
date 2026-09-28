@@ -93,6 +93,7 @@ setActiveLogger(bridgeLogger);
 
 import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
+import { startPiLiveConfigReload } from "./config-live-reload.js";
 import { recordActiveExtensionApi } from "./harness.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
@@ -773,6 +774,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     hashlineEffective: hashlineEditRegistered,
     storageDir,
   };
+  // Keep the live keys of `ctx.config` current when either config file
+  // changes. Tool handlers read `ctx.config` per call; the tool set and its
+  // descriptions stay as loaded and follow the next restart.
+  const liveConfigReload = startPiLiveConfigReload({
+    directory: projectRoot,
+    getConfig: () => ctx.config,
+    setConfig: (next) => {
+      ctx.config = next;
+    },
+    notify: (message) => deliverConfigMigrationWarnings([message]),
+  });
 
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides so bridges spawned
@@ -1004,6 +1016,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
   const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     hostShutdownStarted = true;
+    liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();
@@ -1016,6 +1029,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Clean up bridges on session shutdown.
   pi.on("session_shutdown", async () => {
     hostShutdownStarted = true;
+    liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();

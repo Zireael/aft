@@ -91,6 +91,10 @@ pub struct WatcherFilterConfig {
     pub project_root: PathBuf,
     pub git_common_dir: Option<PathBuf>,
     counters: Arc<crate::context::WatcherCounters>,
+    /// Raised when `<root>/.cortexkit/aft.jsonc` changes, so the root re-reads
+    /// its config. Checked before any ignore filtering: the file is config
+    /// whether or not the project ignores `.cortexkit`.
+    config_reload: Option<Arc<crate::config_live::ConfigReloadSignal>>,
 }
 
 impl WatcherFilterConfig {
@@ -100,6 +104,27 @@ impl WatcherFilterConfig {
             project_root,
             git_common_dir,
             counters,
+            config_reload: None,
+        }
+    }
+
+    pub fn with_config_reload_signal(
+        mut self,
+        signal: Arc<crate::config_live::ConfigReloadSignal>,
+    ) -> Self {
+        self.config_reload = Some(signal);
+        self
+    }
+
+    fn note_config_file_events<'a>(&self, raw_paths: impl IntoIterator<Item = &'a PathBuf>) {
+        let Some(signal) = self.config_reload.as_ref() else {
+            return;
+        };
+        if raw_paths
+            .into_iter()
+            .any(|path| crate::config_live::is_project_config_event_path(&self.project_root, path))
+        {
+            signal.request();
         }
     }
 
@@ -1490,6 +1515,11 @@ impl WatcherFilterThread {
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.flush_deadline = None;
+                        // Dropped events may include a config file edit; the
+                        // reload compares contents, so asking is cheap.
+                        if let Some(signal) = self.config.config_reload.as_ref() {
+                            signal.request();
+                        }
                         if !during_rescan
                             && !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason))
                         {
@@ -1756,6 +1786,7 @@ impl WatcherFilterThread {
 
         let raw_paths = std::mem::take(&mut self.raw_paths);
         self.flush_deadline = None;
+        self.config.note_config_file_events(&raw_paths);
         let initial = filter_canonical_paths(&self.config, &self.matcher, raw_paths.clone());
         let filtered = if initial.ignore_file_changed {
             let observed_generation = self.matcher_generation.load(Ordering::SeqCst);

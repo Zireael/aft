@@ -168,13 +168,14 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
             throw new Error("delete: `files` must be a non-empty array of paths");
           }
           const files = await Promise.all(inputs.map((file) => resolvePathArg(extCtx.cwd, file)));
+          // One value for every file of this call, even if a live config
+          // reload replaces `ctx.config` while the checks run.
+          const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
           const checked = new Set<string>();
           for (const file of files) {
             if (checked.has(file)) continue;
             checked.add(file);
-            await assertExternalDirectoryPermission(extCtx, file, {
-              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-            });
+            await assertExternalDirectoryPermission(extCtx, file, { restrictToProjectRoot });
           }
 
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -240,10 +241,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           const filePath = await resolvePathArg(extCtx.cwd, params.path as string);
           const destination = await resolvePathArg(extCtx.cwd, params.destination);
           const checked = new Set([filePath, destination]);
+          const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
           for (const file of checked) {
-            await assertExternalDirectoryPermission(extCtx, file, {
-              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-            });
+            await assertExternalDirectoryPermission(extCtx, file, { restrictToProjectRoot });
           }
 
           const bridge = bridgeFor(ctx, extCtx.cwd);

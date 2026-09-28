@@ -13,6 +13,7 @@ import {
 } from "../bridge-bootstrap.js";
 import { resolveBridgePoolTransportOptions } from "../config.js";
 import { buildConfigErrorToolMap } from "../config-error-surface.js";
+import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
@@ -39,6 +40,7 @@ const defaults = {
   }),
   acquireBridge,
   releaseBridge,
+  startLiveConfigReload: startOpenCodeLiveConfigReload,
   resolvePoolOptions: resolveBridgePoolTransportOptions,
   resolveVersion: () => resolvePluginVersion(import.meta.url),
 };
@@ -113,7 +115,17 @@ async function bootLocation(context, location, dependencies) {
   const { hashlineEditRegistered } = applyToolSurfaceOverrides(pool, config, registeredTools);
   reportHashlineDowngrade(config, registeredTools, notify);
   toolContext.hashlineEffective = hashlineEditRegistered;
-  return { consumers, pool, tools };
+  // Keep this Location's live config keys current when a config file changes.
+  // The finalizer that releases the bridge also stops the watch.
+  const liveConfigReload = dependencies.startLiveConfigReload({
+    directory,
+    getConfig: () => toolContext.config,
+    setConfig: (next) => {
+      toolContext.config = next;
+    },
+    notify,
+  });
+  return { consumers, pool, tools, liveConfigReload };
 }
 
 /**
@@ -185,6 +197,7 @@ export function makeServerEffect(overrides = {}) {
 
       yield* Effect.addFinalizer(() =>
         Effect.promise(async () => {
+          runtime.liveConfigReload?.stop();
           runtime.consumers.dispose?.();
           await dependencies.releaseBridge(runtime.pool);
         }),

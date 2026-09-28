@@ -47,6 +47,52 @@ pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 
+thread_local! {
+    /// Config snapshots pinned by the requests running on this thread, keyed
+    /// by the address of the `AppContext` they belong to.
+    static CONFIG_PINS: std::cell::RefCell<Vec<(usize, Arc<Config>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn pinned_config_for(key: usize) -> Option<Arc<Config>> {
+    CONFIG_PINS.with(|pins| {
+        pins.borrow()
+            .iter()
+            .find(|(pinned_key, _)| *pinned_key == key)
+            .map(|(_, config)| Arc::clone(config))
+    })
+}
+
+fn replace_pinned_config(key: usize, config: &Arc<Config>) {
+    CONFIG_PINS.with(|pins| {
+        if let Some(slot) = pins
+            .borrow_mut()
+            .iter_mut()
+            .find(|(pinned_key, _)| *pinned_key == key)
+        {
+            slot.1 = Arc::clone(config);
+        }
+    });
+}
+
+/// Releases a request's config pin; see [`AppContext::pin_config`].
+pub struct ConfigPinGuard {
+    key: Option<usize>,
+    // The pin lives in a thread-local, so the guard must drop on this thread.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ConfigPinGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            CONFIG_PINS.with(|pins| {
+                pins.borrow_mut()
+                    .retain(|(pinned_key, _)| *pinned_key != key)
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Ignore-file walks run by this thread; see
@@ -2606,6 +2652,9 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
+    /// State for applying config file edits while the root stays bound: what
+    /// the last configure read, the reload request flag and the file watches.
+    config_live: crate::config_live::ConfigLiveState,
     /// Last tool/request activity for this root. Standalone idle LSP reclaim
     /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.
     last_request_at: parking_lot::Mutex<Instant>,
@@ -3143,6 +3192,7 @@ impl AppContext {
             backup: parking_lot::Mutex::new(BackupStore::new()),
             checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
+            config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -4871,6 +4921,16 @@ impl AppContext {
 
     /// Access an owned configuration snapshot.
     pub fn config(&self) -> Arc<Config> {
+        if let Some(pinned) = pinned_config_for(self.config_pin_key()) {
+            return pinned;
+        }
+        self.config_unpinned()
+    }
+
+    /// The published configuration, ignoring any snapshot the calling request
+    /// pinned. Read-modify-write callers use this so they never republish an
+    /// older snapshot over a newer one.
+    pub fn config_unpinned(&self) -> Arc<Config> {
         let guard = match self.config.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -4880,6 +4940,17 @@ impl AppContext {
 
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
+        self.publish_config(None, config);
+    }
+
+    /// Publish `config` only if the published snapshot is still `expected`.
+    /// A live config reload builds its snapshot from the one it read, so it
+    /// must not overwrite a configure that published in between.
+    pub fn publish_config_if_current(&self, expected: &Arc<Config>, config: Config) -> bool {
+        self.publish_config(Some(expected), config)
+    }
+
+    fn publish_config(&self, expected: Option<&Arc<Config>>, config: Config) -> bool {
         let next = Arc::new(config);
         let next_watcher_counters = next
             .project_root
@@ -4891,13 +4962,19 @@ impl AppContext {
                 .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &guard)) {
+                return false;
+            }
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.
             let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
                 != next.project_root.as_ref().map(|root| root.as_os_str());
-            *guard = next;
+            *guard = Arc::clone(&next);
             changed
         };
+        // The publishing thread sees its own publication even while it holds a
+        // request pin (configure runs inside a pinned request).
+        replace_pinned_config(self.config_pin_key(), &next);
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
@@ -4905,6 +4982,37 @@ impl AppContext {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = next_watcher_counters;
         }
+        true
+    }
+
+    /// Pin the published configuration for the rest of the calling request.
+    ///
+    /// Until the guard drops, `config()` on this thread returns the snapshot
+    /// that was published when the request was admitted, so a live config
+    /// reload switches over between requests and never in the middle of one.
+    /// A nested pin for the same context keeps the outer snapshot.
+    pub fn pin_config(&self) -> ConfigPinGuard {
+        let key = self.config_pin_key();
+        let pushed = CONFIG_PINS.with(|pins| {
+            let mut pins = pins.borrow_mut();
+            if pins.iter().any(|(pinned_key, _)| *pinned_key == key) {
+                return false;
+            }
+            pins.push((key, self.config_unpinned()));
+            true
+        });
+        ConfigPinGuard {
+            key: pushed.then_some(key),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn config_pin_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    pub fn config_live(&self) -> &crate::config_live::ConfigLiveState {
+        &self.config_live
     }
 
     #[cfg(test)]
@@ -4920,7 +5028,7 @@ impl AppContext {
 
     /// Clone-mutate-publish the current configuration without returning a guard.
     pub fn update_config(&self, update: impl FnOnce(&mut Config)) {
-        let mut next = self.config().as_ref().clone();
+        let mut next = self.config_unpinned().as_ref().clone();
         update(&mut next);
         self.set_config(next);
     }

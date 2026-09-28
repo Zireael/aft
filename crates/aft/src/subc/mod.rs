@@ -102,11 +102,12 @@ const RELIABLE_PUSH_DRAIN_BUDGET: usize = 32;
 /// while follow-up batches still re-enter the capped queue instead of bypassing
 /// the budget.
 const MAINTENANCE_SUBMIT_BUDGET: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len() * 8;
-const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 4] = [
+const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 5] = [
     MaintenanceDrainKind::Watcher,
     MaintenanceDrainKind::Lsp,
     MaintenanceDrainKind::ConfigureTail,
     MaintenanceDrainKind::CompletionDrains,
+    MaintenanceDrainKind::ConfigReload,
 ];
 /// Most configure tails (the post-bind catch-up: artifact load starts, symbol
 /// prewarm, storage sweeps, watcher start) running at once across every root.
@@ -1037,6 +1038,7 @@ struct MaintenanceCompletion {
     empty_bg_sessions: Vec<(String, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
+    diagnostics_on_edit: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1045,6 +1047,9 @@ enum MaintenanceDrainKind {
     Lsp,
     ConfigureTail,
     CompletionDrains,
+    /// Re-read the root's config files after an edit and apply the keys that
+    /// may change while the root stays bound (`crate::config_live`).
+    ConfigReload,
 }
 
 impl MaintenanceDrainKind {
@@ -1054,6 +1059,7 @@ impl MaintenanceDrainKind {
             Self::Lsp => "lsp",
             Self::ConfigureTail => "configure-tail",
             Self::CompletionDrains => "completion-drains",
+            Self::ConfigReload => "config-reload",
         }
     }
 }
@@ -1063,6 +1069,9 @@ struct MaintenanceJobOutcome {
     empty_bg_sessions: Vec<(String, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
+    /// The root's `lsp.diagnostics_on_edit` after a config reload, which the
+    /// route loop keeps its own copy of for tool calls.
+    diagnostics_on_edit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1230,6 +1239,7 @@ fn due_maintenance_jobs_with_tail_limits(
                             MaintenanceDrainKind::CompletionDrains => {
                                 root_has_pending_bg_wake || ctx.completion_drains_have_work()
                             }
+                            MaintenanceDrainKind::ConfigReload => ctx.config_live().reload_due(),
                         }
                     })
                     .collect(),
@@ -2988,6 +2998,17 @@ pub fn run_subc_mode(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError> {
+    // One watch on the user config file serves every root in this process:
+    // an edit asks each live root to reload its config.
+    let _user_config_watch = user_config_path.clone().map(|path| {
+        let executor = Arc::downgrade(&executor);
+        crate::config_live::start_process_user_config_watch(path, move || {
+            executor
+                .upgrade()
+                .map(|executor| executor.actor_contexts())
+                .unwrap_or_default()
+        })
+    });
     // Production NEVER allows non-manifest tool names on route channels: AFT
     // fails closed and does not trust subc to enforce the manifest. The
     // test-only harness sets this through `run_subc_mode_for_test`.
@@ -4508,6 +4529,9 @@ where
                 let requiesce = if let Some(meta) = live_roots.get_mut(&root_id) {
                     if completion.kind == MaintenanceDrainKind::ConfigureTail {
                         meta.configure_tail_in_flight = false;
+                    }
+                    if let Some(diagnostics_on_edit) = completion.diagnostics_on_edit {
+                        meta.diagnostics_on_edit = diagnostics_on_edit;
                     }
                     let defer_requeue = meta.unbound_quiesced || bind_pending;
                     note_maintenance_completion(
@@ -7322,6 +7346,7 @@ fn submit_maintenance_job(
                     empty_bg_sessions: Vec::new(),
                     unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
+                    diagnostics_on_edit: None,
                 }
             }
             MaintenanceDrainKind::Lsp => {
@@ -7333,6 +7358,7 @@ fn submit_maintenance_job(
                     empty_bg_sessions: Vec::new(),
                     unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
+                    diagnostics_on_edit: None,
                 }
             }
             MaintenanceDrainKind::ConfigureTail => {
@@ -7363,6 +7389,18 @@ fn submit_maintenance_job(
                     empty_bg_sessions,
                     unacked_bg_keys: Some(ctx.bash_background().unacked_wake_keys()),
                     requeue_kind: None,
+                    diagnostics_on_edit: None,
+                }
+            }
+            MaintenanceDrainKind::ConfigReload => {
+                let reloaded =
+                    crate::config_live::drain_config_reload(ctx).is_some_and(|outcome| {
+                        matches!(outcome, crate::config_live::ReloadOutcome::Reloaded { .. })
+                    });
+                MaintenanceJobOutcome {
+                    diagnostics_on_edit: reloaded
+                        .then(|| ctx.config_unpinned().diagnostics_on_edit),
+                    ..MaintenanceJobOutcome::default()
                 }
             }
         };
@@ -7388,6 +7426,13 @@ fn submit_maintenance_job(
             crate::executor::MaintenanceCoalesceKey::LspDrain,
             job,
         ),
+        MaintenanceDrainKind::ConfigReload => executor.submit_coalescable_maintenance_async(
+            root_id,
+            lane,
+            request_id.clone(),
+            crate::executor::MaintenanceCoalesceKey::ConfigReload,
+            job,
+        ),
         MaintenanceDrainKind::ConfigureTail | MaintenanceDrainKind::CompletionDrains => {
             executor.submit_maintenance_async(root_id, lane, request_id.clone(), job)
         }
@@ -7408,6 +7453,7 @@ fn submit_maintenance_job(
                 empty_bg_sessions: outcome.empty_bg_sessions,
                 unacked_bg_keys: outcome.unacked_bg_keys,
                 requeue_kind: outcome.requeue_kind,
+                diagnostics_on_edit: outcome.diagnostics_on_edit,
             },
         )
         .await;

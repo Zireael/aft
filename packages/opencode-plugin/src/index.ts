@@ -41,6 +41,7 @@ import {
   resolveOpenCodeRegistrationRoot,
 } from "./config.js";
 import { buildConfigErrorToolMap } from "./config-error-surface.js";
+import { startOpenCodeLiveConfigReload } from "./config-live-reload.js";
 import {
   drainPendingConfigParseWarnings,
   enqueueConfigParseWarnings,
@@ -452,6 +453,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     storageDir: configOverrides.storage_dir as string,
     isProjectEnabled,
   };
+  // Keep the live keys of `ctx.config` current when either config file
+  // changes. Tool handlers read `ctx.config` per call; the tool set, schemas
+  // and descriptions stay as loaded and follow the next restart.
+  const liveConfigReload = startOpenCodeLiveConfigReload({
+    directory: registrationRoot,
+    getConfig: () => ctx.config,
+    setConfig: (config) => {
+      ctx.config = config;
+    },
+    notify: (message) => deliverConfigMigrationWarnings(registrationRoot, [message]),
+  });
 
   type StatusSubscribableBridge = {
     subscribeStatus(listener: (snapshot: Record<string, unknown>) => void): () => void;
@@ -515,6 +527,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   let clearInspectTier2Idle = () => {};
   const shutdownCleanup = registerShutdownCleanup(async (reason) => {
     autoUpdateAbort.abort();
+    liveConfigReload.stop();
     clearInspectTier2Idle();
     for (const unsubscribe of statusUnsubscribes) {
       try {
@@ -826,7 +839,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   const inspectTier2Idle = createInspectTier2IdleScheduler({
     isEnabled: () => registeredTools.has("aft_inspect"),
-    idleMinutes: () => aftConfig.inspect?.tier2_idle_minutes,
+    idleMinutes: () => ctx.config.inspect?.tier2_idle_minutes,
     warn,
     run: async (sessionID: string): Promise<void> => {
       const sessionDir =
@@ -897,7 +910,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           storageDir: configOverrides.storage_dir as string,
           pluginVersion: PLUGIN_VERSION,
           serverUrl: input.serverUrl?.toString(),
-          delivery: aftConfig.configure_warnings_delivery ?? "toast",
+          delivery: ctx.config.configure_warnings_delivery ?? "toast",
         });
       }
       await flushConfigureWarningsOnIdle(sessionID);

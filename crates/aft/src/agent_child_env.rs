@@ -292,6 +292,13 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Install the managed git hooks that `git.co_author` needs, without touching
+/// the gh shim. A live config reload turning co-author attribution on calls
+/// this; the shim is only changed by a full configure.
+pub(crate) fn ensure_git_hooks(storage_root: &Path) -> Result<(), String> {
+    ensure_managed_git_hooks(&managed_git_hooks_dir(storage_root))
+}
+
 /// Remove inherited governance markers from THIS PROCESS's environment.
 ///
 /// A daemon is the injector of these markers, never a consumer: when an agent

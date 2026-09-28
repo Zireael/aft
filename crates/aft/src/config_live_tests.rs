@@ -1,0 +1,462 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+
+use super::*;
+use crate::config::Config;
+use crate::context::AppContext;
+use crate::parser::TreeSitterProvider;
+use crate::protocol::RawRequest;
+
+struct Fixture {
+    ctx: AppContext,
+    root: PathBuf,
+    user_path: PathBuf,
+    project_path: PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new(user: &str, project: Option<&str>) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let project_path = project_config_path(&root);
+        write(&user_path, user);
+        if let Some(project) = project {
+            write(&project_path, project);
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(temp.path().join("storage")),
+                ..Config::default()
+            },
+        );
+        let fixture = Self {
+            ctx,
+            root,
+            user_path,
+            project_path,
+            _temp: temp,
+        };
+        fixture.configure();
+        fixture
+    }
+
+    fn configure(&self) {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "configure-live-reload",
+            "command": "configure",
+            "project_root": self.root,
+            "harness": "opencode",
+            "cortexkit_user_config_path": self.user_path,
+        }))
+        .expect("configure request");
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let response = crate::commands::configure::handle_configure(&req, &self.ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+    }
+
+    /// Run the reload the file watcher would have asked for.
+    fn reload(&self) -> ReloadOutcome {
+        self.ctx.config_live().signal().request_now();
+        drain_config_reload(&self.ctx).expect("a due reload runs")
+    }
+}
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+    std::fs::write(path, text).expect("write config");
+}
+
+fn applied(outcome: &ReloadOutcome) -> Vec<&'static str> {
+    match outcome {
+        ReloadOutcome::Reloaded { applied, .. } => applied.clone(),
+        other => panic!("expected a reload, got {other:?}"),
+    }
+}
+
+fn deferred(outcome: &ReloadOutcome) -> Vec<&'static str> {
+    match outcome {
+        ReloadOutcome::Reloaded { deferred, .. } => deferred.clone(),
+        other => panic!("expected a reload, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_edit_applies_a_group_a_key_without_reconnect() {
+    let fixture = Fixture::new("{}", Some(r#"{ "bash": { "enabled": true } }"#));
+    assert!(fixture.ctx.config().bash.enabled);
+    let generation = fixture.ctx.configure_generation();
+
+    write(
+        &fixture.project_path,
+        r#"{ "bash": { "enabled": false }, "format_on_edit": true }"#,
+    );
+    let outcome = fixture.reload();
+
+    assert_eq!(applied(&outcome), vec!["format_on_edit", "bash.enabled"]);
+    assert!(!fixture.ctx.config().bash.enabled);
+    assert!(fixture.ctx.config().format_on_edit);
+    // No configure ran: the generation that artifact loads key on is unchanged.
+    assert_eq!(fixture.ctx.configure_generation(), generation);
+}
+
+#[test]
+fn user_file_edit_applies_live_too() {
+    let fixture = Fixture::new(r#"{ "url_fetch_allow_private": false }"#, None);
+    write(&fixture.user_path, r#"{ "url_fetch_allow_private": true }"#);
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["url_fetch_allow_private"]);
+    assert!(fixture.ctx.config().url_fetch_allow_private);
+}
+
+#[test]
+fn deferred_keys_are_listed_and_not_applied_until_the_next_configure() {
+    let fixture = Fixture::new("{}", Some("{}"));
+    let generation = fixture.ctx.configure_generation();
+    assert!(fixture.ctx.config().indexes.trigram);
+    assert!(!fixture
+        .ctx
+        .config()
+        .disabled_tools
+        .iter()
+        .any(|tool| tool == "aft_zoom"));
+
+    write(
+        &fixture.project_path,
+        r#"{ "disabled_tools": ["aft_zoom"], "indexes": { "trigram": false }, "validate_on_edit": "syntax" }"#,
+    );
+    let outcome = fixture.reload();
+
+    assert_eq!(applied(&outcome), vec!["validate_on_edit"]);
+    assert_eq!(
+        deferred(&outcome),
+        vec!["disabled_tools", "indexes.trigram"]
+    );
+    let config = fixture.ctx.config();
+    assert_eq!(config.validate_on_edit.as_deref(), Some("syntax"));
+    assert!(config.indexes.trigram, "a B key must not change live");
+    assert!(
+        !config.disabled_tools.iter().any(|tool| tool == "aft_zoom"),
+        "a C key must not change live"
+    );
+    assert_eq!(fixture.ctx.configure_generation(), generation);
+
+    // Deferred keys stay listed while they wait for a connect.
+    write(
+        &fixture.project_path,
+        r#"{ "disabled_tools": ["aft_zoom"], "indexes": { "trigram": false }, "validate_on_edit": "full" }"#,
+    );
+    assert_eq!(
+        deferred(&fixture.reload()),
+        vec!["disabled_tools", "indexes.trigram"]
+    );
+
+    // The next configure applies them as before.
+    fixture.configure();
+    let config = fixture.ctx.config();
+    assert!(!config.indexes.trigram);
+    assert!(config.disabled_tools.iter().any(|tool| tool == "aft_zoom"));
+}
+
+#[test]
+fn reload_log_line_names_applied_and_deferred_keys() {
+    let line = reload_log_line(
+        "/p",
+        &["bash.enabled"],
+        &["disabled_tools"],
+        &["restrict_to_project_root (user-only)".to_string()],
+    );
+    assert_eq!(
+        line,
+        "config reload root=/p applied=[bash.enabled] deferred=[disabled_tools] \
+         (deferred keys apply on next connect/restart) \
+         dropped=[restrict_to_project_root (user-only)] (project may only tighten)"
+    );
+}
+
+#[test]
+fn invalid_edits_keep_the_last_good_config() {
+    let fixture = Fixture::new("{}", Some(r#"{ "format_on_edit": true }"#));
+    write(
+        &fixture.project_path,
+        r#"{ "format_on_edit": true, "bash": { "enabled": false } }"#,
+    );
+    assert_eq!(applied(&fixture.reload()), vec!["bash.enabled"]);
+
+    for (label, text) in [
+        ("truncated JSONC", r#"{ "bash": { "enabled": true "#),
+        ("not an object", "[1, 2]"),
+        ("retired key", r#"{ "gh_read": true }"#),
+        (
+            "one bad value next to good ones",
+            r#"{ "bash": { "enabled": "nope" }, "format_on_edit": false }"#,
+        ),
+    ] {
+        write(&fixture.project_path, text);
+        let outcome = fixture.reload();
+        assert!(
+            matches!(outcome, ReloadOutcome::Kept { .. }),
+            "{label}: expected the last good config to stay, got {outcome:?}"
+        );
+        let config = fixture.ctx.config();
+        assert!(
+            !config.bash.enabled,
+            "{label}: bash.enabled fell back to its default"
+        );
+        assert!(config.format_on_edit, "{label}: format_on_edit changed");
+    }
+
+    // Fixing the file applies it.
+    write(&fixture.project_path, r#"{ "format_on_edit": false }"#);
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["format_on_edit", "bash.enabled"]);
+}
+
+#[test]
+fn deleted_config_file_keeps_the_last_good_config() {
+    let fixture = Fixture::new(r#"{ "restrict_to_project_root": true }"#, None);
+    assert!(fixture.ctx.config().restrict_to_project_root);
+
+    std::fs::remove_file(&fixture.user_path).expect("delete user config");
+    let outcome = fixture.reload();
+
+    match outcome {
+        ReloadOutcome::Kept { reason } => assert!(reason.contains("was deleted"), "{reason}"),
+        other => panic!("expected the last good config to stay, got {other:?}"),
+    }
+    assert!(fixture.ctx.config().restrict_to_project_root);
+}
+
+#[test]
+fn absent_file_that_was_absent_at_connect_is_not_an_error() {
+    let fixture = Fixture::new("{}", None);
+    write(&fixture.user_path, r#"{ "format_on_edit": true }"#);
+    assert_eq!(applied(&fixture.reload()), vec!["format_on_edit"]);
+}
+
+#[test]
+fn unchanged_file_text_is_a_no_op() {
+    let fixture = Fixture::new("{}", Some(r#"{ "format_on_edit": true }"#));
+    assert_eq!(fixture.reload(), ReloadOutcome::Unchanged);
+    assert!(
+        drain_config_reload(&fixture.ctx).is_none(),
+        "nothing pending"
+    );
+}
+
+#[test]
+fn project_tier_still_cannot_loosen_on_live_reload() {
+    let fixture = Fixture::new(
+        r#"{ "restrict_to_project_root": true, "sandbox": { "enabled": true } }"#,
+        Some("{}"),
+    );
+    assert!(fixture.ctx.config().restrict_to_project_root);
+    assert!(fixture.ctx.config().sandbox.enabled);
+
+    write(
+        &fixture.project_path,
+        r#"{ "restrict_to_project_root": false, "sandbox": { "enabled": false }, "format_on_edit": true }"#,
+    );
+    let outcome = fixture.reload();
+
+    assert_eq!(applied(&outcome), vec!["format_on_edit"]);
+    let ReloadOutcome::Reloaded { dropped, .. } = outcome else {
+        unreachable!()
+    };
+    assert!(
+        dropped
+            .iter()
+            .any(|drop| drop.starts_with("restrict_to_project_root")),
+        "the dropped project key is reported: {dropped:?}"
+    );
+    let config = fixture.ctx.config();
+    assert!(config.restrict_to_project_root);
+    assert!(config.sandbox.enabled);
+}
+
+#[test]
+fn request_pins_its_config_while_a_reload_publishes() {
+    let fixture = Fixture::new("{}", Some("{}"));
+    assert!(!fixture.ctx.config().restrict_to_project_root);
+    write(
+        &fixture.user_path,
+        r#"{ "restrict_to_project_root": true, "sandbox": { "enabled": true } }"#,
+    );
+
+    let principal = crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty;
+    let _pin = fixture.ctx.pin_config();
+    // The reload runs on another thread, like the maintenance lane.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert_eq!(
+                applied(&fixture.reload()),
+                vec!["restrict_to_project_root", "sandbox.enabled"]
+            );
+        });
+    });
+
+    // This request was admitted before the publication: it keeps the old
+    // values for every check it still makes.
+    assert!(!fixture.ctx.config().restrict_to_project_root);
+    assert!(!crate::sandbox_spawn::native_sandbox_enforced(
+        &fixture.ctx,
+        &principal
+    ));
+    // A request admitted afterwards sees the new values.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _pin = fixture.ctx.pin_config();
+            assert!(fixture.ctx.config().restrict_to_project_root);
+            assert_eq!(
+                crate::sandbox_spawn::native_sandbox_enforced(&fixture.ctx, &principal),
+                cfg!(unix)
+            );
+        });
+    });
+    assert!(fixture.ctx.config_unpinned().restrict_to_project_root);
+}
+
+#[test]
+fn publishing_on_a_pinned_thread_updates_that_pin() {
+    let fixture = Fixture::new("{}", None);
+    let _pin = fixture.ctx.pin_config();
+    fixture
+        .ctx
+        .update_config(|config| config.format_on_edit = true);
+    assert!(fixture.ctx.config().format_on_edit);
+}
+
+#[test]
+fn reload_does_not_overwrite_a_configure_that_published_meanwhile() {
+    let fixture = Fixture::new("{}", Some("{}"));
+    let stale = fixture.ctx.config_unpinned();
+    fixture.ctx.update_config(|config| {
+        config.checker.insert("rust".into(), "cargo".into());
+    });
+    let mut next = stale.as_ref().clone();
+    next.format_on_edit = true;
+    assert!(!fixture.ctx.publish_config_if_current(&stale, next));
+    assert!(!fixture.ctx.config().format_on_edit);
+    assert_eq!(
+        fixture.ctx.config().checker.get("rust").map(String::as_str),
+        Some("cargo")
+    );
+}
+
+#[test]
+fn a_user_file_edit_asks_every_live_root_to_reload() {
+    let first = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    let second = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    request_reload_for_roots(&[Arc::clone(&first), Arc::clone(&second)]);
+    assert!(first.config_live().signal().is_pending());
+    assert!(second.config_live().signal().is_pending());
+}
+
+#[test]
+fn signal_debounces_until_quiet() {
+    let signal = ConfigReloadSignal::default();
+    assert!(!signal.take_if_due());
+    signal.request();
+    assert!(signal.is_pending());
+    assert!(!signal.take_if_due(), "not due inside the debounce window");
+    std::thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
+    assert!(signal.take_if_due());
+    assert!(!signal.is_pending());
+}
+
+#[test]
+fn config_file_watch_sees_edits_and_a_directory_created_later() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = std::fs::canonicalize(temp.path()).expect("canonical temp");
+    let file = project_config_path(&root);
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let _watch = ConfigFileWatch::start_with(
+        file.clone(),
+        Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+    let wait_for_hit = |label: &str| {
+        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("config watch missed {label}");
+    };
+    // Let the watch attach to the root before `.cortexkit` exists.
+    std::thread::sleep(Duration::from_millis(500));
+    write(&file, "{}");
+    wait_for_hit("the directory and file being created");
+    std::thread::sleep(Duration::from_millis(500));
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    write(&file, r#"{ "format_on_edit": true }"#);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hits.load(std::sync::atomic::Ordering::SeqCst) == before {
+        assert!(Instant::now() < deadline, "config watch missed an edit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn project_watcher_filter_recognises_the_config_file() {
+    let root = Path::new("/r");
+    assert!(is_project_config_event_path(
+        root,
+        Path::new("/r/.cortexkit/aft.jsonc")
+    ));
+    assert!(is_project_config_event_path(
+        root,
+        Path::new("/r/.cortexkit/aft.jsonc.tmp.123")
+    ));
+    assert!(!is_project_config_event_path(
+        root,
+        Path::new("/r/.cortexkit/other.json")
+    ));
+    assert!(!is_project_config_event_path(
+        root,
+        Path::new("/r/aft.jsonc")
+    ));
+}
+
+#[test]
+fn root_without_a_project_watcher_watches_its_config_files_itself() {
+    enable_config_watches_for_test();
+    let fixture = Fixture::new("{}", Some(r#"{ "bash": { "enabled": true } }"#));
+    // Unit tests start no project watcher, so the root's own watches cover
+    // both files.
+    assert!(fixture.ctx.config_live().has_project_fallback_watch());
+    assert!(fixture.ctx.config_live().has_user_watch());
+    std::thread::sleep(Duration::from_millis(500));
+
+    write(&fixture.project_path, r#"{ "bash": { "enabled": false } }"#);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let outcome = loop {
+        if let Some(outcome) = drain_config_reload(&fixture.ctx) {
+            break outcome;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no reload was requested by the watch"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(applied(&outcome), vec!["bash.enabled"]);
+    assert!(!fixture.ctx.config().bash.enabled);
+}

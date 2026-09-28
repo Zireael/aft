@@ -270,3 +270,71 @@ describe.serial("OpenCode 1 and OpenCode 2 configure bridges identically", () =>
     }
   });
 });
+
+describe.serial("OpenCode 2 live config reload", () => {
+  test("each Location swaps its tool context config and stops the watch with the Location", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "aft-v2-live-config-"));
+    const project = join(tempDir, "project");
+    mkdirSync(project, { recursive: true });
+    const pools: bridge.BridgePool[] = [];
+    let toolContext: { config: Record<string, unknown> } | undefined;
+    let reloadOptions:
+      | {
+          directory: string;
+          getConfig(): Record<string, unknown>;
+          setConfig(config: Record<string, unknown>): void;
+        }
+      | undefined;
+    let stopped = 0;
+
+    const dependencies = {
+      ...inertV2Surface,
+      loadConfig: () => ({ disabled_tools: [] }),
+      configLoadErrors: () => [],
+      migrateConfigLocations: () => [],
+      resolveVersion: () => "0.0.0-test",
+      resolveBinary: async () => join(tempDir as string, "never-spawned-aft"),
+      ensureStorageMigrated: async () => {},
+      resolveStorageRoot: () => join(tempDir as string, "storage"),
+      buildConfigureParams: (_directory: string, state: Overrides) => ({ ...state, config: [] }),
+      ensureOnnxRuntime: async () => null,
+      startLspAutoInstall: () => null,
+      pushLspPaths: async () => {},
+      isOrtAutoDownloadSupported: () => false,
+      acquireBridge: realBridgePoolAcquire(pools),
+      releaseBridge: bridge.releaseBridge,
+      buildToolMap: (context: { config: Record<string, unknown> }) => {
+        toolContext = context;
+        return {};
+      },
+      startLiveConfigReload: (options: NonNullable<typeof reloadOptions>) => {
+        reloadOptions = options;
+        return {
+          reload: () => null,
+          stop: () => {
+            stopped += 1;
+          },
+        };
+      },
+    };
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* makeServerEffect(dependencies)(v2Host(project));
+          yield* Effect.sync(() => {
+            expect(reloadOptions?.directory).toBe(project);
+            const swapped = { disabled_tools: [], restrict_to_project_root: true };
+            reloadOptions?.setConfig(swapped);
+            // Tools read the Location's tool context on every call.
+            expect(toolContext?.config).toBe(swapped);
+            expect(reloadOptions?.getConfig()).toBe(swapped);
+            expect(stopped).toBe(0);
+          });
+        }),
+      ),
+    );
+
+    expect(stopped).toBe(1);
+  });
+});

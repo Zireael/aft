@@ -644,7 +644,8 @@ fn start_project_watcher_with<W, E, F>(
     let app = ctx.app();
     let db = app.db();
     watcher_filter::load_watcher_observations(&root_path, &watcher_counters, db.as_ref());
-    let filter_config = WatcherFilterConfig::new(root_path.clone(), ctx.git_common_dir());
+    let filter_config = WatcherFilterConfig::new(root_path.clone(), ctx.git_common_dir())
+        .with_config_reload_signal(ctx.config_live().signal());
     let shared_gitignore = ctx.shared_gitignore();
     let gitignore_generation = ctx.gitignore_generation();
     let session_id_for_bg = log_ctx::current_session();
@@ -743,7 +744,18 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
     if file_watcher_disabled_for_test() {
         return;
     }
-    let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
+    let mut extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
+    // Watch `<root>/.cortexkit/` directly as well, so an edit to the project
+    // config file is seen even when the project ignores `.cortexkit` (the
+    // recursive watch may then exclude it). Without the directory, the root's
+    // own config file watch covers it until the next watcher start.
+    let config_dir = root_path.join(".cortexkit");
+    let sees_config = config_dir.is_dir();
+    if sees_config {
+        extra_watch_paths.push(config_dir);
+    }
+    ctx.config_live()
+        .set_project_watcher_sees_config(sees_config);
     let matcher = ctx.shared_gitignore();
     let matcher_generation = ctx.gitignore_generation();
     start_project_watcher_with(
@@ -793,6 +805,10 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
         // this is the point to compare the callgraph store with the disk for
         // the edits made while nothing was watching.
         ctx.start_pending_callgraph_reconcile();
+        // Config edits made while nothing watched the files are picked up
+        // now; the reload compares file contents, so it is a no-op otherwise.
+        crate::config_live::sync_config_watches(ctx);
+        ctx.config_live().signal().request_now();
     }
 }
 
@@ -2489,8 +2505,15 @@ fn configure_warm_key(
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
 ) -> String {
+    // Keys a live config reload may change are left out: they select no
+    // artifact, so a connect after a live edit must not reload artifacts
+    // because of them. `callgraph_chunk_size` is read at the next cold build,
+    // the semantic query fields per query, and `inspect.enabled` per call.
+    let mut semantic = config.semantic.clone();
+    semantic.query_timeout_ms = 0;
+    semantic.query_instruction.clear();
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}:{};inspect={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
         canonical_root,
         config.storage_dir,
         home_match,
@@ -2499,11 +2522,9 @@ fn configure_warm_key(
         config.indexes.trigram,
         config.search_index_max_file_size,
         config.indexes.semantic,
-        config.semantic,
+        semantic,
         config.views.enabled,
         config.indexes.callgraph,
-        config.callgraph_chunk_size,
-        config.inspect.enabled,
     )
 }
 
@@ -2674,6 +2695,14 @@ fn register_hashline_for_configure(
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    let response = handle_configure_inner(req, ctx);
+    // A successful configure applied the files it read; record them so a live
+    // config reload can tell later edits apart and knows what is deferred.
+    crate::config_live::finish_configure(ctx, response.success);
+    response
+}
+
+fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -2785,6 +2814,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         );
     }
+    crate::config_live::stage_configure_sources(crate::config_live::ConfigSources::from_configure(
+        parse_cortexkit_user_config_path(params).ok().flatten(),
+        &root_path,
+        &tiers,
+        &next_config,
+    ));
     let mut configure_warnings = config_diagnostics
         .warnings
         .into_iter()
@@ -3544,6 +3579,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
             }
         }
+    } else if previous_config.inspect.enabled != next_config.inspect.enabled {
+        // `inspect.enabled` is not part of the warm key (it selects no
+        // artifact), but turning it on or off still restarts Tier-2 timing.
+        ctx.reset_tier2_refresh_scheduler();
     }
     // Project root (and thus tsconfig resolution) may have changed; drop the
     // status-bar membership cache so the next bar count re-resolves from disk.
@@ -6408,6 +6447,9 @@ fn run_configure_maintenance_unit_inner(
                     }
                 }
             }
+            // The project watcher may or may not cover the project config file
+            // now; start or stop the root's own config file watch to match.
+            crate::config_live::sync_config_watches(ctx);
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
@@ -8676,6 +8718,27 @@ mod tests {
             "max_results": 10
         }))
         .expect("grep request")
+    }
+
+    #[test]
+    fn warm_key_ignores_keys_a_live_config_reload_may_change() {
+        let root = std::path::Path::new("/warm-key-root");
+        let key = |config: &Config| super::configure_warm_key(root, config, false, false, false);
+        let base = Config::default();
+
+        let mut live = base.clone();
+        live.callgraph_chunk_size += 7;
+        live.inspect.enabled = !live.inspect.enabled;
+        live.semantic.query_timeout_ms += 1;
+        live.semantic.query_instruction = "off".to_string();
+        assert_eq!(key(&base), key(&live));
+
+        let mut index_switch = base.clone();
+        index_switch.indexes.trigram = !index_switch.indexes.trigram;
+        assert_ne!(key(&base), key(&index_switch));
+        let mut model = base.clone();
+        model.semantic.model = "another-model".to_string();
+        assert_ne!(key(&base), key(&model));
     }
 
     #[test]

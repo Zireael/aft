@@ -653,6 +653,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
+        aft::config_live::drain_config_reload(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
         aft::runtime_drain::drain_semantic_index_events(runtime);
@@ -693,6 +694,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     // Preserve the dependency order: install finished search artifacts before
     // watcher deltas, then advance the other build channels and diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);
+    aft::config_live::drain_config_reload(runtime);
     aft::runtime_drain::drain_search_index_events(runtime);
     aft::runtime_drain::drain_callgraph_store_events(runtime);
     aft::runtime_drain::drain_semantic_index_events(runtime);
@@ -1061,10 +1063,32 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside `dispatch` after the request pinned its config snapshot.
+    static DISPATCH_CONFIG_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&AppContext)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn dispatch_config_probe_for_test(ctx: &AppContext) {
+    DISPATCH_CONFIG_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe(ctx);
+        }
+    });
+}
+
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     if let Some(response) = ctx.database_runtime_refusal(&req.id, &req.command) {
         return response;
     }
+    // Every read of `ctx.config()` in this request sees the snapshot published
+    // when it was admitted, so a live config reload switches over between
+    // requests, never in the middle of one (path restriction, sandbox).
+    let _config_pin = ctx.pin_config();
+    #[cfg(test)]
+    dispatch_config_probe_for_test(ctx);
     let response = dispatch_command(req, ctx);
     // Every mutation this request made is on disk now; record what it left so
     // a later undo can tell AFT's own result from a change made outside AFT.
@@ -4935,5 +4959,54 @@ mod watcher_filter_tests {
         let snapshot = recv_status_changed(&rx);
         assert!(snapshot["status_bar"].get("errors").is_none());
         assert_eq!(ctx.status_bar_counts(), None);
+    }
+}
+
+#[cfg(test)]
+mod config_pin_tests {
+    use super::{dispatch, DISPATCH_CONFIG_PROBE};
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn dispatch_keeps_the_config_it_was_admitted_with() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        assert!(!ctx.config().restrict_to_project_root);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_probe = Arc::clone(&seen);
+        DISPATCH_CONFIG_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |ctx: &AppContext| {
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+                // A live config reload publishes from another thread while
+                // this request is running.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        ctx.update_config(|config| config.restrict_to_project_root = true)
+                    });
+                });
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+            }));
+        });
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "pin",
+            "command": "ping",
+        }))
+        .unwrap();
+        let response = dispatch(request, &ctx);
+        DISPATCH_CONFIG_PROBE.with(|probe| probe.borrow_mut().take());
+
+        assert!(response.success);
+        assert_eq!(*seen.lock().unwrap(), vec![false, false]);
+        // The next request sees the publication.
+        assert!(ctx.config().restrict_to_project_root);
     }
 }

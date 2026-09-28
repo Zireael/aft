@@ -882,6 +882,43 @@ fn parse_tier(
     Some((raw, translation))
 }
 
+/// Why a tier would be accepted only leniently, or `None` when it parses
+/// strictly.
+///
+/// [`resolve_config_for_harness`] skips a tier whose text does not parse and
+/// resolves a tier with one bad value by dropping that key to its default. A
+/// connect keeps that behaviour. A live reload must not: a typo would reset a
+/// key to its default while the root stays bound, so the reload calls this
+/// first and keeps the last valid configuration instead. Retired keys are left
+/// to the resolver, which rejects them with its own errors. The contents of
+/// `harnesses.<id>` blocks are checked by the resolver as it applies them.
+pub fn strict_tier_error(tier: &ConfigTier) -> Option<String> {
+    let stripped = strip_jsonc(&tier.doc);
+    let value = match serde_json::from_str::<Value>(&stripped) {
+        Ok(value) => value,
+        Err(error) => return Some(format!("{} does not parse: {error}", tier.source)),
+    };
+    let Value::Object(mut map) = value else {
+        return Some(format!("{} is not a JSON object", tier.source));
+    };
+    let document_tier = if tier.tier == "user" {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    let translation = feature_config::translate_document(
+        &mut map,
+        feature_config::current_policy_phase(),
+        document_tier,
+    );
+    if !translation.errors.is_empty() {
+        return None;
+    }
+    serde_json::from_value::<RawAftConfig>(Value::Object(map))
+        .err()
+        .map(|error| format!("{} has an invalid setting: {error}", tier.source))
+}
+
 fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
     let mut partial = RawAftConfig::default();
 
