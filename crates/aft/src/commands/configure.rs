@@ -871,6 +871,40 @@ fn semantic_view_blob_for_path(
     }
 }
 
+/// Tracks one worker's private index without retaining the index in the census.
+/// Each worker owns its contribution: a retiring generation cannot erase a
+/// replacement worker's bytes. Shared bases contribute zero here and are counted
+/// once by the process-wide semantic base registry. Estimates are refreshed at
+/// completed mutation boundaries; transient embedding/refresh buffers are excluded.
+struct SemanticWorkerMemory {
+    total: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl SemanticWorkerMemory {
+    fn new(total: Arc<AtomicU64>, index: &SemanticIndex) -> Self {
+        let mut memory = Self { total, bytes: 0 };
+        memory.update(index);
+        memory
+    }
+
+    fn update(&mut self, index: &SemanticIndex) {
+        let bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
+        if bytes >= self.bytes {
+            self.total.fetch_add(bytes - self.bytes, Ordering::Relaxed);
+        } else {
+            self.total.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for SemanticWorkerMemory {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -887,7 +921,9 @@ fn spawn_semantic_refresh_worker(
     generation: u64,
     limiter: SemanticRefreshLimiter,
     session_id: Option<String>,
+    worker_memory: Arc<AtomicU64>,
 ) -> thread::JoinHandle<()> {
+    let mut index_memory = SemanticWorkerMemory::new(worker_memory, &index);
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
@@ -1043,6 +1079,7 @@ fn spawn_semantic_refresh_worker(
                         &mut reuse_blob,
                         Some(&mut recovery_paths),
                     );
+                    index_memory.update(&index);
                     if embed_batches > 0 {
                         let files = refresh_result
                             .as_ref()
@@ -1156,6 +1193,7 @@ fn spawn_semantic_refresh_worker(
                     &mut progress,
                     &mut reuse_blob,
                 );
+                index_memory.update(&index);
                 if embed_batches > 0 {
                     let files = refresh_result
                         .as_ref()
@@ -1288,6 +1326,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
         generation,
         SemanticRefreshLimiter(ctx.cold_build_limiter()),
         log_ctx::current_session(),
+        ctx.semantic_worker_bytes(),
     );
     if let Ok(mut slot) = worker_slot.lock() {
         *slot = Some(handle);
@@ -4638,6 +4677,7 @@ fn schedule_artifact_loads(
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
         let semantic_cold_build_limiter = ctx.cold_build_limiter();
+        let semantic_worker_memory = ctx.semantic_worker_bytes();
         let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
         let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
         let semantic_generation = configure_generation;
@@ -5432,6 +5472,7 @@ fn schedule_artifact_loads(
                                         &semantic_cold_build_limiter,
                                     )),
                                     log_ctx::current_session(),
+                                    Arc::clone(&semantic_worker_memory),
                                 );
                                 if let Ok(mut slot) = refresh_worker_slot.lock() {
                                     *slot = Some(worker_handle);
@@ -7936,6 +7977,7 @@ mod tests {
             generation,
             limiter,
             None,
+            ctx.semantic_worker_bytes(),
         );
         (ctx, request_tx, event_rx, worker)
     }
@@ -7946,6 +7988,114 @@ mod tests {
             .flatten()
             .filter(|text| text.as_str() != "semantic index fingerprint probe")
             .count()
+    }
+
+    #[test]
+    fn semantic_worker_census_counts_refresh_and_releases_on_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("memory.rs");
+        std::fs::write(&file, "pub fn first() -> usize { 1 }\n").unwrap();
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let config = semantic_refresh_test_config(&server.base_url);
+        let (ctx, requests, events, worker) = spawn_semantic_corpus_refresh_worker_for_test(
+            root.clone(),
+            &config,
+            super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
+            Duration::ZERO,
+        );
+        assert_eq!(ctx.semantic_worker_bytes().load(Ordering::Relaxed), 0);
+        requests
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![file.clone()],
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                events.recv_timeout(Duration::from_secs(10)).unwrap(),
+                SemanticRefreshEvent::Completed { .. }
+            ) {
+                break;
+            }
+        }
+        let snapshot = ctx.memory_root_snapshot();
+        let first_bytes = snapshot.semantic.counts["worker_index_bytes"];
+        assert!(
+            first_bytes > 0,
+            "a populated worker must be counted even with no serving index"
+        );
+        assert_eq!(snapshot.semantic.counts["serving_index_bytes"], 0);
+        assert_eq!(snapshot.semantic.estimated_bytes, Some(first_bytes));
+        let census = crate::commands::memory_census::render_memory_census(
+            &ctx.memory_snapshot_uncapped(),
+            None,
+        );
+        assert_eq!(
+            census["roots"]["<unconfigured>"]["semantic_worker_bytes"],
+            first_bytes
+        );
+        assert_eq!(
+            census["roots"]["<unconfigured>"]["planes"]["semantic"],
+            first_bytes
+        );
+        std::fs::write(
+            &file,
+            "/// Count payloads that remain owned by background refresh workers.\n\
+             /// Disconnected sessions may still have a refresh finishing its current request.\n\
+             pub fn retained_worker_payload_bytes(active: &[usize]) -> usize {\n\
+                 let mut retained = 0;\n\
+                 for bytes in active { retained += *bytes; }\n\
+                 retained\n\
+             }\n",
+        )
+        .unwrap();
+        requests.send(SemanticRefreshRequest::Corpus).unwrap();
+        loop {
+            if let SemanticRefreshEvent::CorpusCompleted { index, .. } =
+                events.recv_timeout(Duration::from_secs(10)).unwrap()
+            {
+                assert!(
+                    index.entry_count() > 1,
+                    "fixture must produce semantic chunks"
+                );
+                break;
+            }
+        }
+        assert!(
+            ctx.memory_root_snapshot().semantic.counts["worker_index_bytes"] > first_bytes,
+            "corpus refresh must publish the larger worker estimate"
+        );
+        drop(requests);
+        worker.join().unwrap();
+        assert_eq!(
+            ctx.memory_root_snapshot().semantic.counts["worker_index_bytes"],
+            0
+        );
+    }
+
+    #[test]
+    fn semantic_worker_census_retiring_generation_preserves_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("memory.rs");
+        std::fs::write(&file, "pub fn allocated() -> usize { 42 }\n").unwrap();
+        let index = SemanticIndex::build(
+            root.path(),
+            &[file],
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect()),
+            64,
+        )
+        .unwrap();
+        let bytes = index.estimated_memory().estimated_bytes.unwrap();
+        assert!(bytes > 0);
+        let total = Arc::new(super::AtomicU64::new(0));
+        let old = super::SemanticWorkerMemory::new(Arc::clone(&total), &index);
+        let replacement = super::SemanticWorkerMemory::new(Arc::clone(&total), &index);
+        assert_eq!(total.load(Ordering::Relaxed), 2 * bytes);
+        drop(old);
+        assert_eq!(total.load(Ordering::Relaxed), bytes);
+        drop(replacement);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
     }
 
     struct CountingEmbeddingServer {
@@ -8244,6 +8394,7 @@ mod tests {
             ctx.configure_generation(),
             super::SemanticRefreshLimiter(ctx.cold_build_limiter()),
             None,
+            ctx.semantic_worker_bytes(),
         );
         *slot.lock().unwrap() = Some(worker);
 
@@ -9871,6 +10022,7 @@ mod tests {
             generation,
             super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
             None,
+            ctx.semantic_worker_bytes(),
         );
 
         std::fs::write(&source, "pub fn unstable_content() -> bool { false }\n")

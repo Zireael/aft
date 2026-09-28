@@ -2726,6 +2726,7 @@ pub struct AppContext {
     semantic_refresh_epoch: AtomicU64,
     semantic_refresh_build_epoch: AtomicU64,
     semantic_refresh_worker: parking_lot::Mutex<Option<SemanticRefreshWorkerSlot>>,
+    semantic_worker_bytes: Arc<AtomicU64>,
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
     semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
@@ -3212,6 +3213,7 @@ impl AppContext {
             semantic_refresh_epoch: AtomicU64::new(0),
             semantic_refresh_build_epoch: AtomicU64::new(0),
             semantic_refresh_worker: parking_lot::Mutex::new(None),
+            semantic_worker_bytes: Arc::default(),
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
             semantic_embedding_model: parking_lot::Mutex::new(None),
@@ -7749,6 +7751,10 @@ impl AppContext {
             .store(active, Ordering::SeqCst);
     }
 
+    pub(crate) fn semantic_worker_bytes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.semantic_worker_bytes)
+    }
+
     pub fn install_semantic_refresh_worker(
         &self,
         sender: crossbeam_channel::Sender<SemanticRefreshRequest>,
@@ -9189,7 +9195,7 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
-        let semantic = match self.semantic_index.try_read() {
+        let mut semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
                 .map(SemanticIndex::estimated_memory)
@@ -9201,6 +9207,23 @@ impl AppContext {
                 .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
+        let worker_bytes = self.semantic_worker_bytes.load(Ordering::Relaxed);
+        if let Some(serving_bytes) = semantic.estimated_bytes {
+            semantic
+                .counts
+                .insert("serving_index_bytes".into(), serving_bytes);
+            semantic.estimated_bytes = Some(serving_bytes.saturating_add(worker_bytes));
+        } else {
+            // A busy serving index must not hide the independently observed worker.
+            semantic.estimated_bytes = Some(worker_bytes);
+            semantic.bytes_status = "partial";
+            semantic
+                .not_estimated
+                .push("serving_semantic_index_busy".into());
+        }
+        semantic
+            .counts
+            .insert("worker_index_bytes".into(), worker_bytes);
         let trigram = match self.search_index.try_read() {
             Ok(index) => index
                 .as_ref()

@@ -55,6 +55,8 @@ pub fn render_memory_census(
                 "pending_install": pending_install,
             },
             "attributed_bytes": planes_total,
+            // Included in the semantic plane, not an additional plane to sum.
+            "semantic_worker_bytes": detail.semantic.counts.get("worker_index_bytes").copied().unwrap_or(0),
             "evictable_bytes": detail.evictable_bytes(),
             "lsp_children": { "count": 0, "rss_bytes": 0 },
         });
