@@ -323,13 +323,52 @@ fn request_pins_its_config_while_a_reload_publishes() {
 }
 
 #[test]
-fn publishing_on_a_pinned_thread_updates_that_pin() {
+fn configure_publication_updates_its_own_pin_but_a_setter_does_not() {
     let fixture = Fixture::new("{}", None);
     let _pin = fixture.ctx.pin_config();
+    // A setter publishing from inside a request leaves the request on its
+    // admitted snapshot.
     fixture
         .ctx
         .update_config(|config| config.format_on_edit = true);
-    assert!(fixture.ctx.config().format_on_edit);
+    assert!(!fixture.ctx.config().format_on_edit);
+    assert!(fixture.ctx.config_unpinned().format_on_edit);
+    // Configure (set_config) sees its own publication.
+    let mut next = fixture.ctx.config_unpinned().as_ref().clone();
+    next.validate_on_edit = Some("syntax".to_string());
+    fixture.ctx.set_config(next);
+    assert_eq!(
+        fixture.ctx.config().validate_on_edit.as_deref(),
+        Some("syntax")
+    );
+}
+
+#[test]
+fn a_setter_racing_a_reload_does_not_undo_the_reload() {
+    let fixture = Fixture::new("{}", None);
+    write(
+        &fixture.user_path,
+        r#"{ "restrict_to_project_root": true }"#,
+    );
+    let compress_before = fixture.ctx.config_unpinned().experimental_bash_compress;
+    std::thread::scope(|scope| {
+        let mut reload_thread = None;
+        fixture.ctx.update_config(|config| {
+            // The reload publishes while this setter is between its read and
+            // its write.
+            reload_thread = Some(scope.spawn(|| fixture.reload()));
+            std::thread::sleep(Duration::from_millis(300));
+            config.experimental_bash_compress = !config.experimental_bash_compress;
+        });
+        let outcome = reload_thread.unwrap().join().unwrap();
+        assert_eq!(applied(&outcome), vec!["restrict_to_project_root"]);
+    });
+    let config = fixture.ctx.config();
+    assert!(
+        config.restrict_to_project_root,
+        "the setter overwrote the reload"
+    );
+    assert_ne!(config.experimental_bash_compress, compress_before);
 }
 
 #[test]
@@ -632,5 +671,99 @@ fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
     match drain_config_reload(&ctx) {
         Some(ReloadOutcome::Kept { reason }) => assert!(reason.contains("was deleted"), "{reason}"),
         other => panic!("expected the deletion to be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn successive_held_project_edits_keep_all_published_project_hardening() {
+    let fixture = Fixture::new(
+        r#"{ "sandbox": { "enabled": true, "read_deny": ["/u"] } }"#,
+        Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#),
+    );
+    let deny = |path: &str| {
+        fixture
+            .ctx
+            .config()
+            .sandbox
+            .read_deny
+            .contains(&PathBuf::from(path))
+    };
+    assert!(deny("/u") && deny("/a"));
+
+    // [A] -> [B]: A is held, B is added.
+    write(
+        &fixture.project_path,
+        r#"{ "sandbox": { "read_deny": ["/b"] } }"#,
+    );
+    assert_eq!(held(&fixture.reload()), vec!["sandbox.read_deny"]);
+    assert!(deny("/u") && deny("/a") && deny("/b"));
+
+    // [B] -> []: B came from a project text that was never recorded, and must
+    // stay as well as A.
+    write(&fixture.project_path, "{}");
+    assert_eq!(held(&fixture.reload()), vec!["sandbox.read_deny"]);
+    assert!(
+        deny("/u") && deny("/a") && deny("/b"),
+        "{:?}",
+        fixture.ctx.config().sandbox.read_deny
+    );
+
+    // A connect resolves afresh.
+    fixture.configure();
+    assert!(deny("/u") && !deny("/a") && !deny("/b"));
+}
+
+#[test]
+fn successive_held_project_edits_keep_a_project_enabled_sandbox() {
+    // The project turns the sandbox on and also adds a deny; the next edit
+    // drops the deny (held) while keeping the sandbox on, and the one after
+    // turns the sandbox off.
+    let fixture = Fixture::new("{}", Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#));
+    assert!(!fixture.ctx.config().sandbox.enabled);
+
+    write(
+        &fixture.project_path,
+        r#"{ "sandbox": { "enabled": true } }"#,
+    );
+    let outcome = fixture.reload();
+    assert_eq!(held(&outcome), vec!["sandbox.read_deny"]);
+    assert!(fixture.ctx.config().sandbox.enabled);
+
+    write(&fixture.project_path, "{}");
+    fixture.reload();
+    assert!(
+        fixture.ctx.config().sandbox.enabled,
+        "a sandbox a held project edit turned on must stay on"
+    );
+}
+
+#[test]
+fn a_replaced_config_directory_is_watched_again() {
+    enable_config_watches_for_test();
+    let fixture = Fixture::new("{}", Some("{}"));
+    assert!(fixture.ctx.config_live().has_project_fallback_watch());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Rename the directory aside and put a new one in its place.
+    let config_dir = fixture.project_path.parent().unwrap().to_path_buf();
+    let aside = config_dir.with_file_name(".cortexkit-old");
+    std::fs::rename(&config_dir, &aside).unwrap();
+    write(&fixture.project_path, "{}");
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = drain_config_reload(&fixture.ctx);
+
+    // A security tightening in the replacement must be applied.
+    write(
+        &fixture.project_path,
+        r#"{ "sandbox": { "enabled": true } }"#,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.ctx.config().sandbox.enabled {
+        assert!(
+            Instant::now() < deadline,
+            "an edit in the replaced directory was never applied"
+        );
+        let _ = drain_config_reload(&fixture.ctx);
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

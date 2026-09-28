@@ -288,3 +288,60 @@ describe("startLiveConfigReload start-up", () => {
     }
   });
 });
+
+describe("watchAftConfigFiles registration and retries", () => {
+  test("a directory replaced while its watch is being set up is watched again", async () => {
+    const dir = tempDir();
+    const configDir = join(dir, ".cortexkit");
+    const file = join(configDir, "aft.jsonc");
+    mkdirSync(configDir);
+    writeFileSync(file, "{}");
+    const watched: string[] = [];
+    let replaced = false;
+    const fakeWatch = ((path: string) => {
+      watched.push(path);
+      return { close: () => {}, on: () => {} };
+    }) as unknown as typeof import("node:fs").watch;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      onChange: () => {},
+      watchImpl: fakeWatch,
+      beforeWatchForTest: (target) => {
+        if (replaced || target !== configDir) return;
+        replaced = true;
+        // Replace the directory between the identity read and the watch.
+        rmSync(configDir, { recursive: true, force: true });
+        mkdirSync(configDir);
+        writeFileSync(file, "{}");
+      },
+    });
+    try {
+      await waitUntil(
+        () => watched.filter((path) => path === configDir).length >= 2,
+        "the replaced directory was watched again",
+        4_000,
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  test("a rejected text is checked again without another event", async () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    writeFileSync(file, "{}");
+    const results = [false, true];
+    let calls = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      onChange: () => results[calls++] ?? true,
+    });
+    try {
+      writeFileSync(file, '{ "restrict_to_project_root": true }');
+      await waitUntil(() => calls >= 2, "the rejected text was retried", 4_000);
+    } finally {
+      stop();
+    }
+  });
+});

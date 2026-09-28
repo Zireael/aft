@@ -225,6 +225,10 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
         return;
     }
     *ctx.config_live().sources.lock() = Some(sources);
+    // A connect resolves the files afresh; nothing it applied is held.
+    ctx.config_live()
+        .project_hold_active
+        .store(false, Ordering::Release);
     sync_config_watches(ctx);
 }
 
@@ -240,6 +244,11 @@ pub struct ConfigLiveState {
     last_error: parking_lot::Mutex<Option<String>>,
     /// The last reload report, for tests and status.
     last_outcome: parking_lot::Mutex<Option<ReloadOutcome>>,
+    /// Whether a project loosening is being held. While it is, the published
+    /// security values are part of the floor, because they may include
+    /// hardening from project texts that were never recorded (a later project
+    /// edit made while an earlier one was held). Cleared by a connect.
+    project_hold_active: AtomicBool,
 }
 
 #[derive(Default)]
@@ -483,22 +492,26 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             .iter()
             .map(|drop| format!("{} ({})", drop.key, drop.reason))
             .collect();
-        let held = if project_changed {
-            let mut user_only = published.as_ref().clone();
+        let holding = state.project_hold_active.load(Ordering::Acquire);
+        let held = if project_changed || holding {
+            let mut floor = published.as_ref().clone();
             let user_only_diagnostics =
                 crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
                     &user_only_tiers,
                     published.harness.as_ref(),
-                    &mut user_only,
+                    &mut floor,
                 );
             // The previous project text was accepted when it was applied; if
             // it no longer resolves, the published config is the floor.
-            let floor = if user_only_diagnostics.errors.is_empty() {
-                &user_only
-            } else {
-                published.as_ref()
-            };
-            hold_project_loosening(&mut candidate, floor)
+            if !user_only_diagnostics.errors.is_empty() {
+                floor = published.as_ref().clone();
+            }
+            // While a hold is active the published values carry hardening
+            // from project texts that were never recorded; keep all of it.
+            if holding {
+                hold_project_loosening(&mut floor, &published);
+            }
+            hold_project_loosening(&mut candidate, &floor)
         } else {
             Vec::new()
         };
@@ -527,6 +540,9 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             if held.is_empty() {
                 record.project = project;
             }
+        }
+        if !held.is_empty() {
+            state.project_hold_active.store(true, Ordering::Release);
         }
     }
     state.last_error.lock().take();
@@ -988,10 +1004,14 @@ fn run_config_file_watch(
             return;
         }
     };
-    // The directory being watched: the file's own directory, or its parent
-    // while that directory does not exist.
-    let mut watching: Option<PathBuf> = None;
-    let attach = |watcher: &mut notify::RecommendedWatcher, watching: &mut Option<PathBuf>| {
+    // The directory being watched (the file's own directory, or its parent
+    // while that directory does not exist) and its identity when attached.
+    // Backends that watch by inode keep following a directory that was
+    // renamed aside, so a directory replaced under the same name must be
+    // attached again.
+    let mut watching: Option<(PathBuf, Option<DirIdentity>)> = None;
+    let attach = |watcher: &mut notify::RecommendedWatcher,
+                  watching: &mut Option<(PathBuf, Option<DirIdentity>)>| {
         let target = if dir.is_dir() {
             dir.clone()
         } else {
@@ -1000,16 +1020,26 @@ fn run_config_file_watch(
                 None => return false,
             }
         };
-        if watching.as_ref() == Some(&target) {
+        let identity = dir_identity(&target);
+        if watching
+            .as_ref()
+            .is_some_and(|(path, seen)| *path == target && *seen == identity)
+        {
             return false;
         }
-        if let Some(previous) = watching.take() {
+        if let Some((previous, _)) = watching.take() {
             let _ = watcher.unwatch(&previous);
         }
         match watcher.watch(&target, RecursiveMode::NonRecursive) {
             Ok(()) => {
+                // The directory may have been replaced between the identity
+                // read and the watch; the next tick then attaches again.
+                if dir_identity(&target) != identity {
+                    let _ = watcher.unwatch(&target);
+                    return false;
+                }
                 let moved_to_dir = target == dir;
-                *watching = Some(target);
+                *watching = Some((target, identity));
                 moved_to_dir
             }
             Err(error) => {
@@ -1042,14 +1072,29 @@ fn run_config_file_watch(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        // The directory appeared (or vanished): move the watch, and check the
-        // file in case it was created together with its directory.
-        if watching.as_deref() != Some(dir.as_path()) || !dir.is_dir() {
-            if attach(&mut watcher, &mut watching) {
-                on_change();
-            }
+        // On every event and every tick: the directory appeared, vanished or
+        // was replaced. Move the watch, and check the file, which may have
+        // changed together with its directory.
+        if attach(&mut watcher, &mut watching) {
+            on_change();
         }
     }
+}
+
+/// A directory's device and inode, which change when it is replaced.
+type DirIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn dir_identity(path: &Path) -> Option<DirIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_identity(_path: &Path) -> Option<DirIdentity> {
+    None
 }
 
 /// Process-level watch on the user config file for the daemon. On a change it

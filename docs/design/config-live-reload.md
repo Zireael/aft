@@ -39,6 +39,7 @@ Input: [`docs/investigations/config-live-reload-inventory-2026-09.md`](../invest
 - **Ignored `.cortexkit`.** `start_project_watcher` adds `<root>/.cortexkit` to the watcher's existing non-recursive `extra_watch_paths` whenever the directory exists. So the file is seen whether or not the project ignores `.cortexkit`, on every backend. This is simpler than computing "covered" from the matcher, as the design first proposed, and is equivalent.
 - **Fallback: the root's own `ConfigFileWatch`.** It is used when no project watcher runs (a HOME root, `AFT_TEST_DISABLE_FILE_WATCHER`, a failed watcher), or when `.cortexkit/` did not exist at watcher start.
   - It watches `<root>/.cortexkit/` non-recursively, or `<root>` until `.cortexkit/` appears.
+  - It records the watched directory's identity (device and inode, read before the watch and confirmed after) and re-attaches when the identity changes, checked on every event and every 200 ms tick. A directory renamed aside and replaced under the same name is therefore watched again, and the file is checked at once.
   - `sync_config_watches` starts or drops it after configure and after the watcher maintenance stage.
 - **Idle-evicted roots.** `ensure_project_watcher` requests one immediate reload on reattach, and the content gate makes it a no-op when nothing changed.
 
@@ -55,7 +56,8 @@ A plugin must swap its own snapshot, because the daemon cannot reach a plugin's 
   - watches each file's parent directory, or its nearest existing ancestor until it exists, and retires the ancestor watch once the directory appears;
   - wakes on every event in a watched directory (platforms may coalesce several changes into one event that names a different entry, so filtering by name could lose a config edit);
   - uses a 150 ms trailing debounce, capped at 1 s so steady unrelated activity cannot postpone a check indefinitely;
-  - re-arms a watch whose directory was replaced (inode changed) or that reported an error, checked on every event and every 2 s;
+  - re-arms a watch whose directory was replaced (inode changed) or that reported an error, checked on every event and every 2 s. The identity is read before `fs.watch` and confirmed after, so a directory replaced while its watch is being set up is not recorded under the new identity;
+  - records a file's text as seen only after the load accepted it. A rejected text (for example a half-written save) is retried on the next event and up to three times on its own, 1 s apart;
   - calls `onChange` only when a file's text changed.
 - `applyLiveConfigKeys` and `aftLiveConfigKeys`: one table of the TS group A keys:
   - `configure_warnings_delivery`, `restrict_to_project_root`, `inspect.diagnostics_timeout_ms` and `inspect.tier2_idle_minutes`;
@@ -101,7 +103,7 @@ A plugin in the startup config-error state starts no watch; that state still nee
    - `inspect.enabled`: `reset_tier2_refresh_scheduler`;
    - `git.co_author` from `off` to on: `agent_child_env::ensure_git_hooks`, the hook half of `maintain` only (the gh shim is group B);
    - `lsp.diagnostics_on_edit` in the daemon: the maintenance completion carries the new value into `RootMeta`.
-7a. **Project edits only tighten.** When the project file's text changed, the files are also resolved with the new user file and the previous project text (`user_only`). Against that floor, `hold_project_loosening` keeps `restrict_to_project_root`, `url_fetch_allow_private`, `sandbox.enabled`, `sandbox.read_deny` and `sandbox.write_allow` at least as strict: a project edit can add hardening but never remove hardening a project file had put in place, while a user-file change still applies in both directions. A held key keeps its published value, is logged as `held=[...] (a project edit cannot loosen these until the next connect)`, and the previous project text stays the reference so later reloads keep holding it. The next connect resolves the files afresh and is authoritative.
+7a. **Project edits only tighten.** When the project file's text changed, the files are also resolved with the new user file and the previous project text (`user_only`). Against that floor, `hold_project_loosening` keeps `restrict_to_project_root`, `url_fetch_allow_private`, `sandbox.enabled`, `sandbox.read_deny` and `sandbox.write_allow` at least as strict: a project edit can add hardening but never remove hardening a project file had put in place, while a user-file change still applies in both directions. A held key keeps its published value, is logged as `held=[...] (a project edit cannot loosen these until the next connect)`, and the previous project text stays the reference so later reloads keep holding it. While any hold is active (`project_hold_active`, cleared by a connect), the published security values are also part of the floor: they may carry hardening from project texts that were added while an earlier edit was held and so were never recorded (project `[A]` → `[B]` → `[]` keeps both A and B). The cost is that, during a hold, a user-file loosening of these keys also waits for the connect. The next connect resolves the files afresh and is authoritative.
 8. **Log** one line: `config reload root=<root> applied=[...] deferred=[...] (deferred keys apply on next connect/restart) dropped=[...] (project may only tighten)`. When sandbox keys change, it adds that running background tasks keep their spawn-time sandbox.
 
 **Not triggered:** `handle_configure`, `defer_to_exclusive_configure`, `agent_child_env::maintain`, the ONNX lookup, `note_configure_warm_key`, artifact drop or reload, hashline binding, and the configure maintenance stages. The configure generation does not change.
@@ -144,8 +146,8 @@ Other threads a request starts carry no config reads that matter for the switch-
 
 Also:
 - `AppContext::config()` returns the pinned snapshot on that thread.
-- `publish_config` replaces the calling thread's own pin, so configure sees its own publication.
-- `update_config` reads the unpinned snapshot, so a pinned request can never republish an older config over a newer one.
+- configure's `set_config` replaces the calling thread's own pin, so configure sees its own publication.
+- `update_config` (every setter, such as `set_bash_compress_enabled`) builds its snapshot from the one published at that moment, under the configuration write lock, so it can never overwrite a newer publication (a live reload) with values it read earlier. The reload publishes by compare-and-swap. Only configure's `set_config` replaces the calling thread's own pin; a setter inside a request leaves the request on its admitted snapshot.
 - Nested dispatch (tool calls) keeps the outer pin.
 
 **Switch-over point.** A request admitted after publication sees the new value. A request already running finishes on the old one.
@@ -183,7 +185,6 @@ Rust unit tests (`R:config_live_tests.rs`):
 - `unchanged_file_text_is_a_no_op`
 - `project_tier_still_cannot_loosen_on_live_reload`
 - `request_pins_its_config_while_a_reload_publishes` (restrict and sandbox)
-- `publishing_on_a_pinned_thread_updates_that_pin`
 - `reload_does_not_overwrite_a_configure_that_published_meanwhile`
 - `a_user_file_edit_asks_every_live_root_to_reload`
 - `signal_debounces_until_quiet`
@@ -194,6 +195,9 @@ Rust unit tests (`R:config_live_tests.rs`):
 - `invalid_active_harness_block_keeps_the_last_good_config`
 - `project_edit_cannot_remove_project_hardening_until_the_next_connect`, `project_edit_cannot_turn_off_a_sandbox_the_project_turned_on`, `a_user_edit_can_still_loosen_what_the_user_set`
 - `a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed`
+- `successive_held_project_edits_keep_all_published_project_hardening`, `successive_held_project_edits_keep_a_project_enabled_sandbox`
+- `a_replaced_config_directory_is_watched_again`
+- `a_setter_racing_a_reload_does_not_undo_the_reload`, `configure_publication_updates_its_own_pin_but_a_setter_does_not`
 
 Other Rust tests:
 - `R:main.rs` `config_pin_tests::dispatch_keeps_the_config_it_was_admitted_with`;
@@ -205,7 +209,7 @@ Other Rust tests:
   - `user_config_edit_applies_live`
 
 TS tests:
-- `BR:__tests__/config-watch.test.ts`: key table, bash form, invalid files, deletion from the loader's record, a file that appears later, watch recovery after directory replacement, no starvation under unrelated activity, start-up reconciliation;
+- `BR:__tests__/config-watch.test.ts`: key table, bash form, invalid files, deletion from the loader's record, a file that appears later, watch recovery after directory replacement, no starvation under unrelated activity, start-up reconciliation, re-arm when the directory is replaced during watch setup, retry of a rejected text;
 - `OC:__tests__/config-live-reload.test.ts`: the `bash_watch` cap reaches the next call while `bash.background` is deferred; restrict; invalid parse; an invalid value; deletion; project tier clamped; a project edit cannot turn host fallback on but can turn it off;
 - `OC:__tests__/permission-layer-audit.test.ts`: under the restriction an ordinary external read is denied unless the server confirms a session-owned artifact, and a worktree path outside the session directory is denied;
 - `OC:__tests__/v2-bridge-bootstrap.test.ts`: an OpenCode 2 Location swaps its tool context config and stops with the Location;

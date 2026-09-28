@@ -4941,47 +4941,59 @@ impl AppContext {
 
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
-        self.publish_config(None, config);
+        // Configure publishes this way, and it runs inside a pinned request:
+        // it must see its own publication for the rest of that request.
+        self.publish_config(|_| Some(config), true);
     }
 
     /// Publish `config` only if the published snapshot is still `expected`.
     /// A live config reload builds its snapshot from the one it read, so it
     /// must not overwrite a configure that published in between.
     pub fn publish_config_if_current(&self, expected: &Arc<Config>, config: Config) -> bool {
-        self.publish_config(Some(expected), config)
+        self.publish_config(
+            |current| Arc::ptr_eq(expected, current).then_some(config),
+            false,
+        )
     }
 
-    fn publish_config(&self, expected: Option<&Arc<Config>>, config: Config) -> bool {
-        let next = Arc::new(config);
-        let next_watcher_counters = next
-            .project_root
-            .as_deref()
-            .map(watcher_counters_for_root)
-            .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
-        let project_root_changed = {
+    /// Build the next snapshot from the current one and publish it, both
+    /// under the configuration write lock, so no other publication can land
+    /// between the read and the write. `replace_pin` makes the calling
+    /// thread's own request pin follow the publication (configure only).
+    fn publish_config(
+        &self,
+        build: impl FnOnce(&Arc<Config>) -> Option<Config>,
+        replace_pin: bool,
+    ) -> bool {
+        let (next, project_root_changed) = {
             let mut guard = self
                 .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &guard)) {
+            let Some(next) = build(&guard) else {
                 return false;
-            }
+            };
+            let next = Arc::new(next);
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.
             let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
                 != next.project_root.as_ref().map(|root| root.as_os_str());
             *guard = Arc::clone(&next);
-            changed
+            (next, changed)
         };
-        // The publishing thread sees its own publication even while it holds a
-        // request pin (configure runs inside a pinned request).
-        replace_pinned_config(self.config_pin_key(), &next);
+        if replace_pin {
+            replace_pinned_config(self.config_pin_key(), &next);
+        }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
                 .watcher_counters
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next_watcher_counters;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next
+                .project_root
+                .as_deref()
+                .map(watcher_counters_for_root)
+                .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
         }
         true
     }
@@ -5039,10 +5051,21 @@ impl AppContext {
     }
 
     /// Clone-mutate-publish the current configuration without returning a guard.
+    ///
+    /// The update runs on the snapshot that is published at that moment,
+    /// under the configuration write lock, so it can never overwrite a newer
+    /// publication (a live config reload) with values it read earlier. It
+    /// must not read the configuration itself. A request pin on the calling
+    /// thread keeps its admitted snapshot.
     pub fn update_config(&self, update: impl FnOnce(&mut Config)) {
-        let mut next = self.config_unpinned().as_ref().clone();
-        update(&mut next);
-        self.set_config(next);
+        self.publish_config(
+            |current| {
+                let mut next = current.as_ref().clone();
+                update(&mut next);
+                Some(next)
+            },
+            false,
+        );
     }
 
     pub fn force_restrict_guard(&self, req_id: &str) -> ForceRestrictGuard<'_> {

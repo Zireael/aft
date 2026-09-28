@@ -187,9 +187,18 @@ export function applyLiveConfigKeys<C>(
 export interface WatchAftConfigFilesOptions {
   /** The config files to watch (user and project `aft.jsonc`). */
   paths: readonly string[];
-  /** Called after a quiet debounce window when any file's text changed. */
-  onChange: () => void;
+  /**
+   * Called after a quiet debounce window when any file's text changed.
+   * Returning `false` means the new text was not accepted (for example a
+   * half-written save): it is not recorded as seen, and the files are checked
+   * again shortly even if no further event arrives.
+   */
+  onChange: () => boolean | void;
   debounceMs?: number;
+  /** Test seam: replaces `fs.watch`. */
+  watchImpl?: typeof watch;
+  /** Test seam: runs between reading a directory's identity and watching it. */
+  beforeWatchForTest?: (dir: string) => void;
 }
 
 function readTextOrNull(path: string): string | null {
@@ -202,6 +211,8 @@ function readTextOrNull(path: string): string | null {
 
 /** How often the watches are checked against the directories on disk. */
 const CONFIG_WATCH_REVALIDATE_MS = 2_000;
+/** How many times a rejected text is re-checked without a new event. */
+const CONFIG_WATCH_REJECTED_RETRIES = 3;
 /** Longest a stream of events may postpone a check. */
 const CONFIG_WATCH_MAX_DELAY_MS = 1_000;
 
@@ -244,21 +255,34 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   let stopped = false;
   const watchers = new Map<string, { watcher: FSWatcher; ino: number | null }>();
 
+  const watchImpl = options.watchImpl ?? watch;
+  let rejectedRetries = 0;
   const check = (): void => {
     timer = null;
     firstPendingAt = null;
     if (stopped) return;
     revalidate();
-    let changed = false;
+    const seen = new Map<string, string | null>();
     for (const path of options.paths) {
       const text = readTextOrNull(path);
-      if (text !== lastSeen.get(path)) {
-        lastSeen.set(path, text);
-        changed = true;
-      }
+      if (text !== lastSeen.get(path)) seen.set(path, text);
     }
-    if (changed) options.onChange();
+    if (seen.size === 0) return;
+    if (options.onChange() === false) {
+      // Not accepted: keep the old texts as seen so the next event retries,
+      // and retry on our own a few times in case no further event comes (an
+      // editor that finished its save before this check read the file).
+      if (rejectedRetries < CONFIG_WATCH_REJECTED_RETRIES) {
+        rejectedRetries += 1;
+        retryTimer = setTimeout(check, CONFIG_WATCH_MAX_DELAY_MS);
+        retryTimer.unref?.();
+      }
+      return;
+    }
+    rejectedRetries = 0;
+    for (const [path, text] of seen) lastSeen.set(path, text);
   };
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   const schedule = (): void => {
     if (stopped) return;
     const now = Date.now();
@@ -288,10 +312,18 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     for (const dir of wanted) {
       if (watchers.has(dir)) continue;
       try {
-        const entry = {
-          watcher: watch(dir, { persistent: false }, () => schedule()),
-          ino: inodeOf(dir),
-        };
+        // Read the identity first and confirm it after: a directory replaced
+        // in between would leave the watch on the old one under the new
+        // one's identity, and it would never be re-armed.
+        const ino = inodeOf(dir);
+        options.beforeWatchForTest?.(dir);
+        const watcher = watchImpl(dir, { persistent: false }, () => schedule());
+        if (inodeOf(dir) !== ino) {
+          watcher.close();
+          moved = true;
+          continue;
+        }
+        const entry = { watcher, ino };
         entry.watcher.on("error", () => {
           entry.watcher.close();
           if (watchers.get(dir) === entry) watchers.delete(dir);
@@ -319,6 +351,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    if (retryTimer) clearTimeout(retryTimer);
     clearInterval(revalidateTimer);
     for (const entry of watchers.values()) entry.watcher.close();
     watchers.clear();
@@ -475,13 +508,14 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
     }
     return { ...result, held };
   };
-  const safeReload = (): void => {
+  const safeReload = (): boolean => {
     try {
-      reload();
+      return reload() !== null;
     } catch (err) {
       options.reportError(
         `AFT config reload failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+      return false;
     }
   };
   if (options.watch === false) {
