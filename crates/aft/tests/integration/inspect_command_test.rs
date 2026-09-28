@@ -3255,6 +3255,65 @@ fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
     assert_eq!(gap["file"], "src/main.rs");
 }
 
+/// A string file scope selects only the owning TypeScript workspace, even
+/// when other packages and languages have source files in the same project.
+#[test]
+fn scoped_typescript_file_inspect_starts_only_its_workspace() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", "{\"name\":\"root\"}\n");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn root() {}\n");
+    write_file(&root, "scripts/other.sh", "echo other\n");
+    write_file(
+        &root,
+        "packages/plugin/package.json",
+        "{\"name\":\"plugin\"}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/scripts/sentinel.ts",
+        "export const sentinel = 1;\n",
+    );
+    write_file(
+        &root,
+        "packages/other/package.json",
+        "{\"name\":\"other\"}\n",
+    );
+    write_file(
+        &root,
+        "packages/other/src/index.ts",
+        "export const other = 2;\n",
+    );
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Bash, fake_server_path());
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-ts-monorepo",
+            "command": "inspect",
+            "scope": "packages/plugin/scripts/sentinel.ts",
+            "sections": "diagnostics",
+        }),
+    );
+    let active = ctx.lsp().active_server_keys();
+    assert_eq!(active.len(), 1, "response: {response:#}");
+    assert_eq!(active[0].kind, ServerKind::TypeScript);
+    assert_eq!(
+        active[0].root,
+        crate::helpers::canonicalize_like_product(&root.join("packages/plugin"))
+    );
+}
+
 /// Producer discovery may see nested Cargo workspaces, but a scoped blocking
 /// inspect starts rust-analyzer only for the workspace that owns the scope.
 #[test]

@@ -39,6 +39,42 @@ fn fake_server_path() -> PathBuf {
         .expect("fake-lsp-server binary path not set")
 }
 
+#[test]
+fn inspect_deadline_does_not_kill_initializing_server() {
+    use aft::lsp::manager::{start_applicable_server_unlocked, walk_applicable_area};
+
+    let (_temp_dir, file, _) = rust_fixture_files();
+    let root = file.parent().unwrap().parent().unwrap();
+    let mut config = Config::default();
+    config.project_root = Some(root.to_path_buf());
+    let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+    manager
+        .lock()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    manager
+        .lock()
+        .set_extra_env("AFT_FAKE_LSP_INIT_DELAY_MS", "350");
+    let walk =
+        walk_applicable_area(root, Some(&[file.clone()]), &config, None).expect("walk source");
+    let snapshot = manager.lock().classify_applicable_servers(walk, &config);
+    assert_eq!(snapshot.server_keys.len(), 1);
+    let key = snapshot.server_keys[0].clone();
+    let outcome = start_applicable_server_unlocked(
+        &manager,
+        &snapshot,
+        &key,
+        &config,
+        Instant::now() + Duration::from_millis(80),
+    );
+    assert_eq!(outcome.deadline_exceeded, Some(key.clone()));
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && manager.lock().active_server_keys().is_empty() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(manager.lock().active_server_keys(), vec![key]);
+    manager.lock().shutdown_all();
+}
+
 fn rust_fixture_files() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");

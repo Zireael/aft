@@ -2738,7 +2738,7 @@ pub struct AppContext {
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
-    lsp_manager: parking_lot::Mutex<LspManager>,
+    lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
     /// teardown. Already-admitted workers use it to decide whether their disk
@@ -3230,7 +3230,7 @@ impl AppContext {
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
-            lsp_manager: parking_lot::Mutex::new(lsp_manager),
+            lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle: SubcLifecycleAdmission::default(),

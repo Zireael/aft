@@ -853,10 +853,22 @@ impl LspManager {
             // A start through another path (an edit's diagnostics, say) won
             // the race; keep that client and let this one's drop stop its
             // process.
-            Ok(_) if self.clients.contains_key(key) => outcomes.successful.push(key.clone()),
+            Ok(_) if self.clients.contains_key(key) => {
+                slog_info!(
+                    "lsp start discarded server={} root={} reason=duplicate start; stopping redundant client",
+                    key.kind.id_str(),
+                    key.root.display()
+                );
+                outcomes.successful.push(key.clone());
+            }
             // Every client was taken away while this one was starting
             // (shutdown, idle reap, unbind); do not revive the manager.
             Ok(_) if started_generation != Some(self.clients_generation) => {
+                slog_info!(
+                    "lsp start discarded server={} root={} reason=shutdown during initialize; stopping client",
+                    key.kind.id_str(),
+                    key.root.display()
+                );
                 outcomes.failures.push(ApplicableServerFailure {
                     server_key: key.clone(),
                     result: ServerAttemptResult::SpawnFailed {
@@ -3896,7 +3908,7 @@ enum StartNext {
 /// process. Outcomes match [`LspManager::start_applicable_servers`] for one
 /// server under a request deadline.
 pub fn start_applicable_server_unlocked(
-    manager: &parking_lot::Mutex<LspManager>,
+    manager: &Arc<parking_lot::Mutex<LspManager>>,
     snapshot: &ApplicableServerSnapshot,
     server: &ServerKey,
     config: &Config,
@@ -3921,8 +3933,7 @@ pub fn start_applicable_server_unlocked(
 
     let mut waited = false;
     loop {
-        let initialize_timeout = deadline.saturating_duration_since(Instant::now());
-        if initialize_timeout.is_zero() {
+        if Instant::now() >= deadline {
             outcomes.deadline_exceeded = Some(candidate.key.clone());
             return outcomes;
         }
@@ -3940,15 +3951,36 @@ pub fn start_applicable_server_unlocked(
                 waited = true;
             }
             Some(StartNext::Spawn(prepared)) => {
-                let mut reservation = ReservationGuard {
-                    manager,
-                    key: Some(candidate.key.clone()),
-                };
-                let result = prepared.run(Some(initialize_timeout));
-                reservation.key = None;
-                manager
-                    .lock()
-                    .finish_unlocked_start(candidate, result, deadline, &mut outcomes);
+                // The inspect wait budget is not an initialize cancellation. Keep
+                // the reserved start alive after the caller's deadline, so a
+                // slow handshake can finish without being killed by AFT.
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let manager = Arc::clone(manager);
+                let candidate = candidate.clone();
+                std::thread::spawn(move || {
+                    let mut reservation = ReservationGuard {
+                        manager: &manager,
+                        key: Some(candidate.key.clone()),
+                    };
+                    let result = prepared.run(None);
+                    let mut completed = ApplicableServerStartOutcomes::default();
+                    manager.lock().finish_unlocked_start(
+                        &candidate,
+                        result,
+                        deadline,
+                        &mut completed,
+                    );
+                    reservation.key = None;
+                    let _ = tx.send(completed);
+                });
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(completed) => {
+                        outcomes.successful.extend(completed.successful);
+                        outcomes.failures.extend(completed.failures);
+                        outcomes.deadline_exceeded = completed.deadline_exceeded;
+                    }
+                    Err(_) => outcomes.deadline_exceeded = Some(server.clone()),
+                }
                 return outcomes;
             }
         }
