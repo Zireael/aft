@@ -1,0 +1,73 @@
+use aft::commands::read::handle_read;
+use aft::config::Config;
+use aft::context::{default_language_provider_factory, AppContext};
+use aft::protocol::{RawRequest, Response};
+use serde_json::{json, Value};
+use std::{fs, path::Path};
+
+fn read_response(root: &Path, file: &Path, extra: Value) -> Response {
+    let ctx = AppContext::new(default_language_provider_factory(), Config {
+        project_root: Some(root.to_path_buf()), ..Default::default()
+    });
+    let mut params = extra.as_object().cloned().unwrap();
+    params.insert("file".into(), json!(file));
+    handle_read(&RawRequest { id: "bounds".into(), command: "read".into(),
+        lsp_hints: None, session_id: None, params: Value::Object(params) }, &ctx)
+}
+
+#[test]
+fn ranged_huge_line_stops_at_response_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("huge.txt");
+    fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    let started = std::time::Instant::now();
+    let response = read_response(temp.path(), &path, json!({"start_line": 1, "end_line": 1}));
+    eprintln!("ranged huge line: 2097152 source bytes, {:?}, complete={}", started.elapsed(), response.data["complete"]);
+    assert_eq!(response.data["complete"], false);
+    assert!(response.data.get("total_lines").is_none());
+}
+
+#[test]
+fn limit_only_read_does_not_count_unread_tail() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("many.txt");
+    fs::write(&path, "hello\n".repeat(350_000)).unwrap();
+    let started = std::time::Instant::now();
+    let response = read_response(temp.path(), &path, json!({"limit": 1}));
+    eprintln!("limit-only: 2100000 source bytes, {:?}, total_lines={}", started.elapsed(), response.data["total_lines"]);
+    assert_eq!(response.data["lines_read"], 1);
+    assert!(response.data.get("total_lines").is_none(), "unread total must remain unknown");
+}
+
+#[test]
+fn directory_listing_stops_enumeration() {
+    let temp = tempfile::tempdir().unwrap();
+    for n in 0..11_000 { fs::write(temp.path().join(format!("file-{n:05}")), "").unwrap(); }
+    let started = std::time::Instant::now();
+    let response = read_response(temp.path(), temp.path(), json!({}));
+    eprintln!("directory: 11000 entries, {:?}, reported={}", started.elapsed(), response.data["total_entries"]);
+    assert!(response.data["total_entries"].as_u64().unwrap() < 11_000, "must not exhaust the directory for a capped listing");
+    assert_eq!(response.data["complete"], false);
+}
+
+#[test]
+fn wide_range_stops_scanning_when_output_is_full() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("wide.txt");
+    fs::write(&path, format!("{}\n", "x".repeat(1000)).repeat(10_000)).unwrap();
+    let response = read_response(temp.path(), &path, json!({"start_line": 1, "end_line": 10_000}));
+    assert_eq!(response.data["complete"], false);
+    assert!(response.data["scan_bytes_examined"].as_u64().unwrap() < 60_000);
+    assert!(response.data["content"].as_str().unwrap().contains("narrow:"));
+}
+
+#[test]
+fn small_streamed_range_preserves_crlf_and_unicode() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("small.txt");
+    fs::write(&path, "hello\r\ncafé\r\n").unwrap();
+    let response = read_response(temp.path(), &path, json!({"limit": 5}));
+    assert_eq!(response.data["content"], "1: hello\n2: café\n");
+    assert_eq!(response.data["total_lines"], 2);
+    assert_eq!(response.data["complete"], true);
+}

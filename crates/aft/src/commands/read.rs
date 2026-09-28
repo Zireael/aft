@@ -1288,7 +1288,9 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(1);
 
     let explicit_end_line = req.params.get("end_line").and_then(|v| v.as_u64());
-    let has_explicit_range = req.params.get("start_line").is_some() || explicit_end_line.is_some();
+    let has_explicit_range = req.params.get("start_line").is_some()
+        || explicit_end_line.is_some()
+        || req.params.get("limit").is_some();
 
     if has_explicit_range {
         return handle_streaming_range_read(
@@ -1512,30 +1514,50 @@ fn handle_streaming_range_read(
     let mut observed_lines = 0u32;
     let mut invalid_utf8 = false;
     let mut has_more_after_range = false;
-    let reader = std::io::BufReader::new(file);
-
-    for (index, line_result) in reader.lines().enumerate() {
-        let line = match line_result {
-            Ok(line) => line,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                invalid_utf8 = true;
-                break;
-            }
-            Err(e) => {
-                return Response::error(
-                    &req.id,
-                    "io_error",
-                    format!("read: failed to read file: {}", e),
-                );
-            }
-        };
-
-        observed_lines = observed_lines.saturating_add(1);
-        if index >= requested_start_idx && index < requested_end_idx {
-            selected_lines.push(line);
-        }
+    let mut reader = std::io::BufReader::new(file);
+    let mut scanned_bytes = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut scan_gap = false;
+    // Prefix scans have a separate byte budget; even skipped lines and lookahead
+    // must not allocate an entire minified file or scan indefinitely.
+    const SCAN_BYTES: usize = 1024 * 1024;
+    loop {
+        let index = observed_lines as usize;
         if index >= requested_end_idx {
-            has_more_after_range = true;
+            has_more_after_range = reader.fill_buf().map_or(true, |bytes| !bytes.is_empty());
+            break;
+        }
+        let allowance = (MAX_LINE_LENGTH + 4).min(SCAN_BYTES.saturating_sub(scanned_bytes));
+        if allowance == 0 || retained_bytes >= MAX_BYTES {
+            scan_gap = true;
+            break;
+        }
+        let mut bytes = Vec::new();
+        let len = match reader.by_ref().take(allowance as u64).read_until(b'\n', &mut bytes) {
+            Ok(len) => len,
+            Err(error) => return Response::error(&req.id, "io_error", format!("read: failed to read file: {error}")),
+        };
+        if len == 0 { break; }
+        scanned_bytes += len;
+        let partial_line = bytes.last() != Some(&b'\n') && len == allowance;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') { bytes.pop(); }
+        }
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(line) => line,
+            Err(error) if partial_line && error.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix")
+            }
+            Err(_) => { invalid_utf8 = true; break; }
+        };
+        observed_lines = observed_lines.saturating_add(1);
+        if index >= requested_start_idx {
+            retained_bytes += line.len() + 16;
+            selected_lines.push(line.to_string());
+        }
+        if partial_line {
+            scan_gap = true;
             break;
         }
     }
@@ -1552,16 +1574,18 @@ fn handle_streaming_range_read(
         );
     }
 
-    let exact_total_lines = (!has_more_after_range).then_some(observed_lines);
+    let exact_total_lines = (!has_more_after_range && !scan_gap).then_some(observed_lines);
 
     if selected_lines.is_empty() {
         let mut data = serde_json::json!({
-            "content": "",
-            "complete": true,
+            "content": if scan_gap { format!("shown 0 of at least {observed_lines} examined lines (scan budget before requested range; {scanned_bytes} bytes scanned) · narrow: earlier start_line or smaller file") } else { String::new() },
+            "complete": !scan_gap,
+            "scan_bytes_examined": scanned_bytes,
+            "scan_gap": scan_gap.then_some("line or response scan budget; narrow: earlier start_line, smaller range"),
             "lines_read": 0,
             "start_line": start_line,
             "end_line": start_line,
-            "truncated": false,
+            "truncated": scan_gap,
             "byte_size": byte_size as usize,
         });
         if let Some(total_lines) = exact_total_lines {
@@ -1608,11 +1632,16 @@ fn handle_streaming_range_read(
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
     let has_more = requested_start_idx > 0 || has_more_after_range;
-    let truncated = has_more || truncated_by_size;
+    let truncated = has_more || truncated_by_size || scan_gap;
+    if scan_gap {
+        output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
+    }
 
     let mut data = serde_json::json!({
         "content": output,
         "complete": !truncated,
+        "scan_bytes_examined": scanned_bytes,
+        "scan_gap": scan_gap.then_some("line or response scan budget"),
         "lines_read": lines_read,
         "start_line": start_line,
         "end_line": actual_end,
@@ -1650,7 +1679,15 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         }
     };
 
-    for entry_result in read_dir {
+    const MAX_DIRECTORY_SCAN: usize = 10_000;
+    let mut examined = 0;
+    let mut enumeration_cut = false;
+    for entry_result in read_dir.take(MAX_DIRECTORY_SCAN + 1) {
+        examined += 1;
+        if examined > MAX_DIRECTORY_SCAN {
+            enumeration_cut = true;
+            break;
+        }
         let entry = match entry_result {
             Ok(e) => e,
             Err(_) => continue,
@@ -1672,12 +1709,14 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
     entries.sort();
 
     let total = entries.len();
-    let truncated = total > MAX_DIRECTORY_ENTRIES;
+    let truncated = enumeration_cut || total > MAX_DIRECTORY_ENTRIES;
     if truncated {
         entries.truncate(MAX_DIRECTORY_ENTRIES);
+        let shown = entries.len();
+        let bound = if enumeration_cut { "at least " } else { "" };
         entries.push(format!(
-            "\n... and {} more entries (truncated, showing first 1000)",
-            total - MAX_DIRECTORY_ENTRIES
+            "\nshown {shown} of {bound}{total} entries ({}; examined {examined} directory entries) · narrow: subdirectory",
+            if enumeration_cut { "enumeration cap" } else { "display cap" }
         ));
     }
     Response::success(
@@ -1687,6 +1726,9 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             "complete": !truncated,
             "truncated": truncated,
             "total_entries": total,
+            "total_entries_exact": !enumeration_cut,
+            "entries_examined": examined,
+            "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
         }),
     )
 }
