@@ -530,8 +530,23 @@ fn mutation_modes_supply_host_diff_without_include_diff() {
 #[test]
 fn delete_accepts_model_shaped_recursive_and_files_at_both_boundaries() {
     let dir = tempfile::tempdir().unwrap();
+    // `aft_delete` is off by default; this test is about argument shapes, so
+    // enable it through a user config outside the project.
+    let config_dir = tempfile::tempdir().unwrap();
+    let user_config = config_dir.path().join("user-aft.jsonc");
+    fs::write(&user_config, r#"{ "disabled_tools": [] }"#).unwrap();
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "cortexkit_user_config_path": user_config,
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:#}");
     for (index, raw) in [" true ", "TrUe", "1", " false ", "FaLsE", "0"]
         .iter()
         .enumerate()

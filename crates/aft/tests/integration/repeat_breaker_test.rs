@@ -561,6 +561,9 @@ fn repeat_breaker_counts_a_previewed_mutation_once() {
             texts.push(response["text"].as_str().unwrap_or_default().to_string());
         }
         if cycle == 0 {
+            // Remove the file so the second identical write creates it again;
+            // writing unchanged content is refused as `no_change`.
+            std::fs::remove_file(&target).expect("remove written file");
             std::thread::sleep(Duration::from_secs(31));
         }
     }
