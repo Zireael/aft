@@ -198,7 +198,7 @@ use self::health::{
 pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
 use self::manifest::{
-    build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
+    build_manifest_without, command_lane, control_flags, control_ops, is_bash_family_tool,
     is_subc_agent_core_tool,
 };
 pub use self::wire::SubcError;
@@ -979,6 +979,10 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    /// `disabled_tools` resolved from the config files when this route bound.
+    /// Every tool call on the route is checked against this snapshot, so a
+    /// config edit applies to the next bind, not mid-session.
+    disabled_tools: Arc<Vec<String>>,
 }
 
 impl Deref for RouteIdentity {
@@ -3526,7 +3530,11 @@ where
     // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
     // Read once, before HELLO: it selects the warm-up budget and nothing else.
     let spawn_role = readiness::SpawnRole::from_process_env();
-    let manifest = build_manifest();
+    // The catalog is module-wide and sent once, before any route binds, so it
+    // can only reflect the user config file: project and per-harness disables
+    // are enforced per route at dispatch.
+    let catalog_disabled = crate::subc_config::catalog_disabled_tools(user_config_path.as_deref());
+    let manifest = build_manifest_without(&catalog_disabled);
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
@@ -4100,7 +4108,6 @@ where
                                 allow_native_passthrough,
                                 tool_response_body_limit,
                                 &module_drain,
-                                user_config_path.as_deref(),
                             )
                             .await
                         };
@@ -5641,13 +5648,14 @@ async fn handle_control_request(
             // Let configure return its structured invalid-harness error rather
             // than panicking while computing this optional registration setting.
             let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
-            let diagnostics_on_edit = crate::config_resolve::resolve_config_for_harness(
+            let bind_config = crate::config_resolve::resolve_config_for_harness(
                 &local_tiers,
                 active_harness.as_ref(),
             )
-            .config
-            .diagnostics_on_edit;
-            let mut configure_json = json!({
+            .config;
+            let diagnostics_on_edit = bind_config.diagnostics_on_edit;
+            let bind_disabled_tools = Arc::new(bind_config.disabled_tools);
+            let configure_json = json!({
                 "id": request_id,
                 "command": "configure",
                 "project_root": bind_project_root,
@@ -5655,13 +5663,6 @@ async fn handle_control_request(
                 "session_id": bind_session.clone(),
                 "config": config_tiers,
             });
-            // Naming the user file lets configure record it, so tool calls
-            // re-read `disabled_tools` from it rather than from this bind-time
-            // copy. Configure accepts only an absolute path.
-            if let Some(path) = user_config_path.filter(|path| path.is_absolute()) {
-                configure_json["cortexkit_user_config_path"] =
-                    Value::String(path.to_string_lossy().into_owned());
-            }
             let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
                 Ok(req) => req,
                 Err(error) => {
@@ -5692,6 +5693,7 @@ async fn handle_control_request(
                     principal_id: bind_principal_id,
                 },
                 consumer_elicitation_capable,
+                disabled_tools: bind_disabled_tools,
             }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -6339,7 +6341,6 @@ async fn handle_tool_call(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
-    user_config_path: Option<&Path>,
 ) -> Result<(), SubcError> {
     let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
@@ -6504,6 +6505,33 @@ async fn handle_tool_call(
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
 
+    // A tool the session's connect-time config disables is refused before
+    // any other handling: no permission ask, no bash spawn, no dispatch.
+    // `run_tool_call` checks the same snapshot again for the calls it runs.
+    if let Some(response) = crate::tool_gate::refusal(
+        &request_id,
+        &bare_name,
+        &arguments,
+        &identity.disabled_tools,
+    ) {
+        let text = crate::subc_format::format_response_with_context(
+            &bare_name,
+            &response,
+            &format_context,
+        );
+        let result = ToolCallResult { text, response };
+        let response_frame = build_tool_response_frame_with_limit(
+            frame.header.ver,
+            route_id,
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+            bind_trust,
+            tool_response_body_limit,
+        )?;
+        return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
     let requests_host = matches!(bare_name.as_str(), "bash" | "powershell")
         && arguments
             .get("sandbox")
@@ -6602,35 +6630,6 @@ async fn handle_tool_call(
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
-        // Bash skips the shared tool-call pipeline (and its disabled-tool
-        // refusal), and an untrusted bind would ask the consumer for
-        // permission first, so a disabled bash is refused here, from the
-        // config files as they are now.
-        let gate_source = crate::tool_gate::subc_route_source(
-            user_config_path,
-            identity.project_root.as_path(),
-            &identity.harness,
-        );
-        if let Some(response) =
-            crate::tool_gate::refusal_for_source(&gate_source, &request_id, &bare_name, &arguments)
-        {
-            let text = crate::subc_format::format_response_with_context(
-                &bare_name,
-                &response,
-                &format_context,
-            );
-            let result = ToolCallResult { text, response };
-            let response_frame = build_tool_response_frame_with_limit(
-                frame.header.ver,
-                route_id,
-                frame.header.corr,
-                frame.header.flags,
-                &result,
-                bind_trust,
-                tool_response_body_limit,
-            )?;
-            return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
-        }
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
             // drain; the command has not run, so answer with the retryable
@@ -6798,6 +6797,7 @@ async fn handle_tool_call(
         preview: call.preview,
         edit_slot_survives: call.edit_slot_survives,
         report_registration_downgrade: true,
+        disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
@@ -8566,6 +8566,7 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
         }))
     }
 
@@ -11684,6 +11685,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);
         let completion = RouteBindCompletion {
@@ -11765,6 +11767,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
         }));
         let completion = RouteBindCompletion {
             route,

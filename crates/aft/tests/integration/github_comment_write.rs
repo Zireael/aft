@@ -95,6 +95,10 @@ impl Fixture {
             serde_json::to_vec(&json!({
                 "github": github,
                 "gh_shim": { "binary_path": fake_gh },
+                // Every mutating tool must reach its GitHub-address refusal,
+                // including `aft_delete` and `aft_move`, which the default
+                // config disables and dispatch would otherwise refuse first.
+                "disabled_tools": [],
             }))
             .expect("serialize config"),
         )

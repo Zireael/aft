@@ -66,17 +66,35 @@ fn tool_call(aft: &mut AftProcess, id: &str, name: &str, arguments: Value) -> Va
     )
 }
 
-fn assert_disabled(response: &Value, disabled_entry: &str, label: &str) {
+fn assert_disabled(response: &Value, tool: &str, label: &str) {
     assert_eq!(response["success"], false, "{label}: {response:#}");
     assert_eq!(response["code"], "tool_disabled", "{label}: {response:#}");
     let message = response["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(&format!(
-            "remove \"{disabled_entry}\" from `disabled_tools`"
-        )) && message.contains("~/.config/cortexkit/aft.jsonc")
-            && message.contains("npx @cortexkit/aft setup")
-            && message.contains("restart the host"),
+        message.starts_with(&format!("tool_disabled {tool}:"))
+            && message.contains(&format!("remove \"{tool}\" from `disabled_tools`"))
+            && message.contains("~/.config/cortexkit/aft.jsonc")
+            && message.contains("npx @cortexkit/aft setup"),
         "{label}: refusal must name the tool and the fix: {response:#}"
+    );
+}
+
+/// Configure the running bridge again, the way a host reconnect does.
+fn reconfigure(f: &mut Fixture, id: &str) {
+    let response = send(
+        &mut f.aft,
+        json!({
+            "id": id,
+            "command": "configure",
+            "harness": "opencode",
+            "session_id": SESSION_ID,
+            "project_root": f.project.to_string_lossy(),
+            "cortexkit_user_config_path": f.user_config.to_string_lossy(),
+        }),
+    );
+    assert_eq!(
+        response["success"], true,
+        "reconfigure failed: {response:#}"
     );
 }
 
@@ -87,36 +105,43 @@ fn write_file(root: &Path, name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn standalone_default_user_config_refuses_move_and_delete_until_the_file_allows_them() {
+fn standalone_default_user_config_refuses_move_and_delete() {
     // A user file with no `disabled_tools` key gets the default: move and
     // delete stay off.
     let mut f = fixture(Some("{}"));
     let victim = write_file(&f.project, "victim.txt");
     let moved = f.project.join("moved.txt");
-
-    let delete = tool_call(
-        &mut f.aft,
-        "delete-default",
-        "delete",
-        json!({ "files": ["victim.txt"] }),
-    );
-    assert_disabled(&delete, "aft_delete", "default delete");
+    for name in ["delete", "aft_delete"] {
+        let delete = tool_call(
+            &mut f.aft,
+            &format!("delete-as-{name}"),
+            name,
+            json!({ "files": ["victim.txt"] }),
+        );
+        assert_disabled(&delete, "aft_delete", name);
+    }
     assert!(victim.exists(), "a refused delete must not touch the file");
-
-    let mv = tool_call(
-        &mut f.aft,
-        "move-default",
-        "move",
-        json!({ "path": "victim.txt", "destination": "moved.txt" }),
-    );
-    assert_disabled(&mv, "aft_move", "default move");
+    for name in ["move", "aft_move"] {
+        let mv = tool_call(
+            &mut f.aft,
+            &format!("move-as-{name}"),
+            name,
+            json!({ "path": "victim.txt", "destination": "moved.txt" }),
+        );
+        assert_disabled(&mv, "aft_move", name);
+    }
     assert!(
         victim.exists() && !moved.exists(),
         "a refused move must not run"
     );
+    assert!(f.aft.shutdown().success());
+}
 
-    // Mid-session edit, no reconfigure: the next call reads the new list.
-    std::fs::write(&f.user_config, r#"{ "disabled_tools": [] }"#).expect("rewrite user config");
+#[test]
+fn standalone_explicit_empty_list_allows_move_and_delete() {
+    let mut f = fixture(Some(r#"{ "disabled_tools": [] }"#));
+    let victim = write_file(&f.project, "victim.txt");
+    let moved = f.project.join("moved.txt");
     let mv = tool_call(
         &mut f.aft,
         "move-allowed",
@@ -136,19 +161,42 @@ fn standalone_default_user_config_refuses_move_and_delete_until_the_file_allows_
         "explicit [] allows delete: {delete:#}"
     );
     assert!(!moved.exists());
+    assert!(f.aft.shutdown().success());
+}
 
-    // And back: re-disabling takes effect on the next call as well.
-    std::fs::write(&f.user_config, r#"{ "disabled_tools": ["aft_delete"] }"#)
-        .expect("rewrite user config");
-    let again = write_file(&f.project, "again.txt");
+#[test]
+fn standalone_config_edit_applies_only_after_reconnect() {
+    let mut f = fixture(Some(r#"{ "disabled_tools": ["aft_delete"] }"#));
+    let victim = write_file(&f.project, "victim.txt");
     let delete = tool_call(
         &mut f.aft,
-        "delete-redisabled",
+        "delete-before-edit",
         "delete",
-        json!({ "files": ["again.txt"] }),
+        json!({ "files": ["victim.txt"] }),
     );
-    assert_disabled(&delete, "aft_delete", "re-disabled delete");
-    assert!(again.exists());
+    assert_disabled(&delete, "aft_delete", "before edit");
+
+    // Mid-session edit: the session keeps the list it connected with.
+    std::fs::write(&f.user_config, r#"{ "disabled_tools": [] }"#).expect("rewrite user config");
+    let delete = tool_call(
+        &mut f.aft,
+        "delete-after-edit",
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+    );
+    assert_disabled(&delete, "aft_delete", "after mid-session edit");
+    assert!(victim.exists());
+
+    // Reconnect: the edited list applies.
+    reconfigure(&mut f, "cfg-again");
+    let delete = tool_call(
+        &mut f.aft,
+        "delete-after-reconnect",
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+    );
+    assert_eq!(delete["success"], true, "after reconnect: {delete:#}");
+    assert!(!victim.exists());
     assert!(f.aft.shutdown().success());
 }
 
@@ -172,7 +220,7 @@ fn standalone_disabled_read_is_refused_under_its_hoisted_and_prefixed_names() {
 }
 
 #[test]
-fn standalone_disabled_bash_refuses_agent_calls_but_keeps_plumbing() {
+fn standalone_disabled_bash_keeps_powershell_and_plumbing() {
     let mut f = fixture(Some(r#"{ "disabled_tools": ["bash"] }"#));
     let marker = f.project.join("ran.txt");
     let bash = tool_call(
@@ -184,14 +232,19 @@ fn standalone_disabled_bash_refuses_agent_calls_but_keeps_plumbing() {
     assert_disabled(&bash, "bash", "bash");
     assert!(!marker.exists(), "a refused bash must not run");
 
-    // The agent's companion call (catalog `taskId` spelling) follows bash.
-    let status = tool_call(
+    // PowerShell is a separate tool; whatever else happens to it on this
+    // host, it is not refused as disabled.
+    let powershell = tool_call(
         &mut f.aft,
-        "bash-status-agent",
-        "bash_status",
-        json!({ "taskId": "bgb-missing" }),
+        "powershell-not-disabled",
+        "powershell",
+        json!({ "command": "Write-Output hi" }),
     );
-    assert_disabled(&status, "bash", "agent bash_status");
+    assert_ne!(
+        powershell["code"].as_str(),
+        Some("tool_disabled"),
+        "disabling bash must not disable powershell: {powershell:#}"
+    );
 
     // The plugins' own completion plumbing keeps working.
     let drain = tool_call(&mut f.aft, "drain", "bash_drain_completions", json!({}));

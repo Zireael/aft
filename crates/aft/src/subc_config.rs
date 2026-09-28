@@ -107,21 +107,31 @@ pub fn read_local_cortexkit_config_tiers(
     )
 }
 
-/// The tiers configure resolves: for each of `user` and `project`, the file on
-/// disk wins and the plugin-relayed wire tier is only the fallback for a tier
-/// with no file. Shared by configure and by the per-call `disabled_tools`
-/// re-read so both answer from the same files in the same order.
-pub fn select_config_tiers(
-    user_config_path: Option<&Path>,
-    project_root: &Path,
-    wire_tiers: &[ConfigTier],
-) -> Vec<ConfigTier> {
-    let file_tiers = read_local_cortexkit_config_tiers(user_config_path, project_root);
-    let find = |tiers: &[ConfigTier], name: &str| tiers.iter().find(|t| t.tier == name).cloned();
-    ["user", "project"]
+/// The `disabled_tools` list the module-wide subc catalog is filtered by,
+/// read once when the module connects. Only the user file applies: the catalog
+/// is shared by every route, so project files and per-harness overrides (which
+/// differ per route) cannot shape it. A config the resolver rejects yields the
+/// default list, the same one a missing file gives.
+pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
+    let tiers: Vec<ConfigTier> = user_config_path
+        .and_then(|path| {
+            let doc = std::fs::read_to_string(path).ok()?;
+            Some(ConfigTier {
+                tier: "user".to_string(),
+                source: path.to_string_lossy().into_owned(),
+                doc,
+            })
+        })
         .into_iter()
-        .filter_map(|name| find(&file_tiers, name).or_else(|| find(wire_tiers, name)))
-        .collect()
+        .collect();
+    let resolved = crate::config_resolve::resolve_config(&tiers);
+    if !resolved.errors.is_empty() {
+        log::warn!(
+            "subc catalog: user config rejected ({}); filtering by the default disabled_tools",
+            resolved.errors.join(", ")
+        );
+    }
+    resolved.config.disabled_tools
 }
 
 #[cfg(test)]

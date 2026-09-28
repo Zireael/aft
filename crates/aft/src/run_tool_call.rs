@@ -205,6 +205,11 @@ pub struct ToolCallContext {
     /// Whether configure's immediate registration-downgrade warning was discarded
     /// by this transport and must be reported on the first tool call instead.
     pub report_registration_downgrade: bool,
+    /// The session's `disabled_tools` as resolved when it connected. A subc
+    /// route carries its own bind-time list because routes with different
+    /// harnesses can share one root context; `None` uses the configure
+    /// snapshot in the root's config.
+    pub disabled_tools: Option<std::sync::Arc<Vec<String>>>,
 }
 
 pub(crate) fn ensure_hashline_registration(
@@ -283,9 +288,16 @@ pub(crate) fn prepare_tool_call(
 ) -> Result<PreparedToolCall, ToolCallResult> {
     // A tool the user disabled is refused before anything else happens: no
     // hashline registration, translation, permission preflight or backup.
-    if let Some(response) =
-        crate::tool_gate::refusal_for_call(app_ctx, &ctx.request_id, bare_name, &args)
-    {
+    let refusal = match ctx.disabled_tools.as_deref() {
+        Some(disabled) => crate::tool_gate::refusal(&ctx.request_id, bare_name, &args, disabled),
+        None => crate::tool_gate::refusal(
+            &ctx.request_id,
+            bare_name,
+            &args,
+            &app_ctx.config().disabled_tools,
+        ),
+    };
+    if let Some(response) = refusal {
         if let Some(trace) = phase_trace.as_mut() {
             trace.mark_translate_done();
             trace.mark_execute_done();
@@ -691,6 +703,7 @@ mod tests {
                 preview,
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
+                disabled_tools: None,
             }
         }
 
