@@ -318,6 +318,8 @@ pub enum WatchdogPassCause {
 
 pub(crate) struct RegistryInner {
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
+    pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -358,6 +360,7 @@ pub(crate) struct RegistryInner {
     /// this record instead of racing the 500 ms ticker on the wall clock.
     pub(crate) completion_pass_cause: Mutex<HashMap<String, WatchdogPassCause>>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
+    persisted_watch_cursors: Mutex<HashMap<String, (u64, u64, u64)>>,
     /// Session identities with an installed route for this root in subc mode.
     /// The loop-owned route table refreshes this snapshot before replay and on
     /// bind/unbind transitions; standalone replay relies on its binding-session
@@ -611,6 +614,7 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 tasks: Mutex::new(HashMap::new()),
+                watchdog_tasks: Mutex::new(HashMap::new()),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -633,6 +637,7 @@ impl BgTaskRegistry {
                 terminal_transition: tokio::sync::Notify::new(),
                 completion_pass_cause: Mutex::new(HashMap::new()),
                 watch_registry: Mutex::new(WatchRegistry::default()),
+                persisted_watch_cursors: Mutex::new(HashMap::new()),
                 live_delivery_sessions: Mutex::new(HashSet::new()),
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
@@ -1705,6 +1710,15 @@ impl BgTaskRegistry {
         let Ok(conn) = pool.lock() else {
             return;
         };
+        let offsets = (stdout_offset, stderr_offset, pty_offset);
+        if self
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .is_ok_and(|last| last.get(task_id) == Some(&offsets))
+        {
+            return;
+        }
         if let Err(error) = crate::db::bash_watches::update_watch_offsets_for_task(
             &conn,
             &harness,
@@ -1715,6 +1729,8 @@ impl BgTaskRegistry {
             pty_offset as i64,
         ) {
             crate::slog_warn!("persist bash_pattern_watch cursors failed for {task_id}: {error}");
+        } else if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+            last.insert(task_id.to_string(), offsets);
         }
     }
 
@@ -2029,6 +2045,11 @@ impl BgTaskRegistry {
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -2230,6 +2251,11 @@ impl BgTaskRegistry {
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -2388,6 +2414,11 @@ impl BgTaskRegistry {
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -3301,6 +3332,15 @@ impl BgTaskRegistry {
             .transpose()
             .map_err(|_| "artifact_refused")?;
 
+        let stdout_len = stdout
+            .as_ref()
+            .and_then(|file| file.len().ok())
+            .unwrap_or(0);
+        let stderr_len = stderr
+            .as_ref()
+            .and_then(|file| file.len().ok())
+            .unwrap_or(0);
+        let pty_len = pty.as_ref().and_then(|file| file.len().ok()).unwrap_or(0);
         let mut terminal_matches = Vec::new();
         let scanned_terminal = terminal_at_registration;
         let watch_id = {
@@ -3317,46 +3357,50 @@ impl BgTaskRegistry {
                     if terminal_at_registration {
                         registry.set_file_cursor(&stdout_key, 0);
                         registry.set_file_cursor(&stderr_key, 0);
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &stdout_key,
-                            &task_id,
-                            stdout.as_mut().expect("pipe stdout opened"),
-                        ));
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &stderr_key,
-                            &task_id,
-                            stderr.as_mut().expect("pipe stderr opened"),
-                        ));
                     } else {
-                        registry.prime_file_cursor(
-                            &stdout_key,
-                            stdout.as_ref().expect("pipe stdout opened"),
-                        );
-                        registry.prime_file_cursor(
-                            &stderr_key,
-                            stderr.as_ref().expect("pipe stderr opened"),
-                        );
+                        if registry.file_cursor(&stdout_key).is_none() {
+                            registry.set_file_cursor(&stdout_key, stdout_len);
+                        }
+                        if registry.file_cursor(&stderr_key).is_none() {
+                            registry.set_file_cursor(&stderr_key, stderr_len);
+                        }
                     }
                 }
                 BgMode::Pty => {
                     let pty_key = format!("{task_id}:pty");
                     if terminal_at_registration {
                         registry.set_file_cursor(&pty_key, 0);
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &pty_key,
-                            &task_id,
-                            pty.as_mut().expect("PTY artifact opened"),
-                        ));
-                    } else {
-                        registry.prime_file_cursor(
-                            &pty_key,
-                            pty.as_ref().expect("PTY artifact opened"),
-                        );
+                    } else if registry.file_cursor(&pty_key).is_none() {
+                        registry.set_file_cursor(&pty_key, pty_len);
                     }
                 }
             }
             watch_id
         };
+        if terminal_at_registration {
+            match mode {
+                BgMode::Pipes => {
+                    terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:stdout"),
+                        stdout.as_mut().unwrap(),
+                        true,
+                    ));
+                    terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:stderr"),
+                        stderr.as_mut().unwrap(),
+                        true,
+                    ));
+                }
+                BgMode::Pty => terminal_matches.extend(self.scan_watch_file(
+                    &task_id,
+                    &format!("{task_id}:pty"),
+                    pty.as_mut().unwrap(),
+                    true,
+                )),
+            }
+        }
 
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
         self.persist_watch_registration(
@@ -3369,44 +3413,53 @@ impl BgTaskRegistry {
             stderr_offset,
             pty_offset,
         );
+        let single_watch = self.active_watch_count(&task_id) == 1;
+        if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+            if single_watch {
+                last.insert(task_id.clone(), (stdout_offset, stderr_offset, pty_offset));
+            } else {
+                last.remove(&task_id);
+            }
+        }
 
         if task.is_terminal() {
             if !scanned_terminal {
-                terminal_matches = {
+                {
                     let mut registry = self
                         .inner
                         .watch_registry
                         .lock()
                         .map_err(|_| "watch_registry_poisoned")?;
-                    match &mode {
+                    match mode {
                         BgMode::Pipes => {
-                            let stdout_key = format!("{task_id}:stdout");
-                            let stderr_key = format!("{task_id}:stderr");
-                            registry.set_file_cursor(&stdout_key, 0);
-                            registry.set_file_cursor(&stderr_key, 0);
-                            let mut matches = registry.scan_file_new_bytes(
-                                &stdout_key,
-                                &task_id,
-                                stdout.as_mut().expect("pipe stdout opened"),
-                            );
-                            matches.extend(registry.scan_file_new_bytes(
-                                &stderr_key,
-                                &task_id,
-                                stderr.as_mut().expect("pipe stderr opened"),
-                            ));
-                            matches
+                            registry.set_file_cursor(&format!("{task_id}:stdout"), 0);
+                            registry.set_file_cursor(&format!("{task_id}:stderr"), 0);
                         }
-                        BgMode::Pty => {
-                            let pty_key = format!("{task_id}:pty");
-                            registry.set_file_cursor(&pty_key, 0);
-                            registry.scan_file_new_bytes(
-                                &pty_key,
-                                &task_id,
-                                pty.as_mut().expect("PTY artifact opened"),
-                            )
-                        }
+                        BgMode::Pty => registry.set_file_cursor(&format!("{task_id}:pty"), 0),
                     }
-                };
+                }
+                match mode {
+                    BgMode::Pipes => {
+                        terminal_matches.extend(self.scan_watch_file(
+                            &task_id,
+                            &format!("{task_id}:stdout"),
+                            stdout.as_mut().unwrap(),
+                            true,
+                        ));
+                        terminal_matches.extend(self.scan_watch_file(
+                            &task_id,
+                            &format!("{task_id}:stderr"),
+                            stderr.as_mut().unwrap(),
+                            true,
+                        ));
+                    }
+                    BgMode::Pty => terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:pty"),
+                        pty.as_mut().unwrap(),
+                        true,
+                    )),
+                }
             }
 
             let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
@@ -3489,7 +3542,52 @@ impl BgTaskRegistry {
         }
     }
 
+    fn scan_watch_file(
+        &self,
+        task_id: &str,
+        cursor_key: &str,
+        file: &mut super::persistence::ValidatedArtifact,
+        drain: bool,
+    ) -> Vec<PatternMatch> {
+        const CHUNK: u64 = 64 * 1024;
+        let mut matches = Vec::new();
+        loop {
+            let cursor = match self.inner.watch_registry.lock() {
+                Ok(registry) if registry.active_count(task_id) > 0 => {
+                    registry.file_cursor(cursor_key)
+                }
+                _ => break,
+            };
+            let start = cursor.unwrap_or_else(|| file.len().unwrap_or(0));
+            let Ok(bytes) = file.read_range(start, CHUNK) else {
+                break;
+            };
+            if bytes.is_empty() {
+                break;
+            }
+            let len = bytes.len();
+            let Ok(mut registry) = self.inner.watch_registry.lock() else {
+                break;
+            };
+            if registry.active_count(task_id) == 0 {
+                break;
+            }
+            if registry.file_cursor(cursor_key) != cursor {
+                continue;
+            }
+            matches.extend(registry.scan_chunk(cursor_key, task_id, &bytes, start));
+            drop(registry);
+            if !drain || len < CHUNK as usize {
+                break;
+            }
+        }
+        matches
+    }
+
     pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
+        if self.active_watch_count(&task.task_id) == 0 {
+            return;
+        }
         let mode = match task.state.lock() {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return,
@@ -3509,33 +3607,34 @@ impl BgTaskRegistry {
             .transpose()
             .ok()
             .flatten();
+        let drain = !task.is_running();
         let mut matches = Vec::new();
-        if let Ok(mut registry) = self.inner.watch_registry.lock() {
-            match mode {
-                BgMode::Pipes => {
-                    let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
-                        return;
-                    };
-                    let stdout_key = format!("{}:stdout", task.task_id);
-                    let stderr_key = format!("{}:stderr", task.task_id);
-                    matches.extend(registry.scan_file_new_bytes(
-                        &stdout_key,
-                        &task.task_id,
-                        stdout,
-                    ));
-                    matches.extend(registry.scan_file_new_bytes(
-                        &stderr_key,
-                        &task.task_id,
-                        stderr,
-                    ));
-                }
-                BgMode::Pty => {
-                    let Some(pty) = pty.as_mut() else {
-                        return;
-                    };
-                    let pty_key = format!("{}:pty", task.task_id);
-                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, pty));
-                }
+        match mode {
+            BgMode::Pipes => {
+                let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
+                    return;
+                };
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:stdout", task.task_id),
+                    stdout,
+                    drain,
+                ));
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:stderr", task.task_id),
+                    stderr,
+                    drain,
+                ));
+            }
+            BgMode::Pty => {
+                let Some(pty) = pty.as_mut() else { return };
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:pty", task.task_id),
+                    pty,
+                    drain,
+                ));
             }
         }
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
@@ -4736,16 +4835,16 @@ impl BgTaskRegistry {
 
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
         self.inner
-            .tasks
+            .watchdog_tasks
             .lock()
-            .map(|tasks| {
-                tasks
-                    .values()
-                    .filter(|task| task.is_running())
-                    .cloned()
-                    .collect()
-            })
+            .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.watchdog_tasks.lock() {
+            tasks.remove(task_id);
+        }
     }
 
     fn insert_rehydrated_task(
@@ -4796,6 +4895,13 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        if task.is_running() {
+            self.inner
+                .watchdog_tasks
+                .lock()
+                .map_err(|_| "background watchdog lock poisoned")?
+                .insert(task_id.clone(), Arc::clone(&task));
+        }
         // Re-arm durable pattern watches after the task is addressable again so
         // gap matches (bytes written while the bridge was down) are scanned and
         // pending undelivered matches are re-pushed.
@@ -4865,6 +4971,16 @@ impl BgTaskRegistry {
 
             // All rows for a task share stream cursors; take them from the first row.
             let first = &rows[0];
+            if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+                last.insert(
+                    task.task_id.clone(),
+                    (
+                        first.stdout_offset.max(0) as u64,
+                        first.stderr_offset.max(0) as u64,
+                        first.pty_offset.max(0) as u64,
+                    ),
+                );
+            }
             match mode {
                 BgMode::Pipes => {
                     registry.set_file_cursor(&stdout_key, first.stdout_offset.max(0) as u64);
@@ -4917,35 +5033,36 @@ impl BgTaskRegistry {
                 }
             }
 
-            // Gap scan: bytes written after the last persisted cursor while the
-            // previous process was down. Skip when we already have a pending
-            // once-match to re-deliver (avoids double-firing the same hit).
-            let should_gap_scan =
-                rows.iter().any(|row| row.scanning) && !pending_to_emit.iter().any(|m| m.once);
-            if should_gap_scan {
-                match mode {
-                    BgMode::Pipes => {
-                        if let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) {
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &stdout_key,
-                                &task.task_id,
-                                stdout,
-                            ));
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &stderr_key,
-                                &task.task_id,
-                                stderr,
-                            ));
-                        }
+            // Gap bytes are read after releasing the registry lock.
+        }
+        let should_gap_scan =
+            rows.iter().any(|row| row.scanning) && !pending_to_emit.iter().any(|m| m.once);
+        if should_gap_scan {
+            match mode {
+                BgMode::Pipes => {
+                    if let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) {
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:stdout", task.task_id),
+                            stdout,
+                            true,
+                        ));
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:stderr", task.task_id),
+                            stderr,
+                            true,
+                        ));
                     }
-                    BgMode::Pty => {
-                        if let Some(pty) = pty.as_mut() {
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &pty_key,
-                                &task.task_id,
-                                pty,
-                            ));
-                        }
+                }
+                BgMode::Pty => {
+                    if let Some(pty) = pty.as_mut() {
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:pty", task.task_id),
+                            pty,
+                            true,
+                        ));
                     }
                 }
             }
@@ -11202,6 +11319,112 @@ mod tests {
             }),
             "rehydrate should deliver gap match: {matches:?}"
         );
+    }
+
+    #[test]
+    fn noisy_watch_scan_is_bounded_and_other_task_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let spawn = || {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    LONG_RUNNING_COMMAND,
+                    "session".to_string(),
+                    storage.to_path_buf(),
+                    HashMap::new(),
+                    Some(Duration::from_secs(30)),
+                    storage.to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(storage.to_path_buf()),
+                )
+                .unwrap()
+        };
+        let noisy = spawn();
+        let other = spawn();
+        registry
+            .register_watch(
+                noisy.clone(),
+                WatchPattern::Substring("CROSS-CHUNK".into()),
+                true,
+            )
+            .unwrap();
+        registry
+            .register_watch(other.clone(), WatchPattern::Substring("READY".into()), true)
+            .unwrap();
+        let noisy_task = registry.task_for_session(&noisy, "session").unwrap();
+        let other_task = registry.task_for_session(&other, "session").unwrap();
+        let mut burst = vec![b'x'; 64 * 1024 - 5];
+        burst.extend_from_slice(b"CROSS-CHUNK");
+        burst.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&noisy_task.paths.stdout)
+            .unwrap()
+            .write_all(&burst)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&other_task.paths.stdout)
+            .unwrap()
+            .write_all(b"READY")
+            .unwrap();
+        registry.scan_task_watch_output(&noisy_task);
+        let first = registry.watch_stream_cursors(&noisy).0;
+        assert_eq!(
+            first,
+            64 * 1024,
+            "one running tick must not consume the whole burst"
+        );
+        registry.scan_task_watch_output(&other_task);
+        registry.scan_task_watch_output(&noisy_task);
+        let hits = pattern_match_frames(&frames);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.task_id == other && hit.match_text == "READY"));
+        assert!(hits
+            .iter()
+            .any(|hit| hit.task_id == noisy && hit.match_text == "CROSS-CHUNK"));
+    }
+
+    #[test]
+    fn idle_watched_task_does_not_write_unchanged_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, _) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let before = db.lock().unwrap().total_changes();
+        for _ in 0..8 {
+            registry.scan_task_watch_output(&task);
+        }
+        let after = db.lock().unwrap().total_changes();
+        assert_eq!(after - before, 0, "idle ticks updated watch rows");
     }
 
     #[test]

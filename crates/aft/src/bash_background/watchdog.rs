@@ -44,9 +44,11 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                 let _ = registry.poll_task(&task);
                 registry.scan_task_watch_output(&task);
                 if !task.is_running() {
+                    registry.scan_task_watch_output(&task);
                     if let Ok(mut causes) = registry.inner.completion_pass_cause.lock() {
                         causes.entry(task.task_id.clone()).or_insert(pass_cause);
                     }
+                    registry.retire_watchdog_task(&task.task_id);
                     continue;
                 }
 
