@@ -276,6 +276,36 @@ fn main() -> io::Result<()> {
                             std::process::exit(1);
                         }
                     }
+                    // Die during initialize the way a broken real server does:
+                    // print a diagnostic to stderr, then either exit with the
+                    // code in AFT_FAKE_LSP_INIT_EXIT_CODE or be killed by the
+                    // signal named in AFT_FAKE_LSP_INIT_SELF_SIGNAL (for
+                    // example "TERM"), delivered by the system `kill` utility.
+                    let init_exit_code = std::env::var("AFT_FAKE_LSP_INIT_EXIT_CODE")
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    let init_self_signal = std::env::var("AFT_FAKE_LSP_INIT_SELF_SIGNAL").ok();
+                    if init_exit_code.is_some() || init_self_signal.is_some() {
+                        if let Ok(text) = std::env::var("AFT_FAKE_LSP_INIT_EXIT_STDERR") {
+                            let mut stderr = io::stderr().lock();
+                            for line in text.split('|') {
+                                let _ = writeln!(stderr, "{line}");
+                            }
+                            let _ = stderr.flush();
+                        }
+                        if let Some(signal) = init_self_signal {
+                            let _ = std::process::Command::new("kill")
+                                .arg(format!("-{signal}"))
+                                .arg(std::process::id().to_string())
+                                .status();
+                            // The signal normally lands before this sleep ends;
+                            // the fallback exit keeps a misconfigured test from
+                            // hanging.
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            std::process::exit(99);
+                        }
+                        std::process::exit(init_exit_code.unwrap_or(1));
+                    }
                     if std::env::var("AFT_FAKE_LSP_INIT_CRASH_MODULE_NOT_FOUND")
                         .ok()
                         .as_deref()

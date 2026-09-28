@@ -1229,6 +1229,157 @@ fn test_lsp_initialize_crash_reports_stderr_and_hint() {
     );
 }
 
+/// The daemon's maintenance tick sweeps the process-wide child registry every
+/// 250 ms while other threads start language servers. A sweep that ran while a
+/// server was being spawned used to treat the brand-new child as an orphan
+/// (no client owned it yet) and SIGTERM it, so `initialize` failed with a
+/// broken pipe and an empty stderr. Hammer the sweep while starting real
+/// server processes and require every handshake to succeed.
+#[cfg(unix)]
+#[test]
+fn test_lsp_spawn_survives_concurrent_orphan_sweeps() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (_temp_dir, root, _files) = rust_workspace_with_files(&["main.rs"]);
+    let registry = LspChildRegistry::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reaped = Arc::new(AtomicUsize::new(0));
+    let sweeper = {
+        let registry = registry.clone();
+        let stop = Arc::clone(&stop);
+        let reaped = Arc::clone(&reaped);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let count = registry.reap_children_with_gone_cwd_or_reclaimed_root();
+                reaped.fetch_add(count, Ordering::Relaxed);
+                thread::yield_now();
+            }
+        })
+    };
+
+    let mut failures = Vec::new();
+    for attempt in 0..12 {
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let mut client = LspClient::spawn(
+            ServerKind::Rust,
+            root.clone(),
+            &fake_server_path(),
+            &[],
+            &HashMap::new(),
+            event_tx,
+            registry.clone(),
+        )
+        .expect("spawn fake lsp");
+        if let Err(err) = client.initialize(&root, None) {
+            failures.push(format!("attempt {attempt}: {err}"));
+        }
+        let _ = client.shutdown();
+    }
+    stop.store(true, Ordering::Relaxed);
+    sweeper.join().expect("sweeper thread");
+
+    assert!(
+        failures.is_empty(),
+        "the orphan sweep killed {} freshly spawned server(s); failures: {failures:#?}",
+        reaped.load(Ordering::Relaxed)
+    );
+}
+
+/// Run one `lsp_diagnostics` call against a fake TypeScript server that dies
+/// during `initialize`, and return the reported status together with the
+/// manager's server-exit log line for that death.
+fn initialize_death_status_and_exit_line(env: &[(&str, &str)]) -> (String, String) {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_typescript_lsp();
+    for (key, value) in env {
+        ctx.lsp().set_extra_env(key, value);
+    }
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-init-death",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    let status = response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("status string missing: {response:#}"))
+        .to_string();
+
+    // The exit line is written when the dead server's reader event is
+    // drained, which can trail the failed request slightly.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = ctx.lsp().drain_events();
+        let lines = ctx.lsp().recent_server_exit_log_lines();
+        if let Some(line) = lines.iter().find(|line| line.contains("TypeScript")) {
+            return (status, line.clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no server-exit log line was recorded; status was: {status}; lines: {lines:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn test_lsp_initialize_exit_code_and_stderr_reach_status_and_exit_log() {
+    let (status, line) = initialize_death_status_and_exit_line(&[
+        ("AFT_FAKE_LSP_INIT_EXIT_CODE", "3"),
+        (
+            "AFT_FAKE_LSP_INIT_EXIT_STDERR",
+            "fatal: toolchain could not be resolved|second stderr line",
+        ),
+    ]);
+
+    assert!(
+        status.contains("server crashed during initialize (exit 3 after "),
+        "status must lead with the exit code: {status}"
+    );
+    assert!(
+        status.contains("fatal: toolchain could not be resolved"),
+        "status must carry the first stderr line: {status}"
+    );
+    assert!(line.contains("phase=initialize"), "log line: {line}");
+    assert!(line.contains("status=exit 3"), "log line: {line}");
+    assert!(line.contains("pid="), "log line: {line}");
+    assert!(line.contains("elapsed="), "log line: {line}");
+    assert!(line.contains("command="), "log line: {line}");
+    assert!(
+        line.contains("fatal: toolchain could not be resolved")
+            && line.contains("second stderr line"),
+        "log line must carry the stderr tail: {line}"
+    );
+    assert!(
+        !line.contains('\n'),
+        "the exit log entry must stay on one line: {line:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_lsp_initialize_signal_death_names_the_signal() {
+    let (status, line) = initialize_death_status_and_exit_line(&[
+        ("AFT_FAKE_LSP_INIT_SELF_SIGNAL", "TERM"),
+        ("AFT_FAKE_LSP_INIT_EXIT_STDERR", "about to be terminated"),
+    ]);
+
+    assert!(
+        status.contains("signal 15 (SIGTERM)"),
+        "status must name the signal: {status}"
+    );
+    assert!(
+        line.contains("status=signal 15 (SIGTERM)"),
+        "log line must name the signal: {line}"
+    );
+    assert!(line.contains("about to be terminated"), "log line: {line}");
+}
+
 #[test]
 fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
     let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);

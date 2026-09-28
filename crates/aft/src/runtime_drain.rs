@@ -3480,12 +3480,9 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                     lsp_params_for_log(params)
                 );
             }
-            LspEvent::ServerExited {
-                server_kind,
-                root,
-                reason,
-            } => {
-                aft::slog_info!("exited {:?} {} ({reason})", server_kind, root.display());
+            LspEvent::ServerExited { .. } => {
+                // `LspManager::handle_event` already wrote the one log line
+                // for this exit, with its status and stderr tail.
                 status_changed = true;
             }
         }

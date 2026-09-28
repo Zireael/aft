@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{Child, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +30,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STDERR_TAIL_LINES: usize = 64;
 const STDERR_LINE_BYTES: usize = 4 * 1024;
+/// How long an exit report waits for the stderr reader to hit end-of-file,
+/// so the last lines a dying server printed are in the report.
+const STDERR_EOF_WAIT: Duration = Duration::from_millis(250);
+/// Longest stderr excerpt, in bytes, carried by a single server-exit log line.
+const EXIT_LOG_STDERR_BYTES: usize = 2 * 1024;
+/// Longest first-stderr-line excerpt quoted in a short failure cause.
+const CAUSE_STDERR_LINE_BYTES: usize = 200;
+/// Longest command line quoted in exit reports.
+const COMMAND_DISPLAY_BYTES: usize = 512;
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
@@ -66,6 +75,9 @@ pub enum LspEvent {
     ServerExited {
         server_kind: ServerKind,
         root: PathBuf,
+        /// PID of the process whose output stream ended. The manager uses it
+        /// to tell a dead server apart from a newer one for the same root.
+        pid: u32,
         reason: ServerExitReason,
     },
 }
@@ -118,6 +130,186 @@ impl ServerExitReason {
 pub(crate) enum ReaderExitReap {
     AlreadyExited(std::process::ExitStatus),
     KilledWhileAlive,
+}
+
+/// The part of a language server's life it was in when it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPhase {
+    /// The process never started, or stopped before `initialize` was sent.
+    Spawn,
+    /// The `initialize` handshake was in flight.
+    Initialize,
+    /// The server had completed `initialize` and was serving requests.
+    Running,
+}
+
+impl std::fmt::Display for ServerPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Spawn => "spawn",
+            Self::Initialize => "initialize",
+            Self::Running => "running",
+        })
+    }
+}
+
+/// Everything AFT knows about why one language-server process stopped: which
+/// process it was, how far it got, how it ended, and what it last printed.
+#[derive(Debug, Clone)]
+pub struct ServerExitReport {
+    pub kind: ServerKind,
+    pub root: PathBuf,
+    pub pid: u32,
+    pub phase: ServerPhase,
+    /// How the process ended; `None` when that could not be observed.
+    pub status: Option<std::process::ExitStatus>,
+    /// True when AFT killed a server that was still running (its output
+    /// closed, or its handshake failed), so `status` reflects AFT's kill, not
+    /// the server's own exit.
+    pub killed_by_aft: bool,
+    /// Time from spawn until the exit was observed.
+    pub elapsed: Duration,
+    /// Resolved executable path plus arguments.
+    pub command: String,
+    /// Last lines the server wrote to stderr, newline-separated.
+    pub stderr_tail: String,
+}
+
+impl ServerExitReport {
+    /// Human-readable exit status: `exit 3`, `signal 15 (SIGTERM)`, or
+    /// `status unavailable` when the process state could not be read.
+    pub fn status_text(&self) -> String {
+        let status = describe_exit_status(self.status);
+        if self.killed_by_aft {
+            format!("killed by aft ({status})")
+        } else {
+            status
+        }
+    }
+
+    /// The first non-empty stderr line, trimmed to a short excerpt.
+    pub fn first_stderr_line(&self) -> Option<String> {
+        self.stderr_tail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| truncate_to_bytes(line, CAUSE_STDERR_LINE_BYTES))
+    }
+
+    /// Compact cause for error messages, e.g.
+    /// `exit 101 after 0.4 s: error: could not load workspace`.
+    pub fn short_cause(&self) -> String {
+        let mut cause = format!(
+            "{} after {:.1} s",
+            self.status_text(),
+            self.elapsed.as_secs_f64()
+        );
+        if let Some(line) = self.first_stderr_line() {
+            cause.push_str(": ");
+            cause.push_str(&line);
+        }
+        cause
+    }
+
+    /// The single log line recording this exit. `reason` says how AFT noticed
+    /// (for example `eof` when the server's stdout closed).
+    pub fn log_line(&self, reason: &str) -> String {
+        format!(
+            "exited {:?} {} ({reason}): pid={} phase={} status={} elapsed={:.1}s command={:?} stderr_tail={}",
+            self.kind,
+            self.root.display(),
+            self.pid,
+            self.phase,
+            self.status_text(),
+            self.elapsed.as_secs_f64(),
+            self.command,
+            stderr_tail_for_log(&self.stderr_tail),
+        )
+    }
+}
+
+/// Describe how a process ended, naming the signal when it was killed by one.
+pub fn describe_exit_status(status: Option<std::process::ExitStatus>) -> String {
+    let Some(status) = status else {
+        return "status unavailable".to_string();
+    };
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let mut text = match signal_name(signal) {
+                Some(name) => format!("signal {signal} ({name})"),
+                None => format!("signal {signal}"),
+            };
+            if status.core_dumped() {
+                text.push_str(", core dumped");
+            }
+            return text;
+        }
+    }
+    format!("status {status}")
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<&'static str> {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// Keep at most `max_bytes` of `text` from its start, on a char boundary.
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Render a stderr tail as one quoted log field: lines joined by ` | `, and
+/// only the last `EXIT_LOG_STDERR_BYTES` kept.
+fn stderr_tail_for_log(stderr_tail: &str) -> String {
+    let joined = stderr_tail
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        return "<empty>".to_string();
+    }
+    if joined.len() <= EXIT_LOG_STDERR_BYTES {
+        return format!("{joined:?}");
+    }
+    let mut start = joined.len() - EXIT_LOG_STDERR_BYTES;
+    while start < joined.len() && !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{:?}", format!("...{}", &joined[start..]))
 }
 
 /// What this server told us it can do during the LSP `initialize` handshake.
@@ -181,6 +373,13 @@ pub struct LspClient {
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
     child_registry: LspChildRegistry,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the stderr reader when the pipe reaches end-of-file, meaning
+    /// every line the server (and its descendants) wrote is in the tail.
+    stderr_closed: Arc<AtomicBool>,
+    /// When the process was spawned, for the elapsed time in exit reports.
+    spawned_at: Instant,
+    /// Resolved executable path and arguments, for exit reports.
+    command_display: String,
     /// When true, `Drop` untracks but does not kill. Tests use this so a
     /// `ServerExited` handler's kill is the only thing that can reap the child.
     #[cfg(test)]
@@ -289,28 +488,44 @@ impl LspClient {
             });
         }
 
-        let mut child = child_registry.spawn_tracked_child(
-            &mut command,
-            reclaim_root,
-            Some(&root),
-            Some(&kind),
-        )?;
+        let spawned_at = Instant::now();
+        let command_display = truncate_to_bytes(
+            &std::iter::once(binary.display().to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            COMMAND_DISPLAY_BYTES,
+        );
+        let mut child = child_registry
+            .spawn_tracked_child(&mut command, reclaim_root, Some(&root), Some(&kind))
+            .map_err(|err| {
+                // A spawn error from the OS names neither the program nor the
+                // directory; both are what a reader needs to fix it.
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to start `{command_display}` in {}: {err}",
+                        root.display()
+                    ),
+                )
+            })?;
         let child_pid = child.id();
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stdout pipe"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stdin pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stderr pipe"))?;
+        let (stdout, stdin, stderr) =
+            match (child.stdout.take(), child.stdin.take(), child.stderr.take()) {
+                (Some(stdout), Some(stdin), Some(stderr)) => (stdout, stdin, stderr),
+                _ => {
+                    // No client will own this child, so stop it here rather
+                    // than leave an untracked process behind.
+                    kill_lsp_child_group(&mut child);
+                    let _ = child.wait();
+                    child_registry.untrack(child_pid);
+                    return Err(io::Error::other("language server is missing a stdio pipe"));
+                }
+            };
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail));
+        let stderr_closed = Arc::new(AtomicBool::new(false));
+        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail), Arc::clone(&stderr_closed));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
@@ -336,6 +551,7 @@ impl LspClient {
                             let _ = event_tx.send(LspEvent::ServerExited {
                                 server_kind: reader_kind.clone(),
                                 root: reader_root.clone(),
+                                pid: child_pid,
                                 reason: ServerExitReason::PendingLockPoisoned,
                             });
                             break;
@@ -396,6 +612,7 @@ impl LspClient {
                         let _ = event_tx.send(LspEvent::ServerExited {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
+                            pid: child_pid,
                             reason: ServerExitReason::from_read_result(terminal),
                         });
                         break;
@@ -421,6 +638,9 @@ impl LspClient {
             watched_file_registrations,
             child_registry,
             stderr_tail,
+            stderr_closed,
+            spawned_at,
+            command_display,
             #[cfg(test)]
             suppress_kill_on_drop: false,
         })
@@ -792,6 +1012,75 @@ impl LspClient {
         self.child_pid
     }
 
+    /// Which part of its life this server is in, for exit reports.
+    pub fn phase(&self) -> ServerPhase {
+        match self.state {
+            ServerState::Starting => ServerPhase::Spawn,
+            ServerState::Initializing => ServerPhase::Initialize,
+            ServerState::Ready | ServerState::ShuttingDown | ServerState::Exited => {
+                ServerPhase::Running
+            }
+        }
+    }
+
+    /// Poll for the child's exit for up to `timeout`, returning its status if
+    /// it exited in that time. Does not kill the child.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Build the exit report for this process. Waits briefly for the stderr
+    /// reader to reach end-of-file so the server's last words are included.
+    pub fn exit_report(
+        &self,
+        phase: ServerPhase,
+        status: Option<std::process::ExitStatus>,
+        killed_by_aft: bool,
+    ) -> ServerExitReport {
+        let elapsed = self.spawned_at.elapsed();
+        let deadline = Instant::now() + STDERR_EOF_WAIT;
+        while !self.stderr_closed.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        ServerExitReport {
+            kind: self.kind.clone(),
+            root: self.root.clone(),
+            pid: self.child_pid,
+            phase,
+            status,
+            killed_by_aft,
+            elapsed,
+            command: self.command_display.clone(),
+            stderr_tail: self.stderr_tail(),
+        }
+    }
+
+    /// Reap a client whose reader stopped and describe how the process ended.
+    /// After a clean end-of-file the process is normally already exiting, so
+    /// give it a moment to report its own status before killing it.
+    pub(crate) fn reap_with_report(&mut self, reason: &ServerExitReason) -> ServerExitReport {
+        let phase = self.phase();
+        if matches!(reason, ServerExitReason::Eof) {
+            let _ = self.wait_for_exit(STDERR_EOF_WAIT);
+        }
+        match self.reap_after_reader_exit(reason) {
+            ReaderExitReap::AlreadyExited(status) => self.exit_report(phase, Some(status), false),
+            ReaderExitReap::KilledWhileAlive => {
+                let killed_status = self.child.try_wait().ok().flatten();
+                self.exit_report(phase, killed_status, true)
+            }
+        }
+    }
+
     /// If the child is still running, kill its process group and wait bounded.
     /// Always untrack. The caller logs whether this was a real exit or a reader
     /// death that left the child alive.
@@ -921,6 +1210,7 @@ impl Drop for LspClient {
 fn spawn_stderr_drain_thread(
     stderr: std::process::ChildStderr,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_closed: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
@@ -940,6 +1230,7 @@ fn spawn_stderr_drain_thread(
                 Err(_) => break,
             }
         }
+        stderr_closed.store(true, Ordering::Release);
     });
 }
 

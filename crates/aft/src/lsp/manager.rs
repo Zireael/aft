@@ -15,7 +15,7 @@ use lsp_types::{
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
-use crate::lsp::client::{LspClient, LspEvent, ReaderExitReap, ServerState};
+use crate::lsp::client::{LspClient, LspEvent, ServerExitReport, ServerPhase, ServerState};
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
@@ -145,7 +145,7 @@ impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
         match self {
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
-            Self::SpawnFailed { reason, .. } => reason.clone(),
+            Self::SpawnFailed { reason, .. } => summarize_failure_reason(reason),
             Self::NoRootMarker { looked_for } => {
                 format!(
                     "no workspace root marker found (looked for {})",
@@ -427,7 +427,27 @@ pub struct LspManager {
     /// kill them on SIGTERM/SIGINT before aft exits, preventing orphans.
     /// Defaults to empty; production wires this from `AppContext`.
     child_registry: LspChildRegistry,
+    /// The last few server-exit log lines, newest last, so tests and status
+    /// probes can read why a server stopped without installing a logger.
+    recent_exit_log_lines: std::collections::VecDeque<String>,
+    /// Exit reports for servers that died before a client owned them (during
+    /// spawn or `initialize`) or whose failure was already reported, keyed by
+    /// PID. Each waits for its reader's `ServerExited` event so the exit is
+    /// logged exactly once, with full detail.
+    pending_exit_reports: HashMap<u32, ServerExitReport>,
 }
+
+/// How many server-exit log lines `LspManager` keeps for inspection.
+const RECENT_EXIT_LOG_LINES: usize = 16;
+/// Upper bound on exit reports waiting for their reader event. Every spawned
+/// reader sends one event, so this only guards against an unforeseen leak.
+const PENDING_EXIT_REPORTS_CAP: usize = 64;
+/// How long a failed `initialize` waits for the server process to finish
+/// exiting, so the error can carry its real exit status.
+const INITIALIZE_EXIT_WAIT: Duration = Duration::from_millis(250);
+/// Longest failure reason, in bytes, that inspect shows when a language
+/// server (a diagnostics producer) could not start.
+const PRODUCER_FAILURE_REASON_BYTES: usize = 500;
 
 impl LspManager {
     pub fn new() -> Self {
@@ -450,7 +470,23 @@ impl LspManager {
             last_watched_file_notification_trace: "no watched-file notification attempted"
                 .to_string(),
             child_registry: LspChildRegistry::new(),
+            recent_exit_log_lines: std::collections::VecDeque::new(),
+            pending_exit_reports: HashMap::new(),
         }
+    }
+
+    /// The most recent server-exit log lines, oldest first.
+    #[doc(hidden)]
+    pub fn recent_server_exit_log_lines(&self) -> Vec<String> {
+        self.recent_exit_log_lines.iter().cloned().collect()
+    }
+
+    fn record_exit_log_line(&mut self, line: String) {
+        slog_info!("{line}");
+        if self.recent_exit_log_lines.len() == RECENT_EXIT_LOG_LINES {
+            self.recent_exit_log_lines.pop_front();
+        }
+        self.recent_exit_log_lines.push_back(line);
     }
 
     /// Set the child-PID registry. Must be called before any servers spawn.
@@ -2174,23 +2210,15 @@ impl LspManager {
             .get(key)
             .cloned()
             .unwrap_or_else(|| key.kind.id_str().to_string());
-        let (status, stderr_tail) = {
+        let report = {
             let client = self.clients.get_mut(key)?;
-            let mut status = client.child_exit_status();
-            for _ in 0..10 {
-                if status.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                status = client.child_exit_status();
-            }
-            let status = status?;
-            wait_for_stderr_tail(client);
-            (status, client.stderr_tail())
+            let status = client.wait_for_exit(Duration::from_millis(100))?;
+            client.exit_report(client.phase(), Some(status), false)
         };
-        let reason = format_post_initialize_exit_reason(&binary, status, &stderr_tail, err);
+        let reason = format_post_initialize_exit_reason(&binary, &report, err);
         let result = ServerAttemptResult::SpawnFailed { binary, reason };
         self.clients.remove(key);
+        self.remember_exit_report(report);
         self.server_binaries.remove(key);
         self.documents.remove(key);
         self.diagnostics.clear_for_server(key);
@@ -2706,34 +2734,45 @@ impl LspManager {
             LspEvent::ServerExited {
                 server_kind,
                 root,
+                pid,
                 reason,
             } => {
                 let key = ServerKey {
                     kind: server_kind.clone(),
                     root: root.clone(),
                 };
-                if let Some(mut client) = self.clients.remove(&key) {
-                    match client.reap_after_reader_exit(reason) {
-                        ReaderExitReap::AlreadyExited(status) => {
-                            slog_info!(
-                                "exited {:?} {}: exit status {status} ({reason})",
-                                server_kind,
-                                root.display()
-                            );
-                        }
-                        ReaderExitReap::KilledWhileAlive => {
-                            slog_info!(
-                                "exited {:?} {}: reader ended while child alive: {reason}",
-                                server_kind,
-                                root.display()
-                            );
-                        }
+                let reason_text = reason.to_string();
+                let owned_by_live_client = self
+                    .clients
+                    .get(&key)
+                    .is_some_and(|client| client.child_pid() == *pid);
+                if owned_by_live_client {
+                    if let Some(mut client) = self.clients.remove(&key) {
+                        let report = client.reap_with_report(reason);
+                        self.record_exit_log_line(report.log_line(&reason_text));
                     }
+                } else if let Some(report) = self.pending_exit_reports.remove(pid) {
+                    // This process died while starting (or its failure was
+                    // already reported to a caller); its full report was
+                    // kept for this moment so the exit is logged once.
+                    self.record_exit_log_line(report.log_line(&reason_text));
+                } else {
+                    self.record_exit_log_line(format!(
+                        "exited {:?} {} ({reason_text}): pid={pid} status unavailable (aft had already released this server)",
+                        server_kind,
+                        root.display()
+                    ));
                 }
-                self.server_binaries.remove(&key);
-                self.documents.remove(&key);
-                self.diagnostics.clear_for_server(&key);
-                None
+                if self.clients.contains_key(&key) {
+                    // A newer server for the same root is running; the event
+                    // belonged to an older process and must not tear it down.
+                    None
+                } else {
+                    self.server_binaries.remove(&key);
+                    self.documents.remove(&key);
+                    self.diagnostics.clear_for_server(&key);
+                    None
+                }
             }
             _ => None,
         };
@@ -2866,7 +2905,7 @@ impl LspManager {
     }
 
     fn spawn_server(
-        &self,
+        &mut self,
         def: &ServerDef,
         root: &Path,
         source_file: &Path,
@@ -2876,7 +2915,7 @@ impl LspManager {
     }
 
     fn spawn_server_with_timeout(
-        &self,
+        &mut self,
         def: &ServerDef,
         root: &Path,
         source_file: &Path,
@@ -2906,7 +2945,7 @@ impl LspManager {
             .filter(|project_root| root.starts_with(project_root))
             .unwrap_or_else(|| root.to_path_buf());
 
-        let mut client = LspClient::spawn_with_reclaim_root(
+        let mut client = match LspClient::spawn_with_reclaim_root(
             def.kind.clone(),
             root.to_path_buf(),
             &binary,
@@ -2915,22 +2954,56 @@ impl LspManager {
             self.event_tx.clone(),
             self.child_registry.clone(),
             Some(&reclaim_root),
-        )?;
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                self.record_exit_log_line(format!(
+                    "exited {:?} {} (spawn failed): pid=none phase={} status=never started elapsed=0.0s error={:?}",
+                    def.kind,
+                    root.display(),
+                    ServerPhase::Spawn,
+                    err.to_string()
+                ));
+                return Err(err.into());
+            }
+        };
         let initialize = match initialize_timeout {
             Some(timeout) => client.initialize_with_timeout(root, initialization_options, timeout),
             None => client.initialize(root, initialization_options),
         };
         if let Err(err) = initialize {
-            wait_for_stderr_tail(&mut client);
-            let stderr_tail = client.stderr_tail();
-            let reason = if client.child_exited() || !stderr_tail.is_empty() {
-                format_initialize_failure_reason(&def.binary, &stderr_tail, &err)
+            let phase = client.phase();
+            // A timeout means the server is alive but slow; anything else
+            // (broken pipe, closed stream) means it is exiting, so wait a
+            // moment for its real exit status.
+            let status = if matches!(err, LspError::Timeout(_)) {
+                client.child_exit_status()
+            } else {
+                client.wait_for_exit(INITIALIZE_EXIT_WAIT)
+            };
+            let report = client.exit_report(phase, status, status.is_none());
+            let reason = if status.is_some() || !report.stderr_tail.is_empty() {
+                format_initialize_failure_reason(&def.binary, &report, &err)
             } else {
                 format!("server failed during initialize: {err}")
             };
+            // Dropping the client below kills a still-running server, so the
+            // report is complete either way.
+            self.remember_exit_report(report);
             return Err(LspError::ServerNotReady(reason));
         }
         Ok(client)
+    }
+
+    /// Keep a dead server's report until its reader's exit event is drained.
+    fn remember_exit_report(&mut self, report: ServerExitReport) {
+        if self.pending_exit_reports.len() >= PENDING_EXIT_REPORTS_CAP {
+            // Never expected: each report is consumed by its reader's exit
+            // event. Log directly rather than grow without bound.
+            self.record_exit_log_line(report.log_line("exit event not yet seen"));
+            return;
+        }
+        self.pending_exit_reports.insert(report.pid, report);
     }
 
     fn resolve_binary(
@@ -3079,15 +3152,6 @@ fn merge_json_override(base: &mut serde_json::Value, override_value: serde_json:
     }
 }
 
-fn wait_for_stderr_tail(client: &mut LspClient) {
-    for _ in 0..10 {
-        if !client.stderr_tail().is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
 fn recoverable_pull_rejection(err: &LspError) -> bool {
     matches!(
         err,
@@ -3135,35 +3199,58 @@ fn truncate_stderr_tail_for_reason(stderr_tail: &str) -> String {
     format!("{ellipsis}{}", &stderr_tail[start..])
 }
 
-fn format_initialize_failure_reason(binary: &str, stderr_tail: &str, err: &LspError) -> String {
-    let mut reason = format!("server crashed during initialize: {err}");
-    if !stderr_tail.is_empty() {
-        reason.push_str("; stderr (last 64 lines):\n");
-        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
-        reason.push_str("\n\n");
-        reason.push_str(&failure_hint(binary, stderr_tail));
-    }
+/// Full failure text for a server that died during `initialize`. The first
+/// line stands alone (inspect reports only that line); the stderr tail and a
+/// remediation hint follow for callers that show the whole text.
+fn format_initialize_failure_reason(
+    binary: &str,
+    report: &ServerExitReport,
+    err: &LspError,
+) -> String {
+    let mut reason = format!(
+        "server crashed during initialize ({}): {err}",
+        report.short_cause()
+    );
+    append_stderr_block(&mut reason, binary, &report.stderr_tail);
     reason
 }
 
 fn format_post_initialize_exit_reason(
     binary: &str,
-    status: std::process::ExitStatus,
-    stderr_tail: &str,
+    report: &ServerExitReport,
     err: &LspError,
 ) -> String {
-    let code = status
-        .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal/unknown".to_string());
-    let mut reason = format!("server exited after initialize (code {code}): {err}");
-    if !stderr_tail.is_empty() {
-        reason.push_str("; stderr (last 64 lines):\n");
-        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
-        reason.push_str("\n\n");
-        reason.push_str(&failure_hint(binary, stderr_tail));
-    }
+    let mut reason = format!(
+        "server exited after initialize ({}): {err}",
+        report.short_cause()
+    );
+    append_stderr_block(&mut reason, binary, &report.stderr_tail);
     reason
+}
+
+fn append_stderr_block(reason: &mut String, binary: &str, stderr_tail: &str) {
+    if stderr_tail.is_empty() {
+        return;
+    }
+    reason.push_str("\nstderr (last 64 lines):\n");
+    reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
+    reason.push_str("\n\n");
+    reason.push_str(&failure_hint(binary, stderr_tail));
+}
+
+/// Single-line failure summary for inspect output when a language server could
+/// not start: the self-contained first line of the reason, cut to
+/// `PRODUCER_FAILURE_REASON_BYTES`.
+fn summarize_failure_reason(reason: &str) -> String {
+    let first_line = reason.lines().next().unwrap_or_default().trim_end();
+    if first_line.len() <= PRODUCER_FAILURE_REASON_BYTES {
+        return first_line.to_string();
+    }
+    let mut end = PRODUCER_FAILURE_REASON_BYTES;
+    while end > 0 && !first_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &first_line[..end])
 }
 
 fn failure_hint(binary: &str, stderr_tail: &str) -> String {

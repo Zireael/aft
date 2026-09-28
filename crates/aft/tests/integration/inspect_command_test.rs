@@ -3910,6 +3910,64 @@ fn inspect_command_diagnostics_details_honor_top_k() {
 }
 
 #[test]
+fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"inspect-exit\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn rust_value() -> u8 { 1 }\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+
+    let mut lsp = ctx.lsp();
+    lsp.override_binary(ServerKind::Rust, fake_server_path());
+    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_CODE", "3");
+    // Many stderr lines: the inspect reason must quote the first one and
+    // stay short instead of inlining the whole tail.
+    let mut stderr = vec!["error: rust-analyzer could not load the workspace".to_string()];
+    stderr.extend((0..40).map(|index| format!("stderr filler line {index:02}")));
+    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_STDERR", &stderr.join("|"));
+    drop(lsp);
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-producer-exit",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    let rust_gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
+        .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
+    let reason = rust_gap["reason"].as_str().expect("gap reason");
+    assert!(
+        reason.contains("server crashed during initialize (exit 3 after "),
+        "reason must name the exit code: {reason}"
+    );
+    assert!(
+        reason.contains("error: rust-analyzer could not load the workspace"),
+        "reason must quote the first stderr line: {reason}"
+    );
+    assert!(
+        !reason.contains("stderr filler line 39"),
+        "reason must not inline the whole stderr tail: {reason}"
+    );
+    assert!(
+        !reason.contains('\n') && reason.len() <= 600,
+        "reason must stay a bounded single line ({} bytes): {reason:?}",
+        reason.len()
+    );
+}
+
+#[test]
 fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     let (_temp_dir, root) = fixture_project();
     write_file(
