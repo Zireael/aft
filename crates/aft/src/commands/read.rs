@@ -1470,6 +1470,27 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     )
 }
 
+/// Discard a line using only the reader's fixed-size buffer. Skipped bytes count
+/// toward the 50 MiB input ceiling, not the much smaller rendered-response budget.
+fn skip_streamed_line(reader: &mut impl BufRead, budget: usize) -> std::io::Result<(usize, bool)> {
+    let mut consumed = 0;
+    while consumed < budget {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((consumed, true));
+        }
+        let available = &buffer[..buffer.len().min(budget - consumed)];
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(count);
+        consumed += count;
+        if newline.is_some() {
+            return Ok((consumed, true));
+        }
+    }
+    Ok((consumed, false))
+}
+
 fn handle_streaming_range_read(
     req: &RawRequest,
     path: &Path,
@@ -1535,38 +1556,76 @@ fn handle_streaming_range_read(
     let mut scanned_bytes = 0usize;
     let mut retained_bytes = 0usize;
     let mut scan_gap = false;
-    // Prefix scans have a separate byte budget; even skipped lines and lookahead
-    // must not allocate an entire minified file or scan indefinitely.
-    const SCAN_BYTES: usize = 1024 * 1024;
+    let scan_ceiling = MAX_FILE_READ_BYTES as usize;
     loop {
         let index = observed_lines as usize;
         if index >= requested_end_idx {
             has_more_after_range = reader.fill_buf().map_or(true, |bytes| !bytes.is_empty());
             break;
         }
-        let allowance = (MAX_LINE_LENGTH + 4).min(SCAN_BYTES.saturating_sub(scanned_bytes));
+        if index < requested_start_idx {
+            let (consumed, finished) =
+                match skip_streamed_line(&mut reader, scan_ceiling.saturating_sub(scanned_bytes)) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Response::error(
+                            &req.id,
+                            "io_error",
+                            format!("read: failed to skip prefix: {error}"),
+                        )
+                    }
+                };
+            scanned_bytes += consumed;
+            if !finished {
+                scan_gap = true;
+                break;
+            }
+            if consumed == 0 {
+                break;
+            }
+            observed_lines = observed_lines.saturating_add(1);
+            continue;
+        }
+        let allowance = (MAX_LINE_LENGTH + 4).min(scan_ceiling.saturating_sub(scanned_bytes));
         if allowance == 0 || retained_bytes >= MAX_BYTES {
             scan_gap = true;
             break;
         }
         let mut bytes = Vec::new();
-        let len = match reader.by_ref().take(allowance as u64).read_until(b'\n', &mut bytes) {
+        let len = match reader
+            .by_ref()
+            .take(allowance as u64)
+            .read_until(b'\n', &mut bytes)
+        {
             Ok(len) => len,
-            Err(error) => return Response::error(&req.id, "io_error", format!("read: failed to read file: {error}")),
+            Err(error) => {
+                return Response::error(
+                    &req.id,
+                    "io_error",
+                    format!("read: failed to read file: {error}"),
+                )
+            }
         };
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
         scanned_bytes += len;
         let partial_line = bytes.last() != Some(&b'\n') && len == allowance;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
-            if bytes.last() == Some(&b'\r') { bytes.pop(); }
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
         }
         let line = match std::str::from_utf8(&bytes) {
             Ok(line) => line,
             Err(error) if partial_line && error.error_len().is_none() => {
                 std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix")
             }
-            Err(_) => { invalid_utf8 = true; break; }
+            Err(_) => {
+                invalid_utf8 = true;
+                break;
+            }
         };
         observed_lines = observed_lines.saturating_add(1);
         if index >= requested_start_idx {
@@ -1575,7 +1634,24 @@ fn handle_streaming_range_read(
         }
         if partial_line {
             scan_gap = true;
-            break;
+            if observed_lines as usize >= requested_end_idx {
+                break;
+            }
+            let (consumed, finished) =
+                match skip_streamed_line(&mut reader, scan_ceiling.saturating_sub(scanned_bytes)) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Response::error(
+                            &req.id,
+                            "io_error",
+                            format!("read: failed to skip line suffix: {error}"),
+                        )
+                    }
+                };
+            scanned_bytes += consumed;
+            if !finished {
+                break;
+            }
         }
     }
 
