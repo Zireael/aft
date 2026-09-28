@@ -21,10 +21,15 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
                     "op_id": operation.op_id,
                     "restored_count": operation.restored.len(),
                     "restored": operation.restored.into_iter().map(|file| {
-                        serde_json::json!({
+                        let mut restored = serde_json::json!({
                             "path": file.path.display().to_string(),
                             "backup_id": file.backup_id,
-                        })
+                        });
+                        if let Some(preserved) = file.preserved_external_change {
+                            restored["preserved_external_change"] =
+                                serde_json::Value::String(preserved);
+                        }
+                        restored
                     }).collect::<Vec<_>>(),
                     "warnings": operation.warnings,
                 }),
@@ -49,14 +54,20 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         return backup_skipped_response(req, reason);
     }
 
-    match backup.restore_latest(req.session(), &resolved) {
-        Ok((entry, warning)) => {
+    match backup.restore_latest_detailed(req.session(), &resolved) {
+        Ok(restored) => {
             let mut result = serde_json::json!({
                 "path": file,
-                "backup_id": entry.backup_id,
+                "backup_id": restored.entry.backup_id,
             });
-            if let Some(w) = warning {
+            if let Some(w) = restored.warning {
                 result["warning"] = serde_json::Value::String(w);
+            }
+            // Content that changed outside AFT was saved as a new backup
+            // before the restore overwrote it; report that backup's id.
+            // Undoing the file again restores the saved content.
+            if let Some(preserved) = restored.preserved_external_change {
+                result["preserved_external_change"] = serde_json::Value::String(preserved);
             }
             Response::success(&req.id, result)
         }

@@ -112,6 +112,20 @@ pub struct BackupEntry {
     pub mode: Option<u32>,
     pub link_target: Option<PathBuf>,
     pub created_dirs: Vec<PathBuf>,
+    /// What AFT left at the path once the mutation this entry backs up had
+    /// finished. Undo compares it with the live path: a mismatch means the file
+    /// changed outside AFT (an editor save, `mv` over it, `rm` plus recreate),
+    /// so the live content is preserved as its own entry before restoring.
+    /// `None` for entries written before this was recorded; those undo exactly
+    /// as they always did.
+    pub post_state: Option<PathFingerprint>,
+    /// True when, at snapshot time, the path no longer held what AFT left there
+    /// after the previous entry's mutation: something outside AFT changed,
+    /// replaced, or recreated the file in between.
+    pub external_change_before: bool,
+    /// True for entries that undo itself created to preserve content that had
+    /// changed outside AFT before it was overwritten by the restore.
+    pub undo_capture: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +133,79 @@ pub enum BackupEntryKind {
     Content,
     Symlink,
     Tombstone,
+}
+
+/// Identity of what a path held at one moment, reduced to what undo needs to
+/// tell "the state AFT left" from "something else". Content is compared by
+/// hash, never by inode, because editors routinely save through a temp file
+/// renamed over the original and that must not look like a different file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathFingerprint {
+    Absent,
+    Content(String),
+    Symlink(PathBuf),
+    /// A directory or something unreadable: never equal to a recorded state.
+    Other,
+}
+
+impl PathFingerprint {
+    fn of_bytes(bytes: &[u8]) -> Self {
+        Self::Content(blake3::hash(bytes).to_hex().to_string())
+    }
+
+    /// Fingerprint whatever is at `path` right now.
+    pub fn of_path(path: &Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Other,
+            Ok(metadata) if metadata.file_type().is_symlink() => std::fs::read_link(path)
+                .map(Self::Symlink)
+                .unwrap_or(Self::Other),
+            Ok(metadata) if metadata.is_file() => std::fs::read(path)
+                .map(|bytes| Self::of_bytes(&bytes))
+                .unwrap_or(Self::Other),
+            Ok(_) => Self::Other,
+        }
+    }
+
+    /// The state an entry describes: what the path held just before the
+    /// mutation it backs up, which is also what restoring it puts back.
+    pub fn of_entry(entry: &BackupEntry) -> Self {
+        match entry.kind {
+            BackupEntryKind::Content => Self::of_bytes(&entry.content_bytes),
+            BackupEntryKind::Symlink => entry
+                .link_target
+                .clone()
+                .map(Self::Symlink)
+                .unwrap_or(Self::Other),
+            BackupEntryKind::Tombstone => Self::Absent,
+        }
+    }
+
+    fn to_meta_string(&self) -> String {
+        match self {
+            Self::Absent => "absent".to_string(),
+            Self::Content(hash) => format!("content:{hash}"),
+            Self::Symlink(target) => format!("symlink:{}", target.display()),
+            Self::Other => "other".to_string(),
+        }
+    }
+
+    fn from_meta_string(value: &str) -> Option<Self> {
+        match value {
+            "absent" => Some(Self::Absent),
+            "other" => Some(Self::Other),
+            _ => {
+                if let Some(hash) = value.strip_prefix("content:") {
+                    Some(Self::Content(hash.to_string()))
+                } else {
+                    value
+                        .strip_prefix("symlink:")
+                        .map(|target| Self::Symlink(PathBuf::from(target)))
+                }
+            }
+        }
+    }
 }
 
 /// One regular file captured for both rollback and durable undo.
@@ -347,6 +434,15 @@ impl TryFrom<BackupRow> for BackupEntry {
             kind,
             mode: restore_metadata.as_ref().and_then(|metadata| metadata.mode),
             link_target,
+            post_state: restore_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.post_state.clone()),
+            external_change_before: restore_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.external_change_before),
+            undo_capture: restore_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.undo_capture),
             created_dirs: restore_metadata
                 .map(|metadata| metadata.created_dirs)
                 .unwrap_or_default(),
@@ -365,6 +461,42 @@ pub struct RestoredOperation {
 pub struct RestoredFile {
     pub path: PathBuf,
     pub backup_id: String,
+    /// Backup id under which content changed outside AFT was saved before the
+    /// restore overwrote it; undoing again brings it back.
+    pub preserved_external_change: Option<String>,
+}
+
+/// Result of undoing the newest backup of one file.
+#[derive(Debug, Clone)]
+pub struct RestoredLatest {
+    pub entry: BackupEntry,
+    pub warning: Option<String>,
+    /// Backup id under which content changed outside AFT was saved before the
+    /// restore overwrote it. Undoing the same file again brings it back.
+    pub preserved_external_change: Option<String>,
+}
+
+/// Description of the entry undo records when it preserves content that
+/// changed outside AFT.
+pub const UNDO_CAPTURE_DESCRIPTION: &str = "external change captured before undo";
+
+fn external_change_warning(preserved_backup_id: &str) -> String {
+    format!(
+        "file had changed outside AFT since AFT last wrote it; that content was saved as \
+         backup {preserved_backup_id} before this undo overwrote it — undo again to bring it back"
+    )
+}
+
+/// True when undoing `top` would overwrite content AFT did not leave there:
+/// the entry records what its mutation left, and the path now holds something
+/// else. A missing path has nothing to lose and restores normally, as do
+/// entries from before the post-mutation state was recorded.
+fn needs_capture_before_undo(top: &BackupEntry, path: &Path) -> bool {
+    let Some(expected) = top.post_state.as_ref() else {
+        return false;
+    };
+    let live = PathFingerprint::of_path(path);
+    live != *expected && live != PathFingerprint::Absent
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -455,6 +587,10 @@ pub struct BackupStore {
     policy: BackupPolicy,
     /// In-process mutation records whose undo snapshot was intentionally skipped.
     skipped_backups: HashMap<String, Vec<SkippedBackup>>,
+    /// Stack entries snapshotted during the current request whose mutation has
+    /// not finished yet, as (session, key, backup_id). Once the request has
+    /// written, `record_post_mutation_states` stamps each with what it left.
+    pending_post_states: Vec<(String, PathBuf, String)>,
     #[cfg(test)]
     enforce_temp_path_policy: bool,
     #[cfg(test)]
@@ -474,6 +610,9 @@ enum DbMirrorPlan<'a> {
     Append {
         evicted_orders: &'a [u128],
         new_entry: Option<&'a BackupEntry>,
+        /// An existing entry whose recorded metadata changed (its post-mutation
+        /// state was just learned) and whose row must be rewritten in place.
+        restamped: Option<&'a BackupEntry>,
     },
 }
 
@@ -508,6 +647,7 @@ impl BackupStore {
             db_mirrored_stacks: RwLock::new(HashMap::new()),
             policy: BackupPolicy::default(),
             skipped_backups: HashMap::new(),
+            pending_post_states: Vec::new(),
             #[cfg(test)]
             enforce_temp_path_policy: false,
             #[cfg(test)]
@@ -775,6 +915,9 @@ impl BackupStore {
             mode: None,
             link_target: None,
             created_dirs,
+            post_state: None,
+            external_change_before: false,
+            undo_capture: false,
         };
 
         self.persist_new_entry_locked(session, &key, entry)?;
@@ -844,6 +987,7 @@ impl BackupStore {
 
             let mut content_targets = Vec::new();
             let mut tombstone_targets = Vec::new();
+            let mut capture_targets = Vec::new();
             for key in &keys_to_restore {
                 let entry = self
                     .entries
@@ -854,11 +998,13 @@ impl BackupStore {
                     .ok_or_else(|| AftError::NoUndoHistory {
                         path: key.display().to_string(),
                     })?;
+                if needs_capture_before_undo(&entry, key) {
+                    capture_targets.push((key.clone(), entry.clone()));
+                }
                 match entry.kind {
                     BackupEntryKind::Content | BackupEntryKind::Symlink => {
                         let existing_state = capture_path_state(key)?;
-                        let warning = self.check_external_modification(session, key, key);
-                        content_targets.push((key.clone(), entry, warning, existing_state));
+                        content_targets.push((key.clone(), entry, existing_state));
                     }
                     BackupEntryKind::Tombstone => {
                         let existing_state = capture_path_state(key)?;
@@ -867,8 +1013,25 @@ impl BackupStore {
                 }
             }
 
+            // Preserve content changed outside AFT before anything is
+            // overwritten. All captures share one operation id, so a single
+            // later operation undo restores all of them together.
+            let capture_op_id = new_op_id();
+            let mut preserved: HashMap<PathBuf, String> = HashMap::new();
+            for (key, entry) in &capture_targets {
+                match self.capture_before_undo_locked(session, key, key, entry, &capture_op_id) {
+                    Ok(id) => {
+                        preserved.insert(key.clone(), id);
+                    }
+                    Err(error) => {
+                        self.discard_undo_captures_locked(session, &preserved);
+                        return Err(error);
+                    }
+                }
+            }
+
             let mut created_dirs = Vec::new();
-            for (key, _, _, _) in &content_targets {
+            for (key, _, _) in &content_targets {
                 if let Some(parent) = key.parent() {
                     if !parent.as_os_str().is_empty() {
                         let missing_dirs = missing_parent_dirs(parent);
@@ -876,6 +1039,7 @@ impl BackupStore {
                             let mut dirs_to_remove = created_dirs;
                             dirs_to_remove.extend(missing_dirs);
                             let rollback_ok = rollback_created_dirs(&dirs_to_remove);
+                            self.discard_undo_captures_locked(session, &preserved);
                             return Err(AftError::IoError {
                                 path: parent.display().to_string(),
                                 message: format!(
@@ -892,12 +1056,17 @@ impl BackupStore {
             }
 
             let mut written = Vec::new();
-            for (key, entry, _, existing_state) in &content_targets {
+            for (key, entry, existing_state) in &content_targets {
                 if let Err(e) = restore_entry_to_path(key, entry) {
                     let files_rollback_ok =
                         rollback_transactional_restore(&written, Some((key, existing_state)));
                     let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
                     let rollback_ok = files_rollback_ok && dirs_rollback_ok;
+                    // Captures become redundant only once every file is back
+                    // to what it held; otherwise they are the surviving copy.
+                    if files_rollback_ok {
+                        self.discard_undo_captures_locked(session, &preserved);
+                    }
                     return Err(AftError::IoError {
                         path: key.display().to_string(),
                         message: format!(
@@ -922,6 +1091,9 @@ impl BackupStore {
                         let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
                         let rollback_ok =
                             files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
+                        if files_rollback_ok && tombstone_rollback_ok {
+                            self.discard_undo_captures_locked(session, &preserved);
+                        }
                         return Err(AftError::IoError {
                             path: key.display().to_string(),
                             message: format!(
@@ -955,21 +1127,20 @@ impl BackupStore {
                     )
                 })
                 .collect::<Vec<_>>();
-            for (key, entry, warning, _) in content_targets {
-                self.commit_restored_backup_locked(session, &key)?;
-                if let Some(warning) = warning {
-                    warnings.push(format!("{}: {}", key.display(), warning));
+            for (key, entry, _) in content_targets.into_iter().chain(tombstone_targets) {
+                self.commit_restored_backup_locked(session, &key, &entry.backup_id)?;
+                let preserved_external_change = preserved.remove(&key);
+                if let Some(preserved_id) = &preserved_external_change {
+                    warnings.push(format!(
+                        "{}: {}",
+                        key.display(),
+                        external_change_warning(preserved_id)
+                    ));
                 }
                 restored.push(RestoredFile {
                     path: key,
                     backup_id: entry.backup_id,
-                });
-            }
-            for (key, entry, _) in tombstone_targets {
-                self.commit_restored_backup_locked(session, &key)?;
-                restored.push(RestoredFile {
-                    path: key,
-                    backup_id: entry.backup_id,
+                    preserved_external_change,
                 });
             }
             if let Some(skips) = self.skipped_backups.get_mut(session) {
@@ -1001,6 +1172,17 @@ impl BackupStore {
         session: &str,
         path: &Path,
     ) -> Result<(BackupEntry, Option<String>), AftError> {
+        self.restore_latest_detailed(session, path)
+            .map(|restored| (restored.entry, restored.warning))
+    }
+
+    /// Like [`Self::restore_latest`], also reporting whether content changed
+    /// outside AFT had to be preserved before the restore.
+    pub fn restore_latest_detailed(
+        &mut self,
+        session: &str,
+        path: &Path,
+    ) -> Result<RestoredLatest, AftError> {
         self.run_process_maintenance_once();
         let key = canonicalize_key(path);
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
@@ -1066,10 +1248,7 @@ impl BackupStore {
             .and_then(|s| s.get(&key))
             .map_or(false, |s| !s.is_empty());
         if in_memory {
-            let warning = self.check_external_modification(session, &key, path);
-            let result = self
-                .do_restore_locked(session, &key, path)
-                .map(|(entry, _)| (entry, warning));
+            let result = self.restore_top_preserving_external_change(session, &key, path);
             if result.is_ok() {
                 self.touch_session(session);
             }
@@ -1079,6 +1258,106 @@ impl BackupStore {
         Err(AftError::NoUndoHistory {
             path: path.display().to_string(),
         })
+    }
+
+    /// Undo the newest backup of `path`. Content the file gained outside AFT
+    /// since AFT last wrote it is saved as a new newest entry first, so the
+    /// restore never destroys it and undoing the file again brings it back.
+    fn restore_top_preserving_external_change(
+        &mut self,
+        session: &str,
+        key: &Path,
+        path: &Path,
+    ) -> Result<RestoredLatest, AftError> {
+        let top = self
+            .entries
+            .get(session)
+            .and_then(|files| files.get(key))
+            .and_then(|stack| stack.last())
+            .cloned()
+            .ok_or_else(|| AftError::NoUndoHistory {
+                path: path.display().to_string(),
+            })?;
+
+        if !needs_capture_before_undo(&top, path) {
+            let (entry, _) = self.do_restore_locked(session, key, path)?;
+            return Ok(RestoredLatest {
+                entry,
+                warning: None,
+                preserved_external_change: None,
+            });
+        }
+
+        let preserved = self.capture_before_undo_locked(session, key, path, &top, &new_op_id())?;
+        // A failed restore keeps the capture: the live file may already be
+        // partly overwritten, and the capture is then its only copy.
+        restore_entry_to_path(path, &top).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: format!(
+                "{error}; the content found at the path was saved as backup {preserved}"
+            ),
+        })?;
+        if top.kind == BackupEntryKind::Tombstone {
+            remove_created_dirs_best_effort(&top.created_dirs);
+        }
+        self.commit_restored_backup_locked(session, key, &top.backup_id)?;
+        Ok(RestoredLatest {
+            warning: Some(external_change_warning(&preserved)),
+            entry: top,
+            preserved_external_change: Some(preserved),
+        })
+    }
+
+    /// Save what is at `path` now as the newest entry of its stack, ahead of an
+    /// undo that restores `restores` over it. Returns the new backup id.
+    fn capture_before_undo_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        path: &Path,
+        restores: &BackupEntry,
+        op_id: &str,
+    ) -> Result<String, AftError> {
+        if let SnapshotDecision::Skip(reason) = self.should_snapshot_path(path, false)? {
+            return Err(AftError::InvalidRequest {
+                message: format!(
+                    "undo refused: {} changed outside AFT since AFT last wrote it, and that \
+                     content cannot be backed up before the restore ({}); copy it elsewhere \
+                     and retry",
+                    path.display(),
+                    reason.as_str()
+                ),
+            });
+        }
+        let (id, order) = self.next_id_and_order();
+        let mut capture = backup_entry_from_path(
+            path,
+            id.clone(),
+            order,
+            UNDO_CAPTURE_DESCRIPTION,
+            Some(op_id),
+        )?;
+        capture.undo_capture = true;
+        // After this undo the path holds what `restores` describes, so undoing
+        // the capture later is itself checked against that.
+        capture.post_state = Some(PathFingerprint::of_entry(restores));
+        self.persist_new_entry_locked(session, key, capture)?;
+        Ok(id)
+    }
+
+    /// Remove captures made for an undo that was then rolled back, leaving
+    /// each file's content and stack as they were before the attempt.
+    fn discard_undo_captures_locked(&mut self, session: &str, captures: &HashMap<PathBuf, String>) {
+        for (key, backup_id) in captures {
+            if let Err(error) = self.commit_restored_backup_locked(session, key, backup_id) {
+                crate::slog_warn!(
+                    "backup capture {} for {} kept after rolled-back undo: {}",
+                    backup_id,
+                    key.display(),
+                    error
+                );
+            }
+        }
     }
 
     /// Return the backup history for `(session, path)` (oldest first).
@@ -1576,7 +1855,7 @@ impl BackupStore {
         &mut self,
         session: &str,
         key: &Path,
-        entry: BackupEntry,
+        mut entry: BackupEntry,
     ) -> Result<(), AftError> {
         let max_depth = self.policy.max_depth;
         // Detach the stack so persistence can borrow it while updating the rest of
@@ -1587,7 +1866,32 @@ impl BackupStore {
             .get_mut(session)
             .and_then(|files| files.remove(key))
             .unwrap_or_default();
+
+        // Link the new entry to the one below it. When the previous mutation's
+        // result is known and the path now holds something else, the file was
+        // changed outside AFT in between. When the previous entry belongs to an
+        // earlier mutation of this same request, its result is exactly what
+        // this snapshot captured.
+        let captured_state = PathFingerprint::of_entry(&entry);
+        let mut restamped_previous = false;
+        if let Some(previous) = stack.last_mut() {
+            match &previous.post_state {
+                Some(left) => entry.external_change_before |= *left != captured_state,
+                None if self
+                    .pending_post_state_index(session, key, &previous.backup_id)
+                    .is_some() =>
+                {
+                    previous.post_state = Some(captured_state);
+                    restamped_previous = true;
+                }
+                None => {}
+            }
+        }
+        let previous_id = stack.last().map(|previous| previous.backup_id.clone());
+
         let mut evicted = drain_stack_to_depth(&mut stack, max_depth.saturating_sub(1));
+        let new_entry_id = entry.backup_id.clone();
+        let awaits_post_state = entry.post_state.is_none();
         if max_depth > 0 {
             stack.push(entry);
         }
@@ -1597,19 +1901,43 @@ impl BackupStore {
         // entry. Disk persistence still receives the complete stack unchanged.
         let evicted_orders = evicted.iter().map(|entry| entry.order).collect::<Vec<_>>();
         let new_entry = (max_depth > 0).then(|| stack.last().expect("new backup entry"));
+        // The restamped entry survives only if eviction did not just drop it.
+        let restamped = if restamped_previous && stack.len() >= 2 {
+            stack.get(stack.len() - 2)
+        } else {
+            None
+        };
         if let Err(error) = self.write_appended_snapshot_to_disk_locked(
             session,
             key,
             &stack,
             &evicted_orders,
             new_entry,
+            restamped,
         ) {
             if max_depth > 0 {
                 stack.pop();
             }
             evicted.append(&mut stack);
+            if restamped_previous {
+                if let Some(previous) = evicted.last_mut() {
+                    previous.post_state = None;
+                }
+            }
             self.restore_in_memory_stack(session, key, Some(evicted));
             return Err(error);
+        }
+
+        if restamped_previous {
+            if let Some(previous_id) = previous_id {
+                if let Some(index) = self.pending_post_state_index(session, key, &previous_id) {
+                    self.pending_post_states.remove(index);
+                }
+            }
+        }
+        if awaits_post_state && max_depth > 0 {
+            self.pending_post_states
+                .push((session.to_string(), key.to_path_buf(), new_entry_id));
         }
 
         self.entries
@@ -1617,6 +1945,115 @@ impl BackupStore {
             .or_default()
             .insert(key.to_path_buf(), stack);
         Ok(())
+    }
+
+    fn pending_post_state_index(
+        &self,
+        session: &str,
+        key: &Path,
+        backup_id: &str,
+    ) -> Option<usize> {
+        self.pending_post_states
+            .iter()
+            .position(|(pending_session, pending_key, pending_id)| {
+                pending_session == session && pending_key == key && pending_id == backup_id
+            })
+    }
+
+    /// Stamp every entry snapshotted since the last call with what its
+    /// mutation left at the path. Call once a request has finished writing;
+    /// the next undo compares the live path against this to notice changes
+    /// made outside AFT.
+    pub fn record_post_mutation_states(&mut self) {
+        if self.pending_post_states.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_post_states);
+        for (session, key, backup_id) in pending {
+            if let Err(error) = self.record_post_mutation_state(&session, &key, &backup_id) {
+                crate::slog_warn!(
+                    "backup post-mutation state not recorded for {}: {}",
+                    key.display(),
+                    error
+                );
+            }
+        }
+    }
+
+    fn record_post_mutation_state(
+        &mut self,
+        session: &str,
+        key: &Path,
+        backup_id: &str,
+    ) -> Result<(), AftError> {
+        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        if !self.memory_stack_matches_disk(session, key) {
+            self.ensure_stack_hydrated_locked(session, key)?;
+        }
+        let Some(mut stack) = self
+            .entries
+            .get_mut(session)
+            .and_then(|files| files.remove(key))
+        else {
+            return Ok(());
+        };
+        let Some(index) = stack
+            .iter()
+            .position(|entry| entry.backup_id == backup_id && entry.post_state.is_none())
+        else {
+            self.restore_in_memory_stack(session, key, Some(stack));
+            return Ok(());
+        };
+        // Only the newest entry's mutation can have produced what is on disk
+        // now; an older one ended where the snapshot above it began.
+        let state = match stack.get(index + 1) {
+            Some(next) => PathFingerprint::of_entry(next),
+            None => PathFingerprint::of_path(key),
+        };
+        stack[index].post_state = Some(state);
+        let result = self.write_appended_snapshot_to_disk_locked(
+            session,
+            key,
+            &stack,
+            &[],
+            None,
+            Some(&stack[index]),
+        );
+        if result.is_err() {
+            stack[index].post_state = None;
+        }
+        self.restore_in_memory_stack(session, key, Some(stack));
+        result
+    }
+
+    /// Cheap check that this process's copy of a stack is still what disk
+    /// holds, comparing backup ids from the metadata file without reading
+    /// any backed-up content. Memory-only stores always match.
+    fn memory_stack_matches_disk(&self, session: &str, key: &Path) -> bool {
+        let memory_ids = self
+            .entries
+            .get(session)
+            .and_then(|files| files.get(key))
+            .map(|stack| {
+                stack
+                    .iter()
+                    .map(|entry| entry.backup_id.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if self.session_dir(session).is_none() {
+            return true;
+        }
+        let Ok(Some((_, meta))) = self.read_disk_meta_value(session, key) else {
+            return false;
+        };
+        let Ok(disk_entries) = meta_entries(&meta) else {
+            return false;
+        };
+        disk_entries.len() == memory_ids.len()
+            && disk_entries.iter().zip(&memory_ids).all(|(entry, id)| {
+                entry.get("backup_id").and_then(|value| value.as_str()) == Some(*id)
+            })
     }
 
     fn restore_in_memory_stack(
@@ -1932,14 +2369,24 @@ impl BackupStore {
         Ok((entry, None))
     }
 
-    fn commit_restored_backup_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
+    /// Drop the entry `backup_id` from the stack once its restore is on disk.
+    /// It is usually the newest entry, but an undo that preserved an external
+    /// change has already pushed that capture above it.
+    fn commit_restored_backup_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        backup_id: &str,
+    ) -> Result<(), AftError> {
         let mut remove_key = false;
         let mut remove_session = false;
         let mut remaining_stack = None;
 
         if let Some(session_entries) = self.entries.get_mut(session) {
             if let Some(stack) = session_entries.get_mut(key) {
-                stack.pop();
+                if let Some(index) = stack.iter().rposition(|entry| entry.backup_id == backup_id) {
+                    stack.remove(index);
+                }
                 if stack.is_empty() {
                     remove_key = true;
                 } else {
@@ -1964,26 +2411,6 @@ impl BackupStore {
         }
 
         Ok(())
-    }
-
-    fn check_external_modification(
-        &self,
-        session: &str,
-        key: &Path,
-        path: &Path,
-    ) -> Option<String> {
-        let stack = self.entries.get(session).and_then(|s| s.get(key))?;
-        let latest = stack.last()?;
-        let modified = match latest.kind {
-            BackupEntryKind::Content => std::fs::read(path)
-                .map(|current| current.as_slice() != latest.content_bytes.as_ref())
-                .unwrap_or(true),
-            BackupEntryKind::Symlink => std::fs::read_link(path)
-                .map(|target| latest.link_target.as_ref() != Some(&target))
-                .unwrap_or(true),
-            BackupEntryKind::Tombstone => false,
-        };
-        modified.then(|| "file was modified externally since last backup".to_string())
     }
 
     // ---- Disk persistence ----
@@ -2871,6 +3298,7 @@ impl BackupStore {
         stack: &[BackupEntry],
         evicted_orders: &[u128],
         new_entry: Option<&BackupEntry>,
+        restamped: Option<&BackupEntry>,
     ) -> Result<(), AftError> {
         self.write_snapshot_to_disk_locked_with_db_plan(
             session,
@@ -2879,6 +3307,7 @@ impl BackupStore {
             DbMirrorPlan::Append {
                 evicted_orders,
                 new_entry,
+                restamped,
             },
         )
     }
@@ -3061,8 +3490,15 @@ impl BackupStore {
             DbMirrorPlan::Append {
                 evicted_orders,
                 new_entry,
+                restamped,
             } if self.db_mirror_is_synced(session, key) => (
-                apply_backup_append_delta_in_db(&conn, &context, evicted_orders, new_entry),
+                apply_backup_append_delta_in_db(
+                    &conn,
+                    &context,
+                    evicted_orders,
+                    new_entry,
+                    restamped,
+                ),
                 "append delta",
             ),
             // A newly configured or previously failed mirror has no trusted DB
@@ -3279,6 +3715,7 @@ fn apply_backup_append_delta_in_db(
     context: &DbMirrorContext<'_>,
     evicted_orders: &[u128],
     new_entry: Option<&BackupEntry>,
+    restamped: Option<&BackupEntry>,
 ) -> rusqlite::Result<()> {
     // A normal append changes only the entries named by the caller. Applying
     // those deletes and the single insert atomically preserves the same rollback
@@ -3292,6 +3729,9 @@ fn apply_backup_append_delta_in_db(
             context.path_hash,
             order,
         )?;
+    }
+    if let Some(entry) = restamped {
+        crate::db::backups::upsert_backup(&tx, &backup_row_for_db(entry, context))?;
     }
     if let Some(entry) = new_entry {
         crate::db::backups::insert_backup(&tx, &backup_row_for_db(entry, context))?;
@@ -3319,6 +3759,9 @@ struct BackupEntryDiskMetadata {
     mode: Option<u32>,
     link_target: Option<PathBuf>,
     created_dirs: Vec<PathBuf>,
+    post_state: Option<PathFingerprint>,
+    external_change_before: bool,
+    undo_capture: bool,
 }
 
 fn restore_metadata_json(entry: &BackupEntry) -> String {
@@ -3331,6 +3774,9 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
             .iter()
             .map(|dir| dir.display().to_string())
             .collect::<Vec<_>>(),
+        "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
+        "external_change_before": entry.external_change_before,
+        "undo_capture": entry.undo_capture,
     })
     .to_string()
 }
@@ -3386,6 +3832,9 @@ fn restore_metadata_fields(value: &serde_json::Value) -> BackupEntryDiskMetadata
                     .collect()
             })
             .unwrap_or_default(),
+        post_state: post_state_from_meta(value),
+        external_change_before: meta_flag(value, "external_change_before"),
+        undo_capture: meta_flag(value, "undo_capture"),
     }
 }
 
@@ -3465,6 +3914,9 @@ fn backup_entry_from_path(
         mode,
         link_target,
         created_dirs: Vec::new(),
+        post_state: None,
+        external_change_before: false,
+        undo_capture: false,
     })
 }
 
@@ -3487,6 +3939,9 @@ fn backup_entry_from_capture(
         mode: file_mode(capture.metadata()),
         link_target: None,
         created_dirs: Vec::new(),
+        post_state: None,
+        external_change_before: false,
+        undo_capture: false,
     }
 }
 
@@ -3976,7 +4431,23 @@ fn entry_from_meta(
                     .collect()
             })
             .unwrap_or_default(),
+        post_state: entry_meta.and_then(post_state_from_meta),
+        external_change_before: entry_meta
+            .is_some_and(|meta| meta_flag(meta, "external_change_before")),
+        undo_capture: entry_meta.is_some_and(|meta| meta_flag(meta, "undo_capture")),
     }
+}
+
+fn post_state_from_meta(meta: &serde_json::Value) -> Option<PathFingerprint> {
+    meta.get("post_state")
+        .and_then(|value| value.as_str())
+        .and_then(PathFingerprint::from_meta_string)
+}
+
+fn meta_flag(meta: &serde_json::Value, name: &str) -> bool {
+    meta.get(name)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn legacy_entry_from_meta(
@@ -4065,6 +4536,9 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
             .iter()
             .map(|dir| dir.display().to_string())
             .collect::<Vec<_>>(),
+        "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
+        "external_change_before": entry.external_change_before,
+        "undo_capture": entry.undo_capture,
     })
 }
 
@@ -4513,6 +4987,9 @@ mod tests {
             mode: None,
             link_target: None,
             created_dirs: Vec::new(),
+            post_state: None,
+            external_change_before: false,
+            undo_capture: false,
         }
     }
 
@@ -4535,6 +5012,9 @@ mod tests {
         entry.mode = Some(0o100755);
         entry.link_target = Some(PathBuf::from("../target"));
         entry.created_dirs = vec![PathBuf::from("/project/new"), PathBuf::from("/project")];
+        entry.post_state = Some(PathFingerprint::Symlink(PathBuf::from("../elsewhere")));
+        entry.external_change_before = true;
+        entry.undo_capture = true;
 
         crate::db::backups::insert_backup(&conn, &backup_row_for_db(&entry, &context)).unwrap();
         let row = db_mirror_rows(&conn).pop().unwrap();
@@ -4550,6 +5030,9 @@ mod tests {
                 mode: entry.mode,
                 link_target: entry.link_target,
                 created_dirs: entry.created_dirs,
+                post_state: entry.post_state,
+                external_change_before: true,
+                undo_capture: true,
             }
         );
     }
@@ -4589,6 +5072,7 @@ mod tests {
                     &context,
                     &evicted_orders,
                     stack.last(),
+                    None,
                 )
                 .unwrap();
                 replace_backup_stack_in_db(&full_conn, &context, &stack).unwrap();
@@ -4628,6 +5112,10 @@ mod tests {
             store
                 .snapshot(DB_MIRROR_SESSION, &file, "fill retained stack")
                 .unwrap();
+            // Each snapshot is its own request; ending it records the
+            // post-mutation state so the measured append below starts from a
+            // settled stack, as it does in the running daemon.
+            store.record_post_mutation_states();
         }
 
         MIRROR_SQL_TRACE.lock().unwrap().clear();
@@ -4692,6 +5180,7 @@ mod tests {
             &context,
             &[prior_stack[0].order],
             Some(&new_entry),
+            None,
         )
         .unwrap_err();
 
@@ -4890,30 +5379,108 @@ mod tests {
 
         let file_path = temp_file("disk_persist.txt", "original");
 
-        // Create store with storage, snapshot under default session, drop.
+        // Create store with storage, snapshot under default session as an AFT
+        // mutation would, finish the request, drop.
         {
             let mut store = BackupStore::new();
             store.set_storage_dir(dir.clone(), 72);
             store
                 .snapshot(DEFAULT_SESSION_ID, &file_path, "before edit")
                 .unwrap();
+            fs::write(&file_path, "edited by aft").unwrap();
+            store.record_post_mutation_states();
         }
 
         // Modify the file externally.
         fs::write(&file_path, "externally modified").unwrap();
 
-        // Create new store, load from disk, restore.
+        // Create new store, load from disk, restore. What AFT left on disk was
+        // persisted, so the reloaded store still notices the external change
+        // and preserves it instead of overwriting it.
         let mut store2 = BackupStore::new();
         store2.set_storage_dir(dir.clone(), 72);
 
-        let (entry, warning) = store2
-            .restore_latest(DEFAULT_SESSION_ID, &file_path)
+        let restored = store2
+            .restore_latest_detailed(DEFAULT_SESSION_ID, &file_path)
             .unwrap();
-        assert_eq!(entry.content, "original");
-        assert!(warning.is_some()); // modified externally
+        assert_eq!(restored.entry.content, "original");
+        assert!(restored.warning.is_some()); // modified externally
+        assert!(restored.preserved_external_change.is_some());
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
 
+        let (entry, _) = store2
+            .restore_latest(DEFAULT_SESSION_ID, &file_path)
+            .unwrap();
+        assert_eq!(entry.content, "externally modified");
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "externally modified"
+        );
+
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshots_in_one_request_chain_their_post_states() {
+        let path = temp_file("same_request_chain.txt", "v0");
+        let mut store = BackupStore::new();
+
+        // One request mutating the same file twice: the first snapshot's
+        // result is what the second snapshot captured, the second's is what
+        // is on disk when the request ends.
+        store.snapshot(DEFAULT_SESSION_ID, &path, "first").unwrap();
+        fs::write(&path, "v1").unwrap();
+        store.snapshot(DEFAULT_SESSION_ID, &path, "second").unwrap();
+        fs::write(&path, "v2").unwrap();
+        store.record_post_mutation_states();
+
+        let history = store.history(DEFAULT_SESSION_ID, &path);
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.post_state.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(PathFingerprint::of_bytes(b"v1")),
+                Some(PathFingerprint::of_bytes(b"v2")),
+            ]
+        );
+        assert!(history.iter().all(|entry| !entry.external_change_before));
+
+        for expected in ["v1", "v0"] {
+            let restored = store
+                .restore_latest_detailed(DEFAULT_SESSION_ID, &path)
+                .unwrap();
+            assert!(restored.preserved_external_change.is_none());
+            assert!(restored.warning.is_none());
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn snapshot_after_external_change_is_marked() {
+        let path = temp_file("external_change_marker.txt", "v0");
+        let mut store = BackupStore::new();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "aft edit")
+            .unwrap();
+        fs::write(&path, "v1").unwrap();
+        store.record_post_mutation_states();
+
+        fs::write(&path, "edited elsewhere").unwrap();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "aft edit")
+            .unwrap();
+        store.record_post_mutation_states();
+
+        let history = store.history(DEFAULT_SESSION_ID, &path);
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.external_change_before)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
     }
 
     #[test]

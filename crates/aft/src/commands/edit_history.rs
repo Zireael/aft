@@ -1,12 +1,57 @@
 use std::path::Path;
 
+use crate::backup::{BackupEntry, BackupEntryKind, PathFingerprint};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+
+/// Number each entry (oldest first) by which file it belongs to. A new file
+/// begins where AFT saw the path go from empty to occupied: an AFT mutation
+/// that created it, or a snapshot finding it back after AFT had removed it.
+/// Content changes made outside AFT (editor saves, `mv` over the file) are
+/// marked on the entry but do not start a new file, because by content alone
+/// they cannot be told apart from an edit to the same file.
+fn file_generations(history: &[BackupEntry]) -> Vec<u64> {
+    let mut generation = 0;
+    let mut previous: Option<&BackupEntry> = None;
+    history
+        .iter()
+        .map(|entry| {
+            if let Some(previous) = previous {
+                let recreated_outside_aft = entry.external_change_before
+                    && previous.post_state == Some(PathFingerprint::Absent);
+                if entry.kind == BackupEntryKind::Tombstone || recreated_outside_aft {
+                    generation += 1;
+                }
+            }
+            previous = Some(entry);
+            generation
+        })
+        .collect()
+}
+
+/// Lifecycle events AFT observed for one entry.
+fn entry_markers(entry: &BackupEntry) -> Vec<&'static str> {
+    let mut markers = Vec::new();
+    if entry.external_change_before {
+        markers.push("changed_outside_aft_before");
+    }
+    if entry.kind == BackupEntryKind::Tombstone {
+        markers.push("created");
+    } else if entry.post_state == Some(PathFingerprint::Absent) {
+        markers.push("deleted");
+    }
+    if entry.undo_capture {
+        markers.push("captured_before_undo");
+    }
+    markers
+}
 
 /// Handle the `edit_history` command: return the backup stack for a file.
 ///
 /// Params: `file` (string, required) — path to query history for.
-/// Returns: `{ file, entries: [{ backup_id, timestamp, description }, ...] }` (most recent last in stack order).
+/// Returns: `{ file, entries: [{ backup_id, timestamp, description, markers, generation, previous_file }, ...] }`
+/// (most recent first). `previous_file` is true for entries that belong to an
+/// earlier file AFT saw at this path before the current one was created.
 pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -27,15 +72,21 @@ pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let backup = ctx.backup().lock();
     let history = backup.history(req.session(), &resolved);
+    let generations = file_generations(&history);
+    let current_generation = generations.last().copied().unwrap_or(0);
 
     let entries: Vec<serde_json::Value> = history
         .iter()
+        .zip(&generations)
         .rev() // Most recent first for the response
-        .map(|entry| {
+        .map(|(entry, &generation)| {
             serde_json::json!({
                 "backup_id": entry.backup_id,
                 "timestamp": entry.timestamp,
                 "description": entry.description,
+                "markers": entry_markers(entry),
+                "generation": generation,
+                "previous_file": generation < current_generation,
             })
         })
         .collect();

@@ -614,11 +614,20 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                         .map(|items| items.len().to_string())
                         .unwrap_or_else(|| "0".to_string())
                 });
-                [
+                let mut lines = vec![
                     format!("restored operation {op_id}"),
                     format!("files {files}"),
-                ]
-                .join("\n")
+                ];
+                lines.extend(
+                    response
+                        .get("warnings")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(|warning| format!("warning {warning}")),
+                );
+                lines.join("\n")
             } else {
                 // Prefer the agent's own path spelling: translate resolves a
                 // relative filePath against the project root before the undo
@@ -632,11 +641,14 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                     .unwrap_or_else(|| "(file)".to_string());
                 let backup =
                     import_string_field(response, "backup_id").unwrap_or_else(|| "—".to_string());
-                [
+                let mut lines = vec![
                     format!("restored {}", shorten_path(&file)),
                     format!("backup {backup}"),
-                ]
-                .join("\n")
+                ];
+                if let Some(warning) = import_string_field(response, "warning") {
+                    lines.push(format!("warning {warning}"));
+                }
+                lines.join("\n")
             }
         }
         Some("history") => {
@@ -670,6 +682,29 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                             if !description.is_empty() {
                                 line.push_str("\n   ");
                                 line.push_str(description);
+                            }
+                            let mut labels = entry
+                                .get("markers")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(|marker| marker.replace('_', " "))
+                                .collect::<Vec<_>>();
+                            if entry.get("previous_file").and_then(Value::as_bool) == Some(true) {
+                                let generation = entry
+                                    .get("generation")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default();
+                                labels.push(format!(
+                                    "previous file at this path (#{})",
+                                    generation + 1
+                                ));
+                            }
+                            if !labels.is_empty() {
+                                line.push_str("\n   [");
+                                line.push_str(&labels.join("; "));
+                                line.push(']');
                             }
                             line
                         })

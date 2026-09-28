@@ -1037,6 +1037,14 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    let response = dispatch_command(req, ctx);
+    // Every mutation this request made is on disk now; record what it left so
+    // a later undo can tell AFT's own result from a change made outside AFT.
+    ctx.backup().lock().record_post_mutation_states();
+    response
+}
+
+fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
     match req.command.as_str() {
         "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
