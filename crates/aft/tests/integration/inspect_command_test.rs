@@ -4506,7 +4506,12 @@ fn rust_analyzer_warning_keeps_diagnostics_and_reports_note() {
         }),
     );
     assert_eq!(response["success"], true, "{response:#}");
-    assert_ne!(response["complete"], false, "{response:#}");
+    // Scoped inspects report Tier-2 categories as not computed, so only the
+    // diagnostics category is expected to be complete here.
+    assert!(
+        response["summary"]["diagnostics"].get("complete").is_none(),
+        "a rust-analyzer warning must not make diagnostics incomplete: {response:#}"
+    );
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,
         "{response:#}"
