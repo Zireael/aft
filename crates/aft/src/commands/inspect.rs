@@ -2037,6 +2037,13 @@ fn render_inspect_text(
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary);
     render_not_applicable_producers(&mut lines, summary);
+    if let Some(notes) = summary
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.get("notes"))
+        .and_then(Value::as_array)
+    {
+        lines.extend(notes.iter().filter_map(Value::as_str).map(str::to_string));
+    }
     render_group_category(
         &mut lines,
         "Duplicates",
@@ -3112,6 +3119,9 @@ fn diagnostics_summary_for(payload: &Value) -> Value {
         "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
         "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
     });
+    if let Some(notes) = payload.get("notes") {
+        summary["notes"] = notes.clone();
+    }
     if let Some(not_applicable) = payload.get("not_applicable") {
         summary["not_applicable"] = not_applicable.clone();
     }

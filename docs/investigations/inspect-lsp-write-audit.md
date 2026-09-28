@@ -37,11 +37,22 @@ failure. Check/build-script discovery uses the general Cargo arguments; no
 custom check/build-script command is supplied by AFT. Explicit user overrides
 of initialization options or commands can change these guarantees.
 
-Analyzer `experimental/serverStatus` warning/error messages were previously
-ignored while quiescent reports were promoted to authoritative. AFT now retains
-the failure, invalidates earlier reports, keeps subsequent reports provisional,
-and reports the failed producer as settled-but-unavailable. A later healthy
-quiescent status permits normal reporting again.
+Analyzer `experimental/serverStatus` errors become settled-but-unavailable
+producer failures carrying the server's message. Earlier reports are invalidated
+and subsequent reports stay provisional until recovery. Ordinary health warnings
+remain usable: their diagnostics are retained and the message appears in inspect
+as a `rust-analyzer warning: ...` note. The explicitly recognized warning exception
+is Cargo metadata rejecting a lockfile update (`cargo metadata`, `lock file`, and
+`--locked was passed` in the status message). A warning about proc macros, partial
+workspace loading, or flycheck configuration alone does not invalidate reports.
+A later quiescent non-failing status permits normal reporting again.
+
+`rust_analyzer_warning_keeps_diagnostics_and_reports_note` exercises a fake
+proc-macro startup warning through the blocking inspect handler. It asserts the
+two published diagnostics, their error/warning counts, and both structured and
+rendered warning notes. Against the initial implementation that treated every
+health warning as a failed producer it failed with `complete: false`, zero
+counts, no diagnostic details, and a failed-producer gap.
 
 The integration test skips with a named stderr reason when `rust-analyzer
 --version` is unavailable (including a rustup shim without its component).

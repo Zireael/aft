@@ -360,6 +360,8 @@ pub struct LspClient {
     rust_analyzer_quiescent: bool,
     /// Workspace-load or check failure reported by rust-analyzer itself.
     rust_analyzer_failure: Option<String>,
+    /// Non-fatal analyzer health warning; published diagnostics remain usable.
+    pub(crate) rust_analyzer_warning: Option<String>,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -637,6 +639,7 @@ impl LspClient {
             diagnostic_caps: None,
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
+            rust_analyzer_warning: None,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,

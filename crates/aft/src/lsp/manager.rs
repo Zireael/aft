@@ -2730,6 +2730,13 @@ impl LspManager {
             .and_then(LspClient::diagnostic_failure)
     }
 
+    /// Non-fatal analyzer status to show alongside the producer's diagnostics.
+    pub(crate) fn producer_warning(&self, server: &ServerKey) -> Option<&str> {
+        self.clients
+            .get(server)
+            .and_then(|client| client.rust_analyzer_warning.as_deref())
+    }
+
     /// True when every expected producer has settled. Empty input is vacuously
     /// true; callers that mean "no producer was started" must not treat that
     /// as a fresh diagnostics collection.
@@ -3014,17 +3021,23 @@ impl LspManager {
         }
 
         let key = ServerKey { kind: server, root };
-        let failure = match params.get("health").and_then(serde_json::Value::as_str) {
-            Some("warning" | "error") => Some(
-                params
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("rust-analyzer reported unhealthy workspace analysis")
-                    .to_string(),
-            ),
-            _ => None,
-        };
+        let health = params.get("health").and_then(serde_json::Value::as_str);
+        let message = params
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("rust-analyzer reported unhealthy workspace analysis");
+        // Ordinary warnings (for example unavailable proc macros) do not invalidate
+        // diagnostics. Locked metadata resolution is the explicit exception: Cargo
+        // could not load the dependency graph without modifying the lockfile.
+        let locked_metadata_failure = health == Some("warning")
+            && message.contains("cargo metadata")
+            && message.contains("lock file")
+            && message.contains("--locked was passed");
+        let failure =
+            (health == Some("error") || locked_metadata_failure).then(|| message.to_string());
         if let Some(client) = self.clients.get_mut(&key) {
+            client.rust_analyzer_warning = (health == Some("warning") && failure.is_none())
+                .then(|| format!("rust-analyzer warning: {message}"));
             client.set_diagnostic_failure(failure.clone());
         }
         if failure.is_some() {
