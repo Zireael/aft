@@ -7156,6 +7156,11 @@ fn unresolved_calls_for_node_limited(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreForwardCall>> {
+    forward_calls_for_node_limited(conn, node, usize::MAX)
+}
+
 fn forward_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: usize) -> Result<Vec<StoreForwardCall>> {
     let mut calls = Vec::new();
     calls.extend(
