@@ -97,7 +97,8 @@ jobs:
 
   unit-linux:
     name: Unit tests (Linux)
-    runs-on: ubuntu-22.04
+    # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -242,7 +243,8 @@ jobs:
 
   plugin-e2e-linux:
     name: Plugin e2e (${{ matrix.suite }}, Linux)
-    runs-on: ubuntu-22.04
+    # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
