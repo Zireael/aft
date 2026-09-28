@@ -807,6 +807,16 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
         &request_with("needle_symbol", Some("literal")),
         &ctx,
     ));
+    let subfolder = project.path().join("nested");
+    std::fs::create_dir(&subfolder).expect("create subfolder");
+    let with_subfolder = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), &subfolder),
+        &ctx,
+    ));
+    assert_eq!(
+        with_subfolder, without_path,
+        "same-repo subfolder is not a filter"
+    );
     let with_path = response_value(handle_semantic_search(
         &request_with_path("needle_symbol", Some("literal"), project.path()),
         &ctx,
@@ -924,6 +934,9 @@ fn external_non_git_path_still_returns_not_a_git_root() {
 
     assert_eq!(response["success"], false);
     assert_eq!(response["code"], "not_a_git_root");
+    let message = response["message"].as_str().expect("error message");
+    assert!(message.contains("another Git project"));
+    assert!(message.contains("grep or glob with path"));
 }
 
 #[test]

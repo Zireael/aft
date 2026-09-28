@@ -2213,10 +2213,7 @@ exit 0
 // ============================================================================
 // no_op honest reporting tests (v0.27.1, GitHub #45)
 //
-// Rust sets `no_op: true` on the response when the post-write file content is
-// byte-identical to the pre-write state. This separates "matched but produced
-// no change" from a real failure mode so Pi/OpenCode UIs can render an
-// informative message instead of a bare +0/-0 that looks like a tool bug.
+// Identity edits fail before mutation; real changes retain diff information.
 // ============================================================================
 
 #[test]
@@ -2237,14 +2234,11 @@ fn edit_match_no_op_when_old_string_equals_new_string() {
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
-    assert_eq!(resp["success"], true, "edit should succeed: {resp:?}");
-    assert_eq!(resp["replacements"], 1, "match was found and applied once");
     assert_eq!(
-        resp["no_op"], true,
-        "byte-identical replacement must surface no_op: true"
+        resp["success"], false,
+        "identity edit should be rejected: {resp:?}"
     );
-    assert_eq!(resp["diff"]["additions"], 0);
-    assert_eq!(resp["diff"]["deletions"], 0);
+    assert_eq!(resp["code"], "no_change");
 
     // File should genuinely be unchanged on disk
     assert_eq!(fs::read(&target).unwrap(), original);
@@ -2302,14 +2296,11 @@ fn write_no_op_when_content_identical_to_existing_file() {
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
-    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
-    assert_eq!(resp["created"], false);
     assert_eq!(
-        resp["no_op"], true,
-        "writing the same bytes must surface no_op: true"
+        resp["success"], false,
+        "identity write should be rejected: {resp:?}"
     );
-    assert_eq!(resp["diff"]["additions"], 0);
-    assert_eq!(resp["diff"]["deletions"], 0);
+    assert_eq!(resp["code"], "no_change");
 
     let _ = fs::remove_file(&target);
     let status = aft.shutdown();

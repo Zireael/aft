@@ -89,6 +89,10 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::success(&req.id, result);
     }
 
+    if existed && original == content {
+        return edit::no_change_response(&req.id);
+    }
+
     // Auto-backup existing files before overwriting. For create-only writes,
     // record a tombstone so operation undo removes the created file.
     let backup_id = if existed {
@@ -218,5 +222,6 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         result["diff"] = edit::compute_diff_for_response(&req.params, &original, &final_content);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &original, &final_content);
     Response::success(&req.id, result)
 }

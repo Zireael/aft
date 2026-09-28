@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -246,13 +247,58 @@ export function updatePinnedVersion(
   }
 }
 
+const registryCache = new Map<string, Promise<string>>();
+
+function npmConfigGet(key: string, directory: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.platform === "win32" ? "npm.cmd" : "npm",
+      ["config", "get", key],
+      {
+        cwd: directory,
+        timeout: NPM_FETCH_TIMEOUT,
+        windowsHide: true,
+        shell: process.platform === "win32",
+      },
+      (error, stdout) => {
+        if (error) reject(error);
+        else resolve(stdout.trim());
+      },
+    );
+  });
+}
+
+function configuredRegistry(value: string): string | undefined {
+  return value && value !== "undefined" && value !== "null" ? value : undefined;
+}
+
+function resolveRegistry(directory: string): Promise<string> {
+  const key = resolve(directory);
+  let pending = registryCache.get(key);
+  if (!pending) {
+    // Let npm apply scope, environment and npmrc precedence without blocking the host.
+    // Cache failures too: an unresolved private registry must not trigger a public query.
+    pending = (async () => {
+      const scoped = configuredRegistry(await npmConfigGet("@cortexkit:registry", key));
+      return scoped ?? configuredRegistry(await npmConfigGet("registry", key)) ?? NPM_REGISTRY_URL;
+    })();
+    registryCache.set(key, pending);
+  }
+  return pending;
+}
+
 function buildRegistryUrl(registryUrl: string): string {
   return `${registryUrl.replace(/\/+$/, "")}/${encodeURIComponent(PACKAGE_NAME).replace("%2F", "/")}`;
 }
 
 export async function getLatestVersion(
   channel = "latest",
-  options: { registryUrl?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+  options: {
+    registryUrl?: string;
+    directory?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<string | null> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs ?? NPM_FETCH_TIMEOUT);
@@ -261,7 +307,10 @@ export async function getLatestVersion(
 
   try {
     if (options.signal?.aborted) return null;
-    const response = await fetch(buildRegistryUrl(options.registryUrl ?? NPM_REGISTRY_URL), {
+    const registry =
+      options.registryUrl ?? (await resolveRegistry(options.directory ?? process.cwd()));
+    if (controller.signal.aborted) return null;
+    const response = await fetch(buildRegistryUrl(registry), {
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });

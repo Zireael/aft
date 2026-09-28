@@ -377,6 +377,7 @@ async function runBackgroundUpdateCheck(
   const channel = extractChannel(pluginInfo.pinnedVersion ?? currentVersion);
   const latestVersion = await getLatestVersion(channel, {
     registryUrl: options.npmRegistryUrl,
+    directory: ctx.directory,
     timeoutMs: options.fetchTimeoutMs,
     signal: options.signal,
   });

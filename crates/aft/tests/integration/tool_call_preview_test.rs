@@ -367,6 +367,7 @@ fn assert_no_undo_entry(aft: &mut AftProcess, label: &str, path: &Path) {
         &json!({
             "id": format!("history-after-{label}"),
             "command": "edit_history",
+            "session_id": SESSION_ID,
             "file": path.to_string_lossy(),
         })
         .to_string(),
@@ -387,6 +388,7 @@ fn assert_no_undo_entry(aft: &mut AftProcess, label: &str, path: &Path) {
         &json!({
             "id": format!("undo-preview-after-{label}"),
             "command": "undo_preview",
+            "session_id": SESSION_ID,
             "file": path.to_string_lossy(),
         })
         .to_string(),
@@ -416,4 +418,172 @@ fn send_tool_call(
         request["preview"] = json!(true);
     }
     aft.send(&request.to_string())
+}
+
+#[test]
+fn identity_edits_preserve_mtime_and_undo_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("identity.ts");
+    let body = "function identity() { return 1; }\n";
+    fs::write(&path, body).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let cases = [
+        (
+            "match",
+            "edit",
+            json!({"filePath": "identity.ts", "oldString": "return 1", "newString": "return 1"}),
+        ),
+        (
+            "symbol",
+            "edit",
+            json!({"filePath": "identity.ts", "symbol": "identity", "content": "function identity() { return 1; }"}),
+        ),
+        (
+            "batch",
+            "edit",
+            json!({"filePath": "identity.ts", "edits": [{"oldString": "return 1", "newString": "return 1"}]}),
+        ),
+        (
+            "write",
+            "write",
+            json!({"filePath": "identity.ts", "content": body}),
+        ),
+    ];
+    for (label, tool, arguments) in cases {
+        let response = send_tool_call(&mut aft, label, tool, arguments, false);
+        assert_eq!(response["success"], false, "{label}: {response:#}");
+        assert_eq!(response["code"], "no_change", "{label}: {response:#}");
+        assert!(response["message"].as_str().unwrap().contains("No change"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_no_undo_entry(&mut aft, label, &path);
+    }
+    let append = aft.send(
+        &json!({
+            "id": "empty-append", "command": "edit_match", "op": "append",
+            "session_id": SESSION_ID, "file": path, "appendContent": ""
+        })
+        .to_string(),
+    );
+    assert_eq!(append["code"], "no_change");
+    assert_no_undo_entry(&mut aft, "empty-append", &path);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn mutation_modes_supply_host_diff_without_include_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let cases = [
+        (
+            "match",
+            "edit",
+            json!({"filePath": "change.ts", "oldString": "return 1", "newString": "return 2"}),
+        ),
+        (
+            "symbol",
+            "edit",
+            json!({"filePath": "change.ts", "symbol": "change", "content": "function change() { return 2; }"}),
+        ),
+        (
+            "batch",
+            "edit",
+            json!({"filePath": "change.ts", "edits": [{"oldString": "return 1", "newString": "return 2"}]}),
+        ),
+        (
+            "append",
+            "edit",
+            json!({"filePath": "change.ts", "appendContent": "// added\n"}),
+        ),
+        (
+            "write",
+            "write",
+            json!({"filePath": "change.ts", "content": "function change() { return 2; }\n"}),
+        ),
+        (
+            "patch",
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch\n*** Update File: change.ts\n@@\n-function change() { return 1; }\n+function change() { return 2; }\n*** End Patch"}),
+        ),
+    ];
+    for (label, tool, arguments) in cases {
+        fs::write(
+            dir.path().join("change.ts"),
+            "function change() { return 1; }\n",
+        )
+        .unwrap();
+        let response = send_tool_call(&mut aft, label, tool, arguments, false);
+        assert_eq!(response["success"], true, "{label}: {response:#}");
+        let diff = response["metadata"]["diff"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: {response:#}"));
+        assert!(diff.contains("@@"), "{label}: {diff}");
+        assert!(diff.contains("+"), "{label}: {diff}");
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn delete_accepts_model_shaped_recursive_and_files_at_both_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for (index, raw) in [" true ", "TrUe", "1", " false ", "FaLsE", "0"]
+        .iter()
+        .enumerate()
+    {
+        for native in [false, true] {
+            let path = dir.path().join(format!("delete-{index}-{native}"));
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("file.txt"), "keep an undo copy\n").unwrap();
+            let files = json!([path]).to_string();
+            let response = if native {
+                aft.send(&json!({"id": "native-delete", "command": "delete_file", "files": files, "recursive": raw}).to_string())
+            } else {
+                send_tool_call(
+                    &mut aft,
+                    "shaped-delete",
+                    "delete",
+                    json!({"files": files, "recursive": raw}),
+                    false,
+                )
+            };
+            let should_delete = index < 3;
+            assert_eq!(
+                response["success"], should_delete,
+                "native={native}, raw={raw}: {response:#}"
+            );
+            assert_eq!(!path.exists(), should_delete);
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn batch_present_invalid_old_string_reports_the_actual_shape() {
+    use aft::subc_translate::subc_translate;
+    let root = Path::new("/project");
+    for (old, reason) in [
+        (json!(17), "must be a string (got number)"),
+        (Value::Null, "is null"),
+        (json!(""), "is empty"),
+    ] {
+        let args = json!({"path": "file.txt", "edits": [
+            {"oldString": "first", "newString": "FIRST"},
+            {"oldString": old, "newString": "second"},
+            {"startLine": 3, "endLine": 3, "content": "third"}
+        ]});
+        let error = subc_translate("edit", &args, root).unwrap_err();
+        assert_eq!(error.message, format!("edit: edits[1].oldString {reason}"));
+    }
+    let valid = json!({"path": "file.txt", "edits": [
+        {"startLine": 1, "endLine": 1, "content": "first"},
+        {"oldString": "second", "newString": "SECOND"},
+        {"oldString": "third", "newString": "THIRD"}
+    ]});
+    assert!(subc_translate("edit", &valid, root).is_ok());
 }

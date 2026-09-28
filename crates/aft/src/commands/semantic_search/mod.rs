@@ -708,7 +708,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(
                     &req.id,
                     "not_a_git_root",
-                    format!("path is not inside a git repository: {requested_path}"),
+                    format!("aft_search path must be the root of (or inside) another Git project to search: {requested_path}. To filter a subfolder of the current project, use grep or glob with path."),
                 );
             }
             Err(GitRootResolutionError::Other(error)) => {

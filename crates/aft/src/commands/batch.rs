@@ -137,6 +137,10 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::success(&req.id, result);
     }
 
+    if source == content {
+        return edit::no_change_response(&req.id);
+    }
+
     // Phase 5: Auto-backup once before applying
     let backup_id = match edit::auto_backup(
         ctx,
@@ -210,6 +214,12 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
+    edit::attach_mutation_diff(
+        &mut result,
+        file,
+        &source,
+        &std::fs::read_to_string(&path).unwrap_or(content),
+    );
     Response::success(&req.id, result)
 }
 

@@ -196,6 +196,10 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return Response::success(&req.id, result);
     }
 
+    if existed && append_content.is_empty() {
+        return edit::no_change_response(&req.id);
+    }
+
     if create_dirs {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -232,10 +236,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    // Capture before-content for diff computation if requested. Only read it
-    // when the caller asked, since this allocates the whole file string.
+    // Capture the original text for the host's unified diff.
     let want_diff = edit::wants_diff(&req.params);
-    let before_content = if want_diff && existed {
+    let before_content = if existed {
         std::fs::read_to_string(path.as_path()).unwrap_or_default()
     } else {
         String::new()
@@ -383,6 +386,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         write_result.append_reformatted_excerpt_to(&mut result);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &before_content, &final_content);
     Response::success(&req.id, result)
 }
 
@@ -573,9 +577,18 @@ fn handle_glob_edit_match(
                     "deletions": deletions,
                 },
                 "preview_diff": preview_diff,
+                "metadata": { "diff": preview_diff },
             }),
         );
     }
+
+    if pending
+        .iter()
+        .all(|edit| edit.original_source == edit.new_source)
+    {
+        return edit::no_change_response(&req.id);
+    }
+    pending.retain(|edit| edit.original_source != edit.new_source);
 
     let mut captures = pending
         .iter()
@@ -807,6 +820,15 @@ fn handle_glob_edit_match(
         "format_skipped_count": format_skipped_count,
         "format_skip_reasons": format_skip_reasons,
     });
+    let diff = pending
+        .iter()
+        .map(|edit| {
+            let after =
+                std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
+            edit::build_unified_diff(&edit.file_str, &edit.original_source, &after)
+        })
+        .collect::<String>();
+    result["metadata"] = serde_json::json!({ "diff": diff });
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
     Response::success(&req.id, result)
 }
@@ -1279,6 +1301,10 @@ fn handle_single_file_edit_match(
         return Response::success(&req.id, result);
     }
 
+    if source == new_source {
+        return edit::no_change_response(&req.id);
+    }
+
     // Auto-backup before mutation
     let label = if replace_all {
         format!(
@@ -1375,6 +1401,7 @@ fn handle_single_file_edit_match(
         result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &source, &final_content);
     Response::success(&req.id, result)
 }
 

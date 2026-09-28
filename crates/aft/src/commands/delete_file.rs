@@ -37,12 +37,29 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
     let recursive = req
         .params
         .get("recursive")
-        .and_then(|v| v.as_bool())
+        .and_then(crate::subc_translate::model_boolean)
         .unwrap_or(false);
     let mut budget = RecursiveDeleteBackupBudget::for_request(ctx);
 
+    let parsed_files = match req.params.get("files") {
+        Some(Value::String(raw)) => match serde_json::from_str::<Vec<String>>(raw) {
+            Ok(files) => Some(serde_json::json!(files)),
+            Err(_) => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "delete_file: 'files' must be an array of paths",
+                )
+            }
+        },
+        _ => None,
+    };
     // Batch mode: `files: [...]`
-    if let Some(files) = req.params.get("files").and_then(|v| v.as_array()) {
+    if let Some(files) = parsed_files
+        .as_ref()
+        .or_else(|| req.params.get("files"))
+        .and_then(Value::as_array)
+    {
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         for value in files {

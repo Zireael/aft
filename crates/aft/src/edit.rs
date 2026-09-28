@@ -198,6 +198,20 @@ pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
     )
 }
 
+/// Reject an identity edit before writing or recording undo state.
+pub fn no_change_response(id: &str) -> crate::protocol::Response {
+    crate::protocol::Response::error(
+        id,
+        "no_change",
+        "No change: the replacement is identical to the existing text.",
+    )
+}
+
+/// Supply the unified patch consumed by host diff views, independently of diff counts.
+pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
+    result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
+}
+
 /// Attach the standard preview diff fields to a command response payload.
 pub fn attach_preview_diff(
     result: &mut serde_json::Value,
@@ -206,6 +220,7 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
+    attach_mutation_diff(result, file, before, after);
     result["preview"] = serde_json::json!(true);
     result["diff"] = compute_diff_for_response(params, before, after);
     result["preview_diff"] = serde_json::json!(build_unified_diff(file, before, after));

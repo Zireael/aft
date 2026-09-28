@@ -640,6 +640,7 @@ fn normalize_edit_item(value: Value, index: usize) -> Result<Map<String, Value>,
 
     normalize_item_alias(&mut item, "oldString", "oldText");
     normalize_item_alias(&mut item, "newString", "newText");
+    let old_string_was_null = item.get("oldString").is_some_and(Value::is_null);
     normalize_edit_item_sentinels(&mut item);
 
     let has_find = ["oldString", "newString", "replaceAll", "occurrence"]
@@ -655,9 +656,20 @@ fn normalize_edit_item(value: Value, index: usize) -> Result<Map<String, Value>,
     }
 
     if has_find {
-        if !matches!(item.get("oldString"), Some(Value::String(_))) {
+        let problem = match item.get("oldString") {
+            Some(Value::String(value)) if value.is_empty() => Some("is empty"),
+            Some(Value::String(_)) => None,
+            Some(Value::Number(_)) => Some("must be a string (got number)"),
+            Some(Value::Bool(_)) => Some("must be a string (got boolean)"),
+            Some(Value::Array(_)) => Some("must be a string (got array)"),
+            Some(Value::Object(_)) => Some("must be a string (got object)"),
+            Some(Value::Null) => Some("is null"),
+            None if old_string_was_null => Some("is null"),
+            None => Some("is missing"),
+        };
+        if let Some(problem) = problem {
             return Err(invalid_request(format!(
-                "edit: edits[{index}] requires string 'oldString'"
+                "edit: edits[{index}].oldString {problem}"
             )));
         }
         if item.contains_key("newString")
@@ -747,16 +759,7 @@ fn coerce_edit_scalars(item: &mut Map<String, Value>, index: usize) -> Result<()
         )));
     }
     if let Some(value) = item.get("replaceAll") {
-        let coerced = match value {
-            Value::Bool(value) => Some(*value),
-            Value::Number(number) if number.as_f64() == Some(0.0) => Some(false),
-            Value::Number(number) if number.as_f64() == Some(1.0) => Some(true),
-            Value::String(value) if value == "0" => Some(false),
-            Value::String(value) if value == "1" => Some(true),
-            Value::String(value) if value.eq_ignore_ascii_case("true") => Some(true),
-            Value::String(value) if value.eq_ignore_ascii_case("false") => Some(false),
-            _ => None,
-        };
+        let coerced = model_boolean(value);
         let Some(coerced) = coerced else {
             return Err(invalid_request(format!(
                 "edit: edits[{index}].replaceAll must be a boolean, true/false string, or 0/1"
@@ -1211,16 +1214,23 @@ fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
     }
 }
 
-fn coerce_boolean(value: &Value) -> bool {
+/// Decode model-shaped booleans without treating arbitrary nonempty strings as true.
+pub(crate) fn model_boolean(value: &Value) -> Option<bool> {
     match value {
-        Value::Bool(value) => *value,
-        Value::Number(num) => num.as_i64() == Some(1) || num.as_u64() == Some(1),
-        Value::String(raw) => {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "true" || normalized == "1"
-        }
-        _ => false,
+        Value::Bool(value) => Some(*value),
+        Value::Number(num) if num.as_f64() == Some(1.0) => Some(true),
+        Value::Number(num) if num.as_f64() == Some(0.0) => Some(false),
+        Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
+}
+
+fn coerce_boolean(value: &Value) -> bool {
+    model_boolean(value).unwrap_or(false)
 }
 
 fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -1495,7 +1505,7 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
             out.insert("limit".to_string(), Value::Number(limit.into()));
         }
     }
-    if let Some(vision_capability) = map_in.get("vision_capability").and_then(Value::as_bool) {
+    if let Some(vision_capability) = map_in.get("vision_capability").and_then(model_boolean) {
         out.insert(
             "vision_capability".to_string(),
             Value::Bool(vision_capability),
@@ -1884,7 +1894,10 @@ fn insert_present_renamed(
 }
 
 fn translate_delete(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
-    let map_in = agent_args_map(args);
+    let mut map_in = agent_args_map(args);
+    if let Some(files) = map_in.get_mut("files") {
+        parse_stringified_collection(files, "files", "a non-empty array of paths", false)?;
+    }
     let files = map_in
         .get("files")
         .and_then(Value::as_array)
@@ -1988,7 +2001,9 @@ fn translate_import(args: Value) -> Result<Translated, TranslateError> {
     insert_present_renamed(&mut out, &map_in, "alias", "alias");
     insert_present_renamed(&mut out, &map_in, "modifiers", "modifiers");
     insert_present_renamed(&mut out, &map_in, "importKind", "import_kind");
-    insert_present_renamed(&mut out, &map_in, "typeOnly", "type_only");
+    if let Some(value) = map_in.get("typeOnly") {
+        out.insert("type_only".to_string(), Value::Bool(coerce_boolean(value)));
+    }
     insert_present_renamed(&mut out, &map_in, "removeName", "name");
     insert_present_renamed(&mut out, &map_in, "validate", "validate");
 
@@ -2245,10 +2260,7 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
 
 fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
-    let files_flag = map_in
-        .get("files")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let files_flag = map_in.get("files").is_some_and(coerce_boolean);
 
     let target = map_in
         .get("target")
@@ -3364,11 +3376,8 @@ mod tests {
         .expect("pure line-range delete must stay an edits claim");
         assert_eq!(line_delete.command, "batch");
 
-        // {oldString:"", newString:"x"} is NOT a sentinel: it is kept as an
-        // edits claim so the batch parser reports its specific empty-match
-        // error instead of us silently discarding a broken but intentional
-        // edit. Translation succeeds (the batch command is produced); the
-        // empty-match error surfaces at the batch leaf handler.
+        // An empty match with a real replacement is invalid, not an omitted
+        // serializer default. Report the field rather than discard the edit.
         let empty_match = subc_translate_owned(
             "edit",
             serde_json::json!({
@@ -3377,15 +3386,8 @@ mod tests {
             }),
             project,
         )
-        .expect("empty oldString must stay an edits claim");
-        assert_eq!(empty_match.command, "batch");
-        let kept = empty_match
-            .args
-            .get("edits")
-            .and_then(Value::as_array)
-            .unwrap();
-        assert_eq!(kept.len(), 1, "the empty-match item must be kept");
-        assert_eq!(kept[0].get("match").and_then(Value::as_str), Some(""));
+        .expect_err("empty oldString must report an invalid edit, not a missing mode");
+        assert_eq!(empty_match.message, "edit: edits[0].oldString is empty");
 
         // Stringified kitchen-sink edits + appendContent: appendContent wins.
         let stringified = subc_translate_owned(
@@ -3548,12 +3550,8 @@ mod tests {
             }),
             project,
         )
-        .expect("empty find match without line-range fields must reach batch validation");
-        assert_eq!(empty_find.command, "batch");
-        assert_eq!(
-            empty_find.args["edits"][0]["match"],
-            Value::String(String::new())
-        );
+        .expect_err("empty find match must report the invalid field");
+        assert_eq!(empty_find.message, "edit: edits[0].oldString is empty");
     }
 
     #[test]
@@ -3700,7 +3698,7 @@ mod tests {
             project,
         )
         .expect_err("null oldString with real replacement must remain invalid");
-        assert!(malformed.message.contains("requires string 'oldString'"));
+        assert!(malformed.message.contains("oldString is null"));
 
         // When `edits[]` is present, null values for unrelated top-level mode
         // fields are treated as omitted so the batch remains valid.
@@ -4051,5 +4049,89 @@ mod tests {
             Value::Object(translated.args),
             serde_json::json!({ "task_id": "bash-4" })
         );
+    }
+}
+
+#[cfg(test)]
+mod model_boolean_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn all_boolean_tool_arguments_accept_trimmed_model_strings() {
+        let root = Path::new("/project");
+        let cases = [
+            ("bash", json!({"command": "true"}), "wait"),
+            ("bash", json!({"command": "true"}), "background"),
+            ("bash", json!({"command": "true"}), "compressed"),
+            ("bash", json!({"command": "true"}), "pty"),
+            ("bash", json!({"command": "true"}), "foreground_orchestrate"),
+            ("bash", json!({"command": "true"}), "block_to_completion"),
+            ("bash", json!({"command": "true"}), "permissions_requested"),
+            ("read", json!({"path": "file.ts"}), "vision_capability"),
+            ("search", json!({"query": "needle"}), "includeTests"),
+            ("outline", json!({"target": "src"}), "files"),
+            ("outline", json!({"target": "src"}), "includeTests"),
+            ("outline", json!({"target": "src"}), "include_tests"),
+            (
+                "zoom",
+                json!({"path": "file.ts", "symbols": "main"}),
+                "callgraph",
+            ),
+            (
+                "callgraph",
+                json!({"path": "file.ts", "symbol": "main", "op": "callers"}),
+                "includeTests",
+            ),
+            (
+                "ast_replace",
+                json!({"pattern": "foo()", "rewrite": "bar()", "lang": "typescript"}),
+                "dryRun",
+            ),
+            (
+                "ast_replace",
+                json!({"pattern": "foo()", "rewrite": "bar()", "lang": "typescript"}),
+                "dry_run",
+            ),
+            ("delete", json!({"files": ["old"]}), "recursive"),
+            (
+                "import",
+                json!({"path": "file.ts", "op": "add", "module": "pkg"}),
+                "typeOnly",
+            ),
+            (
+                "edit",
+                json!({"path": "file.ts", "oldString": "old", "newString": "new"}),
+                "replaceAll",
+            ),
+        ];
+        for (tool, args, field) in cases {
+            for (raw, expected) in [
+                (" TrUe ", true),
+                (" 1 ", true),
+                (" FaLsE ", false),
+                (" 0 ", false),
+            ] {
+                let mut typed = args.clone();
+                typed[field] = json!(expected);
+                let mut shaped = args.clone();
+                shaped[field] = json!(raw);
+                assert_eq!(
+                    subc_translate(tool, &shaped, root),
+                    subc_translate(tool, &typed, root),
+                    "{tool}.{field}={raw}"
+                );
+                assert!(subc_translate(tool, &typed, root).is_ok(), "{tool}.{field}");
+                if tool == "bash" {
+                    assert_eq!(
+                        subc_translate("powershell", &shaped, root),
+                        subc_translate("powershell", &typed, root)
+                    );
+                }
+            }
+        }
+        let nested = json!({"path": "file.ts", "edits": [{"oldString": "old", "newString": "new", "replaceAll": " TrUe "}]});
+        let result = subc_translate("edit", &nested, root).unwrap();
+        assert_eq!(result.args["edits"][0]["replaceAll"], true);
     }
 }

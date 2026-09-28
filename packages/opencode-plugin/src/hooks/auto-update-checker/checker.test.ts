@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 
 mock.module("../../logger.js", () => ({
   log: mock(() => {}),
@@ -167,6 +168,66 @@ describe("auto-update-checker/checker", () => {
   });
 
   describe("getLatestVersion", () => {
+    test("resolves scoped npmrc before environment default and caches per project", async () => {
+      const directory = fs.mkdtempSync(join(tmpdir(), "aft-registry-"));
+      const originalFetch = globalThis.fetch;
+      const previous = process.env.NPM_CONFIG_REGISTRY;
+      const fetchMock = mock(async (_input: string | URL | Request) =>
+        Response.json({ "dist-tags": { latest: "9.0.0" } }),
+      );
+      globalThis.fetch = fetchMock;
+      process.env.NPM_CONFIG_REGISTRY = "https://default.example.test/";
+      try {
+        fs.writeFileSync(join(directory, "package.json"), "{}");
+        fs.writeFileSync(
+          join(directory, ".npmrc"),
+          "@cortexkit:registry=https://scoped.example.test/mirror/\n",
+        );
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory, timeoutMs: 15000 })).toBe("9.0.0");
+        fs.writeFileSync(
+          join(directory, ".npmrc"),
+          "@cortexkit:registry=https://changed.example.test/\n",
+        );
+        expect(await getLatestVersion("latest", { directory, timeoutMs: 15000 })).toBe("9.0.0");
+        expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+          "https://scoped.example.test/mirror/%40cortexkit/aft-opencode",
+          "https://scoped.example.test/mirror/%40cortexkit/aft-opencode",
+        ]);
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (previous === undefined) delete process.env.NPM_CONFIG_REGISTRY;
+        else process.env.NPM_CONFIG_REGISTRY = previous;
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+    test("uses the default registry when the scope is unset and never queries on resolution failure", async () => {
+      const directory = fs.mkdtempSync(join(tmpdir(), "aft-default-registry-"));
+      const originalFetch = globalThis.fetch;
+      const fetchMock = mock(async (_input: string | URL | Request) =>
+        Response.json({ "dist-tags": { latest: "9.0.0" } }),
+      );
+      globalThis.fetch = fetchMock;
+      try {
+        fs.writeFileSync(join(directory, "package.json"), "{}");
+        fs.writeFileSync(
+          join(directory, ".npmrc"),
+          "@cortexkit:registry=undefined\nregistry=https://default.example.test/\n",
+        );
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory, timeoutMs: 15000 })).toBe("9.0.0");
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+          "https://default.example.test/%40cortexkit/aft-opencode",
+        );
+        expect(
+          await getLatestVersion("latest", { directory: join(directory, "missing") }),
+        ).toBeNull();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        globalThis.fetch = originalFetch;
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
     test("fetches channel dist-tag from npm registry package envelope", async () => {
       const fetchMock = mock(async () =>
         Response.json({ "dist-tags": { latest: "0.17.2", beta: "0.18.0-beta.1" } }),

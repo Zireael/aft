@@ -273,6 +273,10 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::success(&req.id, result);
     }
 
+    if source == new_source {
+        return edit::no_change_response(&req.id);
+    }
+
     // Auto-backup before writing
     let backup_id = match edit::auto_backup(
         ctx,
@@ -410,5 +414,6 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &source, &final_content);
     Response::success(&req.id, result)
 }
