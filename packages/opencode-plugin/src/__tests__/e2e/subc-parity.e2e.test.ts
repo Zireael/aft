@@ -367,10 +367,11 @@ function normalizeRoot(text: string, root: string): string {
     text
       .replace(new RegExp(escapedRoot, "g"), "<ROOT>")
       .replace(new RegExp(escapedSlashRoot, "g"), "<ROOT>")
-      // The status bar's `~` marks code-health counts as older than the latest
-      // edit. Whether a background refresh has finished is timing, not a
-      // transport difference, so the marker is dropped before comparing; the
-      // counts themselves must still match.
-      .replace(/(\[AFT [^\]|]*\| )~D/g, "$1D")
+      // The trailing status bar is dropped before comparing. Whether it is
+      // appended at all depends on whether it changed since that session last
+      // saw it, and its `~` marker on whether a background refresh finished,
+      // so it reflects timing and session history, not the transport. Status
+      // bar rendering has its own tests.
+      .replace(/\n*\[AFT [^\]\n]*\]\s*$/, "")
   );
 }
