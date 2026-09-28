@@ -15,7 +15,7 @@ use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
 use crate::inspect::job::is_test_file;
-use crate::query_shape::{contains_all_content_tokens, extract_content_tokens};
+use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
     DEFAULT_MAX_FILE_SIZE,
@@ -424,24 +424,14 @@ pub fn verify_exact_matches_in_text(
 
     // 3. Check 3-line window match (E2) if no E1 match on file-level.
     // Files missing any query token cannot contain an all-token window, so reject
-    // them before allocating and joining every one-, two-, and three-line window.
+    // them before scanning identifiers and tracking line coverage.
     if matches.is_empty() && e2_window_scan_needed(&norm_text, content_tokens) {
-        let lines: Vec<&str> = text.lines().collect();
-        for width in 1..=3 {
-            if lines.len() < width {
-                continue;
-            }
-            if lines
-                .windows(width)
-                .any(|w| contains_all_content_tokens(&w.join("\n"), content_tokens))
-            {
-                matches.push(CandidateResult::new_exact(
-                    file_path.to_path_buf(),
-                    None,
-                    EvidenceDescriptor::for_e2(width, true, false),
-                ));
-                break;
-            }
+        if let Some(width) = minimum_content_token_window(text, content_tokens) {
+            matches.push(CandidateResult::new_exact(
+                file_path.to_path_buf(),
+                None,
+                EvidenceDescriptor::for_e2(width, true, false),
+            ));
         }
     }
 

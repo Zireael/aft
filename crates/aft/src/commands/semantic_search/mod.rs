@@ -1882,16 +1882,18 @@ fn lexical_candidate_exactness(
         return (true, phrase_count, Some(1));
     }
 
-    let lines = text.lines().collect::<Vec<_>>();
-    for width in 1..=3 {
-        if lines.len() < width {
-            continue;
-        }
-        if lines.windows(width).any(|window| {
-            query_shape::contains_all_content_tokens(&window.join("\n"), content_tokens)
-        }) {
-            return (true, 0, Some(width));
-        }
+    // A window cannot supply tokens absent from the whole file. Unlike the exact
+    // lane's E2 precheck, lexical evidence also permits a single content token.
+    if content_tokens.is_empty()
+        || content_tokens
+            .iter()
+            .any(|token| !normalized_text.contains(token))
+    {
+        return (false, 0, None);
+    }
+
+    if let Some(width) = query_shape::minimum_content_token_window(&text, content_tokens) {
+        return (true, 0, Some(width));
     }
     (false, 0, None)
 }
@@ -9426,5 +9428,41 @@ fn hot_path_lexical_exactness_work_counts() {
             &tokens
         )),
         (false, 0, None)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn lexical_missing_tokens_skip_window_scans() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("source.rs");
+    fs::write(&file, "common unrelated\n".repeat(1000)).unwrap();
+    for tokens in [vec!["common".to_string(), "rare".to_string()], vec![]] {
+        crate::search_hot_path_measurements::reset();
+        assert_eq!(
+            lexical_candidate_exactness(&file, "common rare", &tokens),
+            (false, 0, None)
+        );
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().token_scans
+                + crate::search_hot_path_measurements::counts().token_lines_scanned,
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn lexical_single_token_and_empty_token_phrase_evidence_are_preserved() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("source.rs");
+    fs::write(&file, "common unrelated\n").unwrap();
+    assert_eq!(
+        lexical_candidate_exactness(&file, "where common", &["common".to_string()]),
+        (true, 0, Some(1))
+    );
+    assert_eq!(
+        lexical_candidate_exactness(&file, "common unrelated", &[]),
+        (true, 1, Some(1))
     );
 }
