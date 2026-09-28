@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
 import { log } from "./logger.js";
+import { skipsEagerStartup } from "./session-kind.js";
 import { piHashlineEffective } from "./tool-registration.js";
 
 export interface WorkflowHintsOpts {
@@ -190,12 +191,15 @@ interface ToolSurfaceFlags {
  * `before_agent_start` with the assembled prompt. Our handler appends the
  * AFT workflow hints block to that prompt. If multiple extensions return a
  * `systemPrompt`, Pi chains them — so we always append (never replace).
+ * Magic Context's short-lived Pi children don't need these workflow hints.
  */
 export function registerWorkflowHints(
   pi: ExtensionAPI,
   config: AftConfig,
   surface: ToolSurfaceFlags,
 ): void {
+  if (skipsEagerStartup()) return;
+
   // Build the absent-tools set from the resolved registration predicates.
   const absent = new Set<string>();
   if (!surface.outline) absent.add("aft_outline");

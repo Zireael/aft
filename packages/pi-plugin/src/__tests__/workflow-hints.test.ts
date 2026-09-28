@@ -1,10 +1,13 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "../config.js";
+import { MAGIC_CONTEXT_SUBAGENT_ENV } from "../session-kind.js";
 import {
   buildHintsFromConfig,
   buildWorkflowHints,
   HASHLINE_TAG_SOURCE_HINT,
+  registerWorkflowHints,
 } from "../workflow-hints.js";
 
 describe("Pi hashline tag-source guidance", () => {
@@ -188,6 +191,53 @@ describe("Pi buildWorkflowHints", () => {
     // null proves the parallel-tool-call frame is never emitted on its own
     // (unshift runs only when sections already have content).
     expect(out).toBeNull();
+  });
+});
+
+describe("Pi registerWorkflowHints", () => {
+  test("appends hints normally but registers no hook in a Magic Context child", () => {
+    const previous = process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+    const config: AftConfig = {};
+    const surface = {
+      outline: true,
+      zoom: true,
+      semantic: true,
+      navigate: true,
+      inspect: true,
+      hoistGrep: true,
+      hoistBash: true,
+      hoistEdit: true,
+      hoistRead: true,
+      bashStatus: true,
+    };
+    const handlers: Array<(event: { systemPrompt: string }) => { systemPrompt: string }> = [];
+    const pi = {
+      on: (
+        event: string,
+        handler: (event: { systemPrompt: string }) => { systemPrompt: string },
+      ) => {
+        expect(event).toBe("before_agent_start");
+        handlers.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    try {
+      delete process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+      registerWorkflowHints(pi, config, surface);
+      expect(handlers).toHaveLength(1);
+      const hints = buildHintsFromConfig(config, new Set());
+      expect(hints).not.toBeNull();
+      expect(handlers[0]?.({ systemPrompt: "existing prompt" })).toEqual({
+        systemPrompt: `existing prompt\n\n${hints}`,
+      });
+
+      process.env[MAGIC_CONTEXT_SUBAGENT_ENV] = "1";
+      registerWorkflowHints(pi, config, surface);
+      expect(handlers).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+      else process.env[MAGIC_CONTEXT_SUBAGENT_ENV] = previous;
+    }
   });
 });
 
