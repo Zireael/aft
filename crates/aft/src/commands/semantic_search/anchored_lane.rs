@@ -498,23 +498,39 @@ pub fn verify_file_for_anchored(
     retained_runs: &[String],
     denominator: usize,
 ) -> Option<CandidateResult> {
-    let content = fs::read_to_string(file_path).ok()?;
-    let canonical = find_canonical_alignment(&content, retained_runs)?;
+    verify_admitted_file(file_path, retained_runs, denominator).ok().flatten()
+}
+
+fn verify_admitted_file(
+    file_path: &Path,
+    retained_runs: &[String],
+    denominator: usize,
+) -> Result<Option<CandidateResult>, ()> {
+    let crate::search_index::SearchCorpusEligibility::Eligible(file) =
+        crate::search_index::read_search_corpus_file(
+            file_path,
+            crate::search_index::DEFAULT_MAX_FILE_SIZE,
+        )
+    else {
+        return Err(());
+    };
+    let Ok(content) = std::str::from_utf8(&file.bytes) else { return Err(()); };
+    let Some(canonical) = find_canonical_alignment(content, retained_runs) else { return Ok(None); };
     if !evaluate_threshold(
         canonical.matched_total,
         canonical.runs_matched(),
         denominator,
     ) {
-        return None;
+        return Ok(None);
     }
 
     let descriptor =
         EvidenceDescriptor::for_anchored(canonical.matched_total, canonical.gap_chars, true, false);
-    Some(CandidateResult::new_exact(
+    Ok(Some(CandidateResult::new_exact(
         file_path.to_path_buf(),
         None,
         descriptor,
-    ))
+    )))
 }
 
 /// Anchored lane implementation of SearchLane.
@@ -543,9 +559,19 @@ impl AnchoredLane {
         query: &str,
         include_tests: bool,
     ) -> Vec<CandidateResult> {
+        self.execute_with_admission_report(index, search_root, query, include_tests).0
+    }
+
+    pub(crate) fn execute_with_admission_report(
+        &self,
+        index: &SearchIndex,
+        search_root: &Path,
+        query: &str,
+        include_tests: bool,
+    ) -> (Vec<CandidateResult>, usize, usize) {
         let split = split_query(query);
         if split.retained_runs.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         }
 
         let candidate_files = discover_anchored_candidate_files(
@@ -554,15 +580,20 @@ impl AnchoredLane {
             &split.retained_runs,
             include_tests,
         );
+        let examined = candidate_files.len();
+        let mut excluded = 0;
         let mut results = candidate_files
             .into_iter()
             .filter_map(|path| {
-                verify_file_for_anchored(&path, &split.retained_runs, split.denominator)
+                match verify_admitted_file(&path, &split.retained_runs, split.denominator) {
+                    Ok(candidate) => candidate,
+                    Err(()) => { excluded += 1; None }
+                }
             })
             .collect::<Vec<_>>();
 
         sort_anchored_canonical(&mut results);
-        results
+        (results, examined, excluded)
     }
 }
 

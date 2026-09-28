@@ -1749,6 +1749,7 @@ fn handle_external_semantic_or_hybrid_search(
         serde_json::json!(ranked.engine_capped),
     );
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
 
     search_response(
         req,
@@ -2383,6 +2384,7 @@ struct EngineRanking {
     recall_audit: Option<serde_json::Value>,
     /// Page entries dropped because their file is not on disk (stale index).
     missing_on_disk: usize,
+    anchored_admission: (usize, usize),
 }
 
 /// Report page entries that were dropped because their file is not on disk,
@@ -2402,6 +2404,23 @@ fn disclose_missing_on_disk(
     text.push_str(&format!(
         "\n\n({missing_on_disk} indexed path(s) no longer on disk in this checkout were left out of this page; the index is out of date.)"
     ));
+}
+
+fn disclose_anchored_admission(
+    (examined, excluded): (usize, usize),
+    text: &mut String,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if excluded == 0 {
+        return;
+    }
+    extras.insert("complete".into(), serde_json::json!(false));
+    extras.insert("anchored_admission_gap".into(), serde_json::json!({
+        "candidates_examined": examined,
+        "files_excluded": excluded,
+        "reason": "exact corpus admission: at most 1048576 bytes, readable UTF-8 text"
+    }));
+    text.push_str(&format!("\nAnchored verification cut short: {excluded} of {examined} candidate files excluded by exact corpus admission (readable UTF-8 text, at most 1048576 bytes). Narrow to smaller text files or read a specific file range.\nshown {} of {examined} candidate files verified (corpus admission gap) · narrow: path, file range", examined - excluded));
 }
 
 /// The line of `file` that best shows why it matched `query`, as a 0-based
@@ -2846,6 +2865,7 @@ fn run_engine_ranking(
             lexical_candidates.clone()
         };
 
+    let mut anchored_admission = (0, 0);
     let mut registry = LaneRegistry::new();
     for kind in &plan.executed_callbacks {
         let lane: Arc<dyn SearchLane> = match kind {
@@ -2857,7 +2877,15 @@ fn run_engine_ranking(
                 kind: *kind,
                 candidates: exact_candidates.clone(),
             }),
-            SearchLaneKind::Anchored => Arc::new(anchored_lane::AnchoredLane::new()),
+            SearchLaneKind::Anchored => {
+                let (candidates, examined, excluded) = anchored_lane::AnchoredLane::new()
+                    .execute_with_admission_report(&index, project_root, query, include_tests);
+                anchored_admission = (examined, excluded);
+                Arc::new(PreparedEngineLane {
+                    kind: *kind,
+                    candidates,
+                })
+            }
             SearchLaneKind::Lexical => Arc::new(PreparedEngineLane {
                 kind: *kind,
                 candidates: lexical_execution_candidates.clone(),
@@ -3165,6 +3193,7 @@ fn run_engine_ranking(
         structured_content,
         recall_audit,
         missing_on_disk,
+        anchored_admission,
     })
 }
 
@@ -3296,6 +3325,7 @@ fn handle_engine_only_search(
         extras.insert("note".to_string(), serde_json::json!(disclosure.note));
     }
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     search_response(
         req,
         SearchResponseParts {
@@ -3711,6 +3741,7 @@ fn handle_semantic_or_hybrid_search(
         extras.insert("note".to_string(), serde_json::json!(disclosure));
     }
     disclose_missing_on_disk(engine_ranking.missing_on_disk, &mut text, &mut extras);
+    disclose_anchored_admission(engine_ranking.anchored_admission, &mut text, &mut extras);
 
     search_response(
         req,
@@ -3844,6 +3875,7 @@ fn zero_result_escalation_response(
     );
     extras.insert("escalation_target".to_string(), serde_json::json!("hybrid"));
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     search_response(
         req,
@@ -4023,6 +4055,7 @@ fn semantic_unavailable_or_fallback_response(
         );
         extras.insert("structuredContent".to_string(), ranked.structured_content);
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+        disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
 
         return search_response(
             req,

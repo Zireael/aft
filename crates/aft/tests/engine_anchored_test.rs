@@ -500,3 +500,17 @@ fn every_emitted_anchored_result_is_exact_tier_and_score_free() {
         assert!(tuple_json.get("lane_score").is_none());
     }
 }
+
+#[test]
+fn oversized_anchored_candidate_obeys_exact_byte_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("large.txt");
+    let text = "opening connection to database ".repeat(70_000);
+    fs::write(&path, &text).unwrap();
+    let started = std::time::Instant::now();
+    let result = aft::commands::semantic_search::anchored_lane::verify_file_for_anchored(
+        &path, &["opening connection to database".to_string()], 30,
+    );
+    eprintln!("anchored fixture: {} bytes, {:?}, admitted={}", text.len(), started.elapsed(), result.is_some());
+    assert!(result.is_none(), "oversized source must not enter anchored verification");
+}

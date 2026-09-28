@@ -3242,11 +3242,15 @@ pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> Search
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) => return SearchCorpusEligibility::Skipped,
-    };
-    if is_binary_bytes(&bytes) {
+    // Bound the read itself as well as admission: the file can grow after stat.
+    let mut bytes = Vec::new();
+    let read = File::open(path).and_then(|file| {
+        file.take(max_file_size.saturating_add(1)).read_to_end(&mut bytes)
+    });
+    if read.is_err() {
+        return SearchCorpusEligibility::Skipped;
+    }
+    if bytes.len() as u64 > max_file_size || is_binary_bytes(&bytes) {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
