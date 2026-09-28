@@ -14,6 +14,7 @@ pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
 pub mod scoring;
+mod snippet_bounds;
 pub mod telemetry;
 pub mod trailer;
 
@@ -2403,6 +2404,10 @@ fn disclose_missing_on_disk(
     ));
 }
 
+/// The line of `file` that best shows why it matched `query`, as a 0-based
+/// line number and display text. The text is bounded by `snippet_bounds`: a
+/// long line (minified code, a single-line JSON document) yields a window
+/// around the match, never the whole line.
 fn matching_line_from_source(
     file: &Path,
     query: &str,
@@ -2416,7 +2421,17 @@ fn matching_line_from_source(
             .enumerate()
             .find(|(_, line)| exact_lane::normalize_exact_phrase(line).contains(&normalized_phrase))
         {
-            return Some((u32::try_from(line_index).ok()?, line.to_string()));
+            // The phrase matched after whitespace normalization, so its first
+            // word locates the match in the raw line.
+            let anchor = normalized_phrase
+                .split(' ')
+                .next()
+                .and_then(|word| snippet_bounds::find_ascii_case_insensitive(line, word))
+                .unwrap_or(0);
+            return Some((
+                u32::try_from(line_index).ok()?,
+                snippet_bounds::window_snippet_line(line, anchor),
+            ));
         }
     }
 
@@ -2464,7 +2479,19 @@ fn matching_line_from_source(
         })
         .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
     if let Some((_, line_index, line)) = best {
-        return Some((u32::try_from(line_index).ok()?, line.to_string()));
+        // Start the shown part of a long line at the earliest query token it
+        // contains, so the window covers the region that made the line match.
+        let anchor = content_tokens
+            .iter()
+            .filter_map(|token| {
+                snippet_bounds::find_ascii_case_insensitive(line, &token.to_ascii_lowercase())
+            })
+            .min()
+            .unwrap_or(0);
+        return Some((
+            u32::try_from(line_index).ok()?,
+            snippet_bounds::window_snippet_line(line, anchor),
+        ));
     }
 
     let offset = symbol_range?.start.min(source.len());
@@ -2472,9 +2499,13 @@ fn matching_line_from_source(
         .iter()
         .filter(|byte| **byte == b'\n')
         .count();
+    let line_start = source.as_bytes()[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
     Some((
         u32::try_from(line_index).ok()?,
-        source.lines().nth(line_index)?.to_string(),
+        snippet_bounds::window_snippet_line(source.lines().nth(line_index)?, offset - line_start),
     ))
 }
 
@@ -5239,7 +5270,9 @@ fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<
         if !line.trim().is_empty() {
             nonempty_lines += 1;
         }
-        lines.push(line);
+        // Snippet lines are display text: a minified or single-line data file
+        // must not carry its whole content into the reply.
+        lines.push(snippet_bounds::cap_owned_snippet_line(line));
 
         if plan.is_satisfied(line_index, nonempty_lines) {
             break;
@@ -5531,11 +5564,30 @@ fn format_result_sections_with_context(
     project_root: &Path,
     ctx: Option<&AppContext>,
 ) -> String {
+    format_result_sections_within_budget(
+        results,
+        project_root,
+        ctx,
+        snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+    )
+}
+
+/// Render the result sections, stopping once the text reaches `max_bytes`.
+/// The budget is checked before each path, symbol header and snippet line is
+/// appended, so nothing past the cut is rendered. A cut reply ends with a note
+/// saying how many results were shown and how to narrow the search.
+fn format_result_sections_within_budget(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    max_bytes: usize,
+) -> String {
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
     // A BTreeMap would re-sort groups alphabetically by path and scramble the
-    // ranking the agent relies on to read most-relevant-first. Snippets are
-    // already budgeted by enrich_snippets_from_source; render them verbatim.
+    // ranking the agent relies on to read most-relevant-first. Snippet line
+    // counts are budgeted by enrich_snippets_from_source; here each line is
+    // capped in length and the whole reply is held to `max_bytes`.
     let annotations = ctx
         .map(|ctx| blast_radius_annotations(ctx, results))
         .unwrap_or_else(|| vec![None; results.len()]);
@@ -5558,72 +5610,102 @@ fn format_result_sections_with_context(
             .push((index, result));
     }
 
-    group_order
-        .iter()
-        .map(|file| {
-            let matching_line = groups[file].iter().find(|(_, result)| {
-                matches!(result.kind, SymbolKind::FileSummary)
-                    && (result.exact || result.source == "lexical")
-                    && !result.snippet.trim().is_empty()
-            });
-            let mut section = matching_line.map_or_else(
-                || file.clone(),
-                |(_, result)| format!("{file}:{}", display_line_number(result.start_line)),
-            );
-            if groups[file].iter().any(|(_, result)| result.exact) {
-                section.push_str(" [exact]");
+    let mut out = snippet_bounds::BudgetedText::new(max_bytes);
+    let mut shown = 0usize;
+    'groups: for file in &group_order {
+        let matching_line = groups[file].iter().find(|(_, result)| {
+            matches!(result.kind, SymbolKind::FileSummary)
+                && (result.exact || result.source == "lexical")
+                && !result.snippet.trim().is_empty()
+        });
+        let mut header = if out.is_empty() {
+            String::new()
+        } else {
+            "\n\n".to_string()
+        };
+        match matching_line {
+            Some((_, result)) => header.push_str(&format!(
+                "{file}:{}",
+                display_line_number(result.start_line)
+            )),
+            None => header.push_str(file),
+        }
+        if groups[file].iter().any(|(_, result)| result.exact) {
+            header.push_str(" [exact]");
+        }
+        if matching_line.is_some_and(|(_, result)| result.source == "lexical") {
+            header.push_str(" [lexical match]");
+        }
+        if !out.push(&header) {
+            break;
+        }
+        if let Some((_, result)) = matching_line {
+            shown += 1;
+            if !push_snippet_lines(&mut out, &result.snippet) {
+                break;
             }
-            if matching_line.is_some_and(|(_, result)| result.source == "lexical") {
-                section.push_str(" [lexical match]");
-            }
-            if let Some((_, result)) = matching_line {
-                for line in result.snippet.lines() {
-                    section.push_str("\n      ");
-                    section.push_str(line);
-                }
-            }
+        }
 
-            // Three distinct indent levels disambiguate the three roles for a
-            // weak model at a glance: file path at col 0 (with its `/` and
-            // extension), symbol header at 2 spaces, snippet body at 6. Without
-            // this, file paths and symbol headers were both at col 0 and could
-            // only be told apart by parsing the "[kind] lines X-Y" suffix.
-            for (index, result) in &groups[file] {
-                if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
-                    continue;
-                }
-                if result.source == "lexical" {
-                    // A lexical result without a readable source line keeps the file-level marker.
-                    section.push_str(" [lexical match]");
-                    continue;
-                }
-                if matches!(result.kind, SymbolKind::FileSummary) {
-                    section.push_str(&format!("\n  {} [file summary]", result.name));
-                } else {
-                    section.push_str(&format!(
-                        "\n  {} [{}] lines {}-{}{}",
-                        result.name,
-                        symbol_kind_label(&result.kind),
-                        display_line_number(result.start_line),
-                        display_line_number(result.end_line),
-                        annotations
-                            .get(*index)
-                            .and_then(|annotation| annotation.as_deref())
-                            .unwrap_or("")
-                    ));
-                }
-                if !result.snippet.trim().is_empty() {
-                    for line in result.snippet.lines() {
-                        section.push_str("\n      ");
-                        section.push_str(line);
-                    }
-                }
+        // Three distinct indent levels disambiguate the three roles for a
+        // weak model at a glance: file path at col 0 (with its `/` and
+        // extension), symbol header at 2 spaces, snippet body at 6. Without
+        // this, file paths and symbol headers were both at col 0 and could
+        // only be told apart by parsing the "[kind] lines X-Y" suffix.
+        for (index, result) in &groups[file] {
+            if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
+                continue;
             }
+            if result.source == "lexical" {
+                // A lexical result without a readable source line keeps the file-level marker.
+                if !out.push(" [lexical match]") {
+                    break 'groups;
+                }
+                shown += 1;
+                continue;
+            }
+            let symbol_header = if matches!(result.kind, SymbolKind::FileSummary) {
+                format!("\n  {} [file summary]", result.name)
+            } else {
+                format!(
+                    "\n  {} [{}] lines {}-{}{}",
+                    result.name,
+                    symbol_kind_label(&result.kind),
+                    display_line_number(result.start_line),
+                    display_line_number(result.end_line),
+                    annotations
+                        .get(*index)
+                        .and_then(|annotation| annotation.as_deref())
+                        .unwrap_or("")
+                )
+            };
+            if !out.push(&symbol_header) {
+                break 'groups;
+            }
+            shown += 1;
+            if !result.snippet.trim().is_empty() && !push_snippet_lines(&mut out, &result.snippet) {
+                break 'groups;
+            }
+        }
+    }
 
-            section
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let cut = out.is_cut();
+    let mut text = out.into_string();
+    if cut {
+        text.push_str(&format!(
+            "\n\n(Output reached the {max_bytes}-byte limit after {shown} of {} results; the rest were not printed. Narrow the query or lower topK, or read a listed file for its full text.)",
+            results.len()
+        ));
+    }
+    text
+}
+
+/// Append a result's snippet lines at the snippet indent, each line capped by
+/// `snippet_bounds`. Returns false once the reply's byte budget refuses a line.
+fn push_snippet_lines(out: &mut snippet_bounds::BudgetedText, snippet: &str) -> bool {
+    snippet.lines().all(|line| {
+        let line = snippet_bounds::cap_snippet_line(line);
+        out.push(&format!("\n      {line}"))
+    })
 }
 
 fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
@@ -8185,6 +8267,104 @@ mod tests {
 
         assert!(text.contains("src/transform-mode.ts:8 [lexical match]"));
         assert!(text.contains("export function resolveTransformMode() {"));
+    }
+
+    fn long_line_result(index: usize, snippet: String) -> HybridResult {
+        HybridResult {
+            file: PathBuf::from(format!("/project/data/census_{index:03}.json")),
+            name: format!("census_{index:03}"),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet,
+            score: 0.5,
+            source: "lexical",
+            semantic_score: None,
+            lexical_score: Some(0.5),
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn matching_line_of_a_single_line_json_file_is_a_window_around_the_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("inventory.json");
+        let line = format!(
+            "{{\"entries\": [\"{}\", \"calls open_task_artifact(paths, artifact)\", \"{}\"]}}",
+            "a".repeat(200_000),
+            "b".repeat(200_000)
+        );
+        std::fs::write(&file, &line).expect("write single-line fixture");
+
+        let (line_index, text) =
+            matching_line_from_source(&file, "open_task_artifact(", None).expect("matching line");
+
+        assert_eq!(line_index, 0);
+        assert!(
+            text.contains("open_task_artifact(paths, artifact)"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(snippet_bounds::SNIPPET_LINE_TRUNCATED_MARKER),
+            "{text}"
+        );
+        assert!(
+            text.chars().count()
+                <= snippet_bounds::SNIPPET_LINE_MAX_CHARS
+                    + snippet_bounds::SNIPPET_LINE_TRUNCATED_MARKER
+                        .chars()
+                        .count(),
+            "{} chars",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn rendered_snippet_lines_are_capped_at_the_grep_line_limit() {
+        let results = vec![long_line_result(0, "x".repeat(100_000))];
+
+        let text = format_semantic_text(&results, Path::new("/project"), false, false, None);
+
+        assert!(text.len() < 1_000, "{} bytes", text.len());
+        assert!(text.contains(&format!(
+            "{}{}",
+            "x".repeat(snippet_bounds::SNIPPET_LINE_MAX_CHARS),
+            snippet_bounds::SNIPPET_LINE_TRUNCATED_MARKER
+        )));
+    }
+
+    #[test]
+    fn result_text_stops_at_the_byte_budget_and_says_how_to_narrow() {
+        let results = (0..20)
+            .map(|index| long_line_result(index, format!("line of result {index:03}")))
+            .collect::<Vec<_>>();
+
+        let text = format_result_sections_within_budget(&results, Path::new("/project"), None, 200);
+
+        assert!(
+            text.contains("data/census_000.json:1 [lexical match]"),
+            "{text}"
+        );
+        assert!(!text.contains("census_019"), "{text}");
+        let (sections, trailer) = text
+            .split_once("\n\n(Output reached the 200-byte limit after ")
+            .expect("cut trailer");
+        assert!(sections.len() <= 200, "{} bytes", sections.len());
+        assert!(trailer.contains(" of 20 results"), "{trailer}");
+        assert!(
+            trailer.contains("Narrow the query or lower topK"),
+            "{trailer}"
+        );
+
+        let uncut =
+            format_result_sections_within_budget(&results, Path::new("/project"), None, usize::MAX);
+        assert!(uncut.contains("census_019"));
+        assert!(!uncut.contains("Output reached"));
     }
 
     #[test]

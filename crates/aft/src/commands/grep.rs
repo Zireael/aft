@@ -17,13 +17,13 @@ const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
 /// Longest matching line, in characters, the grep tool prints before cutting
 /// it and appending `GREP_LINE_TRUNCATED_MARKER`.
-const GREP_MAX_LINE_CHARS: usize = 500;
+pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
 /// Byte budget for the match rows of one grep reply (file headers included).
 /// Rows past the budget are left for the next page instead of being printed.
-const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
-const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
+pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 /// Text note for a grep or glob whose search path holds no searchable file.
 pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No searchable files exist under the searched path, so nothing was searched.)";
@@ -488,7 +488,7 @@ pub(crate) fn grep_next_offset(
 
 /// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
 /// Returns the printable text and whether it was cut.
-fn truncate_grep_line(text: &str) -> (String, bool) {
+pub(crate) fn truncate_grep_line(text: &str) -> (String, bool) {
     match text.char_indices().nth(GREP_MAX_LINE_CHARS) {
         None => (text.to_string(), false),
         Some((byte_index, _)) => (
