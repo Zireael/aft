@@ -51,6 +51,39 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/examples/malloc_soak.rs",
+      "line": 201,
+      "column": 103,
+      "token": "filePath",
+      "text": "request(&mut stream, n as u16 + 1, &mut corr, json!({\"name\":\"write\",\"arguments\":{\"filePath\":\"malloc_soak_probe.rs\",\"content\":format!(\"pub fn scaling_{edited}() -> usize {{ {edited} }}\\n\")}}), &out).await;",
+      "location": "line 201, column 103",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/examples/malloc_soak.rs",
+      "line": 210,
+      "column": 103,
+      "token": "filePath",
+      "text": "request(&mut stream, n as u16 + 1, &mut corr, json!({\"name\":\"write\",\"arguments\":{\"filePath\":\"malloc_soak_probe.rs\",\"content\":format!(\"pub fn repeated_{revision}() -> usize {{ {revision} }}\\n\")}}), &out).await;",
+      "location": "line 210, column 103",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/examples/malloc_soak.rs",
+      "line": 243,
+      "column": 99,
+      "token": "filePath",
+      "text": "request(&mut stream, n as u16 + 1, &mut corr, json!({\"name\":\"write\",\"arguments\":{\"filePath\":\"malloc_soak_probe.rs\",\"content\":format!(\"/// Allocation experiment revision {round}.\\npub fn malloc_soak_probe_{round}() -> usize {{ {round} }}\\n\")}}), &out).await;",
+      "location": "line 243, column 99",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "crates/aft/src/commands/apply_patch.rs",
       "line": 887,
       "column": 18,
@@ -448,11 +481,22 @@
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "line": 903,
+      "line": 926,
       "column": 23,
       "token": "filePath",
       "text": "&json!({ \"filePath\": \"a\" })",
-      "location": "line 903, column 23",
+      "location": "line 926, column 23",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/mod.rs",
+      "line": 12372,
+      "column": 26,
+      "token": "filePath",
+      "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
+      "location": "line 12372, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
