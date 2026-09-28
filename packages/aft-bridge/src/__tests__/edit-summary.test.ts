@@ -21,17 +21,23 @@ describe("formatEditSummary", () => {
   });
 
   test("names fuzzy tier and actual non-whitespace replacement text", () => {
-    expect(formatEditSummary({
-      replacements: 2,
-      fuzzy_match: { pass: 3, replaced_text: ["| old | b |", "| old | b |"] },
-    })).toContain("Fuzzy match (pass 3).\nReplaced text 1: | old | b |\nReplaced text 2: | old | b |");
+    expect(
+      formatEditSummary({
+        replacements: 2,
+        fuzzy_match: { pass: 3, replaced_text: ["| old | b |", "| old | b |"] },
+      }),
+    ).toContain(
+      "Fuzzy match (pass 3).\nReplaced text 1: | old | b |\nReplaced text 2: | old | b |",
+    );
   });
 
   test("reports fuzzy batch occurrences without repeating unchanged whitespace", () => {
-    const summary = formatEditSummary({ fuzzy_matches: [
-      { pass: 5, replaced_text: [] },
-      { pass: 4, replaced_text: ["old punctuation"] },
-    ] });
+    const summary = formatEditSummary({
+      fuzzy_matches: [
+        { pass: 5, replaced_text: [] },
+        { pass: 4, replaced_text: ["old punctuation"] },
+      ],
+    });
     expect(summary).toContain("Fuzzy match (pass 5).");
     expect(summary).toContain("Replaced text 1: old punctuation");
   });
