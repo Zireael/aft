@@ -3055,17 +3055,25 @@ fn run_subc_mode_inner(
     ) {
         flush_actor_indexes_on_graceful_shutdown(&actor_contexts);
     }
-    log::info!("subc exit phase=index_flush_done elapsed_ms={}", exit_started.elapsed().as_millis());
+    log::info!(
+        "subc exit phase=index_flush_done elapsed_ms={}",
+        exit_started.elapsed().as_millis()
+    );
     let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
         clients.extend(actor_ctx.lsp().take_all_clients());
         actor_ctx.bash_background().detach();
     }
-    let registry = actor_contexts.first().map(|ctx| ctx.app().lsp_child_registry());
+    let registry = actor_contexts
+        .first()
+        .map(|ctx| ctx.app().lsp_child_registry());
     if let Some(registry) = registry {
         crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
     }
-    log::info!("subc exit phase=lsp_done elapsed_ms={}", exit_started.elapsed().as_millis());
+    log::info!(
+        "subc exit phase=lsp_done elapsed_ms={}",
+        exit_started.elapsed().as_millis()
+    );
 
     match loop_result {
         Ok(exit) => module_loop_exit_result(exit),

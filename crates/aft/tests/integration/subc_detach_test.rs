@@ -438,7 +438,9 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        let projects = (0..6).map(|_| tempfile::tempdir().unwrap()).collect::<Vec<_>>();
+        let projects = (0..6)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
         let storage = tempfile::tempdir().unwrap();
         let conn_dir = tempfile::tempdir().unwrap();
         let config_home = tempfile::tempdir().unwrap();
@@ -458,37 +460,70 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
             });
         let bin_dir = tempfile::tempdir().unwrap();
         let wrapper = bin_dir.path().join("rust-analyzer");
-        std::fs::write(&wrapper, format!(
-            "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
-            pids.path().display(), fake.display()
-        )).unwrap();
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
+                pids.path().display(),
+                fake.display()
+            ),
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(config_dir.join("aft.jsonc"), serde_json::to_vec(&json!({
-            "storage_dir": storage.path(), "search_index": false, "semantic_search": false,
-            "callgraph_store": false
-        })).unwrap()).unwrap();
+        std::fs::write(
+            config_dir.join("aft.jsonc"),
+            serde_json::to_vec(&json!({
+                "storage_dir": storage.path(), "search_index": false, "semantic_search": false,
+                "callgraph_store": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
         let mut module = ModuleProcess::spawn_with_stderr_and_path(
-            &conn_path, config_home.path(), data_home.path(), Some(&stderr_path), Some(bin_dir.path())
+            &conn_path,
+            config_home.path(),
+            data_home.path(),
+            Some(&stderr_path),
+            Some(bin_dir.path()),
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
-            std::fs::write(project.path().join("Cargo.toml"), "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+            std::fs::write(
+                project.path().join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
             std::fs::create_dir_all(project.path().join("src")).unwrap();
             let source = project.path().join("src/main.rs");
             std::fs::write(&source, "source").unwrap();
             bind_route_as(&mut stream, project.path(), (index + 1) as u16, "opencode").await;
             let corr = 100 + index as u64;
-            send_tool_call(&mut stream, (index + 1) as u16, corr, "inspect", json!({"scope": source})).await;
+            send_tool_call(
+                &mut stream,
+                (index + 1) as u16,
+                corr,
+                "inspect",
+                json!({"scope": source}),
+            )
+            .await;
             let result = read_frame_timeout(&mut stream, "spawn fake LSP").await;
             assert_eq!(result.header.channel, (index + 1) as u16);
             assert_eq!(result.header.corr, corr);
             assert!(!tool_result_is_error(&result), "{}", frame_body(&result));
         }
-        let children = std::fs::read_dir(pids.path()).unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().parse::<u32>().unwrap())
+        let children = std::fs::read_dir(pids.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         assert_eq!(children.len(), 6, "six roots must each own a live server");
         send_module_draining(&mut stream).await;
@@ -496,14 +531,29 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
         send_connection_goodbye(&mut stream).await;
         let exit = module.wait_for_exit("drained module with live LSP servers");
         let elapsed = drained.elapsed();
-        eprintln!("drain completion to process exit: {} ms", elapsed.as_millis());
+        eprintln!(
+            "drain completion to process exit: {} ms",
+            elapsed.as_millis()
+        );
         let log = std::fs::read_to_string(&stderr_path).unwrap();
         assert!(exit.success(), "{exit}; {}", log_tail(&log));
-        assert!(elapsed < Duration::from_secs(2), "exit took {elapsed:?}; {}", log_tail(&log));
-        assert_eq!(log.matches("lsp shutdown_all: servers=6 graceful=0 killed=6").count(), 1,
-            "expected one shutdown summary; {}", log_tail(&log));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "exit took {elapsed:?}; {}",
+            log_tail(&log)
+        );
+        assert_eq!(
+            log.matches("lsp shutdown_all: servers=6 graceful=0 killed=6")
+                .count(),
+            1,
+            "expected one shutdown summary; {}",
+            log_tail(&log)
+        );
         for pid in children {
-            assert!(!aft::bash_background::process::is_process_alive(pid), "orphaned LSP pid {pid}");
+            assert!(
+                !aft::bash_background::process::is_process_alive(pid),
+                "orphaned LSP pid {pid}"
+            );
         }
     });
 }
@@ -604,7 +654,14 @@ impl ModuleProcess {
             .stdout(Stdio::null())
             .stderr(stderr);
         if let Some(bin_dir) = bin_dir {
-            command.env("PATH", format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default()));
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
         }
         unsafe {
             command.pre_exec(|| {

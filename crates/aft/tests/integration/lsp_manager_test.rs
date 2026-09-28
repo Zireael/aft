@@ -379,11 +379,17 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6);
-    let clients = managers.iter_mut().flat_map(LspManager::take_all_clients).collect();
+    let clients = managers
+        .iter_mut()
+        .flat_map(LspManager::take_all_clients)
+        .collect();
     let started = Instant::now();
     let outcome = LspManager::shutdown_taken_clients(clients, registry.clone());
     let elapsed = started.elapsed();
-    eprintln!("drain complete to process cleanup: {} ms", elapsed.as_millis());
+    eprintln!(
+        "drain complete to process cleanup: {} ms",
+        elapsed.as_millis()
+    );
     assert!(elapsed < Duration::from_secs(2), "cleanup took {elapsed:?}");
     assert_eq!(outcome.graceful, 0);
     assert_eq!(outcome.forced, 6);
@@ -392,7 +398,10 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
         while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!aft::bash_background::process::is_process_alive(pid), "orphaned pid {pid}");
+        assert!(
+            !aft::bash_background::process::is_process_alive(pid),
+            "orphaned pid {pid}"
+        );
     }
     assert!(registry.pids().is_empty());
 }

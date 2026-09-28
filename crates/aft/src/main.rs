@@ -611,7 +611,9 @@ fn main() {
         let flushed = rx.recv_timeout(Duration::from_millis(300));
         aft::slog_info!(
             "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
-            flushed.is_ok(), flushed.unwrap_or(false), shutdown_started.elapsed().as_millis()
+            flushed.is_ok(),
+            flushed.unwrap_or(false),
+            shutdown_started.elapsed().as_millis()
         );
         let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
     }
