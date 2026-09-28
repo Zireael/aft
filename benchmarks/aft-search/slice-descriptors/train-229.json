@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-lsp-lock",
+    "bash-kill-restored",
+    "release-notes-0.58"
+  ],
+  "note": "LSP manager lock narrowed for inspect; bash_kill marker write; release notes. No ranking-fence file touched."
+}
