@@ -150,6 +150,11 @@ fn collect_warm_working_set(
             expected_producers.to_vec()
         };
         for server in &producers {
+            if let Some(reason) = lsp.producer_failure(server) {
+                collection
+                    .producer_failures
+                    .insert(server_id(server), reason.to_string());
+            }
             if !lsp.producer_has_settled(server) {
                 collection.servers_pending.insert(server_id(server));
             }

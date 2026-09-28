@@ -333,13 +333,19 @@ pub fn builtin_servers() -> Vec<ServerDef> {
             ],
             &["pyrightconfig.json", "pyproject.toml"],
         ),
-        builtin_server(
+        builtin_server_with_init(
             ServerKind::Rust,
             "rust-analyzer",
             &["rs"],
             "rust-analyzer",
             &[],
             &["Cargo.toml", "Cargo.lock"],
+            // Lock metadata resolution and build-script discovery/flycheck so a
+            // stale Cargo.lock fails analysis instead of being rewritten by Cargo.
+            serde_json::json!({ "cargo": {
+                "extraArgs": ["--locked"],
+                "metadataExtraArgs": ["--locked"]
+            } }),
         ),
         // gopls requires opt-in for `textDocument/diagnostic` (LSP 3.17 pull)
         // via the `pullDiagnostics` initializationOption. Without this the
