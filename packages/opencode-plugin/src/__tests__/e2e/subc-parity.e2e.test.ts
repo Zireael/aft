@@ -373,5 +373,7 @@ function normalizeRoot(text: string, root: string): string {
       // so it reflects timing and session history, not the transport. Status
       // bar rendering has its own tests.
       .replace(/\n*\[AFT [^\]\n]*\]\s*$/, "")
+      // Trailing blank lines went with the bar on one side and not the other.
+      .trimEnd()
   );
 }
