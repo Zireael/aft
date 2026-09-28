@@ -2549,6 +2549,19 @@ impl LspManager {
             .any(|client| client.state() == ServerState::Ready)
     }
 
+    /// Report the SDK selected when the server started; resolving it again
+    /// could describe a different installation than the running client uses.
+    pub fn runtime_notes(&self) -> Vec<String> {
+        let mut notes: Vec<_> = self
+            .clients
+            .values()
+            .filter_map(|client| client.runtime_note.clone())
+            .collect();
+        notes.sort();
+        notes.dedup();
+        notes
+    }
+
     /// Active server keys (running clients). Used by `lsp_diagnostics`
     /// directory mode to know which servers to ask for workspace pull.
     pub fn active_server_keys(&self) -> Vec<ServerKey> {
@@ -3126,9 +3139,36 @@ impl LspManager {
         source_file: &Path,
         config: &Config,
     ) -> Result<PreparedSpawn, LspError> {
-        let initialization_options =
-            initialization_options_for_spawn(def, source_file, root, config)?;
+        let mut resolution_config = config.clone();
+        if let Some(paths) = &self.pushed_search_paths {
+            resolution_config.lsp_paths_extra.clone_from(paths);
+        }
+        let mut initialization_options =
+            initialization_options_for_spawn(def, source_file, root, &resolution_config)?;
         let binary = self.resolve_binary(def, root, config)?;
+        let mut runtime_note = None;
+        // Explicit binary overrides may wrap their own SDK discovery.
+        if def.kind == ServerKind::TypeScript
+            && !self.binary_overrides.contains_key(&def.kind)
+            && env_binary_override(&def.kind).is_none()
+        {
+            let (options, note) = if def
+                .args
+                .iter()
+                .any(|arg| arg == "--tsserver-path" || arg.starts_with("--tsserver-path="))
+            {
+                (initialization_options.unwrap_or_else(|| serde_json::json!({})), "TypeScript: explicit --tsserver-path override (version managed by configuration)".into())
+            } else {
+                typescript_runtime_options(
+                    initialization_options,
+                    source_file,
+                    root,
+                    &resolution_config,
+                )?
+            };
+            initialization_options = Some(options);
+            runtime_note = Some(note);
+        }
 
         // Merge the server-defined env with our test-injected env.
         // `extra_env` is empty in production; tests use it to drive fake
@@ -3160,6 +3200,7 @@ impl LspManager {
             child_registry: self.child_registry.clone(),
             reclaim_root,
             initialization_options,
+            runtime_note,
         })
     }
 
@@ -3258,6 +3299,70 @@ impl Default for LspManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn typescript_runtime_options(
+    configured: Option<serde_json::Value>,
+    source_file: &Path,
+    server_root: &Path,
+    config: &Config,
+) -> Result<(serde_json::Value, String), LspError> {
+    let mut options = configured.unwrap_or_else(|| serde_json::json!({}));
+    if options
+        .pointer("/tsserver/path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|p| !p.is_empty())
+    {
+        return Ok((
+            options,
+            "TypeScript: explicit tsserver.path override (version managed by configuration)".into(),
+        ));
+    }
+    let boundary = config
+        .project_root
+        .as_deref()
+        .filter(|p| source_file.starts_with(p))
+        .unwrap_or(server_root);
+    let local = find_project_typescript_sdk(source_file, boundary)
+        .filter(|lib| lib.join("tsserver.js").is_file());
+    let (lib, fallback) = if let Some(lib) = local {
+        (lib, false)
+    } else {
+        let lib = config.lsp_paths_extra.iter().filter_map(|bin| bin.parent())
+            .map(|modules| modules.join("typescript/lib"))
+            .find(|lib| lib.join("tsserver.js").is_file())
+            .ok_or_else(|| LspError::ServerNotReady(
+                "TypeScript SDK unavailable: typescript is not installed in this worktree and no AFT cached SDK is available; run bun install or enable LSP auto-install (AFT never installs into the worktree)".into()
+            ))?;
+        (lib, true)
+    };
+    let version = std::fs::read(lib.parent().unwrap().join("package.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|json| {
+            json.get("version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let path = lib.join("tsserver.js");
+    merge_json_override(
+        &mut options,
+        serde_json::json!({"tsserver": {"path": path}}),
+    );
+    let source = if fallback {
+        "AFT cache fallback; not the project's pinned TypeScript"
+    } else {
+        "project installation"
+    };
+    Ok((
+        options,
+        format!("TypeScript {version}: {source} ({})", path.display()),
+    ))
+}
+
+fn biome_unavailable_reason(reason: &str) -> String {
+    format!("Biome unavailable: {reason}. Check the project's Biome version and configuration; if biome is not installed in this worktree, run bun install (AFT does not install into the worktree).")
 }
 
 const ASTRO_TSDK_UNAVAILABLE: &str = "astro-ls requires a project TypeScript install; none found";
@@ -3609,6 +3714,7 @@ struct PreparedSpawn {
     child_registry: LspChildRegistry,
     reclaim_root: PathBuf,
     initialization_options: Option<serde_json::Value>,
+    runtime_note: Option<String>,
 }
 
 /// Why a prepared spawn produced no client. The manager records the details
@@ -3655,6 +3761,7 @@ impl PreparedSpawn {
                 });
             }
         };
+        client.runtime_note = self.runtime_note;
         let initialize = match initialize_timeout {
             Some(timeout) => {
                 client.initialize_with_timeout(&self.root, self.initialization_options, timeout)
@@ -3676,6 +3783,11 @@ impl PreparedSpawn {
                 format_initialize_failure_reason(&self.binary_name, &report, &err)
             } else {
                 format!("server failed during initialize: {err}")
+            };
+            let reason = if self.kind == ServerKind::Biome {
+                biome_unavailable_reason(&reason)
+            } else {
+                reason
             };
             // Dropping the client here kills a still-running server.
             return Err(SpawnFailure::Initialize {
@@ -4740,5 +4852,103 @@ mod server_exit_reap_tests {
             !registry.pids().contains(&pid1) && !registry.pids().contains(&pid2),
             "reaped orphans must be untracked before the new spawn is tracked"
         );
+    }
+}
+
+#[cfg(test)]
+mod typescript_worktree_tests {
+    use super::*;
+
+    #[test]
+    fn biome_initialize_failure_preserves_cause_and_explains_worktree_remedy() {
+        let reason = biome_unavailable_reason("server closed stream during initialize");
+        assert!(reason.contains("Biome unavailable: server closed stream during initialize"));
+        assert!(reason.contains("biome is not installed in this worktree, run bun install"));
+    }
+
+    fn sdk(root: &Path, version: &str) -> PathBuf {
+        let lib = root.join("node_modules/typescript/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("typescript.js"), "").unwrap();
+        std::fs::write(lib.join("tsserver.js"), "").unwrap();
+        std::fs::write(
+            lib.parent().unwrap().join("package.json"),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .unwrap();
+        lib
+    }
+
+    #[test]
+    fn fresh_worktree_typescript_uses_cache_without_writing_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("fresh");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("index.ts");
+        std::fs::write(&file, "const x: number = 'wrong';").unwrap();
+        let cache = temp.path().join("cache");
+        let lib = sdk(&cache, "5.9.3");
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache.join("node_modules/.bin")],
+            ..Config::default()
+        };
+        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
+        assert_eq!(
+            options["tsserver"]["path"],
+            lib.join("tsserver.js").to_str().unwrap()
+        );
+        assert!(
+            note.contains(
+                "TypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript"
+            ),
+            "{note}"
+        );
+        assert_eq!(std::fs::read_dir(&project).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "const x: number = 'wrong';"
+        );
+    }
+
+    #[test]
+    fn project_typescript_precedes_cache_and_explicit_override_precedes_both() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let local = sdk(&project, "5.8.3");
+        let cache = temp.path().join("cache");
+        sdk(&cache, "5.9.3");
+        let file = project.join("index.ts");
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache.join("node_modules/.bin")],
+            ..Config::default()
+        };
+        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
+        assert_eq!(
+            options["tsserver"]["path"],
+            local.join("tsserver.js").to_str().unwrap()
+        );
+        assert!(note.contains("5.8.3: project installation"));
+        let configured = serde_json::json!({"tsserver":{"path":"/custom/tsserver.js"},"preferences":{"quotePreference":"single"}});
+        let (options, _) =
+            typescript_runtime_options(Some(configured.clone()), &file, &project, &config).unwrap();
+        assert_eq!(options, configured);
+    }
+
+    #[test]
+    fn missing_typescript_sdk_has_actionable_reason_without_writing_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let error =
+            typescript_runtime_options(None, &temp.path().join("index.ts"), temp.path(), &config)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("TypeScript SDK unavailable"), "{error}");
+        assert!(error.contains("run bun install"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

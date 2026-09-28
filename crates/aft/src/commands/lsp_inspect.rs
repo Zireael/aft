@@ -124,6 +124,7 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>(),
             "matching_servers": matching_servers,
+            "lsp_runtime_notes": ctx.lsp().runtime_notes(),
             "pull_results": pull_results_json,
             "diagnostics_complete": diagnostics_gaps.is_empty(),
             "diagnostics_gaps": diagnostics_gaps,

@@ -123,6 +123,17 @@ describe("runAutoInstall", () => {
     expect(result.cachedBinDirs[0]).toContain("typescript-language-server");
   });
 
+  test("surfaces the separately cached TypeScript SDK for fresh worktrees", async () => {
+    fakeInstalled("typescript", "tsserver");
+    const result = await runAutoInstall(
+      tempProject,
+      defaultConfig({ autoInstall: false }),
+      fakeFetch(),
+    );
+    expect(result.cachedBinDirs).toHaveLength(1);
+    expect(result.cachedBinDirs[0]).toContain("typescript");
+  });
+
   test("disabled config blocks discovery for that server", async () => {
     // Make project relevant to TypeScript by creating a package.json.
     writeFileSync(join(tempProject, "package.json"), "{}");

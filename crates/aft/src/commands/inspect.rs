@@ -643,7 +643,18 @@ fn handle_inspect_payload(
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
     };
 
-    let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
+    let mut payload =
+        build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
+    let runtime_notes = ctx.lsp().runtime_notes();
+    if !runtime_notes.is_empty() {
+        if let Some(text) = payload.get_mut("text") {
+            if let Some(existing) = text.as_str() {
+                *text =
+                    serde_json::Value::String(format!("{existing}\n{}", runtime_notes.join("\n")));
+            }
+        }
+        payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
+    }
     Response::success(&req.id, payload)
 }
 

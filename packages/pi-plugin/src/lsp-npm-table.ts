@@ -47,6 +47,15 @@ export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
     extensions: ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],
     rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
   },
+  // The language server does not bundle its TypeScript SDK. Keep a separate
+  // cache install so dependency-free worktrees can use an explicit fallback.
+  {
+    id: "typescript",
+    npm: "typescript",
+    binary: "tsserver",
+    extensions: ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],
+    rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
+  },
   {
     id: "python",
     npm: "pyright",

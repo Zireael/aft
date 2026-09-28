@@ -336,6 +336,7 @@ pub struct ServerDiagnosticCapabilities {
 
 /// A client connected to one language server process.
 pub struct LspClient {
+    pub(crate) runtime_note: Option<String>,
     kind: ServerKind,
     root: PathBuf,
     state: ServerState,
@@ -628,6 +629,7 @@ impl LspClient {
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         child_registry.mark_client_live(child_pid);
         Ok(Self {
+            runtime_note: None,
             kind,
             root,
             state: ServerState::Starting,
