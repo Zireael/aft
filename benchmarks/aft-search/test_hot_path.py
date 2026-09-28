@@ -27,6 +27,32 @@ class HotPathHarnessTests(unittest.TestCase):
                 self.assertEqual((snapshot / "source.rs").read_text(), "fn original() {}\n")
                 self.assertFalse((snapshot / ".git").exists())
 
+    def test_only_known_volatile_suffixes_are_removed(self):
+        from compare_hot_path import without_volatile_footers
+        rows = "a.rs\nb.rs\n\nshown 2 of 2 results"
+        footer = "\n\n[AFT E? W? | ~D? U2874 C? | T?]"
+        reminder = "\n\n<system-reminder>\nThis is the 3rd identical call (same command, same output) in 90s. This call is not returning anything new.\n</system-reminder>"
+        self.assertEqual(without_volatile_footers(rows + reminder + footer), rows)
+        self.assertEqual(without_volatile_footers(rows + "\n\n<system-reminder>\nother warning\n</system-reminder>"), rows + "\n\n<system-reminder>\nother warning\n</system-reminder>")
+        self.assertEqual(without_volatile_footers(rows + "\n"), rows + "\n")
+        self.assertEqual(without_volatile_footers(footer + "\nsource continues"), footer + "\nsource continues")
+
+    def test_count_comparison_rejects_changed_lane_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before, after, output = (root / name for name in ("before.log", "after.log", "result.json"))
+            row = {"case": "lexical/query", "ranked_blake3": "before", "allocations": 10}
+            before.write_text("HOT_PATH " + json.dumps(row) + "\n")
+            after.write_text(before.read_text())
+            command = [sys.executable, str(HERE / "compare_hot_path_counts.py"), str(before), str(after), "--out", str(output)]
+            same = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(same.returncode, 0, same.stderr)
+            row["ranked_blake3"] = "changed"
+            after.write_text("HOT_PATH " + json.dumps(row) + "\n")
+            changed = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(changed.returncode, 0)
+            self.assertIn("ranked lane bytes changed", changed.stderr)
+
     def test_comparison_rejects_changed_rendered_row(self):
         report = {"complete": True, "rows": [{
             "corpus": "fixture", "revision": "abc", "query": "query", "repeat": 0,

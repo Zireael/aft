@@ -7,23 +7,36 @@ latencies. Work counts are the primary evidence.
 ```bash
 CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo build -p agent-file-tools --bin aft -j 2
 python3 benchmarks/aft-search/run_hot_path.py --binary target/debug/aft \
-  --corpus "$PWD" --corpus "$HOME/Work/OSS/opencode" \
+  --corpus "$PWD" \
+  --revision 840f9a0d3e28699bc5a4b37d49464cd7c86e833d \
   --out benchmarks/aft-search/.bench/hot-path-before.json
-bash benchmarks/aft-search/run_hot_path_counts.sh "$PWD"
-bash benchmarks/aft-search/run_hot_path_counts.sh "$HOME/Work/OSS/opencode"
+python3 benchmarks/aft-search/run_hot_path.py --binary target/debug/aft \
+  --corpus "$HOME/Work/OSS/opencode" --revision 5716f8ba60e79ec60ec485b6e5291c0b0bc1f252 \
+  --out benchmarks/aft-search/.bench/hot-path-opencode-before.json
+bash benchmarks/aft-search/run_hot_path_counts.sh "$PWD" --revision 840f9a0d3
+bash benchmarks/aft-search/run_hot_path_counts.sh "$HOME/Work/OSS/opencode" --revision 5716f8ba60e79ec60ec485b6e5291c0b0bc1f252
 ```
 
-The Python runner starts a standalone AFT for each real corpus with a fresh
-`TemporaryDirectory` storage root. It runs fixed natural-language, code literal,
-common-plus-rare-token and anchored queries, recording each complete response
-and per-request elapsed time. `--semantic` enables the installed embedding
+The Python runner snapshots each real corpus into a temporary, non-worktree
+root and starts standalone AFT with a separate fresh `TemporaryDirectory`
+storage root. This matters: AFT worktrees borrow read-only artifacts, so an
+isolated empty storage directory cannot supply their base index. Git-root
+corpora use `git archive --revision`; other directories are copied. Use a pinned
+revision across before/after runs, and run the two corpora separately when their
+revision IDs differ. It runs fixed natural-language, quoted code-literal,
+identifier, common-plus-rare-token, regex and log-excerpt queries, recording each
+complete response, actual lane plan and per-request elapsed time. Literal and
+log-excerpt cases assert their routed shapes; the latter exercises anchoring.
+`--case` selects a subset without changing a query. `--semantic` enables the installed embedding
 backend; without it the standalone run measures lexical/exact/anchored paths.
 First requests and subsequent memo hits are separate rows, not pooled averages.
 
 The Rust runner indexes real files of at most 1 MiB using the ignore-aware
 walker, then measures the lexical, exact and anchored lanes independently.
 `HOT_PATH` JSON lines report allocations, posting materializations, source read
-attempts, regex compilations, score evaluations and sort input sizes. Counters
+attempts, retained-literal regex compilations, score evaluations and sort input
+sizes. The regex counter excludes the single query-splitting matcher and lazy
+identifier tokenization matchers. Counters
 are test-only; ordinary builds have no added counter calls. Posting counts are
 materializations, not physical device reads. Sort input counts include all
 instrumented lexical rank sorts plus final canonical sorting. Read counters
@@ -34,12 +47,14 @@ controlled 200-file, 40-functions-per-file semantic corpus with 384-dimensional
 deterministic vectors. Those vectors are **not** a ranking-quality substitute.
 The semantic test measures search, refreshes of 1 and 100 files (unchanged text,
 so embedding reuse is exercised), then borrowed-base filtering. Process-wide
-allocation counting includes Rayon workers; run with `--test-threads=1` and do
+allocation counting includes Rayon workers and reports cumulative requested
+bytes, not peak/live heap. Run with `--test-threads=1` and do
 not mix these ignored tests with unrelated work in the same test process.
 
 The independent ranking gates must use the actual dev binary:
 
 ```bash
+export AFT_SEARCH_BENCH_RPC_TIMEOUT=600
 AFT_BINARY_PATH="$PWD/target/debug/aft" scripts/telemetry/cost-gate.sh \
   --search-quality --mode record-reference --dry-run
 python3 benchmarks/aft-search/run_exact_recall.py --binary "$PWD/target/debug/aft" \
@@ -47,6 +62,11 @@ python3 benchmarks/aft-search/run_exact_recall.py --binary "$PWD/target/debug/af
 AFT_BINARY_PATH="$PWD/target/debug/aft" python3 benchmarks/aft-search/run_concept_recall.py \
   --output benchmarks/aft-search/.bench/hot-path-concept.json
 ```
+
+`AFT_SEARCH_BENCH_RPC_TIMEOUT` is an opt-in transport wait floor for the benchmark
+clients. It does not change any engine query budget, shape, score or row. The
+existing 30-second status/60-second query waits expired on the dev baseline
+under host load above 190; they are not appropriate latency assertions here.
 
 Read the benchmark README's macOS FSEvents warning before interpreting semantic
 row differences. A changing row is not permission to update the baseline.
@@ -83,3 +103,33 @@ row differences. A changing row is not permission to update the baseline.
 - PERF-16: admission is based on **successful** collection, not merely requested
   paths. Failed changes free capacity for new files. An early cap based on
   requested counts would change which files are admitted.
+
+## Comparing runs and reading results
+
+`HOT_PATH_MEASURED.md` is the final counts/latency table; the preliminary source
+checks and first measurements are retained separately in `HOT_PATH_RESULTS.md`.
+The machine-readable counts, recall rows, standalone parity and mutation
+controls live in `hot-path-*.json`.
+
+```bash
+python3 benchmarks/aft-search/compare_hot_path.py before.json after.json
+python3 benchmarks/aft-search/compare_hot_path_counts.py before.log after.log --out counts.json
+```
+
+The standalone comparator removes only known terminal health/repetition
+footers. It preserves all result rows, ranking, snippets, evidence labels,
+counts, partial-result warnings and continuation messages. It reports every
+case that differs and fails if any differ. The supplemental regex case is a
+known baseline-unstable budgeted fallback on AFT; its actual before-versus-before
+row diff is recorded in `HOT_PATH_FALLBACK_INSTABILITY.md`, not suppressed by
+the comparator. The task owner authorized treating this proven pre-existing
+fallback instability separately, while requiring the requested ranked lanes,
+exact/concept recall and search-quality gate to remain unchanged.
+
+The work-count comparator normalizes only temporary corpus-root prefixes before
+hashing lane results. The measurement tests assert nonempty corpora and an
+8000-chunk semantic fixture, so skipped indexing cannot look like free work.
+The eight old-code counting controls each failed by name; four independent
+result-parity controls remained green. Both comparison guards were separately
+neutralized and their dedicated tests failed while unrelated tests passed.
+Full evidence and staged-restore diff pairs: `hot-path-mutations.json`.
