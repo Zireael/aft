@@ -1516,15 +1516,26 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private onStderrData(data: string): void {
-    this.stderrBuffer += data;
-    let newlineIdx: number;
-    while ((newlineIdx = this.stderrBuffer.indexOf("\n")) !== -1) {
-      const line = this.stderrBuffer.slice(0, newlineIdx).replace(/\r$/, "");
-      this.stderrBuffer = this.stderrBuffer.slice(newlineIdx + 1);
-      if (!line || !shouldSurfaceStderrLine(line)) continue;
-      const tagged = tagStderrLine(line);
-      this.logVia(tagged);
-      this.pushStderrLine(tagged);
+    // Search each incoming segment once; never concatenate an unbounded partial record.
+    const partialLimit = 64 * 1024;
+    let offset = 0;
+    while (offset < data.length) {
+      const newline = data.indexOf("\n", offset);
+      const end = newline < 0 ? data.length : newline;
+      while (offset < end) {
+        const count = Math.min(partialLimit - this.stderrBuffer.length, end - offset);
+        this.stderrBuffer += data.slice(offset, offset + count);
+        offset += count;
+        if (this.stderrBuffer.length === partialLimit) {
+          const tagged = tagStderrLine(`${this.stderrBuffer} [stderr record truncated into bounded fragments; ${Buffer.byteLength(this.stderrBuffer)} bytes shown, continuation follows]`);
+          this.stderrBuffer = "";
+          this.logVia(tagged);
+          this.pushStderrLine(tagged);
+        }
+      }
+      if (newline < 0) break;
+      this.flushStderrBuffer();
+      offset = newline + 1;
     }
   }
 

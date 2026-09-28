@@ -36,6 +36,10 @@ export class RotatingLogSink {
   private queue: Promise<void> = Promise.resolve();
   private disabled = false;
   private failureReported = false;
+  private queuedBytes = 0;
+  private queuedRecords = 0;
+  private droppedBytes = 0;
+  private overflowQueued = false;
 
   constructor(path: string, options: RotatingLogOptions = {}) {
     this.path = path;
@@ -45,8 +49,33 @@ export class RotatingLogSink {
 
   append(data: string): void {
     if (this.disabled || data.length === 0) return;
+    const bytes = Buffer.byteLength(data);
+    const overflow = this.queuedBytes + bytes > 1024 * 1024 || this.queuedRecords >= 4096;
+    if (overflow) {
+      this.droppedBytes += bytes;
+      if (this.overflowQueued) return;
+      this.overflowQueued = true;
+      data = "";
+    } else {
+      this.queuedBytes += bytes;
+      this.queuedRecords += 1;
+    }
     this.queue = this.queue
-      .then(() => this.write(data))
+      .then(async () => {
+        if (overflow) {
+          const dropped = this.droppedBytes;
+          this.droppedBytes = 0;
+          this.overflowQueued = false;
+          await this.write(`[aft-plugin] durable log queue overflow: dropped ${dropped} bytes (1MiB/4096-record pending limit); reduce diagnostic volume.\n`);
+        } else {
+          try {
+            await this.write(data);
+          } finally {
+            this.queuedBytes -= bytes;
+            this.queuedRecords -= 1;
+          }
+        }
+      })
       .catch((error: unknown) => {
         this.disabled = true;
         if (!this.failureReported) {
