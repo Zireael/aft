@@ -54,7 +54,7 @@ pub enum ServerState {
 }
 
 /// Events sent from background reader threads into the main loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LspEvent {
     /// Server sent a notification (e.g. publishDiagnostics).
     Notification {

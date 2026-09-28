@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
@@ -143,6 +144,23 @@ struct ApplicableServerCandidate {
     key: ServerKey,
     definition: ServerDef,
     source_file: PathBuf,
+}
+
+/// What an applicability walk found on disk, before any manager state (cached
+/// spawn failures, binary resolution) is consulted.
+///
+/// The walk reads the whole inspected area and can take seconds on a large
+/// tree or a slow filesystem, so it runs without the `LspManager` lock; only
+/// the short classification in [`LspManager::classify_applicable_servers`]
+/// needs the manager. Holding the lock across the walk stalled every other
+/// user of the manager, including the standalone request loop.
+#[derive(Clone, Debug)]
+pub struct ApplicabilityWalk {
+    /// The first walked file for each server key, in walk order.
+    candidates: Vec<ApplicableServerCandidate>,
+    /// First root marker seen per server kind, with the directory holding it
+    /// and the marker's file name.
+    markers: HashMap<ServerKind, (ServerDef, PathBuf, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +484,12 @@ pub struct LspManager {
     /// PID. Each waits for its reader's `ServerExited` event so the exit is
     /// logged exactly once, with full detail.
     pending_exit_reports: HashMap<u32, ServerExitReport>,
+    /// Servers being started by [`start_applicable_server_unlocked`] without
+    /// the manager lock, keyed by server.
+    starting: HashMap<ServerKey, StartReservation>,
+    /// Advanced whenever every client is taken away, so a start that was in
+    /// flight across it does not publish its client into the emptied manager.
+    clients_generation: u64,
 }
 
 /// How many server-exit log lines `LspManager` keeps for inspection.
@@ -503,6 +527,8 @@ impl LspManager {
             child_registry: LspChildRegistry::new(),
             recent_exit_log_lines: std::collections::VecDeque::new(),
             pending_exit_reports: HashMap::new(),
+            starting: HashMap::new(),
+            clients_generation: 0,
         }
     }
 
@@ -599,154 +625,60 @@ impl LspManager {
         project_root: &Path,
         config: &Config,
     ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
-        self.resolve_applicable_servers(project_root, None, config, None)
+        let walk = walk_applicable_area(project_root, None, config, None)?;
+        Ok(self.classify_applicable_servers(walk, config))
     }
 
-    /// Resolve inspect producers within the request deadline. A scoped inspect
-    /// considers only files inside the scope: a server is selected only when at
-    /// least one scoped file is one it handles, so a scope of `.rs` files never
-    /// starts TypeScript because some `.mjs` file lives elsewhere in the
-    /// project, and rust-analyzer starts only for the Cargo workspace that owns
-    /// the scoped Rust files, not for an unrelated nested workspace.
-    pub fn resolve_applicable_servers_for_inspect(
+    /// Turn a walk into the applicability snapshot: each walked server key is
+    /// either a candidate to start or a producer failure (a cached spawn
+    /// failure or a binary that does not resolve). Only this step reads
+    /// manager state, and it visits each server key once, so it is short
+    /// enough to run under the manager lock.
+    pub fn classify_applicable_servers(
         &self,
-        project_root: &Path,
-        scope_roots: Option<&[PathBuf]>,
+        walk: ApplicabilityWalk,
         config: &Config,
-        deadline: std::time::Instant,
-    ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
-        self.resolve_applicable_servers(project_root, scope_roots, config, Some(deadline))
-    }
-
-    /// Walk the resolved area and select the servers that have a file to analyze.
-    ///
-    /// Selection is by source files only: a server is a candidate when a walked
-    /// file has one of its extensions and a workspace root can be found for that
-    /// file. A root marker such as `package.json` never selects a server by
-    /// itself; a marker whose server ends up with no file is reported in
-    /// `not_applicable` instead. The walked area is the scope when one is given
-    /// (each scope root, file or directory) and the whole project otherwise.
-    fn resolve_applicable_servers(
-        &self,
-        project_root: &Path,
-        scope_roots: Option<&[PathBuf]>,
-        config: &Config,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
-        if !project_root.is_dir() {
-            return Err(ApplicabilityResolutionError::RootUnreadable {
-                root: project_root.to_path_buf(),
-                reason: "project root is not a directory".to_string(),
-            });
-        }
-
-        let walk_roots = match scope_roots.filter(|roots| !roots.is_empty()) {
-            Some(roots) => roots.to_vec(),
-            None => vec![project_root.to_path_buf()],
-        };
-
-        let mut candidates = HashMap::<ServerKey, ApplicableServerCandidate>::new();
-        let mut producer_failures = HashMap::<ServerKey, ApplicableServerFailure>::new();
-        // First root marker seen per server kind, with the directory holding it.
-        let mut markers = HashMap::<ServerKind, (ServerDef, PathBuf, String)>::new();
-        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-        let mut builder = ignore::WalkBuilder::new(&walk_roots[0]);
-        for root in &walk_roots[1..] {
-            builder.add(root);
-        }
-        let walker = builder
-            .same_file_system(true)
-            .standard_filters(true)
-            .add_custom_ignore_filename(".aftignore")
-            .filter_entry(|entry| {
-                !matches!(
-                    entry.file_name().to_string_lossy().as_ref(),
-                    ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
-                )
-            })
-            .build();
-
-        for entry in walker {
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err(ApplicabilityResolutionError::RequestDeadline {
-                    root: project_root.to_path_buf(),
+    ) -> ApplicableServerSnapshot {
+        let mut candidates = Vec::new();
+        let mut producer_failures = Vec::new();
+        for candidate in walk.candidates {
+            if let Some(result) = self.failed_spawns.get(&candidate.key) {
+                producer_failures.push(ApplicableServerFailure {
+                    server_key: candidate.key,
+                    result: result.clone(),
                 });
-            }
-            let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
-                root: project_root.to_path_buf(),
-                reason: error.to_string(),
-            })?;
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
                 continue;
             }
-            let file = entry.path();
-            for definition in servers_with_root_marker(file, config) {
-                if markers.contains_key(&definition.kind) {
-                    continue;
-                }
-                let marker_dir = file.parent().unwrap_or(project_root).to_path_buf();
-                let marker_name = file
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                markers.insert(
-                    definition.kind.clone(),
-                    (definition, marker_dir, marker_name),
-                );
-            }
-            for definition in servers_for_file(file, config) {
-                let Some(key) = server_key_for_definition(&definition, file, config) else {
-                    continue;
-                };
-                if candidates.contains_key(&key) || producer_failures.contains_key(&key) {
-                    continue;
-                }
-                if let Some(result) = self.failed_spawns.get(&key) {
-                    producer_failures.insert(
-                        key.clone(),
-                        ApplicableServerFailure {
-                            server_key: key,
-                            result: result.clone(),
-                        },
-                    );
-                    continue;
-                }
-                if self.resolve_binary(&definition, &key.root, config).is_err() {
-                    producer_failures.insert(
-                        key.clone(),
-                        ApplicableServerFailure {
-                            server_key: key,
-                            result: ServerAttemptResult::BinaryNotInstalled {
-                                binary: definition.binary.clone(),
-                            },
-                        },
-                    );
-                    continue;
-                }
-                candidates.insert(
-                    key.clone(),
-                    ApplicableServerCandidate {
-                        key,
-                        definition,
-                        source_file: file.to_path_buf(),
+            if self
+                .resolve_binary(&candidate.definition, &candidate.key.root, config)
+                .is_err()
+            {
+                producer_failures.push(ApplicableServerFailure {
+                    server_key: candidate.key,
+                    result: ServerAttemptResult::BinaryNotInstalled {
+                        binary: candidate.definition.binary.clone(),
                     },
-                );
+                });
+                continue;
             }
+            candidates.push(candidate);
         }
 
         let selected_kinds = candidates
-            .keys()
-            .chain(producer_failures.keys())
-            .map(|key| key.kind.clone())
+            .iter()
+            .map(|candidate| candidate.key.kind.clone())
+            .chain(
+                producer_failures
+                    .iter()
+                    .map(|failure| failure.server_key.kind.clone()),
+            )
             .collect::<HashSet<_>>();
         // Only a server that could actually have run is worth naming: one whose
         // binary resolves. Markers of servers the user does not have installed
         // (Astro and Prisma also use `package.json`) would otherwise add a
         // not-applicable line for tools nobody expects.
-        let mut not_applicable = markers
+        let mut not_applicable = walk
+            .markers
             .into_values()
             .filter(|(definition, _, _)| !selected_kinds.contains(&definition.kind))
             .filter(|(definition, marker_dir, _)| {
@@ -760,9 +692,7 @@ impl LspManager {
             .collect::<Vec<_>>();
         not_applicable.sort_by(|left, right| left.server_id.cmp(&right.server_id));
 
-        let mut candidates = candidates.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| server_key_sort(&left.key, &right.key));
-        let mut producer_failures = producer_failures.into_values().collect::<Vec<_>>();
         producer_failures
             .sort_by(|left, right| server_key_sort(&left.server_key, &right.server_key));
         let mut server_keys = candidates
@@ -775,12 +705,12 @@ impl LspManager {
             )
             .collect::<Vec<_>>();
         server_keys.sort_by(server_key_sort);
-        Ok(ApplicableServerSnapshot {
+        ApplicableServerSnapshot {
             server_keys,
             not_applicable,
             candidates,
             producer_failures,
-        })
+        }
     }
 
     /// Start exactly the servers selected by a prior applicability snapshot.
@@ -794,35 +724,6 @@ impl LspManager {
         config: &Config,
     ) -> ApplicableServerStartOutcomes {
         self.start_applicable_servers_inner(snapshot, config, None)
-    }
-
-    /// Start one inspect producer without extending the request's shared deadline.
-    /// Calling this per key lets the inspect phase log begin a phase only while
-    /// request budget remains to attempt that producer.
-    pub fn start_applicable_server_until(
-        &mut self,
-        snapshot: &ApplicableServerSnapshot,
-        server: &ServerKey,
-        config: &Config,
-        deadline: std::time::Instant,
-    ) -> ApplicableServerStartOutcomes {
-        let single = ApplicableServerSnapshot {
-            server_keys: vec![server.clone()],
-            not_applicable: Vec::new(),
-            candidates: snapshot
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.key == *server)
-                .cloned()
-                .collect(),
-            producer_failures: snapshot
-                .producer_failures
-                .iter()
-                .filter(|failure| failure.server_key == *server)
-                .cloned()
-                .collect(),
-        };
-        self.start_applicable_servers_inner(&single, config, Some(deadline))
     }
 
     fn start_applicable_servers_inner(
@@ -878,6 +779,145 @@ impl LspManager {
             }
         }
         outcomes
+    }
+
+    /// First step of [`start_applicable_server_unlocked`], under the lock.
+    /// Returns `None` once `outcomes` holds this server's result; otherwise
+    /// says whether to wait for another thread's start or spawn unlocked. A
+    /// start that follows a wait reports the other thread's cached failure
+    /// instead of retrying it.
+    fn begin_unlocked_start(
+        &mut self,
+        candidate: &ApplicableServerCandidate,
+        config: &Config,
+        after_wait: bool,
+        deadline: Instant,
+        outcomes: &mut ApplicableServerStartOutcomes,
+    ) -> Option<StartNext> {
+        let key = &candidate.key;
+        if self.clients.contains_key(key) {
+            outcomes.successful.push(key.clone());
+            return None;
+        }
+        if let Some(reservation) = self.starting.get(key) {
+            return Some(StartNext::Wait(Arc::clone(&reservation.signal)));
+        }
+        if after_wait {
+            if let Some(result) = self.failed_spawns.get(key) {
+                outcomes.failures.push(ApplicableServerFailure {
+                    server_key: key.clone(),
+                    result: result.clone(),
+                });
+                return None;
+            }
+        }
+        match self.prepare_spawn(
+            &candidate.definition,
+            &key.root,
+            &candidate.source_file,
+            config,
+        ) {
+            Ok(prepared) => {
+                self.starting.insert(
+                    key.clone(),
+                    StartReservation {
+                        deferred_events: Vec::new(),
+                        clients_generation: self.clients_generation,
+                        signal: Arc::new(StartSignal::default()),
+                    },
+                );
+                Some(StartNext::Spawn(prepared))
+            }
+            Err(error) => {
+                self.record_start_error(candidate, &error, deadline, outcomes);
+                None
+            }
+        }
+    }
+
+    /// Last step of [`start_applicable_server_unlocked`], under the lock:
+    /// publish the client or record the failure, then release the reservation.
+    fn finish_unlocked_start(
+        &mut self,
+        candidate: &ApplicableServerCandidate,
+        result: Result<LspClient, SpawnFailure>,
+        deadline: Instant,
+        outcomes: &mut ApplicableServerStartOutcomes,
+    ) {
+        let key = &candidate.key;
+        let started_generation = self
+            .starting
+            .get(key)
+            .map(|reservation| reservation.clients_generation);
+        match result {
+            // A start through another path (an edit's diagnostics, say) won
+            // the race; keep that client and let this one's drop stop its
+            // process.
+            Ok(_) if self.clients.contains_key(key) => outcomes.successful.push(key.clone()),
+            // Every client was taken away while this one was starting
+            // (shutdown, idle reap, unbind); do not revive the manager.
+            Ok(_) if started_generation != Some(self.clients_generation) => {
+                outcomes.failures.push(ApplicableServerFailure {
+                    server_key: key.clone(),
+                    result: ServerAttemptResult::SpawnFailed {
+                        binary: candidate.definition.binary.clone(),
+                        reason: "language servers were shut down while this one was starting"
+                            .to_string(),
+                    },
+                });
+            }
+            Ok(client) => {
+                self.clients.insert(key.clone(), client);
+                self.server_binaries
+                    .insert(key.clone(), candidate.definition.binary.clone());
+                self.documents.entry(key.clone()).or_default();
+                outcomes.successful.push(key.clone());
+            }
+            Err(failure) => {
+                let error = self.absorb_spawn_failure(failure);
+                if self.clients.contains_key(key) {
+                    outcomes.successful.push(key.clone());
+                } else {
+                    self.record_start_error(candidate, &error, deadline, outcomes);
+                }
+            }
+        }
+        self.release_start_reservation(key);
+    }
+
+    /// Drop a start reservation, handle the events held back for it, and wake
+    /// any start waiting on it.
+    fn release_start_reservation(&mut self, key: &ServerKey) {
+        let Some(reservation) = self.starting.remove(key) else {
+            return;
+        };
+        for event in &reservation.deferred_events {
+            self.handle_event(event);
+        }
+        reservation.signal.finish();
+    }
+
+    /// Report a start that produced no client, as the locked start path does:
+    /// a failure caused by the request deadline is not cached, any other one
+    /// is, so later file events skip the server.
+    fn record_start_error(
+        &mut self,
+        candidate: &ApplicableServerCandidate,
+        error: &LspError,
+        deadline: Instant,
+        outcomes: &mut ApplicableServerStartOutcomes,
+    ) {
+        if Instant::now() >= deadline {
+            outcomes.deadline_exceeded = Some(candidate.key.clone());
+            return;
+        }
+        let result = classify_spawn_error(&candidate.definition.binary, error);
+        self.failed_spawns
+            .insert(candidate.key.clone(), result.clone());
+        outcomes.failures.push(ApplicableServerFailure {
+            server_key: candidate.key.clone(),
+            result,
+        });
     }
 
     /// Ensure a server is running for the given file. Spawns if needed.
@@ -2398,6 +2438,7 @@ impl LspManager {
     /// manager lock is not held across a Shutdown handshake.
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
         let clients: Vec<_> = self.clients.drain().collect();
+        self.clients_generation = self.clients_generation.wrapping_add(1);
         self.server_binaries.clear();
         self.documents.clear();
         self.diagnostics = DiagnosticsStore::new();
@@ -2782,6 +2823,25 @@ impl LspManager {
     }
 
     fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
+        let (LspEvent::Notification {
+            server_kind, root, ..
+        }
+        | LspEvent::ServerRequest {
+            server_kind, root, ..
+        }
+        | LspEvent::ServerExited {
+            server_kind, root, ..
+        }) = event;
+        let event_key = ServerKey {
+            kind: server_kind.clone(),
+            root: root.clone(),
+        };
+        if !self.clients.contains_key(&event_key) {
+            if let Some(reservation) = self.starting.get_mut(&event_key) {
+                reservation.deferred_events.push(event.clone());
+                return None;
+            }
+        }
         let published_file = match event {
             LspEvent::Notification {
                 server_kind,
@@ -2957,6 +3017,11 @@ impl LspManager {
     }
 
     fn reap_unreferenced_children_for(&self, key: &ServerKey) {
+        // A server starting without the lock has a registered child but no
+        // client yet; it is not an orphan.
+        if self.starting.contains_key(key) {
+            return;
+        }
         let live_pids = self
             .clients
             .values()
@@ -2991,6 +3056,21 @@ impl LspManager {
         config: &Config,
         initialize_timeout: Option<std::time::Duration>,
     ) -> Result<LspClient, LspError> {
+        let prepared = self.prepare_spawn(def, root, source_file, config)?;
+        prepared
+            .run(initialize_timeout)
+            .map_err(|failure| self.absorb_spawn_failure(failure))
+    }
+
+    /// Gather everything a spawn needs from manager state, so the spawn and
+    /// its `initialize` handshake can run without the manager lock.
+    fn prepare_spawn(
+        &self,
+        def: &ServerDef,
+        root: &Path,
+        source_file: &Path,
+        config: &Config,
+    ) -> Result<PreparedSpawn, LspError> {
         let initialization_options =
             initialization_options_for_spawn(def, source_file, root, config)?;
         let binary = self.resolve_binary(def, root, config)?;
@@ -2998,9 +3078,9 @@ impl LspManager {
         // Merge the server-defined env with our test-injected env.
         // `extra_env` is empty in production; tests use it to drive fake
         // server variants (AFT_FAKE_LSP_PULL=1, etc.).
-        let mut merged_env = def.env.clone();
+        let mut env = def.env.clone();
         for (key, value) in &self.extra_env {
-            merged_env.insert(key.clone(), value.clone());
+            env.insert(key.clone(), value.clone());
         }
 
         // A server may use a nested language workspace, but the reclaim marker
@@ -3014,54 +3094,38 @@ impl LspManager {
             .filter(|project_root| root.starts_with(project_root))
             .unwrap_or_else(|| root.to_path_buf());
 
-        let mut client = match LspClient::spawn_with_reclaim_root(
-            def.kind.clone(),
-            root.to_path_buf(),
-            &binary,
-            &def.args,
-            &merged_env,
-            self.event_tx.clone(),
-            self.child_registry.clone(),
-            Some(&reclaim_root),
-        ) {
-            Ok(client) => client,
-            Err(err) => {
-                self.record_exit_log_line(format!(
-                    "exited {:?} {} (spawn failed): pid=none phase={} status=never started elapsed=0.0s error={:?}",
-                    def.kind,
-                    root.display(),
-                    ServerPhase::Spawn,
-                    err.to_string()
-                ));
-                return Err(err.into());
+        Ok(PreparedSpawn {
+            kind: def.kind.clone(),
+            binary_name: def.binary.clone(),
+            root: root.to_path_buf(),
+            binary,
+            args: def.args.clone(),
+            env,
+            event_tx: self.event_tx.clone(),
+            child_registry: self.child_registry.clone(),
+            reclaim_root,
+            initialization_options,
+        })
+    }
+
+    /// Record a failed spawn's exit details the way an inline spawn does, and
+    /// return the error to report.
+    fn absorb_spawn_failure(&mut self, failure: SpawnFailure) -> LspError {
+        match failure {
+            SpawnFailure::NotStarted {
+                error,
+                exit_log_line,
+            } => {
+                self.record_exit_log_line(exit_log_line);
+                error
             }
-        };
-        let initialize = match initialize_timeout {
-            Some(timeout) => client.initialize_with_timeout(root, initialization_options, timeout),
-            None => client.initialize(root, initialization_options),
-        };
-        if let Err(err) = initialize {
-            let phase = client.phase();
-            // A timeout means the server is alive but slow; anything else
-            // (broken pipe, closed stream) means it is exiting, so wait a
-            // moment for its real exit status.
-            let status = if matches!(err, LspError::Timeout(_)) {
-                client.child_exit_status()
-            } else {
-                client.wait_for_exit(INITIALIZE_EXIT_WAIT)
-            };
-            let report = client.exit_report(phase, status, status.is_none());
-            let reason = if status.is_some() || !report.stderr_tail.is_empty() {
-                format_initialize_failure_reason(&def.binary, &report, &err)
-            } else {
-                format!("server failed during initialize: {err}")
-            };
-            // Dropping the client below kills a still-running server, so the
-            // report is complete either way.
-            self.remember_exit_report(report);
-            return Err(LspError::ServerNotReady(reason));
+            SpawnFailure::Initialize { reason, report } => {
+                // Dropping the client in `PreparedSpawn::run` killed a
+                // still-running server, so the report is complete either way.
+                self.remember_exit_report(*report);
+                LspError::ServerNotReady(reason)
+            }
         }
-        Ok(client)
     }
 
     /// Keep a dead server's report until its reader's exit event is drained.
@@ -3476,6 +3540,369 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+/// Everything needed to spawn and initialize one language server, gathered
+/// from `LspManager` state so the slow part can run without the manager lock.
+struct PreparedSpawn {
+    kind: ServerKind,
+    /// The installable binary name, used in failure reasons.
+    binary_name: String,
+    root: PathBuf,
+    binary: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    event_tx: Sender<LspEvent>,
+    child_registry: LspChildRegistry,
+    reclaim_root: PathBuf,
+    initialization_options: Option<serde_json::Value>,
+}
+
+/// Why a prepared spawn produced no client. The manager records the details
+/// with [`LspManager::absorb_spawn_failure`] once it holds its lock again.
+enum SpawnFailure {
+    /// The process never started.
+    NotStarted {
+        error: LspError,
+        exit_log_line: String,
+    },
+    /// The process started but the `initialize` handshake failed.
+    Initialize {
+        reason: String,
+        report: Box<ServerExitReport>,
+    },
+}
+
+impl PreparedSpawn {
+    /// Start the process and run the `initialize` handshake. Touches no
+    /// manager state, so it runs without the manager lock.
+    fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
+        let mut client = match LspClient::spawn_with_reclaim_root(
+            self.kind.clone(),
+            self.root.clone(),
+            &self.binary,
+            &self.args,
+            &self.env,
+            self.event_tx,
+            self.child_registry,
+            Some(&self.reclaim_root),
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                let exit_log_line = format!(
+                    "exited {:?} {} (spawn failed): pid=none phase={} status=never started elapsed=0.0s error={:?}",
+                    self.kind,
+                    self.root.display(),
+                    ServerPhase::Spawn,
+                    err.to_string()
+                );
+                return Err(SpawnFailure::NotStarted {
+                    error: err.into(),
+                    exit_log_line,
+                });
+            }
+        };
+        let initialize = match initialize_timeout {
+            Some(timeout) => {
+                client.initialize_with_timeout(&self.root, self.initialization_options, timeout)
+            }
+            None => client.initialize(&self.root, self.initialization_options),
+        };
+        if let Err(err) = initialize {
+            let phase = client.phase();
+            // A timeout means the server is alive but slow; anything else
+            // (broken pipe, closed stream) means it is exiting, so wait a
+            // moment for its real exit status.
+            let status = if matches!(err, LspError::Timeout(_)) {
+                client.child_exit_status()
+            } else {
+                client.wait_for_exit(INITIALIZE_EXIT_WAIT)
+            };
+            let report = client.exit_report(phase, status, status.is_none());
+            let reason = if status.is_some() || !report.stderr_tail.is_empty() {
+                format_initialize_failure_reason(&self.binary_name, &report, &err)
+            } else {
+                format!("server failed during initialize: {err}")
+            };
+            // Dropping the client here kills a still-running server.
+            return Err(SpawnFailure::Initialize {
+                reason,
+                report: Box::new(report),
+            });
+        }
+        Ok(client)
+    }
+}
+
+/// Completion flag for a server start running without the manager lock. A
+/// second start of the same server waits on it instead of spawning a twin.
+#[derive(Default)]
+struct StartSignal {
+    finished: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl StartSignal {
+    fn finish(&self) {
+        *self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait for the start to finish. False when `deadline` passed first.
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if *finished {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            finished = self
+                .changed
+                .wait_timeout(finished, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// A server whose start is running without the manager lock.
+struct StartReservation {
+    /// Events from this server that arrived before its client was published.
+    /// Handling them earlier would find no client for the key, so a
+    /// rust-analyzer quiescence notice, for example, would be lost; they are
+    /// replayed once the start finishes.
+    deferred_events: Vec<LspEvent>,
+    /// `LspManager::clients_generation` when the start began.
+    clients_generation: u64,
+    signal: Arc<StartSignal>,
+}
+
+/// What an unlocked start does next, decided under the manager lock.
+enum StartNext {
+    /// Another thread is starting this server; wait for it, then look again.
+    Wait(Arc<StartSignal>),
+    /// This thread reserved the server and spawns it without the lock.
+    Spawn(PreparedSpawn),
+}
+
+/// Start one inspect producer without holding the manager lock across the
+/// spawn and the `initialize` handshake.
+///
+/// The handshake can take seconds (rust-analyzer on a large workspace), and
+/// while it held the lock every other manager user waited, including the
+/// standalone request loop, which drains LSP events and renders the status
+/// bar under that lock; a sibling `read` then waited for the handshake. The
+/// start reserves the server under the lock, spawns and initializes it
+/// unlocked, and publishes the client under the lock. A concurrent start of
+/// the same server waits for the reservation instead of spawning a second
+/// process. Outcomes match [`LspManager::start_applicable_servers`] for one
+/// server under a request deadline.
+pub fn start_applicable_server_unlocked(
+    manager: &parking_lot::Mutex<LspManager>,
+    snapshot: &ApplicableServerSnapshot,
+    server: &ServerKey,
+    config: &Config,
+    deadline: Instant,
+) -> ApplicableServerStartOutcomes {
+    let mut outcomes = ApplicableServerStartOutcomes {
+        failures: snapshot
+            .producer_failures
+            .iter()
+            .filter(|failure| failure.server_key == *server)
+            .cloned()
+            .collect(),
+        ..ApplicableServerStartOutcomes::default()
+    };
+    let Some(candidate) = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| candidate.key == *server)
+    else {
+        return outcomes;
+    };
+
+    let mut waited = false;
+    loop {
+        let initialize_timeout = deadline.saturating_duration_since(Instant::now());
+        if initialize_timeout.is_zero() {
+            outcomes.deadline_exceeded = Some(candidate.key.clone());
+            return outcomes;
+        }
+        let next =
+            manager
+                .lock()
+                .begin_unlocked_start(candidate, config, waited, deadline, &mut outcomes);
+        match next {
+            None => return outcomes,
+            Some(StartNext::Wait(signal)) => {
+                if !signal.wait_until(deadline) {
+                    outcomes.deadline_exceeded = Some(candidate.key.clone());
+                    return outcomes;
+                }
+                waited = true;
+            }
+            Some(StartNext::Spawn(prepared)) => {
+                let mut reservation = ReservationGuard {
+                    manager,
+                    key: Some(candidate.key.clone()),
+                };
+                let result = prepared.run(Some(initialize_timeout));
+                reservation.key = None;
+                manager
+                    .lock()
+                    .finish_unlocked_start(candidate, result, deadline, &mut outcomes);
+                return outcomes;
+            }
+        }
+    }
+}
+
+/// Releases a reservation whose start unwound before publishing, so waiters
+/// are not left blocked on a start that will never finish.
+struct ReservationGuard<'a> {
+    manager: &'a parking_lot::Mutex<LspManager>,
+    key: Option<ServerKey>,
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.manager.lock().release_start_reservation(&key);
+        }
+    }
+}
+
+/// Walk the inspected area and record, per server key, the first file a server
+/// could analyze, plus the first root marker seen per server kind.
+///
+/// Selection is by source files only: a server is a candidate when a walked
+/// file has one of its extensions and a workspace root can be found for that
+/// file. A root marker such as `package.json` never selects a server by
+/// itself; a marker whose server ends up with no file is reported in
+/// `not_applicable` instead. The walked area is the scope when one is given
+/// (each scope root, file or directory) and the whole project otherwise.
+///
+/// This reads no `LspManager` state, so callers run it without the manager
+/// lock (see [`ApplicabilityWalk`]).
+pub fn walk_applicable_area(
+    project_root: &Path,
+    scope_roots: Option<&[PathBuf]>,
+    config: &Config,
+    deadline: Option<std::time::Instant>,
+) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
+    if !project_root.is_dir() {
+        return Err(ApplicabilityResolutionError::RootUnreadable {
+            root: project_root.to_path_buf(),
+            reason: "project root is not a directory".to_string(),
+        });
+    }
+    delay_applicability_walk_for_test();
+
+    let walk_roots = match scope_roots.filter(|roots| !roots.is_empty()) {
+        Some(roots) => roots.to_vec(),
+        None => vec![project_root.to_path_buf()],
+    };
+
+    let mut seen = HashSet::<ServerKey>::new();
+    let mut candidates = Vec::new();
+    let mut markers = HashMap::<ServerKind, (ServerDef, PathBuf, String)>::new();
+    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
+    let mut builder = ignore::WalkBuilder::new(&walk_roots[0]);
+    for root in &walk_roots[1..] {
+        builder.add(root);
+    }
+    let walker = builder
+        .same_file_system(true)
+        .standard_filters(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_string_lossy().as_ref(),
+                ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+            )
+        })
+        .build();
+
+    for entry in walker {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(ApplicabilityResolutionError::RequestDeadline {
+                root: project_root.to_path_buf(),
+            });
+        }
+        let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
+            root: project_root.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let file = entry.path();
+        for definition in servers_with_root_marker(file, config) {
+            if markers.contains_key(&definition.kind) {
+                continue;
+            }
+            let marker_dir = file.parent().unwrap_or(project_root).to_path_buf();
+            let marker_name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            markers.insert(
+                definition.kind.clone(),
+                (definition, marker_dir, marker_name),
+            );
+        }
+        for definition in servers_for_file(file, config) {
+            let Some(key) = server_key_for_definition(&definition, file, config) else {
+                continue;
+            };
+            // Whether a key starts or fails depends only on the key and its
+            // definition, so the first file seen for it decides, as it did
+            // when the classification ran inside this loop.
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            candidates.push(ApplicableServerCandidate {
+                key,
+                definition,
+                source_file: file.to_path_buf(),
+            });
+        }
+    }
+
+    Ok(ApplicabilityWalk {
+        candidates,
+        markers,
+    })
+}
+
+/// Test hook: stretch the applicability walk so a test can prove the walk
+/// does not block other users of the language-server manager. Debug builds
+/// only. `AFT_TEST_APPLICABILITY_WALK_DELAY_MS` is the delay in milliseconds;
+/// when `AFT_TEST_APPLICABILITY_WALK_SIGNAL` names a file, it is written as the
+/// delay starts so the test knows the walk is under way.
+fn delay_applicability_walk_for_test() {
+    #[cfg(debug_assertions)]
+    if let Some(delay_ms) = std::env::var("AFT_TEST_APPLICABILITY_WALK_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        if let Some(signal) = std::env::var_os("AFT_TEST_APPLICABILITY_WALK_SIGNAL") {
+            let _ = std::fs::write(signal, b"walking");
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
 /// Classify an error returned by `spawn_server` into a structured
 /// `ServerAttemptResult`. The two interesting cases for callers are:
 /// - `BinaryNotInstalled` — the server's binary couldn't be resolved on PATH
@@ -3744,6 +4171,63 @@ mod diagnostic_capacity_tests {
             .notify_file_changed_if_running(&file, "export const value = 1;\n", &Config::default())
             .unwrap();
         assert!(manager.clients.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unlocked_start_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{LspManager, StartReservation, StartSignal};
+    use crate::lsp::client::{LspEvent, ServerExitReason};
+    use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
+
+    // A server started without the manager lock has no client until its
+    // handshake ends. Its events drained meanwhile must be kept, not handled
+    // against a missing client (a rust-analyzer quiescence notice handled
+    // then would be lost and the server would read as warming forever).
+    #[test]
+    fn events_for_a_starting_server_wait_for_its_start_to_finish() {
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: PathBuf::from("/held-start-root"),
+        };
+        let signal = Arc::new(StartSignal::default());
+        manager.starting.insert(
+            key.clone(),
+            StartReservation {
+                deferred_events: Vec::new(),
+                clients_generation: manager.clients_generation,
+                signal: Arc::clone(&signal),
+            },
+        );
+        manager.enqueue_event_for_test(LspEvent::ServerExited {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            pid: 4242,
+            reason: ServerExitReason::Eof,
+        });
+
+        manager.drain_events();
+        assert!(
+            manager.recent_server_exit_log_lines().is_empty(),
+            "an event for a starting server was handled before its start finished"
+        );
+        assert!(!signal.wait_until(Instant::now() + Duration::from_millis(10)));
+
+        manager.release_start_reservation(&key);
+        let lines = manager.recent_server_exit_log_lines();
+        assert_eq!(lines.len(), 1, "held event was not replayed: {lines:?}");
+        assert!(
+            lines[0].contains("pid=4242"),
+            "unexpected line: {}",
+            lines[0]
+        );
+        assert!(signal.wait_until(Instant::now()), "waiters were not woken");
     }
 }
 

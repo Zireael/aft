@@ -514,6 +514,213 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
     assert!(aft.shutdown().success());
 }
 
+/// How long the language-server work under test is stretched. Well past the
+/// 3 s read liveness bound, so a read queued behind it cannot pass by luck.
+const SLOW_LSP_WORK: Duration = Duration::from_secs(6);
+
+fn wait_for_signal_file(path: &Path, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{what} never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Send an unscoped `aft_inspect`, wait until `signal` shows it is inside the
+/// stretched language-server work, then require a sibling `read` of
+/// `read_path` to answer within the liveness bound and before the inspect.
+/// Cancels the inspect afterwards.
+fn assert_read_answers_during_inspect_lsp_work(
+    aft: &mut AftProcess,
+    signal: &Path,
+    what: &str,
+    read_path: &str,
+) {
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "inspect-in-lsp-work",
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "arguments": {"sections": ["diagnostics"]}
+        }))
+        .expect("serialize inspect tool call"),
+    );
+    wait_for_signal_file(signal, what);
+
+    let read_sent = Instant::now();
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "read-during-lsp-work",
+            "command": "tool_call",
+            "name": "read",
+            "arguments": {"path": read_path}
+        }))
+        .expect("serialize read tool call"),
+    );
+    let liveness = Duration::from_secs(3);
+    let read = loop {
+        let remaining = (read_sent + liveness).saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "read did not answer within {liveness:?} while the inspect was in {what}"
+        );
+        let Some(frame) = aft.try_read_next_timeout(remaining.min(Duration::from_millis(100)))
+        else {
+            continue;
+        };
+        assert_ne!(
+            frame["id"], "inspect-in-lsp-work",
+            "inspect answered before the sibling read: {frame:#}"
+        );
+        if frame["id"] == "read-during-lsp-work" {
+            break frame;
+        }
+    };
+    assert_eq!(read["success"], true, "read failed: {read:#}");
+
+    let cancel = aft.send_with_timeout(
+        &serde_json::to_string(&json!({
+            "id": "cancel-inspect-in-lsp-work",
+            "command": "cancel_request",
+            "params": {"id": "inspect-in-lsp-work"}
+        }))
+        .expect("serialize inspect cancellation"),
+        Duration::from_secs(3),
+    );
+    assert_eq!(cancel["success"], true, "cancel failed: {cancel:#}");
+    let _ = read_response(
+        aft,
+        "inspect-in-lsp-work",
+        SLOW_LSP_WORK + Duration::from_secs(30),
+    );
+}
+
+/// An inspect walks the project to decide which language servers apply. The
+/// walk used to run under the language-server manager lock, and the
+/// standalone loop takes that lock between requests (LSP event drains,
+/// configure maintenance, the status bar), so a read sent during the walk
+/// waited for all of it.
+#[test]
+fn standalone_read_answers_while_inspect_walks_for_language_servers() {
+    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let project = temp_dir.path().join("project");
+    fs::create_dir_all(project.join("src")).expect("create project");
+    fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
+    let signal = temp_dir.path().join("walk-started");
+    let delay_ms = SLOW_LSP_WORK.as_millis().to_string();
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_APPLICABILITY_WALK_DELAY_MS",
+            std::ffi::OsStr::new(&delay_ms),
+        ),
+        ("AFT_TEST_APPLICABILITY_WALK_SIGNAL", signal.as_os_str()),
+    ]);
+    let configure = aft.send(&configure_without_indexes(&project));
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    assert_read_answers_during_inspect_lsp_work(
+        &mut aft,
+        &signal,
+        "the applicability walk",
+        "src/main.rs",
+    );
+    assert!(aft.shutdown().success());
+}
+
+fn fake_lsp_server_path() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
+        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
+        .or_else(|| {
+            let mut path = std::env::current_exe().ok()?;
+            path.pop();
+            path.pop();
+            path.push("fake-lsp-server");
+            Some(path)
+        })
+        .filter(|path| path.exists())
+        .expect("fake-lsp-server binary path not set")
+}
+
+/// Starting a language server includes its `initialize` handshake, which can
+/// take seconds. It used to run under the language-server manager lock, so a
+/// read sent while an inspect started a server waited for the handshake.
+#[test]
+fn standalone_read_answers_while_inspect_initializes_a_language_server() {
+    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let project = temp_dir.path().join("project");
+    fs::create_dir_all(&project).expect("create project");
+    fs::write(project.join("fake.toml"), "[project]\n").expect("write root marker");
+    fs::write(project.join("main.fake"), "hello\n").expect("write fake source");
+    fs::write(project.join("notes.txt"), "notes\n").expect("write read target");
+
+    let fake_server = fake_lsp_server_path();
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake server dir");
+    let binary_name = fake_server
+        .file_name()
+        .expect("fake server file name")
+        .to_string_lossy()
+        .to_string();
+    let installed = bin_dir.join(&binary_name);
+    fs::copy(&fake_server, &installed).expect("install fake server");
+    // The fake LSP has no CLI probe; closed stdin makes its protocol loop exit.
+    super::helpers::warm_executable(&installed, &[]);
+
+    let signal = temp_dir.path().join("initialize-started");
+    let delay_ms = SLOW_LSP_WORK.as_millis().to_string();
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_FAKE_LSP_INIT_DELAY_MS",
+            std::ffi::OsStr::new(&delay_ms),
+        ),
+        ("AFT_FAKE_LSP_INIT_DELAY_SIGNAL", signal.as_os_str()),
+    ]);
+    let configure = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "configure-slow-initialize",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.display().to_string(),
+            "lsp_paths_extra": [bin_dir.display().to_string()],
+            "config": user_config(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "inspect": {"diagnostics_timeout_ms": 30000},
+                "lsp": {
+                    "servers": {
+                        "fake": {
+                            "extensions": ["fake"],
+                            "binary": binary_name,
+                            "args": [],
+                            "root_markers": ["fake.toml"]
+                        }
+                    }
+                }
+            }))
+        }))
+        .expect("serialize configure request"),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    assert_read_answers_during_inspect_lsp_work(
+        &mut aft,
+        &signal,
+        "a language server's initialize handshake",
+        "notes.txt",
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
     let project = tempfile::tempdir().expect("create standalone project");

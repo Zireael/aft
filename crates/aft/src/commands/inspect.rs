@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
+use crate::config::Config;
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::{inspect_request_timeout, run_diagnostics_category};
 #[cfg(test)]
@@ -302,6 +303,34 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_inspect_payload(req, ctx, false, false, &[], &[], &[], None, None)
 }
 
+/// Resolve the language servers an inspect should start, within the request
+/// deadline. A scoped inspect considers only files inside the scope: a server
+/// is selected only when at least one scoped file is one it handles, so a
+/// scope of `.rs` files never starts TypeScript because some `.mjs` file lives
+/// elsewhere in the project, and rust-analyzer starts only for the Cargo
+/// workspace that owns the scoped Rust files.
+///
+/// The filesystem walk runs without the language-server manager lock; only
+/// the per-server classification takes it. The walk covers the whole
+/// inspected tree, and while it held the lock every other manager user
+/// waited, including the standalone request loop, so a sibling `read` sent
+/// during an inspect was not answered until the walk finished.
+fn resolve_inspect_applicability(
+    ctx: &AppContext,
+    project_root: &Path,
+    scoped_roots: Option<&[PathBuf]>,
+    config: &Config,
+    deadline: Instant,
+) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+    let walk = crate::lsp::manager::walk_applicable_area(
+        project_root,
+        scoped_roots,
+        config,
+        Some(deadline),
+    )?;
+    Ok(ctx.lsp().classify_applicable_servers(walk, config))
+}
+
 /// Test-only warm-path entry that preserves nonblocking diagnostics semantics
 /// while waiting on scanner completion events with the normal phase hang catch.
 /// Integration fixtures use it when their assertion is unrelated to the
@@ -353,15 +382,13 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let scope = parse_scope(req, ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = {
-        let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_inspect(
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
+    let applicability = resolve_inspect_applicability(
+        ctx,
+        &snapshot.project_root,
+        scoped_roots,
+        &snapshot.config,
+        deadline.work_at(),
+    );
     let response = match applicability {
         Ok(applicability) => {
             run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
@@ -642,15 +669,13 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let scope = parse_scope(req, &ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = {
-        let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_inspect(
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
+    let applicability = resolve_inspect_applicability(
+        &ctx,
+        &snapshot.project_root,
+        scoped_roots,
+        &snapshot.config,
+        deadline.work_at(),
+    );
     let applicability = match applicability {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -911,15 +936,12 @@ fn run_blocking_inspect_body(
             );
         }
         let phase = phase_log.start(phase_entry.clone());
-        let outcome = {
-            let mut lsp = ctx.lsp();
-            lsp.start_applicable_server_until(
-                &applicability,
-                server,
-                &ctx.config(),
-                deadline.work_at(),
-            )
-        };
+        let outcome = ctx.lsp_start_applicable_server_until(
+            &applicability,
+            server,
+            &ctx.config(),
+            deadline.work_at(),
+        );
         if inspect_cancellation_requested() {
             phase.fail("inspect request cancelled");
             return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
