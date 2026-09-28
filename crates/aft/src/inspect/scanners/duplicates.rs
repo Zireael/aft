@@ -770,26 +770,25 @@ fn aggregate_duplicate_occurrences(
     let headline_groups = groups
         .iter()
         .filter(|group| !group.generated)
-        .cloned()
         .collect::<Vec<_>>();
     let generated_groups = groups
         .iter()
         .filter(|group| group.generated)
-        .cloned()
         .collect::<Vec<_>>();
     let count = headline_groups.len();
     let generated_count = generated_groups.len();
     let duplicate_stats = duplicate_line_stats(&headline_groups);
-    let all_duplicate_stats = duplicate_line_stats(&groups);
+    let all_duplicate_stats = duplicate_line_stats(&groups.iter().collect::<Vec<_>>());
     let generated_duplicate_stats = duplicate_line_stats(&generated_groups);
     let duplicated_percent =
         duplicate_percent(duplicate_stats.duplicated_lines, total_analyzed_lines);
     let drill_down_capped = drill_down_limit.is_some_and(|limit| groups_count > limit);
     let generated_drill_down_capped = drill_down_limit.is_some_and(|limit| generated_count > limit);
-    let generated_items = match drill_down_limit {
-        Some(limit) => generated_groups.into_iter().take(limit).collect::<Vec<_>>(),
-        None => generated_groups,
-    };
+    let generated_items = generated_groups
+        .iter()
+        .take(drill_down_limit.unwrap_or(usize::MAX))
+        .map(|group| (*group).clone())
+        .collect::<Vec<_>>();
     let items = match drill_down_limit {
         Some(limit) => groups.into_iter().take(limit).collect::<Vec<_>>(),
         None => groups,
@@ -942,7 +941,7 @@ struct DuplicateLineStats {
     file_count: usize,
 }
 
-fn duplicate_line_stats(groups: &[DuplicateGroup]) -> DuplicateLineStats {
+fn duplicate_line_stats(groups: &[&DuplicateGroup]) -> DuplicateLineStats {
     let mut by_file = BTreeMap::<String, Vec<(u32, u32)>>::new();
     for group in groups {
         for occurrence in &group.files {

@@ -163,6 +163,53 @@ where
     (start_index..=last_start).find(|&start| matches_at(lines, pattern, start, &compare))
 }
 
+fn normalized_sequence_match(
+    lines: &[&str],
+    pattern: &[&str],
+    start_index: usize,
+    eof: bool,
+    normalize: impl Fn(&str) -> String,
+) -> Option<usize> {
+    if pattern.is_empty() || pattern.len() > lines.len() {
+        return None;
+    }
+    let wanted: Vec<String> = pattern.iter().map(|line| normalize(line)).collect();
+    if eof {
+        let start = lines.len() - pattern.len();
+        return (start >= start_index
+            && lines[start..]
+                .iter()
+                .zip(&wanted)
+                .all(|(line, expected)| normalize(line) == *expected))
+        .then_some(start);
+    }
+    let mut prefix = vec![0; wanted.len()];
+    for i in 1..wanted.len() {
+        let mut matched = prefix[i - 1];
+        while matched > 0 && wanted[i] != wanted[matched] {
+            matched = prefix[matched - 1];
+        }
+        if wanted[i] == wanted[matched] {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+    let mut matched = 0;
+    for (i, line) in lines.iter().enumerate().skip(start_index) {
+        let current = normalize(line);
+        while matched > 0 && current != wanted[matched] {
+            matched = prefix[matched - 1];
+        }
+        if current == wanted[matched] {
+            matched += 1;
+        }
+        if matched == wanted.len() {
+            return Some(i + 1 - wanted.len());
+        }
+    }
+    None
+}
+
 fn non_whitespace_unit_count(input: &str) -> usize {
     // TypeScript uses UTF-16 code units for `.length`; Rust has no direct equivalent on `str`.
     // The length check only bounds candidate windows before exact string equality, so counting
@@ -186,8 +233,11 @@ pub fn find_reflow_match(
     let needle_non_whitespace_len = needle_non_whitespace.chars().count();
     let min_non_whitespace = needle_non_whitespace_len.saturating_sub(REFLOW_NON_WS_TOLERANCE);
     let max_non_whitespace = needle_non_whitespace_len + REFLOW_NON_WS_TOLERANCE;
-    let mut matches = Vec::new();
-    let mut seen = HashSet::new();
+    let mut first_match = None;
+    let line_lengths: Vec<usize> = lines
+        .iter()
+        .map(|line| non_whitespace_unit_count(line))
+        .collect();
 
     for start in start_index..lines.len() {
         if !has_reflow_content(lines[start]) {
@@ -197,7 +247,7 @@ pub fn find_reflow_match(
         let mut window_non_whitespace_len = 0;
         for end in (start + 1)..=lines.len() {
             let line = lines[end - 1];
-            window_non_whitespace_len += non_whitespace_unit_count(line);
+            window_non_whitespace_len += line_lengths[end - 1];
 
             if window_non_whitespace_len > max_non_whitespace {
                 break;
@@ -218,17 +268,13 @@ pub fn find_reflow_match(
                 continue;
             }
 
-            if seen.insert((start, end)) {
-                matches.push((start, end - start));
+            if first_match.replace((start, end - start)).is_some() {
+                return None;
             }
         }
     }
 
-    if matches.len() == 1 {
-        Some(matches[0])
-    } else {
-        None
-    }
+    first_match
 }
 
 /// Run the first-hit-wins Exact/Rstrip/Trim/Indent/Unicode/Reflow ladder; mirrors `patch-parser.ts:353-399`.
@@ -278,13 +324,9 @@ pub fn seek_sequence_tiered(
         });
     }
 
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| normalize_indent(a).trim_end() == normalize_indent(b).trim_end(),
-        eof,
-    ) {
+    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
+        normalize_indent(line).trim_end().to_string()
+    }) {
         return Some(SequenceMatch {
             found,
             tier: MatchTier::Indent,
@@ -292,13 +334,9 @@ pub fn seek_sequence_tiered(
         });
     }
 
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| normalize_unicode(a.trim()) == normalize_unicode(b.trim()),
-        eof,
-    ) {
+    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
+        normalize_unicode(line.trim())
+    }) {
         return Some(SequenceMatch {
             found,
             tier: MatchTier::Unicode,
@@ -519,6 +557,50 @@ pub fn find_nearest_miss(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalized_search_is_linear_on_repeated_prefix_and_preserves_first_match() {
+        use std::cell::Cell;
+        let lines = vec!["same"; 5_000];
+        let mut pattern = vec!["same"; 60];
+        pattern[59] = "missing";
+        let calls = Cell::new(0);
+        let found = super::normalized_sequence_match(&lines, &pattern, 0, false, |line| {
+            calls.set(calls.get() + 1);
+            line.to_string()
+        });
+        assert_eq!(found, None);
+        assert!(calls.get() <= lines.len() + pattern.len());
+        let baseline_calls = Cell::new(0);
+        assert_eq!(
+            found,
+            super::try_match(
+                &lines,
+                &pattern,
+                0,
+                |a, b| {
+                    baseline_calls.set(baseline_calls.get() + 1);
+                    a == b
+                },
+                false
+            )
+        );
+        assert!(baseline_calls.get() > calls.get() * 40);
+        eprintln!(
+            "repeated-prefix comparisons: baseline {}, indexed {}",
+            baseline_calls.get(),
+            calls.get()
+        );
+        let mut found_lines = lines.clone();
+        found_lines[4_999] = "missing";
+        assert_eq!(
+            super::normalized_sequence_match(&found_lines, &pattern, 0, false, str::to_string),
+            Some(4_940)
+        );
+        assert_eq!(
+            super::find_reflow_match(&["hello", "hello", "hello"], &["hello"], 0),
+            None
+        );
+    }
     use super::*;
 
     fn assert_match(

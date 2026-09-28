@@ -1654,16 +1654,51 @@ impl FileParser {
                 path: format!("{}: {}", path.display(), e),
             })?;
 
-        // Return cached symbols if file hasn't changed.
-        if let Some(symbols) = self
+        // Snapshot the entry before checking the file: hashing a touched file must
+        // not block cache writers. Refresh metadata only if the entry is unchanged.
+        let cached = self
             .symbol_cache
             .read()
             .map_err(|_| AftError::ParseError {
                 message: "symbol cache lock poisoned".to_string(),
             })?
-            .get(&canon, current_mtime)
-        {
-            return Ok((symbols, false));
+            .entries
+            .get(&canon)
+            .cloned();
+        if let Some(cached) = cached {
+            if cached_file_is_fresh(
+                path,
+                cached.mtime,
+                cached.size,
+                cached.content_hash,
+                current_mtime,
+            ) {
+                if cached.mtime != current_mtime {
+                    let mut cache =
+                        self.symbol_cache
+                            .write()
+                            .map_err(|_| AftError::ParseError {
+                                message: "symbol cache lock poisoned".to_string(),
+                            })?;
+                    if let Some(entry) = cache.entries.get_mut(&canon) {
+                        if entry.mtime == cached.mtime
+                            && entry.size == cached.size
+                            && entry.content_hash == cached.content_hash
+                        {
+                            entry.mtime = current_mtime;
+                        } else {
+                            // A concurrent writer replaced the snapshot while we hashed.
+                            // Retry rather than returning superseded symbols.
+                            drop(cache);
+                            return self.extract_symbols_with_cache_status(path);
+                        }
+                    } else {
+                        drop(cache);
+                        return self.extract_symbols_with_cache_status(path);
+                    }
+                }
+                return Ok((cached.symbols, false));
+            }
         }
 
         let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
@@ -7604,19 +7639,16 @@ fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
         .map(|tag| node_text(source, &tag).trim().to_string())
 }
 
-fn source_line_end_col(source: &str, line: u32) -> u32 {
-    source
-        .lines()
-        .nth(line as usize)
-        .map(|line| line.len() as u32)
-        .unwrap_or(0)
+fn source_line_end_cols(source: &str) -> Vec<u32> {
+    source.lines().map(|line| line.len() as u32).collect()
 }
 
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut headings = Vec::new();
     collect_html_headings(source, root, &mut headings);
 
-    let total_lines = source.lines().count() as u32;
+    let end_cols = source_line_end_cols(source);
+    let total_lines = end_cols.len() as u32;
 
     // Extend each heading's end_line to just before the next heading at the
     // same or shallower level (or EOF). This makes aft_zoom return the full
@@ -7630,7 +7662,8 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
             .unwrap_or_else(|| total_lines.saturating_sub(1));
         headings[i].symbol.range.end_line = section_end;
         if section_end != headings[i].symbol.range.start_line {
-            headings[i].symbol.range.end_col = source_line_end_col(source, section_end);
+            headings[i].symbol.range.end_col =
+                end_cols.get(section_end as usize).copied().unwrap_or(0);
         }
     }
 
@@ -7909,7 +7942,8 @@ fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
     collect_headings(source, root, &mut raw_headings);
 
     let mut symbols = Vec::new();
-    let total_lines = source.lines().count() as u32;
+    let end_cols = source_line_end_cols(source);
+    let total_lines = end_cols.len() as u32;
 
     let mut active_headings: Vec<Option<String>> = vec![None; 7];
 
@@ -7938,7 +7972,7 @@ fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
         // Find the next heading of the same or higher level (level <= h.level)
         let mut end_line = total_lines.saturating_sub(1);
         let mut end_col = if total_lines > 0 {
-            source_line_end_col(source, end_line)
+            end_cols.get(end_line as usize).copied().unwrap_or(0)
         } else {
             0
         };
@@ -7948,7 +7982,7 @@ fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
                 // The section ends before this heading starts
                 let next_start_line = raw_headings[j].range.start_line;
                 end_line = next_start_line.saturating_sub(1).max(start_line);
-                end_col = source_line_end_col(source, end_line);
+                end_col = end_cols.get(end_line as usize).copied().unwrap_or(0);
                 break;
             }
         }
@@ -10589,6 +10623,33 @@ fn body_macros_are_not_items() {
         cache_freshness::reset_hash_file_if_small_count_for_debug();
         assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
+    }
+
+    #[test]
+    fn heading_columns_index_many_sections_with_mixed_endings() {
+        let source = (0..5_000)
+            .map(|i| format!("# Heading {i}\r\nbody é {i}\r"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cols = source_line_end_cols(&source);
+        assert_eq!(cols.len(), source.lines().count());
+        for (i, line) in source.lines().enumerate() {
+            assert_eq!(cols[i], line.len() as u32);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn touched_symbol_cache_rehashes_only_first_query() {
+        let (_dir, file, _, _, _) = cached_freshness_fixture("pub fn hello() {}\n");
+        let mut parser = FileParser::new();
+        parser.extract_symbols(&file).unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        for _ in 0..100 {
+            assert_eq!(parser.extract_symbols(&file).unwrap()[0].name, "hello");
+        }
+        assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
     #[test]

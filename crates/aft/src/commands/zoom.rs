@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -69,6 +69,40 @@ pub struct ZoomResponse {
     pub context_before: Vec<String>,
     pub context_after: Vec<String>,
     pub annotations: Annotations,
+}
+
+fn zoom_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < source.len() {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) -> usize {
+    let Some(&start) = starts.get(line as usize) else {
+        return source.len();
+    };
+    let next = starts
+        .get(line as usize + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let segment = &source[start..next];
+    let text = segment
+        .strip_suffix("\r\n")
+        .or_else(|| segment.strip_suffix('\n'))
+        .unwrap_or(segment);
+    start + (col as usize).min(text.len())
+}
+
+struct ZoomEnrichment {
+    symbols: Vec<Symbol>,
+    source: String,
+    tree: tree_sitter::Tree,
+    calls: Vec<RawCall>,
+    line_starts: Vec<usize>,
 }
 
 struct RawCall {
@@ -162,6 +196,7 @@ fn zoom_one_target_response(
         symbol,
         context_lines,
         include_callgraph,
+        &mut HashMap::new(),
     )
 }
 
@@ -471,6 +506,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             &symbol_names[0],
             context_lines,
             include_callgraph,
+            &mut HashMap::new(),
         );
     }
 
@@ -768,6 +804,7 @@ fn zoom_batch_symbols(
 ) -> Response {
     let mut entries = Vec::with_capacity(symbol_names.len());
     let mut all_ok = true;
+    let mut enrichments = HashMap::new();
 
     for name in symbol_names {
         let resp = zoom_one_symbol(
@@ -780,6 +817,7 @@ fn zoom_batch_symbols(
             name,
             context_lines,
             include_callgraph,
+            &mut enrichments,
         );
         let json = match serde_json::to_value(&resp) {
             Ok(v) => v,
@@ -819,6 +857,7 @@ fn zoom_one_symbol(
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
+    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
 ) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
@@ -910,13 +949,6 @@ fn zoom_one_symbol(
         .map(|source| source.lines().collect::<Vec<_>>());
     let effective_lines = resolved_lines.as_deref().unwrap_or(lines);
 
-    // Extract symbol body (0-based line indices)
-    let content = if end < effective_lines.len() {
-        effective_lines[start..=end].join("\n")
-    } else {
-        effective_lines[start..].join("\n")
-    };
-
     let resolved_lang = detect_language(resolved_file_path);
     let container_outline = if might_have_container_members(target) {
         match build_container_outline(ctx, resolved_file_path, target) {
@@ -960,6 +992,13 @@ fn zoom_one_symbol(
         };
     }
 
+    // Only join the body when the response actually displays it.
+    let content = if end < effective_lines.len() {
+        effective_lines[start..=end].join("\n")
+    } else {
+        effective_lines[start..].join("\n")
+    };
+
     // Context before
     let ctx_start = start.saturating_sub(context_lines);
     let context_before: Vec<String> = if ctx_start < start {
@@ -992,46 +1031,58 @@ fn zoom_one_symbol(
         None
     };
     let (calls_out, called_by) = if include_callgraph {
-        // Get all symbols in the resolved file for call matching
-        let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
-
-        let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
-
-        // Parse AST for call extraction (use resolved file for cross-file re-exports)
-        let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-        let (tree, lang) = match parser.parse(resolved_file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
-
-        // calls_out: calls within the target symbol's byte range
-        let resolved_source = if resolved_file_path != path {
-            std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
-        } else {
-            source.to_string()
-        };
-        let signature_byte_start = line_col_to_byte(
-            &resolved_source,
+        if !enrichments.contains_key(resolved_file_path) {
+            let symbols = match ctx.provider().list_symbols(resolved_file_path) {
+                Ok(symbols) => symbols,
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
+            let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
+            let (tree, lang) = match parser.parse(resolved_file_path) {
+                Ok((tree, lang)) => (tree.clone(), lang),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
+            let resolved_source = if resolved_file_path != path {
+                std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
+            } else {
+                source.to_string()
+            };
+            let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+            let line_starts = zoom_line_starts(&resolved_source);
+            enrichments.insert(
+                resolved_file_path.to_path_buf(),
+                ZoomEnrichment {
+                    symbols,
+                    source: resolved_source,
+                    tree,
+                    calls,
+                    line_starts,
+                },
+            );
+        }
+        let enrichment = &enrichments[resolved_file_path];
+        let all_symbols = &enrichment.symbols;
+        let resolved_source = &enrichment.source;
+        let line_starts = &enrichment.line_starts;
+        let all_file_calls = &enrichment.calls;
+        let known_names: HashSet<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
+        let signature_byte_start = zoom_line_col_to_byte(
+            resolved_source,
+            line_starts,
             target.range.start_line,
             target.range.start_col,
         );
-        let signature_byte_end = line_col_to_byte(
-            &resolved_source,
+        let signature_byte_end = zoom_line_col_to_byte(
+            resolved_source,
+            line_starts,
             target.range.end_line,
             target.range.end_col,
         );
-        let (target_byte_start, target_byte_end) =
-            symbol_body_byte_range(tree.root_node(), signature_byte_start, signature_byte_end)
-                .unwrap_or((signature_byte_start, signature_byte_end));
-
-        let all_file_calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+        let (target_byte_start, target_byte_end) = symbol_body_byte_range(
+            enrichment.tree.root_node(),
+            signature_byte_start,
+            signature_byte_end,
+        )
+        .unwrap_or((signature_byte_start, signature_byte_end));
 
         let raw_calls = all_file_calls.iter().filter(|call| {
             call.start_byte >= target_byte_start && call.end_byte <= target_byte_end
@@ -1049,21 +1100,30 @@ fn zoom_one_symbol(
                 .collect(),
         );
 
-        // called_by: bucket the single file-wide call extraction by enclosing symbol range
+        // Preserve file-call order for each name when attributing nested symbols.
+        let matching_calls: Vec<&RawCall> = all_file_calls
+            .iter()
+            .filter(|call| call.name == target.name)
+            .collect();
         let mut called_by: Vec<CallRef> = Vec::new();
-        for sym in &all_symbols {
+        for sym in all_symbols {
             if sym.name == target.name && sym.range.start_line == target.range.start_line {
                 continue; // skip self
             }
-            let sym_byte_start =
-                line_col_to_byte(&resolved_source, sym.range.start_line, sym.range.start_col);
-            let sym_byte_end =
-                line_col_to_byte(&resolved_source, sym.range.end_line, sym.range.end_col);
-            for call in &all_file_calls {
-                if call.name == target.name
-                    && call.start_byte >= sym_byte_start
-                    && call.end_byte <= sym_byte_end
-                {
+            let sym_byte_start = zoom_line_col_to_byte(
+                &resolved_source,
+                &line_starts,
+                sym.range.start_line,
+                sym.range.start_col,
+            );
+            let sym_byte_end = zoom_line_col_to_byte(
+                &resolved_source,
+                &line_starts,
+                sym.range.end_line,
+                sym.range.end_col,
+            );
+            for call in &matching_calls {
+                if call.start_byte >= sym_byte_start && call.end_byte <= sym_byte_end {
                     called_by.push(CallRef {
                         name: sym.name.clone(),
                         line: call.line,
@@ -2234,6 +2294,21 @@ mod tests {
     }
 
     #[test]
+    fn indexed_coordinates_match_edit_offsets_for_large_mixed_line_endings() {
+        let source = format!("{}\r\n多字\rsolo\nend\n", "é".repeat(20_000));
+        let starts = zoom_line_starts(&source);
+        for line in 0..8 {
+            for col in [0, 1, 2, 20, 40_000, u32::MAX] {
+                assert_eq!(
+                    zoom_line_col_to_byte(&source, &starts, line, col),
+                    line_col_to_byte(&source, line, col),
+                    "line {line}, col {col}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parse_zoom_symbol_names_splits_whitespace_for_code() {
         let params = serde_json::json!({ "symbol": "InspectCategory active is_active" });
         let names = parse_zoom_symbol_names(&params, Some(LangId::Rust)).expect("parse");
@@ -2506,6 +2581,52 @@ function helper(value: number): number {
             names.contains(&"helper"),
             "call inside the function body should be included: {names:?}"
         );
+    }
+
+    #[test]
+    fn batch_callgraph_reuses_file_enrichment_and_matches_individual_zoom() {
+        let ctx = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.ts");
+        let source = (0..80)
+            .map(|i| format!("function f{i}() {{ f0(); }}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &source).unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let names = (1..40).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        let req = make_zoom_request_cg("many", path.to_str().unwrap(), "f1");
+        let mut enrichments = HashMap::new();
+        for name in &names {
+            let shared = zoom_one_symbol(
+                &req,
+                &ctx,
+                &path,
+                path.to_str().unwrap(),
+                &source,
+                &lines,
+                name,
+                0,
+                true,
+                &mut enrichments,
+            );
+            let standalone = zoom_one_symbol(
+                &req,
+                &ctx,
+                &path,
+                path.to_str().unwrap(),
+                &source,
+                &lines,
+                name,
+                0,
+                true,
+                &mut HashMap::new(),
+            );
+            assert_eq!(
+                serde_json::to_value(shared).unwrap(),
+                serde_json::to_value(standalone).unwrap()
+            );
+        }
+        assert_eq!(enrichments.len(), 1);
     }
 
     #[test]
