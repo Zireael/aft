@@ -1412,8 +1412,31 @@ fn speech_aimed_at_a_bound_repository_refuses_when_governance_is_unavailable_and
     assert_refused(&run, "gh_shim_governance_unavailable");
 }
 
+/// No bot is bound to the named repository, so the comment cannot be bot
+/// speech. It is refused rather than run under the operator's own gh login,
+/// and runs as the operator, with an audit line, only under the bypass.
+fn assert_unbound_speech_needs_the_bypass(argv: &[&str], from: RunFrom) {
+    let refused = run_targeting(argv, from, &[], Governance::Available);
+    assert_refused(&refused, "gh_shim_unbound_target");
+    assert!(refused.bypass_audit.is_empty());
+
+    let bypassed = run_targeting(
+        argv,
+        from,
+        &[("GH_SHIM_BYPASS", "operator")],
+        Governance::Available,
+    );
+    assert_delegated(&bypassed, argv);
+    assert_eq!(bypassed.bypass_audit.len(), 1, "one audit line");
+    assert_eq!(
+        bypassed.bypass_audit[0]["repository"],
+        json!(UNBOUND_REPOSITORY)
+    );
+    assert_eq!(bypassed.bypass_audit[0]["tuple"], json!("issue comment"));
+}
+
 #[test]
-fn speech_with_repo_flag_naming_an_unbound_repository_delegates_from_an_unbound_directory() {
+fn speech_with_repo_flag_naming_an_unbound_repository_from_an_unbound_directory_needs_the_bypass() {
     let argv = [
         "issue",
         "comment",
@@ -1423,8 +1446,7 @@ fn speech_with_repo_flag_naming_an_unbound_repository_delegates_from_an_unbound_
         "--body",
         "hello",
     ];
-    let run = run_targeting(&argv, RunFrom::ScratchDirectory, &[], Governance::Available);
-    assert_delegated(&run, &argv);
+    assert_unbound_speech_needs_the_bypass(&argv, RunFrom::ScratchDirectory);
 }
 
 #[test]
@@ -1447,7 +1469,7 @@ fn speech_from_one_bound_checkout_aimed_at_another_bound_repository_uses_the_tar
 }
 
 #[test]
-fn speech_from_a_bound_checkout_aimed_at_an_unbound_repository_delegates() {
+fn speech_from_a_bound_checkout_aimed_at_an_unbound_repository_needs_the_bypass() {
     let argv = [
         "issue",
         "comment",
@@ -1457,8 +1479,7 @@ fn speech_from_a_bound_checkout_aimed_at_an_unbound_repository_delegates() {
         "--body",
         "hello",
     ];
-    let run = run_targeting(&argv, RunFrom::BoundCheckout, &[], Governance::Available);
-    assert_delegated(&run, &argv);
+    assert_unbound_speech_needs_the_bypass(&argv, RunFrom::BoundCheckout);
 }
 
 #[test]

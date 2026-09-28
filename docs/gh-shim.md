@@ -18,6 +18,66 @@ Anything not named below is `gh_shim_unclassified` (exit 86, nothing sent). The
 refusal names the verb the classifier decided on, because the decision is made
 on the verb alone.
 
+## Writes to repositories no bot is bound to
+
+A write aimed at a repository the signed manifest binds no bot to cannot be bot
+speech, and upstream `gh` would run it under the operator's own login. Such a
+write is refused with `gh_shim_unbound_target` (exit 86, nothing sent) unless
+`GH_SHIM_BYPASS=operator` is set. For example:
+
+```text
+gh-shim: gh_shim_unbound_target: `issue comment` targets earendil-works/pi, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it); bot speech is not possible there, and upstream gh would run it under the operator's own login. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.
+```
+
+With the bypass the command runs under the operator's own `gh`. Before starting
+it, the shim appends and syncs an audit line in the same format the bypass
+writes for `pr merge` and `release create`: `{as_of_unix_secs, tuple,
+repository}`, where `tuple` is the verb (`repo create`) or
+`api:<METHOD>:<endpoint>` and `repository` is `null` when none is known.
+
+**What counts as a write.** Every verb in a declared row above (speech,
+administration, the operator label rows, the destructive forms), plus the
+undeclared writes the classifier lists: `pr create`, `issue delete`/`transfer`/
+`lock`/`pin`, `repo delete`/`rename`/`archive`/`sync`, `label edit`/`delete`,
+`workflow enable`/`disable`, `run cancel`, `secret`/`variable set` and
+`delete`, `repo deploy-key` and `repo autolink` actions other than `list` and
+`view`, and the account writes below. `gh api` writes when its method does: a
+method named with `--method`/`-X`, else POST once a field or `--input` is given.
+A `gh api graphql` call is a read only when its inline `query` holds no
+`mutation`. Everything else passes through as before: `view`, `list`, `api`
+GET, `run view`/`download`, and local commands such as `auth`, `config` or
+`pr checkout`.
+
+**What the target is.** The same resolver the governed rows use: `--repo`/`-R`,
+a thread URL, a `gh repo` subcommand's repository positional (`gh repo delete
+owner/name`), a `/repos/<owner>/<name>` endpoint, `GH_REPO`, then the working
+directory's `origin`. When that target is bound, the governed path applies
+unchanged, and the bypass there still reaches only manifest-declared
+administration. A non-speech write from inside a bound checkout also stays on
+the governed path whatever it names, as before.
+
+**Account writes** never have a binding, so they need the bypass even from a
+bound checkout: `repo create` (a new repository cannot be bound yet),
+`repo fork`, `gist` writes, `ssh-key`/`gpg-key` add and delete, `project`
+writes, and `gh api` writes to an endpoint outside `/repos/<owner>/<name>`
+(such as `POST /user/repos` or a GraphQL mutation).
+
+**No determinable target.** A write whose target cannot be resolved (nothing
+named and no github.com `origin`, or a `--repo` that is not a github.com
+`owner/name`) is refused the same way, and the refusal says why.
+
+The check needs a verified signed manifest to compare against. Without one (no
+manifest installed, or one that never verified) nothing is bound and the shim
+passes writes through as before. An installed manifest that fails validation
+after an earlier one verified (a regressed manifest) already refuses every
+command that is not a read. Destructive forms keep their own refusal, and
+`github.shim: false` turns the whole shim off.
+
+The operator's own terminal is not affected. The shim runs only where AFT puts
+its `shims` directory first on `PATH`, which it does for the bash and PTY
+children it spawns for agents; it never edits shell startup files or the
+terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
+
 ## Rows
 
 | Row | Class | Since |

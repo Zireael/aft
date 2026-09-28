@@ -599,12 +599,19 @@ fn gh_shim_s2_one_agent_many_repos_exercises_binding_and_failure_arms() {
     )
     .output()
     .expect("spawn unbound S2 governed invocation");
-    assert_eq!(unbound.status.code(), Some(73));
-    assert_eq!(String::from_utf8_lossy(&unbound.stdout), "r2-passthrough\n");
-    assert!(unbound.stderr.is_empty());
+    // No bot is bound to this repository, so the comment cannot be bot speech;
+    // it is refused rather than run under the operator's own gh login.
+    assert_eq!(unbound.status.code(), Some(86));
+    assert!(unbound.stdout.is_empty());
     assert_eq!(
-        fs::read_to_string(&unbound_recorder).expect("read unbound upstream invocation"),
-        "issue comment 42 --body S2 fixture\n"
+        String::from_utf8_lossy(&unbound.stderr),
+        unbound_target_refusal(
+            "`issue comment` targets cortexkit/unmanifested-repository, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it)"
+        )
+    );
+    assert!(
+        !unbound_recorder.exists(),
+        "an unbound write must not reach ambient gh"
     );
     let unbound_status = shim_status(
         &unbound_project,
@@ -2891,4 +2898,235 @@ fn gh_shim_slow_daemon_open_route_delay_during_governed_call_refuses_as_not_run_
     assert_eq!(status["last_probe"]["stage"], "open_route");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
     assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
+}
+
+/// Everything one unbound-target scenario needs: a signed v12 manifest that
+/// binds only `cortexkit/aft`, an unreachable governance daemon, a stub
+/// upstream `gh` that records each run, and a working directory.
+struct UnboundTargetFixture {
+    _temp: tempfile::TempDir,
+    config_home: PathBuf,
+    state_home: PathBuf,
+    home: PathBuf,
+    upstream_bin: PathBuf,
+    recorder: PathBuf,
+    /// A directory outside any git repository.
+    outside: PathBuf,
+    /// A checkout whose origin is the bound `cortexkit/aft`.
+    bound_project: PathBuf,
+}
+
+impl UnboundTargetFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create test root");
+        let config_home = temp.path().join("config");
+        let state_home = temp.path().join("state");
+        let home = temp.path().join("home");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("create a directory outside any repository");
+        let bound_project = write_project_repo(temp.path());
+        let connection_file = write_dead_connection_file(temp.path());
+        let upstream_bin = temp.path().join("upstream-bin");
+        let recorder = temp.path().join("upstream-invocations.txt");
+        write_upstream_gh(&upstream_bin);
+        write_fresh_v12_manifest(&state_home, unix_seconds());
+        write_user_config(&config_home, &connection_file, None);
+        Self {
+            _temp: temp,
+            config_home,
+            state_home,
+            home,
+            upstream_bin,
+            recorder,
+            outside,
+            bound_project,
+        }
+    }
+
+    fn run(&self, args: &[&str], cwd: &Path, bypass: bool) -> std::process::Output {
+        let mut command = shim_command(
+            args,
+            cwd,
+            &self.config_home,
+            &self.state_home,
+            &self.home,
+            &self.upstream_bin,
+            &self.recorder,
+        );
+        command.env_remove("GH_REPO");
+        if bypass {
+            command.env("GH_SHIM_BYPASS", "operator");
+        }
+        command.output().expect("spawn gh shim")
+    }
+
+    fn upstream_runs(&self) -> Option<String> {
+        fs::read_to_string(&self.recorder).ok()
+    }
+
+    fn audit_records(&self) -> Vec<Value> {
+        let path = self
+            .state_home
+            .join("cortexkit/aft/gh-shim/operator-bypass.jsonl");
+        fs::read_to_string(path)
+            .map(|text| {
+                text.lines()
+                    .map(|line| serde_json::from_str(line).expect("parse audit line"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn unbound_target_refusal(subject: &str) -> String {
+    format!(
+        "gh-shim: gh_shim_unbound_target: {subject}; bot speech is not possible there, and upstream gh would run it under the operator's own login. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.\n"
+    )
+}
+
+/// Drop the audit line's timestamp so the rest can be compared exactly.
+fn without_timestamp(mut record: Value) -> Value {
+    assert!(record["as_of_unix_secs"].is_u64(), "audit line has a time");
+    record
+        .as_object_mut()
+        .expect("audit line is an object")
+        .remove("as_of_unix_secs");
+    record
+}
+
+#[test]
+fn gh_shim_repo_create_outside_any_repository_is_refused_and_runs_audited_under_the_bypass() {
+    let fixture = UnboundTargetFixture::new();
+    let args = ["repo", "create", "cortexkit/common-auth", "--private"];
+
+    let refused = fixture.run(&args, &fixture.outside, false);
+    assert_eq!(refused.status.code(), Some(86));
+    assert!(refused.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        unbound_target_refusal(
+            "`repo create` creates the new repository cortexkit/common-auth, which is not a bot-bound repository (no manifest binding can cover it)"
+        )
+    );
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert!(fixture.audit_records().is_empty());
+
+    let approved = fixture.run(&args, &fixture.outside, true);
+    assert_eq!(approved.status.code(), Some(73));
+    assert!(approved.stderr.is_empty());
+    assert_eq!(
+        fixture.upstream_runs().as_deref(),
+        Some("repo create cortexkit/common-auth --private\n")
+    );
+    let records = fixture.audit_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        without_timestamp(records[0].clone()),
+        json!({ "tuple": "repo create", "repository": "cortexkit/common-auth" })
+    );
+}
+
+#[test]
+fn gh_shim_comment_on_an_unbound_external_repository_is_refused_and_runs_audited_under_the_bypass()
+{
+    let fixture = UnboundTargetFixture::new();
+    // Run from inside the bound checkout: the comment still speaks in the
+    // repository it names, which no bot is bound to.
+    let args = [
+        "issue",
+        "comment",
+        "12",
+        "--repo",
+        "earendil-works/pi",
+        "--body",
+        "hello",
+    ];
+
+    let refused = fixture.run(&args, &fixture.bound_project, false);
+    assert_eq!(refused.status.code(), Some(86));
+    assert!(refused.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        unbound_target_refusal(
+            "`issue comment` targets earendil-works/pi, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it)"
+        )
+    );
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert!(fixture.audit_records().is_empty());
+
+    let approved = fixture.run(&args, &fixture.bound_project, true);
+    assert_eq!(approved.status.code(), Some(73));
+    assert!(approved.stderr.is_empty());
+    assert_eq!(
+        fixture.upstream_runs().as_deref(),
+        Some("issue comment 12 --repo earendil-works/pi --body hello\n")
+    );
+    let records = fixture.audit_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        without_timestamp(records[0].clone()),
+        json!({ "tuple": "issue comment", "repository": "earendil-works/pi" })
+    );
+}
+
+#[test]
+fn gh_shim_reads_on_an_unbound_repository_pass_through() {
+    let fixture = UnboundTargetFixture::new();
+    for args in [
+        &["issue", "view", "12", "--repo", "earendil-works/pi"][..],
+        &["api", "repos/earendil-works/pi/issues"],
+        &["run", "view", "7", "--log", "--repo", "earendil-works/pi"],
+    ] {
+        let output = fixture.run(args, &fixture.outside, false);
+        assert_eq!(output.status.code(), Some(73), "{args:?} should delegate");
+        assert!(
+            output.stderr.is_empty(),
+            "{args:?} should delegate silently"
+        );
+    }
+    assert_eq!(
+        fixture.upstream_runs().as_deref(),
+        Some(
+            "issue view 12 --repo earendil-works/pi\napi repos/earendil-works/pi/issues\nrun view 7 --log --repo earendil-works/pi\n"
+        )
+    );
+    assert!(fixture.audit_records().is_empty());
+}
+
+#[test]
+fn gh_shim_write_on_a_bound_repository_keeps_the_governed_path_with_or_without_the_bypass() {
+    let fixture = UnboundTargetFixture::new();
+    let args = ["issue", "comment", "42", "--body", "hello"];
+    for bypass in [false, true] {
+        let output = fixture.run(&args, &fixture.bound_project, bypass);
+        assert_eq!(output.status.code(), Some(86));
+        // The governance daemon is down, so the governed route refuses; it
+        // never falls back to upstream gh, and the bypass does not reroute it.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+        );
+    }
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert!(fixture.audit_records().is_empty());
+}
+
+#[test]
+fn gh_shim_write_with_an_undeterminable_target_is_refused() {
+    let fixture = UnboundTargetFixture::new();
+    let output = fixture.run(
+        &["issue", "comment", "12", "--body", "hello"],
+        &fixture.outside,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(86));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        unbound_target_refusal(
+            "`issue comment` has no determinable target repository (no --repo, repository URL or GH_REPO names one, and the working directory has no github.com origin remote), so it cannot be shown to be a bot-bound repository"
+        )
+    );
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert!(fixture.audit_records().is_empty());
 }

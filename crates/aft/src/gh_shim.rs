@@ -162,6 +162,132 @@ const READ_ONLY_ACTION_TUPLES: &[&str] = &[
     "search commits",
     "cache list",
 ];
+/// GitHub-side writes that no declaration row above names. With the declared
+/// tables (governed, admin, operator rows, edit-last, destructive) they make
+/// up the verbs `is_write_invocation` treats as writes when it decides whether
+/// a command aimed at an unbound repository must be refused. A verb in none of
+/// these tables is a read (`issue view`, `run download`) or acts only on the
+/// local machine (`auth`, `config`, `extension`, `pr checkout`), and passes
+/// through as it always has.
+const UNDECLARED_WRITE_TUPLES: &[&str] = &[
+    "issue delete",
+    "issue develop",
+    "issue lock",
+    "issue unlock",
+    "issue pin",
+    "issue unpin",
+    "issue transfer",
+    "pr create",
+    "pr ready",
+    "pr lock",
+    "pr unlock",
+    "pr revert",
+    "pr update-branch",
+    "repo delete",
+    "repo rename",
+    "repo archive",
+    "repo unarchive",
+    "repo sync",
+    "label edit",
+    "label delete",
+    "label clone",
+    "workflow enable",
+    "workflow disable",
+    "run cancel",
+    "secret set",
+    "secret delete",
+    "variable set",
+    "variable delete",
+    "cache delete",
+];
+/// Writes that act on the caller's account rather than on an existing
+/// repository: a new repository, a fork, gists, account keys and projects. No
+/// manifest binding can cover them, so they are refused without the operator
+/// bypass even from inside a bound checkout.
+const ACCOUNT_WRITE_TUPLES: &[&str] = &[
+    "repo create",
+    "repo fork",
+    "gist create",
+    "gist edit",
+    "gist delete",
+    "gist rename",
+    "ssh-key add",
+    "ssh-key delete",
+    "gpg-key add",
+    "gpg-key delete",
+    "project close",
+    "project copy",
+    "project create",
+    "project delete",
+    "project edit",
+    "project field-create",
+    "project field-delete",
+    "project item-add",
+    "project item-archive",
+    "project item-create",
+    "project item-delete",
+    "project item-edit",
+    "project link",
+    "project mark-template",
+    "project unlink",
+];
+/// Verbs whose third word picks the action (`gh repo deploy-key add`). Their
+/// `list` and `view` actions read; every other action writes.
+const NESTED_WRITE_GROUPS: &[&str] = &["repo deploy-key", "repo autolink"];
+/// `gh repo` subcommands whose first positional names the repository they act
+/// on (`gh repo delete owner/name`). `repo rename` is absent: its positional is
+/// the new name, and `-R` names the repository.
+const REPO_POSITIONAL_TARGET_SUBCOMMANDS: &[&str] = &[
+    "view",
+    "clone",
+    "create",
+    "delete",
+    "edit",
+    "fork",
+    "archive",
+    "unarchive",
+    "sync",
+    "set-default",
+];
+/// Flags of the `gh repo` subcommands above whose next argument is their
+/// value, so a description such as `--description a/b` is not read as the
+/// repository.
+const REPO_VALUE_FLAGS: &[&str] = &[
+    "--description",
+    "-d",
+    "--homepage",
+    "-h",
+    "--source",
+    "-s",
+    "--remote",
+    "-r",
+    "--team",
+    "-t",
+    "--template",
+    "-p",
+    "--gitignore",
+    "-g",
+    "--license",
+    "-l",
+    "--visibility",
+    "--default-branch",
+    "--add-topic",
+    "--remove-topic",
+    "--fork-name",
+    "--org",
+    "--remote-name",
+    "--upstream-remote-name",
+    "-u",
+    "--branch",
+    "-b",
+    "--json",
+    "--jq",
+    "-q",
+    "--repo",
+    "-R",
+    "--hostname",
+    "--config-dir",
+];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
@@ -198,10 +324,11 @@ pub enum RefusalCode {
     DestructiveFlag,
     UnsupportedFlag,
     OutcomeUnknown,
+    UnboundTarget,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -217,6 +344,7 @@ impl RefusalCode {
         Self::DestructiveFlag,
         Self::UnsupportedFlag,
         Self::OutcomeUnknown,
+        Self::UnboundTarget,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -236,6 +364,7 @@ impl RefusalCode {
             Self::DestructiveFlag => "gh_shim_destructive_flag",
             Self::UnsupportedFlag => "gh_shim_unsupported_flag",
             Self::OutcomeUnknown => "gh_shim_outcome_unknown",
+            Self::UnboundTarget => "gh_shim_unbound_target",
         }
     }
 }
@@ -381,6 +510,20 @@ fn run(args: &[OsString]) -> i32 {
     }
 
     let target = TargetRepository::from_invocation(args);
+    // A write aimed at a repository no signed binding covers cannot be spoken
+    // by any bot, and upstream `gh` would run it under the operator's own
+    // login. Decide that before the rung probe: the answer does not depend on
+    // the governance daemon, and a bound target falls through to the governed
+    // path below unchanged. Without a signed manifest (a public installation,
+    // or one that never verified) there are no bindings to compare against,
+    // so those keep passing through as before.
+    if let ManifestResolution::Active(manifest) = &initial_manifest {
+        if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd)
+            .filter(|_| !shim_disabled_by_operator())
+        {
+            return dispatch_unbound_write(args, &write, &paths, now, delegate);
+        }
+    }
     let determination = determine_rung(&paths, &target, &cwd, now);
     if determination.record.rung != Rung::R3 {
         let disposition = match resolve_manifest(&paths, now) {
@@ -711,6 +854,337 @@ fn admin_refusal_text(tuple: &str) -> String {
     format!(
         "`{tuple}` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line."
     )
+}
+
+/// A write whose target is not a repository bound in the signed manifest.
+#[derive(Debug, Eq, PartialEq)]
+struct UnboundWrite {
+    /// The command as the refusal and the audit line name it: the verb tuple
+    /// (`repo create`), or `api:<METHOD>:<endpoint>` for a raw API call.
+    command: String,
+    target: WriteTarget,
+}
+
+/// What a write invocation acts on, as far as the shim can tell before it runs.
+#[derive(Debug, Eq, PartialEq)]
+enum WriteTarget {
+    /// An existing github.com repository, as canonical `owner/name`.
+    Repository(String),
+    /// Not an existing repository: a repository being created, a fork, the
+    /// caller's gists, keys or projects, or an API endpoint outside
+    /// `/repos/<owner>/<name>`. `description` completes the sentence
+    /// "`<command>` ...", and `named` is the repository the command spells,
+    /// if it spells one, for the audit line.
+    NotARepository {
+        description: String,
+        named: Option<String>,
+    },
+    /// Nothing identifies the repository; the text says why.
+    Undetermined(String),
+}
+
+impl WriteTarget {
+    fn audit_repository(&self) -> Option<&str> {
+        match self {
+            Self::Repository(repository) => Some(repository),
+            Self::NotARepository { named, .. } => named.as_deref(),
+            Self::Undetermined(_) => None,
+        }
+    }
+}
+
+/// True when the user turned the shim off (`github.shim: false`), the same
+/// operator hard-off the rung determination honours.
+fn shim_disabled_by_operator() -> bool {
+    gh_shim_enabled_from_config_doc(read_user_config_doc().as_deref().unwrap_or("")) == Some(false)
+}
+
+/// The write in `args` when no signed binding covers what it targets.
+///
+/// Returns `None`, leaving the invocation to the governed path, for a read, a
+/// local-only command, a destructive form (which that path refuses whatever
+/// it targets), and a write whose target is bound. A write that is not bot
+/// speech (administration, or a verb the manifest does not declare) aimed at
+/// another repository from inside a bound checkout also stays on that path,
+/// which already sends it through the checkout's audited bypass or refuses it
+/// (see `target_or_checkout_binding`). Writes that act on the
+/// caller's account rather than a repository never have a binding, so the
+/// checkout does not matter for them.
+fn unbound_write(
+    args: &[OsString],
+    manifest: &Manifest,
+    platform: &str,
+    target: &TargetRepository,
+    cwd: &Path,
+) -> Option<UnboundWrite> {
+    if !is_write_invocation(args) {
+        return None;
+    }
+    let classification = classify(args, manifest, platform);
+    if matches!(classification, Classification::Destructive) {
+        return None;
+    }
+    let write_target = write_target(args, target, cwd);
+    if !matches!(write_target, WriteTarget::NotARepository { .. })
+        && governing_binding(&classification, manifest, target, cwd).is_some()
+    {
+        return None;
+    }
+    Some(UnboundWrite {
+        command: write_command(args),
+        target: write_target,
+    })
+}
+
+/// Refuse a write on an unbound target, or run it as the operator under
+/// `GH_SHIM_BYPASS=operator` after the same audit line an administration
+/// bypass writes. The audit line is synced before upstream `gh` is spawned, so
+/// an attempt that dies mid-call is still on record.
+fn dispatch_unbound_write<F>(
+    args: &[OsString],
+    write: &UnboundWrite,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    if !operator_bypass_requested() {
+        return refuse(
+            RefusalCode::UnboundTarget,
+            &unbound_target_refusal_text(write),
+        );
+    }
+    if let Err(error) =
+        append_bypass_audit(paths, &write.command, write.target.audit_repository(), now)
+    {
+        return refuse(
+            RefusalCode::BypassAuditUnavailable,
+            &format!("operator bypass audit could not be appended: {error}"),
+        );
+    }
+    delegate_to_upstream(args)
+}
+
+/// Refusal text for a write whose target no bot is bound to. It names the
+/// command and the target, says why no bot can speak there, and gives the
+/// operator's way to approve it.
+fn unbound_target_refusal_text(write: &UnboundWrite) -> String {
+    let command = &write.command;
+    let subject = match &write.target {
+        WriteTarget::Repository(repository) => format!(
+            "`{command}` targets {repository}, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it)"
+        ),
+        WriteTarget::NotARepository { description, .. } => format!(
+            "`{command}` {description}, which is not a bot-bound repository (no manifest binding can cover it)"
+        ),
+        WriteTarget::Undetermined(reason) => format!(
+            "`{command}` has no determinable target repository ({reason}), so it cannot be shown to be a bot-bound repository"
+        ),
+    };
+    format!(
+        "{subject}; bot speech is not possible there, and upstream gh would run it under the operator's own login. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
+    )
+}
+
+/// The name a write goes by in its refusal and audit line.
+fn write_command(args: &[OsString]) -> String {
+    let Some((verb, subcommand, head_index)) = command_head(args) else {
+        return "this invocation".to_string();
+    };
+    if verb == "api" {
+        return match api_request_shape(&args[head_index..]) {
+            Some(shape) => format!("api:{}:{}", shape.effective_method(), shape.path),
+            None => verb,
+        };
+    }
+    verb_tuple(verb, subcommand)
+}
+
+/// True when `args` asks GitHub to change something.
+///
+/// The verb tables are the ones classification uses (governed, admin, the
+/// operator rows, edit-last, destructive) plus the undeclared and account
+/// writes, so the decision does not depend on what a manifest happens to
+/// declare. `gh api` writes when its method does: an explicit method, else
+/// POST once any field or `--input` is given, as upstream `gh` decides. An
+/// argument vector the shim cannot read counts as a write.
+fn is_write_invocation(args: &[OsString]) -> bool {
+    if has_exact_flag(args, "--help") {
+        // Upstream `gh` prints help and runs nothing.
+        return false;
+    }
+    let Some((verb, subcommand, head_index)) = command_head(args) else {
+        return args.iter().any(|arg| arg.to_str().is_none());
+    };
+    if verb == "api" {
+        return api_invocation_writes(&args[head_index..]);
+    }
+    let tuple = verb_tuple(verb, subcommand);
+    if NESTED_WRITE_GROUPS.contains(&tuple.as_str()) {
+        return !matches!(nested_action(args).as_deref(), Some("list" | "view"));
+    }
+    is_write_tuple(&tuple)
+}
+
+fn is_write_tuple(tuple: &str) -> bool {
+    [
+        V1_GOVERNED_TUPLES,
+        V1_ADMIN_TUPLES,
+        V9_ADMIN_TUPLES,
+        V10_ADMIN_TUPLES,
+        V10_EDIT_LAST_TUPLES,
+        V11_ADMIN_TUPLES,
+        V12_GOVERNED_TUPLES,
+        V13_ADMIN_TUPLES,
+        V14_GOVERNED_TUPLES,
+        V14_OPERATOR_LABEL_TUPLES,
+        V14_OPERATOR_ROW_ADMIN_TUPLES,
+        DESTRUCTIVE_TUPLES,
+        UNDECLARED_WRITE_TUPLES,
+        ACCOUNT_WRITE_TUPLES,
+    ]
+    .iter()
+    .any(|table| table.contains(&tuple))
+}
+
+/// The third positional word (`add` in `gh repo deploy-key add key.pub`).
+fn nested_action(args: &[OsString]) -> Option<String> {
+    let mut skip_next = false;
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .filter(|value| {
+            if std::mem::take(&mut skip_next) {
+                return false;
+            }
+            if matches!(*value, "--repo" | "-R" | "--hostname" | "--config-dir") {
+                skip_next = true;
+                return false;
+            }
+            !value.starts_with('-')
+        })
+        .nth(2)
+        .map(str::to_ascii_lowercase)
+}
+
+/// Whether a `gh api` call (arguments from `api` on) writes.
+fn api_invocation_writes(args: &[OsString]) -> bool {
+    let Some(shape) = api_request_shape(args) else {
+        return true;
+    };
+    let method = shape.effective_method();
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        return false;
+    }
+    // A GraphQL call is always a POST; only a mutation changes anything.
+    if shape.path == "/graphql" {
+        return !graphql_query_is_read_only(args);
+    }
+    true
+}
+
+/// True when every `query` field of a `gh api graphql` call is inline text
+/// with no `mutation` in it. A query read from a file or stdin, a call with
+/// `--input`, or a call with no query field cannot be inspected here, so it
+/// counts as a write.
+fn graphql_query_is_read_only(args: &[OsString]) -> bool {
+    let mut queries = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let Some(value) = args[index].to_str() else {
+            return false;
+        };
+        index += 1;
+        if value == "--input" || value.starts_with("--input=") {
+            return false;
+        }
+        let field = if matches!(value, "-f" | "-F" | "--field" | "--raw-field") {
+            let Some(field) = args.get(index).and_then(|arg| arg.to_str()) else {
+                return false;
+            };
+            index += 1;
+            Some(field)
+        } else if let Some(field) = value
+            .strip_prefix("--field=")
+            .or_else(|| value.strip_prefix("--raw-field="))
+        {
+            Some(field)
+        } else if value.len() > 2 && (value.starts_with("-f") || value.starts_with("-F")) {
+            Some(&value[2..])
+        } else {
+            None
+        };
+        if let Some(("query", text)) = field.and_then(|field| field.split_once('=')) {
+            queries.push(text);
+        }
+    }
+    !queries.is_empty()
+        && queries
+            .iter()
+            .all(|query| !query.starts_with('@') && !query.contains("mutation"))
+}
+
+/// What a write acts on (see `WriteTarget`), from the same resolver the
+/// governed path uses: `--repo`, a URL or repository positional, `GH_REPO`,
+/// then the working directory's origin.
+fn write_target(args: &[OsString], target: &TargetRepository, cwd: &Path) -> WriteTarget {
+    if let Some((verb, subcommand, head_index)) = command_head(args) {
+        if verb == "api" {
+            // `{owner}/{repo}` placeholders are filled by upstream `gh` from
+            // `GH_REPO` or the origin, so those endpoints resolve below.
+            if let Some(shape) = api_request_shape(&args[head_index..]) {
+                if !shape.path.starts_with("/repos/") {
+                    return WriteTarget::NotARepository {
+                        description: format!(
+                            "calls {}, an endpoint outside /repos/<owner>/<repo>",
+                            shape.path
+                        ),
+                        named: None,
+                    };
+                }
+            }
+        }
+        let tuple = verb_tuple(verb, subcommand);
+        if ACCOUNT_WRITE_TUPLES.contains(&tuple.as_str()) {
+            // Only a positional names the repository here; `GH_REPO` and the
+            // origin say nothing about a repository being created or forked.
+            let named = target.url.clone();
+            return WriteTarget::NotARepository {
+                description: account_write_description(&tuple, named.as_deref()),
+                named,
+            };
+        }
+    }
+    match target.named() {
+        Some(named) => match canonical_repository_key(named) {
+            Some(repository) => WriteTarget::Repository(repository),
+            None => WriteTarget::Undetermined(format!(
+                "`{named}` is not a github.com owner/name repository"
+            )),
+        },
+        None => match repository_key_from_origin(&project_root_for(cwd)) {
+            Some(repository) => WriteTarget::Repository(repository),
+            None => WriteTarget::Undetermined(
+                "no --repo, repository URL or GH_REPO names one, and the working directory has no github.com origin remote"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn account_write_description(tuple: &str, named: Option<&str>) -> String {
+    match (tuple, named) {
+        ("repo create", Some(named)) => format!("creates the new repository {named}"),
+        ("repo create", None) => "creates a new repository".to_string(),
+        ("repo fork", Some(named)) => format!("forks {named} into the caller's account"),
+        ("repo fork", None) => "creates a fork in the caller's account".to_string(),
+        _ if tuple.starts_with("gist ") => "acts on the caller's gists".to_string(),
+        _ if tuple.starts_with("project ") => {
+            "acts on a project owned by a user or organization".to_string()
+        }
+        _ => "changes the caller's account keys".to_string(),
+    }
 }
 
 /// Refusal text for an undeclared invocation.
@@ -3213,19 +3687,54 @@ fn is_api_tuple(tuple: &str) -> bool {
 }
 
 fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
-    let mut method = "GET".to_string();
+    let shape = api_request_shape(args)?;
+    Some((
+        shape.method.unwrap_or_else(|| "GET".to_string()),
+        shape.path,
+        shape.has_fields,
+    ))
+}
+
+/// A `gh api` call as the shim reads it (arguments from `api` on).
+struct ApiRequestShape {
+    /// The method named by `--method`/`-X`, upper-cased; `None` when unnamed.
+    method: Option<String>,
+    /// The endpoint, with the leading slash upstream `gh` treats as implied.
+    path: String,
+    /// Whether any field or `--input` payload is given.
+    has_fields: bool,
+}
+
+impl ApiRequestShape {
+    /// The method upstream `gh` sends: the named one, else POST when a field
+    /// or `--input` payload is given, else GET.
+    fn effective_method(&self) -> String {
+        match &self.method {
+            Some(method) => method.clone(),
+            None if self.has_fields => "POST".to_string(),
+            None => "GET".to_string(),
+        }
+    }
+}
+
+fn api_request_shape(args: &[OsString]) -> Option<ApiRequestShape> {
+    let mut method = None;
     let mut path = None;
     let mut has_fields = false;
     let mut index = 1;
     while index < args.len() {
         let value = args[index].to_str()?;
         if matches!(value, "--method" | "-X") {
-            method = args.get(index + 1)?.to_str()?.to_ascii_uppercase();
+            method = Some(args.get(index + 1)?.to_str()?.to_ascii_uppercase());
             index += 2;
             continue;
         }
-        if let Some(method_value) = value.strip_prefix("--method=") {
-            method = method_value.to_ascii_uppercase();
+        if let Some(method_value) = value
+            .strip_prefix("--method=")
+            .or_else(|| value.strip_prefix("-X="))
+            .or_else(|| value.strip_prefix("-X").filter(|rest| !rest.is_empty()))
+        {
+            method = Some(method_value.to_ascii_uppercase());
             index += 1;
             continue;
         }
@@ -3263,7 +3772,11 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
     } else {
         format!("/{path}")
     };
-    Some((method, path, has_fields))
+    Some(ApiRequestShape {
+        method,
+        path,
+        has_fields,
+    })
 }
 
 fn is_api_field_argument(value: &str) -> bool {
@@ -4295,6 +4808,12 @@ fn positional_target_repository(args: &[OsString]) -> Option<String> {
         let (_, path, _) = api_method_and_path(&args[head_index..])?;
         return api_endpoint_repository(&path);
     }
+    if verb == "repo" {
+        return subcommand
+            .as_deref()
+            .filter(|subcommand| REPO_POSITIONAL_TARGET_SUBCOMMANDS.contains(subcommand))
+            .and_then(|_| repo_positional_repository(&args[head_index + 1..]));
+    }
     // `pr review --comment` is a switch selecting the review event, not a
     // comment value as it is on the close and reopen verbs.
     let comment_is_switch = verb == "pr" && subcommand.as_deref() == Some("review");
@@ -4312,6 +4831,34 @@ fn positional_target_repository(args: &[OsString]) -> Option<String> {
         if let Some(repository) = thread_url_repository(value) {
             return Some(repository);
         }
+    }
+    None
+}
+
+/// Canonical `owner/name` of the repository positional of a `gh repo`
+/// subcommand (arguments after `repo`): the first positional after the
+/// subcommand, as `owner/name` or a github.com URL. A bare name (`gh repo
+/// create foo`) names no owner and resolves to nothing.
+fn repo_positional_repository(args_after_verb: &[OsString]) -> Option<String> {
+    let mut skip_value = false;
+    let mut seen_subcommand = false;
+    for arg in args_after_verb {
+        let value = arg.to_str()?;
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        // Everything after `--` is handed to git, not read by `gh`.
+        if value == "--" {
+            return None;
+        }
+        if value.starts_with('-') {
+            skip_value = !value.contains('=') && REPO_VALUE_FLAGS.contains(&value);
+            continue;
+        }
+        if !std::mem::replace(&mut seen_subcommand, true) {
+            continue;
+        }
+        return canonical_repository_key(value);
     }
     None
 }
@@ -8019,7 +8566,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 15);
+        assert_eq!(RefusalCode::ALL.len(), 16);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
@@ -9931,6 +10478,32 @@ INHERITED FLAGS
         );
         // Placeholders are filled from the other sources by upstream gh.
         assert_eq!(named(&["api", "repos/{owner}/{repo}/issues"]), None);
+        // `gh repo` subcommands name their repository as the first positional,
+        // past any flag value that happens to look like `owner/name`.
+        assert_eq!(
+            named(&["repo", "delete", "Owner/Repo", "--yes"]),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            named(&[
+                "repo",
+                "create",
+                "--description",
+                "a/b",
+                "cortexkit/common-auth",
+                "--private"
+            ]),
+            Some("cortexkit/common-auth".to_string())
+        );
+        assert_eq!(
+            named(&["repo", "fork", "https://github.com/o/r", "--clone"]),
+            Some("o/r".to_string())
+        );
+        // A bare name has no owner; `repo rename` takes the new name, not the
+        // repository; a key path is not a repository.
+        assert_eq!(named(&["repo", "create", "common-auth"]), None);
+        assert_eq!(named(&["repo", "rename", "o/new"]), None);
+        assert_eq!(named(&["repo", "deploy-key", "add", "keys/id.pub"]), None);
 
         let explicit = explicit_repo(&os_args(&["issue", "comment", "5", "-R=o/r"]));
         assert_eq!(explicit.as_deref(), Some("o/r"));
@@ -9956,6 +10529,247 @@ INHERITED FLAGS
             ..TargetRepository::default()
         };
         assert_eq!(foreign.repository_key(Path::new(".")), None);
+    }
+
+    #[test]
+    fn write_classification_reads_the_verb_tables_and_the_api_method() {
+        let writes = |raw: &[&str]| is_write_invocation(&os_args(raw));
+        for raw in [
+            // Verbs the manifest can declare: bot speech (comments, issue
+            // creation), operator administration (merge, release, workflow
+            // run, repository settings) and the operator label rows.
+            &["issue", "comment", "5", "--body", "x"][..],
+            &["issue", "create", "--title", "t"],
+            &["pr", "merge", "7"],
+            &["release", "create", "v1"],
+            &["release", "delete", "v1"],
+            &["label", "create", "bug"],
+            &["workflow", "run", "ci.yml"],
+            &["repo", "edit", "--visibility", "public"],
+            // Writes no manifest row declares, including those that act on
+            // the caller's account (new repositories, forks, gists).
+            &["repo", "create", "cortexkit/common-auth", "--private"],
+            &["repo", "delete", "o/r", "--yes"],
+            &["repo", "fork", "o/r"],
+            &["pr", "create", "--fill"],
+            &["label", "delete", "bug"],
+            &["gist", "create", "notes.md"],
+            &["secret", "set", "TOKEN"],
+            &["repo", "deploy-key", "add", "key.pub"],
+            // API writes: a named method, or a payload without one.
+            &["api", "-X", "POST", "repos/o/r/issues"],
+            &["api", "--method=delete", "repos/o/r"],
+            &["api", "-XDELETE", "repos/o/r"],
+            &["api", "repos/o/r/issues/1/comments", "-f", "body=x"],
+            &["api", "user/repos", "--input", "repo.json"],
+            &["api", "graphql", "-f", "query=mutation { addStar }"],
+            &["api", "graphql", "-F", "query=@query.graphql"],
+        ] {
+            assert!(writes(raw), "{raw:?} should be a write");
+        }
+        for raw in [
+            &["issue", "view", "5"][..],
+            &["issue", "list"],
+            &["pr", "list"],
+            &["pr", "checkout", "7"],
+            &["run", "view", "1", "--log"],
+            &["run", "download", "1"],
+            &["release", "download", "v1"],
+            &["repo", "view", "o/r"],
+            &["repo", "clone", "o/r"],
+            &["repo", "deploy-key", "list"],
+            &["auth", "status"],
+            &["repo", "create", "--help"],
+            &["api", "repos/o/r/issues"],
+            &["api", "-X", "GET", "search/issues", "-f", "q=repo:o/r"],
+            &["api", "graphql", "-f", "query={ viewer { login } }"],
+            &[],
+            &["--version"],
+        ] {
+            assert!(!writes(raw), "{raw:?} should be a read");
+        }
+        // A method attached to the flag (`-XDELETE`) is read as the method
+        // by classification as well, so a field-free DELETE is not taken for
+        // the default GET, which the manifest's `GET **` rule passes through.
+        assert!(matches!(
+            classify(
+                &os_args(&["api", "-XDELETE", "repos/o/r"]),
+                &fixture_manifest(),
+                "macos"
+            ),
+            Classification::Unclassified
+        ));
+    }
+
+    /// The target as `TargetRepository::from_invocation` reads it, minus the
+    /// process `GH_REPO`, so these tests do not depend on the environment.
+    fn target_of(args: &[OsString]) -> TargetRepository {
+        TargetRepository {
+            explicit: explicit_repo(args),
+            url: positional_target_repository(args),
+            gh_repo: None,
+        }
+    }
+
+    #[test]
+    fn write_target_names_the_repository_the_account_or_why_it_is_undetermined() {
+        let outside = tempfile::tempdir().expect("create a directory outside any repository");
+        let target = |raw: &[&str]| {
+            let args = os_args(raw);
+            write_target(&args, &target_of(&args), outside.path())
+        };
+        assert_eq!(
+            target(&[
+                "issue",
+                "comment",
+                "5",
+                "-R",
+                "earendil-works/pi",
+                "-b",
+                "x"
+            ]),
+            WriteTarget::Repository("earendil-works/pi".to_string())
+        );
+        assert_eq!(
+            target(&["repo", "create", "cortexkit/common-auth", "--private"]),
+            WriteTarget::NotARepository {
+                description: "creates the new repository cortexkit/common-auth".to_string(),
+                named: Some("cortexkit/common-auth".to_string()),
+            }
+        );
+        assert_eq!(
+            target(&["repo", "create", "common-auth"]),
+            WriteTarget::NotARepository {
+                description: "creates a new repository".to_string(),
+                named: None,
+            }
+        );
+        assert_eq!(
+            target(&["api", "-X", "POST", "/user/repos", "-f", "name=x"]),
+            WriteTarget::NotARepository {
+                description: "calls /user/repos, an endpoint outside /repos/<owner>/<repo>"
+                    .to_string(),
+                named: None,
+            }
+        );
+        assert!(matches!(
+            target(&["issue", "comment", "5", "--body", "x"]),
+            WriteTarget::Undetermined(reason) if reason.contains("no github.com origin remote")
+        ));
+        assert!(matches!(
+            target(&["issue", "comment", "5", "-R", "ghe.example.com/o/r", "-b", "x"]),
+            WriteTarget::Undetermined(reason) if reason.contains("`ghe.example.com/o/r` is not a github.com owner/name repository")
+        ));
+    }
+
+    #[test]
+    fn unbound_write_leaves_bound_targets_reads_and_destructive_forms_to_the_governed_path() {
+        let outside = tempfile::tempdir().expect("create a directory outside any repository");
+        let manifest = v12_fixture_manifest();
+        let unbound = |raw: &[&str]| {
+            let args = os_args(raw);
+            unbound_write(&args, &manifest, "macos", &target_of(&args), outside.path())
+        };
+        // `cortexkit/aft` is the fixture's one bound repository.
+        assert_eq!(
+            unbound(&["issue", "comment", "5", "-R", "cortexkit/aft", "-b", "x"]),
+            None
+        );
+        assert_eq!(unbound(&["pr", "merge", "7", "-R", "cortexkit/aft"]), None);
+        assert_eq!(
+            unbound(&["issue", "view", "5", "-R", "earendil-works/pi"]),
+            None
+        );
+        assert_eq!(unbound(&["api", "repos/earendil-works/pi/issues"]), None);
+        assert_eq!(
+            unbound(&["release", "delete", "v1", "-R", "earendil-works/pi"]),
+            None
+        );
+
+        let comment = unbound(&[
+            "issue",
+            "comment",
+            "5",
+            "-R",
+            "earendil-works/pi",
+            "-b",
+            "x",
+        ])
+        .expect("a comment on an unbound repository is an unbound write");
+        assert_eq!(comment.command, "issue comment");
+        assert_eq!(
+            unbound_target_refusal_text(&comment),
+            "`issue comment` targets earendil-works/pi, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it); bot speech is not possible there, and upstream gh would run it under the operator's own login. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
+        );
+        let create = unbound(&["repo", "create", "cortexkit/common-auth", "--private"])
+            .expect("creating a repository is an unbound write");
+        assert_eq!(create.command, "repo create");
+        assert_eq!(
+            create.target.audit_repository(),
+            Some("cortexkit/common-auth")
+        );
+        let api = unbound(&["api", "-X", "POST", "repos/earendil-works/pi/issues"])
+            .expect("an API write on an unbound repository is an unbound write");
+        assert_eq!(api.command, "api:POST:/repos/earendil-works/pi/issues");
+        assert_eq!(
+            api.target,
+            WriteTarget::Repository("earendil-works/pi".to_string())
+        );
+        let undetermined = unbound(&["issue", "comment", "5", "--body", "x"])
+            .expect("a write with no determinable target is refused");
+        assert!(unbound_target_refusal_text(&undetermined).starts_with(
+            "`issue comment` has no determinable target repository (no --repo, repository URL or GH_REPO names one, and the working directory has no github.com origin remote)"
+        ));
+    }
+
+    #[test]
+    fn unbound_write_refuses_without_the_bypass_and_audits_before_running_with_it() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create unbound write state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let args = os_args(&["repo", "create", "cortexkit/common-auth", "--private"]);
+        let write = UnboundWrite {
+            command: "repo create".to_string(),
+            target: WriteTarget::NotARepository {
+                description: "creates the new repository cortexkit/common-auth".to_string(),
+                named: Some("cortexkit/common-auth".to_string()),
+            },
+        };
+
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            let status = dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |_| {
+                panic!("an unbound write ran without the operator bypass")
+            });
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+            assert!(!paths.bypass_audit.exists());
+        }
+
+        let delegated = Cell::new(0);
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+            let status = dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |ran| {
+                assert_eq!(ran, args);
+                // The audit line is durable before upstream `gh` is spawned.
+                assert!(paths.bypass_audit.exists());
+                delegated.set(delegated.get() + 1);
+                73
+            });
+            assert_eq!(status, 73);
+        }
+        assert_eq!(delegated.get(), 1);
+        let (records, error) = read_bypass_audit(&paths);
+        assert!(error.is_none());
+        assert_eq!(
+            records.expect("operator bypass audit records"),
+            vec![json!({
+                "as_of_unix_secs": TEST_NOW,
+                "tuple": "repo create",
+                "repository": "cortexkit/common-auth",
+            })]
+        );
     }
 
     /// The binding and the canonical request must name the same repository;
