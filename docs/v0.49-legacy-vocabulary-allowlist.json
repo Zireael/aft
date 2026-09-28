@@ -2998,11 +2998,11 @@
     },
     {
       "path": "packages/aft-bridge/src/edit-summary.ts",
-      "line": 68,
+      "line": 70,
       "column": 17,
       "token": "filePath",
       "text": "// Glob edit (filePath is a glob pattern): Rust reports per-file results plus",
-      "location": "line 68, column 17",
+      "location": "line 70, column 17",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
