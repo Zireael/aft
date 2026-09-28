@@ -1132,6 +1132,142 @@ fn inspect_blocking_reuse_attaches_to_in_flight_background_category() {
 }
 
 #[test]
+fn scoped_inspect_does_not_wait_for_blocked_tier2() {
+    let _env_lock = env_serial_lock();
+    let (temp, owner) = fixture_project();
+    write_file(&owner, "src/foo.ts", duplicate_fixture_source());
+    let git = |root: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git fixture");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&owner, &["init"]);
+    git(&owner, &["add", "src/foo.ts"]);
+    git(
+        &owner,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &owner,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+
+    let gate_ready = temp.path().join("tier2-ready");
+    let gate_release = temp.path().join("tier2-release");
+    let _gate_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &linked.to_string_lossy());
+    let _gate_ready = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_READY",
+        &gate_ready.to_string_lossy(),
+    );
+    let _gate_release = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+        &gate_release.to_string_lossy(),
+    );
+    let owner_ctx = configured_context(&owner);
+    let linked_ctx = configured_context(&linked);
+    let manager = linked_ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new(
+        linked.clone(),
+        linked_ctx.inspect_dir(),
+        linked_ctx.config(),
+        linked_ctx.symbol_cache(),
+    );
+    let tier2_root = linked.clone();
+    let tier2_worker = thread::spawn(move || {
+        manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Duplicates,
+            JobScope::for_project(tier2_root),
+        )
+    });
+    wait_for_path_event(&gate_ready, "Tier-2 gate");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::scope(|threads| {
+        threads.spawn(|| {
+            for ctx in [&linked_ctx, &owner_ctx] {
+                ctx.lsp()
+                    .override_binary(ServerKind::TypeScript, fake_server_path());
+                ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+                for sections in [json!("diagnostics"), Value::Null] {
+                    let response = handle_inspect_tool_call(
+                        &request(json!({
+                            "id": "scoped-blocked-tier2", "command": "inspect",
+                            "scope": "src/foo.ts", "sections": sections,
+                        })),
+                        ctx,
+                    );
+                    tx.send(serde_json::to_value(response).unwrap()).unwrap();
+                }
+            }
+        });
+        // Release even on failure so the regression cannot strand a worker.
+        let mut responses = Vec::new();
+        for _ in 0..4 {
+            let response = rx.recv_timeout(Duration::from_secs(15));
+            let timed_out = response.is_err();
+            responses.push(response);
+            if timed_out {
+                break;
+            }
+        }
+        fs::write(&gate_release, b"release").expect("release Tier-2");
+        tier2_worker.join().expect("Tier-2 worker finished");
+        for response in responses {
+            let response = response.expect("scoped inspect waited for blocked Tier-2");
+            assert_eq!(response["success"], true, "{response:#}");
+            assert!(
+                response["summary"]["diagnostics"].is_object(),
+                "{response:#}"
+            );
+            assert_eq!(
+                response["summary"]["duplicates"]["complete"], false,
+                "{response:#}"
+            );
+            assert!(
+                response["summary"]["duplicates"].get("count").is_none(),
+                "{response:#}"
+            );
+            let phases = response["wait_stamp"]["phases"]
+                .as_array()
+                .expect("completed phase log");
+            assert!(
+                phases
+                    .iter()
+                    .any(|phase| phase["id"] == "stat_verification"),
+                "{response:#}"
+            );
+            assert!(
+                phases
+                    .iter()
+                    .all(|phase| phase["id"] != "tier2_rescan" && phase["id"] != "callgraph_ready"),
+                "{response:#}"
+            );
+            let text = response["text"].as_str().unwrap();
+            assert!(
+                text.contains("Incomplete duplicates: Tier-2 unavailable"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("Duplicates: 0") && !text.contains("Dead code: 0"),
+                "{text}"
+            );
+        }
+    });
+}
+
+#[test]
 fn inspect_blocking_reuse_waits_for_slow_category_completion() {
     let _env_lock = env_serial_lock();
     let (_temp_dir, root) = fixture_project();
@@ -3417,8 +3553,8 @@ fn scoped_diagnostics_filter_warm_findings_to_the_scope() {
     );
     assert_eq!(scoped["success"], true, "inspect failed: {scoped:#}");
     assert!(
-        scoped.get("complete").is_none(),
-        "covered scope must be complete: {scoped:#}"
+        scoped["summary"]["diagnostics"].get("complete").is_none(),
+        "covered diagnostics must be complete even with Tier-2 gaps: {scoped:#}"
     );
     assert_eq!(scoped["summary"]["diagnostics"]["errors"], 1);
     assert_eq!(scoped["summary"]["diagnostics"]["warnings"], 1);
@@ -3537,8 +3673,10 @@ fn scoped_diagnostics_name_uncovered_files_instead_of_rendering_clean_empty() {
 
     assert_eq!(mutated["success"], true, "inspect failed: {mutated:#}");
     assert!(
-        mutated.get("complete").is_none(),
-        "forced coverage must remove the gap: {mutated:#}"
+        mutated["gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.iter().all(|gap| gap["kind"] != "uncovered_file")),
+        "forced coverage must remove the diagnostics gap: {mutated:#}"
     );
     assert!(
         mutated["summary"]["diagnostics"].get("complete").is_none(),
@@ -3584,8 +3722,10 @@ fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
     assert!(
-        response.get("complete").is_none(),
-        "covered clean scope must not be marked incomplete: {response:#}"
+        response["gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.iter().all(|gap| gap["kind"] != "uncovered_file")),
+        "covered clean scope must not carry a diagnostics gap: {response:#}"
     );
     assert!(
         response["summary"]["diagnostics"].get("complete").is_none(),

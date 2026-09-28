@@ -480,7 +480,7 @@ fn handle_inspect_payload(
         .copied()
         .filter(|category| category.is_tier2())
     {
-        if !ctx.inspect_writer() {
+        if scope_was_provided || !ctx.inspect_writer() {
             continue;
         }
         let phase_entry = InspectPhaseEntry::category(InspectPhaseId::Tier2Rescan, category);
@@ -620,6 +620,24 @@ fn handle_inspect_payload(
     // than reading as zero.
     refresh_status_bar_counts(ctx, &outcomes);
 
+    // Scoped inspection never schedules or joins project-wide Tier-2 work.
+    // Missing or stale cached results are gaps, not verified zero counts.
+    if scope_was_provided {
+        for (category, outcome) in &mut outcomes {
+            if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
+                let reason = match &*outcome {
+                    JobOutcome::Failed { message } => message.clone(),
+                    JobOutcome::Stale { .. } => "cached analysis could not be stat-verified".into(),
+                    _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
+                    _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
+                };
+                *outcome = JobOutcome::Fresh {
+                    payload: serde_json::json!({"unavailable": true, "complete": false,
+                        "gaps": [{"kind": "tier2_unavailable", "reason": reason}]}),
+                };
+            }
+        }
+    }
     let payloads = match fresh_payloads(&outcomes) {
         Ok(payloads) => payloads,
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
@@ -1855,6 +1873,23 @@ fn build_inspect_payload(
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
+        if payload.get("unavailable").and_then(Value::as_bool) == Some(true) {
+            let category_gaps = payload["gaps"].as_array().expect("unavailable gaps");
+            gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
+                gap["categories"] = serde_json::json!([category.as_str()]);
+                gap
+            }));
+            summary.insert(
+                category.as_str().to_string(),
+                serde_json::json!({
+                    "unavailable": true, "complete": false, "gaps": category_gaps,
+                }),
+            );
+            if sections.includes(*category) {
+                details.insert(category.as_str().to_string(), Value::Null);
+            }
+            continue;
+        }
         let mut category_summary = summary_for(*category, payload);
         let dead_code_unavailable =
             *category == InspectCategory::DeadCode && dead_code_callgraph_unavailable(payload);
@@ -2036,6 +2071,14 @@ fn render_inspect_text(
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary);
+    // Uncomputed categories have no counts, so the incomplete-category notice
+    // is their only output.
+    let available_summary = summary
+        .iter()
+        .filter(|(_, value)| value.get("unavailable").and_then(Value::as_bool) != Some(true))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    let summary = &available_summary;
     render_not_applicable_producers(&mut lines, summary);
     render_group_category(
         &mut lines,
@@ -2103,6 +2146,12 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unavailable");
+            if gap.get("kind").and_then(Value::as_str) == Some("tier2_unavailable") {
+                lines.push(format!(
+                    "Incomplete {category}: Tier-2 unavailable ({reason})"
+                ));
+                continue;
+            }
             if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
                 let file = gap
                     .get("file")
