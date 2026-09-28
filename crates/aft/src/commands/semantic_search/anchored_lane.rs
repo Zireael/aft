@@ -200,6 +200,8 @@ pub fn find_run_occurrences(text: &str, run: &str, run_idx: usize) -> Vec<Occurr
         return Vec::new();
     }
 
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.regex_compilations += 1);
     let matcher = regex::RegexBuilder::new(&regex::escape(run))
         .case_insensitive(true)
         .build()

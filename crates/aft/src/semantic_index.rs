@@ -6162,6 +6162,8 @@ impl SemanticIndex {
                 continue;
             }
 
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.score_evaluations += 1);
             let dot = if query_vector.len() == entry.vector.len() {
                 dot_product(query_vector, &entry.vector)
             } else {
@@ -6184,6 +6186,10 @@ impl SemanticIndex {
             scored.select_nth_unstable_by(keep, semantic_score_order);
             scored.truncate(keep);
         }
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += scored.len()
+        });
         scored.sort_by(semantic_score_order);
 
         scored
@@ -8486,6 +8492,8 @@ fn collect_semantic_file(
             return Ok((indexed_metadata, lang, None));
         }
 
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record_file_read();
         let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
             cache_freshness::hash_bytes(source.as_bytes())
@@ -11318,6 +11326,77 @@ Connection: close
         let loaded = SemanticIndex::from_bytes(&bytes, &project).expect("load serialized index");
         assert_eq!(loaded.entries.len(), 0);
         assert!(loaded.file_mtimes.is_empty());
+    }
+
+    #[test]
+    #[ignore = "opt-in many-chunks and 1/100-file refresh allocation benchmark"]
+    fn hot_path_semantic_work_counts() {
+        use crate::search_hot_path_measurements::measure;
+        let temp = tempfile::tempdir().unwrap();
+        let files = (0..200)
+            .map(|n| {
+                let file = temp.path().join(format!("src/file_{n}.rs"));
+                let source = (0..40)
+                    .map(|i| format!("pub fn function_{i}() -> usize {{\n    let initial_value = {i};\n    initial_value + 1\n}}\n"))
+                    .collect::<String>();
+                write_source(&file, &source);
+                file
+            })
+            .collect::<Vec<_>>();
+        let mut index = build_recorded_test_index(temp.path(), &files);
+        assert!(index.entries.len() >= 8000, "fixture must contain many semantic chunks");
+        for entry in &mut index.entries {
+            entry.vector = entry.vector.iter().copied().cycle().take(384).collect();
+            entry.norm = vector_norm(&entry.vector);
+        }
+        index.dimension = 384;
+        let query = vec![0.5; 384];
+        let results = measure("semantic/many_chunks_per_file", || {
+            index.search_filtered(&query, 50, |_| true)
+        });
+        assert_eq!(results.len(), 50);
+        for count in [1, 100] {
+            let update = measure(&format!("semantic/refresh_{count}"), || {
+                index
+                    .refresh_invalidated_files(
+                        temp.path(),
+                        &files[..count],
+                        &mut |texts| {
+                            Ok(texts
+                                .iter()
+                                .map(|text| {
+                                    deterministic_test_vector(text)
+                                        .into_iter()
+                                        .cycle()
+                                        .take(384)
+                                        .collect()
+                                })
+                                .collect())
+                        },
+                        16,
+                        1000,
+                        &mut |_, _| {},
+                    )
+                    .unwrap()
+            });
+            std::hint::black_box(update);
+        }
+        let borrowed = SemanticIndex::from_shared_base(
+            temp.path().to_path_buf(),
+            Arc::new(index.into_shared_base().ok().unwrap()),
+        );
+        let filter_calls = std::cell::Cell::new(0);
+        let results = measure("semantic/borrowed_many_chunks_per_file", || {
+            borrowed.search_filtered(&query, 50, |_| {
+                filter_calls.set(filter_calls.get() + 1);
+                true
+            })
+        });
+        assert_eq!(results.len(), 50);
+        println!(
+            "HOT_PATH {}",
+            serde_json::json!({"case": "semantic/filter_calls", "calls": filter_calls.get()})
+        );
     }
 
     #[test]

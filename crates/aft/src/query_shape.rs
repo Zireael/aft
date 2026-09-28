@@ -176,6 +176,8 @@ pub fn extract_content_tokens(text: &str) -> Vec<String> {
 /// text slice. Exact-tier fusion supplies at most three consecutive source lines
 /// and exits as soon as every requested token has been observed.
 pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.token_scans += 1);
     if tokens.is_empty() {
         return false;
     }
