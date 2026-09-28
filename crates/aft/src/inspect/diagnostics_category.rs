@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-use crate::lsp::manager::ApplicableServerFailure;
+use crate::lsp::manager::{ApplicableServerFailure, NotApplicableServer};
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
@@ -48,6 +48,10 @@ struct DiagnosticsCollection {
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
     producer_failures: BTreeMap<String, String>,
+    /// Servers with a root marker but no file to analyze, keyed by server id.
+    /// Informational only: an inapplicable server is neither a failure nor a
+    /// gap, so it never makes the payload incomplete.
+    not_applicable: BTreeMap<String, String>,
     scope_coverage_gaps: Vec<ScopedCoverageGap>,
     /// True when the producer set this collection is responsible for has all
     /// settled (authoritative report or no longer warming). Distinct from
@@ -81,6 +85,7 @@ pub(crate) fn run_diagnostics_category(
     scope_was_provided: bool,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
+    not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
 ) -> JobOutcome {
     let mut collection = if applicability_is_empty {
@@ -94,6 +99,10 @@ pub(crate) fn run_diagnostics_category(
         collect_warm_working_set(ctx, snapshot, expected_producers)
     };
     collection.record_producer_failures(producer_failures);
+    collection.not_applicable = not_applicable
+        .iter()
+        .map(|server| (server.server_id.clone(), server.reason()))
+        .collect();
 
     if scope_was_provided {
         collection.apply_scope(scope);
@@ -403,6 +412,16 @@ impl DiagnosticsCollection {
         if !gaps.is_empty() {
             payload["complete"] = Value::Bool(false);
             payload["gaps"] = Value::Array(gaps);
+        }
+        if !self.not_applicable.is_empty() {
+            payload["not_applicable"] = Value::Array(
+                self.not_applicable
+                    .iter()
+                    .map(|(producer, reason)| {
+                        serde_json::json!({ "producer": producer, "reason": reason })
+                    })
+                    .collect(),
+            );
         }
         payload
     }

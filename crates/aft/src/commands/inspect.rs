@@ -16,7 +16,7 @@ use crate::inspect::{
 };
 use crate::lsp::manager::{
     ApplicabilityResolutionError, ApplicableServerFailure, ApplicableServerSnapshot,
-    ApplicableServerStartOutcomes,
+    ApplicableServerStartOutcomes, NotApplicableServer,
 };
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
@@ -299,7 +299,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], None, None)
+    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], None, None)
 }
 
 /// Test-only warm-path entry that preserves nonblocking diagnostics semantics
@@ -309,7 +309,17 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 #[doc(hidden)]
 pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
-    handle_inspect_payload(req, ctx, false, false, &[], &[], Some(&phase_log), None)
+    handle_inspect_payload(
+        req,
+        ctx,
+        false,
+        false,
+        &[],
+        &[],
+        &[],
+        Some(&phase_log),
+        None,
+    )
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -381,6 +391,7 @@ fn handle_inspect_payload(
     force_root_diagnostics: bool,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
+    not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
@@ -524,6 +535,7 @@ fn handle_inspect_payload(
                 scope_was_provided,
                 applicability_is_empty,
                 producer_failures,
+                not_applicable,
                 expected_producers,
             )
         } else if category.is_tier2() {
@@ -1002,6 +1014,7 @@ fn run_blocking_inspect_body(
         true,
         applicability.server_keys.is_empty(),
         &start_outcomes.failures,
+        &applicability.not_applicable,
         &start_outcomes.successful,
         Some(&phase_log),
         Some(deadline),
@@ -2001,6 +2014,7 @@ fn render_inspect_text(
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary);
+    render_not_applicable_producers(&mut lines, summary);
     render_group_category(
         &mut lines,
         "Duplicates",
@@ -2023,6 +2037,33 @@ fn render_inspect_text(
     render_diagnostics_category(&mut lines, summary, details);
 
     lines.join("\n")
+}
+
+/// Name servers that were deliberately not started because the inspected area
+/// has none of their files. Without this line a Rust repository whose
+/// `package.json` exists only to install a tool gives no hint why TypeScript
+/// produced nothing; it is not a failure and does not make the result partial.
+fn render_not_applicable_producers(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    for (category, value) in summary {
+        for entry in value
+            .get("not_applicable")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let producer = entry
+                .get("producer")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown producer");
+            let reason = entry
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no files to analyze");
+            lines.push(format!(
+                "{category}: producer {producer} not applicable ({reason})"
+            ));
+        }
+    }
 }
 
 fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, Value>) {
@@ -3043,12 +3084,16 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
 }
 
 fn diagnostics_summary_for(payload: &Value) -> Value {
-    serde_json::json!({
+    let mut summary = serde_json::json!({
         "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
         "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
         "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
         "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
-    })
+    });
+    if let Some(not_applicable) = payload.get("not_applicable") {
+        summary["not_applicable"] = not_applicable.clone();
+    }
+    summary
 }
 
 fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Value {
@@ -4450,6 +4495,7 @@ mod deferred_terminal_tests {
             &ctx,
             true,
             true,
+            &[],
             &[],
             &[],
             Some(&phase_log),

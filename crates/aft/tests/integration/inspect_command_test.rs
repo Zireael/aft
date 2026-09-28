@@ -3177,6 +3177,217 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
     }));
 }
 
+/// A Rust Cargo project whose `package.json` exists only to install a tool
+/// (Cloudflare's `wrangler` here). The manifest is a TypeScript root marker but
+/// not a TypeScript source file.
+fn wrangler_rust_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"wrangler-worker\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn worker() {}\n");
+    write_file(
+        &root,
+        "package.json",
+        "{\n  \"private\": true,\n  \"devDependencies\": { \"wrangler\": \"4.0.0\" }\n}\n",
+    );
+    (temp_dir, root)
+}
+
+/// Both the Rust and the TypeScript producers run the fake LSP child, so a
+/// TypeScript start is observable as a live server key rather than depending
+/// on whether `typescript-language-server` happens to be installed.
+fn configure_fake_rust_and_typescript_lsp(ctx: &AppContext) {
+    configure_fake_rust_lsp(ctx);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+}
+
+fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
+    ctx.lsp()
+        .active_server_keys()
+        .into_iter()
+        .map(|key| key.kind)
+        .collect()
+}
+
+/// A context whose Tier-2 aggregates are already built, so an unscoped inspect
+/// returns a fresh payload with a diagnostics summary instead of refusing
+/// while the callgraph is still building.
+fn tier2_ready_context(root: &Path) -> AppContext {
+    let ctx = configured_context_with_callgraph_store(root, true);
+    ensure_callgraph_store_ready(&ctx);
+    tier2_run(
+        &ctx,
+        &[
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ],
+    );
+    ctx
+}
+
+fn not_applicable_producers(response: &Value) -> Vec<String> {
+    response["summary"]["diagnostics"]["not_applicable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["producer"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn failed_producers(response: &Value) -> Vec<String> {
+    response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["kind"] == "failed_producer")
+        .filter_map(|gap| gap["producer"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A scoped inspect selects producers from the files inside the scope only.
+/// A JavaScript file elsewhere in the project (a checked-in `.mjs` test stub)
+/// must not start TypeScript for a scope that contains only Rust.
+#[test]
+fn scoped_rust_inspect_does_not_start_typescript_for_js_outside_the_scope() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    write_file(
+        &root,
+        "tests/usage-stub/index.mjs",
+        "export default { fetch() { return new Response(\"ok\"); } };\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-rust-with-outside-js",
+            "command": "inspect",
+            "scope": "src/lib.rs",
+        }),
+    );
+
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "a Rust-only scope must start only rust-analyzer: {response:#}"
+    );
+    assert!(
+        !failed_producers(&response).contains(&"typescript".to_string()),
+        "response: {response:#}"
+    );
+}
+
+/// With no file TypeScript handles anywhere in the project, `package.json`
+/// alone never starts it: a scoped Rust inspect starts only rust-analyzer, and
+/// an unscoped inspect names TypeScript as not applicable instead of starting
+/// it, failing it, or saying nothing.
+#[test]
+fn package_json_without_typescript_files_never_starts_typescript() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    // Each inspect gets its own context so the live-server roster after it
+    // reflects that call alone.
+    let ctx = tier2_ready_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let unscoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-wrangler",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "response: {unscoped:#}"
+    );
+    assert_eq!(
+        not_applicable_producers(&unscoped),
+        vec!["typescript".to_string()],
+        "response: {unscoped:#}"
+    );
+    assert!(
+        failed_producers(&unscoped).is_empty(),
+        "not applicable is not a failure: {unscoped:#}"
+    );
+    let text = unscoped["text"].as_str().expect("inspect text");
+    assert!(
+        text.contains("diagnostics: producer typescript not applicable (package.json found"),
+        "text: {text}"
+    );
+
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let scoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-rust-wrangler",
+            "command": "inspect",
+            "scope": "src/lib.rs",
+        }),
+    );
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "response: {scoped:#}"
+    );
+}
+
+/// Positive control for the two tests above: once the project has a
+/// TypeScript file, TypeScript is selected exactly as before, both for an
+/// unscoped inspect and for a scope naming that file.
+#[test]
+fn a_typescript_file_still_starts_typescript() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    write_file(&root, "worker/index.ts", "export const answer = 42;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+
+    let scoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-typescript",
+            "command": "inspect",
+            "scope": "worker/index.ts",
+        }),
+    );
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::TypeScript],
+        "response: {scoped:#}"
+    );
+
+    let ctx = tier2_ready_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let unscoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-typescript",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
+    let mut kinds = active_server_kinds(&ctx);
+    kinds.sort_by(|left, right| left.id_str().cmp(right.id_str()));
+    assert_eq!(
+        kinds,
+        vec![ServerKind::Rust, ServerKind::TypeScript],
+        "response: {unscoped:#}"
+    );
+    assert!(
+        not_applicable_producers(&unscoped).is_empty(),
+        "response: {unscoped:#}"
+    );
+}
+
 /// A scoped call over a warm root returns only scope-matching findings, and
 /// the same findings appear in the unscoped call.
 #[test]

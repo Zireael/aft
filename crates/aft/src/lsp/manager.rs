@@ -25,7 +25,9 @@ use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
     AftWorkspaceDiagnosticRequest,
 };
-use crate::lsp::registry::{resolve_server_binary, servers_for_file, ServerDef, ServerKind};
+use crate::lsp::registry::{
+    resolve_server_binary, servers_for_file, servers_with_root_marker, ServerDef, ServerKind,
+};
 use crate::lsp::roots::ServerKey;
 use crate::lsp::LspError;
 use crate::slog_error;
@@ -103,8 +105,37 @@ pub struct EnsureServerOutcomes {
 #[derive(Clone, Debug)]
 pub struct ApplicableServerSnapshot {
     pub server_keys: Vec<ServerKey>,
+    /// Servers whose workspace root marker was found in the resolved area but
+    /// which have no file there to analyze, so none of them is started. They
+    /// are reported so a Rust repository that ships a `package.json` only to
+    /// install a tool reads as "TypeScript not applicable", not as silence or
+    /// as a broken TypeScript project.
+    pub not_applicable: Vec<NotApplicableServer>,
     candidates: Vec<ApplicableServerCandidate>,
     producer_failures: Vec<ApplicableServerFailure>,
+}
+
+/// A configured server that has a root marker but nothing to analyze.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotApplicableServer {
+    /// Stable server identifier (kind ID, e.g. "typescript").
+    pub server_id: String,
+    /// The root marker file that was found (for example `package.json`).
+    pub marker: String,
+    /// File extensions the server handles, none of which were found.
+    pub extensions: Vec<String>,
+}
+
+impl NotApplicableServer {
+    pub fn reason(&self) -> String {
+        let extensions = self
+            .extensions
+            .iter()
+            .map(|extension| format!(".{extension}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{} found, but no {extensions} files", self.marker)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -572,9 +603,11 @@ impl LspManager {
     }
 
     /// Resolve inspect producers within the request deadline. A scoped inspect
-    /// may start rust-analyzer only for the Cargo workspace that owns each scope;
-    /// an unrelated nested workspace must not gain a process merely because it
-    /// lives elsewhere under the configured project root.
+    /// considers only files inside the scope: a server is selected only when at
+    /// least one scoped file is one it handles, so a scope of `.rs` files never
+    /// starts TypeScript because some `.mjs` file lives elsewhere in the
+    /// project, and rust-analyzer starts only for the Cargo workspace that owns
+    /// the scoped Rust files, not for an unrelated nested workspace.
     pub fn resolve_applicable_servers_for_inspect(
         &self,
         project_root: &Path,
@@ -585,6 +618,14 @@ impl LspManager {
         self.resolve_applicable_servers(project_root, scope_roots, config, Some(deadline))
     }
 
+    /// Walk the resolved area and select the servers that have a file to analyze.
+    ///
+    /// Selection is by source files only: a server is a candidate when a walked
+    /// file has one of its extensions and a workspace root can be found for that
+    /// file. A root marker such as `package.json` never selects a server by
+    /// itself; a marker whose server ends up with no file is reported in
+    /// `not_applicable` instead. The walked area is the scope when one is given
+    /// (each scope root, file or directory) and the whole project otherwise.
     fn resolve_applicable_servers(
         &self,
         project_root: &Path,
@@ -599,10 +640,21 @@ impl LspManager {
             });
         }
 
+        let walk_roots = match scope_roots.filter(|roots| !roots.is_empty()) {
+            Some(roots) => roots.to_vec(),
+            None => vec![project_root.to_path_buf()],
+        };
+
         let mut candidates = HashMap::<ServerKey, ApplicableServerCandidate>::new();
         let mut producer_failures = HashMap::<ServerKey, ApplicableServerFailure>::new();
+        // First root marker seen per server kind, with the directory holding it.
+        let mut markers = HashMap::<ServerKind, (ServerDef, PathBuf, String)>::new();
         // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-        let walker = ignore::WalkBuilder::new(project_root)
+        let mut builder = ignore::WalkBuilder::new(&walk_roots[0]);
+        for root in &walk_roots[1..] {
+            builder.add(root);
+        }
+        let walker = builder
             .same_file_system(true)
             .standard_filters(true)
             .add_custom_ignore_filename(".aftignore")
@@ -631,6 +683,20 @@ impl LspManager {
                 continue;
             }
             let file = entry.path();
+            for definition in servers_with_root_marker(file, config) {
+                if markers.contains_key(&definition.kind) {
+                    continue;
+                }
+                let marker_dir = file.parent().unwrap_or(project_root).to_path_buf();
+                let marker_name = file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                markers.insert(
+                    definition.kind.clone(),
+                    (definition, marker_dir, marker_name),
+                );
+            }
             for definition in servers_for_file(file, config) {
                 let Some(key) = server_key_for_definition(&definition, file, config) else {
                     continue;
@@ -671,27 +737,28 @@ impl LspManager {
             }
         }
 
-        if let Some(scope_roots) = scope_roots.filter(|roots| !roots.is_empty()) {
-            let rust_roots = candidates
-                .keys()
-                .chain(producer_failures.keys())
-                .filter(|key| key.kind == ServerKind::Rust)
-                .map(|key| key.root.clone())
-                .collect::<HashSet<_>>();
-            let mut owners = HashSet::new();
-            for scope_root in scope_roots {
-                if let Some(owner) = rust_roots
-                    .iter()
-                    .filter(|root| scope_root.starts_with(root))
-                    .max_by_key(|root| root.components().count())
-                {
-                    owners.insert(owner.clone());
-                }
-            }
-            candidates.retain(|key, _| key.kind != ServerKind::Rust || owners.contains(&key.root));
-            producer_failures
-                .retain(|key, _| key.kind != ServerKind::Rust || owners.contains(&key.root));
-        }
+        let selected_kinds = candidates
+            .keys()
+            .chain(producer_failures.keys())
+            .map(|key| key.kind.clone())
+            .collect::<HashSet<_>>();
+        // Only a server that could actually have run is worth naming: one whose
+        // binary resolves. Markers of servers the user does not have installed
+        // (Astro and Prisma also use `package.json`) would otherwise add a
+        // not-applicable line for tools nobody expects.
+        let mut not_applicable = markers
+            .into_values()
+            .filter(|(definition, _, _)| !selected_kinds.contains(&definition.kind))
+            .filter(|(definition, marker_dir, _)| {
+                self.resolve_binary(definition, marker_dir, config).is_ok()
+            })
+            .map(|(definition, _, marker)| NotApplicableServer {
+                server_id: definition.kind.id_str().to_string(),
+                marker,
+                extensions: definition.extensions.clone(),
+            })
+            .collect::<Vec<_>>();
+        not_applicable.sort_by(|left, right| left.server_id.cmp(&right.server_id));
 
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| server_key_sort(&left.key, &right.key));
@@ -710,6 +777,7 @@ impl LspManager {
         server_keys.sort_by(server_key_sort);
         Ok(ApplicableServerSnapshot {
             server_keys,
+            not_applicable,
             candidates,
             producer_failures,
         })
@@ -740,6 +808,7 @@ impl LspManager {
     ) -> ApplicableServerStartOutcomes {
         let single = ApplicableServerSnapshot {
             server_keys: vec![server.clone()],
+            not_applicable: Vec::new(),
             candidates: snapshot
                 .candidates
                 .iter()

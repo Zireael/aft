@@ -711,6 +711,55 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .collect()
 }
 
+/// Find every enabled server definition for which `path` is a root marker that
+/// signals the server's language is in use (for example `package.json` for the
+/// TypeScript server). A marker only says where a server's workspace would
+/// start; it does not mean the server has any files to analyze.
+pub fn servers_with_root_marker(path: &Path, config: &Config) -> Vec<ServerDef> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+
+    resolved_servers(config)
+        .into_iter()
+        .filter(|server| !is_disabled(server, config))
+        .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+        .filter(|server| {
+            server
+                .root_markers
+                .iter()
+                .chain(server.priority_root_markers.iter())
+                .any(|marker| marker == file_name)
+        })
+        .filter(|server| marker_signals_language(file_name, server))
+        .collect()
+}
+
+/// Several servers borrow generic files as workspace-root fallbacks: Bash and
+/// YAML use `package.json` and `.git`, Vue and Astro use package-manager
+/// lockfiles, Prisma uses `package.json`. Those files say a JavaScript
+/// package lives here, not that shell scripts or Vue components do, so they
+/// signal only servers that handle JavaScript or TypeScript files; `.git`
+/// signals nothing. Every other marker (`Cargo.toml`, `tsconfig.json`,
+/// `astro.config.mjs`, ...) is specific to its server.
+fn marker_signals_language(marker: &str, server: &ServerDef) -> bool {
+    const JS_PACKAGE_FILES: &[&str] = &[
+        "package.json",
+        "package-lock.json",
+        "bun.lock",
+        "bun.lockb",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    ];
+    if marker == ".git" {
+        return false;
+    }
+    if JS_PACKAGE_FILES.contains(&marker) {
+        return server.matches_extension("js") || server.matches_extension("ts");
+    }
+    true
+}
+
 /// Resolve the full server set after applying user overrides.
 ///
 /// When a user-defined server's `id` matches a built-in server's `id_str()`
