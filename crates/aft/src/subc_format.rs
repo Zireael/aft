@@ -2673,6 +2673,9 @@ fn format_call_tree_sections(
 
     let mut lines = Vec::new();
     render_call_tree_node(record, 0, &mut lines, include_unresolved);
+    if let Some(gap) = string_field(record, "gap") {
+        lines.push(gap.to_string());
+    }
     let hidden_test_callers = number_field(record, "hidden_test_callers").unwrap_or(0);
     if hidden_test_callers > 0 {
         lines.push(format!(
@@ -2682,7 +2685,10 @@ fn format_call_tree_sections(
     let is_envelope_governed =
         crate::list_surfaces::find_surface("callgraph", "call_tree", "payload.tree").is_some();
     let truncated = number_field(record, "truncated").unwrap_or(0);
-    let warning = if envelope.is_some() || (is_envelope_governed && truncated == 0) {
+    let warning = if record.contains_key("gap")
+        || envelope.is_some()
+        || (is_envelope_governed && truncated == 0)
+    {
         String::new()
     } else {
         depth_warning(record, "depth_limited", "truncated")

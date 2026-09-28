@@ -608,6 +608,9 @@ pub struct CallTreeNode {
     pub work_gap: Option<CallTreeWorkGap>,
 }
 
+pub const CALL_TREE_NODE_BUDGET: usize = 1000;
+pub const CALL_TREE_WORK_GAP: &str = "Call tree cut short: examined 1000 call nodes (work budget); additional nodes not examined · narrow: symbol, depth";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CallTreeWorkGap {
     pub complete: bool,

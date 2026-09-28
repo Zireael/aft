@@ -1317,6 +1317,7 @@ fn make_tree_value(count: usize, depth_limited: bool) -> Value {
             truncated: 0,
             hidden_test_callers: 0,
             tree_list_envelope: None,
+            work_gap: None,
         })
         .collect::<Vec<_>>();
     let (shown, total) = cap_items(&mut children);
@@ -1333,6 +1334,7 @@ fn make_tree_value(count: usize, depth_limited: bool) -> Value {
         truncated: 0,
         hidden_test_callers: 0,
         tree_list_envelope: build_callgraph_envelope(Unit::Items, shown, total, 0),
+        work_gap: None,
     };
     serde_json::to_value(result).expect("call tree fixture serialization")
 }
@@ -1460,6 +1462,7 @@ fn make_capped_tree_value(count: usize) -> Value {
             truncated: 0,
             hidden_test_callers: 0,
             tree_list_envelope: None,
+            work_gap: None,
         })
         .collect::<Vec<_>>();
     let (shown, total) = cap_items(&mut children);
@@ -1477,6 +1480,7 @@ fn make_capped_tree_value(count: usize) -> Value {
         truncated: 0,
         hidden_test_callers: 0,
         tree_list_envelope,
+        work_gap: None,
     };
     serde_json::to_value(result).expect("capped call tree fixture serialization")
 }

@@ -5688,15 +5688,27 @@ impl CallGraphStore {
         symbol: &str,
         max_depth: usize,
     ) -> Result<callgraph::CallTreeNode> {
-        let node = self.node_for(file_rel, symbol)?;
+        self.refresh_read_marker()?;
+        let abs_path = normalize_file_path(&self.project_root, file_rel)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
         let mut visited = HashSet::new();
-        let mut remaining = 1000;
-        let mut tree = call_tree_inner(self, &node, max_depth.min(100), 0, &mut visited, &mut remaining)?;
+        let mut remaining = callgraph::CALL_TREE_NODE_BUDGET;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        let node = resolve_node_for_rel(&conn, &rel_path, symbol)?;
+        let mut tree = call_tree_inner(
+            &conn,
+            &node,
+            max_depth.min(100),
+            0,
+            &mut visited,
+            &mut remaining,
+        )?;
         if remaining == 0 && tree.truncated > 0 {
             tree.work_gap = Some(callgraph::CallTreeWorkGap {
                 complete: false,
-                nodes_examined: 1000,
-                gap: "shown 1000 of at least 1001 call nodes (work budget) · narrow: symbol, depth".into(),
+                nodes_examined: callgraph::CALL_TREE_NODE_BUDGET,
+                gap: callgraph::CALL_TREE_WORK_GAP.into(),
             });
         }
         Ok(tree)
@@ -7040,7 +7052,11 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
     outgoing_calls_for_node_limited(conn, node, usize::MAX)
 }
 
-fn outgoing_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: usize) -> Result<Vec<StoreCallSite>> {
+fn outgoing_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
@@ -7054,20 +7070,23 @@ fn outgoing_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: u
          WHERE e.kind = 'call' AND e.source_node = ?1
           ORDER BY r.byte_start, r.line, r.ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-        let target = optional_store_node_from_row_at(row, 7)?;
-        Ok(StoreCallSite {
-            caller: node.clone(),
-            target_file: row.get(0)?,
-            target_symbol: row.get(1)?,
-            target,
-            line: row.get::<_, i64>(2)?.max(0) as u32,
-            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
-            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
-            resolved: row.get::<_, String>(5)? == "resolved",
-            provenance: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            let target = optional_store_node_from_row_at(row, 7)?;
+            Ok(StoreCallSite {
+                caller: node.clone(),
+                target_file: row.get(0)?,
+                target_symbol: row.get(1)?,
+                target,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+                resolved: row.get::<_, String>(5)? == "resolved",
+                provenance: row.get(6)?,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -7142,16 +7161,19 @@ fn unresolved_calls_for_node_limited(
            )
           ORDER BY byte_start, line, ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-        Ok(StoreUnresolvedCall {
-            caller: node.clone(),
-            symbol: row.get(0)?,
-            full_ref: row.get(1)?,
-            line: row.get::<_, i64>(2)?.max(0) as u32,
-            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
-            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok(StoreUnresolvedCall {
+                caller: node.clone(),
+                symbol: row.get(0)?,
+                full_ref: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -7161,7 +7183,11 @@ fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<Sto
     forward_calls_for_node_limited(conn, node, usize::MAX)
 }
 
-fn forward_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: usize) -> Result<Vec<StoreForwardCall>> {
+fn forward_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreForwardCall>> {
     let mut calls = Vec::new();
     calls.extend(
         outgoing_calls_for_node_limited(conn, node, limit)?
@@ -7208,7 +7234,7 @@ fn forward_call_count_for_node(conn: &Connection, node: &StoreNode) -> Result<us
 }
 
 fn call_tree_inner(
-    store: &CallGraphStore,
+    conn: &Connection,
     node: &StoreNode,
     max_depth: usize,
     current_depth: usize,
@@ -7237,11 +7263,7 @@ fn call_tree_inner(
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
-        let calls = {
-            let conn = store.conn.lock().expect("callgraph store mutex poisoned");
-            store.ensure_ready(&conn)?;
-            forward_calls_for_node_limited(&conn, node, remaining.saturating_add(1))?
-        };
+        let calls = forward_calls_for_node_limited(conn, node, remaining.saturating_add(1))?;
         for call in calls {
             if *remaining == 0 {
                 truncated += 1;
@@ -7250,8 +7272,14 @@ fn call_tree_inner(
             match call {
                 StoreForwardCall::Resolved(site) => {
                     if let Some(target) = site.target {
-                        let child =
-                            call_tree_inner(store, &target, max_depth, current_depth + 1, visited, remaining)?;
+                        let child = call_tree_inner(
+                            conn,
+                            &target,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                            remaining,
+                        )?;
                         depth_limited |= child.depth_limited;
                         truncated += child.truncated;
                         children.push(child);
@@ -7266,7 +7294,7 @@ fn call_tree_inner(
                             children: Vec::new(),
                             depth_limited: false,
                             work_gap: None,
-            truncated: 0,
+                            truncated: 0,
                         });
                     }
                 }
@@ -7281,15 +7309,13 @@ fn call_tree_inner(
                         children: Vec::new(),
                         depth_limited: false,
                         work_gap: None,
-            truncated: 0,
+                        truncated: 0,
                     });
                 }
             }
         }
     } else {
-        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
-        store.ensure_ready(&conn)?;
-        truncated = forward_call_count_for_node(&conn, node)?;
+        truncated = forward_call_count_for_node(conn, node)?;
         depth_limited = truncated > 0;
     }
 

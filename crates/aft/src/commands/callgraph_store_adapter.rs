@@ -107,6 +107,8 @@ pub struct StoreCallTreeNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
     pub children: Vec<StoreCallTreeNode>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub work_gap: Option<crate::callgraph::CallTreeWorkGap>,
     pub depth_limited: bool,
     pub truncated: usize,
     #[serde(skip_serializing_if = "is_zero")]
@@ -594,15 +596,24 @@ pub fn call_tree_result(
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
     let mut adjacency_cache = HashMap::new();
+    let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
     let mut tree = call_tree_inner(
         store,
         &target,
-        depth,
+        depth.min(100),
         0,
         &mut visited,
         &mut adjacency_cache,
         true,
+        &mut remaining,
     )?;
+    if remaining == 0 && tree.truncated > 0 {
+        tree.work_gap = Some(crate::callgraph::CallTreeWorkGap {
+            complete: false,
+            nodes_examined: crate::callgraph::CALL_TREE_NODE_BUDGET,
+            gap: crate::callgraph::CALL_TREE_WORK_GAP.into(),
+        });
+    }
     let hidden_test_callers = if include_tests {
         0
     } else {
@@ -619,6 +630,15 @@ pub fn call_tree_result(
         total_children,
         tree.truncated.max(usize::from(tree.depth_limited)),
     );
+    if tree.work_gap.is_some() {
+        tree.tree_list_envelope = Some(ListEnvelope::new(
+            shown,
+            crate::list_envelope::Total::AtLeast(total_children),
+            Unit::Items,
+            vec![crate::list_envelope::Reason::Cap],
+            &["symbol", "depth"],
+        ));
+    }
     Ok(tree)
 }
 
@@ -2272,7 +2292,9 @@ fn call_tree_inner(
     visited: &mut HashSet<(String, String)>,
     adjacency_cache: &mut HashMap<(String, String), Vec<ForwardCall>>,
     memoize_adjacency: bool,
+    remaining: &mut usize,
 ) -> StoreAdapterResult<StoreCallTreeNode> {
+    *remaining -= 1;
     let node = &current.representative;
     let visit_key = (node.file.clone(), node.symbol.clone());
     if visited.contains(&visit_key) {
@@ -2289,6 +2311,7 @@ fn call_tree_inner(
             truncated: 0,
             hidden_test_callers: 0,
             tree_list_envelope: None,
+            work_gap: None,
         });
     }
     visited.insert(visit_key.clone());
@@ -2312,6 +2335,10 @@ fn call_tree_inner(
 
     if current_depth < max_depth {
         for call in calls {
+            if *remaining == 0 {
+                truncated += 1;
+                break;
+            }
             match call {
                 ForwardCall::Resolved(site) => {
                     let resolved = resolve_exact_symbol(
@@ -2329,6 +2356,7 @@ fn call_tree_inner(
                             visited,
                             adjacency_cache,
                             memoize_adjacency,
+                            remaining,
                         )?;
                         child.approximate = edge_approximate(&site);
                         child.resolved_by = edge_resolved_by(&site);
@@ -2336,6 +2364,7 @@ fn call_tree_inner(
                         truncated += child.truncated;
                         children.push(child);
                     } else {
+                        *remaining -= 1;
                         children.push(StoreCallTreeNode {
                             name: site.target_symbol.clone(),
                             file: site.target_file.clone(),
@@ -2349,23 +2378,28 @@ fn call_tree_inner(
                             truncated: 0,
                             hidden_test_callers: 0,
                             tree_list_envelope: None,
+                            work_gap: None,
                         });
                     }
                 }
-                ForwardCall::Unresolved(call) => children.push(StoreCallTreeNode {
-                    name: call.symbol,
-                    file: call.caller.file,
-                    line: call.line,
-                    signature: None,
-                    resolved: false,
-                    approximate: None,
-                    resolved_by: None,
-                    children: Vec::new(),
-                    depth_limited: false,
-                    truncated: 0,
-                    hidden_test_callers: 0,
-                    tree_list_envelope: None,
-                }),
+                ForwardCall::Unresolved(call) => {
+                    *remaining -= 1;
+                    children.push(StoreCallTreeNode {
+                        name: call.symbol,
+                        file: call.caller.file,
+                        line: call.line,
+                        signature: None,
+                        resolved: false,
+                        approximate: None,
+                        resolved_by: None,
+                        children: Vec::new(),
+                        depth_limited: false,
+                        truncated: 0,
+                        hidden_test_callers: 0,
+                        tree_list_envelope: None,
+                        work_gap: None,
+                    });
+                }
             }
         }
     } else if !calls.is_empty() {
@@ -2387,6 +2421,7 @@ fn call_tree_inner(
         truncated,
         hidden_test_callers: 0,
         tree_list_envelope: None,
+        work_gap: None,
     })
 }
 
@@ -2917,6 +2952,7 @@ mod trace_to_tests {
         };
         let mut visited = HashSet::new();
         let mut unused_cache = HashMap::new();
+        let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
         let mut uncached = call_tree_inner(
             &store,
             &resolved_root,
@@ -2925,6 +2961,7 @@ mod trace_to_tests {
             &mut visited,
             &mut unused_cache,
             false,
+            &mut remaining,
         )
         .expect("uncached call tree");
         let uncached_queries = store.total_forward_queries();
