@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-notes-format",
+    "daemon-write-investigation",
+    "plugin-e2e-ci"
+  ],
+  "note": "Release-notes format doc, a write investigation with ignored offline probes, and plugin e2e suites added to Linux CI with the subc-core test pin raised. No ranking-fence file touched."
+}
