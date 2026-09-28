@@ -1050,7 +1050,18 @@ pub(crate) fn push_fuzzy_replacement(
     matched: &crate::fuzzy_match::FuzzyMatch,
     replacement: &str,
 ) {
-    output.push_str(replacement);
+    let end = matched.byte_start + matched.byte_len;
+    // When the match leaves the source line separator outside its span, a
+    // replacement ending in a newline must not introduce a second separator.
+    let separator_is_outside = matched.pass > 1
+        && source[end..]
+            .trim_start_matches(|c| c == ' ' || c == '\t')
+            .starts_with('\n');
+    if separator_is_outside && replacement.ends_with('\n') {
+        output.push_str(&replacement[..replacement.len() - 1]);
+    } else {
+        output.push_str(replacement);
+    }
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
         output.push('\n');
     }
@@ -1297,6 +1308,15 @@ fn handle_single_file_edit_match(
         if source == new_source {
             result["no_op"] = serde_json::json!(true);
         }
+        if fuzzy_matches[0].pass > 1 {
+            let selected = if replace_all {
+                &fuzzy_matches[..]
+            } else {
+                &fuzzy_matches[occurrence.unwrap_or(0)..occurrence.unwrap_or(0) + 1]
+            };
+            result["fuzzy_match"] =
+                crate::fuzzy_match::replacement_detail(&source, match_str, selected);
+        }
         edit::attach_preview_diff(&mut result, &req.params, file, &source, &new_source);
         return Response::success(&req.id, result);
     }
@@ -1354,6 +1374,15 @@ fn handle_single_file_edit_match(
         "formatted": write_result.formatted,
     });
 
+    if fuzzy_matches[0].pass > 1 {
+        let selected = if replace_all {
+            &fuzzy_matches[..]
+        } else {
+            &fuzzy_matches[occurrence.unwrap_or(0)..occurrence.unwrap_or(0) + 1]
+        };
+        result["fuzzy_match"] =
+            crate::fuzzy_match::replacement_detail(&source, match_str, selected);
+    }
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }

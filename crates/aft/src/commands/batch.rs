@@ -17,6 +17,7 @@ struct ResolvedEdit {
     byte_start: usize,
     byte_end: usize,
     replacement: String,
+    fuzzy_match: Option<serde_json::Value>,
 }
 
 /// Handle a `batch` request.
@@ -91,6 +92,11 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let fuzzy_matches: Vec<_> = resolved
+        .iter()
+        .filter_map(|r| r.fuzzy_match.clone())
+        .collect();
+
     // Phase 2: Sort edits by byte_start descending (bottom-to-top) to prevent drift
     resolved.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
 
@@ -132,6 +138,9 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         });
         if source == content {
             result["no_op"] = serde_json::json!(true);
+        }
+        if !fuzzy_matches.is_empty() {
+            result["fuzzy_matches"] = serde_json::json!(fuzzy_matches);
         }
         edit::attach_preview_diff(&mut result, &req.params, file, &source, &content);
         return Response::success(&req.id, result);
@@ -175,6 +184,10 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         "edits_applied": edits.len(),
         "formatted": write_result.formatted,
     });
+
+    if !fuzzy_matches.is_empty() {
+        result["fuzzy_matches"] = serde_json::json!(fuzzy_matches);
+    }
 
     // Aggregate diff counts across all applied edits, computed from the
     // original source vs the final (post-format) on-disk content. Without
@@ -313,24 +326,10 @@ fn resolve_edit(
 
         let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(source, match_str);
 
-        // Fuzzy passes (>= 2) are line-based and set the byte range to include
-        // the trailing newline after the last matched line, even when the user's
-        // match had none. Applying `newString` verbatim over that range merges
-        // the last replaced line with the next one (#83). Re-append a newline
-        // when the matched range ended in one and the replacement does not —
-        // mirrors edit_match.rs and batch's own line-range mode. The exact pass
-        // (1) matches byte-for-byte, so its trailing newline is left untouched.
         let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
-            let byte_end = m.byte_start + m.byte_len;
-            let range_has_trailing_nl = m.pass >= 2
-                && byte_end > 0
-                && byte_end <= source.len()
-                && source.as_bytes()[byte_end - 1] == b'\n';
-            if range_has_trailing_nl && !replacement.is_empty() && !replacement.ends_with('\n') {
-                format!("{replacement}\n")
-            } else {
-                replacement.to_string()
-            }
+            let mut output = String::new();
+            super::edit_match::push_fuzzy_replacement(&mut output, source, m, replacement);
+            output
         };
 
         if fuzzy_matches.is_empty() {
@@ -359,6 +358,13 @@ fn resolve_edit(
                     byte_start: m.byte_start,
                     byte_end: m.byte_start + m.byte_len,
                     replacement: effective_replacement(m),
+                    fuzzy_match: (m.pass > 1).then(|| {
+                        crate::fuzzy_match::replacement_detail(
+                            source,
+                            match_str,
+                            std::slice::from_ref(m),
+                        )
+                    }),
                 })
                 .collect());
         }
@@ -381,6 +387,13 @@ fn resolve_edit(
                 byte_start: m.byte_start,
                 byte_end: m.byte_start + m.byte_len,
                 replacement: effective_replacement(m),
+                fuzzy_match: (m.pass > 1).then(|| {
+                    crate::fuzzy_match::replacement_detail(
+                        source,
+                        match_str,
+                        std::slice::from_ref(m),
+                    )
+                }),
             }]);
         }
 
@@ -421,6 +434,9 @@ fn resolve_edit(
             byte_start: m.byte_start,
             byte_end: m.byte_start + m.byte_len,
             replacement: effective_replacement(m),
+            fuzzy_match: (m.pass > 1).then(|| {
+                crate::fuzzy_match::replacement_detail(source, match_str, std::slice::from_ref(m))
+            }),
         }])
     } else if edit_val.get("line_start").is_some() {
         // Line-range replacement
@@ -506,6 +522,7 @@ fn resolve_edit(
                 byte_start: byte_pos,
                 byte_end: byte_pos,
                 replacement: replacement_str,
+                fuzzy_match: None,
             }]);
         }
 
@@ -541,6 +558,7 @@ fn resolve_edit(
                 byte_start: byte_pos,
                 byte_end: byte_pos,
                 replacement: replacement_str,
+                fuzzy_match: None,
             }]);
         }
 
@@ -573,6 +591,7 @@ fn resolve_edit(
             byte_start,
             byte_end,
             replacement: replacement_str,
+            fuzzy_match: None,
         }])
     } else {
         Err(Response::error(

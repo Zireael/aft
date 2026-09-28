@@ -60,6 +60,7 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
         &needle_lines,
         &line_byte_offsets,
         haystack,
+        needle,
         |a, b| a.trim_end() == b.trim_end(),
         2,
     );
@@ -73,6 +74,7 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
         &needle_lines,
         &line_byte_offsets,
         haystack,
+        needle,
         |a, b| a.trim() == b.trim(),
         3,
     );
@@ -101,6 +103,7 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
         &normalized_needle_refs,
         &line_byte_offsets,
         haystack,
+        needle,
         |a, b| a == b,
         4,
     );
@@ -111,7 +114,13 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
     // Pass 5: final fallback for formatter reflows. This pass deliberately
     // runs only after every line-contiguous pass fails, and each candidate
     // window must have the same non-whitespace content as the needle.
-    find_reflow_matches(&haystack_lines, &needle_lines, &line_byte_offsets, haystack)
+    find_reflow_matches(
+        &haystack_lines,
+        &needle_lines,
+        &line_byte_offsets,
+        haystack,
+        needle,
+    )
 }
 
 pub(crate) fn render_nearest_miss_detail(source: &str, needle: &str) -> String {
@@ -245,6 +254,7 @@ fn find_line_matches<F>(
     needle_lines: &[&str],
     line_offsets: &[usize],
     haystack: &str,
+    needle: &str,
     compare: F,
     pass: u8,
 ) -> Vec<FuzzyMatch>
@@ -271,14 +281,94 @@ where
         } else {
             haystack.len()
         };
-        matches.push(FuzzyMatch {
-            byte_start,
-            byte_len: byte_end - byte_start,
-            pass,
-        });
+        matches.push(boundary_match(haystack, needle, byte_start, byte_end, pass));
     }
 
     matches
+}
+
+// Match line windows for comparison, but leave whitespace outside the caller's
+// boundary text in place. In particular a missing terminal newline is not an
+// instruction to remove the line separator.
+fn boundary_match(source: &str, needle: &str, start: usize, end: usize, pass: u8) -> FuzzyMatch {
+    let window = &source[start..end];
+    let source_first = window.lines().next().unwrap_or("");
+    let needle_first = needle.lines().next().unwrap_or("");
+    let source_lead = source_first
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let needle_lead = needle_first
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let leading_extra = source_lead.saturating_sub(needle_lead);
+    let byte_start = start
+        + source_first
+            .chars()
+            .take(leading_extra)
+            .map(char::len_utf8)
+            .sum::<usize>();
+
+    let source_last = window
+        .trim_end_matches('\n')
+        .split('\n')
+        .next_back()
+        .unwrap_or("");
+    let needle_last = needle
+        .trim_end_matches('\n')
+        .split('\n')
+        .next_back()
+        .unwrap_or("");
+    let source_tail = source_last
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let needle_tail = needle_last
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let trailing_extra = source_tail.saturating_sub(needle_tail);
+    let mut byte_end = end;
+    if window.ends_with('\n') && (!needle.ends_with('\n') || trailing_extra > 0) {
+        byte_end -= 1;
+    }
+    byte_end -= source_last
+        .chars()
+        .rev()
+        .take(trailing_extra)
+        .map(char::len_utf8)
+        .sum::<usize>();
+    FuzzyMatch {
+        byte_start,
+        byte_len: byte_end - byte_start,
+        pass,
+    }
+}
+
+/// Describe fuzzy replacements only when the bytes being replaced contain
+/// non-whitespace content different from the requested text.
+pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) -> serde_json::Value {
+    let pass = matches.first().map(|m| m.pass).unwrap_or(1);
+    let actual: Vec<String> = matches
+        .iter()
+        .filter_map(|m| {
+            let text = &source[m.byte_start..m.byte_start + m.byte_len];
+            let content = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            (content(text) != content(needle)).then(|| {
+                let escaped = text.escape_debug().to_string();
+                let excerpt: String = escaped.chars().take(160).collect();
+                if escaped.chars().count() > 160 {
+                    format!("{excerpt}…")
+                } else {
+                    excerpt
+                }
+            })
+        })
+        .collect();
+    serde_json::json!({"pass": pass, "replaced_text": actual})
 }
 
 const REFLOW_NON_WS_TOLERANCE: usize = 8;
@@ -288,6 +378,7 @@ fn find_reflow_matches(
     needle_lines: &[&str],
     line_offsets: &[usize],
     haystack: &str,
+    needle: &str,
 ) -> Vec<FuzzyMatch> {
     let needle_text = needle_lines.join("\n");
     let normalized_needle = normalize_reflow_whitespace(&needle_text);
@@ -340,11 +431,7 @@ fn find_reflow_matches(
             } else {
                 haystack.len()
             };
-            matches.push(FuzzyMatch {
-                byte_start,
-                byte_len: byte_end - byte_start,
-                pass: 5,
-            });
+            matches.push(boundary_match(haystack, needle, byte_start, byte_end, 5));
         }
     }
 
@@ -409,6 +496,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn table_boundary_preserves_skipped_whitespace_and_separator() {
+        let source = "  | For  a task | b |  \n  | For  a task | b |  \n";
+        let matches = find_all_fuzzy(source, "| For a task | b |");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].pass, 5);
+        let mut result = source.to_string();
+        for m in matches.iter().rev() {
+            result.replace_range(m.byte_start..m.byte_start + m.byte_len, "| Changed | b |");
+        }
+        assert_eq!(result, "  | Changed | b |  \n  | Changed | b |  \n");
+        assert!(find_all_fuzzy("| a  | b |\n", "a | b |").is_empty());
+        assert_eq!(find_all_fuzzy("| a | b |\n", "| a | b |")[0].pass, 1);
+    }
+
+    #[test]
+    fn replacement_detail_exposes_unicode_difference_but_not_padding() {
+        let source = "  let title = “hello”;  \n";
+        let needle = "let title = \"hello\";";
+        let matches = find_all_fuzzy(source, needle);
+        let detail = replacement_detail(source, needle, &matches);
+        assert_eq!(detail["pass"], 4);
+        assert_eq!(detail["replaced_text"][0], "let title = “hello”;");
+        let padded = find_all_fuzzy("  foo  \n", "foo   ");
+        assert!(
+            replacement_detail("  foo  \n", "foo   ", &padded)["replaced_text"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_exact_match() {
         let matches = find_all_fuzzy("hello world", "world");
         assert_eq!(matches.len(), 1);
@@ -460,7 +579,7 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pass, 4);
-        assert_eq!(matches[0].byte_start, source.find("  let title").unwrap());
+        assert_eq!(matches[0].byte_start, source.find("let title").unwrap());
     }
 
     #[test]
@@ -490,7 +609,7 @@ mod tests {
         assert_eq!(matches[0].byte_start, source.find("let total").unwrap());
         assert_eq!(
             &source[matches[0].byte_start..matches[0].byte_start + matches[0].byte_len],
-            "let total = alpha +\n    beta +\n    gamma;\n"
+            "let total = alpha +\n    beta +\n    gamma;"
         );
     }
 
@@ -505,7 +624,7 @@ mod tests {
         assert_eq!(matches[0].byte_start, source.find("let total").unwrap());
         assert_eq!(
             &source[matches[0].byte_start..matches[0].byte_start + matches[0].byte_len],
-            "let total = alpha + beta + gamma;\n"
+            "let total = alpha + beta + gamma;"
         );
     }
 

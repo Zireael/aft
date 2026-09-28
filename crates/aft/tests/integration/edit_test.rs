@@ -1084,6 +1084,29 @@ fn edit_match_handles_brackets_in_relative_literal_path() {
 // ============================================================================
 
 #[test]
+fn batch_table_replace_all_preserves_fuzzy_boundaries() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("table.md");
+    fs::write(
+        &target,
+        "  | For  a task | b |  \n  | For  a task | b |  \n",
+    )
+    .unwrap();
+    let resp = aft.send(&serde_json::json!({
+        "id": "batch-table", "command": "batch", "file": target,
+        "edits": [{"oldString": "| For a task | b |", "newString": "| Changed | b |", "replaceAll": true}]
+    }).to_string());
+    assert_eq!(resp["success"], true, "{resp:?}");
+    assert_eq!(resp["fuzzy_matches"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "  | Changed | b |  \n  | Changed | b |  \n"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn batch_multiple_edits() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -1324,7 +1347,7 @@ fn batch_fuzzy_preserves_trailing_newline() {
 
     let result = fs::read_to_string(&target).unwrap();
     assert!(
-        result.contains("  const c = 3;\n  return a + b;"),
+        result.contains("  const c = 3;   \n  return a + b;"),
         "the line after the match must not be merged: {result:?}"
     );
     assert!(
@@ -1576,8 +1599,8 @@ fn batch_fuzzy_matching_covers_all_progressive_passes() {
         fs::read_to_string(&target).unwrap(),
         concat!(
             "exact = 10\n",
-            "trailing = 20\n",
-            "trimmed = 30\n",
+            "trailing = 20   \n",
+            "    trimmed = 30   \n",
             "normalized space = 40\n"
         )
     );
