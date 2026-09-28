@@ -363,7 +363,14 @@ function normalizeRoot(text: string, root: string): string {
   const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const slashRoot = root.split(sep).join("/");
   const escapedSlashRoot = slashRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text
-    .replace(new RegExp(escapedRoot, "g"), "<ROOT>")
-    .replace(new RegExp(escapedSlashRoot, "g"), "<ROOT>");
+  return (
+    text
+      .replace(new RegExp(escapedRoot, "g"), "<ROOT>")
+      .replace(new RegExp(escapedSlashRoot, "g"), "<ROOT>")
+      // The status bar's `~` marks code-health counts as older than the latest
+      // edit. Whether a background refresh has finished is timing, not a
+      // transport difference, so the marker is dropped before comparing; the
+      // counts themselves must still match.
+      .replace(/(\[AFT [^\]|]*\| )~D/g, "$1D")
+  );
 }
