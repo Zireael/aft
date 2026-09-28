@@ -2732,7 +2732,16 @@ impl LspManager {
     /// diagnostics freshness gate both use this predicate so a complete
     /// producer set cannot be judged incomplete by a second, stricter check.
     pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
-        self.has_authoritative_report_for_server(server) || !self.server_is_warming(server)
+        self.producer_failure(server).is_some()
+            || self.has_authoritative_report_for_server(server)
+            || !self.server_is_warming(server)
+    }
+
+    /// A terminal analysis failure is settled but cannot certify clean diagnostics.
+    pub fn producer_failure(&self, server: &ServerKey) -> Option<&str> {
+        self.clients
+            .get(server)
+            .and_then(LspClient::diagnostic_failure)
     }
 
     /// True when every expected producer has settled. Empty input is vacuously
@@ -3014,13 +3023,32 @@ impl LspManager {
         root: PathBuf,
         params: &serde_json::Value,
     ) {
-        if !matches!(&server, ServerKind::Rust)
-            || params.get("quiescent").and_then(serde_json::Value::as_bool) != Some(true)
-        {
+        if !matches!(&server, ServerKind::Rust) {
             return;
         }
 
         let key = ServerKey { kind: server, root };
+        let failure = match params.get("health").and_then(serde_json::Value::as_str) {
+            Some("warning" | "error") => Some(
+                params
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("rust-analyzer reported unhealthy workspace analysis")
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(client) = self.clients.get_mut(&key) {
+            client.set_diagnostic_failure(failure.clone());
+        }
+        if failure.is_some() {
+            // Earlier reports cannot certify a workspace whose metadata or check failed.
+            self.diagnostics.clear_server_instance(&key);
+            return;
+        }
+        if params.get("quiescent").and_then(serde_json::Value::as_bool) != Some(true) {
+            return;
+        }
         let became_quiescent = self
             .clients
             .get_mut(&key)

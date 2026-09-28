@@ -4276,3 +4276,70 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         "failed producer reason missing: {response:#}"
     );
 }
+
+#[test]
+fn scoped_rust_inspect_preserves_stale_cargo_lock() {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        eprintln!("SKIP scoped_rust_inspect_preserves_stale_cargo_lock: rust-analyzer is not installed (or rustup component unavailable)");
+        return;
+    }
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlocal-dep = { path = \"dep\" }\n");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub fn value() -> u8 { local_dep::value() }\n",
+    );
+    let manifest = write_file(
+        &root,
+        "dep/Cargo.toml",
+        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "dep/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    let before = fs::read(root.join("Cargo.lock")).unwrap();
+    fs::write(
+        manifest,
+        "[package]\nname = \"local-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-stale-lock",
+            "command": "inspect",
+            "scope": "src",
+            "sections": ["diagnostics"],
+        })),
+        &ctx,
+    ))
+    .unwrap();
+    assert_eq!(
+        fs::read(root.join("Cargo.lock")).unwrap(),
+        before,
+        "Rust-scoped inspect rewrote the stale Cargo.lock"
+    );
+    assert_eq!(ctx.lsp().active_server_keys().len(), 1, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| {
+            gaps.iter()
+                .find(|gap| gap["kind"] == "failed_producer" && gap["producer"] == "rust")
+        })
+        .unwrap_or_else(|| panic!("missing rust-analyzer failure: {response:#}"));
+    assert!(
+        gap["reason"].as_str().unwrap().contains("--locked"),
+        "metadata failure must explain why diagnostics are unavailable: {response:#}"
+    );
+}

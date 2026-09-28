@@ -358,6 +358,8 @@ pub struct LspClient {
     /// kinds do not use the experimental server-status signal and start
     /// authoritative by default.
     rust_analyzer_quiescent: bool,
+    /// Workspace-load or check failure reported by rust-analyzer itself.
+    rust_analyzer_failure: Option<String>,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -634,6 +636,7 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             rust_analyzer_quiescent,
+            rust_analyzer_failure: None,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
@@ -788,13 +791,26 @@ impl LspClient {
     }
 
     /// Whether diagnostics from this server instance should be treated as
-    /// provisional because rust-analyzer has not reached quiescence.
+    /// provisional because rust-analyzer is warming or reported failed analysis.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        matches!(&self.kind, ServerKind::Rust) && !self.rust_analyzer_quiescent
+        matches!(&self.kind, ServerKind::Rust)
+            && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some())
+    }
+
+    pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
+        self.rust_analyzer_failure.as_deref()
+    }
+
+    /// Recovery must reach healthy quiescence before reports regain authority.
+    pub(crate) fn set_diagnostic_failure(&mut self, failure: Option<String>) {
+        if failure.is_some() || self.rust_analyzer_failure.is_some() {
+            self.rust_analyzer_quiescent = false;
+        }
+        self.rust_analyzer_failure = failure;
     }
 
     /// Record a rust-analyzer server-status transition. Returns true only for
-    /// the first transition to quiescent, which is the completion boundary that
+    /// first transition to quiescent after startup or failure, the boundary that
     /// makes each latest warming report authoritative.
     pub fn set_rust_analyzer_quiescent(&mut self, quiescent: bool) -> bool {
         if !matches!(&self.kind, ServerKind::Rust) || !quiescent || self.rust_analyzer_quiescent {
