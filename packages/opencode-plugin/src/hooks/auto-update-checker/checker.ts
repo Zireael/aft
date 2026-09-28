@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getOpenCodeCacheRoot } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
-import { log, warn } from "../../logger.js";
+import { debug, log, warn } from "../../logger.js";
 import {
   cacheDir,
   NPM_FETCH_TIMEOUT,
@@ -272,15 +274,103 @@ function configuredRegistry(value: string): string | undefined {
   return value && value !== "undefined" && value !== "null" ? value : undefined;
 }
 
+type RegistrySettings = { registry?: string; "@cortexkit:registry"?: string };
+
+async function readRegistrySettings(path: string, required = false): Promise<RegistrySettings> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+  const settings: RegistrySettings = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+    const separator = trimmed.indexOf("=");
+    if (separator < 0) continue;
+    const key = trimmed.slice(0, separator).trim();
+    if (key === "registry" || key === "@cortexkit:registry") {
+      settings[key] = configuredRegistry(trimmed.slice(separator + 1).trim());
+    }
+  }
+  return settings;
+}
+
+function registryEnvironment(key: string): string | undefined {
+  const variable = `npm_config_${key}`;
+  const value =
+    process.env[variable] ??
+    Object.entries(process.env).find(([name]) => name.toLowerCase() === variable)?.[1];
+  return configuredRegistry(value ?? "");
+}
+
+async function registryWithoutNpm(directory: string): Promise<string> {
+  let scoped = registryEnvironment("@cortexkit:registry");
+  let registry = registryEnvironment("registry");
+  const visited = new Set<string>();
+  for (let current = directory; ; current = dirname(current)) {
+    if (scoped) break;
+    const path = join(current, ".npmrc");
+    visited.add(path);
+    const settings = await readRegistrySettings(path);
+    scoped ??= settings["@cortexkit:registry"];
+    registry ??= settings.registry;
+    if (dirname(current) === current) break;
+  }
+  const explicitUserConfig = process.env.npm_config_userconfig ?? process.env.NPM_CONFIG_USERCONFIG;
+  const home =
+    (process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME) ?? homedir();
+  const userConfig = explicitUserConfig ?? join(home, ".npmrc");
+  if (!scoped && !visited.has(userConfig)) {
+    const settings = await readRegistrySettings(userConfig, explicitUserConfig !== undefined);
+    scoped = settings["@cortexkit:registry"];
+    registry ??= settings.registry;
+  }
+  const selected = scoped ?? registry ?? NPM_REGISTRY_URL;
+  return selected.replace(/\$\{([^}]+)\}/g, (_match, name: string) => {
+    const value = process.env[name];
+    if (value === undefined) throw new Error("Unresolved registry environment variable");
+    return value;
+  });
+}
+
+function validateRegistry(registry: string): string {
+  const url = new URL(registry);
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    throw new Error("Unsupported registry protocol");
+  return registry;
+}
+
+const reportedRegistryFailures = new Set<string>();
+
+function reportRegistryFailure(directory: string): void {
+  const key = resolve(directory);
+  if (reportedRegistryFailures.has(key)) return;
+  reportedRegistryFailures.add(key);
+  // Do not log registry URLs or parser errors: either can contain credentials.
+  debug(
+    "[auto-update-checker] Configured npm registry could not be resolved or used; skipping update check.",
+  );
+}
+
 function resolveRegistry(directory: string): Promise<string> {
   const key = resolve(directory);
   let pending = registryCache.get(key);
   if (!pending) {
-    // Let npm apply scope, environment and npmrc precedence without blocking the host.
-    // Cache failures too: an unresolved private registry must not trigger a public query.
+    // npm applies full config precedence; bun-only hosts use asynchronous npmrc reads.
+    // Cache both outcomes so an unreadable private config never causes a public query.
     pending = (async () => {
-      const scoped = configuredRegistry(await npmConfigGet("@cortexkit:registry", key));
-      return scoped ?? configuredRegistry(await npmConfigGet("registry", key)) ?? NPM_REGISTRY_URL;
+      let registry: string;
+      try {
+        const scoped = configuredRegistry(await npmConfigGet("@cortexkit:registry", key));
+        registry =
+          scoped ?? configuredRegistry(await npmConfigGet("registry", key)) ?? NPM_REGISTRY_URL;
+      } catch {
+        registry = await registryWithoutNpm(key);
+      }
+      return validateRegistry(registry);
     })();
     registryCache.set(key, pending);
   }
@@ -307,19 +397,24 @@ export async function getLatestVersion(
 
   try {
     if (options.signal?.aborted) return null;
-    const registry =
-      options.registryUrl ?? (await resolveRegistry(options.directory ?? process.cwd()));
+    const registry = validateRegistry(
+      options.registryUrl ?? (await resolveRegistry(options.directory ?? process.cwd())),
+    );
     if (controller.signal.aborted) return null;
     const response = await fetch(buildRegistryUrl(registry), {
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      reportRegistryFailure(options.directory ?? process.cwd());
+      return null;
+    }
 
     const data = NpmPackageEnvelopeSchema.safeParse(await response.json());
     if (!data.success) return null;
     return data.data["dist-tags"][channel] ?? data.data["dist-tags"].latest ?? null;
   } catch {
+    if (!controller.signal.aborted) reportRegistryFailure(options.directory ?? process.cwd());
     return null;
   } finally {
     options.signal?.removeEventListener("abort", abortHandler);

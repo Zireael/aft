@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+const debugMock = mock(() => {});
+
 mock.module("../../logger.js", () => ({
   log: mock(() => {}),
-  debug: mock(() => {}),
+  debug: debugMock,
   warn: mock(() => {}),
   error: mock(() => {}),
 }));
@@ -14,6 +16,52 @@ let importCounter = 0;
 
 function freshCheckerImport() {
   return import(`./checker.ts?test=${importCounter++}`);
+}
+
+async function withoutNpm(
+  run: (fixture: {
+    root: string;
+    directory: string;
+    home: string;
+    fetchMock: ReturnType<typeof mock<typeof fetch>>;
+  }) => Promise<void>,
+) {
+  const root = fs.mkdtempSync(join(tmpdir(), "aft-no-npm-"));
+  const home = join(root, "home");
+  const directory = join(root, "project", "nested");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(directory, { recursive: true });
+  const keys = new Set([
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "AFT_REGISTRY_HOST",
+    ...Object.keys(process.env).filter((key) => key.toLowerCase().startsWith("npm_config_")),
+  ]);
+  const saved = new Map([...keys].map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  process.env.PATH = "";
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const originalFetch = globalThis.fetch;
+  const fetchMock = mock<typeof fetch>(async () =>
+    Response.json({ "dist-tags": { latest: "9.0.0" } }),
+  );
+  globalThis.fetch = fetchMock;
+  debugMock.mockClear();
+  try {
+    await run({ root, directory, home, fetchMock });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const key of Object.keys(process.env)) {
+      if (key.toLowerCase().startsWith("npm_config_")) delete process.env[key];
+    }
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 afterEach(() => {
@@ -168,6 +216,81 @@ describe("auto-update-checker/checker", () => {
   });
 
   describe("getLatestVersion", () => {
+    test("no npm uses ancestor npmrc scoped registry with environment expansion", async () => {
+      await withoutNpm(async ({ root, directory, fetchMock }) => {
+        process.env.AFT_REGISTRY_HOST = "mirror.example.test";
+        process.env.NPM_CONFIG_REGISTRY = "https://default.example.test/";
+        fs.writeFileSync(
+          join(root, "project", ".npmrc"),
+          "# registry settings\n; ignored\n@cortexkit:registry = https://${AFT_REGISTRY_HOST}/npm/\n",
+        );
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory })).toBe("9.0.0");
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+          "https://mirror.example.test/npm/%40cortexkit/aft-opencode",
+        );
+      });
+    });
+
+    test("no npm and no registry configuration uses npmjs", async () => {
+      await withoutNpm(async ({ directory, fetchMock }) => {
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory })).toBe("9.0.0");
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+          "https://registry.npmjs.org/%40cortexkit/aft-opencode",
+        );
+        expect(debugMock).not.toHaveBeenCalled();
+      });
+    });
+
+    test("no npm and unreadable npmrc skips the query and logs once", async () => {
+      await withoutNpm(async ({ directory, fetchMock }) => {
+        fs.mkdirSync(join(directory, ".npmrc"));
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory })).toBeNull();
+        expect(await getLatestVersion("latest", { directory })).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(debugMock).toHaveBeenCalledTimes(1);
+      });
+    });
+    test("no npm honors environment, project and home registry precedence", async () => {
+      for (const mode of ["home", "project", "upper-default", "lower-default", "scope"] as const) {
+        await withoutNpm(async ({ directory, home, fetchMock }) => {
+          fs.writeFileSync(join(home, ".npmrc"), "registry=https://home.example.test/\n");
+          if (mode !== "home")
+            fs.writeFileSync(join(directory, ".npmrc"), "registry=https://project.example.test/\n");
+          if (mode === "upper-default")
+            process.env.NPM_CONFIG_REGISTRY = "https://upper-default.example.test/";
+          if (mode === "lower-default")
+            process.env.npm_config_registry = "https://lower-default.example.test/";
+          if (mode === "scope") {
+            process.env["npm_config_@cortexkit:registry"] = "https://scope.example.test/";
+            process.env.NPM_CONFIG_REGISTRY = "https://ignored.example.test/";
+            fs.writeFileSync(
+              join(directory, ".npmrc"),
+              "@cortexkit:registry=https://ignored-project.example.test/\n",
+            );
+          }
+          const { getLatestVersion } = await freshCheckerImport();
+          expect(await getLatestVersion("latest", { directory })).toBe("9.0.0");
+          expect(fetchMock.mock.calls[0]?.[0]).toBe(
+            `https://${mode}.example.test/%40cortexkit/aft-opencode`,
+          );
+        });
+      }
+    });
+
+    test("no npm does not fall back to public for an invalid configured registry", async () => {
+      await withoutNpm(async ({ directory, fetchMock }) => {
+        process.env.npm_config_registry = "${UNSET_AFT_REGISTRY_HOST}/npm";
+        const { getLatestVersion } = await freshCheckerImport();
+        expect(await getLatestVersion("latest", { directory })).toBeNull();
+        expect(await getLatestVersion("latest", { directory })).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(debugMock).toHaveBeenCalledTimes(1);
+      });
+    });
+
     test("resolves scoped npmrc before environment default and caches per project", async () => {
       const directory = fs.mkdtempSync(join(tmpdir(), "aft-registry-"));
       const originalFetch = globalThis.fetch;
@@ -201,7 +324,7 @@ describe("auto-update-checker/checker", () => {
         fs.rmSync(directory, { recursive: true, force: true });
       }
     });
-    test("uses the default registry when the scope is unset and never queries on resolution failure", async () => {
+    test("uses the default registry when the scope is unset", async () => {
       const directory = fs.mkdtempSync(join(tmpdir(), "aft-default-registry-"));
       const originalFetch = globalThis.fetch;
       const fetchMock = mock(async (_input: string | URL | Request) =>
@@ -219,9 +342,6 @@ describe("auto-update-checker/checker", () => {
         expect(fetchMock.mock.calls[0]?.[0]).toBe(
           "https://default.example.test/%40cortexkit/aft-opencode",
         );
-        expect(
-          await getLatestVersion("latest", { directory: join(directory, "missing") }),
-        ).toBeNull();
         expect(fetchMock).toHaveBeenCalledTimes(1);
       } finally {
         globalThis.fetch = originalFetch;
