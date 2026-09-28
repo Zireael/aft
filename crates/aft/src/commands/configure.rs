@@ -2001,9 +2001,19 @@ fn detect_missing_tools_for_languages(
     languages: &HashSet<LangId>,
     config: &crate::config::Config,
 ) -> Vec<crate::format::MissingTool> {
+    detect_missing_tools_with_cache(languages, config, HashMap::new())
+}
+
+/// `tool_cache` maps a tool name to whether it is installed. Production starts
+/// it empty; tests pre-seed it so the result does not depend on which
+/// formatters the machine running the tests happens to have.
+fn detect_missing_tools_with_cache(
+    languages: &HashSet<LangId>,
+    config: &crate::config::Config,
+    mut tool_cache: HashMap<String, bool>,
+) -> Vec<crate::format::MissingTool> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
-    let mut tool_cache = HashMap::new();
 
     for &lang in languages {
         let language = lang_key(lang);
@@ -13257,7 +13267,13 @@ mod tests {
             .formatter
             .insert("typescript".to_string(), "biome".to_string());
         let languages = std::collections::HashSet::from([crate::parser::LangId::TypeScript]);
-        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+        // Biome is installed on many development machines; pin it as missing
+        // so the test checks the warning rule, not the machine.
+        let warnings = super::detect_missing_tools_with_cache(
+            &languages,
+            &config,
+            std::collections::HashMap::from([("biome".to_string(), false)]),
+        );
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].tool, "biome");
     }

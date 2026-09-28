@@ -938,7 +938,7 @@ fn write_command_reports_changed_for_existing_config_file() {
         "id": "write-changed-config",
         "command": "write",
         "file": config_path.display().to_string(),
-        "content": "{\"devDependencies\":{}}\n"
+        "content": "{\"devDependencies\":{\"typescript\":\"*\"}}\n"
     }))
     .expect("request parses");
     let response = handle_write(&req, &ctx);
