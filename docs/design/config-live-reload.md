@@ -53,8 +53,8 @@ A plugin must swap its own snapshot, because the daemon cannot reach a plugin's 
 **Shared component** `BR:config-watch.ts`:
 - `watchAftConfigFiles`:
   - watches each file's parent directory, or its nearest existing ancestor until it exists, and retires the ancestor watch once the directory appears;
-  - wakes only for events that can concern a config file (the file, an editor sibling, or the missing directory on the way to it);
-  - uses a 150 ms trailing debounce, capped at 1 s so steady related activity cannot postpone a check indefinitely;
+  - wakes on every event in a watched directory (platforms may coalesce several changes into one event that names a different entry, so filtering by name could lose a config edit);
+  - uses a 150 ms trailing debounce, capped at 1 s so steady unrelated activity cannot postpone a check indefinitely;
   - re-arms a watch whose directory was replaced (inode changed) or that reported an error, checked on every event and every 2 s;
   - calls `onChange` only when a file's text changed.
 - `applyLiveConfigKeys` and `aftLiveConfigKeys`: one table of the TS group A keys:

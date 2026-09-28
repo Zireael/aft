@@ -13,7 +13,7 @@
  */
 
 import { type FSWatcher, readFileSync, statSync, watch } from "node:fs";
-import { basename, dirname } from "node:path";
+import { dirname } from "node:path";
 
 /** How long a burst of file events must be quiet before the files are read. */
 export const CONFIG_WATCH_DEBOUNCE_MS = 150;
@@ -214,28 +214,13 @@ function inodeOf(dir: string): number | null {
 }
 
 /**
- * The directory to watch for `file` and the entry name in it that matters:
- * the file's own directory and the file name, or, while that directory does
- * not exist, the nearest existing ancestor and the name of the child on the
- * way down to it.
+ * The directory to watch for `file`: its own directory, or while that does
+ * not exist, the nearest existing ancestor.
  */
-function watchTarget(file: string): { dir: string; name: string } {
-  let child = file;
+function watchDirFor(file: string): string {
   let dir = dirname(file);
-  while (dir !== dirname(dir) && inodeOf(dir) === null) {
-    child = dir;
-    dir = dirname(dir);
-  }
-  return { dir, name: basename(child) };
-}
-
-/** Whether a directory event for entry `filename` can concern `name`. */
-function eventConcerns(filename: string | null, name: string): boolean {
-  if (filename === null) return true;
-  const entry = basename(filename);
-  // Editors write a temporary sibling (`aft.jsonc.tmp`, `.aft.jsonc.swp`)
-  // and rename it over the file.
-  return entry === name || entry.startsWith(`${name}.`) || entry.startsWith(`.${name}`);
+  while (dir !== dirname(dir) && inodeOf(dir) === null) dir = dirname(dir);
+  return dir;
 }
 
 /**
@@ -243,8 +228,9 @@ function eventConcerns(filename: string | null, name: string): boolean {
  * watched, because an editor replaces the file by renaming a temporary
  * sibling over it. A directory that does not exist yet is watched through its
  * nearest existing ancestor until it appears, and a watch whose directory was
- * replaced or failed is re-armed. Only events that can concern a config file
- * wake the check, and a steady stream of them delays it at most
+ * replaced or failed is re-armed. Every event in a watched directory wakes
+ * the check (platforms may coalesce several changes into one event naming a
+ * different entry), and a steady stream of events delays it at most
  * {@link CONFIG_WATCH_MAX_DELAY_MS}. `onChange` runs only when a file's text
  * actually differs from what was last seen. Returns a function that stops
  * every watch.
@@ -256,10 +242,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let firstPendingAt: number | null = null;
   let stopped = false;
-  const watchers = new Map<
-    string,
-    { watcher: FSWatcher; ino: number | null; names: Set<string> }
-  >();
+  const watchers = new Map<string, { watcher: FSWatcher; ino: number | null }>();
 
   const check = (): void => {
     timer = null;
@@ -291,13 +274,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
 
   /** Bring the watches in line with the directories on disk. */
   function revalidate(): boolean {
-    const wanted = new Map<string, Set<string>>();
-    for (const path of options.paths) {
-      const target = watchTarget(path);
-      const names = wanted.get(target.dir) ?? new Set<string>();
-      names.add(target.name);
-      wanted.set(target.dir, names);
-    }
+    const wanted = new Set(options.paths.map(watchDirFor));
     let moved = false;
     for (const [dir, entry] of watchers) {
       // A directory that is no longer wanted (its child appeared) or that was
@@ -308,26 +285,12 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
         moved = true;
       }
     }
-    for (const [dir, names] of wanted) {
-      const existing = watchers.get(dir);
-      if (existing) {
-        existing.names = names;
-        continue;
-      }
+    for (const dir of wanted) {
+      if (watchers.has(dir)) continue;
       try {
         const entry = {
-          watcher: watch(dir, { persistent: false }, (_event, filename) => {
-            const current = watchers.get(dir);
-            const name = typeof filename === "string" ? filename : null;
-            if (
-              current &&
-              [...current.names].some((wantedName) => eventConcerns(name, wantedName))
-            ) {
-              schedule();
-            }
-          }),
+          watcher: watch(dir, { persistent: false }, () => schedule()),
           ino: inodeOf(dir),
-          names,
         };
         entry.watcher.on("error", () => {
           entry.watcher.close();
