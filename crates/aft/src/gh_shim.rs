@@ -165,21 +165,30 @@ const READ_ONLY_ACTION_TUPLES: &[&str] = &[
 /// Commands that may pass through to upstream `gh` even when the repository
 /// they name has no bot binding. The check for unbound targets is a safe list:
 /// anything not listed here or in `READ_ONLY_ACTION_TUPLES` (and not a `gh api`
-/// read) is refused on an unbound target, including verbs this build does not
-/// know, so a write verb added to a future `gh` cannot slip through under the
-/// operator's login. `verb *` matches the verb with any subcommand, or none.
+/// read) is refused on an unbound target, including verbs and subcommands this
+/// build does not know, so one added to a future `gh` cannot slip through under
+/// the operator's login. Every entry is exact: `verb subcommand`, or a bare
+/// `verb` for a command that takes no subcommand, matched as the shim reads
+/// the first two positional words (`command_head`).
 ///
 /// Not listed, on purpose: `extension exec` and any extension or alias invoked
 /// by name. Both run code the shim cannot inspect (an extension is a program,
 /// an alias can expand to `api --method POST` or to a shell command), and
 /// either can write with the operator's token, so they are refused on an
-/// unbound target like any unknown verb.
+/// unbound target like any unknown verb. Every `gh auth` subcommand other
+/// than `auth status` is refused before this list is consulted (see
+/// `operator_credential_use`).
 const UNBOUND_SAFE_COMMANDS: &[&str] = &[
     // Reads beyond `READ_ONLY_ACTION_TUPLES`. They only fetch from GitHub.
     // (That table also feeds classification on bound repositories, so these
-    // stay here instead of widening it.)
-    "search *",
-    "status *",
+    // stay here instead of widening it.) `status` takes no subcommand; a
+    // value flag such as `status -o org` reads as a subcommand and is refused.
+    "search issues",
+    "search prs",
+    "search repos",
+    "search code",
+    "search commits",
+    "status",
     "org list",
     "gist list",
     "gist view",
@@ -201,24 +210,70 @@ const UNBOUND_SAFE_COMMANDS: &[&str] = &[
     "attestation verify",
     "extension list",
     "extension search",
-    // Local machine only: credentials, configuration, aliases and shell
-    // completion live in the operator's own config files, and `help` and
-    // `version` print text. None of them sends a write to GitHub. Alias
-    // management is local; running an alias is not (see above).
-    "auth *",
-    "config *",
-    "alias *",
-    "completion *",
-    "help *",
-    "version *",
+    // Local machine only. `auth status` without a token flag reports which
+    // account is logged in. `config` and `alias` edit the operator's local
+    // gh configuration; managing an alias does not run it. `completion`
+    // prints a shell script (the shell name reads as its subcommand), and
+    // `help` and `version` print text. None of them sends a write to GitHub.
+    "auth status",
+    "config get",
+    "config set",
+    "config list",
+    "config clear-cache",
+    "alias list",
+    "alias set",
+    "alias delete",
+    "alias import",
+    "completion",
+    "completion bash",
+    "completion zsh",
+    "completion fish",
+    "completion powershell",
+    "version",
+    // `help` alone, or `help <command or topic>`: the word names what to
+    // describe, and help never runs it.
+    "help",
+    "help alias",
+    "help api",
+    "help attestation",
+    "help auth",
+    "help browse",
+    "help cache",
+    "help codespace",
+    "help completion",
+    "help config",
+    "help environment",
+    "help exit-codes",
+    "help extension",
+    "help formatting",
+    "help gist",
+    "help gpg-key",
+    "help issue",
+    "help label",
+    "help mintty",
+    "help org",
+    "help pr",
+    "help project",
+    "help reference",
+    "help release",
+    "help repo",
+    "help ruleset",
+    "help run",
+    "help search",
+    "help secret",
+    "help ssh-key",
+    "help status",
+    "help variable",
+    "help workflow",
     // Local git work on a copy: cloning and checking out a pull request
     // fetch from GitHub and write only to the local disk.
     "repo clone",
     "gist clone",
     "pr checkout",
-    // `browse --no-browser` prints a URL; the flag check is in
-    // `is_unbound_safe`.
-    "browse *",
+    // `browse` takes no subcommand; with `--no-browser` it prints a URL. The
+    // flag check, and the limit of one location argument (an issue or pull
+    // request number, a path or a commit), are in `is_unbound_safe`.
+    "browse",
 ];
 /// Writes that act on the caller's account rather than on an existing
 /// repository: a new repository, a fork, gists, account keys and projects. No
@@ -345,10 +400,11 @@ pub enum RefusalCode {
     UnsupportedFlag,
     OutcomeUnknown,
     UnboundTarget,
+    OperatorCredentials,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -365,6 +421,7 @@ impl RefusalCode {
         Self::UnsupportedFlag,
         Self::OutcomeUnknown,
         Self::UnboundTarget,
+        Self::OperatorCredentials,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -385,6 +442,7 @@ impl RefusalCode {
             Self::UnsupportedFlag => "gh_shim_unsupported_flag",
             Self::OutcomeUnknown => "gh_shim_outcome_unknown",
             Self::UnboundTarget => "gh_shim_unbound_target",
+            Self::OperatorCredentials => "gh_shim_operator_credentials",
         }
     }
 }
@@ -538,6 +596,21 @@ fn run(args: &[OsString]) -> i32 {
     // or one that never verified) there are no bindings to compare against,
     // so those keep passing through as before.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
+        // The operator's token works on every repository, bound or not, and
+        // an agent holding it could reach GitHub around the shim, so this
+        // check comes before any target is resolved.
+        if let Some((command, credential_use)) =
+            operator_credential_use(args).filter(|_| !shim_disabled_by_operator())
+        {
+            return dispatch_operator_credentials(
+                args,
+                &command,
+                credential_use,
+                &paths,
+                now,
+                delegate,
+            );
+        }
         if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd)
             .filter(|_| !shim_disabled_by_operator())
         {
@@ -1025,7 +1098,9 @@ fn write_command(args: &[OsString]) -> String {
 /// True when `args` may run under the operator's login even though what it
 /// names has no bot binding: a known read, a command that acts only on the
 /// local machine (`UNBOUND_SAFE_COMMANDS`), or a `gh api` read. Everything
-/// else, including a verb this build does not recognise, is not safe.
+/// else, including a verb or subcommand this build does not recognise and any
+/// `gh auth` use that reveals or changes the operator's credentials, is not
+/// safe.
 fn is_unbound_safe(args: &[OsString]) -> bool {
     if has_exact_flag(args, "--help") {
         // Upstream `gh` prints help and runs nothing.
@@ -1036,21 +1111,122 @@ fn is_unbound_safe(args: &[OsString]) -> bool {
         // shim cannot read might hide a verb, so it is not safe.
         return args.iter().all(|arg| arg.to_str().is_some());
     };
+    // A flag before the verb is one the shim does not model: its value could
+    // be what `command_head` took for the verb, so the real verb is unknown.
+    if args[..head_index]
+        .iter()
+        .any(|arg| arg.to_str().is_none_or(|value| value.starts_with('-')))
+    {
+        return false;
+    }
+    if operator_credential_use(args).is_some() {
+        return false;
+    }
     if verb == "api" {
         return !api_invocation_writes(&args[head_index..]);
     }
-    if verb == "browse" && !has_exact_flag(args, "--no-browser") {
-        return false;
+    if verb == "browse" {
+        // One location argument at most (read as the subcommand); a second
+        // positional is something the shim does not model.
+        return has_exact_flag(args, "--no-browser") && nested_action(args).is_none();
     }
-    let tuple = verb_tuple(verb.clone(), subcommand);
+    let tuple = verb_tuple(verb, subcommand);
     if NESTED_ACTION_GROUPS.contains(&tuple.as_str()) {
         return matches!(nested_action(args).as_deref(), Some("list" | "view"));
     }
-    let wildcard = format!("{verb} *");
     READ_ONLY_ACTION_TUPLES.contains(&tuple.as_str())
-        || UNBOUND_SAFE_COMMANDS
-            .iter()
-            .any(|safe| *safe == tuple || *safe == wildcard)
+        || UNBOUND_SAFE_COMMANDS.contains(&tuple.as_str())
+}
+
+/// How a `gh auth` command touches the operator's credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialUse {
+    /// Prints the operator's token (`auth token`, `auth status --show-token`).
+    /// With it an agent could call the GitHub API directly, around the shim.
+    RevealsToken,
+    /// Logs in or out, refreshes or switches accounts, or rewrites git's
+    /// credential configuration (`auth login`, `setup-git`, and any `auth`
+    /// subcommand this build does not know).
+    ChangesCredentials,
+}
+
+/// The `gh auth` command in `args` and how it touches the operator's
+/// credentials, or `None` when it does not: `auth status` without a token
+/// flag, `gh auth` alone (help), or any other verb.
+fn operator_credential_use(args: &[OsString]) -> Option<(String, CredentialUse)> {
+    if has_exact_flag(args, "--help") {
+        return None;
+    }
+    let (verb, subcommand, head_index) = command_head(args)?;
+    if verb != "auth" {
+        return None;
+    }
+    let subcommand = subcommand?;
+    let tuple = format!("auth {subcommand}");
+    match subcommand.as_str() {
+        "status" if !shows_token(&args[head_index..]) => None,
+        "status" | "token" => Some((tuple, CredentialUse::RevealsToken)),
+        _ => Some((tuple, CredentialUse::ChangesCredentials)),
+    }
+}
+
+/// True when `gh auth status` is asked to print the token: `--show-token`
+/// (unless set to false), or `-t` alone or in a cluster of short flags (`-at`).
+fn shows_token(args: &[OsString]) -> bool {
+    args.iter().filter_map(|arg| arg.to_str()).any(|value| {
+        if value == "--show-token" {
+            return true;
+        }
+        if let Some(setting) = value.strip_prefix("--show-token=") {
+            return !setting.eq_ignore_ascii_case("false");
+        }
+        value
+            .strip_prefix('-')
+            .filter(|cluster| !cluster.starts_with('-'))
+            .is_some_and(|cluster| {
+                cluster.chars().all(|flag| flag.is_ascii_alphabetic()) && cluster.contains('t')
+            })
+    })
+}
+
+/// Refuse a `gh auth` command that reveals or changes the operator's
+/// credentials, or run it under `GH_SHIM_BYPASS=operator` after an audit line.
+/// This holds whatever repository the command runs in: the token works on
+/// every repository, bound or not.
+fn dispatch_operator_credentials<F>(
+    args: &[OsString],
+    command: &str,
+    credential_use: CredentialUse,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    if !operator_bypass_requested() {
+        return refuse(
+            RefusalCode::OperatorCredentials,
+            &operator_credentials_refusal_text(command, credential_use),
+        );
+    }
+    if let Err(error) = append_bypass_audit(paths, command, None, now) {
+        return refuse(
+            RefusalCode::BypassAuditUnavailable,
+            &format!("operator bypass audit could not be appended: {error}"),
+        );
+    }
+    delegate_to_upstream(args)
+}
+
+fn operator_credentials_refusal_text(command: &str, credential_use: CredentialUse) -> String {
+    let effect = match credential_use {
+        CredentialUse::RevealsToken => "prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim",
+        CredentialUse::ChangesCredentials => "changes the operator's gh login or git credential configuration",
+    };
+    format!(
+        "`{command}` {effect}. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
+    )
 }
 
 /// The third positional word (`add` in `gh repo deploy-key add key.pub`).
@@ -8570,7 +8746,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 16);
+        assert_eq!(RefusalCode::ALL.len(), 17);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
@@ -10567,6 +10743,31 @@ INHERITED FLAGS
             &["co", "7"],
             // Browsing opens a browser unless asked only for the URL.
             &["browse", "12"],
+            &["browse", "12", "extra", "--no-browser"],
+            // The operator's credentials: printing the token, or changing
+            // the login or git's credential configuration.
+            &["auth", "token"],
+            &["auth", "status", "--show-token"],
+            &["auth", "status", "-t"],
+            &["auth", "status", "-at"],
+            &["auth", "login", "--with-token"],
+            &["auth", "logout"],
+            &["auth", "refresh"],
+            &["auth", "switch"],
+            &["auth", "setup-git"],
+            // Subcommands of safe verbs that this build does not list, as a
+            // future gh might add them.
+            &["config", "future-subcommand"],
+            &["alias", "future-subcommand"],
+            &["search", "future-kind", "x"],
+            &["status", "future-subcommand"],
+            &["version", "future-subcommand"],
+            &["completion", "-s", "future-shell"],
+            &["help", "future-command"],
+            // A flag before the verb that the shim does not model: its value
+            // may be what reads as the verb.
+            &["--future-global", "search", "issues", "flaky"],
+            &["--future-global", "value", "issue", "view", "5"],
             // API writes: a named method, or a payload without one.
             &["api", "-X", "POST", "repos/o/r/issues"],
             &["api", "--method=delete", "repos/o/r"],
@@ -10595,8 +10796,9 @@ INHERITED FLAGS
             &["extension", "list"],
             // Local machine only.
             &["auth", "status"],
-            &["auth", "token"],
+            &["auth", "status", "--show-token=false"],
             &["config", "set", "editor", "vim"],
+            &["config", "get", "editor"],
             &["alias", "set", "co", "pr checkout"],
             &["alias", "list"],
             &["completion", "-s", "zsh"],
@@ -10627,6 +10829,48 @@ INHERITED FLAGS
             ),
             Classification::Unclassified
         ));
+    }
+
+    #[test]
+    fn auth_commands_that_reveal_or_change_the_operators_credentials_are_named() {
+        let credential = |raw: &[&str]| operator_credential_use(&os_args(raw));
+        assert_eq!(
+            credential(&["auth", "token"]),
+            Some(("auth token".to_string(), CredentialUse::RevealsToken))
+        );
+        assert_eq!(
+            credential(&["auth", "status", "-h", "github.com", "--show-token"]),
+            Some(("auth status".to_string(), CredentialUse::RevealsToken))
+        );
+        for subcommand in [
+            "login",
+            "logout",
+            "refresh",
+            "switch",
+            "setup-git",
+            "future",
+        ] {
+            assert_eq!(
+                credential(&["auth", subcommand]),
+                Some((
+                    format!("auth {subcommand}"),
+                    CredentialUse::ChangesCredentials
+                ))
+            );
+        }
+        for raw in [
+            &["auth", "status"][..],
+            &["auth", "status", "-h", "github.com", "--json", "hosts"],
+            &["auth"],
+            &["auth", "token", "--help"],
+            &["issue", "view", "5"],
+        ] {
+            assert_eq!(credential(raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            operator_credentials_refusal_text("auth token", CredentialUse::RevealsToken),
+            "`auth token` prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
+        );
     }
 
     /// The target as `TargetRepository::from_invocation` reads it, minus the

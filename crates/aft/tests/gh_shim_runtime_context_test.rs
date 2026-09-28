@@ -3199,7 +3199,7 @@ fn gh_shim_unknown_verbs_on_an_unbound_target_are_refused_and_run_audited_under_
 #[test]
 fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
     let fixture = UnboundTargetFixture::new();
-    let groups: [&[&str]; 14] = [
+    let groups: [&[&str]; 15] = [
         // Reads.
         &["issue", "view", "12", "--repo", "earendil-works/pi"],
         &["run", "download", "7", "--repo", "earendil-works/pi"],
@@ -3208,6 +3208,7 @@ fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
         // Local machine only.
         &["auth", "status"],
         &["config", "get", "editor"],
+        &["config", "set", "editor", "vim"],
         &["alias", "list"],
         &["completion", "-s", "zsh"],
         &["extension", "list"],
@@ -3237,4 +3238,82 @@ fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
     }
     assert_eq!(fixture.upstream_runs(), Some(expected));
     assert!(fixture.audit_records().is_empty());
+}
+
+fn operator_credentials_refusal(command: &str, effect: &str) -> String {
+    format!(
+        "gh-shim: gh_shim_operator_credentials: `{command}` {effect}. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.\n"
+    )
+}
+
+const REVEALS_TOKEN: &str = "prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim";
+
+#[test]
+fn gh_shim_auth_token_is_refused_in_bound_and_unbound_places_and_runs_audited_under_the_bypass() {
+    let fixture = UnboundTargetFixture::new();
+    for cwd in [&fixture.outside, &fixture.bound_project] {
+        let refused = fixture.run(&["auth", "token"], cwd, false);
+        assert_eq!(refused.status.code(), Some(86), "from {cwd:?}");
+        assert!(refused.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            operator_credentials_refusal("auth token", REVEALS_TOKEN)
+        );
+    }
+    for args in [
+        &["auth", "status", "--show-token"][..],
+        &["auth", "status", "-t"],
+    ] {
+        let refused = fixture.run(args, &fixture.outside, false);
+        assert_eq!(refused.status.code(), Some(86), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            operator_credentials_refusal("auth status", REVEALS_TOKEN)
+        );
+    }
+    for subcommand in ["login", "logout", "refresh", "switch", "setup-git"] {
+        let refused = fixture.run(&["auth", subcommand], &fixture.bound_project, false);
+        assert_eq!(refused.status.code(), Some(86), "auth {subcommand}");
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            operator_credentials_refusal(
+                &format!("auth {subcommand}"),
+                "changes the operator's gh login or git credential configuration"
+            )
+        );
+    }
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert!(fixture.audit_records().is_empty());
+
+    let approved = fixture.run(&["auth", "token"], &fixture.bound_project, true);
+    assert_eq!(approved.status.code(), Some(73));
+    assert!(approved.stderr.is_empty());
+    assert_eq!(fixture.upstream_runs().as_deref(), Some("auth token\n"));
+    let records = fixture.audit_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        without_timestamp(records[0].clone()),
+        json!({ "tuple": "auth token", "repository": null })
+    );
+}
+
+#[test]
+fn gh_shim_unmodelled_flag_before_the_verb_fails_closed_on_an_unbound_target() {
+    let fixture = UnboundTargetFixture::new();
+    // Without the flag this is a safe read; with a flag the shim does not
+    // model, the verb it reads may not be the one upstream gh runs.
+    let args = ["--future-global", "search", "issues", "flaky"];
+    let refused = fixture.run(&args, &fixture.outside, false);
+    assert_eq!(refused.status.code(), Some(86));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).starts_with("gh-shim: gh_shim_unbound_target: ")
+    );
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+
+    let plain = fixture.run(&args[1..], &fixture.outside, false);
+    assert_eq!(plain.status.code(), Some(73));
+    assert_eq!(
+        fixture.upstream_runs().as_deref(),
+        Some("search issues flaky\n")
+    );
 }

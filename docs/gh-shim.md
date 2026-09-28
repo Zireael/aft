@@ -37,28 +37,59 @@ repository}`, where `tuple` is the verb (`repo create`) or
 `api:<METHOD>:<endpoint>` and `repository` is `null` when none is known.
 
 **What passes through.** The check is a safe list, not a list of writes: a
-verb the shim does not recognise (`codespace create`, or one a future `gh`
-adds) is refused like any other write. Only these pass through unapproved:
+verb or subcommand the shim does not recognise (`codespace create`, or one a
+future `gh` adds, even under a listed verb such as `config`) is refused like
+any other write. Every entry is an exact subcommand. Only these pass through
+unapproved:
 
 - reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
-  views, lists and downloads, `search`, `status`, `org list`, `gist`
-  `list`/`view`, `secret list`, `variable list`/`get`, `ruleset`
-  `list`/`view`/`check`, `project` `list`/`view`/`field-list`/`item-list`,
-  `ssh-key list`, `gpg-key list`, `codespace list`, `release verify`,
-  `attestation verify`, `extension list`/`search`, and the `list`/`view`
-  actions of `repo deploy-key` and `repo autolink`;
-- commands that act only on the local machine: `auth`, `config`, `alias`
-  (managing aliases), `completion`, `help`, `version`, `repo clone`,
-  `gist clone`, `pr checkout`, and `browse --no-browser`;
+  views, lists and downloads, `search` `issues`/`prs`/`repos`/`code`/`commits`,
+  `status`, `org list`, `gist` `list`/`view`, `secret list`, `variable`
+  `list`/`get`, `ruleset` `list`/`view`/`check`, `project`
+  `list`/`view`/`field-list`/`item-list`, `ssh-key list`, `gpg-key list`,
+  `codespace list`, `release verify`/`verify-asset`, `attestation verify`,
+  `extension list`/`search`, and the `list`/`view` actions of
+  `repo deploy-key` and `repo autolink`;
+- commands that act only on the local machine: `auth status` (without a token
+  flag), `config` `get`/`set`/`list`/`clear-cache`, `alias`
+  `list`/`set`/`delete`/`import` (managing aliases), `completion` for bash,
+  zsh, fish or powershell, `help` alone or for a gh command or help topic,
+  `version`, `repo clone`, `gist clone`, `pr checkout`, and
+  `browse --no-browser` with at most one location argument;
 - anything with `--help`, and `gh` with no verb;
 - `gh api` reads: GET or HEAD (a method named with `--method`/`-X`, else POST
   once a field or `--input` is given, as upstream `gh` decides), and a
   `gh api graphql` call whose inline `query` holds no `mutation`.
 
+A flag before the verb (`gh --something search issues`) is one the shim does
+not model, so it cannot tell which verb upstream `gh` would run; the command
+is refused. A value flag the shim reads as a subcommand (`gh status -o org`)
+is refused the same way.
+
 Running an extension (`gh extension exec`, or `gh <extension>`) or an alias
 (`gh <alias>`) is not on the list: an extension is a program and an alias can
 expand to `api --method POST` or a shell command, so either can write with the
 operator's token where the shim cannot see it.
+
+## The operator's gh credentials
+
+`gh auth token` and `gh auth status --show-token` (or `-t`) print the
+operator's GitHub token into the agent's session, and with the token an agent
+could call the GitHub API directly, around the shim. `gh auth login`,
+`logout`, `refresh`, `switch` and `setup-git`, and any other `auth`
+subcommand, change the operator's gh login or git's credential configuration.
+With a verified manifest all of these are refused with
+`gh_shim_operator_credentials` (exit 86, nothing sent) wherever they run, in a
+bound checkout or not, unless `GH_SHIM_BYPASS=operator` is set:
+
+```text
+gh-shim: gh_shim_operator_credentials: `auth token` prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.
+```
+
+With the bypass the command runs after an audit line
+`{as_of_unix_secs, tuple: "auth token", repository: null}`. `gh auth status`
+without a token flag only reports which account is logged in and passes
+through.
 
 **What the target is.** The same resolver the governed rows use: `--repo`/`-R`,
 a thread URL, a `gh repo` subcommand's repository positional (`gh repo delete
