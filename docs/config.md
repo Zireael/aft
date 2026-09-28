@@ -244,10 +244,12 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "restrict_to_project_root": false,
 
   // OpenCode plugin only. When true, the auto-update hook installs newer
-  // @cortexkit/aft-opencode versions automatically when you have @latest in your
-  // OpenCode config.plugin entry. When false, the hook still notifies you that an
-  // update is available but does not install it. Local-dev (file://) and pinned
-  // (@x.y.z) installs always notify-only regardless of this setting.
+  // @cortexkit/aft-opencode versions automatically when your OpenCode plugin
+  // entry is unpinned (no version, or a `latest` tag). When false, the hook still
+  // notifies you that an update is available but does not install it. Local-dev
+  // (file://) and pinned (@x.y.z) installs always notify-only regardless of this
+  // setting. `aft setup` and `aft doctor --fix` write a pinned entry matching the
+  // CLI version, so update by running `npx @cortexkit/aft@latest doctor --fix`.
   // Default: true. USER-only — strict-allowlist trust boundary refuses to honor
   // this field from project-level config to prevent hostile repos from silently
   // suppressing security updates.

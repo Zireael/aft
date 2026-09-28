@@ -27,7 +27,9 @@ something needs attention so it can be wired into CI scripts. Pure inspection �
 is modified.
 
 **`doctor --fix`** — Applies the fixes doctor would otherwise just report. Registers
-missing plugin entries in your harness config, downloads the matching `aft` binary if
+missing plugin entries in your harness config, pins the OpenCode plugin entry to this CLI's
+exact version (for example `@cortexkit/aft-opencode@0.58.0`, never `@latest`) and updates a
+plugin older than the CLI, downloads the matching `aft` binary if
 `~/.cache/aft/bin` is empty (run this after `--clear` or after wiping the cache to recover
 without opening a session), and repairs ONNX Runtime version mismatches by clearing AFT's
 managed ONNX cache so the next bridge launch redownloads. Each step asks confirmation
@@ -53,7 +55,7 @@ Server attempts:
 ```
 
 **`doctor --clear`** — Walks you through interactive cache cleanup. Useful when you're on
-an old version and `@latest` doesn't seem to update (some harness installers cache npm
+an old version and updating doesn't seem to take effect (some harness installers cache npm
 packages aggressively), or when you want to reset the LSP server cache to force a fresh
 download. Targets harness plugin cache, binary cache, downloaded LSP servers, and semantic
 index storage.

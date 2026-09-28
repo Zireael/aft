@@ -57,6 +57,7 @@ import {
   type DiagnosticReport,
   findPluginCliVersionSkews,
   formatDiagnosticIssuesSection,
+  pluginVersionSkewFor,
   renderDiagnosticsMarkdown,
   tailLogFile,
 } from "../lib/diagnostics.js";
@@ -307,6 +308,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
       : null;
+  const opencodeSkew = opencodeHarness ? pluginVersionSkewFor(report, opencodeHarness) : null;
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
@@ -378,7 +380,14 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       ) {
         log.error(`  expected load path: ${opencodeDoctor.expectedLoadPath}`);
       }
-      for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
+      for (const problem of opencodeDoctor?.problems ?? []) {
+        // An entry that needs pinning beside a plugin older than this CLI is
+        // one problem with one fix; the version-skew line below names both.
+        if (opencodeSkew && problem === opencodeDoctor?.pinProblem) continue;
+        log.error(`  ${problem}`);
+      }
+      // Same text as the "Issues found" entry, so the two never disagree.
+      if (opencodeSkew) log.error(`  ${opencodeSkew.message} ${opencodeSkew.remediation}`);
       const hostShell = hostShellDoctorLine(opencodeAdapter);
       if (hostShell) log[hostShell.level](`  ${hostShell.text}`);
     }
@@ -858,7 +867,7 @@ export interface DoctorFixPlanItem {
  * `plugin_cli_version_skew` diagnostic). This is the case where the plugin's own
  * auto-updater couldn't run `npm install` (commonly because a GUI/Desktop launch
  * had no npm on PATH), so the user is stuck on the old plugin. `doctor --fix`
- * can reinstall the latest plugin via the npm we resolve beyond PATH.
+ * can reinstall the plugin via the npm we resolve beyond PATH.
  */
 interface PluginUpdateTarget {
   adapter: HarnessAdapter;
@@ -1000,8 +1009,9 @@ async function applyPluginUpdates(
   for (const target of targets) {
     try {
       // `npm install` in the plugin's cache dir reinstalls against the
-      // package.json dependency spec OpenCode wrote (pinned to @latest), pulling
-      // the newest plugin. Mirrors the plugin auto-updater's install flags.
+      // package.json dependency spec OpenCode wrote for the configured entry.
+      // The entry itself is pinned to this CLI's version by the plugin
+      // registration fix. Mirrors the plugin auto-updater's install flags.
       await runDoctorNpmInstall(npm, target.installDir);
       updated += 1;
       log.success(
@@ -1583,7 +1593,7 @@ async function confirmBinaryDownloadDespitePluginSkew(
   }
   if (decision === "skip") {
     log.info(
-      `Skipped binary download. Update the plugin to @latest, then rerun \`${CLI} doctor --fix\`.`,
+      `Skipped binary download. Update the plugin to ${report.cliVersion} as described above, then rerun \`${CLI} doctor --fix\`.`,
     );
     return false;
   }

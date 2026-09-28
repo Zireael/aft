@@ -42,6 +42,21 @@ export function pinnedPluginEntry(version: string): string {
   return `${AFT_OPENCODE_PACKAGE}@${version}`;
 }
 
+/**
+ * Why an npm plugin entry other than this CLI's exact pin is a problem, as a
+ * clause that follows "the plugin entry <entry>". Doctor's OpenCode section and
+ * its version-skew issue share this wording so the two never disagree.
+ */
+export function describePluginEntry(entry: string): string {
+  if (entry === AFT_OPENCODE_PACKAGE) {
+    return "has no version, so OpenCode may load any release of the plugin";
+  }
+  const tag = entry.slice(entry.lastIndexOf("@") + 1);
+  return tag === "latest"
+    ? "follows the newest release, which can differ from this CLI and its binary"
+    : `asks for version ${tag}, not the version of this CLI and its binary`;
+}
+
 const EXACT_VERSION =
   /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
