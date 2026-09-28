@@ -921,8 +921,29 @@ when it removes many files. Single-file callers pass a single-element array.
 { "files": ["dist/foo.js", "dist/bar.js", "dist/baz.js"] }
 ```
 
-Deleting a directory requires `recursive: true`. Every file inside is individually backed up
-before the tree is removed; symlinks and empty directories are rejected before any mutation.
+Deleting a directory requires `recursive: true`. The tree is backed up before it is removed,
+and one `aft_safety undo` restores it exactly:
+
+- directories, including empty ones, with their permissions;
+- file contents;
+- hard links inside the tree, relinked so they share one file again;
+- symlinks: the link itself is deleted and restored with its exact target text (also when
+  dangling or pointing outside the tree); the target is never followed or touched.
+
+Reported as warnings: sockets are deleted but not restored (they hold no data, and a recreated
+one would have no process listening), and a file hard-linked to paths outside the tree comes
+back as an independent copy. Refused before anything is deleted: a mount point of another
+filesystem (removing it would delete that filesystem's contents), named pipes, device nodes,
+and symlinks undo cannot recreate exactly (a non-UTF-8 target, or any symlink on Windows).
+The delete removes only the entries it backed up, deepest first; if something new appears in
+the tree meanwhile, it stops with `partial: true`, leaves the new entry in place, and undo
+restores what was removed.
+
+Paths under the system temp directory are never backed up, and neither is anything when
+backups are disabled; such deletes skip these checks and the backup budget, and only a mount
+point is refused. A recursive delete whose backup would record more than 2,000 entries (files,
+directories and links) or copy 100 MiB in one call is refused; delete it in smaller pieces or
+use bash `rm -rf` when no undo is needed.
 
 ```json
 { "files": ["build/cache"], "recursive": true }

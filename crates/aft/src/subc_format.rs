@@ -445,18 +445,26 @@ fn format_delete(data: &Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
-    if deleted.len() == 1 && skipped.is_empty() {
+    let mut text = if deleted.len() == 1 && skipped.is_empty() {
         let file = deleted[0]
             .get("file")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return format!("Deleted {file}");
+        format!("Deleted {file}")
+    } else {
+        let total = deleted.len() + skipped.len();
+        format!("Deleted {}/{} file(s)", deleted.len(), total)
+    };
+    // One `warning <text>` line per warning, the same shape undo uses.
+    for warning in deleted
+        .iter()
+        .flat_map(|entry| string_array(entry.get("warnings")))
+    {
+        text.push_str("\nwarning ");
+        text.push_str(&warning);
     }
-
-    let total = deleted.len() + skipped.len();
-    format!("Deleted {}/{} file(s)", deleted.len(), total)
+    text
 }
-
 fn format_move(data: &Value, ctx: &FormatContext) -> String {
     let response = data.as_object();
     let Some(file) = ctx

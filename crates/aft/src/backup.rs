@@ -47,7 +47,12 @@ pub fn backup_skipped_totals() -> (u64, u64) {
 #[cfg(test)]
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
-const DB_RESTORE_META_VERSION: u32 = 1;
+/// Version of the `restore_meta` JSON mirrored into the backups table.
+/// Version 2 adds `post_state`, `external_change_before`,
+/// `external_change_checkpoint` (undo's external-change record), `link_to`
+/// and `hardlink_detached`. Readers accept 1 and 2; in version 1 rows these
+/// fields are absent or optional and read as unset.
+const DB_RESTORE_META_VERSION: u32 = 2;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 
 #[cfg(test)]
@@ -94,7 +99,15 @@ fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 ///
 /// Bump this when the `meta.json` shape changes. Readers check the field and
 /// refuse or migrate older versions instead of misinterpreting them.
-const SCHEMA_VERSION: u32 = 4;
+///
+/// Version 5 adds the `directory` and `hardlink` entry kinds and the
+/// per-entry fields `link_to`, `hardlink_detached`, `post_state`,
+/// `external_change_before` and `external_change_checkpoint`. The new kinds
+/// never carry a `content_path`, so a version-4 reader, which reads an
+/// unknown kind as content and then requires its content file, fails closed
+/// on them; the new fields are optional, and readers treat them as unset when
+/// absent, so version-4 stacks load unchanged.
+const SCHEMA_VERSION: u32 = 5;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -127,6 +140,13 @@ pub struct BackupEntry {
     /// outside AFT: names the checkpoint that preserved that content before
     /// the undo overwrote it (restore it with `aft_safety restore`).
     pub external_change_checkpoint: Option<String>,
+    /// For a [`BackupEntryKind::HardLink`] entry: the key of the entry in the
+    /// same operation that carries the shared content; undo links to it.
+    pub link_to: Option<PathBuf>,
+    /// For a content entry of a hard-linked file that also had links outside
+    /// the deleted tree: undo can restore the content, but only as an
+    /// independent copy that no longer shares data with those outside links.
+    pub hardlink_detached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +154,12 @@ pub enum BackupEntryKind {
     Content,
     Symlink,
     Tombstone,
+    /// A directory, recorded by a recursive delete so undo can recreate it
+    /// (including an empty one) with its mode. Carries no content file.
+    Directory,
+    /// A regular file that shared its data with another path in the same
+    /// operation; undo recreates it as a hard link. Carries no content file.
+    HardLink,
 }
 
 /// Identity of what a path held at one moment, reduced to what undo needs to
@@ -180,6 +206,10 @@ impl PathFingerprint {
                 .map(Self::Symlink)
                 .unwrap_or(Self::Other),
             BackupEntryKind::Tombstone => Self::Absent,
+            // Neither records its own content (a directory has none; a hard
+            // link shares another entry's), so the state it describes is not
+            // known from the entry alone.
+            BackupEntryKind::Directory | BackupEntryKind::HardLink => Self::Other,
         }
     }
 
@@ -337,6 +367,37 @@ impl BackupEntryHead {
     }
 }
 
+impl BackupEntryKind {
+    /// Stable persisted name, used in `meta.json` and the backups table.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::Symlink => "symlink",
+            Self::Tombstone => "tombstone",
+            Self::Directory => "directory",
+            Self::HardLink => "hardlink",
+        }
+    }
+
+    /// Parse a persisted kind. Unknown names read as content, which then
+    /// requires a content file: an entry this version does not understand
+    /// fails to load instead of restoring as something it is not.
+    fn from_str_lossy(value: &str) -> Self {
+        match value {
+            "tombstone" => Self::Tombstone,
+            "symlink" => Self::Symlink,
+            "directory" => Self::Directory,
+            "hardlink" => Self::HardLink,
+            _ => Self::Content,
+        }
+    }
+
+    /// Whether the entry stores a content file (file bytes or link text).
+    const fn has_content_file(self) -> bool {
+        matches!(self, Self::Content | Self::Symlink)
+    }
+}
+
 impl BackupEntry {
     fn to_backup_row(
         &self,
@@ -357,11 +418,7 @@ impl BackupEntry {
             file_path: file_path.to_string(),
             path_hash: path_hash.to_string(),
             backup_path: backup_path.map(str::to_string),
-            kind: match self.kind {
-                BackupEntryKind::Content => "content".to_string(),
-                BackupEntryKind::Symlink => "symlink".to_string(),
-                BackupEntryKind::Tombstone => "tombstone".to_string(),
-            },
+            kind: self.kind.as_str().to_string(),
             description: self.description.clone(),
             created_at: i64::try_from(self.timestamp).unwrap_or(i64::MAX),
             is_tombstone: matches!(self.kind, BackupEntryKind::Tombstone),
@@ -374,12 +431,10 @@ impl TryFrom<BackupRow> for BackupEntry {
     type Error = std::io::Error;
 
     fn try_from(row: BackupRow) -> Result<Self, Self::Error> {
-        let kind = if row.is_tombstone || row.kind == "tombstone" {
+        let kind = if row.is_tombstone {
             BackupEntryKind::Tombstone
-        } else if row.kind == "symlink" {
-            BackupEntryKind::Symlink
         } else {
-            BackupEntryKind::Content
+            BackupEntryKind::from_str_lossy(&row.kind)
         };
         let backup_path = row.backup_path.clone();
         let persisted_metadata = row
@@ -391,17 +446,16 @@ impl TryFrom<BackupRow> for BackupEntry {
                 .as_deref()
                 .and_then(|path| read_entry_disk_metadata(Path::new(path), &row.backup_id))
         });
-        let content_bytes = match kind {
-            BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                let backup_path = backup_path.ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("backup DB row {} has no backup_path", row.backup_id),
-                    )
-                })?;
-                std::fs::read(backup_path)?
-            }
-            BackupEntryKind::Tombstone => Vec::new(),
+        let content_bytes = if kind.has_content_file() {
+            let backup_path = backup_path.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("backup DB row {} has no backup_path", row.backup_id),
+                )
+            })?;
+            std::fs::read(backup_path)?
+        } else {
+            Vec::new()
         };
         let link_target = if kind == BackupEntryKind::Symlink {
             restore_metadata
@@ -415,13 +469,27 @@ impl TryFrom<BackupRow> for BackupEntry {
         } else {
             None
         };
+        let link_to = restore_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.link_to.clone());
+        if kind == BackupEntryKind::HardLink && link_to.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "backup DB row {} is a hard link without link_to",
+                    row.backup_id
+                ),
+            ));
+        }
         let content = match kind {
             BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
             BackupEntryKind::Symlink => link_target
                 .as_ref()
                 .map(|target| target.display().to_string())
                 .unwrap_or_default(),
-            BackupEntryKind::Tombstone => String::new(),
+            BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
+                String::new()
+            }
         };
 
         Ok(BackupEntry {
@@ -444,6 +512,10 @@ impl TryFrom<BackupRow> for BackupEntry {
             external_change_checkpoint: restore_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.external_change_checkpoint.clone()),
+            hardlink_detached: restore_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.hardlink_detached),
+            link_to,
             created_dirs: restore_metadata
                 .map(|metadata| metadata.created_dirs)
                 .unwrap_or_default(),
@@ -514,6 +586,12 @@ pub fn external_change_warning(checkpoint: &str) -> String {
 /// else. A missing path has nothing to lose and restores normally, as do
 /// entries from before the post-mutation state was recorded.
 fn needs_capture_before_undo(top: &BackupEntry, path: &Path) -> bool {
+    // A directory entry holds no content that undo overwrites: a real
+    // directory at the path already satisfies it, and anything else there is
+    // refused rather than replaced.
+    if top.kind == BackupEntryKind::Directory {
+        return false;
+    }
     let Some(expected) = top.post_state.as_ref() else {
         return false;
     };
@@ -940,11 +1018,98 @@ impl BackupStore {
             post_state: None,
             external_change_before: false,
             external_change_checkpoint: None,
+            link_to: None,
+            hardlink_detached: false,
         };
 
         self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
 
+        Ok(Some(id))
+    }
+
+    /// Record a directory so undoing `op_id` recreates it, empty or not, with
+    /// its current mode. The directory's contents are recorded separately.
+    pub(crate) fn snapshot_directory_with_op(
+        &mut self,
+        session: &str,
+        path: &Path,
+        description: &str,
+        op_id: &str,
+    ) -> Result<Option<String>, AftError> {
+        self.snapshot_built_entry(session, path, op_id, |id, order| {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            })?;
+            if !metadata.is_dir() {
+                return Err(AftError::InvalidRequest {
+                    message: format!("backup: '{}' is not a directory", path.display()),
+                });
+            }
+            let mut entry = metadata_only_entry(id, order, description, op_id);
+            entry.kind = BackupEntryKind::Directory;
+            entry.mode = file_mode(&metadata);
+            Ok(entry)
+        })
+    }
+
+    /// Record `path` as a hard link to `link_to`, a path whose content is
+    /// backed up in the same operation. Undo relinks instead of copying.
+    pub(crate) fn snapshot_hard_link_with_op(
+        &mut self,
+        session: &str,
+        path: &Path,
+        link_to: &Path,
+        description: &str,
+        op_id: &str,
+    ) -> Result<Option<String>, AftError> {
+        let link_to = canonicalize_key(link_to);
+        self.snapshot_built_entry(session, path, op_id, |id, order| {
+            let mut entry = metadata_only_entry(id, order, description, op_id);
+            entry.kind = BackupEntryKind::HardLink;
+            entry.link_to = Some(link_to);
+            Ok(entry)
+        })
+    }
+
+    /// Back up a hard-linked file whose other links are (partly) outside the
+    /// deleted tree. Its content is captured as usual; the entry is marked so
+    /// undo can warn that the file comes back as an independent copy.
+    pub(crate) fn snapshot_detached_hard_link_with_op(
+        &mut self,
+        session: &str,
+        path: &Path,
+        description: &str,
+        op_id: &str,
+    ) -> Result<Option<String>, AftError> {
+        self.snapshot_built_entry(session, path, op_id, |id, order| {
+            let mut entry = backup_entry_from_path(path, id, order, description, Some(op_id))?;
+            entry.hardlink_detached = true;
+            Ok(entry)
+        })
+    }
+
+    /// Shared body of the snapshot methods: apply the skip policy, hydrate the
+    /// stack under its disk lock, then persist the entry `build` produces.
+    fn snapshot_built_entry(
+        &mut self,
+        session: &str,
+        path: &Path,
+        op_id: &str,
+        build: impl FnOnce(String, u128) -> Result<BackupEntry, AftError>,
+    ) -> Result<Option<String>, AftError> {
+        if !self.prepare_snapshot(session, path, Some(op_id), false)? {
+            return Ok(None);
+        }
+        self.run_process_maintenance_once();
+        let key = canonicalize_key(path);
+        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
+        self.ensure_stack_hydrated_locked(session, &key)?;
+        let (id, order) = self.next_id_and_order();
+        let entry = build(id.clone(), order)?;
+        self.persist_new_entry_locked(session, &key, entry)?;
+        self.touch_session(session);
         Ok(Some(id))
     }
 
@@ -1018,160 +1183,8 @@ impl BackupStore {
                 continue;
             }
 
-            let mut content_targets = Vec::new();
-            let mut tombstone_targets = Vec::new();
-            let mut capture_targets = Vec::new();
-            for key in &keys_to_restore {
-                let entry = self
-                    .entries
-                    .get(session)
-                    .and_then(|files| files.get(key))
-                    .and_then(|stack| stack.last())
-                    .cloned()
-                    .ok_or_else(|| AftError::NoUndoHistory {
-                        path: key.display().to_string(),
-                    })?;
-                if needs_capture_before_undo(&entry, key) {
-                    capture_targets.push(key.clone());
-                }
-                match entry.kind {
-                    BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                        let existing_state = capture_path_state(key)?;
-                        content_targets.push((key.clone(), entry, existing_state));
-                    }
-                    BackupEntryKind::Tombstone => {
-                        let existing_state = capture_path_state(key)?;
-                        tombstone_targets.push((key.clone(), entry, existing_state));
-                    }
-                }
-            }
-
-            // Preserve content changed outside AFT before anything is
-            // overwritten: one checkpoint covers every such file of the
-            // operation. It stays out of the undo stacks, so later undos keep
-            // walking back through AFT's own history.
-            let external_change_checkpoint = if capture_targets.is_empty() {
-                None
-            } else {
-                for key in &capture_targets {
-                    self.ensure_preservable(key)?;
-                }
-                Some(save_external(&capture_targets)?)
-            };
-
-            let mut created_dirs = Vec::new();
-            for (key, _, _) in &content_targets {
-                if let Some(parent) = key.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let missing_dirs = missing_parent_dirs(parent);
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            let mut dirs_to_remove = created_dirs;
-                            dirs_to_remove.extend(missing_dirs);
-                            let rollback_ok = rollback_created_dirs(&dirs_to_remove);
-                            return Err(AftError::IoError {
-                                path: parent.display().to_string(),
-                                message: format!(
-                                    "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
-                                    e,
-                                    !rollback_ok,
-                                    rollback_ok
-                                ),
-                            });
-                        }
-                        created_dirs.extend(missing_dirs);
-                    }
-                }
-            }
-
-            let mut written = Vec::new();
-            for (key, entry, existing_state) in &content_targets {
-                if let Err(e) = restore_entry_to_path(key, entry) {
-                    let files_rollback_ok =
-                        rollback_transactional_restore(&written, Some((key, existing_state)));
-                    let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
-                    let rollback_ok = files_rollback_ok && dirs_rollback_ok;
-                    return Err(AftError::IoError {
-                        path: key.display().to_string(),
-                        message: format!(
-                            "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
-                            e,
-                            !rollback_ok,
-                            rollback_ok
-                        ),
-                    });
-                }
-                written.push((key.clone(), existing_state.clone()));
-            }
-
-            let mut deleted_tombstones = Vec::new();
-            for (key, _, existing_state) in &tombstone_targets {
-                match remove_tombstone_path(key) {
-                    Ok(()) => deleted_tombstones.push((key.clone(), existing_state.clone())),
-                    Err(e) => {
-                        let files_rollback_ok = rollback_transactional_restore(&written, None);
-                        let tombstone_rollback_ok =
-                            rollback_deleted_tombstones(&deleted_tombstones);
-                        let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
-                        let rollback_ok =
-                            files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
-                        return Err(AftError::IoError {
-                            path: key.display().to_string(),
-                            message: format!(
-                                "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
-                                e,
-                                !rollback_ok,
-                                rollback_ok
-                            ),
-                        });
-                    }
-                }
-            }
-            let tombstone_created_dirs = tombstone_targets
-                .iter()
-                .flat_map(|(_, entry, _)| entry.created_dirs.iter().cloned())
-                .collect::<Vec<_>>();
-            remove_created_dirs_best_effort(&tombstone_created_dirs);
-
-            let mut restored = Vec::new();
-            let mut warnings = self
-                .skipped_backups
-                .get(session)
-                .into_iter()
-                .flatten()
-                .filter(|skip| skip.op_id.as_deref() == Some(op_id.as_str()))
-                .map(|skip| {
-                    format!(
-                        "{}: undo unavailable because backup was skipped ({})",
-                        skip.path.display(),
-                        skip.reason.as_str()
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Some(checkpoint) = &external_change_checkpoint {
-                warnings.push(format!(
-                    "{}: {}",
-                    capture_targets
-                        .iter()
-                        .map(|key| key.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    external_change_warning(checkpoint)
-                ));
-            }
-            for (key, entry, _) in content_targets.into_iter().chain(tombstone_targets) {
-                self.commit_restored_backup_locked(session, &key, &entry.backup_id)?;
-                let file_checkpoint = external_change_checkpoint
-                    .clone()
-                    .filter(|_| capture_targets.contains(&key));
-                if let Some(checkpoint) = &file_checkpoint {
-                    self.mark_external_change_checkpoint_locked(session, &key, checkpoint)?;
-                }
-                restored.push(RestoredFile {
-                    path: key,
-                    backup_id: entry.backup_id,
-                    external_change_checkpoint: file_checkpoint,
-                });
-            }
+            let (restored, warnings, external_change_checkpoint) = self
+                .apply_operation_restore_locked(session, &op_id, &keys_to_restore, save_external)?;
             if let Some(skips) = self.skipped_backups.get_mut(session) {
                 skips.retain(|skip| skip.op_id.as_deref() != Some(op_id.as_str()));
                 if skips.is_empty() {
@@ -1193,6 +1206,267 @@ impl BackupStore {
             path: "operation".to_string(),
             message: "backup stack changing under concurrent activity; retry".to_string(),
         })
+    }
+
+    /// Restore every top-of-stack entry of `op_id`, all or nothing. The caller
+    /// holds the disk locks for `keys`.
+    ///
+    /// Paths whose content changed outside AFT since the operation are first
+    /// handed to `save_external` together, so one checkpoint preserves them
+    /// before anything is overwritten (see [`needs_capture_before_undo`]).
+    ///
+    /// Order: directories (parents first), file contents, hard links,
+    /// symlinks, tombstones, then directory modes (deepest first, so a
+    /// read-only directory does not block restoring its children). Any failure
+    /// before the modes rolls back everything already restored or created.
+    fn apply_operation_restore_locked(
+        &mut self,
+        session: &str,
+        op_id: &str,
+        keys: &[PathBuf],
+        save_external: &mut ExternalChangeSaver<'_>,
+    ) -> Result<(Vec<RestoredFile>, Vec<String>, Option<String>), AftError> {
+        let mut directory_targets = Vec::new();
+        let mut content_targets = Vec::new();
+        let mut link_targets = Vec::new();
+        let mut symlink_targets = Vec::new();
+        let mut tombstone_targets = Vec::new();
+        let mut capture_targets = Vec::new();
+        for key in keys {
+            let entry = self
+                .entries
+                .get(session)
+                .and_then(|files| files.get(key))
+                .and_then(|stack| stack.last())
+                .cloned()
+                .ok_or_else(|| AftError::NoUndoHistory {
+                    path: key.display().to_string(),
+                })?;
+            if needs_capture_before_undo(&entry, key) {
+                capture_targets.push(key.clone());
+            }
+            match entry.kind {
+                BackupEntryKind::Directory => directory_targets.push((key.clone(), entry)),
+                BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                    let existing_state = capture_path_state(key)?;
+                    let target = (key.clone(), entry, existing_state);
+                    if target.1.kind == BackupEntryKind::Content {
+                        content_targets.push(target);
+                    } else {
+                        symlink_targets.push(target);
+                    }
+                }
+                BackupEntryKind::HardLink => {
+                    let existing_state = capture_path_state(key)?;
+                    link_targets.push((key.clone(), entry, existing_state));
+                }
+                BackupEntryKind::Tombstone => {
+                    let existing_state = capture_path_state(key)?;
+                    tombstone_targets.push((key.clone(), entry, existing_state));
+                }
+            }
+        }
+
+        // A recorded directory now occupied by a file or symlink is refused
+        // before anything is preserved or written: undo will not replace it,
+        // and must never create entries through a symlink.
+        for (key, _) in &directory_targets {
+            if let Ok(metadata) = std::fs::symlink_metadata(key) {
+                if !metadata.is_dir() {
+                    return Err(AftError::IoError {
+                        path: key.display().to_string(),
+                        message: "undo refused: this path is no longer a real directory (a file or symlink now stands in its place); nothing was restored".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Preserve content changed outside AFT before anything is
+        // overwritten: one checkpoint covers every such path of the
+        // operation. It stays out of the undo stacks, so later undos keep
+        // walking back through AFT's own history.
+        let external_change_checkpoint = if capture_targets.is_empty() {
+            None
+        } else {
+            for key in &capture_targets {
+                self.ensure_preservable(key)?;
+            }
+            Some(save_external(&capture_targets)?)
+        };
+
+        let mut rollback = OperationRollback::default();
+        let operation_dirs: HashSet<PathBuf> = directory_targets
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        // Directories are created one at a time with `create_dir`, never
+        // through a path that could pass a symlink: each one's parent is either
+        // a directory this operation just created or verified, or lies above
+        // the restored tree.
+        directory_targets.sort_by_key(|(key, _)| key.components().count());
+        let mut modes_to_apply = Vec::new();
+        for (key, entry) in &directory_targets {
+            match std::fs::symlink_metadata(key) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(rollback.abort(
+                        key,
+                        "undo refused: this path is no longer a real directory (a file or symlink now stands in its place)"
+                            .to_string(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = key.parent() {
+                        if !parent.as_os_str().is_empty() && !operation_dirs.contains(parent) {
+                            let missing = missing_parent_dirs(parent);
+                            if let Err(error) = std::fs::create_dir_all(parent) {
+                                rollback.created_dirs.extend(missing);
+                                return Err(rollback.abort(parent, error.to_string()));
+                            }
+                            rollback.created_dirs.extend(missing);
+                        }
+                    }
+                    if let Err(error) = std::fs::create_dir(key) {
+                        return Err(rollback.abort(key, error.to_string()));
+                    }
+                    rollback.created_dirs.push(key.clone());
+                    modes_to_apply.push((key.clone(), entry.mode));
+                }
+                Err(error) => return Err(rollback.abort(key, error.to_string())),
+            }
+        }
+
+        let non_directory_keys = content_targets
+            .iter()
+            .map(|(key, ..)| key)
+            .chain(link_targets.iter().map(|(key, ..)| key))
+            .chain(symlink_targets.iter().map(|(key, ..)| key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &non_directory_keys {
+            let Some(parent) = key.parent() else {
+                continue;
+            };
+            if parent.as_os_str().is_empty() || operation_dirs.contains(parent) {
+                continue;
+            }
+            let missing = missing_parent_dirs(parent);
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                rollback.created_dirs.extend(missing);
+                return Err(rollback.abort(parent, error.to_string()));
+            }
+            rollback.created_dirs.extend(missing);
+        }
+
+        for (key, entry, existing_state) in &content_targets {
+            rollback.attempt(key, existing_state, false);
+            if let Err(error) = restore_entry_to_path(key, entry) {
+                return Err(rollback.abort(key, error.to_string()));
+            }
+        }
+        for (key, entry, existing_state) in &link_targets {
+            // Replacing an existing file with a link must unlink it first on
+            // rollback too, or writing the old content back would write
+            // through the new link into the file it shares data with.
+            rollback.attempt(key, existing_state, true);
+            if let Err(error) = restore_entry_to_path(key, entry) {
+                return Err(rollback.abort(key, error.to_string()));
+            }
+        }
+        for (key, entry, existing_state) in &symlink_targets {
+            rollback.attempt(key, existing_state, false);
+            if let Err(error) = restore_entry_to_path(key, entry) {
+                return Err(rollback.abort(key, error.to_string()));
+            }
+        }
+        for (key, _, existing_state) in &tombstone_targets {
+            if let Err(error) = remove_tombstone_path(key) {
+                return Err(rollback.abort(key, error.to_string()));
+            }
+            rollback
+                .deleted_tombstones
+                .push((key.clone(), existing_state.clone()));
+        }
+        let tombstone_created_dirs = tombstone_targets
+            .iter()
+            .flat_map(|(_, entry, _)| entry.created_dirs.iter().cloned())
+            .collect::<Vec<_>>();
+        remove_created_dirs_best_effort(&tombstone_created_dirs);
+
+        let mut warnings = self
+            .skipped_backups
+            .get(session)
+            .into_iter()
+            .flatten()
+            .filter(|skip| skip.op_id.as_deref() == Some(op_id))
+            .map(|skip| {
+                format!(
+                    "{}: undo unavailable because backup was skipped ({})",
+                    skip.path.display(),
+                    skip.reason.as_str()
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(checkpoint) = &external_change_checkpoint {
+            warnings.push(format!(
+                "{}: {}",
+                capture_targets
+                    .iter()
+                    .map(|key| key.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                external_change_warning(checkpoint)
+            ));
+        }
+
+        // Everything is in place; a mode that cannot be applied leaves a
+        // restored directory with default permissions, which is reported
+        // instead of undoing the whole restore.
+        modes_to_apply.sort_by_key(|(key, _)| std::cmp::Reverse(key.components().count()));
+        for (key, mode) in &modes_to_apply {
+            if let Err(error) = set_file_mode(key, *mode) {
+                warnings.push(format!(
+                    "{}: restored, but its permissions could not be restored: {}",
+                    key.display(),
+                    error
+                ));
+            }
+        }
+
+        let mut committed = Vec::new();
+        for (key, entry) in directory_targets {
+            committed.push((key, entry));
+        }
+        for (key, entry, _) in content_targets.into_iter().chain(symlink_targets) {
+            if entry.hardlink_detached {
+                warnings.push(format!(
+                    "{}: restored as an independent copy; before the delete it shared its data with hard links outside the deleted tree",
+                    key.display()
+                ));
+            }
+            committed.push((key, entry));
+        }
+        for (key, entry, _) in link_targets.into_iter().chain(tombstone_targets) {
+            committed.push((key, entry));
+        }
+
+        let mut restored = Vec::new();
+        for (key, entry) in committed {
+            self.commit_restored_backup_locked(session, &key, &entry.backup_id)?;
+            let file_checkpoint = external_change_checkpoint
+                .clone()
+                .filter(|_| capture_targets.contains(&key));
+            if let Some(checkpoint) = &file_checkpoint {
+                self.mark_external_change_checkpoint_locked(session, &key, checkpoint)?;
+            }
+            restored.push(RestoredFile {
+                path: key,
+                backup_id: entry.backup_id,
+                external_change_checkpoint: file_checkpoint,
+            });
+        }
+        Ok((restored, warnings, external_change_checkpoint))
     }
 
     /// Pop the most recent backup for `(session, path)` and restore the file.
@@ -1907,7 +2181,10 @@ impl BackupStore {
         let mut restamped_previous = false;
         if let Some(previous) = stack.last_mut() {
             match &previous.post_state {
-                Some(left) => entry.external_change_before |= *left != captured_state,
+                Some(left) if captured_state != PathFingerprint::Other => {
+                    entry.external_change_before |= *left != captured_state
+                }
+                Some(_) => {}
                 None if self
                     .pending_post_state_index(session, key, &previous.backup_id)
                     .is_some() =>
@@ -2364,7 +2641,10 @@ impl BackupStore {
             })?;
 
         match entry.kind {
-            BackupEntryKind::Content | BackupEntryKind::Symlink => {
+            BackupEntryKind::Content
+            | BackupEntryKind::Symlink
+            | BackupEntryKind::Directory
+            | BackupEntryKind::HardLink => {
                 restore_entry_to_path(path, &entry).map_err(|e| AftError::IoError {
                     path: path.display().to_string(),
                     message: e.to_string(),
@@ -2743,7 +3023,15 @@ impl BackupStore {
         if !self.policy.enabled || self.policy.max_file_size == Some(0) {
             return Ok(SnapshotDecision::Skip(BackupSkippedReason::Disabled));
         }
-        if self.temp_path_policy_applies() && crate::bash_permissions::is_system_temp_path(path) {
+        // Judge a symlink by the directory holding it: resolving the link
+        // would judge wherever it points instead of where the link lives.
+        let temp_probe = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => path.parent().unwrap_or(path),
+            _ => path,
+        };
+        if self.temp_path_policy_applies()
+            && crate::bash_permissions::is_system_temp_path(temp_probe)
+        {
             return Ok(SnapshotDecision::Skip(BackupSkippedReason::TempPath));
         }
         let Some(max_file_size) = self.policy.max_file_size else {
@@ -3288,7 +3576,7 @@ impl BackupStore {
         entry_meta: &serde_json::Value,
     ) -> Result<(), String> {
         let kind = entry_kind_from_meta(Some(entry_meta));
-        if matches!(kind, BackupEntryKind::Tombstone) {
+        if !kind.has_content_file() {
             return Ok(());
         }
         let content_path = content_path_from_meta(entry_meta)?;
@@ -3309,26 +3597,27 @@ impl BackupStore {
         index: usize,
     ) -> Result<BackupEntry, String> {
         let kind = entry_kind_from_meta(Some(entry_meta));
-        let content_bytes = match kind {
-            BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                let content_path = content_path_from_meta(entry_meta)?;
-                let path = dir.join(content_path);
-                std::fs::read(&path).map_err(|error| {
-                    format!(
-                        "failed to read v2 backup content {}: {}",
-                        path.display(),
-                        error
-                    )
-                })?
-            }
-            BackupEntryKind::Tombstone => Vec::new(),
+        let content_bytes = if kind.has_content_file() {
+            let content_path = content_path_from_meta(entry_meta)?;
+            let path = dir.join(content_path);
+            std::fs::read(&path).map_err(|error| {
+                format!(
+                    "failed to read v2 backup content {}: {}",
+                    path.display(),
+                    error
+                )
+            })?
+        } else {
+            Vec::new()
         };
-        Ok(entry_from_meta(
-            Some(entry_meta),
-            index,
-            kind,
-            content_bytes,
-        ))
+        let entry = entry_from_meta(Some(entry_meta), index, kind, content_bytes);
+        if kind == BackupEntryKind::HardLink && entry.link_to.is_none() {
+            return Err(format!(
+                "v2 backup entry {} is a hard link without link_to",
+                entry.backup_id
+            ));
+        }
+        Ok(entry)
     }
 
     fn write_snapshot_to_disk(
@@ -3821,6 +4110,8 @@ struct BackupEntryDiskMetadata {
     post_state: Option<PathFingerprint>,
     external_change_before: bool,
     external_change_checkpoint: Option<String>,
+    link_to: Option<PathBuf>,
+    hardlink_detached: bool,
 }
 
 fn restore_metadata_json(entry: &BackupEntry) -> String {
@@ -3836,13 +4127,16 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
         "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
         "external_change_before": entry.external_change_before,
         "external_change_checkpoint": entry.external_change_checkpoint,
+        "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
+        "hardlink_detached": entry.hardlink_detached,
     })
     .to_string()
 }
 
 fn restore_metadata_from_json(value: &str) -> Option<BackupEntryDiskMetadata> {
     let value: serde_json::Value = serde_json::from_str(value).ok()?;
-    if value.get("version")?.as_u64()? != u64::from(DB_RESTORE_META_VERSION) {
+    let version = value.get("version")?.as_u64()?;
+    if version != 1 && version != u64::from(DB_RESTORE_META_VERSION) {
         return None;
     }
 
@@ -3866,6 +4160,13 @@ fn restore_metadata_from_json(value: &str) -> Option<BackupEntryDiskMetadata> {
         .all(serde_json::Value::is_string)
     {
         return None;
+    }
+    if version >= 2 {
+        let link_to = value.get("link_to")?;
+        if !link_to.is_null() && !link_to.is_string() {
+            return None;
+        }
+        value.get("hardlink_detached")?.as_bool()?;
     }
 
     Some(restore_metadata_fields(&value))
@@ -3894,6 +4195,14 @@ fn restore_metadata_fields(value: &serde_json::Value) -> BackupEntryDiskMetadata
         post_state: post_state_from_meta(value),
         external_change_before: meta_flag(value, "external_change_before"),
         external_change_checkpoint: meta_string(value, "external_change_checkpoint"),
+        link_to: value
+            .get("link_to")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
+        hardlink_detached: value
+            .get("hardlink_detached")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -3976,7 +4285,32 @@ fn backup_entry_from_path(
         post_state: None,
         external_change_before: false,
         external_change_checkpoint: None,
+        link_to: None,
+        hardlink_detached: false,
     })
+}
+
+/// An entry with no content, for kinds that record only metadata; the caller
+/// sets the kind and its fields.
+fn metadata_only_entry(id: String, order: u128, description: &str, op_id: &str) -> BackupEntry {
+    BackupEntry {
+        backup_id: id,
+        content: String::new(),
+        content_bytes: Arc::from([]),
+        timestamp: current_timestamp(),
+        order,
+        description: description.to_string(),
+        op_id: Some(op_id.to_string()),
+        kind: BackupEntryKind::Content,
+        mode: None,
+        link_target: None,
+        post_state: None,
+        external_change_before: false,
+        external_change_checkpoint: None,
+        created_dirs: Vec::new(),
+        link_to: None,
+        hardlink_detached: false,
+    }
 }
 
 fn backup_entry_from_capture(
@@ -4001,6 +4335,8 @@ fn backup_entry_from_capture(
         post_state: None,
         external_change_before: false,
         external_change_checkpoint: None,
+        link_to: None,
+        hardlink_detached: false,
     }
 }
 
@@ -4149,7 +4485,51 @@ fn restore_entry_to_path(path: &Path, entry: &BackupEntry) -> std::io::Result<()
             restore_symlink(path, target)
         }
         BackupEntryKind::Tombstone => remove_tombstone_path(path),
+        BackupEntryKind::Directory => restore_directory(path, entry.mode),
+        BackupEntryKind::HardLink => {
+            let source = entry.link_to.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hard-link backup entry missing link_to",
+                )
+            })?;
+            restore_hard_link(path, source)
+        }
     }
+}
+
+/// Recreate a directory for a single-path undo. An existing real directory
+/// is left as it is; anything else at the path is an error.
+fn restore_directory(path: &Path, mode: Option<u32>) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a file or symlink now stands where the directory was",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::create_dir(path)?;
+            set_file_mode(path, mode)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Recreate `path` as a hard link to `source`, replacing a file or symlink
+/// already there. `source` must already be restored.
+fn restore_hard_link(path: &Path, source: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    remove_file_or_symlink_if_present(path)?;
+    std::fs::hard_link(source, path)
 }
 
 fn restore_path_state(path: &Path, state: &RestorePathState) -> bool {
@@ -4254,21 +4634,45 @@ fn read_entry_disk_metadata(
     Some(restore_metadata_fields(entry))
 }
 
-fn rollback_transactional_restore(
-    written: &[(PathBuf, RestorePathState)],
-    attempted: Option<(&PathBuf, &RestorePathState)>,
-) -> bool {
-    let mut ok = true;
+/// What an operation restore has changed so far, so a failure can put every
+/// path back the way it was before the restore started.
+#[derive(Default)]
+struct OperationRollback {
+    /// Paths written, with their state before the write, and whether the path
+    /// must be unlinked before that state is put back (it may now be a hard
+    /// link, and writing through it would change the file it shares data with).
+    written: Vec<(PathBuf, RestorePathState, bool)>,
+    deleted_tombstones: Vec<(PathBuf, RestorePathState)>,
+    created_dirs: Vec<PathBuf>,
+}
 
-    if let Some((path, state)) = attempted {
-        ok &= restore_path_state(path, state);
+impl OperationRollback {
+    /// Record a path's prior state just before writing it, so a failed write
+    /// is rolled back along with everything before it.
+    fn attempt(&mut self, key: &Path, state: &RestorePathState, unlink_first: bool) {
+        self.written
+            .push((key.to_path_buf(), state.clone(), unlink_first));
     }
 
-    for (path, state) in written.iter().rev() {
-        ok &= restore_path_state(path, state);
+    /// Roll everything back and describe the failure at `path`.
+    fn abort(&self, path: &Path, message: String) -> AftError {
+        let mut ok = true;
+        for (written, state, unlink_first) in self.written.iter().rev() {
+            if *unlink_first {
+                ok &= remove_file_or_symlink_if_present(written).is_ok();
+            }
+            ok &= restore_path_state(written, state);
+        }
+        ok &= rollback_deleted_tombstones(&self.deleted_tombstones);
+        ok &= rollback_created_dirs(&self.created_dirs);
+        AftError::IoError {
+            path: path.display().to_string(),
+            message: format!(
+                "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                message, !ok, ok
+            ),
+        }
     }
-
-    ok
 }
 
 fn rollback_deleted_tombstones(deleted: &[(PathBuf, RestorePathState)]) -> bool {
@@ -4390,9 +4794,8 @@ fn entry_kind_from_meta(entry_meta: Option<&serde_json::Value>) -> BackupEntryKi
         .and_then(|meta| meta.get("kind"))
         .and_then(|value| value.as_str())
     {
-        Some("tombstone") => BackupEntryKind::Tombstone,
-        Some("symlink") => BackupEntryKind::Symlink,
-        _ => BackupEntryKind::Content,
+        Some(kind) => BackupEntryKind::from_str_lossy(kind),
+        None => BackupEntryKind::Content,
     }
 }
 
@@ -4457,7 +4860,9 @@ fn entry_from_meta(
             .as_ref()
             .map(|target| target.display().to_string())
             .unwrap_or_default(),
-        BackupEntryKind::Tombstone => String::new(),
+        BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
+            String::new()
+        }
     };
     BackupEntry {
         backup_id,
@@ -4495,6 +4900,14 @@ fn entry_from_meta(
             .is_some_and(|meta| meta_flag(meta, "external_change_before")),
         external_change_checkpoint: entry_meta
             .and_then(|meta| meta_string(meta, "external_change_checkpoint")),
+        link_to: entry_meta
+            .and_then(|meta| meta.get("link_to"))
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
+        hardlink_detached: entry_meta
+            .and_then(|meta| meta.get("hardlink_detached"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -4522,11 +4935,10 @@ fn legacy_entry_from_meta(
     index: usize,
 ) -> Option<BackupEntry> {
     let kind = entry_kind_from_meta(entry_meta);
-    let content_bytes = match kind {
-        BackupEntryKind::Content | BackupEntryKind::Symlink => {
-            std::fs::read(dir.join(format!("{}.bak", index))).ok()?
-        }
-        BackupEntryKind::Tombstone => Vec::new(),
+    let content_bytes = if kind.has_content_file() {
+        std::fs::read(dir.join(format!("{}.bak", index))).ok()?
+    } else {
+        Vec::new()
     };
     Some(entry_from_meta(entry_meta, index, kind, content_bytes))
 }
@@ -4558,14 +4970,13 @@ fn sanitize_backup_id(value: &str) -> String {
 }
 
 fn content_filename_for_entry(entry: &BackupEntry) -> Option<String> {
-    match entry.kind {
-        BackupEntryKind::Content | BackupEntryKind::Symlink => Some(format!(
+    entry.kind.has_content_file().then(|| {
+        format!(
             "bak_{}_{}.bak",
             entry.order,
             sanitize_backup_id(&entry.backup_id)
-        )),
-        BackupEntryKind::Tombstone => None,
-    }
+        )
+    })
 }
 
 fn content_bytes_for_disk(entry: &BackupEntry) -> Cow<'_, [u8]> {
@@ -4578,7 +4989,9 @@ fn content_bytes_for_disk(entry: &BackupEntry) -> Cow<'_, [u8]> {
                 .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
                 .unwrap_or_default(),
         ),
-        BackupEntryKind::Tombstone => Cow::Borrowed(&[]),
+        BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
+            Cow::Borrowed(&[])
+        }
     }
 }
 
@@ -4589,11 +5002,7 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
         "order": entry.order.to_string(),
         "description": entry.description,
         "op_id": entry.op_id,
-        "kind": match entry.kind {
-            BackupEntryKind::Content => "content",
-            BackupEntryKind::Symlink => "symlink",
-            BackupEntryKind::Tombstone => "tombstone",
-        },
+        "kind": entry.kind.as_str(),
         "content_path": content_filename_for_entry(entry),
         "mode": entry.mode,
         "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
@@ -4605,6 +5014,8 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
         "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
         "external_change_before": entry.external_change_before,
         "external_change_checkpoint": entry.external_change_checkpoint,
+        "link_to": entry.link_to.as_ref().map(|key| key.display().to_string()),
+        "hardlink_detached": entry.hardlink_detached,
     })
 }
 
@@ -5056,6 +5467,8 @@ mod tests {
             post_state: None,
             external_change_before: false,
             external_change_checkpoint: None,
+            link_to: None,
+            hardlink_detached: false,
         }
     }
 
@@ -5081,6 +5494,8 @@ mod tests {
         entry.post_state = Some(PathFingerprint::Symlink(PathBuf::from("../elsewhere")));
         entry.external_change_before = true;
         entry.external_change_checkpoint = Some("external-change-a.txt-1".to_string());
+        entry.link_to = Some(PathBuf::from("/project/first"));
+        entry.hardlink_detached = true;
 
         crate::db::backups::insert_backup(&conn, &backup_row_for_db(&entry, &context)).unwrap();
         let row = db_mirror_rows(&conn).pop().unwrap();
@@ -5099,7 +5514,189 @@ mod tests {
                 post_state: entry.post_state,
                 external_change_before: true,
                 external_change_checkpoint: Some("external-change-a.txt-1".to_string()),
+                link_to: entry.link_to,
+                hardlink_detached: entry.hardlink_detached,
             }
+        );
+    }
+
+    /// Rows written before `restore_meta` version 2 lack the hard-link fields
+    /// and must still load.
+    #[test]
+    fn restore_metadata_version_1_still_loads() {
+        let metadata = restore_metadata_from_json(
+            r#"{"version":1,"mode":420,"link_target":null,"created_dirs":["/p"]}"#,
+        )
+        .expect("version 1 must load");
+        assert_eq!(metadata.mode, Some(420));
+        assert_eq!(metadata.created_dirs, vec![PathBuf::from("/p")]);
+        assert_eq!(metadata.link_to, None);
+        assert!(!metadata.hardlink_detached);
+        // Version-1 rows written with undo's external-change record keep it.
+        let with_external_change = restore_metadata_from_json(
+            r#"{"version":1,"mode":null,"link_target":null,"created_dirs":[],"post_state":"absent","external_change_before":true,"external_change_checkpoint":"external-change-x-1"}"#,
+        )
+        .expect("version 1 with external-change fields must load");
+        assert_eq!(
+            with_external_change.post_state,
+            Some(PathFingerprint::Absent)
+        );
+        assert!(with_external_change.external_change_before);
+        assert_eq!(
+            with_external_change.external_change_checkpoint.as_deref(),
+            Some("external-change-x-1")
+        );
+        assert!(restore_metadata_from_json(
+            r#"{"version":3,"mode":null,"link_target":null,"created_dirs":[]}"#
+        )
+        .is_none());
+    }
+
+    /// A recursive-delete operation recorded with the directory and hard-link
+    /// entry kinds: a directory `tree`, its file `a`, and `b`, a hard link to
+    /// `a`. The entries are backed up and the tree removed, as a delete does.
+    #[cfg(unix)]
+    struct NewKindOperation {
+        project: tempfile::TempDir,
+        storage: tempfile::TempDir,
+        tree: PathBuf,
+    }
+
+    #[cfg(unix)]
+    const NEW_KIND_SESSION: &str = "new-kind-session";
+
+    #[cfg(unix)]
+    fn new_kind_store(storage: &Path) -> BackupStore {
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.to_path_buf(), 72);
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+        let conn = crate::db::open(&storage.join("aft.db")).unwrap();
+        store.set_db_pool(Arc::new(Mutex::new(conn)));
+        store
+    }
+
+    #[cfg(unix)]
+    fn record_new_kind_operation() -> NewKindOperation {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let tree = project.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("a"), "shared").unwrap();
+        fs::hard_link(tree.join("a"), tree.join("b")).unwrap();
+
+        let mut store = new_kind_store(storage.path());
+        let op = "op-new-kinds";
+        store
+            .snapshot_directory_with_op(NEW_KIND_SESSION, &tree, "dir", op)
+            .unwrap()
+            .unwrap();
+        store
+            .snapshot_with_op(NEW_KIND_SESSION, &tree.join("a"), "content", Some(op))
+            .unwrap()
+            .unwrap();
+        store
+            .snapshot_hard_link_with_op(
+                NEW_KIND_SESSION,
+                &tree.join("b"),
+                &tree.join("a"),
+                "link",
+                op,
+            )
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(&tree).unwrap();
+        NewKindOperation {
+            project,
+            storage,
+            tree,
+        }
+    }
+
+    /// Rewrite the stored entries the way a version-4 reader sees them. That
+    /// reader does not know the `directory` and `hardlink` kinds; for any
+    /// kind it does not know it reads `content` (on disk and in the backups
+    /// table), and a content entry must have a content file. The current
+    /// reader's content path is unchanged from version 4, so loading the
+    /// rewritten entries runs the same code a version-4 daemon would.
+    #[cfg(unix)]
+    fn view_as_version_4_reader(operation: &NewKindOperation) {
+        let session_dir = operation
+            .storage
+            .path()
+            .join("backups")
+            .join(BackupStore::session_hash(NEW_KIND_SESSION));
+        let mut rewritten = 0;
+        for stack in fs::read_dir(&session_dir).unwrap() {
+            let meta_path = stack.unwrap().path().join("meta.json");
+            if !meta_path.is_file() {
+                continue;
+            }
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            for entry in meta["entries"].as_array_mut().unwrap() {
+                let kind = entry["kind"].as_str().unwrap().to_string();
+                if kind == "directory" || kind == "hardlink" {
+                    assert!(
+                        entry["content_path"].is_null(),
+                        "new kinds must never name a content file: {entry}"
+                    );
+                    entry["kind"] = serde_json::json!("content");
+                    rewritten += 1;
+                }
+            }
+            fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        }
+        assert_eq!(rewritten, 2, "the directory and the hard link");
+
+        let conn = crate::db::open(&operation.storage.path().join("aft.db")).unwrap();
+        let rows = conn
+            .execute(
+                "UPDATE backups SET kind = 'content' WHERE kind IN ('directory', 'hardlink') AND backup_path IS NULL",
+                [],
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "the mirrored rows carry no backup_path either");
+    }
+
+    /// Control for the rollback test below: the current reader restores the
+    /// same operation completely, relinking the hard link.
+    #[cfg(unix)]
+    #[test]
+    fn new_kind_operation_restores_with_the_current_reader() {
+        use std::os::unix::fs::MetadataExt;
+        let operation = record_new_kind_operation();
+        let mut store = new_kind_store(operation.storage.path());
+        store.restore_last_operation(NEW_KIND_SESSION).unwrap();
+        let a = fs::metadata(operation.tree.join("a")).unwrap();
+        let b = fs::metadata(operation.tree.join("b")).unwrap();
+        assert_eq!(
+            fs::read_to_string(operation.tree.join("a")).unwrap(),
+            "shared"
+        );
+        assert_eq!(a.ino(), b.ino());
+        drop(operation.project);
+    }
+
+    /// Rolling back to a version-4 daemon: undo of an operation containing
+    /// the new kinds must fail and write nothing, never restore a directory
+    /// or hard link as some other kind of file.
+    #[cfg(unix)]
+    #[test]
+    fn new_kind_entries_fail_closed_under_the_version_4_reader() {
+        let operation = record_new_kind_operation();
+        view_as_version_4_reader(&operation);
+
+        let mut store = new_kind_store(operation.storage.path());
+        let error = store.restore_last_operation(NEW_KIND_SESSION).unwrap_err();
+        assert_eq!(error.code(), "io_error", "{error}");
+        assert!(
+            fs::symlink_metadata(&operation.tree).is_err(),
+            "nothing may be written: {:?}",
+            fs::read_dir(operation.project.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -23,6 +23,7 @@ pub mod checkpoint;
 pub mod configure;
 pub mod conflicts;
 pub mod delete_file;
+pub(crate) mod delete_tree;
 pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;

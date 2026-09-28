@@ -347,6 +347,67 @@ fn rename_over_file_operation_undo_saves_the_new_file_and_keeps_walking_back() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn recursive_delete_undo_saves_a_file_recreated_outside_aft_before_restoring_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(tree.join("empty")).unwrap();
+    let file = tree.join("a.txt");
+    fs::write(&file, "A0\n").unwrap();
+    fs::hard_link(&file, tree.join("a-link.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", tree.join("a-symlink")).unwrap();
+    let mut aft = AftProcess::spawn();
+    let delete = send(
+        &mut aft,
+        json!({
+            "id": "delete-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(delete["success"], true, "delete: {delete:?}");
+
+    // Outside AFT, the tree comes back with new content at one of its paths.
+    fs::create_dir(&tree).unwrap();
+    fs::write(&file, "NEW\n").unwrap();
+
+    // Undo goes through the same checkpoint-first path as any other undo:
+    // the new content is saved before the deleted tree is restored over it.
+    let undo = undo_operation(&mut aft);
+    let warnings = undo["warnings"].as_array().unwrap();
+    let warning = warnings
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|warning| warning.contains("checkpoint"))
+        .unwrap_or_default();
+    let checkpoint =
+        external_change_checkpoint(&undo, &undo["external_change_checkpoint"], warning);
+    assert_eq!(read(&file).as_deref(), Some("A0\n"));
+    assert!(tree.join("empty").is_dir());
+    assert_eq!(
+        fs::read_link(tree.join("a-symlink")).unwrap(),
+        Path::new("a.txt")
+    );
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&file).unwrap().ino(),
+            fs::metadata(tree.join("a-link.txt")).unwrap().ino(),
+            "the hard link is relinked"
+        );
+    }
+
+    restore_checkpoint(&mut aft, &checkpoint);
+    assert_eq!(
+        read(&file).as_deref(),
+        Some("NEW\n"),
+        "the content created outside AFT must be recoverable"
+    );
+    assert!(aft.shutdown().success());
+}
+
 /// Save `content` the way many editors do: write a sibling temp file and
 /// rename it over the original, which gives the path a new inode.
 fn editor_atomic_save(file: &Path, content: &str) {

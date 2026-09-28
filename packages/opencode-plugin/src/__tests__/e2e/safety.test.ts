@@ -270,20 +270,22 @@ export function runSafetySuite(
       const undoResp = await agentCall(h, "safety", { op: "undo" });
       expect(undoResp.success).toBe(true);
       expect(undoResp.operation).toBe(true);
-      expect(undoResp.restored_count).toBe(2);
+      // Two files and the two directories holding them.
+      expect(undoResp.restored_count).toBe(4);
       // Both files AND their parent directories must be restored.
       expect(await readTextFile(`${dir}/top.txt`)).toBe("top-content\n");
       expect(await readTextFile(`${dir}/nested/inner.txt`)).toBe("inner-content\n");
     });
 
-    test("recursive delete rejects symlinks before touching the filesystem", async () => {
-      // Regression: v0.25 guards recursive delete against symlinks (whose
-      // canonical target could be outside the tree) and empty directories
-      // (which the backup format can't currently restore).
+    test("recursive delete removes symlinks without touching their targets, and undo recreates them", async () => {
+      // Symlinks inside a deleted tree are removed as links: the file they
+      // point at is never followed, backed up, or deleted, and undo recreates
+      // the link with its exact target. (Before undo could restore symlinks,
+      // this test asserted the delete was refused.)
       const h = await harness();
       const dir = h.path("symlink-guard");
       const outside = h.path("symlink-target.txt");
-      const { mkdir, symlink } = await import("node:fs/promises");
+      const { mkdir, symlink, readlink } = await import("node:fs/promises");
       const { existsSync } = await import("node:fs");
       await mkdir(dir, { recursive: true });
       await writeFile(`${dir}/real.txt`, "inside\n");
@@ -294,16 +296,15 @@ export function runSafetySuite(
         files: [dir],
         recursive: true,
       });
-      expect(resp.success).toBe(false);
-      expect(resp.code).toBe("delete_failed");
-      expect(resp.all_failed).toBe(true);
-      const skipped = resp.skipped_files as Array<Record<string, unknown>>;
-      expect(skipped).toHaveLength(1);
-      expect(skipped[0]?.reason as string).toContain("link.txt");
-      // The whole tree, the symlink, and the outside target must be untouched.
-      expect(existsSync(dir)).toBe(true);
-      expect(existsSync(`${dir}/real.txt`)).toBe(true);
-      expect(existsSync(`${dir}/link.txt`)).toBe(true);
+      expect(resp.success).toBe(true);
+      expect(resp.complete).toBe(true);
+      expect(existsSync(dir)).toBe(false);
+      expect(await readTextFile(outside)).toBe("outside\n");
+
+      const undoResp = await agentCall(h, "safety", { op: "undo" });
+      expect(undoResp.success).toBe(true);
+      expect(await readlink(`${dir}/link.txt`)).toBe(outside);
+      expect(await readTextFile(`${dir}/real.txt`)).toBe("inside\n");
       expect(await readTextFile(outside)).toBe("outside\n");
     });
   });
