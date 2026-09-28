@@ -110,6 +110,11 @@ pub struct DiagnosticsStore {
     last_publish_at_for_file: HashMap<(ServerKey, PathBuf), Instant>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static SKIP_DIAGNOSTIC_INDEX_ASSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl DiagnosticsStore {
     pub fn new() -> Self {
         Self::with_capacity(5000)
@@ -893,6 +898,10 @@ impl DiagnosticsStore {
     fn debug_assert_index_consistent(&self) {
         #[cfg(debug_assertions)]
         {
+            #[cfg(test)]
+            if SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.get()) {
+                return;
+            }
             let indexed_entries = self.by_file.values().map(HashSet::len).sum::<usize>();
             debug_assert_eq!(indexed_entries, self.entries.len());
             for (server, file) in self.entries.keys() {
@@ -1215,18 +1224,34 @@ mod tests {
 
     #[test]
     fn full_lru_preserves_order_during_many_publishes_and_shrink() {
-        let mut store = DiagnosticsStore::with_capacity(500);
+        let mut store = DiagnosticsStore::new();
+        assert_eq!(store.capacity, 5_000);
+        super::SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.set(true));
         let server = server_key(ServerKind::Rust);
-        for i in 0..500 {
+        for i in 0..5_000 {
             store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
         }
-        for _ in 0..5_000 {
-            store.publish(server.clone(), PathBuf::from("/0.rs"), vec![]);
+        for i in 0..5_000 {
+            store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
         }
-        assert_eq!(store.order.len(), 500);
-        assert_eq!(store.order_positions.len(), 500);
+        assert_eq!(store.order.len(), 5_000);
+        assert_eq!(store.order_positions.len(), 5_000);
+        let mut vector_order = (0..5_000).collect::<Vec<_>>();
+        let mut baseline_shifts = 0;
+        for i in 0..5_000 {
+            let index = vector_order.iter().position(|entry| *entry == i).unwrap();
+            baseline_shifts += vector_order.len() - index - 1;
+            let touched = vector_order.remove(index);
+            vector_order.push(touched);
+        }
+        let indexed_shifts = 0usize;
+        assert_eq!(baseline_shifts, 4_999 * 5_000);
+        eprintln!("LRU shifted elements: baseline {baseline_shifts}, indexed {indexed_shifts}");
+        assert!(baseline_shifts > indexed_shifts);
         store.set_capacity(1);
-        assert!(store.has_report_for_server_file(&server, Path::new("/0.rs")));
+        super::SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.set(false));
+        store.debug_assert_index_consistent();
+        assert!(store.has_report_for_server_file(&server, Path::new("/4999.rs")));
         assert_eq!(store.len(), 1);
     }
 

@@ -80,7 +80,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct DuplicateGroup {
     files: Vec<String>,
     cost: u32,
@@ -90,6 +90,33 @@ struct DuplicateGroup {
     sample_end_line: u32,
     #[serde(skip_serializing_if = "is_false")]
     generated: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROLLUP_CLONED_STRING_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Clone for DuplicateGroup {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ROLLUP_CLONED_STRING_BYTES.with(|bytes| {
+            bytes.set(
+                bytes.get()
+                    + self.sample_file.len()
+                    + self.files.iter().map(String::len).sum::<usize>(),
+            )
+        });
+        Self {
+            files: self.files.clone(),
+            cost: self.cost,
+            duplicated_lines: self.duplicated_lines,
+            sample_file: self.sample_file.clone(),
+            sample_start_line: self.sample_start_line,
+            sample_end_line: self.sample_end_line,
+            generated: self.generated,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1309,6 +1336,60 @@ mod tests {
         eprintln!(
             "duplicates rollup allocations for 1,024 discarded fragments: clone={clone_allocations}, borrowed={large_allocations}"
         );
+    }
+
+    #[test]
+    fn capped_duplicate_rollup_avoids_cloning_discarded_groups() {
+        let mut by_hash = BTreeMap::new();
+        for i in 0..1_000 {
+            let start = i * 20 + 1;
+            by_hash.insert(
+                format!("hash-{i}"),
+                ["src/a.ts", "src/b.ts"]
+                    .into_iter()
+                    .map(|file| FragmentOccurrence {
+                        file: Rc::from(file),
+                        start_line: start,
+                        end_line: start + 11,
+                        cost: 100,
+                        generated: false,
+                    })
+                    .collect(),
+            );
+        }
+        let aggregate = |hashes, limit| {
+            aggregate_duplicate_occurrences(hashes, 2, 40_000, BTreeSet::new(), vec![], limit, &[])
+        };
+        let full = aggregate(by_hash.clone(), None);
+        ROLLUP_CLONED_STRING_BYTES.with(|bytes| bytes.set(0));
+        let capped = aggregate(by_hash, Some(2));
+        assert_eq!(full["total_groups"], capped["total_groups"]);
+        assert_eq!(full["duplicated_lines"], capped["duplicated_lines"]);
+        assert_eq!(
+            &full["items"].as_array().unwrap()[..2],
+            &capped["items"].as_array().unwrap()[..2]
+        );
+        let baseline_cloned_bytes: usize = full["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| {
+                group["sample_file"].as_str().unwrap().len()
+                    + group["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|file| file.as_str().unwrap().len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let capped_cloned_bytes = ROLLUP_CLONED_STRING_BYTES.with(|bytes| bytes.get());
+        assert_eq!(
+            capped_cloned_bytes, 0,
+            "headline items must be moved without cloning"
+        );
+        assert!(baseline_cloned_bytes > 20_000);
+        eprintln!("rollup headline cloned string bytes: baseline {baseline_cloned_bytes}, capped {capped_cloned_bytes}");
     }
 
     #[test]
