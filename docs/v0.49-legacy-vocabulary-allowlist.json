@@ -63,11 +63,11 @@
     },
     {
       "path": "crates/aft/src/commands/delete_file.rs",
-      "line": 24,
+      "line": 28,
       "column": 32,
       "token": "filePath",
       "text": "/// `aft_safety undo` (without filePath) restores everything atomically.",
-      "location": "line 24, column 32",
+      "location": "line 28, column 32",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -514,33 +514,33 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 633,
+      "line": 641,
       "column": 29,
       "token": "filePath",
       "text": "// relative filePath against the project root before the undo",
-      "location": "line 633, column 29",
+      "location": "line 641, column 29",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2538,
+      "line": 2546,
       "column": 23,
       "token": "toFile",
       "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 2538, column 23",
+      "location": "line 2546, column 23",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2540,
+      "line": 2548,
       "column": 45,
       "token": "toFile",
       "text": "\"Try one of these files for toFile\"",
-      "location": "line 2540, column 45",
+      "location": "line 2548, column 45",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -1530,11 +1530,11 @@
     },
     {
       "path": "crates/aft/tests/integration/safety_test.rs",
-      "line": 2292,
+      "line": 2635,
       "column": 29,
       "token": "filePath",
       "text": "\"arguments\": { \"filePath\": written, \"content\": \"after write\" },",
-      "location": "line 2292, column 29",
+      "location": "line 2635, column 29",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
