@@ -3669,7 +3669,6 @@ struct SharedSemanticBase {
     fingerprint: Option<SemanticIndexFingerprint>,
     deferred_files: HashSet<PathBuf>,
     skipped_rows: usize,
-    dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
 
@@ -4215,6 +4214,9 @@ fn semantic_entry_cmp(left: &&EmbeddingEntry, right: &&EmbeddingEntry) -> std::c
 }
 
 fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) -> bool {
+    // The caller groups entries by their absolute file path before comparing
+    // them. Base rows store paths relative to the root; delta rows store them
+    // as absolute paths.
     left.chunk.name == right.chunk.name
         && left.chunk.qualified_name == right.chunk.qualified_name
         && left.chunk.kind == right.chunk.kind
@@ -4357,6 +4359,10 @@ impl SemanticIndex {
             if !self.tombstones.is_empty()
                 || !self.entries.is_empty()
                 || !self.file_mtimes.is_empty()
+                || !base
+                    .fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| fingerprint.matches(&expected))
             {
                 return None;
             }
@@ -4401,8 +4407,8 @@ impl SemanticIndex {
 
     /// Every path this index carries must be expressible relative to its own
     /// root before the index can be frozen into a base shared across roots.
-    /// The dirty-path set belongs here too: it is persisted with the base, and
-    /// a delta path outside the root once turned the freeze into a panic.
+    /// Dirty paths must also stay inside the root: the writer encodes them as
+    /// relative file identities in its replacement segments.
     fn paths_are_shareable(&self) -> bool {
         let shareable = |path: &Path| cache_relative_path(&self.project_root, path).is_some();
         self.entries
@@ -4424,6 +4430,9 @@ impl SemanticIndex {
     }
 
     fn into_shared_base(mut self) -> Result<SharedSemanticBase, Self> {
+        if self.shared_base.is_some() || !self.paths_are_shareable() {
+            return Err(self);
+        }
         // Relativize every path before moving anything, so a path outside the
         // root hands the index back intact instead of leaving a half-moved
         // one behind. Only the path strings are copied here; the vectors move.
@@ -4443,23 +4452,6 @@ impl SemanticIndex {
             .map(|path| relative(path))
             .collect::<Option<HashSet<_>>>()
         else {
-            return Err(self);
-        };
-        let dirty_paths = {
-            let guard = self
-                .dirty_paths
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match guard.as_ref() {
-                Some(paths) => paths
-                    .iter()
-                    .map(|path| relative(path))
-                    .collect::<Option<BTreeSet<_>>>()
-                    .map(Some),
-                None => Some(None),
-            }
-        };
-        let Some(dirty_paths) = dirty_paths else {
             return Err(self);
         };
         let (Some(file_mtimes), Some(file_sizes), Some(file_hashes)) = (
@@ -4486,7 +4478,6 @@ impl SemanticIndex {
             fingerprint: self.fingerprint,
             deferred_files,
             skipped_rows: self.skipped_rows,
-            dirty_paths: Arc::new(Mutex::new(dirty_paths)),
             persistence: Arc::new(Mutex::new(persistence)),
         })
     }
@@ -10152,6 +10143,45 @@ Connection: close
     }
 
     #[test]
+    fn shared_overlay_corpus_refresh_and_segments_match_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        let empty = root.join("empty.rs");
+        write_rust_file(&a, "old_a");
+        write_rust_file(&b, "old_b");
+        fs::write(&empty, "").unwrap();
+        let original = build_test_index(root, &[a.clone(), b.clone(), empty.clone()]);
+        let mut private = original.clone();
+        let mut serving = original.clone();
+        let mut worker = serving.fork_for_refresh();
+        assert!(Arc::ptr_eq(
+            serving.shared_base.as_ref().unwrap(),
+            worker.shared_base.as_ref().unwrap()
+        ));
+        write_rust_file(&a, "new_a");
+        fs::remove_file(&b).unwrap();
+        let files = [a.clone(), empty];
+        private
+            .refresh_stale_files(root, &files, &mut test_vector_for_texts, 8, &mut |_, _| {})
+            .unwrap();
+        worker
+            .refresh_stale_files(root, &files, &mut test_vector_for_texts, 8, &mut |_, _| {})
+            .unwrap();
+        assert_eq!(worker.to_bytes(), private.to_bytes());
+        assert_eq!(serving.to_bytes(), original.to_bytes());
+        let paths = semantic_changed_paths(&original, &worker);
+        assert_eq!(paths, BTreeSet::from([a, b]));
+        let mut bytes = original.to_bytes();
+        bytes.extend(worker.build_segment_frame(1, &paths).unwrap());
+        let replayed = SemanticIndex::from_bytes(&bytes, root).unwrap();
+        assert_eq!(replayed.to_bytes(), private.to_bytes());
+        let roundtrip = SemanticIndex::from_bytes(&worker.to_bytes(), root).unwrap();
+        assert_eq!(roundtrip.to_bytes(), private.to_bytes());
+    }
+
+    #[test]
     fn shared_overlay_slow_failed_refresh_is_isolated() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
@@ -11817,12 +11847,10 @@ public class Greeter {
             .collect::<Vec<_>>();
         let invalidated = vec![files[1].clone(), files[3].clone(), files[6].clone()];
 
-        let shared = Arc::new(source.into_shared_base().ok().unwrap());
+        let shared = Arc::new(source.clone().into_shared_base().ok().unwrap());
         let mut shared_batched =
             SemanticIndex::from_shared_base(project_root.clone(), Arc::clone(&shared));
         shared_batched.invalidate_files(&invalidated);
-        let mut source = SemanticIndex::from_shared_base(project_root, shared);
-        source.materialize_shared_base();
         let mut sequential = source.clone();
         let mut batched = source;
         for file in &invalidated {
