@@ -984,7 +984,7 @@ describe("permission audit regressions", () => {
   });
 
   test("restrict_to_project_root denies a worktree path outside the session directory", async () => {
-    const { project, external } = await makeProjectAndExternalDirs();
+    const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const worktree = path.dirname(project);
     const context = {

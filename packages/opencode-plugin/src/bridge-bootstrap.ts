@@ -405,10 +405,16 @@ export function loadBootstrapConfig(
     const config = dependencies.loadConfig(directory);
     const failure = parseFailure(dependencies);
     if (failure) return configErrorState(failure, notify);
-    const sources = dependencies.configLoadSources?.() ?? [];
-    const sourceTexts = Object.fromEntries(dependencies.configLoadTexts?.() ?? []);
+    // What this load read, for a live config reload. Omitted when a
+    // substituted `loadConfig` has no such record.
+    const provenance = dependencies.configLoadSources
+      ? {
+          sources: [...dependencies.configLoadSources()],
+          sourceTexts: Object.fromEntries(dependencies.configLoadTexts?.() ?? []),
+        }
+      : {};
     dependencies.deliverLoadNotices?.(notify);
-    return { ok: true, config, sources: [...sources], sourceTexts };
+    return { ok: true, config, ...provenance };
   } catch (err) {
     return configErrorState(err instanceof Error ? err.message : String(err), notify);
   }
