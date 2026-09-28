@@ -4870,6 +4870,8 @@ impl SemanticIndex {
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
         for (path, entry) in self.live_entries() {
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
             if !requested.contains(path.as_ref()) {
                 continue;
             }
@@ -4878,6 +4880,8 @@ impl SemanticIndex {
             // so refresh-time reuse can hash it in memory and confirm the exact
             // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
             // user through a full rebuild.
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.reused_payload_clones += 1);
             let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
             reuse_map
                 .entry(path.into_owned())
@@ -4890,6 +4894,51 @@ impl SemanticIndex {
                 });
         }
 
+        reuse_map
+    }
+
+    /// Move root-local payloads into the reuse map during removal. Shared seed
+    /// payloads must be copied before tombstoning: other roots still own the
+    /// immutable base and must not lose their embeddings.
+    fn take_chunk_reuse_map(&mut self, files: &[PathBuf]) -> ChunkReuseMap {
+        let requested: HashSet<PathBuf> = files.iter().cloned().collect();
+        let mut reuse_map: ChunkReuseMap = HashMap::new();
+        if let Some(base) = &self.shared_base {
+            for entry in &base.entries {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
+                if self.tombstones.contains(&entry.chunk.file) {
+                    continue;
+                }
+                let path = self.project_root.join(&entry.chunk.file);
+                if !requested.contains(&path) {
+                    continue;
+                }
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| counts.reused_payload_clones += 1);
+                reuse_map
+                    .entry(path)
+                    .or_default()
+                    .entry(blake3::hash(entry.chunk.embed_text.as_bytes()))
+                    .or_default()
+                    .push(ReusableEmbedding {
+                        embed_text: entry.chunk.embed_text.clone(),
+                        vector: entry.vector.clone(),
+                    });
+            }
+        }
+        self.remove_indexed_file_keys_with(&requested, files, |entry| {
+            let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
+            reuse_map
+                .entry(entry.chunk.file.clone())
+                .or_default()
+                .entry(hash)
+                .or_default()
+                .push(ReusableEmbedding {
+                    embed_text: std::mem::take(&mut entry.chunk.embed_text),
+                    vector: std::mem::take(&mut entry.vector),
+                });
+        });
         reuse_map
     }
 
@@ -5837,12 +5886,10 @@ impl SemanticIndex {
             })
             .cloned()
             .collect();
-        let mut reuse_map = self.build_chunk_reuse_map(&requested_paths);
-
         // The watcher path has already invalidated these files in the request
-        // thread's live index. Mirror that behavior here before inserting any
-        // fresh chunks so parse/read failures do not resurrect stale entries.
-        self.remove_indexed_files(&requested_paths);
+        // thread's live index. Move reusable payloads out while mirroring that
+        // removal, so parse/read failures do not resurrect stale entries.
+        let mut reuse_map = self.take_chunk_reuse_map(&requested_paths);
 
         let existing_paths = requested_paths
             .iter()
@@ -5877,8 +5924,41 @@ impl SemanticIndex {
             .as_ref()
             .map(|fingerprint| fingerprint.embed_text_caps)
             .unwrap_or_default();
+        let indexed_paths = existing_paths
+            .iter()
+            .filter(|path| previously_indexed.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
         let (mut chunks, mut fresh_metadata) =
-            Self::collect_chunks(project_root, &existing_paths, embed_text_caps);
+            Self::collect_chunks(project_root, &indexed_paths, embed_text_caps);
+        let available =
+            max_files.saturating_sub(self.indexed_file_count().saturating_add(fresh_metadata.len()));
+        // Failed indexed files free capacity. Only after collecting them is it
+        // safe to skip already-deferred files when no new file can be admitted.
+        // Not-yet-deferred files are still collected so only successful files defer.
+        let new_paths = existing_paths
+            .iter()
+            .filter(|path| {
+                !previously_indexed.contains(*path)
+                    && (available > 0 || !self.deferred_files.contains(*path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !new_paths.is_empty() {
+            let (new_chunks, new_metadata) =
+                Self::collect_chunks(project_root, &new_paths, embed_text_caps);
+            let needs_sort = chunks
+                .last()
+                .zip(new_chunks.first())
+                .is_some_and(|(left, right)| left.file > right.file);
+            chunks.extend(new_chunks);
+            if needs_sort {
+                // Preserve the original sorted-file collection order, including
+                // each file's chunk order, because entry indices break score ties.
+                chunks.sort_by(|left, right| left.file.cmp(&right.file));
+            }
+            fresh_metadata.extend(new_metadata);
+        }
         self.extend_reuse_map_from_blob_store(
             project_root,
             fresh_metadata.keys().cloned(),
@@ -6090,13 +6170,30 @@ impl SemanticIndex {
         entry_files: &HashSet<PathBuf>,
         metadata_files: &[PathBuf],
     ) {
+        self.remove_indexed_file_keys_with(entry_files, metadata_files, |_| {});
+    }
+
+    fn remove_indexed_file_keys_with(
+        &mut self,
+        entry_files: &HashSet<PathBuf>,
+        metadata_files: &[PathBuf],
+        mut removed: impl FnMut(&mut EmbeddingEntry),
+    ) {
         #[cfg(test)]
         {
             self.removal_retain_passes += 1;
         }
         self.hide_base_files(entry_files);
-        self.entries
-            .retain(|entry| !entry_files.contains(&entry.chunk.file));
+        self.entries.retain_mut(|entry| {
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
+            if entry_files.contains(&entry.chunk.file) {
+                removed(entry);
+                false
+            } else {
+                true
+            }
+        });
         for path in metadata_files {
             self.file_mtimes.remove(path);
             self.file_sizes.remove(path);
@@ -6145,6 +6242,9 @@ impl SemanticIndex {
         let query_norm = vector_norm(query_vector);
         let cancellation = crate::executor::current_job_cancellation();
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(entries.len());
+        // Shared chunks repeat relative file paths. Eligibility is stable within
+        // a request, so resolve and filter each distinct shared file once.
+        let mut included_paths: HashMap<&Path, bool> = HashMap::new();
         for (i, (entry, shared)) in entries.iter().enumerate() {
             if i % 64 == 0
                 && cancellation
@@ -6154,7 +6254,9 @@ impl SemanticIndex {
                 break;
             }
             let included = if *shared {
-                include(&self.project_root.join(&entry.chunk.file))
+                *included_paths
+                    .entry(entry.chunk.file.as_path())
+                    .or_insert_with(|| include(&self.project_root.join(&entry.chunk.file)))
             } else {
                 include(&entry.chunk.file)
             };
@@ -11344,7 +11446,10 @@ Connection: close
             })
             .collect::<Vec<_>>();
         let mut index = build_recorded_test_index(temp.path(), &files);
-        assert!(index.entries.len() >= 8000, "fixture must contain many semantic chunks");
+        assert!(
+            index.entries.len() >= 8000,
+            "fixture must contain many semantic chunks"
+        );
         for entry in &mut index.entries {
             entry.vector = entry.vector.iter().copied().cycle().take(384).collect();
             entry.norm = vector_norm(&entry.vector);
@@ -11381,6 +11486,20 @@ Connection: close
             });
             std::hint::black_box(update);
         }
+        let deferred = (0..100).map(|n| {
+            let file = temp.path().join(format!("deferred/file_{n}.rs"));
+            write_source(&file, &fs::read_to_string(&files[0]).unwrap());
+            file
+        }).collect::<Vec<_>>();
+        index.refresh_invalidated_files(temp.path(), &deferred, &mut |_| {
+            panic!("files beyond the cap must not embed")
+        }, 16, 200, &mut |_, _| {}).unwrap();
+        assert_eq!(index.deferred_files.len(), 100);
+        measure("semantic/refresh_full_cap_100_deferred", || {
+            index.refresh_invalidated_files(temp.path(), &files[..1], &mut |_| {
+                panic!("unchanged admitted chunks must reuse embeddings")
+            }, 16, 200, &mut |_, _| {}).unwrap()
+        });
         let borrowed = SemanticIndex::from_shared_base(
             temp.path().to_path_buf(),
             Arc::new(index.into_shared_base().ok().unwrap()),
@@ -11397,6 +11516,180 @@ Connection: close
             "HOT_PATH {}",
             serde_json::json!({"case": "semantic/filter_calls", "calls": filter_calls.get()})
         );
+    }
+
+    #[test]
+    fn full_cap_refresh_skips_deferred_reads_but_failed_changes_free_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let indexed = temp.path().join("a.rs");
+        let deferred = temp.path().join("b.rs");
+        write_source(&indexed, "pub fn alpha() -> i32 {\n    1\n}\n");
+        write_source(&deferred, "pub fn beta() -> i32 {\n    2\n}\n");
+        let mut index = build_recorded_test_index(temp.path(), std::slice::from_ref(&indexed));
+        let mut embed = |texts: Vec<String>| {
+            Ok(texts
+                .iter()
+                .map(|text| deterministic_test_vector(text))
+                .collect())
+        };
+        index
+            .refresh_invalidated_files(
+                temp.path(),
+                std::slice::from_ref(&deferred),
+                &mut embed,
+                16,
+                1,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(index.deferred_files.contains(&deferred));
+        crate::search_hot_path_measurements::reset();
+        let update = index
+            .refresh_invalidated_files(
+                temp.path(),
+                std::slice::from_ref(&indexed),
+                &mut embed,
+                16,
+                1,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(crate::search_hot_path_measurements::counts().file_reads, 1);
+        assert_eq!(update.summary.total_processed, 2);
+        assert_eq!(update.summary.added, 0);
+        assert!(index.deferred_files.contains(&deferred));
+        fs::write(&indexed, [0xff]).unwrap();
+        let update = index
+            .refresh_invalidated_files(
+                temp.path(),
+                std::slice::from_ref(&indexed),
+                &mut embed,
+                16,
+                1,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(update.summary.added, 1);
+        assert!(!index.deferred_files.contains(&deferred));
+        assert!(index
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.file == deferred));
+        assert!(!index.entries.is_empty());
+    }
+
+    #[test]
+    fn invalidated_refresh_preserves_interleaved_file_order_for_score_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a.rs");
+        let b = temp.path().join("b.rs");
+        let z = temp.path().join("z.rs");
+        for (file, name) in [(&a, "alpha"), (&b, "beta"), (&z, "zeta")] {
+            write_source(file, &format!("pub fn {name}() -> i32 {{\n    1\n}}\n"));
+        }
+        let mut embed = |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect());
+        let mut index = SemanticIndex::build(temp.path(), &[a, z.clone()], &mut embed, 16).unwrap();
+        index
+            .refresh_invalidated_files(temp.path(), &[z, b], &mut embed, 16, 3, &mut |_, _| {})
+            .unwrap();
+        let names = index
+            .search(&[1.0, 0.0], 3)
+            .into_iter()
+            .map(|result| result.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn invalidated_refresh_moves_reusable_payloads_in_one_entry_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("src/lib.rs");
+        write_source(
+            &file,
+            "pub fn alpha() -> i32 {\n    1\n}\npub fn beta() -> i32 {\n    2\n}\n",
+        );
+        let mut index = build_recorded_test_index(temp.path(), std::slice::from_ref(&file));
+        let before = index.entry_vectors_for_test();
+        assert!(!before.is_empty());
+        let entries = index.entries.len();
+        crate::search_hot_path_measurements::reset();
+        let update = index
+            .refresh_invalidated_files(
+                temp.path(),
+                std::slice::from_ref(&file),
+                &mut |_| panic!("unchanged chunks must reuse their original embeddings"),
+                16,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(index.entry_vectors_for_test(), before);
+        assert_eq!(update.added_entries.len(), entries);
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().reused_payload_clones,
+            0
+        );
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().refresh_entry_visits,
+            entries
+        );
+    }
+
+    #[test]
+    fn borrowed_semantic_filter_runs_once_per_file_and_keeps_result_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        for ordinal in 0..40 {
+            let file = root.join(if ordinal % 2 == 0 {
+                "keep.rs"
+            } else {
+                "skip.rs"
+            });
+            add_invalidation_fixture_entry(&mut index, file, ordinal);
+        }
+        let expected = index.search_filtered(&[1.0, 0.5], 50, |path| path.ends_with("keep.rs"));
+        let borrowed =
+            SemanticIndex::from_shared_base(root, Arc::new(index.into_shared_base().ok().unwrap()));
+        for keep in [true, false] {
+            let calls = std::cell::Cell::new(0);
+            let actual = borrowed.search_filtered(&[1.0, 0.5], 50, |path| {
+                calls.set(calls.get() + 1);
+                assert!(path.is_absolute());
+                path.ends_with("keep.rs") == keep
+            });
+            assert_eq!(calls.get(), 2);
+            assert_eq!(actual.len(), 20);
+            if keep {
+                let bytes = |results: &[SemanticResult]| {
+                    serde_json::to_vec(
+                        &results
+                            .iter()
+                            .map(|result| {
+                                (
+                                    &result.file,
+                                    &result.name,
+                                    &result.qualified_name,
+                                    &result.kind,
+                                    result.start_line,
+                                    result.end_line,
+                                    result.exported,
+                                    &result.snippet,
+                                    result.score.to_bits(),
+                                    result.rank_score.to_bits(),
+                                    result.cap_protected,
+                                    result.source,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                };
+                assert_eq!(bytes(&actual), bytes(&expected));
+            } else {
+                assert!(actual.iter().all(|result| result.file.ends_with("skip.rs")));
+            }
+        }
     }
 
     #[test]
