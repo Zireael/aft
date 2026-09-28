@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   type AftProjectTransport,
   type AftTransportPool,
@@ -365,13 +365,6 @@ export async function createHarness(
 
   const transport = options.transport ?? "ndjson";
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const configOverrides = { harness: "opencode", ...(options.configOverrides ?? {}) };
-  const factoryConfigOverrides = { ...configOverrides };
-  // Production revalidates edit-slot survival after building its tool list.
-  // Excluding the flag here makes factory-backed tests exercise the later
-  // BridgePool.setConfigureOverride update rather than constructor injection.
-  delete factoryConfigOverrides.edit_slot_survives;
-
   // Keep e2e projects outside both the repository and OS temp directories so
   // external-directory tests cover ordinary out-of-project paths (and undo
   // snapshots are not skipped as they are under /tmp). A dedicated scratch
@@ -381,6 +374,27 @@ export async function createHarness(
   await mkdir(scratchRoot, { recursive: true });
   await sweepStaleScratch(scratchRoot);
   const tempDir = await mkdtemp(join(scratchRoot, options.tempPrefix ?? "e2e-"));
+
+  // `aft_delete` and `aft_move` are off by default, and only a user-tier config
+  // can turn them on. These tests exercise tool behaviour, so they run with every
+  // tool enabled from a user config file of their own; a test that passes its own
+  // `cortexkit_user_config_path` keeps it. The default-off rule itself is covered
+  // by the Rust tool_disabled tests.
+  const defaultUserConfig = join(tempDir, ".aft-user", "aft.jsonc");
+  if (options.configOverrides?.cortexkit_user_config_path === undefined) {
+    await mkdir(dirname(defaultUserConfig), { recursive: true });
+    await writeFile(defaultUserConfig, JSON.stringify({ disabled_tools: [] }), "utf8");
+  }
+  const configOverrides = {
+    harness: "opencode",
+    cortexkit_user_config_path: defaultUserConfig,
+    ...(options.configOverrides ?? {}),
+  };
+  const factoryConfigOverrides = { ...configOverrides };
+  // Production revalidates edit-slot survival after building its tool list.
+  // Excluding the flag here makes factory-backed tests exercise the later
+  // BridgePool.setConfigureOverride update rather than constructor injection.
+  delete factoryConfigOverrides.edit_slot_survives;
 
   let standaloneBridge: BinaryBridge | undefined;
   let pool: AftTransportPool | undefined;
