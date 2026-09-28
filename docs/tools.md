@@ -22,6 +22,21 @@ from "ran but partial":
   - `format_skipped_reason`: `unsupported_language` | `no_formatter_configured` | `formatter_not_installed` | `formatter_excluded_path` | `timeout` | `error`
   - `validate_skipped_reason`: `unsupported_language` | `no_checker_configured` | `checker_not_installed` | `timeout` | `error`
 
+### When an index is off or still building
+
+Tools that read a background index (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`)
+say so instead of returning an empty result:
+
+- `grep` and `glob` scan the filesystem while the trigram index is not ready and mark the
+  answer `fallback: "filesystem"`.
+- `aft_search` uses whichever lanes are ready and names the ones it left out. With no lane
+  ready it refuses with `no_search_lanes_enabled` (both indexes configured off) or
+  `search_lanes_unavailable`, with each lane's status and cause. Use `grep` meanwhile.
+- `aft_callgraph` refuses with `callgraph_off`, `callgraph_building` or `callgraph_unavailable`.
+- `aft_inspect` reports dead code as unavailable rather than zero findings.
+- `glob` and `aft_search` leave out indexed paths that no longer exist on disk and count them
+  in `missing_on_disk_dropped`.
+
 ## Hoisted tools
 
 These replace the host harness's built-ins under the same names. A tool is registered unless

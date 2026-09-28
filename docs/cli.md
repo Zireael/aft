@@ -18,7 +18,18 @@ Add `--harness opencode` or `--harness pi` to any command to target one harness 
 
 **`setup`** — Registers AFT with each installed harness (edits the harness config to enable
 the AFT plugin). When multiple harnesses are detected, prompts you to pick which ones to
-configure.
+configure. It then shows a checklist of features (search and navigation tools, editing tools,
+the `bash` tool and its settings, the three indexes, GitHub read and write) and saves your
+choices to `~/.config/cortexkit/aft.jsonc`, keeping its comments and other keys. Rerun it, or
+run `doctor --reconfigure`, to change them. For scripts, three modes skip the prompts:
+
+- `aft setup --plan` prints every feature with its default, your value and its current state
+  (`off`, `building`, `ready`, `unavailable`) as JSON.
+- `aft setup --answers <file|->` applies `{"plan_version":1,"selections":{"<feature-id>":true}}`;
+  features you leave out keep their setting.
+- `aft setup --yes` saves the defaults for settings your file does not have yet.
+
+All three accept `--harness opencode|pi|omp`.
 
 **`doctor`** — Read-only health check. Reports host install state, plugin registration,
 plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for

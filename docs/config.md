@@ -540,6 +540,16 @@ block, including `[]`, wins over every generated name. Project configs cannot
 disable `aft_safety` or host tool slots, whether directly or through a legacy
 key.
 
+A configuration AFT cannot use — a file that does not parse, a rejected key such
+as `gh_read` or `gh_shim.enabled`, or a missing `subc.connection_file` — no
+longer falls back to defaults. The plugin still loads, every AFT tool call
+returns the error and how to fix it, the sidebar and status show it, and no
+indexing starts until the file is fixed and the host restarted.
+
+When `FASTEMBED_CACHE_DIR` is not set, the local embedding model is cached in
+`$XDG_CACHE_HOME/fastembed` if `XDG_CACHE_HOME` is an absolute path, otherwise
+`~/.cache/fastembed`.
+
 ### Earlier migrations
 
 v0.18 reorganized experimental flags. Old config files using the flat shape:
