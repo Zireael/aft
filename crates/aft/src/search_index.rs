@@ -857,6 +857,50 @@ impl SearchIndexSnapshot {
         }
     }
 
+    /// Score the union of the three rarest nonempty postings without ranking
+    /// each posting merely to discover its membership. Trigram-value ties and
+    /// candidate filtering match the canonical lexical lane's discovery rules.
+    pub(crate) fn lexical_selected_pool(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+    ) -> Vec<(PathBuf, f32)> {
+        let mut seen = HashSet::with_capacity(query_trigrams.len());
+        let unique = query_trigrams
+            .iter()
+            .copied()
+            .filter(|trigram| seen.insert(*trigram))
+            .collect::<Vec<_>>();
+        let postings = materialize_query_postings(self, &unique);
+        let mut memberships = postings
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect::<Vec<_>>();
+        memberships.sort_unstable_by_key(|(trigram, ids)| (ids.len(), **trigram));
+        let selected = memberships
+            .iter()
+            .take(3)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut ranked = selected
+            .into_iter()
+            .filter_map(|id| {
+                let entry = self.files.get(id as usize)?;
+                if candidate_filter.is_some_and(|include| !include(&entry.path)) {
+                    return None;
+                }
+                let score = lexical_score_from_postings(self, &unique, &postings, id);
+                (score > 0.0).then(|| (entry.path.clone(), score))
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += ranked.len()
+        });
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked
+    }
+
     /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
     pub fn lexical_discovery_and_rank_at_depth(
         &self,
