@@ -4,7 +4,12 @@ import { RotatingLogSink } from "../durable-log.js";
 
 test("newline-free stderr retains at most 64KiB and discloses truncation", () => {
   const bridge = new BinaryBridge("/fake/aft", process.cwd(), { maxRestarts: 0 });
-  const probe = bridge as unknown as { onStderrData(data: string): void; stderrBuffer: string; stderrTail: string[]; logVia(message: string): void };
+  const probe = bridge as unknown as {
+    onStderrData(data: string): void;
+    stderrBuffer: string;
+    stderrTail: string[];
+    logVia(message: string): void;
+  };
   probe.logVia = () => {};
   for (let i = 0; i < 2048; i++) probe.onStderrData("x".repeat(1024));
   console.log(`stderr retained chars=${probe.stderrBuffer.length}`);
@@ -15,10 +20,15 @@ test("newline-free stderr retains at most 64KiB and discloses truncation", () =>
 test("slow durable sink bounds queued bytes and records dropped bytes", async () => {
   const sink = new RotatingLogSink("/unused-by-test");
   let release!: () => void;
-  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const writes: string[] = [];
   const probe = sink as unknown as { write(data: string): Promise<void> };
-  probe.write = async (data) => { await blocked; writes.push(data); };
+  probe.write = async (data) => {
+    await blocked;
+    writes.push(data);
+  };
   for (let i = 0; i < 2048; i++) sink.append("x".repeat(1024));
   release();
   await sink.drain();
@@ -30,7 +40,11 @@ test("slow durable sink bounds queued bytes and records dropped bytes", async ()
 
 test("stderr fragments preserve a surrogate pair crossing the cap", () => {
   const bridge = new BinaryBridge("/fake/aft", process.cwd(), { maxRestarts: 0 });
-  const probe = bridge as unknown as { onStderrData(data: string): void; stderrTail: string[]; logVia(message: string): void };
+  const probe = bridge as unknown as {
+    onStderrData(data: string): void;
+    stderrTail: string[];
+    logVia(message: string): void;
+  };
   probe.logVia = () => {};
   probe.onStderrData(`${"x".repeat(65535)}😀tail\n`);
   expect(probe.stderrTail.at(-1)).toBe("[aft] 😀tail");

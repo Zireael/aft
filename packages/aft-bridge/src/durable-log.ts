@@ -66,7 +66,9 @@ export class RotatingLogSink {
           const dropped = this.droppedBytes;
           this.droppedBytes = 0;
           this.overflowQueued = false;
-          await this.write(`[aft-plugin] durable log queue overflow: dropped ${dropped} bytes (1MiB/4096-record pending limit); reduce diagnostic volume.\n`);
+          await this.write(
+            `[aft-plugin] durable log queue overflow: dropped ${dropped} bytes (1MiB/4096-record pending limit); reduce diagnostic volume.\n`,
+          );
         } else {
           try {
             await this.write(data);

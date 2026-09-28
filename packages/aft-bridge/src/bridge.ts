@@ -1530,7 +1530,9 @@ export class BinaryBridge implements AftProjectTransport {
           const last = this.stderrBuffer.charCodeAt(this.stderrBuffer.length - 1);
           const carry = last >= 0xd800 && last <= 0xdbff ? this.stderrBuffer.slice(-1) : "";
           const fragment = carry ? this.stderrBuffer.slice(0, -1) : this.stderrBuffer;
-          const tagged = tagStderrLine(`${fragment} [stderr record truncated into bounded fragments; ${Buffer.byteLength(fragment)} bytes shown, continuation follows]`);
+          const tagged = tagStderrLine(
+            `${fragment} [stderr record truncated into bounded fragments; ${Buffer.byteLength(fragment)} bytes shown, continuation follows]`,
+          );
           this.stderrBuffer = carry;
           this.logVia(tagged);
           this.pushStderrLine(tagged);
