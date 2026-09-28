@@ -3695,9 +3695,19 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
 
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // A change to another lane's settings does not invalidate the serving
+        // trigram generation. Root and corpus-limit changes still require a reset.
+        let retain_search = !project_root_changed
+            && search_index
+            && previous_config.search_index_max_file_size == next_config.search_index_max_file_size
+            && previous_config.storage_dir == next_config.storage_dir;
+        if !retain_search {
+            *ctx.search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        let retain_semantic = !semantic_build_inputs_changed
+            && previous_config.storage_dir == next_config.storage_dir;
         ctx.retire_search_index_rx("a reconfigure with different settings superseded it");
         if semantic_build_adopted {
             let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
@@ -3706,9 +3716,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 "semantic build receiver disappeared before adoption"
             );
         } else {
-            *ctx.semantic_index()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            if !retain_semantic {
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
             ctx.retire_semantic_index_rx(
                 "a reconfigure with different semantic settings superseded it",
             );
@@ -3738,9 +3750,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
         if !semantic_build_adopted {
-            *ctx.semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+            if !retain_semantic {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Disabled;
+            }
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
         }
@@ -4218,9 +4233,7 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
             return result;
         }
 
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // Keep the last published generation serving while its replacement loads.
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
@@ -4373,9 +4386,13 @@ fn schedule_artifact_loads(
                 // must stay independent of the limiter that protects paths able
                 // to fall through to `rebuild_or_refresh_with_strategy` below.
                 if search_loads_shared_artifacts_read_only {
-                    let opened = match crate::readonly_artifacts::open_search_index_read_only(
+                    let opened = match crate::readonly_artifacts::open_search_index_background(
                         &root_for_search,
-                        symbol_storage.as_deref(),
+                        cache_dir.clone(),
+                        &|| {
+                            search_lifecycle
+                                .is_current(search_generation_flag.as_ref(), search_generation)
+                        },
                     ) {
                         crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => Some(index),
                         crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
@@ -4465,22 +4482,6 @@ fn schedule_artifact_loads(
                 ) else {
                     return;
                 };
-                // Only writable roots reach this permit. Even a cache hit can
-                // discover stale inputs and rebuild, so the writable load stays
-                // cold-build limited before reading or refreshing the artifact.
-                let Some(_permit) =
-                    crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                        &search_cold_build_limiter,
-                        "search index post-configure load",
-                        &root_for_search,
-                        || {
-                            search_lifecycle
-                                .is_current(search_generation_flag.as_ref(), search_generation)
-                        },
-                    )
-                else {
-                    return;
-                };
                 if search_persist_epoch_flag.current() != search_persist_epoch {
                     return;
                 }
@@ -4537,6 +4538,27 @@ fn schedule_artifact_loads(
                         index
                     }
                     mut baseline => {
+                        // A valid same-HEAD cache only needs warm verification.
+                        // Do not queue that reopen behind unrelated cold builds;
+                        // absent or incompatible generations still need a permit.
+                        let Some(_permit) =
+                            crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                                &search_cold_build_limiter,
+                                "search index post-configure load",
+                                &root_for_search,
+                                || {
+                                    search_lifecycle.is_current(
+                                        search_generation_flag.as_ref(),
+                                        search_generation,
+                                    )
+                                },
+                            )
+                        else {
+                            return;
+                        };
+                        if search_persist_epoch_flag.current() != search_persist_epoch {
+                            return;
+                        }
                         if let Some(index) = baseline.as_mut() {
                             index.set_ready(false);
                         }
@@ -4629,14 +4651,22 @@ fn schedule_artifact_loads(
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.
     if load_semantic && (is_worktree_bridge || ctx.shared_artifacts_read_only()) {
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
+        if ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: "loading_artifacts".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+        }
         let (tx, rx) = unbounded::<SemanticIndexEvent>();
         let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
         let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
@@ -4726,14 +4756,22 @@ fn schedule_artifact_loads(
     } else if load_semantic {
         let semantic_build_progress = SemanticBuildProgress::default();
         ctx.set_semantic_build_progress(Some(semantic_build_progress.clone()));
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
+        if ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: "loading_artifacts".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+        }
         let (tx, rx): (
             crossbeam_channel::Sender<SemanticIndexEvent>,
             crossbeam_channel::Receiver<SemanticIndexEvent>,
@@ -11765,10 +11803,37 @@ mod tests {
     }
 
     #[test]
-    fn owner_search_load_waits_for_cold_build_limiter_permit() {
+    fn owner_warm_search_load_bypasses_saturated_cold_build_limiter() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        persist_search_index_fixture(root.path(), storage.path());
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.indexes.trigram = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_role(false, None);
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let limiter = ctx.cold_build_limiter();
+        let _permit = crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
+            &limiter,
+            "hold cold build during warm reopen",
+            || true,
+        )
+        .unwrap();
+        assert!(super::start_artifact_loads(super::schedule_artifact_loads(
+            &ctx, true, false
+        )));
+        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn owner_cold_search_load_waits_for_cold_build_limiter_permit() {
         let root = tempfile::tempdir().expect("create search root");
         let storage = tempfile::tempdir().expect("create search storage");
-        persist_search_index_fixture(root.path(), storage.path());
         let ctx = test_context();
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());

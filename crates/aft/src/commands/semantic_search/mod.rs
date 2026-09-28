@@ -850,6 +850,43 @@ impl SearchLaneStatus {
         })
     }
 
+    fn text(&self, ctx: &AppContext) -> String {
+        [("trigram", &self.trigram), ("semantic", &self.semantic)]
+            .into_iter()
+            .map(|(name, lane)| {
+                let state = match lane.effective {
+                    IndexEffective::Unavailable => format!(
+                        "unavailable: {}",
+                        lane.unavailable_reason.as_deref().unwrap_or("unknown")
+                    ),
+                    IndexEffective::Off => "unavailable: disabled".to_string(),
+                    _ => lane.effective.as_str().to_string(),
+                };
+                let state = if name == "semantic" {
+                    match ctx.semantic_index_status().try_read().ok().as_deref() {
+                        Some(SemanticIndexStatus::Ready { refreshing, .. })
+                            if !refreshing.is_empty() && lane.is_ready() =>
+                        {
+                            "refreshing (previous generation serving)".to_string()
+                        }
+                        Some(SemanticIndexStatus::Building {
+                            entries_done: Some(done),
+                            entries_total: Some(total),
+                            ..
+                        }) if *total > 0 && lane.effective == IndexEffective::Building => {
+                            format!("building {}%", done.saturating_mul(100) / total)
+                        }
+                        _ => state,
+                    }
+                } else {
+                    state
+                };
+                format!("{name}: {state}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn omitted_lanes(&self) -> Vec<&'static str> {
         [("trigram", &self.trigram), ("semantic", &self.semantic)]
             .into_iter()
@@ -874,9 +911,19 @@ impl SearchLaneStatus {
         } else {
             (
                 "search_lanes_unavailable",
-                "aft_search has no ready index lane yet (see lanes for each lane's status); retry shortly or use grep.",
+                "aft_search has no ready index lane.",
             )
         };
+        let advice = if self.trigram.effective == IndexEffective::Building
+            || self.semantic.effective == IndexEffective::Building
+        {
+            "\nRetry shortly or use grep."
+        } else if both_off {
+            ""
+        } else {
+            "\nUse grep, or inspect the unavailable lane's configuration."
+        };
+        let message = format!("{message}\n{}{advice}", self.text(ctx));
         Some(Response::error_with_data(
             req_id,
             code,
@@ -894,6 +941,11 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
+        if let Some(text) = data.get_mut("text") {
+            if let Some(current) = text.as_str() {
+                *text = serde_json::json!(format!("{current}\n{}", self.text(ctx)));
+            }
+        }
         data.insert("lanes".to_string(), self.lanes_json());
         data.insert(
             "omitted_lanes".to_string(),
@@ -7152,6 +7204,48 @@ mod tests {
     }
 
     #[test]
+    fn refusal_message_names_both_lane_states() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_context(project.path());
+        let lanes = SearchLaneStatus {
+            trigram: IndexObservation::building(),
+            semantic: IndexObservation::unavailable("semantic_backend_unavailable"),
+        };
+        let response = lanes.refusal("lane-text", &ctx).unwrap();
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(serialized.contains("trigram: building"), "{serialized}");
+        assert!(
+            serialized.contains("semantic: unavailable: semantic_backend_unavailable"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn pending_trigram_replacement_keeps_previous_generation_searchable() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("needle.rs"),
+            "pub fn retained_generation_needle() {}\n",
+        )
+        .unwrap();
+        let ctx = test_context(project.path());
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(project.path()));
+        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let response = response_value(handle_semantic_search(
+            &semantic_request("retained_generation_needle", 5),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true, "{response}");
+        assert!(
+            response["results"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "{response}"
+        );
+    }
+
+    #[test]
     fn both_lanes_configured_off_refuse_with_no_search_lanes_enabled() {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
@@ -8061,7 +8155,7 @@ mod tests {
     }
 
     #[test]
-    fn churned_borrowed_tree_query_completes_with_budget_degradation() {
+    fn churned_borrowed_tree_keeps_previous_generation_when_reload_is_budget_limited() {
         let session = tempfile::tempdir().expect("session root");
         let external = tempfile::tempdir().expect("external root");
         let external_root =
@@ -8134,16 +8228,8 @@ mod tests {
             "churned generation must stop at the borrowed-load budget"
         );
         assert_eq!(degraded["success"], true);
-        assert_eq!(degraded["complete"], false);
-        assert_eq!(degraded["fully_degraded"], true);
-        assert_eq!(
-            degraded["borrowed_index_degraded_reason"],
-            "borrowed_search_index_load_budget"
-        );
-        assert!(degraded["text"]
-            .as_str()
-            .expect("degraded response text")
-            .ends_with(BORROWED_SEARCH_LOAD_FOOTER));
+        assert_ne!(degraded["fully_degraded"], true);
+        assert!(degraded["borrowed_index_degraded_reason"].is_null());
     }
 
     #[test]

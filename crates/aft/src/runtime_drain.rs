@@ -1072,6 +1072,16 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                         receiver_generation,
                         receiver_epoch,
                         |_receiver| {
+                            // Progress describes the replacement, not the usability
+                            // of a generation that has already been published.
+                            if ctx
+                                .semantic_index()
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .is_some()
+                            {
+                                return true;
+                            }
                             *ctx.semantic_index_status()
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -5450,6 +5460,45 @@ mod tests {
             ),
         );
         index
+    }
+
+    #[test]
+    fn semantic_replacement_progress_keeps_previous_generation_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = semantic_owner_context(&root);
+        let index = owner_semantic_index_fixture(&ctx, &root, 1, 1);
+        let entries = index.entry_count();
+        *ctx.semantic_index().write().unwrap() = Some(index);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_index_rx(rx, ctx.configure_generation());
+        tx.send(SemanticIndexEvent::Progress {
+            stage: "loading_artifacts".into(),
+            files: None,
+            entries_done: Some(1),
+            entries_total: Some(10),
+        })
+        .unwrap();
+        drain_semantic_index_events(&ctx);
+        assert!(matches!(
+            *ctx.semantic_index_status().read().unwrap(),
+            SemanticIndexStatus::Ready { .. }
+        ));
+        assert_eq!(
+            ctx.semantic_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .entry_count(),
+            entries
+        );
+        assert!(crate::feature_status::observed_index_status(
+            &ctx,
+            crate::feature_status::IndexPlane::Semantic
+        )
+        .is_ready());
     }
 
     fn semantic_owner_context(root: &Path) -> Arc<AppContext> {

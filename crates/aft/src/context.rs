@@ -2567,9 +2567,35 @@ struct BorrowedIndexCacheKey {
     artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
 }
 
+type BorrowedSearchResult = crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>;
+
+#[derive(Debug, Default)]
+struct BorrowedSearchFlight {
+    result: Option<BorrowedSearchResult>,
+    previous: Option<BorrowedSearchResult>,
+}
+
+impl BorrowedSearchFlight {
+    fn serving(&self) -> BorrowedSearchResult {
+        match &self.result {
+            Some(
+                result @ (crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)),
+            ) => result.clone(),
+            _ => self
+                .previous
+                .clone()
+                .or_else(|| self.result.clone())
+                .unwrap_or(crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
+                    crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
+                )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum BorrowedIndexCacheValue {
-    Search(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>),
+    SearchLoading(Arc<parking_lot::Mutex<BorrowedSearchFlight>>),
     Semantic(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>),
 }
 
@@ -2585,13 +2611,13 @@ impl BorrowedIndexCache {
         key: &BorrowedIndexCacheKey,
     ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>> {
         let position = self.entries.iter().position(|(candidate, value)| {
-            candidate == key && matches!(value, BorrowedIndexCacheValue::Search(_))
+            candidate == key && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
         })?;
         let entry = self.entries.remove(position)?;
-        let BorrowedIndexCacheValue::Search(index) = &entry.1 else {
+        let BorrowedIndexCacheValue::SearchLoading(slot) = &entry.1 else {
             return None;
         };
-        let index = (*index).clone();
+        let index = slot.lock().serving();
         self.entries.push_back(entry);
         Some(index)
     }
@@ -4639,31 +4665,73 @@ impl AppContext {
             canonical_root: canonical_root.clone(),
             artifact,
         };
+        let slot = Arc::new(parking_lot::Mutex::new(BorrowedSearchFlight::default()));
         {
             let mut cache = self.borrowed_index_cache.lock();
             if let Some(index) = cache.search(&key) {
                 return index;
             }
+            slot.lock().previous = cache.entries.iter().find_map(|(candidate, value)| {
+                if candidate.canonical_root == key.canonical_root
+                    && candidate.artifact.path == key.artifact.path
+                {
+                    if let BorrowedIndexCacheValue::SearchLoading(previous) = value {
+                        let serving = previous.lock().serving();
+                        if matches!(
+                            serving,
+                            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
+                        ) {
+                            return Some(serving);
+                        }
+                    }
+                }
+                None
+            });
+            // Publish the flight before spawning: concurrent requests share one
+            // parse, and eviction drops its only long-lived strong reference.
+            cache.insert(
+                key,
+                BorrowedIndexCacheValue::SearchLoading(Arc::clone(&slot)),
+            );
         }
-
-        // Artifact parsing can touch many records. Keep this process-local cache
-        // mutex free so another read-only request is not blocked behind the load.
-        let opened = crate::readonly_artifacts::open_search_index_read_only_with_key(
-            &canonical_root,
-            storage_dir,
-            &project_key,
-        )
-        .map(Arc::new);
-        if !matches!(
-            opened,
-            crate::readonly_artifacts::ReadOnlyArtifact::Absent
-                | crate::readonly_artifacts::ReadOnlyArtifact::Cancelled
-        ) {
-            self.borrowed_index_cache
-                .lock()
-                .insert(key, BorrowedIndexCacheValue::Search(opened.clone()));
+        let weak = Arc::downgrade(&slot);
+        let (max_records, wait_budget) =
+            crate::readonly_artifacts::borrowed_search_background_limits();
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(&project_key, storage_dir);
+        std::thread::spawn(move || {
+            let opened = crate::readonly_artifacts::open_search_index_background_with_limit(
+                &canonical_root,
+                cache_dir,
+                max_records,
+                &|| weak.strong_count() > 0,
+            )
+            .map(Arc::new);
+            if let Some(slot) = weak.upgrade() {
+                let mut flight = slot.lock();
+                if matches!(
+                    opened,
+                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                        | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
+                ) {
+                    flight.previous = None;
+                }
+                flight.result = Some(opened);
+            }
+        });
+        let started = Instant::now();
+        loop {
+            {
+                let flight = slot.lock();
+                if flight.result.is_some() {
+                    return flight.serving();
+                }
+            }
+            if started.elapsed() >= wait_budget || crate::executor::current_job_cancelled() {
+                return slot.lock().serving();
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        opened
     }
 
     pub(crate) fn open_borrowed_semantic_index(

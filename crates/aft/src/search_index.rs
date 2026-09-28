@@ -204,16 +204,18 @@ pub(crate) struct BorrowedReconcileSummary {
     pub(crate) apply: Duration,
 }
 
-struct BorrowedIndexLoadBudget {
+struct BorrowedIndexLoadBudget<'a> {
+    keep_going: &'a dyn Fn() -> bool,
     started_at: Instant,
     duration: Duration,
     max_records: usize,
     stop: Cell<Option<BorrowedIndexLoadStop>>,
 }
 
-impl BorrowedIndexLoadBudget {
-    fn new(max_records: usize, duration: Duration) -> Self {
+impl<'a> BorrowedIndexLoadBudget<'a> {
+    fn new(max_records: usize, duration: Duration, keep_going: &'a dyn Fn() -> bool) -> Self {
         Self {
+            keep_going,
             started_at: Instant::now(),
             duration,
             max_records,
@@ -252,8 +254,9 @@ impl BorrowedIndexLoadBudget {
     }
 
     fn checkpoint(&self) -> bool {
-        if crate::executor::current_job_cancellation()
-            .is_some_and(|token| token.cancel_requested_before_commit())
+        if !(self.keep_going)()
+            || crate::executor::current_job_cancellation()
+                .is_some_and(|token| token.cancel_requested_before_commit())
         {
             self.stop.set(Some(BorrowedIndexLoadStop::Cancelled));
             return false;
@@ -1656,14 +1659,31 @@ impl SearchIndex {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_from_disk_borrow_tolerant_with_budget(
         cache_dir: &Path,
         current_canonical_root: &Path,
         max_records: usize,
         duration: Duration,
     ) -> BorrowedIndexLoad {
+        Self::read_from_disk_borrow_tolerant_cancellable(
+            cache_dir,
+            current_canonical_root,
+            max_records,
+            duration,
+            &|| true,
+        )
+    }
+
+    pub(crate) fn read_from_disk_borrow_tolerant_cancellable(
+        cache_dir: &Path,
+        current_canonical_root: &Path,
+        max_records: usize,
+        duration: Duration,
+        keep_going: &dyn Fn() -> bool,
+    ) -> BorrowedIndexLoad {
         let load_started = Instant::now();
-        let budget = BorrowedIndexLoadBudget::new(max_records, duration);
+        let budget = BorrowedIndexLoadBudget::new(max_records, duration, keep_going);
         let outcome = match Self::read_from_disk_with_policy(
             cache_dir,
             current_canonical_root,

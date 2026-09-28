@@ -45,6 +45,7 @@ thread_local! {
     static BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST: std::cell::Cell<Option<(usize, Duration)>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
 fn borrowed_search_load_limits() -> (usize, Duration) {
     #[cfg(test)]
     if let Some(limits) = BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST.with(std::cell::Cell::get) {
@@ -52,6 +53,19 @@ fn borrowed_search_load_limits() -> (usize, Duration) {
     }
     (
         crate::search_index::BORROWED_INDEX_LOAD_MAX_RECORDS,
+        crate::search_index::BORROWED_INDEX_LOAD_BUDGET,
+    )
+}
+
+pub(crate) const BORROWED_SEARCH_BACKGROUND_MAX_RECORDS: usize = 1_000_000;
+
+pub(crate) fn borrowed_search_background_limits() -> (usize, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST.with(std::cell::Cell::get) {
+        return limits;
+    }
+    (
+        BORROWED_SEARCH_BACKGROUND_MAX_RECORDS,
         crate::search_index::BORROWED_INDEX_LOAD_BUDGET,
     )
 }
@@ -166,6 +180,7 @@ fn search_artifact_generation_from_cache_dir(
     Some(BorrowedArtifactGeneration { path, generation })
 }
 
+#[cfg(test)]
 pub(crate) fn open_search_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
@@ -176,17 +191,7 @@ pub(crate) fn open_search_index_read_only(
     open_search_index_from_cache_dir(project_root, cache_dir)
 }
 
-pub(crate) fn open_search_index_read_only_with_key(
-    project_root: &Path,
-    storage_dir: Option<&Path>,
-    project_key: &str,
-) -> ReadOnlyArtifact<SearchIndex> {
-    open_search_index_from_cache_dir(
-        project_root,
-        resolve_cache_dir_with_key(project_key, storage_dir),
-    )
-}
-
+#[cfg(test)]
 fn open_search_index_from_cache_dir(
     project_root: &Path,
     cache_dir: PathBuf,
@@ -195,22 +200,95 @@ fn open_search_index_from_cache_dir(
     open_search_index_from_cache_dir_with_budget(project_root, cache_dir, max_records, duration)
 }
 
+static ACTIVE_BACKGROUND_SEARCH_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct BackgroundSearchPermit;
+impl Drop for BackgroundSearchPermit {
+    fn drop(&mut self) {
+        ACTIVE_BACKGROUND_SEARCH_LOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn open_search_index_background_with_limit(
+    project_root: &Path,
+    cache_dir: PathBuf,
+    max_records: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> ReadOnlyArtifact<SearchIndex> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        if !keep_going() {
+            return ReadOnlyArtifact::Cancelled;
+        }
+        if std::time::Instant::now() >= deadline {
+            return ReadOnlyArtifact::Degraded(BORROWED_SEARCH_LOAD_DEGRADATION);
+        }
+        if ACTIVE_BACKGROUND_SEARCH_LOADS
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active < 2).then_some(active + 1),
+            )
+            .is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _permit = BackgroundSearchPermit;
+    open_search_index_cancellable(
+        project_root,
+        cache_dir,
+        max_records,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        keep_going,
+    )
+}
+
+pub(crate) fn open_search_index_background(
+    project_root: &Path,
+    cache_dir: PathBuf,
+    keep_going: &dyn Fn() -> bool,
+) -> ReadOnlyArtifact<SearchIndex> {
+    // Background loading is not an interactive request. Bound its record count
+    // separately: large valid snapshots can exceed the interactive parse cap.
+    open_search_index_background_with_limit(
+        project_root,
+        cache_dir,
+        BORROWED_SEARCH_BACKGROUND_MAX_RECORDS,
+        keep_going,
+    )
+}
+
+#[cfg(test)]
 fn open_search_index_from_cache_dir_with_budget(
     project_root: &Path,
     cache_dir: PathBuf,
     max_records: usize,
     duration: Duration,
 ) -> ReadOnlyArtifact<SearchIndex> {
+    open_search_index_cancellable(project_root, cache_dir, max_records, duration, &|| true)
+}
+
+pub(crate) fn open_search_index_cancellable(
+    project_root: &Path,
+    cache_dir: PathBuf,
+    max_records: usize,
+    duration: Duration,
+    keep_going: &dyn Fn() -> bool,
+) -> ReadOnlyArtifact<SearchIndex> {
     if !cache_dir.join("cache.bin").is_file() {
         return ReadOnlyArtifact::Absent;
     }
 
     let (mut index, ignore_rules_differ) =
-        match SearchIndex::read_from_disk_borrow_tolerant_with_budget(
+        match SearchIndex::read_from_disk_borrow_tolerant_cancellable(
             &cache_dir,
             project_root,
             max_records,
             duration,
+            keep_going,
         ) {
             BorrowedIndexLoad::Loaded(index, ignore_rules_differ) => (index, ignore_rules_differ),
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => {
@@ -632,6 +710,30 @@ mod tests {
         assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 1);
         assert_eq!(snapshot_dir(storage.path()), rebuilt_snapshot);
 
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 0);
+    }
+
+    #[test]
+    fn borrowed_search_load_outlives_interactive_budget_and_reuses_generation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        build_search_artifact(&root, storage.path());
+        let ctx = borrowed_context(&root, storage.path());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let first = with_borrowed_search_load_limits_for_test(100_000, Duration::ZERO, || loop {
+            match ctx.open_borrowed_search_index(&root, Some(storage.path())) {
+                ReadOnlyArtifact::Fresh(index) => break index,
+                ReadOnlyArtifact::Degraded(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("background load did not complete: {other:?}"),
+            }
+        });
+        let second = cached_search_index(&ctx, &root, storage.path());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 1);
         assert!(ctx.evict_idle_artifacts());
         assert_eq!(ctx.borrowed_index_cache_len_for_test(), 0);
     }
