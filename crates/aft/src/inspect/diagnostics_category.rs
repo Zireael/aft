@@ -44,6 +44,7 @@ struct ScopedCoverageGap {
 #[derive(Default)]
 struct DiagnosticsCollection {
     diagnostics: Vec<CollectedDiagnostic>,
+    producer_reports: Vec<(String, PathBuf, Vec<CollectedDiagnostic>)>,
     server_ran: bool,
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
@@ -139,6 +140,26 @@ fn collect_warm_working_set(
         // warm diagnostics store. It does not open files or spawn servers.
         lsp.drain_events();
         collection.server_ran = lsp.has_any_diagnostic_reports();
+        collection.producer_reports = lsp
+            .authoritative_diagnostic_reports()
+            .filter(|(_, file, _)| {
+                file.starts_with(&snapshot.project_root)
+                    && !tsconfig_membership.should_skip_diagnostics(file)
+            })
+            .map(|(server, file, diagnostics)| {
+                (
+                    server_id(server),
+                    file.to_path_buf(),
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| CollectedDiagnostic {
+                            diagnostic: diagnostic.clone(),
+                            provisional: false,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
         // Pending producers are those that have not settled. The blocking wait
         // uses the same `producer_has_settled` check, so a quiesced producer
         // with no published report is complete rather than forever pending.
@@ -306,6 +327,8 @@ impl DiagnosticsCollection {
     /// check reports their files as named gaps until the responsible server
     /// settles, and a warming row must not read as an authoritative finding.
     fn apply_scope(&mut self, scope: &JobScope) {
+        self.producer_reports
+            .retain(|(_, file, _)| scope.contains(file));
         self.diagnostics.retain(|diagnostic| {
             !diagnostic.provisional && scope.contains(&diagnostic.diagnostic.file)
         });
@@ -391,6 +414,17 @@ impl DiagnosticsCollection {
             "items": items,
         });
 
+        let mut by_producer: BTreeMap<String, Vec<CollectedDiagnostic>> = BTreeMap::new();
+        for (producer, _, diagnostics) in self.producer_reports {
+            if !self.producer_failures.contains_key(&producer) {
+                by_producer.entry(producer).or_default().extend(diagnostics);
+            }
+        }
+        payload["by_producer"] = Value::Object(by_producer.into_iter().map(|(producer, diagnostics)| {
+            let (errors, warnings, info, hints) = severity_counts(&diagnostics);
+            (producer, serde_json::json!({"errors": errors, "warnings": warnings, "info": info, "hints": hints}))
+        }).collect());
+
         let mut gaps: Vec<Value> = self
             .producer_failures
             .into_iter()
@@ -409,7 +443,18 @@ impl DiagnosticsCollection {
                 "reason": gap.reason,
             })
         }));
+        for producer in self.servers_pending {
+            gaps.push(serde_json::json!({
+                "kind": "failed_producer", "producer": producer,
+                "reason": "producer has not settled",
+            }));
+        }
         if !gaps.is_empty() {
+            // Aggregate totals cannot certify a scope with missing producer results.
+            // Answering producers retain their numeric counts in by_producer.
+            for key in ["errors", "warnings", "info", "hints"] {
+                payload[key] = Value::Null;
+            }
             payload["complete"] = Value::Bool(false);
             payload["gaps"] = Value::Array(gaps);
         }

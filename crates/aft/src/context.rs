@@ -3289,6 +3289,17 @@ impl AppContext {
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
         let lsp = self.lsp_manager.lock();
         let diagnostics_generation = lsp.diagnostics_generation();
+        let root = self
+            .canonical_cache_root_opt()
+            .map(|root| crate::inspect::job::normalize_path(&root));
+        let failed = lsp.has_failed_diagnostic_producers(root.as_deref());
+        let mask_failed = |mut counts: StatusBarCountValues| {
+            if failed {
+                counts.errors = None;
+                counts.warnings = None;
+            }
+            counts
+        };
 
         {
             let cached = self
@@ -3300,10 +3311,12 @@ impl AppContext {
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return cached
-                    .counts
-                    .clone()
-                    .expect("a valid status-count cache carries truthful values");
+                return mask_failed(
+                    cached
+                        .counts
+                        .clone()
+                        .expect("a valid status-count cache carries truthful values"),
+                );
             }
         }
 
@@ -3357,7 +3370,7 @@ impl AppContext {
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
-        counts
+        mask_failed(counts)
     }
 
     /// Provides legacy numeric status-bar fields to callers that still require

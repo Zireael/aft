@@ -2652,6 +2652,20 @@ impl LspManager {
         self.diagnostics.for_directory_with_provisional(&normalized)
     }
 
+    pub(crate) fn authoritative_diagnostic_reports(
+        &self,
+    ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
+        self.diagnostics.authoritative_reports()
+    }
+
+    /// Failed starts leave the project-wide diagnostic total unknown even when
+    /// another server has published a clean report.
+    pub(crate) fn has_failed_diagnostic_producers(&self, root: Option<&Path>) -> bool {
+        self.failed_spawns.keys().any(|key| {
+            root.is_none_or(|root| key.root.starts_with(root) || root.starts_with(&key.root))
+        })
+    }
+
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
         self.diagnostics.all()
     }

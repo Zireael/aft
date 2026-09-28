@@ -2809,67 +2809,23 @@ fn render_diagnostics_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
-    let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics")
-    else {
+    if let Some(line) =
+        crate::subc_format::format_diagnostics_summary(Some(&Value::Object(summary.clone())))
+    {
+        lines.push(line);
+    }
+    let trailer = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics");
+    if trailer.is_none()
+        && details
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
         return;
-    };
+    }
 
     if !lines.is_empty() {
         lines.push(String::new());
-    }
-
-    if let Some(section) = summary.get("diagnostics").and_then(Value::as_object) {
-        let errors = section.get("errors").and_then(Value::as_u64);
-        let warnings = section.get("warnings").and_then(Value::as_u64);
-        let info = section.get("info").and_then(Value::as_u64);
-        let hints = section.get("hints").and_then(Value::as_u64);
-        let has_counts = [errors, warnings, info, hints].iter().any(|v| v.is_some());
-        let counts = format!(
-            "{} errors, {} warnings, {} info, {} hints",
-            errors.unwrap_or(0),
-            warnings.unwrap_or(0),
-            info.unwrap_or(0),
-            hints.unwrap_or(0)
-        );
-        let status = section.get("status").and_then(Value::as_str);
-        let provisional_counts = section.get("provisional_counts").and_then(Value::as_object);
-        let provisional_text = provisional_counts.map(|counts| {
-            format!(
-                " ({} errors, {} warnings, {} info, {} hints)",
-                counts.get("errors").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("info").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("hints").and_then(Value::as_u64).unwrap_or(0),
-            )
-        });
-        let provisional_framing = || {
-            format!(
-                "provisional — analyzer not ready; counts excluded from E/W{}",
-                provisional_text.as_deref().unwrap_or("")
-            )
-        };
-
-        match status {
-            Some("pending") => lines.push(format!(
-                "diagnostics: {} — still pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
-                provisional_framing(),
-                diagnostics_server_summary(section)
-            )),
-            Some("incomplete") => lines.push(format!(
-                "diagnostics: {} (incomplete — servers: {})",
-                provisional_framing(),
-                diagnostics_server_summary(section)
-            )),
-            _ if provisional_counts.is_some() => lines.push(format!(
-                "diagnostics: {}",
-                provisional_framing()
-            )),
-            _ => {
-                if has_counts {
-                    lines.push(format!("diagnostics: {counts}"));
-                }
-            }
-        }
     }
 
     let provisional = summary.get("diagnostics").is_some_and(|section| {
@@ -2907,7 +2863,9 @@ fn render_diagnostics_category(
             }
         }
     }
-    lines.push(trailer);
+    if let Some(trailer) = trailer {
+        lines.push(trailer);
+    }
 }
 
 fn format_diagnostic_location(d: &Map<String, Value>) -> String {
@@ -2922,34 +2880,6 @@ fn format_diagnostic_location(d: &Map<String, Value>) -> String {
         (Some(line), None) => format!("{file}:{line}"),
         (Some(line), Some(col)) => format!("{file}:{line}:{col}"),
     }
-}
-
-fn diagnostics_server_summary(section: &Map<String, Value>) -> String {
-    let pending = string_array(section.get("servers_pending"));
-    let not_installed = string_array(section.get("servers_not_installed"));
-    let mut parts = Vec::new();
-    if !pending.is_empty() {
-        parts.push(format!("pending: {}", pending.join(", ")));
-    }
-    if !not_installed.is_empty() {
-        parts.push(format!("not installed: {}", not_installed.join(", ")));
-    }
-    if parts.is_empty() {
-        "none reported".to_string()
-    } else {
-        parts.join("; ")
-    }
-}
-
-fn string_array(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// True when the dead-code aggregate could not run because the callgraph was
@@ -3107,11 +3037,14 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
 
 fn diagnostics_summary_for(payload: &Value) -> Value {
     let mut summary = serde_json::json!({
-        "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
-        "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-        "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
-        "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
+        "errors": payload.get("errors"),
+        "warnings": payload.get("warnings"),
+        "info": payload.get("info"),
+        "hints": payload.get("hints"),
     });
+    if let Some(by_producer) = payload.get("by_producer") {
+        summary["by_producer"] = by_producer.clone();
+    }
     if let Some(not_applicable) = payload.get("not_applicable") {
         summary["not_applicable"] = not_applicable.clone();
     }

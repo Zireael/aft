@@ -2220,8 +2220,45 @@ fn render_inspect_diagnostics(data: &Value) -> String {
     lines.join("\n")
 }
 
-fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
+pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
     let section = summary?.get("diagnostics")?.as_object()?;
+    if section.get("complete").and_then(Value::as_bool) == Some(false) {
+        let gaps = section
+            .get("gaps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|gap| {
+                format!(
+                    "{}: {}",
+                    gap.get("producer")
+                        .or_else(|| gap.get("file"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown producer"),
+                    gap.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unavailable")
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut text = "diagnostics: unknown".to_string();
+        if !gaps.is_empty() {
+            text.push_str(&format!(" ({})", gaps.join("; ")));
+        }
+        if let Some(producers) = section.get("by_producer").and_then(Value::as_object) {
+            for (producer, counts) in producers {
+                if let (Some(errors), Some(warnings), Some(info), Some(hints)) = (
+                    counts.get("errors").and_then(Value::as_u64),
+                    counts.get("warnings").and_then(Value::as_u64),
+                    counts.get("info").and_then(Value::as_u64),
+                    counts.get("hints").and_then(Value::as_u64),
+                ) {
+                    text.push_str(&format!("; {errors} errors, {warnings} warnings, {info} info, {hints} hints from {producer}"));
+                }
+            }
+        }
+        return Some(text);
+    }
     let errors = section.get("errors").and_then(Value::as_u64);
     let warnings = section.get("warnings").and_then(Value::as_u64);
     let info = section.get("info").and_then(Value::as_u64);
@@ -3912,5 +3949,34 @@ mod bash_companion_format_tests {
             ),
             "background task is not a PTY task: bash-1"
         );
+    }
+}
+
+#[cfg(test)]
+mod incomplete_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn failed_producer_never_renders_legacy_zero_as_a_total() {
+        let summary = serde_json::json!({"diagnostics": {
+            "complete": false, "errors": 0, "warnings": 0,
+            "gaps": [{"producer": "typescript", "reason": "initialize crashed"}]
+        }});
+        let text = format_diagnostics_summary(Some(&summary)).unwrap();
+        assert_eq!(
+            text,
+            "diagnostics: unknown (typescript: initialize crashed)"
+        );
+    }
+
+    #[test]
+    fn incomplete_diagnostics_keep_answering_producer_zero_labelled() {
+        let summary = serde_json::json!({"diagnostics": {
+            "complete": false, "errors": null, "warnings": null,
+            "gaps": [{"producer": "typescript", "reason": "initialize timed out"}],
+            "by_producer": {"rust": {"errors": 0, "warnings": 1, "info": 0, "hints": 0}}
+        }});
+        let text = format_diagnostics_summary(Some(&summary)).unwrap();
+        assert_eq!(text, "diagnostics: unknown (typescript: initialize timed out); 0 errors, 1 warnings, 0 info, 0 hints from rust");
     }
 }

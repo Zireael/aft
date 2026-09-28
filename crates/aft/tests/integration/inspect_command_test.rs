@@ -3498,7 +3498,7 @@ fn scoped_diagnostics_name_uncovered_files_instead_of_rendering_clean_empty() {
         summary.get("complete").and_then(Value::as_bool),
         Some(false)
     );
-    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("errors"), Some(&Value::Null));
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -3963,7 +3963,7 @@ fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
     assert_eq!(response["summary"]["diagnostics"]["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -4000,7 +4000,7 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
     // never a confident zero result.
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -4075,7 +4075,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     // named coverage gap, never a confident zero result.
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -4149,10 +4149,20 @@ fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
         &request(json!({
             "id": "inspect-producer-exit",
             "command": "inspect",
+            "scope": "src/lib.rs",
         })),
         &ctx,
     ))
     .expect("inspect response serializes");
+
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(!text.contains("0 errors"), "{text}");
+    assert!(text.contains("rust"), "{text}");
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    assert!(response["summary"]["diagnostics"]["warnings"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
 
     let rust_gap = response["gaps"]
         .as_array()
@@ -4222,10 +4232,14 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         "export function tsValue(): number { return 1; }\n",
     );
 
+    let before_failure = ctx.status_bar_count_values();
+    assert!(before_failure.errors.is_some_and(|errors| errors > 0));
+
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-producer-gap",
             "command": "inspect",
+            "scope": ["src/lib.rs", "web/src/app.ts"],
         })),
         &ctx,
     ))
@@ -4235,7 +4249,7 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     assert_eq!(response["inspect_terminal"], "fresh");
     assert_eq!(response["complete"], false);
     assert!(
-        response["summary"]["diagnostics"]["errors"]
+        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"]
             .as_u64()
             .is_some_and(|errors| errors > 0),
         "the working TypeScript producer's diagnostics should survive: {response:#}"
@@ -4244,6 +4258,15 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
         .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(!text.contains("diagnostics: 0 errors"), "{text}");
+    assert!(text.contains("from typescript"), "{text}");
+    assert!(text.contains("test diagnostic error"), "{text}");
+    assert!(text.contains("rust"), "{text}");
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
     assert_eq!(rust_gap["kind"], "failed_producer");
     assert_eq!(rust_gap["categories"], json!(["diagnostics"]));
     assert!(
