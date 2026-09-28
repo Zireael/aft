@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -137,6 +138,9 @@ class AftClient:
         params: Optional[JsonObject] = None,
         timeout_secs: float = 30.0,
     ) -> JsonObject:
+        # Dev-profile runs on contended hosts may need longer transport waits;
+        # this does not change the engine's query budget or ranking parameters.
+        timeout_secs = max(timeout_secs, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
         self._next_id += 1
         request_id = str(self._next_id)
         request: JsonObject = {"id": request_id, "command": command}
