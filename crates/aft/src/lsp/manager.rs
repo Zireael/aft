@@ -3332,7 +3332,7 @@ fn typescript_runtime_options(
             .lsp_paths_extra
             .iter()
             .filter_map(|bin| bin.parent())
-            .map(|modules| modules.join("typescript/lib"))
+            .map(|modules| modules.join("typescript").join("lib"))
             .find(|lib| lib.join("tsserver.js").is_file())
         else {
             // The server can discover global or bundled SDKs that AFT does not resolve.
@@ -4896,7 +4896,7 @@ mod typescript_worktree_tests {
     }
 
     fn sdk(root: &Path, version: &str) -> PathBuf {
-        let lib = root.join("node_modules/typescript/lib");
+        let lib = root.join("node_modules").join("typescript").join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("typescript.js"), "").unwrap();
         std::fs::write(lib.join("tsserver.js"), "").unwrap();
@@ -4919,7 +4919,7 @@ mod typescript_worktree_tests {
         let lib = sdk(&cache, "5.9.3");
         let config = Config {
             project_root: Some(project.clone()),
-            lsp_paths_extra: vec![cache.join("node_modules/.bin")],
+            lsp_paths_extra: vec![cache.join("node_modules").join(".bin")],
             ..Config::default()
         };
         let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
@@ -4950,7 +4950,7 @@ mod typescript_worktree_tests {
         let file = project.join("index.ts");
         let config = Config {
             project_root: Some(project.clone()),
-            lsp_paths_extra: vec![cache.join("node_modules/.bin")],
+            lsp_paths_extra: vec![cache.join("node_modules").join(".bin")],
             ..Config::default()
         };
         let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
