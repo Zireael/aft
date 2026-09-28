@@ -3,6 +3,4 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-export CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER=
-export AFT_PERF_CORPUS=${1:-$ROOT}
-cargo test -p agent-file-tools --lib hot_path -- --ignored --nocapture --test-threads=1
+python3 benchmarks/aft-search/run_hot_path_counts.py --corpus "${1:-$ROOT}" "${@:2}"

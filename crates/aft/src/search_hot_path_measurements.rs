@@ -15,6 +15,10 @@ pub(crate) struct Counts {
     pub score_evaluations: usize,
     pub candidates_sorted: usize,
     pub token_scans: usize,
+    pub token_lines_scanned: usize,
+    pub anchor_windows_evaluated: usize,
+    pub reused_payload_clones: usize,
+    pub refresh_entry_visits: usize,
 }
 
 thread_local! {
@@ -65,7 +69,23 @@ pub(crate) fn measure<T>(case: &str, operation: impl FnOnce() -> T) -> T {
 }
 
 pub(crate) fn result_digest(case: &str, value: &impl serde::Serialize) {
-    let bytes = serde_json::to_vec(value).unwrap();
+    let mut value = serde_json::to_value(value).unwrap();
+    fn relative_paths(value: &mut serde_json::Value, root: &str) {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Some(relative) = text.strip_prefix(root).filter(|relative| relative.starts_with(std::path::MAIN_SEPARATOR)) {
+                    *text = format!("<corpus>{relative}");
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(|value| relative_paths(value, root)),
+            serde_json::Value::Object(values) => values.values_mut().for_each(|value| relative_paths(value, root)),
+            _ => {}
+        }
+    }
+    if let Ok(root) = std::env::var("AFT_PERF_CORPUS") {
+        relative_paths(&mut value, &root);
+    }
+    let bytes = serde_json::to_vec(&value).unwrap();
     println!(
         "HOT_PATH {}",
         serde_json::json!({"case": case, "ranked_blake3": blake3::hash(&bytes).to_hex().to_string()})

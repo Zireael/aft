@@ -139,6 +139,9 @@ class NdjsonClient:
         self._stderr.close()
 
     def call(self, command: str, params: Optional[Mapping[str, Any]] = None, timeout: float = 120.0) -> JsonObject:
+        # Only extend how long the client waits; do not change the engine's
+        # query-work limits or ranking parameters.
+        timeout = max(timeout, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
         self._next_id += 1
         request_id = str(self._next_id)
         request: JsonObject = {"id": request_id, "command": command}
