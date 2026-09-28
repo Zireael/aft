@@ -13,7 +13,7 @@
  */
 
 export interface NpmServerSpec {
-  /** AFT server-kind id (matches `crates/aft/src/lsp/registry.rs::ServerKind::id_str`). */
+  /** Server ID, or a separate ID for a runtime installed alongside a server (e.g. `typescript-sdk`). */
   readonly id: string;
   /** npm package name. */
   readonly npm: string;
@@ -50,7 +50,7 @@ export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
   // The language server does not bundle its TypeScript SDK. Keep a separate
   // cache install so dependency-free worktrees can use an explicit fallback.
   {
-    id: "typescript",
+    id: "typescript-sdk",
     npm: "typescript",
     binary: "tsserver",
     extensions: ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],

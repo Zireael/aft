@@ -36,13 +36,16 @@ faster diagnostic report as proof of TypeScript analysis.
 - Otherwise explicitly pass a TypeScript SDK from `lsp_paths_extra` to the
   language server. Both plugins now independently install/cache `typescript`
   using the existing registry grace period, version pins, locks and integrity
-  checks. It shares the `typescript` disabled-server setting. No install is
+  checks. The distinct `typescript-sdk` entry also honors the `typescript`
+  disabled-server setting. No install is
   performed by the Rust resolver.
 - Cache fallback versions are not project-pinned. Inspect reports the selected
   version and source in both text and `lsp_runtime_notes`, captured at startup
   rather than recomputed from a possibly changed filesystem.
-- If neither SDK is available, report `TypeScript SDK unavailable` with an
-  installation remedy rather than launching a server destined to fail.
+- If neither SDK is available to AFT, preserve the language server's own SDK
+  discovery (including global and bundled installs). Report `TypeScript SDK
+  unavailable` only when the server's actual initialize error says it could not
+  find a valid TypeScript installation; preserve other failures unchanged.
 - Explicit binary and tsserver path overrides retain responsibility for their
   own SDK selection. Their versions cannot be inferred reliably.
 - Do not implicitly borrow the main checkout's dependencies. Matching lockfiles
@@ -70,4 +73,7 @@ variable or Node it prints a named skip reason. It creates a real linked
 worktree, proves the TS2322 diagnostic and fallback disclosure, and checks both
 directory entries and Git status for writes. Unit tests cover missing SDKs,
 local precedence, explicit initialization overrides, version reporting and
-read-only resolution without requiring Node or servers.
+read-only resolution without requiring Node or servers. Missing local/cache SDK
+coverage asserts that configured initialization options pass through unchanged,
+not that startup is refused. Actual server missing-installation errors are
+separately tested for actionable classification.

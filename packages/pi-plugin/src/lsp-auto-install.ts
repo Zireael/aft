@@ -650,7 +650,10 @@ export function runAutoInstall(
       cachedBinDirs.push(lspBinDir(spec.npm));
     }
 
-    if (config.disabled.has(spec.id)) {
+    if (
+      config.disabled.has(spec.id) ||
+      (spec.id === "typescript-sdk" && config.disabled.has("typescript"))
+    ) {
       skipped.push({ id: spec.id, reason: "disabled by config" });
       continue;
     }

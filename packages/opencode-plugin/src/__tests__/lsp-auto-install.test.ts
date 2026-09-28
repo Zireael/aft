@@ -145,6 +145,7 @@ describe("runAutoInstall", () => {
     // Disabled entries appear in skipped with reason "disabled by config".
     const disabledEntries = result.skipped.filter((s) => s.reason.includes("disabled"));
     expect(disabledEntries.map((s) => s.id)).toContain("typescript");
+    expect(disabledEntries.map((s) => s.id)).toContain("typescript-sdk");
     expect(disabledEntries.map((s) => s.id)).toContain("biome");
   });
 

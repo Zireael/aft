@@ -3328,12 +3328,19 @@ fn typescript_runtime_options(
     let (lib, fallback) = if let Some(lib) = local {
         (lib, false)
     } else {
-        let lib = config.lsp_paths_extra.iter().filter_map(|bin| bin.parent())
+        let Some(lib) = config
+            .lsp_paths_extra
+            .iter()
+            .filter_map(|bin| bin.parent())
             .map(|modules| modules.join("typescript/lib"))
             .find(|lib| lib.join("tsserver.js").is_file())
-            .ok_or_else(|| LspError::ServerNotReady(
-                "TypeScript SDK unavailable: typescript is not installed in this worktree and no AFT cached SDK is available; run bun install or enable LSP auto-install (AFT never installs into the worktree)".into()
-            ))?;
+        else {
+            // The server can discover global or bundled SDKs that AFT does not resolve.
+            return Ok((
+                options,
+                "TypeScript: server-managed SDK resolution (version not reported by AFT)".into(),
+            ));
+        };
         (lib, true)
     };
     let version = std::fs::read(lib.parent().unwrap().join("package.json"))
@@ -3359,6 +3366,14 @@ fn typescript_runtime_options(
         options,
         format!("TypeScript {version}: {source} ({})", path.display()),
     ))
+}
+
+fn typescript_initialize_failure_reason(reason: String) -> String {
+    if reason.contains("Could not find a valid TypeScript installation") {
+        format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}")
+    } else {
+        reason
+    }
 }
 
 fn biome_unavailable_reason(reason: &str) -> String {
@@ -3786,6 +3801,8 @@ impl PreparedSpawn {
             };
             let reason = if self.kind == ServerKind::Biome {
                 biome_unavailable_reason(&reason)
+            } else if self.kind == ServerKind::TypeScript {
+                typescript_initialize_failure_reason(reason)
             } else {
                 reason
             };
@@ -4866,6 +4883,18 @@ mod typescript_worktree_tests {
         assert!(reason.contains("biome is not installed in this worktree, run bun install"));
     }
 
+    #[test]
+    fn typescript_sdk_unavailable_requires_actual_server_error() {
+        let missing = typescript_initialize_failure_reason("initialize failed: Could not find a valid TypeScript installation. Please ensure that the typescript dependency is installed".into());
+        assert!(missing.starts_with("TypeScript SDK unavailable:"));
+        assert!(missing.contains("run bun install"));
+        let unrelated = "initialize failed: connection closed";
+        assert_eq!(
+            typescript_initialize_failure_reason(unrelated.into()),
+            unrelated
+        );
+    }
+
     fn sdk(root: &Path, version: &str) -> PathBuf {
         let lib = root.join("node_modules/typescript/lib");
         std::fs::create_dir_all(&lib).unwrap();
@@ -4937,18 +4966,22 @@ mod typescript_worktree_tests {
     }
 
     #[test]
-    fn missing_typescript_sdk_has_actionable_reason_without_writing_project() {
+    fn missing_local_and_cached_sdk_preserves_server_discovery_without_writing_project() {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             project_root: Some(temp.path().to_path_buf()),
             ..Config::default()
         };
-        let error =
-            typescript_runtime_options(None, &temp.path().join("index.ts"), temp.path(), &config)
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("TypeScript SDK unavailable"), "{error}");
-        assert!(error.contains("run bun install"), "{error}");
+        let configured = serde_json::json!({"preferences": {"quotePreference": "single"}});
+        let (options, note) = typescript_runtime_options(
+            Some(configured.clone()),
+            &temp.path().join("index.ts"),
+            temp.path(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(options, configured);
+        assert!(note.contains("server-managed SDK resolution"), "{note}");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }
