@@ -948,9 +948,8 @@ impl SubcError {
     /// decided the way a clean end of the connection decides it.
     pub(super) fn is_connection_closed(&self) -> bool {
         match self {
-            Self::WriterClosed | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => {
-                true
-            }
+            Self::WriterClosed
+            | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => true,
             Self::FrameIo(subc_transport::FrameIoError::Io(error)) => matches!(
                 error.kind(),
                 std::io::ErrorKind::BrokenPipe

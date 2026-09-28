@@ -323,7 +323,9 @@ impl ModuleProcess {
         use std::os::unix::process::CommandExt;
 
         let stderr = match stderr_path {
-            Some(path) => Stdio::from(std::fs::File::create(path).expect("create module stderr file")),
+            Some(path) => {
+                Stdio::from(std::fs::File::create(path).expect("create module stderr file"))
+            }
             None => Stdio::null(),
         };
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")

@@ -1036,7 +1036,10 @@ fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
             && response["semantic_index"]["next_retry_ms"].is_u64()
     });
     assert_eq!(waiting["semantic_index"]["status"], "backend_unavailable");
-    assert_eq!(waiting["semantic_index"]["backend_url"], server.base_url.as_str());
+    assert_eq!(
+        waiting["semantic_index"]["backend_url"],
+        server.base_url.as_str()
+    );
 
     // Bring the backend up: the in-flight retry loop's next attempt succeeds.
     server.bring_up();

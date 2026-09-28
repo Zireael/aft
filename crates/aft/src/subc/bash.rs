@@ -1579,7 +1579,10 @@ mod grant_path_tests {
             .load(Ordering::Relaxed)
             < 1
         {
-            assert!(Instant::now() < started_by, "deferred bash wait never started");
+            assert!(
+                Instant::now() < started_by,
+                "deferred bash wait never started"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let registry = executor
@@ -1628,6 +1631,12 @@ mod grant_path_tests {
             .await
             .expect("deferred completion deadline")
             .expect("deferred completion");
-        assert!(completion.result.expect("terminal bash result").response.success);
+        assert!(
+            completion
+                .result
+                .expect("terminal bash result")
+                .response
+                .success
+        );
     }
 }

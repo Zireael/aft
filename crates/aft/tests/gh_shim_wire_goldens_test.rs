@@ -1423,12 +1423,7 @@ fn speech_with_repo_flag_naming_an_unbound_repository_delegates_from_an_unbound_
         "--body",
         "hello",
     ];
-    let run = run_targeting(
-        &argv,
-        RunFrom::ScratchDirectory,
-        &[],
-        Governance::Available,
-    );
+    let run = run_targeting(&argv, RunFrom::ScratchDirectory, &[], Governance::Available);
     assert_delegated(&run, &argv);
 }
 

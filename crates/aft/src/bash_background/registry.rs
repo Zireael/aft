@@ -1347,7 +1347,9 @@ impl BgTaskRegistry {
             return false;
         };
         #[cfg(test)]
-        self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .gc_db_liveness_queries
+            .fetch_add(1, Ordering::SeqCst);
         crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
             .map(|rows| {
                 rows.into_iter().any(|row| {
@@ -1374,7 +1376,9 @@ impl BgTaskRegistry {
                 return HashSet::new();
             };
             #[cfg(test)]
-            self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .gc_db_liveness_queries
+                .fetch_add(1, Ordering::SeqCst);
             // Same fallback as the per-task lookup: a failed query reads as
             // no live row.
             crate::db::bash_tasks::list_bash_task_process_ids(&conn, &harness, task_ids)
@@ -2489,7 +2493,12 @@ impl BgTaskRegistry {
     /// it, and a request within [`PERSISTED_GC_COALESCE_WINDOW`] of a finished
     /// sweep is covered by that one.
     fn request_persisted_gc(&self, storage_dir: &Path) {
-        let harness = self.inner.db_harness.read().ok().and_then(|slot| slot.clone());
+        let harness = self
+            .inner
+            .db_harness
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
         let key = (canonicalized_path(storage_dir), harness);
         {
             let mut slots = persisted_gc_slots()
@@ -2648,7 +2657,8 @@ impl BgTaskRegistry {
     ) {
         if let Some((harness, pool)) = self.db_harness_and_pool() {
             // Fenced so a queued row snapshot cannot re-insert the row.
-            with_task_db_fence(originating_session_id, task_id, || match pool.lock() {
+            with_task_db_fence(originating_session_id, task_id, || {
+                match pool.lock() {
                 Ok(conn) => {
                     if let Err(error) = crate::db::bash_tasks::delete_bash_task(
                         &conn,
@@ -2664,6 +2674,7 @@ impl BgTaskRegistry {
                 Err(_) => crate::slog_warn!(
                     "failed to delete already-reaped orphaned background completion row: task_id={task_id} error=database_lock_poisoned"
                 ),
+            }
             });
         }
         let _ = self.remove_pending_completion(task_id);
@@ -2850,7 +2861,11 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "ignoring persisted background task with invalid id {:?}: reason={}",
                         metadata.task_id,
-                        if old_id { "process_alive" } else { "unrecognized_id" }
+                        if old_id {
+                            "process_alive"
+                        } else {
+                            "unrecognized_id"
+                        }
                     );
                     continue;
                 }
@@ -2882,12 +2897,20 @@ impl BgTaskRegistry {
                     continue;
                 }
                 if let Some((harness, pool)) = self.db_harness_and_pool() {
-                    let result = with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
-                        pool.lock().map_err(|_| "database_lock_poisoned".to_string())
-                            .and_then(|conn| crate::db::bash_tasks::delete_bash_task(
-                                &conn, &harness, &metadata.session_id, &metadata.task_id,
-                            ).map_err(|error| error.to_string()))
-                    });
+                    let result =
+                        with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+                            pool.lock()
+                                .map_err(|_| "database_lock_poisoned".to_string())
+                                .and_then(|conn| {
+                                    crate::db::bash_tasks::delete_bash_task(
+                                        &conn,
+                                        &harness,
+                                        &metadata.session_id,
+                                        &metadata.task_id,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                })
+                        });
                     match result {
                         Ok(removed) if removed > 0 => crate::slog_warn!(
                             "retired old-id background task {}: reason=invalid_legacy_id",
@@ -3948,8 +3971,7 @@ impl BgTaskRegistry {
                     if !(metadata.status.is_terminal() && metadata.completion_delivered) {
                         continue;
                     }
-                    if Self::persisted_task_process_is_alive(&metadata)
-                        || live_in_db(self, task_id)
+                    if Self::persisted_task_process_is_alive(&metadata) || live_in_db(self, task_id)
                     {
                         crate::slog_warn!(
                             "refusing to delete terminal background task bundle {task_id}: recorded process is still alive"
@@ -9053,7 +9075,10 @@ mod tests {
         assert_eq!(registry.inner.tasks.lock().unwrap().len(), 3);
         registry.cleanup_finished(Duration::ZERO);
         let tasks = registry.inner.tasks.lock().unwrap();
-        let retained: Vec<&String> = task_ids.iter().filter(|id| tasks.contains_key(*id)).collect();
+        let retained: Vec<&String> = task_ids
+            .iter()
+            .filter(|id| tasks.contains_key(*id))
+            .collect();
         assert!(
             retained.is_empty(),
             "foreground tasks outlived retention: {retained:?}"
@@ -9171,13 +9196,7 @@ mod tests {
         task_ids.push(killed);
         task_ids.push(pty);
         for task_id in &task_ids {
-            wait_for_terminal_snapshot(
-                &registry,
-                task_id,
-                session,
-                project.path(),
-                storage.path(),
-            );
+            wait_for_terminal_snapshot(&registry, task_id, session, project.path(), storage.path());
         }
 
         // The watchdog thread may be finishing a transition that a status
@@ -9705,7 +9724,10 @@ mod tests {
             .map(|metadata| metadata.status.is_terminal())
             .unwrap_or(false)
         {
-            assert!(Instant::now() < json_by, "finalize never wrote the terminal JSON");
+            assert!(
+                Instant::now() < json_by,
+                "finalize never wrote the terminal JSON"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let state_by = Instant::now() + Duration::from_millis(1_000);
@@ -10255,13 +10277,7 @@ mod tests {
             "a running task's ticket redeems to its own session"
         );
 
-        wait_for_terminal_snapshot(
-            &registry,
-            &task_id,
-            session,
-            project.path(),
-            storage.path(),
-        );
+        wait_for_terminal_snapshot(&registry, &task_id, session, project.path(), storage.path());
         assert_eq!(
             crate::gh_shim_ticket::redeem(&ticket),
             None,
@@ -10675,13 +10691,21 @@ mod tests {
             )
             .unwrap();
         let row = |db: &Mutex<TrackedConnection>| {
-            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "opencode", "session", &task_id)
-                .unwrap()
-                .expect("bash_tasks row")
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task_id,
+            )
+            .unwrap()
+            .expect("bash_tasks row")
         };
         let terminal_by = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
         while row(&db).status != "completed" {
-            assert!(Instant::now() < terminal_by, "task row never reached completed");
+            assert!(
+                Instant::now() < terminal_by,
+                "task row never reached completed"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!row(&db).completion_delivered);
@@ -10810,7 +10834,10 @@ mod tests {
             .iter()
             .any(|registry| registry.persisted_gc_thread().is_none())
         {
-            assert!(Instant::now() < deadline, "a replay's persisted GC never finished");
+            assert!(
+                Instant::now() < deadline,
+                "a replay's persisted GC never finished"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
 

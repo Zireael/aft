@@ -4564,7 +4564,12 @@ mod tests {
         })
         .unwrap();
         drain_callgraph_store_events(&ctx);
-        let resident = ctx.callgraph_store().read().unwrap().as_ref().map(Arc::clone);
+        let resident = ctx
+            .callgraph_store()
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone);
         assert!(
             resident.is_some_and(|resident| Arc::ptr_eq(&resident, &served)),
             "the build's completion must not swap the resident store for the same generation"
