@@ -293,6 +293,27 @@ pub(super) fn build_manifest() -> ModuleManifest {
     build_manifest_for_host(crate::bash_background::powershell_available())
 }
 
+/// [`build_manifest`] minus every tool whose canonical name is in `disabled`,
+/// so a consumer that builds its tool surface from the catalog never offers
+/// them. The list
+/// is the one read when the module connects; dispatch still refuses a disabled
+/// tool that is called anyway.
+pub(super) fn build_manifest_without(disabled: &[String]) -> ModuleManifest {
+    filter_manifest_tools(build_manifest(), disabled)
+}
+
+pub(super) fn filter_manifest_tools(
+    mut manifest: ModuleManifest,
+    disabled: &[String],
+) -> ModuleManifest {
+    for role in &mut manifest.provides {
+        if let ProviderRole::ToolProvider { tools, .. } = role {
+            tools.retain(|tool| crate::tool_gate::catalog_keeps(&tool.name, disabled));
+        }
+    }
+    manifest
+}
+
 /// Builds the manifest for a host where PowerShell is or is not runnable.
 ///
 /// The `powershell` tool is advertised only when `pwsh` resolves, checked when

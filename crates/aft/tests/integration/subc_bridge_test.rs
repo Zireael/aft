@@ -26,7 +26,7 @@ use aft::subc::{
 };
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
-use subc_protocol::manifest::ModuleManifest;
+use subc_protocol::manifest::{ModuleManifest, ProviderRole};
 use subc_protocol::session::{
     HealthReport, ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
     ModuleControlResponseToModule, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
@@ -1051,6 +1051,22 @@ fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn tool_disabled_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected tool-disabled bridge command: {other}"),
+        ),
+    }
+}
+
 fn hashline_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -1393,6 +1409,7 @@ fn run_subc_bridge_test_with_response_body_limit<F, Fut, A>(
         bridge_dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1427,6 +1444,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         bridge_dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1465,6 +1483,36 @@ fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         false,
+        None,
+    );
+}
+
+/// A production-mode run whose CortexKit user config file holds `user_doc`
+/// before the module connects.
+fn run_subc_bridge_production_test_with_user_config<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    user_doc: &'static str,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        false,
+        None,
+        dispatch,
+        bridge_executor_config(),
+        false,
+        Some(user_doc),
     );
 }
 
@@ -1490,6 +1538,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1515,6 +1564,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_lifecycle_probe<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         true,
+        None,
     );
 }
 
@@ -1541,6 +1591,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
         dispatch,
         executor_config,
         false,
+        None,
     );
 }
 
@@ -1556,6 +1607,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     dispatch: aft::subc::DispatchFn,
     executor_config: ExecutorConfig,
     with_lifecycle_probe: bool,
+    user_config_doc: Option<&'static str>,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1575,6 +1627,11 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let roots = SubcBridgeTestRoots::new();
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
     let user_config_path = roots.storage.path().join("user-aft.jsonc");
+    // Written before the module connects, because the catalog it sends at
+    // hello is filtered by the user config's `disabled_tools`.
+    if let Some(doc) = user_config_doc {
+        std::fs::write(&user_config_path, doc).expect("write user config");
+    }
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -2783,11 +2840,16 @@ fn subc_bridge_inspect_dead_code_converges_for_bound_git_root() {
 
 #[test]
 fn subc_bridge_new_manifest_tools_route_in_production() {
-    run_subc_bridge_production_test(
+    // `aft_delete` and `aft_move` are disabled by default and refused at
+    // dispatch; this test is about routing, so the user config enables every
+    // tool.
+    run_subc_bridge_production_test_with_user_config(
         "subc_bridge_new_manifest_tools_route_in_production",
         Duration::from_secs(90),
+        r#"{ "disabled_tools": [] }"#,
         drive_manifest_reachability_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -2799,6 +2861,18 @@ fn subc_bridge_hashline_preflight_and_edit_round_route_in_production() {
         drive_hashline_edit_round_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
+    run_subc_bridge_production_test_with_user_config(
+        "subc_bridge_disabled_tools_are_refused_at_dispatch",
+        Duration::from_secs(30),
+        r#"{ "disabled_tools": ["aft_delete", "bash"] }"#,
+        drive_disabled_tools_daemon,
+        |_, _, _| {},
+        tool_disabled_bridge_dispatch,
     );
 }
 
@@ -2815,11 +2889,16 @@ fn subc_bridge_registered_hashline_bash_cat_starts_with_tag_header() {
 
 #[test]
 fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
-    run_subc_bridge_production_test(
+    // The default config hides `aft_delete` and `aft_move` from the catalog;
+    // this test compares the whole catalog against the embedded schemas, so
+    // the user config enables every tool.
+    run_subc_bridge_production_test_with_user_config(
         "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
         Duration::from_secs(30),
+        r#"{ "disabled_tools": [] }"#,
         drive_module_hello_health_manifest_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -3542,6 +3621,21 @@ async fn send_channel_zero_error(stream: &mut tokio::net::TcpStream, corr: u64, 
         .expect("error frame"),
     )
     .await;
+}
+
+/// The tool names a module's hello catalog advertises.
+fn hello_tool_names(hello: &ModuleHelloBody) -> Vec<String> {
+    hello
+        .manifest
+        .provides
+        .iter()
+        .filter_map(|role| match role {
+            ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .flatten()
+        .map(|tool| tool.name.clone())
+        .collect()
 }
 
 pub(super) async fn open_fake_daemon_session_with_hello(
@@ -10830,6 +10924,165 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
         std::fs::read(&target).expect("read edited hashline target"),
         b"omega\nbeta\n"
     );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
+    let user_config = input.user_config_path.clone();
+    let (
+        FakeDaemonSession {
+            mut stream, root1, ..
+        },
+        hello,
+    ) = open_fake_daemon_session_with_hello(input).await;
+
+    // The catalog sent at connect omits what the user config disables.
+    let advertised = hello_tool_names(&hello);
+    for hidden in ["delete", "bash"] {
+        assert!(
+            !advertised.iter().any(|name| name == hidden),
+            "disabled {hidden} must not be advertised: {advertised:?}"
+        );
+    }
+    for kept in ["move", "read", "bash_status"] {
+        assert!(
+            advertised.iter().any(|name| name == kept),
+            "{kept} stays advertised: {advertised:?}"
+        );
+    }
+
+    let victim = root1.join("victim.txt");
+    std::fs::write(&victim, "keep me\n").expect("write delete target");
+    let doc = json!({
+        "callgraph_store": false,
+        "search_index": false,
+        "semantic_search": false,
+    });
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "tool-disabled-session",
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let assert_disabled = |response: &Value, tool: &str, label: &str| {
+        assert_tool_error_code(response, "tool_disabled", label);
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!("tool_disabled {tool}:"))
+                && message.contains("aft.jsonc")
+                && message.contains(&format!("remove \"{tool}\" from `disabled_tools`")),
+            "{label}: refusal must name the tool and the fix: {response:?}"
+        );
+    };
+
+    // Dispatch refuses a disabled tool even though the catalog hid it, under
+    // its bare and prefixed names, and the file is untouched.
+    for (corr, name) in [(100, "delete"), (101, "aft_delete")] {
+        let delete = call_tool_response(
+            &mut stream,
+            1,
+            corr,
+            name,
+            json!({ "files": ["victim.txt"] }),
+            name,
+        )
+        .await;
+        assert_disabled(&delete, "aft_delete", name);
+    }
+    assert!(victim.exists(), "a refused delete must not touch the file");
+
+    // A disabled bash is refused before the command runs...
+    let marker = root1.join("ran.txt");
+    let bash = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": format!("touch {}", marker.display()) }),
+        "disabled bash",
+    )
+    .await;
+    assert_disabled(&bash, "bash", "disabled bash");
+    assert!(!marker.exists(), "a refused bash must not run");
+    // ...powershell is a separate tool and is not refused as disabled...
+    let powershell = call_tool_response(
+        &mut stream,
+        1,
+        103,
+        "powershell",
+        json!({ "command": "Write-Output hi" }),
+        "powershell with bash disabled",
+    )
+    .await;
+    assert_ne!(
+        powershell["code"].as_str(),
+        Some("tool_disabled"),
+        "disabling bash must not disable powershell: {powershell:?}"
+    );
+    // ...and the plugin's own completion plumbing keeps working.
+    let drain = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "bash_drain_completions",
+        json!({}),
+        "plumbing drain",
+    )
+    .await;
+    assert_tool_success(&drain, "plumbing drain");
+    let ack = call_tool_response(
+        &mut stream,
+        1,
+        105,
+        "bash_ack_completions",
+        json!({ "task_ids": [] }),
+        "plumbing ack",
+    )
+    .await;
+    assert_tool_success(&ack, "plumbing ack");
+
+    // A config edit mid-session does not change this session's answer.
+    std::fs::write(&user_config, r#"{ "disabled_tools": [] }"#).expect("rewrite user config");
+    let delete = call_tool_response(
+        &mut stream,
+        1,
+        106,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "delete after mid-session edit",
+    )
+    .await;
+    assert_disabled(&delete, "aft_delete", "delete after mid-session edit");
+    assert!(victim.exists());
+
+    // A new connect picks up the edited config.
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        2,
+        20,
+        &root1,
+        "tool-disabled-session-2",
+        doc,
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 20).await;
+    let delete = call_tool_response(
+        &mut stream,
+        2,
+        200,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "delete after reconnect",
+    )
+    .await;
+    assert_tool_success(&delete, "delete after reconnect");
+    assert!(!victim.exists(), "the allowed delete must run");
 
     send_connection_goodbye(&mut stream).await;
 }

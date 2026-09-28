@@ -1146,6 +1146,7 @@ mod tests {
                 trust: BindTrust::FirstParty,
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
+                disabled_tools: Arc::default(),
             })),
         );
         let mut root_channels = HashMap::new();
