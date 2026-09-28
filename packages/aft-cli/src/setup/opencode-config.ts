@@ -72,6 +72,17 @@ export function acceptV1Entry(entry: string): boolean {
   return tag === "latest" || EXACT_VERSION.test(tag);
 }
 
+/**
+ * The exact version an AFT npm entry is pinned to (`0.57.2` for
+ * `@cortexkit/aft-opencode@0.57.2`), or null for a bare entry, a dist-tag such
+ * as `@latest`, or a range.
+ */
+export function exactPinnedVersion(entry: string): string | null {
+  if (!entry.startsWith(`${AFT_OPENCODE_PACKAGE}@`)) return null;
+  const tag = entry.slice(AFT_OPENCODE_PACKAGE.length + 1);
+  return EXACT_VERSION.test(tag) ? tag : null;
+}
+
 export function isAftNpmEntry(entry: unknown): entry is string {
   return (
     typeof entry === "string" &&

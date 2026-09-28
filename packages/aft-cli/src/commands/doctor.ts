@@ -102,7 +102,12 @@ import {
   formatHostGenerations,
   type OpenCodeHostDetection,
 } from "../setup/host-generation.js";
-import { OPENCODE_HOST_SHELL_DISABLE_ENTRY } from "../setup/opencode-config.js";
+import {
+  AFT_OPENCODE_PACKAGE,
+  exactPinnedVersion,
+  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+  pinnedPluginEntry,
+} from "../setup/opencode-config.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -144,6 +149,8 @@ export interface DoctorOptions {
   features?: FeatureSetupDeps;
   /** Binary downloader for --fix (tests stub it). */
   downloadBinary?: BinaryDownloader;
+  /** `npm install` runner for the --fix plugin update (tests stub it). */
+  runNpmInstall?: PluginNpmInstaller;
   /** GitHub CLI check for the GitHub read/write report (tests stub it). */
   checkGh?: () => GhStatus;
 }
@@ -274,6 +281,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       options.applyOnnxFix,
       options.runNative,
       options.downloadBinary,
+      options.runNpmInstall,
     );
   }
 
@@ -874,6 +882,14 @@ interface PluginUpdateTarget {
   installDir: string;
   cached: string;
   latest: string;
+  /**
+   * The older exact version the config entry pins, when it pins one. OpenCode
+   * keeps one cache directory per entry, and that directory's package.json asks
+   * for exactly this version, so `npm install` there can never move past it.
+   * Such a target is not installed by doctor: the registration fix re-pins the
+   * entry to this CLI's version and OpenCode installs that on its next start.
+   */
+  oldPin: string | null;
 }
 
 function findPluginUpdateTargets(
@@ -893,11 +909,13 @@ function findPluginUpdateTargets(
     if (cache.cached === cache.latest) continue;
     const adapter = adaptersByKind.get(harness.kind);
     if (!adapter) continue;
+    const pin = cache.configuredEntry ? exactPinnedVersion(cache.configuredEntry) : null;
     targets.push({
       adapter,
       installDir: cache.path,
       cached: cache.cached,
       latest: cache.latest,
+      oldPin: pin !== null && pin !== cache.latest ? pin : null,
     });
   }
   return targets;
@@ -990,40 +1008,118 @@ async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promis
   });
 }
 
+/** Runs `npm install` in a plugin cache directory; tests stub it. */
+export type PluginNpmInstaller = (installDir: string) => Promise<void>;
+
+interface PluginUpdateSummary {
+  /** npm ran and the plugin in the cache directory is now this CLI's version. */
+  updated: number;
+  /** The plugin is still not this CLI's version; reported as a warning. */
+  notUpdated: number;
+  errors: number;
+}
+
+/** The plugin version `npm install` left in a cache directory, or null when unreadable. */
+function installedPluginVersion(installDir: string): string | null {
+  const manifest = join(
+    installDir,
+    "node_modules",
+    ...AFT_OPENCODE_PACKAGE.split("/"),
+    "package.json",
+  );
+  try {
+    const pkg = JSON.parse(readFileSync(manifest, "utf-8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Report a target whose entry pins an older exact version. npm is not run in
+ * its cache directory, whose package.json asks for that old version, so the
+ * install would change nothing. The update happens when OpenCode starts with
+ * the entry re-pinned to this CLI's version, which the registration fix earlier
+ * in this run should have written; this checks the config really says so.
+ */
+function reportNextStartInstall(
+  target: PluginUpdateTarget,
+  oldPin: string,
+  summary: PluginUpdateSummary,
+): void {
+  const name = target.adapter.displayName;
+  const wanted = pinnedPluginEntry(target.latest);
+  const configured = target.adapter.getPluginCacheInfo().configuredEntry;
+  if (configured === wanted) {
+    log.info(
+      `${name} will install ${wanted} on its next start (restart ${name} to apply). npm was not run in ${target.installDir}: that cache pins ${oldPin}, so npm cannot update it.`,
+    );
+    return;
+  }
+  summary.notUpdated += 1;
+  log.warn(
+    `${name}: plugin not updated; it stays on ${target.cached}. The plugin entry is ${configured ?? "missing"}, not ${wanted}, and npm cannot update ${target.installDir} because that cache pins ${oldPin}. Pin the entry to ${wanted}, then restart ${name}.`,
+  );
+}
+
 async function applyPluginUpdates(
   targets: PluginUpdateTarget[],
-): Promise<{ updated: number; errors: number }> {
-  let updated = 0;
-  let errors = 0;
-  if (targets.length === 0) return { updated, errors };
-
-  const npm = resolveNpm();
-  if (!npm) {
-    errors += targets.length;
-    log.error(
-      "Could not find npm on PATH or in known version-manager locations, so the plugin cannot be updated automatically. Install Node/npm, or launch your editor from a shell where npm is available.",
-    );
-    return { updated, errors };
-  }
-
+  runNpmInstall?: PluginNpmInstaller,
+): Promise<PluginUpdateSummary> {
+  const summary: PluginUpdateSummary = { updated: 0, notUpdated: 0, errors: 0 };
+  const npmTargets: PluginUpdateTarget[] = [];
   for (const target of targets) {
-    try {
-      // `npm install` in the plugin's cache dir reinstalls against the
-      // package.json dependency spec OpenCode wrote for the configured entry.
-      // The entry itself is pinned to this CLI's version by the plugin
-      // registration fix. Mirrors the plugin auto-updater's install flags.
-      await runDoctorNpmInstall(npm, target.installDir);
-      updated += 1;
-      log.success(
-        `${target.adapter.displayName}: plugin updated ${target.cached} → ${target.latest} (restart ${target.adapter.displayName} to apply)`,
-      );
-    } catch (err) {
-      errors += 1;
-      const message = err instanceof Error ? err.message : String(err);
-      log.error(`${target.adapter.displayName}: plugin update failed: ${message}`);
+    if (target.oldPin !== null) {
+      reportNextStartInstall(target, target.oldPin, summary);
+    } else {
+      npmTargets.push(target);
     }
   }
-  return { updated, errors };
+  if (npmTargets.length === 0) return summary;
+
+  let install = runNpmInstall;
+  if (!install) {
+    const npm = resolveNpm();
+    if (!npm) {
+      summary.errors += npmTargets.length;
+      log.error(
+        "Could not find npm on PATH or in known version-manager locations, so the plugin cannot be updated automatically. Install Node/npm, or launch your editor from a shell where npm is available.",
+      );
+      return summary;
+    }
+    install = (installDir) => runDoctorNpmInstall(npm, installDir);
+  }
+
+  for (const target of npmTargets) {
+    const name = target.adapter.displayName;
+    try {
+      // `npm install` in the plugin's cache dir reinstalls against the
+      // package.json dependency spec OpenCode wrote for the configured entry
+      // (a dist-tag such as `latest`, or no version). Mirrors the plugin
+      // auto-updater's install flags.
+      await install(target.installDir);
+    } catch (err) {
+      summary.errors += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`${name}: plugin update failed: ${message}`);
+      continue;
+    }
+    // A clean npm exit says nothing about which version it resolved, so the
+    // report names the version that is actually installed now.
+    const installed = installedPluginVersion(target.installDir);
+    if (installed === target.latest) {
+      summary.updated += 1;
+      log.success(
+        `${name}: plugin updated ${target.cached} → ${installed} in ${target.installDir} (restart ${name} to apply)`,
+      );
+    } else {
+      summary.notUpdated += 1;
+      log.warn(
+        `${name}: npm install finished in ${target.installDir}, but the installed plugin is ${installed ?? "unreadable"}, not ${target.latest}; the plugin was not updated.`,
+      );
+    }
+  }
+  return summary;
 }
 
 function applySchemaFixes(targets: SchemaFixTarget[]): { changed: number; errors: number } {
@@ -1105,9 +1201,20 @@ export function buildDoctorFixPlan(
   }
 
   for (const target of findPluginUpdateTargets(adapters, report)) {
+    const name = target.adapter.displayName;
+    if (target.oldPin !== null) {
+      // This outcome depends on the registration write that re-pins the entry,
+      // so it is a "plugin" item: withheld along with that write when config
+      // writes are refused.
+      items.push({
+        kind: "plugin",
+        message: `Will not run npm for ${name} plugin ${target.cached}: its cache ${target.installDir} pins ${target.oldPin}. With the entry pinned to ${pinnedPluginEntry(target.latest)}, ${name} will install ${target.latest} on its next start`,
+      });
+      continue;
+    }
     items.push({
       kind: "plugin-update",
-      message: `Will update ${target.adapter.displayName} plugin ${target.cached} → ${target.latest} via npm (the plugin's own auto-update could not run, often no npm on PATH)`,
+      message: `Will update ${name} plugin ${target.cached} → ${target.latest} via npm install in ${target.installDir} (the plugin's own auto-update could not run, often no npm on PATH)`,
     });
   }
 
@@ -1235,6 +1342,7 @@ async function runFixFlow(
   applyOnnxFix: typeof runOnnxFix = runOnnxFix,
   runNativeFn: NativeRunner = runNative,
   downloadBinaryFn?: BinaryDownloader,
+  runNpmInstall?: PluginNpmInstaller,
 ): Promise<number> {
   const adapters = await resolveAdapters(argv, {
     allowMulti: false,
@@ -1302,7 +1410,10 @@ async function runFixFlow(
       pluginEntrySummary.errors += 1;
     }
   }
-  const pluginUpdateSummary = await applyPluginUpdates(findPluginUpdateTargets(adapters, report));
+  const pluginUpdateSummary = await applyPluginUpdates(
+    findPluginUpdateTargets(adapters, report),
+    runNpmInstall,
+  );
   const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
 
   // Ensure aft.jsonc carries the $schema URL (editor autocomplete + validation).
@@ -1395,6 +1506,7 @@ async function runFixFlow(
     pluginEntrySummary.changed === 0 &&
     pluginEntrySummary.errors === 0 &&
     pluginUpdateSummary.updated === 0 &&
+    pluginUpdateSummary.notUpdated === 0 &&
     pluginUpdateSummary.errors === 0;
   if (nothingAttempted && skipped.length === 0) {
     log.info("No auto-fixable issues detected.");
