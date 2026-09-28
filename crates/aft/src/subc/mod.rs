@@ -3046,19 +3046,25 @@ fn run_subc_mode_inner(
         .await
     });
 
+    let exit_started = Instant::now();
     let actor_contexts = executor.actor_contexts();
     if matches!(
         loop_result,
         Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
     ) {
-        // EOF/Goodbye teardown flushes each root's index deltas and queued
-        // callgraph refreshes. Fatal/panic teardown skips this best-effort work.
         flush_actor_indexes_on_graceful_shutdown(&actor_contexts);
     }
+    log::info!("subc exit phase=index_flush_done elapsed_ms={}", exit_started.elapsed().as_millis());
+    let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
-        actor_ctx.lsp().shutdown_all();
+        clients.extend(actor_ctx.lsp().take_all_clients());
         actor_ctx.bash_background().detach();
     }
+    let registry = actor_contexts.first().map(|ctx| ctx.app().lsp_child_registry());
+    if let Some(registry) = registry {
+        crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
+    }
+    log::info!("subc exit phase=lsp_done elapsed_ms={}", exit_started.elapsed().as_millis());
 
     match loop_result {
         Ok(exit) => module_loop_exit_result(exit),
@@ -3136,10 +3142,38 @@ fn note_fatal_panic_response(response: &Response) -> bool {
 }
 
 fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
+    // Index deltas can be rebuilt after a restart. Give the independent roots
+    // one short shared window to persist them, without extending the outage
+    // when a rebuild or a cache lock holds one root for several seconds.
+    let (tx, rx) = std::sync::mpsc::channel();
     for actor_ctx in actor_contexts {
-        let _ = actor_ctx.flush_search_index_on_graceful_shutdown();
+        let ctx = Arc::clone(actor_ctx);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ctx.flush_search_index_on_graceful_shutdown());
+        });
     }
-    let _ = crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+    drop(tx);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(300);
+    let mut completed = 0;
+    let mut flushed = 0;
+    while completed < actor_contexts.len() {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(saved) => {
+                completed += 1;
+                flushed += usize::from(saved);
+            }
+            Err(_) => break,
+        }
+    }
+    // Refreshes are reconstructible and the worker already uses a 100 ms
+    // shared shutdown budget; run it after the root flush window.
+    let refreshed = crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+    log::info!(
+        "subc exit phase=index_flush roots={} completed={} flushed={} callgraph_drained={} elapsed_ms={}",
+        actor_contexts.len(), completed, flushed, refreshed, started.elapsed().as_millis()
+    );
 }
 
 /// Test-only entry that enables the non-manifest native-command passthrough on

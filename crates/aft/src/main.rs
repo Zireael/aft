@@ -603,13 +603,28 @@ fn main() {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
-        flush_indexes_on_graceful_shutdown(&registry);
+        let runtime = Arc::clone(registry.current());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
+        });
+        let flushed = rx.recv_timeout(Duration::from_millis(300));
+        aft::slog_info!(
+            "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
+            flushed.is_ok(), flushed.unwrap_or(false), shutdown_started.elapsed().as_millis()
+        );
+        let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
+    let mut clients = Vec::new();
     for runtime in registry.iter() {
-        runtime.lsp().shutdown_all();
+        clients.extend(runtime.lsp().take_all_clients());
         runtime.bash_background().detach();
     }
+    aft::lsp::manager::LspManager::shutdown_taken_clients(
+        clients,
+        registry.app().lsp_child_registry(),
+    );
     aft::slog_info!("shutdown phase=runtime_cleanup_done");
     aft::artifact_owner::shutdown_heartbeat_thread();
     aft::slog_info!(
@@ -703,6 +718,7 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
 fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     for (runtime_index, runtime) in registry.iter().enumerate() {
         let started = Instant::now();

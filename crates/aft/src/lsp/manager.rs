@@ -36,7 +36,7 @@ use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 /// The total grace period for draining every LSP client during process shutdown.
-const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_secs(5);
+const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_millis(1500);
 
 fn server_key_for_definition(
     def: &ServerDef,
@@ -2448,11 +2448,16 @@ impl LspManager {
     /// Shut down every server concurrently within one shared grace period.
     pub fn shutdown_all(&mut self) -> LspShutdownAllOutcome {
         let clients = self.take_all_clients();
-        Self::shutdown_all_clients(
-            clients,
-            self.child_registry.clone(),
-            LSP_SHUTDOWN_ALL_BUDGET,
-        )
+        Self::shutdown_taken_clients(clients, self.child_registry.clone())
+    }
+
+    /// Shut down clients collected from every root under one process-wide deadline.
+    /// The registry also terminates server process groups whose replies never arrive.
+    pub fn shutdown_taken_clients(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+    ) -> LspShutdownAllOutcome {
+        Self::shutdown_all_clients(clients, child_registry, LSP_SHUTDOWN_ALL_BUDGET)
     }
 
     fn shutdown_all_clients(
@@ -2461,6 +2466,7 @@ impl LspManager {
         budget: Duration,
     ) -> LspShutdownAllOutcome {
         let started = Instant::now();
+        let servers = clients.len();
         let mut pending_pids = clients
             .iter()
             .map(|(_, client)| client.child_pid())
@@ -2513,7 +2519,8 @@ impl LspManager {
 
         outcome.elapsed = started.elapsed();
         slog_info!(
-            "lsp shutdown_all: graceful={} forced={} elapsed_ms={}",
+            "lsp shutdown_all: servers={} graceful={} killed={} elapsed_ms={}",
+            servers,
             outcome.graceful,
             outcome.forced,
             outcome.elapsed.as_millis()

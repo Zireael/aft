@@ -365,6 +365,40 @@ fn test_manager_shutdown_all() {
 
 #[cfg(unix)]
 #[test]
+fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() {
+    let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let registry = LspChildRegistry::new();
+    let mut managers = Vec::new();
+    for (_, main_rs, _) in &fixtures {
+        let mut manager = LspManager::new();
+        manager.set_child_registry(registry.clone());
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
+        manager.ensure_server_for_file_default(main_rs);
+        managers.push(manager);
+    }
+    let pids = registry.pids();
+    assert_eq!(pids.len(), 6);
+    let clients = managers.iter_mut().flat_map(LspManager::take_all_clients).collect();
+    let started = Instant::now();
+    let outcome = LspManager::shutdown_taken_clients(clients, registry.clone());
+    let elapsed = started.elapsed();
+    eprintln!("drain complete to process cleanup: {} ms", elapsed.as_millis());
+    assert!(elapsed < Duration::from_secs(2), "cleanup took {elapsed:?}");
+    assert_eq!(outcome.graceful, 0);
+    assert_eq!(outcome.forced, 6);
+    for pid in pids {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!aft::bash_background::process::is_process_alive(pid), "orphaned pid {pid}");
+    }
+    assert!(registry.pids().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let registry = LspChildRegistry::new();

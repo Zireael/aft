@@ -238,6 +238,9 @@ fn delay_changed_diagnostics_if_requested() {
 }
 
 fn main() -> io::Result<()> {
+    if let Some(pid_dir) = std::env::var_os("AFT_FAKE_LSP_PID_DIR") {
+        std::fs::write(std::path::Path::new(&pid_dir).join(std::process::id().to_string()), b"started")?;
+    }
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_STARTED_SIGNAL") {
         std::fs::write(signal_path, b"started")?;
     }
