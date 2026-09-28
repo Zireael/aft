@@ -292,19 +292,36 @@ fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
     )
 }
 
+static ACTIVE_IMAGE_DECODERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const MAX_IMAGE_DECODERS: usize = 2;
+
+struct ImageDecoderPermit;
+
+impl Drop for ImageDecoderPermit {
+    fn drop(&mut self) {
+        ACTIVE_IMAGE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
+    ACTIVE_IMAGE_DECODERS.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |active| (active < MAX_IMAGE_DECODERS).then_some(active + 1),
+    ).map_err(|active| format!("image decoder capacity reached ({active}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"))?;
+    let permit = ImageDecoderPermit;
     let (tx, rx) = crossbeam_channel::bounded(1);
-    // One dedicated thread per request instead of a shared bounded pool: the
-    // timeout below must measure image processing itself. With a shared pool,
-    // queue wait counted against the budget, so unrelated parallel reads could
-    // time out an image that never started processing.
+    // The worker owns admission until decoding actually ends, including after a
+    // caller timeout. Reject overload rather than queueing retained image bytes.
     let spawned = std::thread::Builder::new()
         .name("aft-read-media".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            let _permit = permit;
             let _ = tx.send(process_image(raw_bytes, kind));
         });
     if let Err(error) = spawned {

@@ -71,3 +71,24 @@ fn small_streamed_range_preserves_crlf_and_unicode() {
     assert_eq!(response.data["total_lines"], 2);
     assert_eq!(response.data["complete"], true);
 }
+
+#[test]
+fn concurrent_image_reads_report_decoder_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("large.png");
+    image::DynamicImage::new_rgb8(2048, 2048).save(&path).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let started = std::time::Instant::now();
+    let responses = std::thread::scope(|scope| {
+        let handles = (0..8).map(|_| {
+            let barrier = barrier.clone();
+            let root = temp.path();
+            let path = &path;
+            scope.spawn(move || { barrier.wait(); read_response(root, path, json!({})) })
+        }).collect::<Vec<_>>();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+    });
+    let busy = responses.iter().filter(|response| response.data["attachment_omitted_reason"].as_str().unwrap_or("").contains("decoder capacity")).count();
+    eprintln!("8 concurrent image reads: busy={busy}, elapsed={:?}", started.elapsed());
+    assert!(busy > 0, "concurrent decoders must have a finite admission capacity");
+}
