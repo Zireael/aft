@@ -43,6 +43,21 @@ export interface AftProjectTransport {
   getCwd(): string;
   getCachedStatus(): StatusSnapshot | null;
   cacheStatusSnapshot(snapshot: StatusSnapshot): void;
+  /**
+   * Optional push-invalidation capability (observability REQ-AFT-004).
+   *
+   * Implemented by the default standalone bridge (`BinaryBridge`) and the
+   * revivable transport; `SubcTransport` intentionally does not implement it
+   * in V1 and instead refreshes at host lifecycle/discovery boundaries.
+   *
+   * The delivered snapshot is an **invalidation signal** only: pushed Rust
+   * `status_changed` payloads are session-stripped and MUST NOT be treated as
+   * a complete session-authoritative status. Consumers re-fetch through the
+   * authoritative `status` command.
+   */
+  subscribeStatus?(
+    listener: (snapshot: StatusSnapshot | Record<string, unknown>) => void,
+  ): () => void;
 }
 
 // The pool of project transports (today: BridgePool).

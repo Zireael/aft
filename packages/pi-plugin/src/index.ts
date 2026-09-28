@@ -96,6 +96,7 @@ import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-e
 import { recordActiveExtensionApi } from "./harness.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { registerAftStatusObservability } from "./status-observability.js";
 import {
   piHashlineDowngrade,
   piHashlineEffective,
@@ -774,6 +775,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     storageDir,
   };
 
+  // Cross-extension status observability producer (cortexkit:aft:status).
+  // Registered here — only `pi` and `ctx` are required — so the eager-warmup
+  // closure below can re-activate it once the warm bridge exists.
+  const statusObservability = registerAftStatusObservability(pi, ctx);
+
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides so bridges spawned
   // after this point get it in their environment. Bridges already running are
@@ -873,6 +879,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       if (response.success !== false) {
         bridge.cacheStatusSnapshot(response as Parameters<typeof bridge.cacheStatusSnapshot>[0]);
       }
+      // The pool now holds an active transport: attach the observability
+      // producer's push subscription and publish the first snapshot (the
+      // producer resolves only this active bridge — it never spawns one).
+      statusObservability?.activate();
     } catch (err) {
       log(`eager configure failed: ${err instanceof Error ? err.message : String(err)}`);
     }
