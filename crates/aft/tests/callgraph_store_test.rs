@@ -2898,3 +2898,24 @@ fn canonicalize_like_projection(path: &std::path::Path) -> std::path::PathBuf {
     }
     std::path::PathBuf::from(display)
 }
+
+#[test]
+fn layered_diamond_call_tree_has_total_node_budget() {
+    let dir = tempdir().unwrap();
+    let mut source = String::new();
+    for level in 0..14 {
+        source.push_str(&format!("function layer{level}() {{ layer{}(); layer{}(); }}\n", level + 1, level + 1));
+    }
+    source.push_str("function layer14() {}\n");
+    write_file(&dir.path().join("main.ts"), &source);
+    let store = CallGraphStore::open(dir.path().join(".store-budget"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+    fn count(node: &aft::callgraph::CallTreeNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    let started = std::time::Instant::now();
+    let tree = store.call_tree(Path::new("main.ts"), "layer0", 20).unwrap();
+    eprintln!("diamond: nodes={}, elapsed={:?}", count(&tree), started.elapsed());
+    assert!(count(&tree) <= 1000, "total expansion must be bounded independently of depth");
+    assert!(tree.truncated > 0);
+}

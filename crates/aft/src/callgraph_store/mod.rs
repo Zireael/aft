@@ -5689,10 +5689,17 @@ impl CallGraphStore {
         max_depth: usize,
     ) -> Result<callgraph::CallTreeNode> {
         let node = self.node_for(file_rel, symbol)?;
-        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        self.ensure_ready(&conn)?;
         let mut visited = HashSet::new();
-        call_tree_inner(&conn, &node, max_depth, 0, &mut visited)
+        let mut remaining = 1000;
+        let mut tree = call_tree_inner(self, &node, max_depth.min(100), 0, &mut visited, &mut remaining)?;
+        if remaining == 0 && tree.truncated > 0 {
+            tree.work_gap = Some(callgraph::CallTreeWorkGap {
+                complete: false,
+                nodes_examined: 1000,
+                gap: "shown 1000 of at least 1001 call nodes (work budget) · narrow: symbol, depth".into(),
+            });
+        }
+        Ok(tree)
     }
 
     pub fn trace_to(
@@ -7030,6 +7037,10 @@ fn nodes_for_symbol_tuples(
 }
 
 fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+    outgoing_calls_for_node_limited(conn, node, usize::MAX)
+}
+
+fn outgoing_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: usize) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
@@ -7041,9 +7052,9 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.source_node = ?1
-         ORDER BY r.byte_start, r.line, r.ref_id",
+          ORDER BY r.byte_start, r.line, r.ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id], |row| {
+    let rows = stmt.query_map(params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
         let target = optional_store_node_from_row_at(row, 7)?;
         Ok(StoreCallSite {
             caller: node.clone(),
@@ -7112,6 +7123,14 @@ fn unresolved_calls_for_node(
     conn: &Connection,
     node: &StoreNode,
 ) -> Result<Vec<StoreUnresolvedCall>> {
+    unresolved_calls_for_node_limited(conn, node, usize::MAX)
+}
+
+fn unresolved_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreUnresolvedCall>> {
     let mut stmt = conn.prepare(
         "SELECT COALESCE(short_name, full_ref, ''), full_ref, line, byte_start, byte_end
          FROM refs
@@ -7121,9 +7140,9 @@ fn unresolved_calls_for_node(
            AND NOT EXISTS (
                SELECT 1 FROM edges e WHERE e.ref_id = refs.ref_id AND e.kind = 'call'
            )
-         ORDER BY byte_start, line, ref_id",
+          ORDER BY byte_start, line, ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id], |row| {
+    let rows = stmt.query_map(params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
         Ok(StoreUnresolvedCall {
             caller: node.clone(),
             symbol: row.get(0)?,
@@ -7137,15 +7156,15 @@ fn unresolved_calls_for_node(
         .map_err(Into::into)
 }
 
-fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreForwardCall>> {
+fn forward_calls_for_node_limited(conn: &Connection, node: &StoreNode, limit: usize) -> Result<Vec<StoreForwardCall>> {
     let mut calls = Vec::new();
     calls.extend(
-        outgoing_calls_for_node(conn, node)?
+        outgoing_calls_for_node_limited(conn, node, limit)?
             .into_iter()
             .map(StoreForwardCall::Resolved),
     );
     calls.extend(
-        unresolved_calls_for_node(conn, node)?
+        unresolved_calls_for_node_limited(conn, node, limit)?
             .into_iter()
             .map(StoreForwardCall::Unresolved),
     );
@@ -7154,6 +7173,7 @@ fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<Sto
             .cmp(&right.byte_start())
             .then(left.line().cmp(&right.line()))
     });
+    calls.truncate(limit);
     Ok(calls)
 }
 
@@ -7183,12 +7203,14 @@ fn forward_call_count_for_node(conn: &Connection, node: &StoreNode) -> Result<us
 }
 
 fn call_tree_inner(
-    conn: &Connection,
+    store: &CallGraphStore,
     node: &StoreNode,
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<(String, String)>,
+    remaining: &mut usize,
 ) -> Result<callgraph::CallTreeNode> {
+    *remaining -= 1;
     let visit_key = (node.file.clone(), node.symbol.clone());
     if visited.contains(&visit_key) {
         return Ok(callgraph::CallTreeNode {
@@ -7199,6 +7221,7 @@ fn call_tree_inner(
             resolved: true,
             children: Vec::new(),
             depth_limited: false,
+            work_gap: None,
             truncated: 0,
         });
     }
@@ -7209,17 +7232,26 @@ fn call_tree_inner(
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
-        let calls = forward_calls_for_node(conn, node)?;
+        let calls = {
+            let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            store.ensure_ready(&conn)?;
+            forward_calls_for_node_limited(&conn, node, remaining.saturating_add(1))?
+        };
         for call in calls {
+            if *remaining == 0 {
+                truncated += 1;
+                break;
+            }
             match call {
                 StoreForwardCall::Resolved(site) => {
                     if let Some(target) = site.target {
                         let child =
-                            call_tree_inner(conn, &target, max_depth, current_depth + 1, visited)?;
+                            call_tree_inner(store, &target, max_depth, current_depth + 1, visited, remaining)?;
                         depth_limited |= child.depth_limited;
                         truncated += child.truncated;
                         children.push(child);
                     } else {
+                        *remaining -= 1;
                         children.push(callgraph::CallTreeNode {
                             name: site.target_symbol,
                             file: site.target_file,
@@ -7228,11 +7260,13 @@ fn call_tree_inner(
                             resolved: false,
                             children: Vec::new(),
                             depth_limited: false,
-                            truncated: 0,
+                            work_gap: None,
+            truncated: 0,
                         });
                     }
                 }
                 StoreForwardCall::Unresolved(call) => {
+                    *remaining -= 1;
                     children.push(callgraph::CallTreeNode {
                         name: call.symbol,
                         file: call.caller.file,
@@ -7241,13 +7275,16 @@ fn call_tree_inner(
                         resolved: false,
                         children: Vec::new(),
                         depth_limited: false,
-                        truncated: 0,
+                        work_gap: None,
+            truncated: 0,
                     });
                 }
             }
         }
     } else {
-        truncated = forward_call_count_for_node(conn, node)?;
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        store.ensure_ready(&conn)?;
+        truncated = forward_call_count_for_node(&conn, node)?;
         depth_limited = truncated > 0;
     }
 
@@ -7261,6 +7298,7 @@ fn call_tree_inner(
         children,
         depth_limited,
         truncated,
+        work_gap: None,
     })
 }
 

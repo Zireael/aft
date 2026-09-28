@@ -602,8 +602,17 @@ pub struct CallTreeNode {
     pub children: Vec<CallTreeNode>,
     /// Whether traversal below this node stopped at the requested depth.
     pub depth_limited: bool,
-    /// Number of child call edges omitted because of the depth limit.
+    /// Number of omitted edges, a lower bound when the work budget is exhausted.
     pub truncated: usize,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub work_gap: Option<CallTreeWorkGap>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallTreeWorkGap {
+    pub complete: bool,
+    pub nodes_examined: usize,
+    pub gap: String,
 }
 
 // ---------------------------------------------------------------------------
