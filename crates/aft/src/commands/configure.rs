@@ -1283,9 +1283,10 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
     };
     let Some(index) = ctx
         .semantic_index()
-        .read()
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .as_mut()
+        .map(SemanticIndex::fork_for_refresh)
     else {
         return false;
     };
@@ -5475,7 +5476,7 @@ fn schedule_artifact_loads(
                 let event = match outcome {
                     SemanticBuildOutcome::Ready(ready) => {
                         let SemanticBuildReady {
-                            index,
+                            mut index,
                             model,
                             persist_to_disk,
                             record_verify_completion,
@@ -5496,7 +5497,7 @@ fn schedule_artifact_loads(
                             semantic_generation_flag.as_ref(),
                             publish_generation,
                             || {
-                                let worker_index = index.clone();
+                                let worker_index = index.fork_for_refresh();
                                 let worker_handle = spawn_semantic_refresh_worker(
                                     root_clone.clone(),
                                     worker_index,

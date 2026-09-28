@@ -3917,7 +3917,7 @@ pub(crate) fn files_with_changed_content(
 }
 
 /// The semantic index — stores embeddings for all symbols in a project.
-/// Borrow-only roots retain only a root path plus an Arc to immutable relative data.
+/// Roots borrowing a frozen corpus retain an Arc plus file-local deltas.
 #[derive(Debug, Clone)]
 pub struct SemanticIndex {
     entries: Vec<EmbeddingEntry>,
@@ -3934,6 +3934,8 @@ pub struct SemanticIndex {
     project_root: PathBuf,
     deferred_files: HashSet<PathBuf>,
     shared_base: Option<Arc<SharedSemanticBase>>,
+    /// Relative base file identities hidden by local replacements or deletions.
+    tombstones: HashSet<PathBuf>,
     /// Paths whose complete persisted rows must replace prior rows. `None` is
     /// reserved for indexes created by callers that cannot report mutations.
     dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
@@ -4213,8 +4215,7 @@ fn semantic_entry_cmp(left: &&EmbeddingEntry, right: &&EmbeddingEntry) -> std::c
 }
 
 fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) -> bool {
-    left.chunk.file == right.chunk.file
-        && left.chunk.name == right.chunk.name
+    left.chunk.name == right.chunk.name
         && left.chunk.qualified_name == right.chunk.qualified_name
         && left.chunk.kind == right.chunk.kind
         && left.chunk.start_line == right.chunk.start_line
@@ -4230,13 +4231,10 @@ fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) 
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
-fn semantic_entries_by_file(index: &SemanticIndex) -> HashMap<&Path, Vec<&EmbeddingEntry>> {
-    let mut by_file: HashMap<&Path, Vec<&EmbeddingEntry>> = HashMap::new();
-    for entry in &index.entries {
-        by_file
-            .entry(entry.chunk.file.as_path())
-            .or_default()
-            .push(entry);
+fn semantic_entries_by_file(index: &SemanticIndex) -> HashMap<PathBuf, Vec<&EmbeddingEntry>> {
+    let mut by_file: HashMap<PathBuf, Vec<&EmbeddingEntry>> = HashMap::new();
+    for (path, entry) in index.live_entries() {
+        by_file.entry(path.into_owned()).or_default().push(entry);
     }
     for entries in by_file.values_mut() {
         entries.sort_by(semantic_entry_cmp);
@@ -4248,16 +4246,19 @@ fn semantic_changed_paths(previous: &SemanticIndex, current: &SemanticIndex) -> 
     let previous_entries = semantic_entries_by_file(previous);
     let current_entries = semantic_entries_by_file(current);
     let mut paths = BTreeSet::new();
-    paths.extend(previous.file_mtimes.keys().cloned());
-    paths.extend(current.file_mtimes.keys().cloned());
+    paths.extend(previous.indexed_paths());
+    paths.extend(current.indexed_paths());
     paths.extend(previous_entries.keys().map(|path| (*path).to_path_buf()));
     paths.extend(current_entries.keys().map(|path| (*path).to_path_buf()));
     paths
         .into_iter()
         .filter(|path| {
-            if previous.file_mtimes.get(path) != current.file_mtimes.get(path)
-                || previous.file_sizes.get(path) != current.file_sizes.get(path)
-                || previous.file_hashes.get(path) != current.file_hashes.get(path)
+            if previous.metadata_value(path, &previous.file_mtimes, |base| &base.file_mtimes)
+                != current.metadata_value(path, &current.file_mtimes, |base| &base.file_mtimes)
+                || previous.metadata_value(path, &previous.file_sizes, |base| &base.file_sizes)
+                    != current.metadata_value(path, &current.file_sizes, |base| &base.file_sizes)
+                || previous.metadata_value(path, &previous.file_hashes, |base| &base.file_hashes)
+                    != current.metadata_value(path, &current.file_hashes, |base| &base.file_hashes)
             {
                 return true;
             }
@@ -4285,20 +4286,58 @@ impl SemanticIndex {
             entries: Vec::new(),
             file_mtimes: HashMap::new(),
             file_sizes: HashMap::new(),
-            any_missing_sizes: false,
+            any_missing_sizes: shared_base.any_missing_sizes,
             file_hashes: HashMap::new(),
             dimension: shared_base.dimension,
             fingerprint: shared_base.fingerprint.clone(),
-            project_root,
-            deferred_files: HashSet::new(),
-            dirty_paths: Arc::clone(&shared_base.dirty_paths),
-            persistence: Arc::clone(&shared_base.persistence),
+            project_root: project_root.clone(),
+            deferred_files: shared_base
+                .deferred_files
+                .iter()
+                .map(|path| project_root.join(path))
+                .collect(),
+            // A new root has no saved-index baseline of its own. On its first
+            // write, it compares the saved index contents with current entries;
+            // borrowers do not inherit the owner's pending dirty-path set.
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(
+                *shared_base
+                    .persistence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             skipped_rows: shared_base.skipped_rows,
-            shared_base: Some(shared_base),
+            shared_base: Some(Arc::clone(&shared_base)),
+            tombstones: HashSet::new(),
             #[cfg(test)]
             removal_retain_passes: 0,
         }
+    }
+
+    /// Freeze before starting a worker so the serving index and refresh clone
+    /// never acquire independent copies of the unchanged corpus.
+    pub(crate) fn fork_for_refresh(&mut self) -> Self {
+        if self.shared_base.is_none() && self.paths_are_shareable() {
+            let root = self.project_root.clone();
+            let private = std::mem::replace(self, Self::new(root.clone(), self.dimension));
+            let dirty_paths = Arc::clone(&private.dirty_paths);
+            let persistence = Arc::clone(&private.persistence);
+            match private.into_shared_base() {
+                Ok(base) => {
+                    let base = Arc::new(base);
+                    note_frozen_owner_semantic_base(&base);
+                    *self = Self::from_shared_base(root, base);
+                    self.dirty_paths = dirty_paths;
+                    self.persistence = persistence;
+                }
+                Err(private) => *self = private,
+            }
+        }
+        let mut worker = self.clone();
+        worker.dirty_paths = Arc::new(Mutex::new(self.dirty_paths_snapshot()));
+        worker.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
+        worker
     }
 
     pub(crate) fn adopt_frozen_base_for_root(
@@ -4315,6 +4354,12 @@ impl SemanticIndex {
         }
 
         if let Some(base) = self.shared_base.as_ref() {
+            if !self.tombstones.is_empty()
+                || !self.entries.is_empty()
+                || !self.file_mtimes.is_empty()
+            {
+                return None;
+            }
             return Some(Self::from_shared_base(
                 project_root.to_path_buf(),
                 Arc::clone(base),
@@ -4446,60 +4491,67 @@ impl SemanticIndex {
         })
     }
 
-    fn materialize_shared_base(&mut self) {
-        let Some(base) = self.shared_base.take() else {
-            return;
-        };
-        self.entries = base
-            .entries
+    // Base paths are relative; delta paths are absolute. Iteration preserves the
+    // old retain-then-append order, including the score comparator's index ties.
+    fn live_entries(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, Path>, &EmbeddingEntry)> {
+        self.shared_base
             .iter()
-            .cloned()
-            .map(|mut entry| {
-                entry.chunk.file = self.project_root.join(&entry.chunk.file);
-                entry
+            .flat_map(|base| base.entries.iter())
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Owned(self.project_root.join(&entry.chunk.file)),
+                    entry,
+                )
             })
-            .collect();
-        self.file_mtimes = base
-            .file_mtimes
+            .chain(self.entries.iter().map(|entry| {
+                (
+                    std::borrow::Cow::Borrowed(entry.chunk.file.as_path()),
+                    entry,
+                )
+            }))
+    }
+
+    fn metadata_value<'a, T>(
+        &'a self,
+        path: &Path,
+        local: &'a HashMap<PathBuf, T>,
+        base_map: impl FnOnce(&'a SharedSemanticBase) -> &'a HashMap<PathBuf, T>,
+    ) -> Option<&'a T> {
+        local.get(path).or_else(|| {
+            let relative = path.strip_prefix(&self.project_root).ok()?;
+            if self.tombstones.contains(relative) {
+                return None;
+            }
+            base_map(self.shared_base.as_deref()?).get(relative)
+        })
+    }
+
+    fn indexed_paths(&self) -> BTreeSet<PathBuf> {
+        self.shared_base
             .iter()
-            .map(|(path, value)| (self.project_root.join(path), *value))
-            .collect();
-        self.file_sizes = base
-            .file_sizes
-            .iter()
-            .map(|(path, value)| (self.project_root.join(path), *value))
-            .collect();
-        self.any_missing_sizes = base.any_missing_sizes;
-        self.file_hashes = base
-            .file_hashes
-            .iter()
-            .map(|(path, value)| (self.project_root.join(path), *value))
-            .collect();
-        self.dimension = base.dimension;
-        self.fingerprint = base.fingerprint.clone();
-        self.skipped_rows = base.skipped_rows;
-        self.deferred_files = base
-            .deferred_files
-            .iter()
+            .flat_map(|base| base.file_mtimes.keys())
+            .filter(|path| !self.tombstones.contains(*path))
             .map(|path| self.project_root.join(path))
-            .collect();
-        let dirty_paths = base
-            .dirty_paths
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|paths| {
-                paths
-                    .iter()
-                    .map(|path| self.project_root.join(path))
-                    .collect()
-            });
-        let persistence = *base
-            .persistence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.set_dirty_paths(dirty_paths);
-        self.set_persistence(persistence);
+            .chain(self.file_mtimes.keys().cloned())
+            .collect()
+    }
+
+    fn hide_base_files<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        if let Some(base) = &self.shared_base {
+            for path in paths {
+                if let Ok(relative) = path.strip_prefix(&self.project_root) {
+                    if base.file_mtimes.contains_key(relative)
+                        || base
+                            .entries
+                            .iter()
+                            .any(|entry| entry.chunk.file == relative)
+                    {
+                        self.tombstones.insert(relative.to_path_buf());
+                    }
+                }
+            }
+        }
     }
 
     pub fn new(project_root: PathBuf, dimension: usize) -> Self {
@@ -4515,6 +4567,7 @@ impl SemanticIndex {
             project_root,
             deferred_files: HashSet::new(),
             shared_base: None,
+            tombstones: HashSet::new(),
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -4532,36 +4585,35 @@ impl SemanticIndex {
     /// Number of embedded symbol entries.
     pub fn entry_count(&self) -> usize {
         self.shared_base
-            .as_ref()
-            .map(|base| base.entries.len())
-            .unwrap_or_else(|| self.entries.len())
+            .iter()
+            .flat_map(|base| &base.entries)
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .count()
+            + self.entries.len()
     }
 
     /// Estimate resident semantic-index bytes from the vectors and metadata
     /// actually held by each entry. This intentionally excludes allocator and
     /// hash-table bucket overhead, which are not cheaply observable.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        if let Some(base) = &self.shared_base {
-            return crate::memory::MemoryEstimate::estimated(0)
-                .count("entries", base.entries.len())
-                .count("dimensions", base.dimension)
-                .count("indexed_files", base.file_mtimes.len())
-                .count("shared_base_entries", base.entries.len())
-                .count("overlay_entries", 0)
-                .count_u64("vector_bytes", 0)
-                .count_u64("text_bytes", 0)
-                .count_u64("metadata_bytes", 0);
-        }
         if self.entries.is_empty()
             && self.file_mtimes.is_empty()
             && self.file_sizes.is_empty()
             && self.file_hashes.is_empty()
             && self.deferred_files.is_empty()
+            && self.tombstones.is_empty()
         {
             return crate::memory::MemoryEstimate::estimated(0)
-                .count("entries", 0)
+                .count("entries", self.entry_count())
+                .count(
+                    "shared_base_entries",
+                    self.shared_base
+                        .as_ref()
+                        .map_or(0, |base| base.entries.len()),
+                )
+                .count("overlay_entries", 0)
                 .count("dimensions", self.dimension)
-                .count("indexed_files", 0)
+                .count("indexed_files", self.indexed_file_count())
                 .count_u64("vector_bytes", 0)
                 .count_u64("text_bytes", 0)
                 .count_u64("metadata_bytes", 0)
@@ -4597,6 +4649,7 @@ impl SemanticIndex {
             .chain(self.file_sizes.keys())
             .chain(self.file_hashes.keys())
             .chain(self.deferred_files.iter())
+            .chain(self.tombstones.iter())
             .map(|path| crate::memory::path_bytes(path))
             .fold(0u64, u64::saturating_add)
             .saturating_add(
@@ -4630,9 +4683,17 @@ impl SemanticIndex {
                 .saturating_add(text_bytes)
                 .saturating_add(metadata_bytes),
         )
-        .count("entries", self.entries.len())
+        .count("entries", self.entry_count())
+        .count(
+            "shared_base_entries",
+            self.shared_base
+                .as_ref()
+                .map_or(0, |base| base.entries.len()),
+        )
+        .count("overlay_entries", self.entries.len())
+        .count("tombstoned_files", self.tombstones.len())
         .count("dimensions", self.dimension)
-        .count("indexed_files", self.file_mtimes.len())
+        .count("indexed_files", self.indexed_file_count())
         .count_u64("vector_bytes", vector_bytes)
         .count_u64("text_bytes", text_bytes)
         .count_u64("metadata_bytes", metadata_bytes)
@@ -4648,10 +4709,7 @@ impl SemanticIndex {
 
     /// Number of files currently tracked by the semantic index.
     pub fn indexed_file_count(&self) -> usize {
-        self.shared_base
-            .as_ref()
-            .map(|base| base.file_mtimes.len())
-            .unwrap_or_else(|| self.file_mtimes.len())
+        self.indexed_paths().len()
     }
 
     /// Status word for an index object the daemon has already loaded.
@@ -4783,8 +4841,8 @@ impl SemanticIndex {
         let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
-        for entry in &self.entries {
-            if !requested.contains(entry.chunk.file.as_path()) {
+        for (path, entry) in self.live_entries() {
+            if !requested.contains(path.as_ref()) {
                 continue;
             }
 
@@ -4794,7 +4852,7 @@ impl SemanticIndex {
             // user through a full rebuild.
             let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
             reuse_map
-                .entry(entry.chunk.file.clone())
+                .entry(path.into_owned())
                 .or_default()
                 .entry(hash)
                 .or_default()
@@ -4982,6 +5040,7 @@ impl SemanticIndex {
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
+                tombstones: HashSet::new(),
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -5116,6 +5175,7 @@ impl SemanticIndex {
             project_root: project_root.to_path_buf(),
             deferred_files: HashSet::new(),
             shared_base: None,
+            tombstones: HashSet::new(),
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -5327,6 +5387,51 @@ impl SemanticIndex {
         progress: &mut P,
         verify_strategy: cache_freshness::VerifyStrategy,
         reuse_blob: &mut R,
+        recovery_paths: Option<&mut Vec<PathBuf>>,
+    ) -> Result<RefreshSummary, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        R: FnMut(&Path) -> Option<Vec<u8>>,
+    {
+        if self.shared_base.is_some() {
+            let mut candidate = self.clone();
+            candidate.dirty_paths = Arc::new(Mutex::new(self.dirty_paths_snapshot()));
+            candidate.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
+            let summary = candidate.refresh_stale_files_inner(
+                project_root,
+                current_files,
+                embed_fn,
+                max_batch_size,
+                progress,
+                verify_strategy,
+                reuse_blob,
+                recovery_paths,
+            )?;
+            *self = candidate;
+            return Ok(summary);
+        }
+        self.refresh_stale_files_inner(
+            project_root,
+            current_files,
+            embed_fn,
+            max_batch_size,
+            progress,
+            verify_strategy,
+            reuse_blob,
+            recovery_paths,
+        )
+    }
+
+    fn refresh_stale_files_inner<F, P, R>(
+        &mut self,
+        project_root: &Path,
+        current_files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        verify_strategy: cache_freshness::VerifyStrategy,
+        reuse_blob: &mut R,
         mut recovery_paths: Option<&mut Vec<PathBuf>>,
     ) -> Result<RefreshSummary, String>
     where
@@ -5334,17 +5439,16 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         R: FnMut(&Path) -> Option<Vec<u8>>,
     {
-        self.materialize_shared_base();
         self.backfill_missing_file_sizes();
 
         // 1. Bucket files into deleted / changed / added.
         let current_set: HashSet<&Path> = current_files.iter().map(PathBuf::as_path).collect();
         self.deferred_files
             .retain(|path| current_set.contains(path.as_path()));
-        let total_processed = current_set.len() + self.file_mtimes.len()
-            - self
-                .file_mtimes
-                .keys()
+        let indexed_paths = self.indexed_paths();
+        let total_processed = current_set.len() + indexed_paths.len()
+            - indexed_paths
+                .iter()
                 .filter(|path| current_set.contains(path.as_path()))
                 .count();
 
@@ -5358,7 +5462,7 @@ impl SemanticIndex {
 
         let mut deleted: Vec<PathBuf> = Vec::new();
         let mut changed: Vec<PathBuf> = Vec::new();
-        let indexed_paths: Vec<PathBuf> = self.file_mtimes.keys().cloned().collect();
+        let indexed_paths: Vec<PathBuf> = indexed_paths.into_iter().collect();
         let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
         let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
 
@@ -5369,9 +5473,9 @@ impl SemanticIndex {
                 continue;
             }
             let cached = match (
-                self.file_mtimes.get(&indexed_path),
-                self.file_sizes.get(&indexed_path),
-                self.file_hashes.get(&indexed_path),
+                self.metadata_value(&indexed_path, &self.file_mtimes, |base| &base.file_mtimes),
+                self.metadata_value(&indexed_path, &self.file_sizes, |base| &base.file_sizes),
+                self.metadata_value(&indexed_path, &self.file_hashes, |base| &base.file_hashes),
             ) {
                 (Some(mtime), Some(size), Some(hash)) => Some(FileFreshness {
                     mtime: *mtime,
@@ -5428,7 +5532,10 @@ impl SemanticIndex {
         // Files in walk that were never indexed.
         let mut added: Vec<PathBuf> = Vec::new();
         for path in current_files {
-            if !self.file_mtimes.contains_key(path) {
+            if self
+                .metadata_value(path, &self.file_mtimes, |base| &base.file_mtimes)
+                .is_none()
+            {
                 added.push(path.clone());
             }
         }
@@ -5508,6 +5615,7 @@ impl SemanticIndex {
                 self.deferred_files.remove(file);
             }
             if !successful_files.is_empty() {
+                self.hide_base_files(&successful_files);
                 self.entries
                     .retain(|entry| !successful_files.contains(&entry.chunk.file));
             }
@@ -5535,7 +5643,7 @@ impl SemanticIndex {
 
         // 4. Build the full replacement set, reusing cached vectors for chunks
         //    whose embed_text is unchanged and embedding only cache misses.
-        let existing_dimension = if self.entries.is_empty() {
+        let existing_dimension = if self.len() == 0 {
             None
         } else {
             Some(self.dimension)
@@ -5556,6 +5664,7 @@ impl SemanticIndex {
             self.deferred_files.remove(file);
         }
         if !successful_files.is_empty() {
+            self.hide_base_files(&successful_files);
             self.entries
                 .retain(|entry| !successful_files.contains(&entry.chunk.file));
         }
@@ -5630,7 +5739,48 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         R: FnMut(&Path) -> Option<Vec<u8>>,
     {
-        self.materialize_shared_base();
+        if self.shared_base.is_some() {
+            let mut candidate = self.clone();
+            candidate.dirty_paths = Arc::new(Mutex::new(self.dirty_paths_snapshot()));
+            candidate.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
+            let update = candidate.refresh_invalidated_files_inner(
+                project_root,
+                paths,
+                embed_fn,
+                max_batch_size,
+                max_files,
+                progress,
+                reuse_blob,
+            )?;
+            *self = candidate;
+            return Ok(update);
+        }
+        self.refresh_invalidated_files_inner(
+            project_root,
+            paths,
+            embed_fn,
+            max_batch_size,
+            max_files,
+            progress,
+            reuse_blob,
+        )
+    }
+
+    fn refresh_invalidated_files_inner<F, P, R>(
+        &mut self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        max_files: usize,
+        progress: &mut P,
+        reuse_blob: &mut R,
+    ) -> Result<InvalidatedFilesRefresh, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        R: FnMut(&Path) -> Option<Vec<u8>>,
+    {
         self.backfill_missing_file_sizes();
 
         self.deferred_files.retain(|path| path.exists());
@@ -5653,7 +5803,10 @@ impl SemanticIndex {
 
         let previously_indexed: HashSet<PathBuf> = requested_paths
             .iter()
-            .filter(|path| self.file_mtimes.contains_key(*path))
+            .filter(|path| {
+                self.metadata_value(path, &self.file_mtimes, |base| &base.file_mtimes)
+                    .is_some()
+            })
             .cloned()
             .collect();
         let mut reuse_map = self.build_chunk_reuse_map(&requested_paths);
@@ -5705,7 +5858,7 @@ impl SemanticIndex {
             reuse_blob,
         );
 
-        let retained_file_count = self.file_mtimes.len();
+        let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
             .iter()
             .filter(|path| {
@@ -5788,8 +5941,7 @@ impl SemanticIndex {
             });
         }
 
-        let initial_observed_dimension = if self.entries.is_empty() && previously_indexed.is_empty()
-        {
+        let initial_observed_dimension = if self.len() == 0 && previously_indexed.is_empty() {
             None
         } else {
             Some(self.dimension)
@@ -5842,7 +5994,6 @@ impl SemanticIndex {
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: &[PathBuf],
     ) {
-        self.materialize_shared_base();
         // `added_entries` is the complete replacement set for completed paths:
         // freshly embedded misses plus reused chunks carrying refreshed metadata.
         // Removing first is safe only because producers include both kinds.
@@ -5901,8 +6052,8 @@ impl SemanticIndex {
 
     fn mark_all_dirty(&self) {
         let mut paths = BTreeSet::new();
-        paths.extend(self.file_mtimes.keys().cloned());
-        paths.extend(self.entries.iter().map(|entry| entry.chunk.file.clone()));
+        paths.extend(self.indexed_paths());
+        paths.extend(self.live_entries().map(|(path, _)| path.into_owned()));
         self.set_dirty_paths(Some(paths));
     }
 
@@ -5915,6 +6066,7 @@ impl SemanticIndex {
         {
             self.removal_retain_passes += 1;
         }
+        self.hide_base_files(entry_files);
         self.entries
             .retain(|entry| !entry_files.contains(&entry.chunk.file));
         for path in metadata_files {
@@ -5948,12 +6100,15 @@ impl SemanticIndex {
     where
         F: Fn(&Path) -> bool,
     {
-        let (entries, dimension) = self
+        let entries = self
             .shared_base
-            .as_ref()
-            .map(|base| (base.entries.as_slice(), base.dimension))
-            .unwrap_or_else(|| (self.entries.as_slice(), self.dimension));
-        if entries.is_empty() || query_vector.len() != dimension {
+            .iter()
+            .flat_map(|base| &base.entries)
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .map(|entry| (entry, true))
+            .chain(self.entries.iter().map(|entry| (entry, false)))
+            .collect::<Vec<_>>();
+        if entries.is_empty() || query_vector.len() != self.dimension {
             return Vec::new();
         }
 
@@ -5962,7 +6117,7 @@ impl SemanticIndex {
         let query_norm = vector_norm(query_vector);
         let cancellation = crate::executor::current_job_cancellation();
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(entries.len());
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, (entry, shared)) in entries.iter().enumerate() {
             if i % 64 == 0
                 && cancellation
                     .as_ref()
@@ -5970,7 +6125,7 @@ impl SemanticIndex {
             {
                 break;
             }
-            let included = if self.shared_base.is_some() {
+            let included = if *shared {
                 include(&self.project_root.join(&entry.chunk.file))
             } else {
                 include(&entry.chunk.file)
@@ -6009,13 +6164,9 @@ impl SemanticIndex {
             // old `> 0.0` floor: top_k has already been selected, and zero-score
             // tail entries remain observable when requested.
             .map(|(score, idx)| {
-                let entry = &entries[idx];
+                let (entry, shared) = &entries[idx];
                 SemanticResult {
-                    file: if self.shared_base.is_some() {
-                        self.project_root.join(&entry.chunk.file)
-                    } else {
-                        entry.chunk.file.clone()
-                    },
+                    file: if *shared { self.project_root.join(&entry.chunk.file) } else { entry.chunk.file.clone() },
                     name: entry.chunk.name.clone(),
                     qualified_name: entry.chunk.qualified_name.clone(),
                     kind: entry.chunk.kind.clone(),
@@ -6039,34 +6190,8 @@ impl SemanticIndex {
 
     /// Check if a file needs re-indexing based on mtime/size
     pub fn is_file_stale(&self, file: &Path) -> bool {
-        let relative;
-        let (file_mtimes, file_sizes, file_hashes, lookup) = if let Some(base) = &self.shared_base {
-            relative = file
-                .strip_prefix(&self.project_root)
-                .unwrap_or(file)
-                .to_path_buf();
-            (
-                &base.file_mtimes,
-                &base.file_sizes,
-                &base.file_hashes,
-                relative.as_path(),
-            )
-        } else {
-            (&self.file_mtimes, &self.file_sizes, &self.file_hashes, file)
-        };
-        let Some(stored_mtime) = file_mtimes.get(lookup) else {
+        let Some(cached) = self.recorded_file_freshness(file) else {
             return true;
-        };
-        let Some(stored_size) = file_sizes.get(lookup) else {
-            return true;
-        };
-        let Some(stored_hash) = file_hashes.get(lookup) else {
-            return true;
-        };
-        let cached = FileFreshness {
-            mtime: *stored_mtime,
-            size: *stored_size,
-            content_hash: *stored_hash,
         };
         match cache_freshness::verify_file_strict(file, &cached) {
             FreshnessVerdict::HotFresh => false,
@@ -6085,20 +6210,12 @@ impl SemanticIndex {
     /// the pair of keys `invalidate_files` removes.
     pub fn recorded_file_freshness(&self, file: &Path) -> Option<FileFreshness> {
         let lookup = |path: &Path| -> Option<FileFreshness> {
-            if let Some(base) = &self.shared_base {
-                let relative = path.strip_prefix(&self.project_root).ok()?;
-                Some(FileFreshness {
-                    mtime: *base.file_mtimes.get(relative)?,
-                    size: *base.file_sizes.get(relative)?,
-                    content_hash: *base.file_hashes.get(relative)?,
-                })
-            } else {
-                Some(FileFreshness {
-                    mtime: *self.file_mtimes.get(path)?,
-                    size: *self.file_sizes.get(path)?,
-                    content_hash: *self.file_hashes.get(path)?,
-                })
-            }
+            Some(FileFreshness {
+                mtime: *self.metadata_value(path, &self.file_mtimes, |base| &base.file_mtimes)?,
+                size: *self.metadata_value(path, &self.file_sizes, |base| &base.file_sizes)?,
+                content_hash: *self
+                    .metadata_value(path, &self.file_hashes, |base| &base.file_hashes)?,
+            })
         };
         lookup(file).or_else(|| {
             let canonical = canonicalize_existing_or_deleted_path(file);
@@ -6130,21 +6247,24 @@ impl SemanticIndex {
             return;
         }
 
-        for path in self.file_mtimes.keys() {
-            if self.file_sizes.contains_key(path) {
+        for path in self.indexed_paths() {
+            if self
+                .metadata_value(&path, &self.file_sizes, |base| &base.file_sizes)
+                .is_some()
+            {
                 continue;
             }
-            if let Ok(metadata) = fs::metadata(path) {
+            if let Ok(metadata) = fs::metadata(&path) {
                 self.file_sizes.insert(path.clone(), metadata.len());
-                if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(path, metadata.len()) {
-                    self.file_hashes.insert(path.clone(), hash);
+                if let Ok(Some(hash)) = cache_freshness::hash_file_if_small(&path, metadata.len()) {
+                    self.file_hashes.insert(path, hash);
                 }
             }
         }
-        self.any_missing_sizes = self
-            .file_mtimes
-            .keys()
-            .any(|path| !self.file_sizes.contains_key(path));
+        self.any_missing_sizes = self.indexed_paths().iter().any(|path| {
+            self.metadata_value(path, &self.file_sizes, |base| &base.file_sizes)
+                .is_none()
+        });
     }
 
     /// Remove entries for a specific file.
@@ -6161,7 +6281,6 @@ impl SemanticIndex {
         if files.is_empty() {
             return;
         }
-        self.materialize_shared_base();
 
         // Watchers may report a symlinked spelling while persisted metadata uses
         // the canonical spelling (or vice versa), so both keys must be removed.
@@ -6193,47 +6312,27 @@ impl SemanticIndex {
     /// can check that vectors survived an operation bit-for-bit.
     #[cfg(test)]
     pub(crate) fn entry_vectors_for_test(&self) -> Vec<(PathBuf, String, Vec<f32>)> {
-        let mut rows = match &self.shared_base {
-            Some(base) => base
-                .entries
-                .iter()
-                .map(|entry| {
-                    (
-                        self.project_root.join(&entry.chunk.file),
-                        entry.chunk.name.clone(),
-                        entry.vector.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            None => self
-                .entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.chunk.file.clone(),
-                        entry.chunk.name.clone(),
-                        entry.vector.clone(),
-                    )
-                })
-                .collect(),
-        };
+        let mut rows = self
+            .live_entries()
+            .map(|(path, entry)| {
+                (
+                    path.into_owned(),
+                    entry.chunk.name.clone(),
+                    entry.vector.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
         rows
     }
 
     /// Get the embedding dimension
     pub fn dimension(&self) -> usize {
-        self.shared_base
-            .as_ref()
-            .map(|base| base.dimension)
-            .unwrap_or(self.dimension)
+        self.dimension
     }
 
     pub fn fingerprint(&self) -> Option<&SemanticIndexFingerprint> {
-        self.shared_base
-            .as_ref()
-            .and_then(|base| base.fingerprint.as_ref())
-            .or(self.fingerprint.as_ref())
+        self.fingerprint.as_ref()
     }
 
     pub fn backend_label(&self) -> Option<&str> {
@@ -6245,7 +6344,6 @@ impl SemanticIndex {
     }
 
     pub fn set_fingerprint(&mut self, fingerprint: SemanticIndexFingerprint) {
-        self.materialize_shared_base();
         self.fingerprint = Some(fingerprint);
     }
 
@@ -6438,44 +6536,36 @@ impl SemanticIndex {
     }
 
     fn delta_for_paths(&self, paths: &BTreeSet<PathBuf>) -> Self {
-        Self {
-            entries: self
-                .entries
-                .iter()
-                .filter(|entry| paths.contains(&entry.chunk.file))
-                .cloned()
-                .collect(),
-            file_mtimes: self
-                .file_mtimes
-                .iter()
-                .filter(|(path, _)| paths.contains(*path))
-                .map(|(path, value)| (path.clone(), *value))
-                .collect(),
-            file_sizes: self
-                .file_sizes
-                .iter()
-                .filter(|(path, _)| paths.contains(*path))
-                .map(|(path, value)| (path.clone(), *value))
-                .collect(),
-            any_missing_sizes: false,
-            file_hashes: self
-                .file_hashes
-                .iter()
-                .filter(|(path, _)| paths.contains(*path))
-                .map(|(path, value)| (path.clone(), *value))
-                .collect(),
-            dimension: self.dimension,
-            fingerprint: self.fingerprint.clone(),
-            project_root: self.project_root.clone(),
-            deferred_files: HashSet::new(),
-            shared_base: None,
-            dirty_paths: Arc::new(Mutex::new(None)),
-            persistence: Arc::new(Mutex::new(None)),
-            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-            skipped_rows: self.skipped_rows,
-            #[cfg(test)]
-            removal_retain_passes: 0,
+        let mut delta = Self::new(self.project_root.clone(), self.dimension);
+        delta.fingerprint = self.fingerprint.clone();
+        delta.skipped_rows = self.skipped_rows;
+        delta.entries = self
+            .live_entries()
+            .filter(|(path, _)| paths.contains(path.as_ref()))
+            .map(|(path, entry)| {
+                let mut entry = entry.clone();
+                entry.chunk.file = path.into_owned();
+                entry
+            })
+            .collect();
+        for path in paths {
+            if let Some(value) =
+                self.metadata_value(path, &self.file_mtimes, |base| &base.file_mtimes)
+            {
+                delta.file_mtimes.insert(path.clone(), *value);
+            }
+            if let Some(value) =
+                self.metadata_value(path, &self.file_sizes, |base| &base.file_sizes)
+            {
+                delta.file_sizes.insert(path.clone(), *value);
+            }
+            if let Some(value) =
+                self.metadata_value(path, &self.file_hashes, |base| &base.file_hashes)
+            {
+                delta.file_hashes.insert(path.clone(), *value);
+            }
         }
+        delta
     }
 
     fn build_segment_frame(
@@ -6630,11 +6720,6 @@ impl SemanticIndex {
     /// A final partial segment is ignored (and truncated by an owning reader/writer),
     /// so SIGKILL during append leaves every previously committed refresh loadable.
     pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) -> bool {
-        if self.shared_base.is_some() {
-            let mut private = self.clone();
-            private.materialize_shared_base();
-            return private.write_to_disk(storage_dir, project_key);
-        }
         let dir = storage_dir.join("semantic").join(project_key);
         let data_path = dir.join("semantic.bin");
         let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
@@ -7390,11 +7475,6 @@ impl SemanticIndex {
 
     /// Serialize the index to bytes for disk persistence
     pub fn to_bytes(&self) -> Vec<u8> {
-        if self.shared_base.is_some() {
-            let mut private = self.clone();
-            private.materialize_shared_base();
-            return private.to_bytes();
-        }
         let mut buf = Vec::new();
         self.write_to_writer(&mut buf)
             .expect("writing semantic index to Vec cannot fail");
@@ -7413,20 +7493,17 @@ impl SemanticIndex {
         });
         let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
         let mut file_metadata = self
-            .file_mtimes
-            .iter()
-            .filter_map(|(path, mtime)| {
-                cache_relative_path(&self.project_root, path)
-                    .map(|relative| (relative, path, mtime))
+            .indexed_paths()
+            .into_iter()
+            .filter_map(|path| {
+                cache_relative_path(&self.project_root, &path).map(|relative| (relative, path))
             })
             .collect::<Vec<_>>();
         file_metadata.sort_by(|left, right| left.0.cmp(&right.0));
         let mut persisted_entries = self
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                cache_relative_path(&self.project_root, &entry.chunk.file)
-                    .map(|relative| (relative, entry))
+            .live_entries()
+            .filter_map(|(path, entry)| {
+                cache_relative_path(&self.project_root, &path).map(|relative| (relative, entry))
             })
             .collect::<Vec<_>>();
         persisted_entries.sort_by(|left, right| {
@@ -7477,7 +7554,10 @@ impl SemanticIndex {
             &(file_mtime_count as u32).to_le_bytes(),
             &mut bytes_written,
         )?;
-        for (relative, path, mtime) in file_metadata {
+        for (relative, path) in file_metadata {
+            let mtime = self
+                .metadata_value(&path, &self.file_mtimes, |base| &base.file_mtimes)
+                .unwrap();
             let relative = relative.to_string_lossy();
             let path_bytes = relative.as_bytes();
             write_counted(
@@ -7499,11 +7579,13 @@ impl SemanticIndex {
                 &duration.subsec_nanos().to_le_bytes(),
                 &mut bytes_written,
             )?;
-            let size = self.file_sizes.get(path).copied().unwrap_or_default();
+            let size = self
+                .metadata_value(&path, &self.file_sizes, |base| &base.file_sizes)
+                .copied()
+                .unwrap_or_default();
             write_counted(writer, &size.to_le_bytes(), &mut bytes_written)?;
             let hash = self
-                .file_hashes
-                .get(path)
+                .metadata_value(&path, &self.file_hashes, |base| &base.file_hashes)
                 .copied()
                 .unwrap_or_else(cache_freshness::zero_hash);
             write_counted(writer, hash.as_bytes(), &mut bytes_written)?;
@@ -7871,6 +7953,7 @@ impl SemanticIndex {
                 project_root: current_canonical_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
+                tombstones: HashSet::new(),
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -9944,6 +10027,170 @@ Connection: close
         .unwrap();
     }
 
+    #[test]
+    fn shared_overlay_equivalence_and_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner_root = temp.path().join("owner");
+        fs::create_dir(&owner_root).unwrap();
+        let files = (0..64)
+            .map(|i| {
+                let path = owner_root.join(format!("file_{i:02}.rs"));
+                write_rust_file(&path, &format!("symbol_{i}"));
+                path
+            })
+            .collect::<Vec<_>>();
+        let original = build_test_index(&owner_root, &files);
+        let base = Arc::new(original.clone().into_shared_base().unwrap());
+        let weak = Arc::downgrade(&base);
+        let mut roots = Vec::new();
+        // Include the owner: freezing does not give it a different mutation path.
+        for i in 0..11 {
+            let root = if i == 0 {
+                owner_root.clone()
+            } else {
+                temp.path().join(format!("borrower_{i}"))
+            };
+            fs::create_dir_all(&root).unwrap();
+            for file in &files {
+                if i != 0 {
+                    fs::copy(file, root.join(file.file_name().unwrap())).unwrap();
+                }
+            }
+            let mut oracle = original.clone();
+            oracle.project_root = root.clone();
+            for entry in &mut oracle.entries {
+                entry.chunk.file = root.join(entry.chunk.file.file_name().unwrap());
+            }
+            oracle.file_mtimes = original
+                .file_mtimes
+                .iter()
+                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
+                .collect();
+            oracle.file_sizes = original
+                .file_sizes
+                .iter()
+                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
+                .collect();
+            oracle.file_hashes = original
+                .file_hashes
+                .iter()
+                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
+                .collect();
+            let mut serving = SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base));
+            let mut worker = serving.clone();
+            for (name, symbol) in [
+                ("file_00.rs", Some("changed")),
+                ("added.rs", Some("added")),
+                ("file_01.rs", None),
+                ("file_01.rs", Some("readded")),
+                ("file_00.rs", Some("changed_twice")),
+            ] {
+                let path = root.join(name);
+                match symbol {
+                    Some(symbol) => write_rust_file(&path, symbol),
+                    None => fs::remove_file(&path).unwrap(),
+                }
+                serving.invalidate_file(&path);
+                let update = worker
+                    .refresh_invalidated_files(
+                        &root,
+                        std::slice::from_ref(&path),
+                        &mut test_vector_for_texts,
+                        8,
+                        1000,
+                        &mut |_, _| {},
+                    )
+                    .unwrap();
+                serving.apply_refresh_update(
+                    update.added_entries,
+                    update.updated_metadata,
+                    &update.completed_paths,
+                );
+                oracle
+                    .refresh_invalidated_files(
+                        &root,
+                        std::slice::from_ref(&path),
+                        &mut test_vector_for_texts,
+                        8,
+                        1000,
+                        &mut |_, _| {},
+                    )
+                    .unwrap();
+                assert_eq!(serving.to_bytes(), oracle.to_bytes());
+                assert_eq!(worker.to_bytes(), oracle.to_bytes());
+                for query in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
+                    for k in [1, 7, 1000] {
+                        assert_eq!(
+                            format!("{:?}", serving.search(&query, k)),
+                            format!("{:?}", oracle.search(&query, k))
+                        );
+                    }
+                }
+                assert!(Arc::ptr_eq(
+                    serving
+                        .shared_base
+                        .as_ref()
+                        .expect("edits must not materialize the base"),
+                    &base
+                ));
+                assert!(Arc::ptr_eq(worker.shared_base.as_ref().unwrap(), &base));
+                assert!(serving.entries.len() < original.entries.len() / 4);
+                assert!(
+                    worker.estimated_memory().estimated_bytes.unwrap()
+                        < original.estimated_memory().estimated_bytes.unwrap() / 3
+                );
+            }
+            roots.push((serving, worker));
+        }
+        assert_eq!(Arc::strong_count(&base), 23);
+        drop(base);
+        drop(roots);
+        assert!(
+            weak.upgrade().is_none(),
+            "the last index must release its base"
+        );
+    }
+
+    #[test]
+    fn shared_overlay_slow_failed_refresh_is_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let path = root.join("lib.rs");
+        write_rust_file(&path, "before");
+        let original = build_test_index(&root, std::slice::from_ref(&path));
+        let base = Arc::new(original.into_shared_base().unwrap());
+        let serving = SemanticIndex::from_shared_base(root.clone(), base);
+        let before = serving.to_bytes();
+        let rows = format!("{:?}", serving.search(&[1.0, 0.0, 0.0], 100));
+        let mut worker = serving.clone();
+        write_rust_file(&path, "after");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = worker.refresh_invalidated_files(
+                &root,
+                &[path],
+                &mut |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err("backend failed".to_string())
+                },
+                8,
+                100,
+                &mut |_, _| {},
+            );
+            assert!(result.is_err());
+            worker
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(serving.to_bytes(), before);
+        assert_eq!(format!("{:?}", serving.search(&[1.0, 0.0, 0.0], 100)), rows);
+        release_tx.send(()).unwrap();
+        let worker = handle.join().unwrap();
+        assert_eq!(worker.to_bytes(), before);
+        assert_eq!(serving.to_bytes(), before);
+    }
+
     fn build_test_index(project_root: &Path, files: &[PathBuf]) -> SemanticIndex {
         let mut embed = test_vector_for_texts;
         SemanticIndex::build(project_root, files, &mut embed, 8).unwrap()
@@ -11585,14 +11832,12 @@ public class Greeter {
 
         assert!(sequential.shared_base.is_none());
         assert!(batched.shared_base.is_none());
-        assert!(shared_batched.shared_base.is_none());
+        assert!(shared_batched.shared_base.is_some());
         assert_eq!(batched.to_bytes(), sequential.to_bytes());
-        assert_eq!(shared_batched.file_mtimes, batched.file_mtimes);
-        assert_eq!(shared_batched.file_sizes, batched.file_sizes);
-        assert_eq!(shared_batched.file_hashes, batched.file_hashes);
+        assert_eq!(shared_batched.to_bytes(), batched.to_bytes());
         assert_eq!(
-            format!("{:?}", shared_batched.entries),
-            format!("{:?}", batched.entries)
+            shared_batched.entry_vectors_for_test(),
+            batched.entry_vectors_for_test()
         );
         assert_eq!(
             sequential.removal_retain_passes_for_test(),
