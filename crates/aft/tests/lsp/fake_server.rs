@@ -707,9 +707,11 @@ fn main() -> io::Result<()> {
                             &Notification::new(
                                 "experimental/serverStatus",
                                 Some(json!({
-                                    "health": if warming { "warning" } else { "ok" },
+                                    "health": if warming || server_status_mode.as_deref() == Some("warning") { "warning" } else { "ok" },
                                     "quiescent": !warming,
-                                    "message": if warming {
+                                    "message": if server_status_mode.as_deref() == Some("warning") {
+                                        "proc-macro server failed to start"
+                                    } else if warming {
                                         "workspace analysis is warming"
                                     } else {
                                         "workspace analysis is ready"

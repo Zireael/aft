@@ -49,6 +49,7 @@ struct DiagnosticsCollection {
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
     producer_failures: BTreeMap<String, String>,
+    producer_notes: BTreeSet<String>,
     /// Servers with a root marker but no file to analyze, keyed by server id.
     /// Informational only: an inapplicable server is neither a failure nor a
     /// gap, so it never makes the payload incomplete.
@@ -171,6 +172,9 @@ fn collect_warm_working_set(
             expected_producers.to_vec()
         };
         for server in &producers {
+            if let Some(note) = lsp.producer_warning(server) {
+                collection.producer_notes.insert(note.to_string());
+            }
             if let Some(reason) = lsp.producer_failure(server) {
                 collection
                     .producer_failures
@@ -430,6 +434,9 @@ impl DiagnosticsCollection {
             (producer, serde_json::json!({"errors": errors, "warnings": warnings, "info": info, "hints": hints}))
         }).collect());
 
+        if !self.producer_notes.is_empty() {
+            payload["notes"] = serde_json::json!(self.producer_notes);
+        }
         let mut gaps: Vec<Value> = self
             .producer_failures
             .into_iter()

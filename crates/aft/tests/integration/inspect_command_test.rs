@@ -4343,3 +4343,51 @@ fn scoped_rust_inspect_preserves_stale_cargo_lock() {
         "metadata failure must explain why diagnostics are unavailable: {response:#}"
     );
 }
+
+#[test]
+fn rust_analyzer_warning_keeps_diagnostics_and_reports_note() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-warning\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "warning");
+    open_with_lsp(&ctx, &file, "fn main() {}\n");
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-analyzer-warning",
+            "command": "inspect",
+            "scope": "src/main.rs",
+            "sections": ["diagnostics"],
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_ne!(response["complete"], false, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["warnings"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["details"]["diagnostics"].as_array().unwrap().len(),
+        2,
+        "{response:#}"
+    );
+    let note = "rust-analyzer warning: proc-macro server failed to start";
+    assert_eq!(
+        response["summary"]["diagnostics"]["notes"],
+        json!([note]),
+        "{response:#}"
+    );
+    assert!(
+        response["text"].as_str().unwrap().contains(note),
+        "{response:#}"
+    );
+}
