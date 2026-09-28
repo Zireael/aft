@@ -577,7 +577,11 @@ fn handle_outline_files_mode(
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
-    let unknown_lines = file_entries.iter().filter(|entry| entry.lines.is_none() && entry.language != "binary").map(|entry| entry.path.clone()).collect::<Vec<_>>();
+    let unknown_lines = file_entries
+        .iter()
+        .filter(|entry| entry.lines.is_none() && entry.language != "binary")
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
     if !unknown_lines.is_empty() {
         text.push_str("\nLine counts unknown for unreadable files or text exceeding the 1048576-byte count budget; narrow: read a file range.\n");
     }
@@ -1106,7 +1110,10 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
 
     const LINE_COUNT_BYTES: u64 = 1024 * 1024;
     if file.metadata()?.len() > LINE_COUNT_BYTES {
-        return Ok(OutlineFileContentStats { binary: false, lines: None });
+        return Ok(OutlineFileContentStats {
+            binary: false,
+            lines: None,
+        });
     }
     let mut file = file.take(LINE_COUNT_BYTES + 1 - sample_len as u64);
     let mut newline_count = sample[..sample_len]
@@ -1127,7 +1134,10 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
     }
 
     if total_bytes as u64 > LINE_COUNT_BYTES {
-        return Ok(OutlineFileContentStats { binary: false, lines: None });
+        return Ok(OutlineFileContentStats {
+            binary: false,
+            lines: None,
+        });
     }
     let lines = newline_count + usize::from(total_bytes > 0 && last_byte != Some(b'\n'));
     Ok(OutlineFileContentStats {
@@ -1262,7 +1272,10 @@ fn format_files_table(
                         entry.language,
                         entry.symbols.unwrap_or(0)
                     ),
-                    entry.lines.map(|lines| lines.to_string()).or_else(|| (entry.language == "binary").then(|| "-".to_string())),
+                    entry
+                        .lines
+                        .map(|lines| lines.to_string())
+                        .or_else(|| (entry.language == "binary").then(|| "-".to_string())),
                 )
             }
             OutlineTableRow::Rollup(node_id) => {
@@ -1516,7 +1529,8 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
     options: Option<&OutlineWalkOptions>,
     boundary: &crate::walk_boundary::DeviceBoundary,
     device_lookup: &mut F,
-) -> usize where
+) -> usize
+where
     F: FnMut(&Path) -> std::io::Result<Option<u64>>,
 {
     let mut pending = VecDeque::from([directory.to_path_buf()]);

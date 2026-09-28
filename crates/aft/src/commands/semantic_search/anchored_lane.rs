@@ -498,7 +498,9 @@ pub fn verify_file_for_anchored(
     retained_runs: &[String],
     denominator: usize,
 ) -> Option<CandidateResult> {
-    verify_admitted_file(file_path, retained_runs, denominator).ok().flatten()
+    verify_admitted_file(file_path, retained_runs, denominator)
+        .ok()
+        .flatten()
 }
 
 fn verify_admitted_file(
@@ -514,8 +516,12 @@ fn verify_admitted_file(
     else {
         return Err(());
     };
-    let Ok(content) = std::str::from_utf8(&file.bytes) else { return Err(()); };
-    let Some(canonical) = find_canonical_alignment(content, retained_runs) else { return Ok(None); };
+    let Ok(content) = std::str::from_utf8(&file.bytes) else {
+        return Err(());
+    };
+    let Some(canonical) = find_canonical_alignment(content, retained_runs) else {
+        return Ok(None);
+    };
     if !evaluate_threshold(
         canonical.matched_total,
         canonical.runs_matched(),
@@ -559,7 +565,8 @@ impl AnchoredLane {
         query: &str,
         include_tests: bool,
     ) -> Vec<CandidateResult> {
-        self.execute_with_admission_report(index, search_root, query, include_tests).0
+        self.execute_with_admission_report(index, search_root, query, include_tests)
+            .0
     }
 
     pub(crate) fn execute_with_admission_report(
@@ -587,7 +594,10 @@ impl AnchoredLane {
             .filter_map(|path| {
                 match verify_admitted_file(&path, &split.retained_runs, split.denominator) {
                     Ok(candidate) => candidate,
-                    Err(()) => { excluded += 1; None }
+                    Err(()) => {
+                        excluded += 1;
+                        None
+                    }
                 }
             })
             .collect::<Vec<_>>();

@@ -3245,7 +3245,8 @@ pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> Search
     // Bound the read itself as well as admission: the file can grow after stat.
     let mut bytes = Vec::new();
     let read = File::open(path).and_then(|file| {
-        file.take(max_file_size.saturating_add(1)).read_to_end(&mut bytes)
+        file.take(max_file_size.saturating_add(1))
+            .read_to_end(&mut bytes)
     });
     if read.is_err() {
         return SearchCorpusEligibility::Skipped;

@@ -178,7 +178,9 @@ impl ExactLane {
     ) -> FallbackExactResult {
         let file_limit = options.file_limit.unwrap_or(self.fallback_file_limit);
         let result_limit = options.result_limit.unwrap_or(self.fallback_result_limit);
-        let budget = options.time_limit.unwrap_or(crate::grep_executor::FALLBACK_WALK_BUDGET);
+        let budget = options
+            .time_limit
+            .unwrap_or(crate::grep_executor::FALLBACK_WALK_BUDGET);
         let deadline = Some(Instant::now() + budget);
 
         // Sort a bounded discovery batch before verification, retaining a lookahead
@@ -364,7 +366,6 @@ impl SearchLane for ExactLane {
         }
     }
 }
-
 
 /// Verify exact matches in file text and return candidates.
 pub fn verify_exact_matches_in_text(

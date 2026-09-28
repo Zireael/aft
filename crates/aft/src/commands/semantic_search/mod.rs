@@ -2413,7 +2413,9 @@ fn disclose_exact_gaps(
     text: &mut String,
     extras: &mut serde_json::Map<String, serde_json::Value>,
 ) {
-    if disclosures.is_empty() { return; }
+    if disclosures.is_empty() {
+        return;
+    }
     extras.insert("complete".into(), serde_json::json!(false));
     extras.insert("exact_fallback_gap".into(), serde_json::json!(disclosures));
     for disclosure in disclosures {
@@ -2431,11 +2433,14 @@ fn disclose_anchored_admission(
         return;
     }
     extras.insert("complete".into(), serde_json::json!(false));
-    extras.insert("anchored_admission_gap".into(), serde_json::json!({
-        "candidates_examined": examined,
-        "files_excluded": excluded,
-        "reason": "exact corpus admission: at most 1048576 bytes, readable UTF-8 text"
-    }));
+    extras.insert(
+        "anchored_admission_gap".into(),
+        serde_json::json!({
+            "candidates_examined": examined,
+            "files_excluded": excluded,
+            "reason": "exact corpus admission: at most 1048576 bytes, readable UTF-8 text"
+        }),
+    );
     text.push_str(&format!("\nAnchored verification cut short: {excluded} of {examined} candidate files excluded by exact corpus admission (readable UTF-8 text, at most 1048576 bytes). Narrow to smaller text files or read a specific file range.\nshown {} of {examined} candidate files verified (corpus admission gap) · narrow: path, file range", examined - excluded));
 }
 
@@ -4083,7 +4088,7 @@ fn semantic_unavailable_or_fallback_response(
         extras.insert("structuredContent".to_string(), ranked.structured_content);
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
-    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
+        disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 
         return search_response(
             req,
