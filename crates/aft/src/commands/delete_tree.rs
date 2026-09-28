@@ -75,7 +75,8 @@ impl From<std::io::Error> for CollectError {
     }
 }
 
-/// What a recorded entry is. Only kinds undo can restore are recorded.
+/// Kinds of entries a recursive delete records. Undo restores all of them
+/// except sockets, which are deleted and reported as not restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeKind {
     Directory,
