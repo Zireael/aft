@@ -484,6 +484,9 @@ pub enum BgMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
+    /// Storage namespace captured at spawn, independent of later route binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     pub task_id: String,
     pub session_id: String,
     pub command: String,
@@ -562,6 +565,7 @@ impl PersistedTask {
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
+            harness: super::route_harness().map(|harness| harness.storage_segment()),
             task_id,
             session_id,
             command,
@@ -661,7 +665,8 @@ impl PersistedTask {
 
 impl From<BashTaskRow> for PersistedTask {
     fn from(row: BashTaskRow) -> Self {
-        if let Ok(task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+        if let Ok(mut task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+            task.harness = Some(row.harness.clone());
             return task;
         }
         let status = match row.status.as_str() {
@@ -679,6 +684,7 @@ impl From<BashTaskRow> for PersistedTask {
         let finished_at = row.completed_at.and_then(|value| u64::try_from(value).ok());
         Self {
             schema_version: SCHEMA_VERSION,
+            harness: Some(row.harness.clone()),
             task_id: row.task_id,
             session_id: row.session_id,
             command: row.command,

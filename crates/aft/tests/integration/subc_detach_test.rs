@@ -119,6 +119,179 @@ fn subc_background_bash_survives_module_process_group_restart() {
     });
 }
 
+#[test]
+fn subc_foreground_drain_preserves_route_harness_across_restart() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let ready = project.path().join("foreground.ready");
+        let stop = project.path().join("foreground.stop");
+        let release = ReleaseOnDrop::new(stop.clone());
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        // Another consumer can configure the same root without owning this route.
+        bind_route_as(&mut stream, project.path(), 2, "runner").await;
+        send_tool_call(&mut stream, ROUTE_CHANNEL, 20, "bash", json!({
+            "command": sentinel_command(&ready, &stop), "wait": true,
+            "timeout": 60_000, "compressed": false,
+        })).await;
+        wait_for_path(&ready, "foreground ready");
+        send_module_draining(&mut stream).await;
+        let detached = read_tool_response(&mut stream, 20, "drain detach").await;
+        assert!(!tool_result_is_error(&detached), "{}", frame_body(&detached));
+        let task_id = extract_task_id(&detached);
+        let db = rusqlite::Connection::open(data_home.path().join("cortexkit/aft/aft.db")).unwrap();
+        let (harness, stdout, stderr, pgid, notify): (String, String, String, i64, bool) = db.query_row(
+            "SELECT harness, stdout_path, stderr_path, pgid, json_extract(metadata, '$.notify_on_completion') FROM bash_tasks WHERE task_id = ?1",
+            [&task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(harness, "opencode", "persisted owner must be the command route, not the last root configure");
+        assert!(pgid > 0 && notify);
+        assert!(Path::new(&stdout).is_file() && Path::new(&stderr).is_file());
+        assert!(frame_body(&detached).contains(&stdout), "detach must name its output: {}", frame_body(&detached));
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("drained module").success());
+        drop(stream);
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        let running = bash_status(&mut stream, 30, &task_id).await;
+        assert_eq!(running["status"], "running", "{running}");
+        assert_eq!(running["child_pid"].as_i64(), Some(pgid));
+        drop(release);
+        let completed = wait_for_status(&mut stream, 31, &task_id, "completed").await;
+        assert_eq!(completed["exit_code"], 0);
+        assert!(completed["output_preview"].as_str().unwrap().contains("sentinel-stopped"));
+        assert!(std::fs::read_to_string(&stdout).unwrap().contains("sentinel-stopped"));
+        send_tool_call(&mut stream, ROUTE_CHANNEL, 100, "bash_drain_completions", json!({})).await;
+        let completions = read_tool_response(&mut stream, 100, "restarted completion delivery").await;
+        assert!(tool_response_json(&completions)["bg_completions"].as_array().unwrap().iter().any(|item| item["task_id"] == task_id), "{}", frame_body(&completions));
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("restarted module").success());
+        let harnesses: String = db.query_row("SELECT group_concat(harness) FROM bash_tasks WHERE task_id = ?1", [&task_id], |row| row.get(0)).unwrap();
+        assert_eq!(harnesses, "opencode", "watchdog must not rewrite ownership");
+    });
+}
+
+#[test]
+fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let ready = project.path().join("foreign.ready");
+        let stop = project.path().join("foreign.stop");
+        let _release = ReleaseOnDrop::new(stop.clone());
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route_as(&mut stream, project.path(), ROUTE_CHANNEL, "runner").await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            20,
+            "bash",
+            json!({
+                "command": sentinel_command(&ready, &stop), "background": true,
+                "timeout": 60_000, "compressed": false,
+            }),
+        )
+        .await;
+        let launch = read_tool_response(&mut stream, 20, "runner launch").await;
+        let task_id = extract_task_id(&launch);
+        wait_for_path(&ready, "runner task ready");
+        let running = bash_status(&mut stream, 21, &task_id).await;
+        let stdout = running["output_path"].as_str().unwrap();
+        let stderr = running["stderr_path"].as_str().unwrap();
+        send_module_draining(&mut stream).await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("runner module").success());
+        drop(stream);
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            30,
+            "bash_status",
+            json!({ "task_id": task_id }),
+        )
+        .await;
+        let refused = read_tool_response(&mut stream, 30, "foreign task refusal").await;
+        assert!(
+            tool_result_is_error(&refused),
+            "must not adopt a foreign namespace"
+        );
+        let text = frame_body(&refused);
+        assert!(
+            text.contains("could not be adopted") && text.contains(stdout) && text.contains(stderr),
+            "{text}"
+        );
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            40,
+            "bash_notify",
+            json!({ "task_id": task_id, "pattern": "sentinel-stopped" }),
+        )
+        .await;
+        let refused_watch =
+            read_tool_response(&mut stream, 40, "foreign async watch refusal").await;
+        let text = frame_body(&refused_watch);
+        assert!(
+            tool_result_is_error(&refused_watch)
+                && text.contains("could not be adopted")
+                && text.contains(stdout)
+                && text.contains(stderr),
+            "{text}"
+        );
+        assert_process_alive(
+            running["child_pid"].as_u64().unwrap() as u32,
+            "unadopted child",
+        );
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("refusal module").success());
+        drop(stream);
+        // Returning to the owning namespace restores normal process control.
+        let mut third = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route_as(&mut stream, project.path(), ROUTE_CHANNEL, "runner").await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            31,
+            "bash_kill",
+            json!({ "task_id": task_id }),
+        )
+        .await;
+        let killed = read_tool_response(&mut stream, 31, "rehydrated kill").await;
+        assert!(!tool_result_is_error(&killed), "{}", frame_body(&killed));
+        wait_for_status(&mut stream, 32, &task_id, "killed").await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(third.wait_for_exit("owning module").success());
+    });
+}
+
 /// The supervisor respawns a module only on a non-zero exit; exit 0 means
 /// "stopped on request" and leaves the module down with no respawn. So the
 /// two ways a daemon connection can end must map to different exit codes:
@@ -440,6 +613,10 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
 }
 
 async fn bind_route(stream: &mut TcpStream, root: &Path) {
+    bind_route_as(stream, root, ROUTE_CHANNEL, "opencode").await;
+}
+
+async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harness: &str) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -455,14 +632,14 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
     .expect("write project config");
 
     let request = ModuleControlRequest::RouteBind {
-        route_channel: ROUTE_CHANNEL,
+        route_channel: channel,
         epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
         identity: BindIdentity::new(
             root.to_path_buf(),
-            "opencode".to_string(),
+            harness.to_string(),
             SESSION_ID.to_string(),
         ),
         principal: Some(Principal::Direct),

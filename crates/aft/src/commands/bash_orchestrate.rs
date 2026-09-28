@@ -156,7 +156,7 @@ pub fn build_bash_outcome(
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
     let block_to_completion = params.block_to_completion || params.wait;
     let timeout = params.timeout;
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
@@ -333,14 +333,28 @@ pub(crate) fn detach_bash_for_module_drain(
     request_id: &str,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => Response::success(
-            request_id,
-            json!({
-                "output": format_module_drain_detach_message(task_id),
-                "task_id": task_id,
-                "status": "running",
-            }),
-        ),
+        Ok(_) => {
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(task_id, session_id, 0);
+            let output_path = snapshot
+                .as_ref()
+                .and_then(|task| task.output_path.as_deref());
+            let stderr_path = snapshot
+                .as_ref()
+                .and_then(|task| task.stderr_path.as_deref());
+            crate::slog_info!("bash drain detach persisted: task_id={task_id} output={output_path:?} stderr={stderr_path:?}");
+            Response::success(
+                request_id,
+                json!({
+                    "output": format!("{}\nOutput: {}", format_module_drain_detach_message(task_id), output_path.unwrap_or("unavailable")),
+                    "task_id": task_id,
+                    "status": "running",
+                    "output_path": output_path,
+                    "stderr_path": stderr_path,
+                }),
+            )
+        }
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",

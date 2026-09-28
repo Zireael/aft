@@ -483,9 +483,12 @@ pub(super) fn submit_deferred_bash(
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args),
                 };
-                let response =
+                let (response, storage_dir) =
                     crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
-                        dispatch(raw_req, ctx)
+                        (
+                            dispatch(raw_req, ctx),
+                            crate::bash_background::task_storage_dir(ctx),
+                        )
                     });
                 if !response.success {
                     return finish_bash_spawn_immediate(
@@ -554,8 +557,6 @@ pub(super) fn submit_deferred_bash(
                         settings.wait,
                     );
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-                let storage_dir =
-                    crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
                 let project_root = ctx.config().project_root.clone();
                 // Register the session as detachable exactly like the
                 // standalone path (bash_orchestrate) does: without this, a

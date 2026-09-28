@@ -1240,12 +1240,13 @@ impl BgTaskRegistry {
         let Some(pool) = pool else {
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata.harness.clone().or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "dual-write bash_task to DB skipped for {}: harness not configured",
@@ -1920,6 +1921,13 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
         // bash/zsh PIPESTATUS and a dedicated inherited fd, neither of which
         // exists on the Windows spawn path.
@@ -2140,6 +2148,13 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -2301,6 +2316,13 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -3560,6 +3582,29 @@ impl BgTaskRegistry {
         validate_task_id(task_id).ok()?;
         let task = self.task_for_session(task_id, session_id)?;
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
+    }
+
+    /// Explain failed adoption without importing a task from another namespace.
+    pub(crate) fn unadopted_task_message(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Option<String> {
+        validate_task_id(task_id).ok()?;
+        let pool = self.inner.db_pool.read().ok()?.clone()?;
+        let conn = pool.lock().ok()?;
+        let project_key = crate::path_identity::project_scope_key(project_root);
+        conn.query_row(
+            "SELECT harness, stdout_path, stderr_path FROM bash_tasks WHERE task_id = ?1 AND session_id = ?2 AND project_key = ?3 ORDER BY started_at DESC LIMIT 1",
+            rusqlite::params![task_id, session_id, project_key],
+            |row| {
+                let harness: String = row.get(0)?;
+                let stdout: Option<String> = row.get(1)?;
+                let stderr: Option<String> = row.get(2)?;
+                Ok(format!("background task could not be adopted: {task_id} (persisted namespace: {harness}). Output: {}. Stderr: {}. The task has not been adopted or signaled; inspect these files before rerunning the command.", stdout.as_deref().unwrap_or("unavailable"), stderr.as_deref().unwrap_or("unavailable")))
+            },
+        ).ok()
     }
 
     pub fn status(

@@ -67,7 +67,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = crate::bash_background::task_storage_dir(ctx);
     if ctx.bash_background().has_erased_watch_reference(&task_id) {
         return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
     }
@@ -160,11 +160,20 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 Response::success(&req.id, data)
             }
         }
-        None => Response::error(
-            &req.id,
-            "task_not_found",
-            format_unknown_task_message(&task_id),
-        ),
+        None => {
+            let unadopted = ctx.config().project_root.as_deref().and_then(|root| {
+                ctx.bash_background()
+                    .unadopted_task_message(&task_id, req.session(), root)
+            });
+            match unadopted {
+                Some(message) => Response::error(&req.id, "task_not_adopted", message),
+                None => Response::error(
+                    &req.id,
+                    "task_not_found",
+                    format_unknown_task_message(&task_id),
+                ),
+            }
+        }
     }
 }
 

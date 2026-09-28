@@ -409,11 +409,22 @@ pub fn spawn(
     }
 }
 
+// A root context is shared by routes from different harnesses. Determine a
+// command's owner from its route binding, not the last harness to configure the root.
+pub(crate) fn route_harness() -> Option<crate::harness::Harness> {
+    match current_authenticated_principal() {
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { harness, .. } => {
+            harness.parse().ok()
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
     let config = ctx.config();
     let root = storage_dir(config.storage_dir.as_deref());
-    config
-        .harness
+    route_harness()
+        .or_else(|| config.harness.clone())
         .as_ref()
         .map(|harness| root.join(harness.storage_segment()))
         .unwrap_or(root)
