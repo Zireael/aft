@@ -130,7 +130,7 @@ fn aft_delete_then_recreate_labels_previous_file_and_undo_walks_the_timeline() {
             undo.get("warning").is_none(),
             "unexpected warning: {undo:?}"
         );
-        assert!(undo.get("preserved_external_change").is_none(), "{undo:?}");
+        assert!(undo.get("external_change_checkpoint").is_none(), "{undo:?}");
         states.push(read(&file));
     }
     let expected = [
@@ -175,7 +175,7 @@ fn rm_then_recreate_labels_previous_file() {
     assert_eq!(read(&file), None);
     // The path is empty, so restoring the previous file's content loses nothing.
     let undo = undo_file(&mut aft, &file);
-    assert!(undo.get("preserved_external_change").is_none(), "{undo:?}");
+    assert!(undo.get("external_change_checkpoint").is_none(), "{undo:?}");
     assert_eq!(read(&file).as_deref(), Some("A1\n"));
     assert!(aft.shutdown().success());
 }
@@ -221,8 +221,38 @@ fn rename_over_file_with_history(aft: &mut AftProcess, dir: &Path) -> std::path:
     file
 }
 
+/// Restore a checkpoint by name, as `aft_safety restore name=<name>` does.
+fn restore_checkpoint(aft: &mut AftProcess, name: &str) {
+    let response = send(
+        aft,
+        json!({"id": "restore", "command": "restore_checkpoint", "name": name}),
+    );
+    assert_eq!(
+        response["success"], true,
+        "restore_checkpoint: {response:?}"
+    );
+}
+
+/// The checkpoint an undo reply names, checked against the reply's warning.
+fn external_change_checkpoint(reply: &Value, checkpoint_field: &Value, warning: &str) -> String {
+    let name = checkpoint_field
+        .as_str()
+        .unwrap_or_else(|| panic!("the external change was not saved: {reply:?}"))
+        .to_string();
+    assert!(
+        name.starts_with("external-change-a.txt-"),
+        "unexpected checkpoint name {name}"
+    );
+    assert!(
+        warning.contains(&format!("checkpoint '{name}'"))
+            && warning.contains(&format!("aft_safety restore name={name}")),
+        "warning must name the checkpoint and how to restore it: {reply:?}"
+    );
+    name
+}
+
 #[test]
-fn rename_over_file_undo_preserves_the_new_file_and_undo_again_restores_it() {
+fn rename_over_file_undo_saves_the_new_file_as_checkpoint_and_keeps_walking_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
     let file = rename_over_file_with_history(&mut aft, dir.path());
@@ -239,38 +269,45 @@ fn rename_over_file_undo_preserves_the_new_file_and_undo_again_restores_it() {
     assert_eq!(read(&file).as_deref(), Some("B0\n"));
 
     // The next entry was A's last edit, but the path now holds B0, which AFT
-    // never wrote there. Undo restores A1 only after saving B0.
+    // never wrote there. Undo saves B0 as a checkpoint, then restores A1.
     let second = undo_file(&mut aft, &file);
     assert_eq!(read(&file).as_deref(), Some("A1\n"));
-    let preserved = second["preserved_external_change"]
-        .as_str()
-        .unwrap_or_else(|| panic!("B0 was not preserved: {second:?}"))
-        .to_string();
-    assert!(
-        second["warning"]
-            .as_str()
-            .is_some_and(|warning| warning.contains(&preserved)),
-        "{second:?}"
+    let checkpoint = external_change_checkpoint(
+        &second,
+        &second["external_change_checkpoint"],
+        second["warning"].as_str().unwrap_or_default(),
     );
     let entries = history(&mut aft, &file);
-    assert_eq!(entries[0]["backup_id"], preserved.as_str(), "{entries:#?}");
+    assert_eq!(
+        entries[0]["external_change_checkpoint"],
+        checkpoint.as_str(),
+        "history marks where the external change was saved: {entries:#?}"
+    );
     assert!(
-        markers(&entries[0]).contains(&"captured_before_undo"),
+        markers(&entries[0]).contains(&"external_change_checkpoint"),
         "{entries:#?}"
     );
 
+    // The saved content is not an undo step: repeated undo keeps walking back
+    // through AFT's own history to the start, never returning B0.
     let third = undo_file(&mut aft, &file);
-    assert_eq!(third["backup_id"], preserved.as_str(), "{third:?}");
+    assert!(third.get("warning").is_none(), "{third:?}");
+    assert_eq!(read(&file).as_deref(), Some("A0\n"));
+    let fourth = undo_file(&mut aft, &file);
+    assert!(fourth.get("warning").is_none(), "{fourth:?}");
+    assert_eq!(read(&file), None, "undoing the creation removes the file");
+
+    restore_checkpoint(&mut aft, &checkpoint);
     assert_eq!(
         read(&file).as_deref(),
         Some("B0\n"),
-        "B0 must be recoverable"
+        "B0 must be recoverable from the checkpoint"
     );
     assert!(aft.shutdown().success());
 }
 
 #[test]
-fn rename_over_file_operation_undo_preserves_the_new_file() {
+fn rename_over_file_operation_undo_saves_the_new_file_and_keeps_walking_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
     let file = rename_over_file_with_history(&mut aft, dir.path());
@@ -279,21 +316,33 @@ fn rename_over_file_operation_undo_preserves_the_new_file() {
     assert_eq!(read(&file).as_deref(), Some("B0\n"));
     let second = undo_operation(&mut aft);
     assert_eq!(read(&file).as_deref(), Some("A1\n"));
-    assert!(
-        second["restored"][0]["preserved_external_change"].is_string(),
-        "{second:?}"
+    let warnings = second["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{second:?}");
+    let checkpoint = external_change_checkpoint(
+        &second,
+        &second["external_change_checkpoint"],
+        warnings[0].as_str().unwrap(),
     );
     assert_eq!(
-        second["warnings"].as_array().unwrap().len(),
-        1,
+        second["restored"][0]["external_change_checkpoint"],
+        checkpoint.as_str(),
         "{second:?}"
     );
 
+    let third = undo_operation(&mut aft);
+    assert!(
+        third.get("external_change_checkpoint").is_none(),
+        "{third:?}"
+    );
+    assert_eq!(read(&file).as_deref(), Some("A0\n"));
     undo_operation(&mut aft);
+    assert_eq!(read(&file), None);
+
+    restore_checkpoint(&mut aft, &checkpoint);
     assert_eq!(
         read(&file).as_deref(),
         Some("B0\n"),
-        "B0 must be recoverable"
+        "B0 must be recoverable from the checkpoint"
     );
     assert!(aft.shutdown().success());
 }
@@ -316,14 +365,14 @@ fn editor_atomic_save_with_unchanged_content_undoes_normally() {
 
     let undo = undo_file(&mut aft, &file);
     assert!(undo.get("warning").is_none(), "{undo:?}");
-    assert!(undo.get("preserved_external_change").is_none(), "{undo:?}");
+    assert!(undo.get("external_change_checkpoint").is_none(), "{undo:?}");
     assert_eq!(read(&file).as_deref(), Some("A1\n"));
     assert_eq!(history(&mut aft, &file).len(), 2);
     assert!(aft.shutdown().success());
 }
 
 #[test]
-fn editor_atomic_save_with_new_content_is_preserved_before_undo() {
+fn editor_atomic_save_with_new_content_is_saved_before_undo() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
@@ -331,9 +380,15 @@ fn editor_atomic_save_with_new_content_is_preserved_before_undo() {
     editor_atomic_save(&file, "A2 plus editor work\n");
 
     let undo = undo_file(&mut aft, &file);
-    assert!(undo["preserved_external_change"].is_string(), "{undo:?}");
+    let checkpoint = external_change_checkpoint(
+        &undo,
+        &undo["external_change_checkpoint"],
+        undo["warning"].as_str().unwrap_or_default(),
+    );
     assert_eq!(read(&file).as_deref(), Some("A1\n"));
     undo_file(&mut aft, &file);
+    assert_eq!(read(&file).as_deref(), Some("A0\n"));
+    restore_checkpoint(&mut aft, &checkpoint);
     assert_eq!(read(&file).as_deref(), Some("A2 plus editor work\n"));
     assert!(aft.shutdown().success());
 }
@@ -351,8 +406,38 @@ fn undoing_aft_own_edits_reports_no_external_change() {
             undo.get("warning").is_none(),
             "undo of AFT's own edit must not claim an external change: {undo:?}"
         );
-        assert!(undo.get("preserved_external_change").is_none(), "{undo:?}");
+        assert!(undo.get("external_change_checkpoint").is_none(), "{undo:?}");
         assert_eq!(read(&file).as_deref(), expected);
     }
     assert!(aft.shutdown().success());
+}
+
+/// Only file contents are checked, so this holds whatever the reply looks
+/// like: after the path was changed outside AFT, repeated undo must step back
+/// through every AFT change to the file's start and never return to the
+/// externally written content.
+#[test]
+fn repeated_undo_past_an_external_change_reaches_the_oldest_state() {
+    for operation_undo in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut aft = AftProcess::spawn();
+        let file = rename_over_file_with_history(&mut aft, dir.path());
+
+        let mut states = Vec::new();
+        for _ in 0..4 {
+            if operation_undo {
+                undo_operation(&mut aft);
+            } else {
+                undo_file(&mut aft, &file);
+            }
+            states.push(read(&file));
+        }
+        let expected = [Some("B0\n"), Some("A1\n"), Some("A0\n"), None];
+        assert_eq!(
+            states,
+            expected.map(|state| state.map(str::to_string)).to_vec(),
+            "operation_undo={operation_undo}"
+        );
+        assert!(aft.shutdown().success());
+    }
 }

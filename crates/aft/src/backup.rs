@@ -115,7 +115,7 @@ pub struct BackupEntry {
     /// What AFT left at the path once the mutation this entry backs up had
     /// finished. Undo compares it with the live path: a mismatch means the file
     /// changed outside AFT (an editor save, `mv` over it, `rm` plus recreate),
-    /// so the live content is preserved as its own entry before restoring.
+    /// so the live content is saved to a checkpoint before restoring.
     /// `None` for entries written before this was recorded; those undo exactly
     /// as they always did.
     pub post_state: Option<PathFingerprint>,
@@ -123,9 +123,10 @@ pub struct BackupEntry {
     /// after the previous entry's mutation: something outside AFT changed,
     /// replaced, or recreated the file in between.
     pub external_change_before: bool,
-    /// True for entries that undo itself created to preserve content that had
-    /// changed outside AFT before it was overwritten by the restore.
-    pub undo_capture: bool,
+    /// Set on the entry an undo stopped at after it found the path changed
+    /// outside AFT: names the checkpoint that preserved that content before
+    /// the undo overwrote it (restore it with `aft_safety restore`).
+    pub external_change_checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,9 +441,9 @@ impl TryFrom<BackupRow> for BackupEntry {
             external_change_before: restore_metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.external_change_before),
-            undo_capture: restore_metadata
+            external_change_checkpoint: restore_metadata
                 .as_ref()
-                .is_some_and(|metadata| metadata.undo_capture),
+                .and_then(|metadata| metadata.external_change_checkpoint.clone()),
             created_dirs: restore_metadata
                 .map(|metadata| metadata.created_dirs)
                 .unwrap_or_default(),
@@ -455,15 +456,18 @@ pub struct RestoredOperation {
     pub op_id: String,
     pub restored: Vec<RestoredFile>,
     pub warnings: Vec<String>,
+    /// Checkpoint holding every file of the operation that had changed outside
+    /// AFT, saved before the undo overwrote them.
+    pub external_change_checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RestoredFile {
     pub path: PathBuf,
     pub backup_id: String,
-    /// Backup id under which content changed outside AFT was saved before the
-    /// restore overwrote it; undoing again brings it back.
-    pub preserved_external_change: Option<String>,
+    /// Checkpoint that saved this file's content changed outside AFT before
+    /// the restore overwrote it.
+    pub external_change_checkpoint: Option<String>,
 }
 
 /// Result of undoing the newest backup of one file.
@@ -471,19 +475,37 @@ pub struct RestoredFile {
 pub struct RestoredLatest {
     pub entry: BackupEntry,
     pub warning: Option<String>,
-    /// Backup id under which content changed outside AFT was saved before the
-    /// restore overwrote it. Undoing the same file again brings it back.
-    pub preserved_external_change: Option<String>,
+    /// Checkpoint that saved the file's content changed outside AFT before
+    /// the restore overwrote it.
+    pub external_change_checkpoint: Option<String>,
 }
 
-/// Description of the entry undo records when it preserves content that
-/// changed outside AFT.
-pub const UNDO_CAPTURE_DESCRIPTION: &str = "external change captured before undo";
+/// Saves the current content of the given paths somewhere outside the undo
+/// stack (the caller's checkpoint store) and returns the checkpoint name.
+/// Undo calls it before overwriting content that changed outside AFT, so
+/// that content survives without becoming the next undo step.
+pub type ExternalChangeSaver<'a> = dyn FnMut(&[PathBuf]) -> Result<String, AftError> + 'a;
 
-fn external_change_warning(preserved_backup_id: &str) -> String {
+/// Saver for callers with no checkpoint store: refuses, so undo never
+/// overwrites content it cannot preserve.
+fn refuse_external_change(paths: &[PathBuf]) -> Result<String, AftError> {
+    Err(AftError::InvalidRequest {
+        message: format!(
+            "undo refused: {} changed outside AFT since AFT last wrote it and no \
+             checkpoint store is available to preserve it",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+pub fn external_change_warning(checkpoint: &str) -> String {
     format!(
-        "file had changed outside AFT since AFT last wrote it; that content was saved as \
-         backup {preserved_backup_id} before this undo overwrote it — undo again to bring it back"
+        "The file had changed outside AFT; its content was saved as checkpoint '{checkpoint}' \
+         (aft_safety restore name={checkpoint}) before undoing."
     )
 }
 
@@ -917,7 +939,7 @@ impl BackupStore {
             created_dirs,
             post_state: None,
             external_change_before: false,
-            undo_capture: false,
+            external_change_checkpoint: None,
         };
 
         self.persist_new_entry_locked(session, &key, entry)?;
@@ -929,6 +951,17 @@ impl BackupStore {
     /// Restore every top-of-stack backup entry belonging to the most recent
     /// operation in this session.
     pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
+        self.restore_last_operation_preserving(session, &mut refuse_external_change)
+    }
+
+    /// Like [`Self::restore_last_operation`]; files that changed outside AFT
+    /// are first handed to `save_external` together, so one checkpoint holds
+    /// all of them before any is overwritten.
+    pub fn restore_last_operation_preserving(
+        &mut self,
+        session: &str,
+        save_external: &mut ExternalChangeSaver<'_>,
+    ) -> Result<RestoredOperation, AftError> {
         self.run_process_maintenance_once();
         let mut candidate_keys = self.restore_operation_candidate_keys(session)?;
         if candidate_keys.is_empty() {
@@ -999,7 +1032,7 @@ impl BackupStore {
                         path: key.display().to_string(),
                     })?;
                 if needs_capture_before_undo(&entry, key) {
-                    capture_targets.push((key.clone(), entry.clone()));
+                    capture_targets.push(key.clone());
                 }
                 match entry.kind {
                     BackupEntryKind::Content | BackupEntryKind::Symlink => {
@@ -1014,21 +1047,17 @@ impl BackupStore {
             }
 
             // Preserve content changed outside AFT before anything is
-            // overwritten. All captures share one operation id, so a single
-            // later operation undo restores all of them together.
-            let capture_op_id = new_op_id();
-            let mut preserved: HashMap<PathBuf, String> = HashMap::new();
-            for (key, entry) in &capture_targets {
-                match self.capture_before_undo_locked(session, key, key, entry, &capture_op_id) {
-                    Ok(id) => {
-                        preserved.insert(key.clone(), id);
-                    }
-                    Err(error) => {
-                        self.discard_undo_captures_locked(session, &preserved);
-                        return Err(error);
-                    }
+            // overwritten: one checkpoint covers every such file of the
+            // operation. It stays out of the undo stacks, so later undos keep
+            // walking back through AFT's own history.
+            let external_change_checkpoint = if capture_targets.is_empty() {
+                None
+            } else {
+                for key in &capture_targets {
+                    self.ensure_preservable(key)?;
                 }
-            }
+                Some(save_external(&capture_targets)?)
+            };
 
             let mut created_dirs = Vec::new();
             for (key, _, _) in &content_targets {
@@ -1039,7 +1068,6 @@ impl BackupStore {
                             let mut dirs_to_remove = created_dirs;
                             dirs_to_remove.extend(missing_dirs);
                             let rollback_ok = rollback_created_dirs(&dirs_to_remove);
-                            self.discard_undo_captures_locked(session, &preserved);
                             return Err(AftError::IoError {
                                 path: parent.display().to_string(),
                                 message: format!(
@@ -1062,11 +1090,6 @@ impl BackupStore {
                         rollback_transactional_restore(&written, Some((key, existing_state)));
                     let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
                     let rollback_ok = files_rollback_ok && dirs_rollback_ok;
-                    // Captures become redundant only once every file is back
-                    // to what it held; otherwise they are the surviving copy.
-                    if files_rollback_ok {
-                        self.discard_undo_captures_locked(session, &preserved);
-                    }
                     return Err(AftError::IoError {
                         path: key.display().to_string(),
                         message: format!(
@@ -1091,9 +1114,6 @@ impl BackupStore {
                         let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
                         let rollback_ok =
                             files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
-                        if files_rollback_ok && tombstone_rollback_ok {
-                            self.discard_undo_captures_locked(session, &preserved);
-                        }
                         return Err(AftError::IoError {
                             path: key.display().to_string(),
                             message: format!(
@@ -1127,20 +1147,29 @@ impl BackupStore {
                     )
                 })
                 .collect::<Vec<_>>();
+            if let Some(checkpoint) = &external_change_checkpoint {
+                warnings.push(format!(
+                    "{}: {}",
+                    capture_targets
+                        .iter()
+                        .map(|key| key.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    external_change_warning(checkpoint)
+                ));
+            }
             for (key, entry, _) in content_targets.into_iter().chain(tombstone_targets) {
                 self.commit_restored_backup_locked(session, &key, &entry.backup_id)?;
-                let preserved_external_change = preserved.remove(&key);
-                if let Some(preserved_id) = &preserved_external_change {
-                    warnings.push(format!(
-                        "{}: {}",
-                        key.display(),
-                        external_change_warning(preserved_id)
-                    ));
+                let file_checkpoint = external_change_checkpoint
+                    .clone()
+                    .filter(|_| capture_targets.contains(&key));
+                if let Some(checkpoint) = &file_checkpoint {
+                    self.mark_external_change_checkpoint_locked(session, &key, checkpoint)?;
                 }
                 restored.push(RestoredFile {
                     path: key,
                     backup_id: entry.backup_id,
-                    preserved_external_change,
+                    external_change_checkpoint: file_checkpoint,
                 });
             }
             if let Some(skips) = self.skipped_backups.get_mut(session) {
@@ -1156,6 +1185,7 @@ impl BackupStore {
                 op_id,
                 restored,
                 warnings,
+                external_change_checkpoint,
             });
         }
 
@@ -1172,16 +1202,18 @@ impl BackupStore {
         session: &str,
         path: &Path,
     ) -> Result<(BackupEntry, Option<String>), AftError> {
-        self.restore_latest_detailed(session, path)
+        self.restore_latest_detailed(session, path, &mut refuse_external_change)
             .map(|restored| (restored.entry, restored.warning))
     }
 
-    /// Like [`Self::restore_latest`], also reporting whether content changed
-    /// outside AFT had to be preserved before the restore.
+    /// Like [`Self::restore_latest`]. If the file changed outside AFT since
+    /// AFT last wrote it, `save_external` preserves it (as a checkpoint)
+    /// before the restore, and the result names that checkpoint.
     pub fn restore_latest_detailed(
         &mut self,
         session: &str,
         path: &Path,
+        save_external: &mut ExternalChangeSaver<'_>,
     ) -> Result<RestoredLatest, AftError> {
         self.run_process_maintenance_once();
         let key = canonicalize_key(path);
@@ -1248,7 +1280,8 @@ impl BackupStore {
             .and_then(|s| s.get(&key))
             .map_or(false, |s| !s.is_empty());
         if in_memory {
-            let result = self.restore_top_preserving_external_change(session, &key, path);
+            let result =
+                self.restore_top_preserving_external_change(session, &key, path, save_external);
             if result.is_ok() {
                 self.touch_session(session);
             }
@@ -1261,13 +1294,15 @@ impl BackupStore {
     }
 
     /// Undo the newest backup of `path`. Content the file gained outside AFT
-    /// since AFT last wrote it is saved as a new newest entry first, so the
-    /// restore never destroys it and undoing the file again brings it back.
+    /// since AFT last wrote it is first handed to `save_external` (a
+    /// checkpoint), so the restore never destroys it, and it does not become
+    /// an undo step: repeated undo keeps walking back through AFT's history.
     fn restore_top_preserving_external_change(
         &mut self,
         session: &str,
         key: &Path,
         path: &Path,
+        save_external: &mut ExternalChangeSaver<'_>,
     ) -> Result<RestoredLatest, AftError> {
         let top = self
             .entries
@@ -1279,85 +1314,81 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
-        if !needs_capture_before_undo(&top, path) {
-            let (entry, _) = self.do_restore_locked(session, key, path)?;
-            return Ok(RestoredLatest {
-                entry,
-                warning: None,
-                preserved_external_change: None,
-            });
-        }
+        let checkpoint = if needs_capture_before_undo(&top, path) {
+            self.ensure_preservable(path)?;
+            Some(save_external(&[key.to_path_buf()])?)
+        } else {
+            None
+        };
 
-        let preserved = self.capture_before_undo_locked(session, key, path, &top, &new_op_id())?;
-        // A failed restore keeps the capture: the live file may already be
-        // partly overwritten, and the capture is then its only copy.
-        restore_entry_to_path(path, &top).map_err(|error| AftError::IoError {
-            path: path.display().to_string(),
-            message: format!(
-                "{error}; the content found at the path was saved as backup {preserved}"
-            ),
-        })?;
-        if top.kind == BackupEntryKind::Tombstone {
-            remove_created_dirs_best_effort(&top.created_dirs);
+        let (entry, _) = self
+            .do_restore_locked(session, key, path)
+            .map_err(|error| match (&checkpoint, error) {
+                (Some(name), AftError::IoError { path, message }) => AftError::IoError {
+                    path,
+                    message: format!(
+                        "{message}; the content found at the path was saved as checkpoint '{name}'"
+                    ),
+                },
+                (_, error) => error,
+            })?;
+        if let Some(name) = &checkpoint {
+            self.mark_external_change_checkpoint_locked(session, key, name)?;
         }
-        self.commit_restored_backup_locked(session, key, &top.backup_id)?;
         Ok(RestoredLatest {
-            warning: Some(external_change_warning(&preserved)),
-            entry: top,
-            preserved_external_change: Some(preserved),
+            warning: checkpoint.as_deref().map(external_change_warning),
+            entry,
+            external_change_checkpoint: checkpoint,
         })
     }
 
-    /// Save what is at `path` now as the newest entry of its stack, ahead of an
-    /// undo that restores `restores` over it. Returns the new backup id.
-    fn capture_before_undo_locked(
-        &mut self,
-        session: &str,
-        key: &Path,
-        path: &Path,
-        restores: &BackupEntry,
-        op_id: &str,
-    ) -> Result<String, AftError> {
-        if let SnapshotDecision::Skip(reason) = self.should_snapshot_path(path, false)? {
-            return Err(AftError::InvalidRequest {
+    /// Refuse an undo whose overwritten content could not be preserved under
+    /// the backup policy (for example a file over the size cap).
+    fn ensure_preservable(&self, path: &Path) -> Result<(), AftError> {
+        match self.should_snapshot_path(path, false)? {
+            SnapshotDecision::Capture => Ok(()),
+            SnapshotDecision::Skip(reason) => Err(AftError::InvalidRequest {
                 message: format!(
                     "undo refused: {} changed outside AFT since AFT last wrote it, and that \
-                     content cannot be backed up before the restore ({}); copy it elsewhere \
+                     content cannot be preserved before the restore ({}); copy it elsewhere \
                      and retry",
                     path.display(),
                     reason.as_str()
                 ),
-            });
+            }),
         }
-        let (id, order) = self.next_id_and_order();
-        let mut capture = backup_entry_from_path(
-            path,
-            id.clone(),
-            order,
-            UNDO_CAPTURE_DESCRIPTION,
-            Some(op_id),
-        )?;
-        capture.undo_capture = true;
-        // After this undo the path holds what `restores` describes, so undoing
-        // the capture later is itself checked against that.
-        capture.post_state = Some(PathFingerprint::of_entry(restores));
-        self.persist_new_entry_locked(session, key, capture)?;
-        Ok(id)
     }
 
-    /// Remove captures made for an undo that was then rolled back, leaving
-    /// each file's content and stack as they were before the attempt.
-    fn discard_undo_captures_locked(&mut self, session: &str, captures: &HashMap<PathBuf, String>) {
-        for (key, backup_id) in captures {
-            if let Err(error) = self.commit_restored_backup_locked(session, key, backup_id) {
-                crate::slog_warn!(
-                    "backup capture {} for {} kept after rolled-back undo: {}",
-                    backup_id,
-                    key.display(),
-                    error
-                );
-            }
-        }
+    /// Record on the entry an undo stopped at (now the newest of its stack)
+    /// which checkpoint preserved the external change the undo overwrote, so
+    /// `edit_history` can show it at that point.
+    fn mark_external_change_checkpoint_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        checkpoint: &str,
+    ) -> Result<(), AftError> {
+        let Some(mut stack) = self
+            .entries
+            .get_mut(session)
+            .and_then(|files| files.remove(key))
+        else {
+            return Ok(());
+        };
+        let Some(top) = stack.last_mut() else {
+            return Ok(());
+        };
+        top.external_change_checkpoint = Some(checkpoint.to_string());
+        let result = self.write_appended_snapshot_to_disk_locked(
+            session,
+            key,
+            &stack,
+            &[],
+            None,
+            stack.last(),
+        );
+        self.restore_in_memory_stack(session, key, Some(stack));
+        result
     }
 
     /// Return the backup history for `(session, path)` (oldest first).
@@ -3761,7 +3792,7 @@ struct BackupEntryDiskMetadata {
     created_dirs: Vec<PathBuf>,
     post_state: Option<PathFingerprint>,
     external_change_before: bool,
-    undo_capture: bool,
+    external_change_checkpoint: Option<String>,
 }
 
 fn restore_metadata_json(entry: &BackupEntry) -> String {
@@ -3776,7 +3807,7 @@ fn restore_metadata_json(entry: &BackupEntry) -> String {
             .collect::<Vec<_>>(),
         "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
         "external_change_before": entry.external_change_before,
-        "undo_capture": entry.undo_capture,
+        "external_change_checkpoint": entry.external_change_checkpoint,
     })
     .to_string()
 }
@@ -3834,7 +3865,7 @@ fn restore_metadata_fields(value: &serde_json::Value) -> BackupEntryDiskMetadata
             .unwrap_or_default(),
         post_state: post_state_from_meta(value),
         external_change_before: meta_flag(value, "external_change_before"),
-        undo_capture: meta_flag(value, "undo_capture"),
+        external_change_checkpoint: meta_string(value, "external_change_checkpoint"),
     }
 }
 
@@ -3916,7 +3947,7 @@ fn backup_entry_from_path(
         created_dirs: Vec::new(),
         post_state: None,
         external_change_before: false,
-        undo_capture: false,
+        external_change_checkpoint: None,
     })
 }
 
@@ -3941,7 +3972,7 @@ fn backup_entry_from_capture(
         created_dirs: Vec::new(),
         post_state: None,
         external_change_before: false,
-        undo_capture: false,
+        external_change_checkpoint: None,
     }
 }
 
@@ -4434,7 +4465,8 @@ fn entry_from_meta(
         post_state: entry_meta.and_then(post_state_from_meta),
         external_change_before: entry_meta
             .is_some_and(|meta| meta_flag(meta, "external_change_before")),
-        undo_capture: entry_meta.is_some_and(|meta| meta_flag(meta, "undo_capture")),
+        external_change_checkpoint: entry_meta
+            .and_then(|meta| meta_string(meta, "external_change_checkpoint")),
     }
 }
 
@@ -4448,6 +4480,12 @@ fn meta_flag(meta: &serde_json::Value, name: &str) -> bool {
     meta.get(name)
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn meta_string(meta: &serde_json::Value, name: &str) -> Option<String> {
+    meta.get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn legacy_entry_from_meta(
@@ -4538,7 +4576,7 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "post_state": entry.post_state.as_ref().map(PathFingerprint::to_meta_string),
         "external_change_before": entry.external_change_before,
-        "undo_capture": entry.undo_capture,
+        "external_change_checkpoint": entry.external_change_checkpoint,
     })
 }
 
@@ -4989,7 +5027,7 @@ mod tests {
             created_dirs: Vec::new(),
             post_state: None,
             external_change_before: false,
-            undo_capture: false,
+            external_change_checkpoint: None,
         }
     }
 
@@ -5014,7 +5052,7 @@ mod tests {
         entry.created_dirs = vec![PathBuf::from("/project/new"), PathBuf::from("/project")];
         entry.post_state = Some(PathFingerprint::Symlink(PathBuf::from("../elsewhere")));
         entry.external_change_before = true;
-        entry.undo_capture = true;
+        entry.external_change_checkpoint = Some("external-change-a.txt-1".to_string());
 
         crate::db::backups::insert_backup(&conn, &backup_row_for_db(&entry, &context)).unwrap();
         let row = db_mirror_rows(&conn).pop().unwrap();
@@ -5032,7 +5070,7 @@ mod tests {
                 created_dirs: entry.created_dirs,
                 post_state: entry.post_state,
                 external_change_before: true,
-                undo_capture: true,
+                external_change_checkpoint: Some("external-change-a.txt-1".to_string()),
             }
         );
     }
@@ -5400,24 +5438,49 @@ mod tests {
         let mut store2 = BackupStore::new();
         store2.set_storage_dir(dir.clone(), 72);
 
+        let mut saved = SavedExternal::default();
         let restored = store2
-            .restore_latest_detailed(DEFAULT_SESSION_ID, &file_path)
+            .restore_latest_detailed(DEFAULT_SESSION_ID, &file_path, &mut saved.saver())
             .unwrap();
         assert_eq!(restored.entry.content, "original");
         assert!(restored.warning.is_some()); // modified externally
-        assert!(restored.preserved_external_change.is_some());
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
-
-        let (entry, _) = store2
-            .restore_latest(DEFAULT_SESSION_ID, &file_path)
-            .unwrap();
-        assert_eq!(entry.content, "externally modified");
         assert_eq!(
-            fs::read_to_string(&file_path).unwrap(),
-            "externally modified"
+            restored.external_change_checkpoint.as_deref(),
+            Some("saved-0")
+        );
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
+        assert_eq!(
+            saved.calls,
+            vec![vec![(
+                canonicalize_key(&file_path),
+                Some("externally modified".to_string())
+            )]]
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stands in for the checkpoint store in unit tests: records each call
+    /// with the content every path held at that moment, and names the
+    /// checkpoints `saved-0`, `saved-1`, ...
+    #[derive(Default)]
+    struct SavedExternal {
+        calls: Vec<Vec<(PathBuf, Option<String>)>>,
+    }
+
+    impl SavedExternal {
+        fn saver(&mut self) -> impl FnMut(&[PathBuf]) -> Result<String, AftError> + '_ {
+            move |paths| {
+                let name = format!("saved-{}", self.calls.len());
+                self.calls.push(
+                    paths
+                        .iter()
+                        .map(|path| (path.clone(), fs::read_to_string(path).ok()))
+                        .collect(),
+                );
+                Ok(name)
+            }
+        }
     }
 
     #[test]
@@ -5449,9 +5512,9 @@ mod tests {
 
         for expected in ["v1", "v0"] {
             let restored = store
-                .restore_latest_detailed(DEFAULT_SESSION_ID, &path)
+                .restore_latest_detailed(DEFAULT_SESSION_ID, &path, &mut refuse_external_change)
                 .unwrap();
-            assert!(restored.preserved_external_change.is_none());
+            assert!(restored.external_change_checkpoint.is_none());
             assert!(restored.warning.is_none());
             assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         }
@@ -5920,6 +5983,195 @@ mod tests {
         assert_eq!(fs::read_to_string(&path_c).unwrap(), "c-original");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Snapshot `files` as one AFT operation, write each file's new content,
+    /// and end the request so every entry records what the operation left.
+    fn stamped_operation(store: &mut BackupStore, op_id: &str, files: &[(&Path, &str)]) {
+        for (path, content) in files {
+            if path.exists() {
+                store
+                    .snapshot_with_op(DEFAULT_SESSION_ID, path, "edit", Some(op_id))
+                    .unwrap();
+            } else {
+                store
+                    .snapshot_op_tombstone(DEFAULT_SESSION_ID, op_id, path, "create")
+                    .unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+        store.record_post_mutation_states();
+    }
+
+    fn assert_stacks_untouched(store: &BackupStore, paths: &[&Path]) {
+        for path in paths {
+            let history = store.history(DEFAULT_SESSION_ID, path);
+            assert_eq!(history.len(), 1, "{}", path.display());
+            assert!(history[0].external_change_checkpoint.is_none());
+        }
+    }
+
+    #[test]
+    fn operation_undo_is_refused_untouched_when_the_external_change_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "a-original").unwrap();
+        let mut store = BackupStore::new();
+        stamped_operation(&mut store, "op-refused", &[(&path, "a-aft")]);
+        fs::write(&path, "a-external").unwrap();
+
+        let mut failing = |_: &[PathBuf]| -> Result<String, AftError> {
+            Err(AftError::InvalidRequest {
+                message: "checkpoint store unavailable".to_string(),
+            })
+        };
+        let result = store.restore_last_operation_preserving(DEFAULT_SESSION_ID, &mut failing);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a-external");
+        assert_stacks_untouched(&store, &[&path]);
+    }
+
+    #[test]
+    fn operation_undo_is_refused_when_the_changed_file_exceeds_the_size_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "a-original").unwrap();
+        let mut store = BackupStore::new();
+        store.set_policy(BackupPolicy {
+            enabled: true,
+            max_depth: DEFAULT_MAX_UNDO_DEPTH,
+            max_file_size: Some(16),
+        });
+        stamped_operation(&mut store, "op-too-large", &[(&path, "a-aft")]);
+        fs::write(&path, "external content well over sixteen bytes").unwrap();
+
+        let mut saved = SavedExternal::default();
+        let result =
+            store.restore_last_operation_preserving(DEFAULT_SESSION_ID, &mut saved.saver());
+
+        assert!(result.is_err());
+        assert!(saved.calls.is_empty(), "nothing may be saved or restored");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "external content well over sixteen bytes"
+        );
+        assert_stacks_untouched(&store, &[&path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_undo_write_failure_after_saving_external_change_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed.txt");
+        let readonly = dir.path().join("readonly.txt");
+        fs::write(&changed, "changed-original").unwrap();
+        fs::write(&readonly, "readonly-original").unwrap();
+        let mut store = BackupStore::new();
+        stamped_operation(
+            &mut store,
+            "op-write-fails",
+            &[(&changed, "changed-aft"), (&readonly, "readonly-aft")],
+        );
+        fs::write(&changed, "changed-external").unwrap();
+        let original_permissions = fs::metadata(&readonly).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_mode(0o444);
+        fs::set_permissions(&readonly, readonly_permissions).unwrap();
+
+        let mut saved = SavedExternal::default();
+        let result =
+            store.restore_last_operation_preserving(DEFAULT_SESSION_ID, &mut saved.saver());
+        fs::set_permissions(&readonly, original_permissions).unwrap();
+
+        assert!(result.is_err(), "read-only restore target must fail");
+        assert_eq!(
+            saved.calls,
+            vec![vec![(
+                canonicalize_key(&changed),
+                Some("changed-external".to_string())
+            )]],
+            "the external change is saved before anything is written"
+        );
+        assert_eq!(
+            fs::read_to_string(&changed).unwrap(),
+            "changed-external",
+            "rollback puts the external content back"
+        );
+        assert_eq!(fs::read_to_string(&readonly).unwrap(), "readonly-aft");
+        assert_stacks_untouched(&store, &[&changed, &readonly]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_undo_tombstone_failure_after_saving_external_change_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed.txt");
+        let locked_dir = dir.path().join("locked");
+        fs::create_dir(&locked_dir).unwrap();
+        let created = locked_dir.join("created.txt");
+        fs::write(&changed, "changed-original").unwrap();
+        let mut store = BackupStore::new();
+        stamped_operation(
+            &mut store,
+            "op-tombstone-fails",
+            &[(&changed, "changed-aft"), (&created, "created-by-aft")],
+        );
+        fs::write(&changed, "changed-external").unwrap();
+        // Removing the created file needs write access to its directory.
+        let original_permissions = fs::metadata(&locked_dir).unwrap().permissions();
+        let mut locked_permissions = original_permissions.clone();
+        locked_permissions.set_mode(0o555);
+        fs::set_permissions(&locked_dir, locked_permissions).unwrap();
+
+        let mut saved = SavedExternal::default();
+        let result =
+            store.restore_last_operation_preserving(DEFAULT_SESSION_ID, &mut saved.saver());
+        fs::set_permissions(&locked_dir, original_permissions).unwrap();
+
+        assert!(result.is_err(), "tombstone removal must fail");
+        assert_eq!(saved.calls.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&changed).unwrap(),
+            "changed-external",
+            "rollback puts the external content back"
+        );
+        assert_eq!(fs::read_to_string(&created).unwrap(), "created-by-aft");
+        assert_stacks_untouched(&store, &[&changed, &created]);
+    }
+
+    #[test]
+    fn per_file_undo_past_external_change_keeps_walking_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "A0").unwrap();
+        let mut store = BackupStore::new();
+        for next in ["A1", "A2"] {
+            store.snapshot(DEFAULT_SESSION_ID, &path, "edit").unwrap();
+            fs::write(&path, next).unwrap();
+            store.record_post_mutation_states();
+        }
+        fs::write(&path, "B0").unwrap();
+
+        let mut saved = SavedExternal::default();
+        let first = store
+            .restore_latest_detailed(DEFAULT_SESSION_ID, &path, &mut saved.saver())
+            .unwrap();
+        assert_eq!(first.external_change_checkpoint.as_deref(), Some("saved-0"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A1");
+        let history = store.history(DEFAULT_SESSION_ID, &path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].external_change_checkpoint.as_deref(),
+            Some("saved-0")
+        );
+
+        let second = store
+            .restore_latest_detailed(DEFAULT_SESSION_ID, &path, &mut saved.saver())
+            .unwrap();
+        assert!(second.external_change_checkpoint.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A0");
+        assert_eq!(saved.calls.len(), 1, "only the external change is saved");
     }
 
     #[test]

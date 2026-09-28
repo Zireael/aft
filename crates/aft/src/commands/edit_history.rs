@@ -40,8 +40,8 @@ fn entry_markers(entry: &BackupEntry) -> Vec<&'static str> {
     } else if entry.post_state == Some(PathFingerprint::Absent) {
         markers.push("deleted");
     }
-    if entry.undo_capture {
-        markers.push("captured_before_undo");
+    if entry.external_change_checkpoint.is_some() {
+        markers.push("external_change_checkpoint");
     }
     markers
 }
@@ -49,9 +49,11 @@ fn entry_markers(entry: &BackupEntry) -> Vec<&'static str> {
 /// Handle the `edit_history` command: return the backup stack for a file.
 ///
 /// Params: `file` (string, required) — path to query history for.
-/// Returns: `{ file, entries: [{ backup_id, timestamp, description, markers, generation, previous_file }, ...] }`
+/// Returns: `{ file, entries: [{ backup_id, timestamp, description, markers, external_change_checkpoint, generation, previous_file }, ...] }`
 /// (most recent first). `previous_file` is true for entries that belong to an
 /// earlier file AFT saw at this path before the current one was created.
+/// `external_change_checkpoint` names the checkpoint an undo saved when it
+/// stopped at this entry and found the file changed outside AFT.
 pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -85,6 +87,7 @@ pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
                 "timestamp": entry.timestamp,
                 "description": entry.description,
                 "markers": entry_markers(entry),
+                "external_change_checkpoint": entry.external_change_checkpoint,
                 "generation": generation,
                 "previous_file": generation < current_generation,
             })
