@@ -817,7 +817,7 @@ fn aggregate_outline_directory(
         let entry = &file_entries[file_id];
         stats.files += 1;
         stats.lines += entry.lines.unwrap_or(0);
-        stats.unknown_lines += usize::from(entry.lines.is_none());
+        stats.unknown_lines += usize::from(entry.lines.is_none() && entry.language != "binary");
         if entry.data_doc {
             stats.data_doc_files += 1;
         } else {
@@ -1262,7 +1262,7 @@ fn format_files_table(
                         entry.language,
                         entry.symbols.unwrap_or(0)
                     ),
-                    entry.lines.map(|lines| lines.to_string()),
+                    entry.lines.map(|lines| lines.to_string()).or_else(|| (entry.language == "binary").then(|| "-".to_string())),
                 )
             }
             OutlineTableRow::Rollup(node_id) => {
