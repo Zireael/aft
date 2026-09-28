@@ -93,7 +93,8 @@ describe.serial("OpenCode live config reload", () => {
     await expect(
       watchTool.execute({ taskId: "t", timeoutMs: 5_000 }, sdkContext()),
     ).rejects.toThrow("timeoutMs must be between 1 and 1000 (bash.watch_sync_max_ms)");
-    // `background` changes the bash schema the model sees: it waits for a restart.
+    // A `background` change is deferred until restart because it changes the
+    // bash schema the model sees.
     expect(resolveBashConfig(f.ctx.config).background).toBe(true);
   });
 

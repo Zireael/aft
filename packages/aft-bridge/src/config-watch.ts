@@ -18,7 +18,11 @@ import { dirname } from "node:path";
 /** How long a burst of file events must be quiet before the files are read. */
 export const CONFIG_WATCH_DEBOUNCE_MS = 150;
 
-/** Sentence that replaces the restart note on a live-reload config error. */
+/**
+ * Appended to a config error found by a live reload, in place of the
+ * "restart the host" note a startup config error carries: the plugin keeps
+ * running on the last valid configuration.
+ */
 export const CONFIG_LIVE_KEEP_NOTE =
   "AFT keeps using the last valid configuration until the file is fixed.";
 

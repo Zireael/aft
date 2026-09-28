@@ -2652,8 +2652,9 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
-    /// State for applying config file edits while the root stays bound: what
-    /// the last configure read, the reload request flag and the file watches.
+    /// State for applying config file edits while the root stays bound: the
+    /// config file texts the last configure applied, the pending-reload flag
+    /// and the root's own config file watches.
     config_live: crate::config_live::ConfigLiveState,
     /// Last tool/request activity for this root. Standalone idle LSP reclaim
     /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.

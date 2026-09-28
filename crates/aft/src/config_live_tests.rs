@@ -102,7 +102,7 @@ fn live_edit_applies_a_group_a_key_without_reconnect() {
     assert_eq!(applied(&outcome), vec!["format_on_edit", "bash.enabled"]);
     assert!(!fixture.ctx.config().bash.enabled);
     assert!(fixture.ctx.config().format_on_edit);
-    // No configure ran: the generation that artifact loads key on is unchanged.
+    // No configure ran: the configure generation is unchanged.
     assert_eq!(fixture.ctx.configure_generation(), generation);
 }
 

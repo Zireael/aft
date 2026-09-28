@@ -882,8 +882,8 @@ fn parse_tier(
     Some((raw, translation))
 }
 
-/// Why a tier would be accepted only leniently, or `None` when it parses
-/// strictly.
+/// Return why a tier would be accepted only by the lenient resolver, or
+/// `None` when it passes strict validation.
 ///
 /// [`resolve_config_for_harness`] skips a tier whose text does not parse and
 /// resolves a tier with one bad value by dropping that key to its default. A

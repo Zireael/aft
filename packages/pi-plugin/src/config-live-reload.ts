@@ -32,8 +32,8 @@ export const PI_LIVE_CONFIG_KEYS = aftLiveConfigKeys<AftConfig>(
 /**
  * Load both config files for a live reload. A parse failure, a setting whose
  * value does not validate, or a rejected key is an error here, not a default:
- * the reload then keeps the last valid config. (A connect keeps the valid part
- * of such a file instead.)
+ * the reload then keeps the last valid config. (Loading at host startup keeps
+ * the valid part of such a file instead.)
  */
 export function loadPiConfigForLiveReload(directory: string): LiveConfigLoad<AftConfig> {
   try {
