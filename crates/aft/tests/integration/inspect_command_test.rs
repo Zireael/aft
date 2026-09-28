@@ -3821,9 +3821,7 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
     );
 }
 
-/// A producer that never settles is cut off by the shared request deadline.
-/// The terminal reserve keeps the PHASE-FAILED response inside the configured
-/// budget and attributes it to the unfinished quiescence phase.
+/// A producer that never settles leaves a named gap without hiding other categories.
 #[test]
 fn blocking_inspect_returns_before_the_configured_request_deadline() {
     let (_temp_dir, root) = fixture_project();
@@ -3849,10 +3847,15 @@ fn blocking_inspect_returns_before_the_configured_request_deadline() {
     ))
     .expect("inspect response serializes");
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["inspect_terminal"], "phase_failed");
-    assert_eq!(response["failure_reason"], "inspect_request_timeout");
-    assert_eq!(response["failed_phase"], "lsp_quiescence");
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert!(response["text"]
+        .as_str()
+        .unwrap()
+        .contains("still indexing after"));
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "the terminal reserve must return well before the 10s request budget: {:?}",
@@ -3860,10 +3863,9 @@ fn blocking_inspect_returns_before_the_configured_request_deadline() {
     );
 }
 
-/// The deadline error text carries the configured millisecond budget end to
-/// end: user config, clamped deadline, blocking wait, terminal failure detail.
+/// A larger configured budget still bounds indexing and reports how to retry.
 #[test]
-fn blocking_inspect_deadline_error_names_the_configured_budget() {
+fn blocking_inspect_indexing_gap_names_elapsed_wait_and_retry() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -3884,15 +3886,16 @@ fn blocking_inspect_deadline_error_names_the_configured_budget() {
     ))
     .expect("inspect response serializes");
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["failure_reason"], "inspect_request_timeout");
-    let detail = response["failure_detail"]
-        .as_str()
-        .unwrap_or_else(|| panic!("failure_detail missing: {response:#}"));
-    assert!(
-        detail.contains("12000ms"),
-        "the configured budget must reach the error text: {detail}"
-    );
+    assert_eq!(response["success"], true, "response: {response:#}");
+    let gap = response["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gap| gap["producer"] == "rust")
+        .unwrap();
+    let reason = gap["reason"].as_str().unwrap();
+    assert!(reason.contains("still indexing after"), "{reason}");
+    assert!(reason.contains("retry aft_inspect"), "{reason}");
 }
 
 /// A producer that declares quiescence without publishing any report is
@@ -4535,4 +4538,40 @@ fn rust_analyzer_warning_keeps_diagnostics_and_reports_note() {
         response["text"].as_str().unwrap().contains(note),
         "{response:#}"
     );
+}
+
+#[test]
+fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"partial-diag\"\n");
+    let file = write_file(&root, "src/main.rs", "// TODO: finish\nfn main() {}\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    open_with_server_status_mode(&ctx, &file, "1");
+    wait_for_lsp_report_state(&ctx, &file, true);
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs"
+        })),
+        &ctx,
+    ))
+    .unwrap();
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false);
+    assert!(
+        response["summary"]["todos"]["count"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "{response:#}"
+    );
+    let details = response["details"]["diagnostics"].as_array().unwrap();
+    assert!(
+        details.iter().any(|item| item["complete"] == false
+            && item["message"]
+                .as_str()
+                .unwrap()
+                .contains("analyzer warming")),
+        "{response:#}"
+    );
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    assert_eq!(ctx.status_bar_count_values().errors, None);
 }

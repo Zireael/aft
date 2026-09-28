@@ -966,3 +966,66 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 
     assert!(aft.shutdown().success());
 }
+
+#[test]
+fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join("crates")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    fs::write(
+        project.join("crates/lib.rs"),
+        "// TODO: check indexing\npub fn value() {}\n",
+    )
+    .unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    fs::write(project.join("outside.ts"), "export const value = 1;\n").unwrap();
+    let binary = fake_lsp_server_path();
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_SERVER_STATUS", std::ffi::OsStr::new("1"))]);
+    let configured = aft.send(
+        &json!({
+            "id": "configure-partial", "command": "configure", "harness": "opencode",
+            "project_root": project, "storage_dir": temp.path().join("storage"),
+            "config": user_config(json!({
+                "search_index": false, "semantic_search": false, "callgraph_store": false,
+                "inspect": {"diagnostics_timeout_ms": 10000},
+                "lsp": {"servers": {
+                    "rust": {"binary": binary, "args": []},
+                    "typescript": {"binary": binary, "args": []}
+                }}
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let started = Instant::now();
+    let response = aft.send_with_timeout(
+        &json!({
+            "id": "partial-inspect", "command": "inspect", "scope": "crates"
+        })
+        .to_string(),
+        Duration::from_secs(15),
+    );
+    eprintln!(
+        "partial inspect elapsed={:?} response={response:#}",
+        started.elapsed()
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false);
+    assert!(
+        !response.to_string().contains("\"producer\":\"typescript\""),
+        "{response:#}"
+    );
+    assert!(response["text"]
+        .as_str()
+        .unwrap()
+        .contains("still indexing after"));
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    assert!(
+        response["text"].as_str().unwrap().contains("E? W?"),
+        "{response:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(aft.shutdown().success());
+}

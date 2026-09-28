@@ -60,6 +60,7 @@ struct DiagnosticsCollection {
     /// `server_ran`: a quiesced producer may never publish, and that empty
     /// store is still a complete answer.
     producers_settled: bool,
+    indexing_gaps: BTreeMap<String, String>,
 }
 
 /// Collect diagnostics for the explicit inspect path.
@@ -77,9 +78,9 @@ struct DiagnosticsCollection {
 /// settled producer cannot prove that a specific file nothing ever analyzed
 /// is clean. A collection becomes Fresh after every expected producer has
 /// settled (authoritative report or no longer warming) or reached a
-/// terminal failure. Terminal producer failures remain named gaps in the
-/// payload; producers still warming without an authoritative report still
-/// prevent a fresh response.
+/// terminal failure. When the blocking wait reaches its indexing budget,
+/// unfinished producers become named gaps and published rows remain explicitly
+/// provisional; other categories can still be returned.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
@@ -89,6 +90,7 @@ pub(crate) fn run_diagnostics_category(
     producer_failures: &[ApplicableServerFailure],
     not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
+    indexing_gaps: &[(ServerKey, String)],
 ) -> JobOutcome {
     let mut collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
@@ -100,6 +102,10 @@ pub(crate) fn run_diagnostics_category(
     } else {
         collect_warm_working_set(ctx, snapshot, expected_producers)
     };
+    collection.indexing_gaps = indexing_gaps
+        .iter()
+        .map(|(server, reason)| (server_id(server), reason.clone()))
+        .collect();
     collection.record_producer_failures(producer_failures);
     collection.not_applicable = not_applicable
         .iter()
@@ -118,7 +124,7 @@ pub(crate) fn run_diagnostics_category(
         };
     }
 
-    if collection.is_reportable() {
+    if collection.is_reportable() || !collection.indexing_gaps.is_empty() {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
         }
@@ -331,15 +337,15 @@ impl DiagnosticsCollection {
     }
 
     /// Render-time scope filter over findings. The warm collection is
-    /// full-root; a scoped payload keeps only in-scope findings. Warming
-    /// (provisional) rows are dropped here because the per-file coverage
-    /// check reports their files as named gaps until the responsible server
-    /// settles, and a warming row must not read as an authoritative finding.
+    /// full-root; a scoped payload keeps only in-scope findings. Warming rows
+    /// are included only after a bounded wait expires, labeled incomplete and
+    /// excluded from authoritative counts.
     fn apply_scope(&mut self, scope: &JobScope) {
         self.producer_reports
             .retain(|(_, file, _)| scope.contains(file));
         self.diagnostics.retain(|diagnostic| {
-            !diagnostic.provisional && scope.contains(&diagnostic.diagnostic.file)
+            (!diagnostic.provisional || !self.indexing_gaps.is_empty())
+                && scope.contains(&diagnostic.diagnostic.file)
         });
     }
 
@@ -402,11 +408,10 @@ impl DiagnosticsCollection {
     }
 
     fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
-        // Warming rows are not findings. After producers settle, leftover
-        // provisional entries are dropped rather than blocking the payload;
-        // the wait already treated those producers as complete.
+        // Preserve provisional rows only for a timed-out wait. They explain
+        // what the producer has published so far, but cannot certify totals.
         self.diagnostics
-            .retain(|diagnostic| !diagnostic.provisional);
+            .retain(|diagnostic| !diagnostic.provisional || !self.indexing_gaps.is_empty());
         self.sort_and_dedup();
         let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self
@@ -458,7 +463,8 @@ impl DiagnosticsCollection {
         for producer in self.servers_pending {
             gaps.push(serde_json::json!({
                 "kind": "failed_producer", "producer": producer,
-                "reason": "producer has not settled",
+                "reason": self.indexing_gaps.get(&producer).map(String::as_str)
+                    .unwrap_or("producer has not settled"),
             }));
         }
         if !gaps.is_empty() {
@@ -564,6 +570,7 @@ fn diagnostic_item(snapshot: &InspectSnapshot, diagnostic: &CollectedDiagnostic)
         "severity": diagnostic.diagnostic.severity.as_str(),
         "message": diagnostic_detail_message(diagnostic),
         "source": diagnostic.diagnostic.source.as_deref().unwrap_or("lsp"),
+        "complete": !diagnostic.provisional,
     })
 }
 
