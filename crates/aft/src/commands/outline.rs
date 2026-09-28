@@ -397,6 +397,7 @@ struct OutlineDirectoryStats {
     dirs: usize,
     files: usize,
     lines: usize,
+    unknown_lines: usize,
     data_doc_files: usize,
     code_files: usize,
     code_lines: usize,
@@ -490,6 +491,7 @@ struct OutlineWalkOptions {
 
 #[derive(Debug, Clone)]
 struct OutlineFileDiscovery {
+    entries_examined: usize,
     files: Vec<String>,
     directories: Vec<String>,
     walk_truncated: bool,
@@ -514,6 +516,7 @@ fn handle_outline_files_mode(
     let mut file_entries = Vec::new();
     let mut directory_nodes = Vec::new();
     let mut tree_roots = Vec::new();
+    let mut entries_examined = 0usize;
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
@@ -545,6 +548,7 @@ fn handle_outline_files_mode(
             &dir_path
         };
         let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
+        entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
@@ -572,7 +576,11 @@ fn handle_outline_files_mode(
     );
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
-    let text = table.into_string();
+    let mut text = table.into_string();
+    let unknown_lines = file_entries.iter().filter(|entry| entry.lines.is_none() && entry.language != "binary").map(|entry| entry.path.clone()).collect::<Vec<_>>();
+    if !unknown_lines.is_empty() {
+        text.push_str("\nLine counts unknown for unreadable files or text exceeding the 1048576-byte count budget; narrow: read a file range.\n");
+    }
     let rollup_count = rows
         .iter()
         .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
@@ -608,7 +616,7 @@ fn handle_outline_files_mode(
             .push("<additional files not counted: 10000-file walk limit reached>".to_string());
     }
     if collection_truncated {
-        unchecked_files.push("<additional files not counted: directory walk failed>".to_string());
+        unchecked_files.push("<additional files not counted: directory walk failed or 10000-entry examination budget reached>".to_string());
     }
     if skipped_foreign_mounts > 0 {
         unchecked_files.push(format!(
@@ -622,7 +630,10 @@ fn handle_outline_files_mode(
         "files": file_entries,
         "complete": !walk_truncated
             && !collection_truncated
-            && skipped_foreign_mounts == 0,
+            && skipped_foreign_mounts == 0
+            && unknown_lines.is_empty(),
+        "line_count_gaps": unknown_lines,
+        "entries_examined": entries_examined,
         "walk_truncated": walk_truncated,
         "walk_limit": OUTLINE_FILE_COLLECTION_CAP,
         "collection_truncated": collection_truncated,
@@ -806,6 +817,7 @@ fn aggregate_outline_directory(
         let entry = &file_entries[file_id];
         stats.files += 1;
         stats.lines += entry.lines.unwrap_or(0);
+        stats.unknown_lines += usize::from(entry.lines.is_none());
         if entry.data_doc {
             stats.data_doc_files += 1;
         } else {
@@ -818,6 +830,7 @@ fn aggregate_outline_directory(
         stats.dirs += child_stats.dirs + 1;
         stats.files += child_stats.files;
         stats.lines += child_stats.lines;
+        stats.unknown_lines += child_stats.unknown_lines;
         stats.data_doc_files += child_stats.data_doc_files;
         stats.code_files += child_stats.code_files;
         stats.code_lines += child_stats.code_lines;
@@ -1091,6 +1104,11 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
         });
     }
 
+    const LINE_COUNT_BYTES: u64 = 1024 * 1024;
+    if file.metadata()?.len() > LINE_COUNT_BYTES {
+        return Ok(OutlineFileContentStats { binary: false, lines: None });
+    }
+    let mut file = file.take(LINE_COUNT_BYTES + 1 - sample_len as u64);
     let mut newline_count = sample[..sample_len]
         .iter()
         .filter(|byte| **byte == b'\n')
@@ -1108,6 +1126,9 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
         last_byte = Some(buffer[read - 1]);
     }
 
+    if total_bytes as u64 > LINE_COUNT_BYTES {
+        return Ok(OutlineFileContentStats { binary: false, lines: None });
+    }
     let lines = newline_count + usize::from(total_bytes > 0 && last_byte != Some(b'\n'));
     Ok(OutlineFileContentStats {
         binary: false,
@@ -1249,13 +1270,13 @@ fn format_files_table(
                 (
                     format!("{}/", node.path.trim_end_matches('/')),
                     directory_rollup_summary(&node.stats),
-                    Some(node.stats.lines.to_string()),
+                    (node.stats.unknown_lines == 0).then(|| node.stats.lines.to_string()),
                 )
             }
         };
         output.push_str(&format!(
             "{path:<path_width$}  {middle:<middle_width$} {lines:>7} lines\n",
-            lines = lines.as_deref().unwrap_or("-"),
+            lines = lines.as_deref().unwrap_or("unknown"),
         ));
     }
 
@@ -1360,6 +1381,7 @@ fn discover_outline_files_with_options(
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut directories = Vec::new();
+    let mut entries_examined = 0;
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
@@ -1370,7 +1392,7 @@ fn discover_outline_files_with_options(
     if let Ok(boundary) = boundary {
         let mut device_lookup = crate::walk_boundary::filesystem_device_id;
         if breadth_first {
-            collect_outline_files_breadth_first_with_device_lookup(
+            entries_examined = collect_outline_files_breadth_first_with_device_lookup(
                 directory,
                 &mut files,
                 &mut directories,
@@ -1401,6 +1423,7 @@ fn discover_outline_files_with_options(
     directories.sort();
 
     OutlineFileDiscovery {
+        entries_examined,
         files,
         directories,
         walk_truncated,
@@ -1493,20 +1516,29 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
     options: Option<&OutlineWalkOptions>,
     boundary: &crate::walk_boundary::DeviceBoundary,
     device_lookup: &mut F,
-) where
+) -> usize where
     F: FnMut(&Path) -> std::io::Result<Option<u64>>,
 {
     let mut pending = VecDeque::from([directory.to_path_buf()]);
+    let mut entries_examined = 0usize;
+    const ENTRY_BUDGET: usize = 10_000;
 
     while let Some(current) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
-            return;
+            return entries_examined;
         }
         let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
+        let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
+        let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        entries_examined += entries.len();
+        if entries.len() > remaining {
+            entries.truncate(remaining);
+            *collection_truncated = true;
+        }
+        let mut entries = entries.into_iter().flatten().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
@@ -1541,7 +1573,7 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
                     *collection_truncated = true;
-                    return;
+                    return entries_examined;
                 }
             }
         }
@@ -1549,14 +1581,18 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
         for path in child_files {
             if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
                 *walk_truncated = true;
-                return;
+                return entries_examined;
             }
             if is_ignored_outline_path(&path, false, options) {
                 continue;
             }
             files.push(path.to_string_lossy().to_string());
         }
+        if *collection_truncated {
+            return entries_examined;
+        }
     }
+    entries_examined
 }
 
 fn is_ignored_outline_path(
