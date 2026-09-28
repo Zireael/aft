@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "write-description-large-files",
+    "lsp-spawn-orphan-sweep",
+    "inspect-scoped-server-selection"
+  ],
+  "note": "The only ranking-fence file touched is the subc tool-schema artifact, where the write tool's description gains one sentence. The LSP and inspect changes are outside the fence, and aft_search ranking, fusion, lane admission and truncation are unchanged, so ranked rows should be byte-equal to the reference."
+}
