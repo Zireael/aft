@@ -18,11 +18,12 @@ Anything not named below is `gh_shim_unclassified` (exit 86, nothing sent). The
 refusal names the verb the classifier decided on, because the decision is made
 on the verb alone.
 
-## Writes to repositories no bot is bound to
+## Commands on repositories no bot is bound to
 
-A write aimed at a repository the signed manifest binds no bot to cannot be bot
-speech, and upstream `gh` would run it under the operator's own login. Such a
-write is refused with `gh_shim_unbound_target` (exit 86, nothing sent) unless
+A command aimed at a repository the signed manifest binds no bot to cannot be
+bot speech, and upstream `gh` would run it under the operator's own login.
+Unless it is known to be safe (below), such a command is refused with
+`gh_shim_unbound_target` (exit 86, nothing sent) unless
 `GH_SHIM_BYPASS=operator` is set. For example:
 
 ```text
@@ -35,26 +36,37 @@ writes for `pr merge` and `release create`: `{as_of_unix_secs, tuple,
 repository}`, where `tuple` is the verb (`repo create`) or
 `api:<METHOD>:<endpoint>` and `repository` is `null` when none is known.
 
-**What counts as a write.** Every verb in a declared row above (speech,
-administration, the operator label rows, the destructive forms), plus the
-undeclared writes the classifier lists: `pr create`, `issue delete`/`transfer`/
-`lock`/`pin`, `repo delete`/`rename`/`archive`/`sync`, `label edit`/`delete`,
-`workflow enable`/`disable`, `run cancel`, `secret`/`variable set` and
-`delete`, `repo deploy-key` and `repo autolink` actions other than `list` and
-`view`, and the account writes below. `gh api` writes when its method does: a
-method named with `--method`/`-X`, else POST once a field or `--input` is given.
-A `gh api graphql` call is a read only when its inline `query` holds no
-`mutation`. Everything else passes through as before: `view`, `list`, `api`
-GET, `run view`/`download`, and local commands such as `auth`, `config` or
-`pr checkout`.
+**What passes through.** The check is a safe list, not a list of writes: a
+verb the shim does not recognise (`codespace create`, or one a future `gh`
+adds) is refused like any other write. Only these pass through unapproved:
+
+- reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
+  views, lists and downloads, `search`, `status`, `org list`, `gist`
+  `list`/`view`, `secret list`, `variable list`/`get`, `ruleset`
+  `list`/`view`/`check`, `project` `list`/`view`/`field-list`/`item-list`,
+  `ssh-key list`, `gpg-key list`, `codespace list`, `release verify`,
+  `attestation verify`, `extension list`/`search`, and the `list`/`view`
+  actions of `repo deploy-key` and `repo autolink`;
+- commands that act only on the local machine: `auth`, `config`, `alias`
+  (managing aliases), `completion`, `help`, `version`, `repo clone`,
+  `gist clone`, `pr checkout`, and `browse --no-browser`;
+- anything with `--help`, and `gh` with no verb;
+- `gh api` reads: GET or HEAD (a method named with `--method`/`-X`, else POST
+  once a field or `--input` is given, as upstream `gh` decides), and a
+  `gh api graphql` call whose inline `query` holds no `mutation`.
+
+Running an extension (`gh extension exec`, or `gh <extension>`) or an alias
+(`gh <alias>`) is not on the list: an extension is a program and an alias can
+expand to `api --method POST` or a shell command, so either can write with the
+operator's token where the shim cannot see it.
 
 **What the target is.** The same resolver the governed rows use: `--repo`/`-R`,
 a thread URL, a `gh repo` subcommand's repository positional (`gh repo delete
 owner/name`), a `/repos/<owner>/<name>` endpoint, `GH_REPO`, then the working
 directory's `origin`. When that target is bound, the governed path applies
 unchanged, and the bypass there still reaches only manifest-declared
-administration. A non-speech write from inside a bound checkout also stays on
-the governed path whatever it names, as before.
+administration. A command that is not bot speech, run from inside a bound
+checkout, also stays on the governed path whatever it names, as before.
 
 **Account writes** never have a binding, so they need the bypass even from a
 bound checkout: `repo create` (a new repository cannot be bound yet),
@@ -62,13 +74,14 @@ bound checkout: `repo create` (a new repository cannot be bound yet),
 writes, and `gh api` writes to an endpoint outside `/repos/<owner>/<name>`
 (such as `POST /user/repos` or a GraphQL mutation).
 
-**No determinable target.** A write whose target cannot be resolved (nothing
-named and no github.com `origin`, or a `--repo` that is not a github.com
-`owner/name`) is refused the same way, and the refusal says why.
+**No determinable target.** A command not on the safe list whose target cannot
+be resolved (nothing named and no github.com `origin`, or a `--repo` that is
+not a github.com `owner/name`) is refused the same way, and the refusal says
+why.
 
 The check needs a verified signed manifest to compare against. Without one (no
 manifest installed, or one that never verified) nothing is bound and the shim
-passes writes through as before. An installed manifest that fails validation
+passes commands through as before. An installed manifest that fails validation
 after an earlier one verified (a regressed manifest) already refuses every
 command that is not a read. Destructive forms keep their own refusal, and
 `github.shim: false` turns the whole shim off.

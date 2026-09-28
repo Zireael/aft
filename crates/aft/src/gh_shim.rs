@@ -162,43 +162,63 @@ const READ_ONLY_ACTION_TUPLES: &[&str] = &[
     "search commits",
     "cache list",
 ];
-/// GitHub-side writes that no declaration row above names. With the declared
-/// tables (governed, admin, operator rows, edit-last, destructive) they make
-/// up the verbs `is_write_invocation` treats as writes when it decides whether
-/// a command aimed at an unbound repository must be refused. A verb in none of
-/// these tables is a read (`issue view`, `run download`) or acts only on the
-/// local machine (`auth`, `config`, `extension`, `pr checkout`), and passes
-/// through as it always has.
-const UNDECLARED_WRITE_TUPLES: &[&str] = &[
-    "issue delete",
-    "issue develop",
-    "issue lock",
-    "issue unlock",
-    "issue pin",
-    "issue unpin",
-    "issue transfer",
-    "pr create",
-    "pr ready",
-    "pr lock",
-    "pr unlock",
-    "pr revert",
-    "pr update-branch",
-    "repo delete",
-    "repo rename",
-    "repo archive",
-    "repo unarchive",
-    "repo sync",
-    "label edit",
-    "label delete",
-    "label clone",
-    "workflow enable",
-    "workflow disable",
-    "run cancel",
-    "secret set",
-    "secret delete",
-    "variable set",
-    "variable delete",
-    "cache delete",
+/// Commands that may pass through to upstream `gh` even when the repository
+/// they name has no bot binding. The check for unbound targets is a safe list:
+/// anything not listed here or in `READ_ONLY_ACTION_TUPLES` (and not a `gh api`
+/// read) is refused on an unbound target, including verbs this build does not
+/// know, so a write verb added to a future `gh` cannot slip through under the
+/// operator's login. `verb *` matches the verb with any subcommand, or none.
+///
+/// Not listed, on purpose: `extension exec` and any extension or alias invoked
+/// by name. Both run code the shim cannot inspect (an extension is a program,
+/// an alias can expand to `api --method POST` or to a shell command), and
+/// either can write with the operator's token, so they are refused on an
+/// unbound target like any unknown verb.
+const UNBOUND_SAFE_COMMANDS: &[&str] = &[
+    // Reads beyond `READ_ONLY_ACTION_TUPLES`. They only fetch from GitHub.
+    // (That table also feeds classification on bound repositories, so these
+    // stay here instead of widening it.)
+    "search *",
+    "status *",
+    "org list",
+    "gist list",
+    "gist view",
+    "secret list",
+    "variable list",
+    "variable get",
+    "ruleset list",
+    "ruleset view",
+    "ruleset check",
+    "project list",
+    "project view",
+    "project field-list",
+    "project item-list",
+    "ssh-key list",
+    "gpg-key list",
+    "codespace list",
+    "release verify",
+    "release verify-asset",
+    "attestation verify",
+    "extension list",
+    "extension search",
+    // Local machine only: credentials, configuration, aliases and shell
+    // completion live in the operator's own config files, and `help` and
+    // `version` print text. None of them sends a write to GitHub. Alias
+    // management is local; running an alias is not (see above).
+    "auth *",
+    "config *",
+    "alias *",
+    "completion *",
+    "help *",
+    "version *",
+    // Local git work on a copy: cloning and checking out a pull request
+    // fetch from GitHub and write only to the local disk.
+    "repo clone",
+    "gist clone",
+    "pr checkout",
+    // `browse --no-browser` prints a URL; the flag check is in
+    // `is_unbound_safe`.
+    "browse *",
 ];
 /// Writes that act on the caller's account rather than on an existing
 /// repository: a new repository, a fork, gists, account keys and projects. No
@@ -233,7 +253,7 @@ const ACCOUNT_WRITE_TUPLES: &[&str] = &[
 ];
 /// Verbs whose third word picks the action (`gh repo deploy-key add`). Their
 /// `list` and `view` actions read; every other action writes.
-const NESTED_WRITE_GROUPS: &[&str] = &["repo deploy-key", "repo autolink"];
+const NESTED_ACTION_GROUPS: &[&str] = &["repo deploy-key", "repo autolink"];
 /// `gh repo` subcommands whose first positional names the repository they act
 /// on (`gh repo delete owner/name`). `repo rename` is absent: its positional is
 /// the new name, and `-R` names the repository.
@@ -917,7 +937,7 @@ fn unbound_write(
     target: &TargetRepository,
     cwd: &Path,
 ) -> Option<UnboundWrite> {
-    if !is_write_invocation(args) {
+    if is_unbound_safe(args) {
         return None;
     }
     let classification = classify(args, manifest, platform);
@@ -1002,51 +1022,35 @@ fn write_command(args: &[OsString]) -> String {
     verb_tuple(verb, subcommand)
 }
 
-/// True when `args` asks GitHub to change something.
-///
-/// The verb tables are the ones classification uses (governed, admin, the
-/// operator rows, edit-last, destructive) plus the undeclared and account
-/// writes, so the decision does not depend on what a manifest happens to
-/// declare. `gh api` writes when its method does: an explicit method, else
-/// POST once any field or `--input` is given, as upstream `gh` decides. An
-/// argument vector the shim cannot read counts as a write.
-fn is_write_invocation(args: &[OsString]) -> bool {
+/// True when `args` may run under the operator's login even though what it
+/// names has no bot binding: a known read, a command that acts only on the
+/// local machine (`UNBOUND_SAFE_COMMANDS`), or a `gh api` read. Everything
+/// else, including a verb this build does not recognise, is not safe.
+fn is_unbound_safe(args: &[OsString]) -> bool {
     if has_exact_flag(args, "--help") {
         // Upstream `gh` prints help and runs nothing.
-        return false;
+        return true;
     }
     let Some((verb, subcommand, head_index)) = command_head(args) else {
-        return args.iter().any(|arg| arg.to_str().is_none());
+        // No verb: upstream `gh` prints help or its version. An argument the
+        // shim cannot read might hide a verb, so it is not safe.
+        return args.iter().all(|arg| arg.to_str().is_some());
     };
     if verb == "api" {
-        return api_invocation_writes(&args[head_index..]);
+        return !api_invocation_writes(&args[head_index..]);
     }
-    let tuple = verb_tuple(verb, subcommand);
-    if NESTED_WRITE_GROUPS.contains(&tuple.as_str()) {
-        return !matches!(nested_action(args).as_deref(), Some("list" | "view"));
+    if verb == "browse" && !has_exact_flag(args, "--no-browser") {
+        return false;
     }
-    is_write_tuple(&tuple)
-}
-
-fn is_write_tuple(tuple: &str) -> bool {
-    [
-        V1_GOVERNED_TUPLES,
-        V1_ADMIN_TUPLES,
-        V9_ADMIN_TUPLES,
-        V10_ADMIN_TUPLES,
-        V10_EDIT_LAST_TUPLES,
-        V11_ADMIN_TUPLES,
-        V12_GOVERNED_TUPLES,
-        V13_ADMIN_TUPLES,
-        V14_GOVERNED_TUPLES,
-        V14_OPERATOR_LABEL_TUPLES,
-        V14_OPERATOR_ROW_ADMIN_TUPLES,
-        DESTRUCTIVE_TUPLES,
-        UNDECLARED_WRITE_TUPLES,
-        ACCOUNT_WRITE_TUPLES,
-    ]
-    .iter()
-    .any(|table| table.contains(&tuple))
+    let tuple = verb_tuple(verb.clone(), subcommand);
+    if NESTED_ACTION_GROUPS.contains(&tuple.as_str()) {
+        return matches!(nested_action(args).as_deref(), Some("list" | "view"));
+    }
+    let wildcard = format!("{verb} *");
+    READ_ONLY_ACTION_TUPLES.contains(&tuple.as_str())
+        || UNBOUND_SAFE_COMMANDS
+            .iter()
+            .any(|safe| *safe == tuple || *safe == wildcard)
 }
 
 /// The third positional word (`add` in `gh repo deploy-key add key.pub`).
@@ -10532,30 +10536,37 @@ INHERITED FLAGS
     }
 
     #[test]
-    fn write_classification_reads_the_verb_tables_and_the_api_method() {
-        let writes = |raw: &[&str]| is_write_invocation(&os_args(raw));
+    fn unbound_safe_list_passes_reads_and_local_commands_and_refuses_everything_else() {
+        let safe = |raw: &[&str]| is_unbound_safe(&os_args(raw));
         for raw in [
-            // Verbs the manifest can declare: bot speech (comments, issue
-            // creation), operator administration (merge, release, workflow
-            // run, repository settings) and the operator label rows.
+            // Writes the manifest can declare: bot speech (comments, issue
+            // creation), operator administration and label changes.
             &["issue", "comment", "5", "--body", "x"][..],
             &["issue", "create", "--title", "t"],
             &["pr", "merge", "7"],
             &["release", "create", "v1"],
-            &["release", "delete", "v1"],
             &["label", "create", "bug"],
             &["workflow", "run", "ci.yml"],
             &["repo", "edit", "--visibility", "public"],
-            // Writes no manifest row declares, including those that act on
-            // the caller's account (new repositories, forks, gists).
+            // Writes no manifest declares, and account writes.
             &["repo", "create", "cortexkit/common-auth", "--private"],
             &["repo", "delete", "o/r", "--yes"],
             &["repo", "fork", "o/r"],
             &["pr", "create", "--fill"],
-            &["label", "delete", "bug"],
             &["gist", "create", "notes.md"],
             &["secret", "set", "TOKEN"],
             &["repo", "deploy-key", "add", "key.pub"],
+            // Verbs the shim has no table entry for: refused, not assumed
+            // to be reads.
+            &["codespace", "create", "-R", "o/r"],
+            &["agent-task", "create", "fix the build"],
+            &["extension", "install", "owner/gh-ext"],
+            // Extensions and aliases run code the shim cannot inspect.
+            &["extension", "exec", "gh-ext"],
+            &["my-extension", "--flag"],
+            &["co", "7"],
+            // Browsing opens a browser unless asked only for the URL.
+            &["browse", "12"],
             // API writes: a named method, or a payload without one.
             &["api", "-X", "POST", "repos/o/r/issues"],
             &["api", "--method=delete", "repos/o/r"],
@@ -10565,28 +10576,45 @@ INHERITED FLAGS
             &["api", "graphql", "-f", "query=mutation { addStar }"],
             &["api", "graphql", "-F", "query=@query.graphql"],
         ] {
-            assert!(writes(raw), "{raw:?} should be a write");
+            assert!(!safe(raw), "{raw:?} must not pass an unbound target");
         }
         for raw in [
+            // Reads.
             &["issue", "view", "5"][..],
             &["issue", "list"],
             &["pr", "list"],
-            &["pr", "checkout", "7"],
             &["run", "view", "1", "--log"],
             &["run", "download", "1"],
             &["release", "download", "v1"],
             &["repo", "view", "o/r"],
-            &["repo", "clone", "o/r"],
             &["repo", "deploy-key", "list"],
+            &["search", "issues", "flaky"],
+            &["search", "prs", "--author", "me"],
+            &["status"],
+            &["gist", "view", "abc"],
+            &["extension", "list"],
+            // Local machine only.
             &["auth", "status"],
+            &["auth", "token"],
+            &["config", "set", "editor", "vim"],
+            &["alias", "set", "co", "pr checkout"],
+            &["alias", "list"],
+            &["completion", "-s", "zsh"],
+            &["help", "repo"],
+            &["help"],
+            &["version"],
+            &["repo", "clone", "o/r"],
+            &["pr", "checkout", "7"],
+            &["browse", "12", "--no-browser"],
             &["repo", "create", "--help"],
+            &[],
+            &["--version"],
+            // API reads.
             &["api", "repos/o/r/issues"],
             &["api", "-X", "GET", "search/issues", "-f", "q=repo:o/r"],
             &["api", "graphql", "-f", "query={ viewer { login } }"],
-            &[],
-            &["--version"],
         ] {
-            assert!(!writes(raw), "{raw:?} should be a read");
+            assert!(safe(raw), "{raw:?} should pass through");
         }
         // A method attached to the flag (`-XDELETE`) is read as the method
         // by classification as well, so a field-free DELETE is not taken for

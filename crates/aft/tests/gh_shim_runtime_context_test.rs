@@ -3130,3 +3130,111 @@ fn gh_shim_write_with_an_undeterminable_target_is_refused() {
     assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
     assert!(fixture.audit_records().is_empty());
 }
+
+#[test]
+fn gh_shim_unknown_verbs_on_an_unbound_target_are_refused_and_run_audited_under_the_bypass() {
+    let fixture = UnboundTargetFixture::new();
+    // `codespace create` has no entry in any of the shim's verb tables, and
+    // `agent-task create` stands in for a verb a future gh might add. Neither
+    // is known to be safe, so neither may run as the operator unapproved.
+    let cases: [(&[&str], &str, Option<&str>); 2] = [
+        (
+            &["codespace", "create", "--repo", "earendil-works/pi"],
+            "`codespace create` targets earendil-works/pi, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it)",
+            Some("earendil-works/pi"),
+        ),
+        (
+            &["agent-task", "create", "fix the build"],
+            "`agent-task create` has no determinable target repository (no --repo, repository URL or GH_REPO names one, and the working directory has no github.com origin remote), so it cannot be shown to be a bot-bound repository",
+            None,
+        ),
+    ];
+    for (args, subject, repository) in cases {
+        let refused = fixture.run(args, &fixture.outside, false);
+        assert_eq!(refused.status.code(), Some(86), "{args:?}");
+        assert!(refused.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            unbound_target_refusal(subject)
+        );
+        assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+        assert!(fixture.audit_records().is_empty());
+
+        let approved = fixture.run(args, &fixture.outside, true);
+        assert_eq!(approved.status.code(), Some(73), "{args:?}");
+        assert!(approved.stderr.is_empty());
+        assert_eq!(
+            fixture.upstream_runs().as_deref(),
+            Some(format!("{}\n", args.join(" ")).as_str())
+        );
+        let records = fixture.audit_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            without_timestamp(records[0].clone()),
+            json!({ "tuple": format!("{} {}", args[0], args[1]), "repository": repository })
+        );
+        fs::remove_file(&fixture.recorder).expect("reset the upstream record");
+        fs::remove_file(
+            fixture
+                .state_home
+                .join("cortexkit/aft/gh-shim/operator-bypass.jsonl"),
+        )
+        .expect("reset the audit log");
+    }
+
+    // An extension or alias runs code the shim cannot inspect, so running
+    // one on an unbound target is refused the same way.
+    for args in [
+        &["extension", "exec", "gh-ext", "--repo", "earendil-works/pi"][..],
+        &["co", "7", "--repo", "earendil-works/pi"],
+    ] {
+        let refused = fixture.run(args, &fixture.outside, false);
+        assert_eq!(refused.status.code(), Some(86), "{args:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .starts_with("gh-shim: gh_shim_unbound_target: "));
+    }
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+}
+
+#[test]
+fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
+    let fixture = UnboundTargetFixture::new();
+    let groups: [&[&str]; 14] = [
+        // Reads.
+        &["issue", "view", "12", "--repo", "earendil-works/pi"],
+        &["run", "download", "7", "--repo", "earendil-works/pi"],
+        &["search", "issues", "flaky", "--repo", "earendil-works/pi"],
+        &["status"],
+        // Local machine only.
+        &["auth", "status"],
+        &["config", "get", "editor"],
+        &["alias", "list"],
+        &["completion", "-s", "zsh"],
+        &["extension", "list"],
+        &["help", "repo"],
+        &["version"],
+        // Local copies and printing a URL.
+        &["repo", "clone", "earendil-works/pi"],
+        &["pr", "checkout", "7", "--repo", "earendil-works/pi"],
+        &[
+            "browse",
+            "12",
+            "--no-browser",
+            "--repo",
+            "earendil-works/pi",
+        ],
+    ];
+    let mut expected = String::new();
+    for args in groups {
+        let output = fixture.run(args, &fixture.outside, false);
+        assert_eq!(output.status.code(), Some(73), "{args:?} should delegate");
+        assert!(
+            output.stderr.is_empty(),
+            "{args:?} should delegate silently"
+        );
+        expected.push_str(&args.join(" "));
+        expected.push('\n');
+    }
+    assert_eq!(fixture.upstream_runs(), Some(expected));
+    assert!(fixture.audit_records().is_empty());
+}
