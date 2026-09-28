@@ -90,6 +90,10 @@ pub struct ToolCallPhaseDurations {
 }
 
 impl PhaseTrace {
+    pub(crate) fn received_at(&self) -> Instant {
+        self.frame_decoded
+    }
+
     pub fn new(frame_decoded: Instant) -> Self {
         Self {
             frame_decoded,
@@ -309,7 +313,7 @@ pub(crate) fn prepare_tool_call(
         }
         return Err(result);
     }
-    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id) {
+    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id, bare_name) {
         return Err(tool_call_result_from_response(
             bare_name,
             format_context,

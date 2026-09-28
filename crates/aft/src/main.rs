@@ -1053,10 +1053,8 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    if !matches!(req.command.as_str(), "configure" | "ping" | "version") {
-        if let Some(response) = ctx.database_runtime_refusal(&req.id) {
-            return response;
-        }
+    if let Some(response) = ctx.database_runtime_refusal(&req.id, &req.command) {
+        return response;
     }
     let response = dispatch_command(req, ctx);
     // Every mutation this request made is on disk now; record what it left so

@@ -777,6 +777,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_advertised_mutating_tool_has_explicit_persistence_classification() {
+        let manifest = build_manifest_for_host(true);
+        let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+            panic!("expected ToolProvider");
+        };
+        let mut mutations = 0;
+        for tool in tools {
+            if tool.execution_mode == ExecutionMode::Mutating {
+                mutations += 1;
+                assert!(
+                    crate::persistence_gate::classification(&tool.name).is_some(),
+                    "new mutating tool {} needs an explicit persistence classification",
+                    tool.name
+                );
+            }
+        }
+        assert!(
+            mutations > 0,
+            "the production catalog must contain mutations"
+        );
+    }
+
     /// Serializes the HELLO manifest with the two volatile parts replaced by
     /// markers: the crate version (changes every release) and each tool's
     /// embedded schema/description (regenerated from the plugin tool map).

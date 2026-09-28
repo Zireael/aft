@@ -5557,7 +5557,7 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
         Ok(shared) => {
             ctx.backup().lock().set_db_pool(shared.clone());
             ctx.bash_background().set_db_pool(shared);
-            ctx.finish_database_runtime(true);
+            ctx.finish_database_runtime(Ok(()));
         }
         Err(err) => {
             // Do not clear the process-shared handle if another root is already
@@ -5566,7 +5566,7 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
             ctx.app().clear_db_for_path(&db_path);
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
-            ctx.finish_database_runtime(false);
+            ctx.finish_database_runtime(Err(format!("{}: {err}", db_path.display())));
             slog_warn!(
                 "failed to open aft.db at {}: {} — tools refused with database_unavailable",
                 db_path.display(),
@@ -6257,7 +6257,7 @@ fn run_configure_maintenance_unit_inner(
                 && job.semantic_artifact_load_start.is_none();
             if session_only {
                 if ctx
-                    .database_runtime_refusal("configure-session-replay")
+                    .database_runtime_refusal("configure-session-replay", "bash_drain_completions")
                     .is_some()
                 {
                     forget_configure_job_binding(ctx, job);

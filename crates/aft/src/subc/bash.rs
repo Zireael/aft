@@ -42,6 +42,17 @@ pub(super) struct BashDeferredCompletion {
     fatal: bool,
 }
 
+#[cfg(test)]
+impl BashDeferredCompletion {
+    pub(super) fn response_for_test(&self) -> &Response {
+        &self
+            .result
+            .as_ref()
+            .expect("bash completion result")
+            .response
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct BashTranslatedSettings {
     background: bool,

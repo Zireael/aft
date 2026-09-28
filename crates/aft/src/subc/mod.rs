@@ -184,6 +184,7 @@ mod bash;
 mod drain;
 mod health;
 mod manifest;
+mod persistence;
 mod push;
 mod readiness;
 mod stall_watchdog;
@@ -3702,6 +3703,7 @@ where
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     let pending_deferred_setups = Arc::new(AtomicUsize::new(0));
     let mut pending_responses = PendingSubcResponses::default();
+    let mut database_waits = persistence::DatabaseWaits::default();
     let health_rollup_cache = Arc::new(HealthRollupCache::new());
     let health_rollup_worker = HealthRollupWorker::start(
         Arc::clone(&health_rollup_cache),
@@ -3937,7 +3939,12 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            maybe_frame = reader_rx.recv() => {
+            (maybe_frame, database_waited) = async {
+                tokio::select! {
+                    frame = reader_rx.recv() => (frame, false),
+                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true),
+                }
+            } => {
                 let frame = match maybe_frame {
                     None => {
                         log::warn!(
@@ -4088,6 +4095,17 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
+                        let decoded = DecodedFrame { frame, phase_trace };
+                        let decoded = if !database_waited && !management_routes.contains(&route) {
+                            match database_waits.defer(decoded, &routes, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {
+                            decoded
+                        };
+                        let frame = decoded.frame;
+                        let phase_trace = decoded.phase_trace;
                         let result = if management_routes.contains(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
@@ -4162,7 +4180,7 @@ where
                             channel,
                             corr,
                             "Cancel frame",
-                        );
+                        ).or_else(|| database_waits.cancel(channel, corr));
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
@@ -6552,7 +6570,7 @@ async fn handle_tool_call(
     .or_else(|| {
         executor
             .actor_context(&identity.root)
-            .and_then(|ctx| ctx.database_runtime_refusal(&request_id))
+            .and_then(|ctx| ctx.database_runtime_refusal(&request_id, &bare_name))
     }) {
         let text = crate::subc_format::format_response_with_context(
             &bare_name,
@@ -12319,12 +12337,12 @@ mod tests {
         }
     }
 
-    fn assert_database_refuses_wire_tool(
+    fn database_wire_tool(
         executor: &Arc<Executor>,
         fixture: &ConfiguredRoot,
         name: &str,
-        expected_code: &str,
-    ) {
+        wait_budget: Duration,
+    ) -> Value {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12340,13 +12358,24 @@ mod tests {
                 7,
                 serde_json::to_vec(&json!({
                     "name": name,
-                    "arguments": { "command": "printf persistence-ready", "background": true }
+                    "deadline_ms": (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap() + wait_budget).as_millis() as u64,
+                    "arguments": {
+                        "command": "printf persistence-ready", "background": true,
+                        "filePath": fixture.dir.path().join("module_0.rs")
+                    }
                 }))
                 .unwrap(),
             )
             .unwrap();
+            let mut waits = persistence::DatabaseWaits::default();
+            let decoded = DecodedFrame { frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = match waits.defer(decoded, &routes, executor) {
+                Ok(()) => waits.next().await,
+                Err(decoded) => decoded,
+            };
+            let frame = decoded.frame;
             let (writer, mut replies) = mpsc::channel(8);
-            let (bash_tx, _bash_rx) = mpsc::channel(8);
+            let (bash_tx, mut bash_rx) = mpsc::channel(8);
             let (touch_tx, _touch_rx) = mpsc::channel(8);
             let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
             tokio::time::timeout(
@@ -12354,7 +12383,7 @@ mod tests {
                 handle_tool_call(
                     &writer,
                     &frame,
-                    PhaseTrace::new(Instant::now()),
+                    decoded.phase_trace,
                     &routes,
                     &HashMap::new(),
                     &mut HashMap::new(),
@@ -12373,7 +12402,14 @@ mod tests {
                     &mut HashMap::new(),
                     &mut HashMap::new(),
                     &mut HashMap::new(),
-                    |_, _| panic!("a persistence-unready tool must not dispatch"),
+                    |req, ctx| {
+                        assert!(ctx.database_runtime_refusal(&req.id, &req.command).is_none(), "unready mutation dispatched");
+                        match req.command.as_str() {
+                            "read" => crate::commands::read::handle_read(&req, ctx),
+                            "bash" => crate::commands::bash::handle(&req, ctx),
+                            other => panic!("unexpected dispatch {other}"),
+                        }
+                    },
                     &deferred_tx,
                     false,
                     1024 * 1024,
@@ -12383,11 +12419,64 @@ mod tests {
             .await
             .expect("persistence refusal must not wait for the executor")
             .unwrap();
-            let reply = replies.try_recv().expect("immediate tool refusal");
-            let body: Value = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(body["isError"], true, "{body}");
-            assert_eq!(body["structuredContent"]["code"], expected_code, "{body}");
-        });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    reply = replies.recv() => serde_json::from_slice::<Value>(&reply.unwrap().body).unwrap()["structuredContent"].clone(),
+                    completion = bash_rx.recv() => serde_json::to_value(completion.unwrap().response_for_test()).unwrap(),
+                }
+            }).await.expect("tool response")
+        })
+    }
+
+    fn assert_database_refuses_wire_tool(
+        executor: &Arc<Executor>,
+        fixture: &ConfiguredRoot,
+        name: &str,
+        code: &str,
+    ) {
+        let started = Instant::now();
+        let body = database_wire_tool(executor, fixture, name, Duration::from_millis(150));
+        assert_eq!(body["success"], false, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+        if code == "database_initializing" {
+            assert!(
+                started.elapsed() >= Duration::from_millis(120),
+                "bash did not wait for readiness"
+            );
+            assert_eq!(body["retryable"], true);
+        } else {
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains(&fixture.storage.path().join("aft.db").display().to_string()));
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains("Read-only tools still work"));
+        }
+    }
+
+    fn assert_read_works_during_database_open(executor: &Arc<Executor>, fixture: &ConfiguredRoot) {
+        let body = database_wire_tool(executor, fixture, "read", Duration::from_secs(1));
+        assert_eq!(body["success"], true, "{body}");
+        assert!(body.to_string().contains("function_0"), "{body}");
+        for name in [
+            "read",
+            "grep",
+            "glob",
+            "outline",
+            "zoom",
+            "aft_search",
+            "aft_inspect",
+        ] {
+            assert!(
+                fixture
+                    .ctx
+                    .database_runtime_refusal("reader", name)
+                    .is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -12426,7 +12515,7 @@ mod tests {
         assert!(fixture.ctx.search_index_rx().read().unwrap().is_some());
         assert!(fixture.ctx.search_index().read().unwrap().is_none());
         let generation = fixture.ctx.configure_generation();
-        for name in ["bash", "aft_safety", "write", "db_set_state", "inspect"] {
+        for name in ["bash", "aft_safety", "write", "db_set_state"] {
             assert_database_refuses_wire_tool(&executor, &fixture, name, "database_initializing");
         }
         assert!(!fixture.storage.path().join("aft.db").exists());
@@ -12443,6 +12532,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("database open reached after ack");
         assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
+        assert_read_works_during_database_open(&executor, &fixture);
         assert!(!fixture.storage.path().join("aft.db").exists());
         let mut second = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
         let started = Instant::now();
@@ -12457,7 +12547,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         };
         let second_latency = started.elapsed();
-        let _ = release.send(());
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = release.send(());
+        });
+        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        release_thread.join().unwrap();
+        assert_eq!(
+            bash["success"], true,
+            "bash must proceed when database opens: {bash}"
+        );
         assert!(tail.blocking_recv().unwrap().success);
         if second_response.is_none() {
             let _ = second.blocking_recv();
@@ -12468,9 +12567,26 @@ mod tests {
         );
         assert!(second_response.unwrap().success);
         assert_eq!(fixture.ctx.configure_generation(), generation);
-        assert!(fixture.ctx.database_runtime_refusal("ready").is_none());
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("ready", "bash")
+            .is_none());
         assert!(fixture.ctx.db().is_some());
         assert!(fixture.storage.path().join("aft.db").is_file());
+        let db = fixture.ctx.db().unwrap();
+        let rows: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM bash_tasks WHERE session_id = 'herd-session-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            rows > 0,
+            "bash admitted after notification must persist its task row"
+        );
         eprintln!("blocked database open: first bind {first_latency:?}, equivalent bind {second_latency:?}");
     }
 
@@ -12485,13 +12601,17 @@ mod tests {
         assert!(first.blocking_recv().unwrap().success);
         crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
         assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_unavailable");
+        assert_read_works_during_database_open(&executor, &fixture);
         assert!(fixture.ctx.db().is_none());
         std::fs::remove_dir(&db_path).unwrap();
         let retry = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
         assert!(retry.blocking_recv().unwrap().success);
         assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
         crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
-        assert!(fixture.ctx.database_runtime_refusal("ready").is_none());
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("ready", "bash")
+            .is_none());
         assert!(fixture.ctx.db().is_some());
     }
 

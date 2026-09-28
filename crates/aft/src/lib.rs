@@ -343,3 +343,5 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
+
+pub(crate) mod persistence_gate;

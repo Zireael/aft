@@ -2760,8 +2760,10 @@ pub struct AppContext {
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     // 0: never configured, 1: opening, 2: ready, 3: failed. Dispatch must not
-    // run tools while the configured root's database is opening.
+    // run persistence-dependent tools while the root's database is opening.
     database_runtime_state: AtomicU8,
+    database_runtime_changed: tokio::sync::Notify,
+    database_runtime_error: parking_lot::Mutex<Option<String>>,
     /// Configure-tail work that stepped aside mid-drain so a queued
     /// interactive writer (usually a route bind) could take the actor. The
     /// next tail drain resumes it before anything newly enqueued.
@@ -3240,6 +3242,8 @@ impl AppContext {
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             database_runtime_state: AtomicU8::new(0),
+            database_runtime_changed: tokio::sync::Notify::new(),
+            database_runtime_error: parking_lot::Mutex::new(None),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
@@ -4771,30 +4775,66 @@ impl AppContext {
         self.database_runtime_state.store(1, Ordering::Release);
     }
 
-    pub(crate) fn finish_database_runtime(&self, success: bool) {
+    pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {
+        let success = result.is_ok();
+        *self.database_runtime_error.lock() = result.err();
         self.database_runtime_state
             .store(if success { 2 } else { 3 }, Ordering::Release);
+        self.database_runtime_changed.notify_waiters();
+    }
+
+    pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
+        crate::persistence_gate::requires_database(command)
+            && self.database_runtime_state.load(Ordering::Acquire) == 1
+    }
+
+    /// Wait outside executor admission. Register before checking state so an
+    /// open completing between the check and await cannot lose its notification.
+    pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
+        loop {
+            let changed = self.database_runtime_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.database_runtime_pending(command) {
+                return;
+            }
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 
     pub(crate) fn database_runtime_failed(&self) -> bool {
         self.database_runtime_state.load(Ordering::Acquire) == 3
     }
 
-    /// Refuse requests before any side effect rather than silently using a
-    /// JSON-only fallback while post-bind database initialization is pending.
-    /// Unconfigured library contexts retain their explicit in-memory behavior.
-    pub fn database_runtime_refusal(&self, request_id: &str) -> Option<crate::protocol::Response> {
+    /// Persistence-dependent commands must not silently use a JSON fallback.
+    /// Read-only commands and unconfigured library contexts remain available.
+    pub fn database_runtime_refusal(
+        &self,
+        request_id: &str,
+        command: &str,
+    ) -> Option<crate::protocol::Response> {
+        if !crate::persistence_gate::requires_database(command) {
+            return None;
+        }
+        let failure;
         let (code, message, retryable) = match self.database_runtime_state.load(Ordering::Acquire) {
             1 => (
                 "database_initializing",
                 "Project persistence is still initializing after route bind; retry the tool shortly. No tool operation was performed.",
                 true,
             ),
-            3 => (
-                "database_unavailable",
-                "Project persistence could not be opened; reconfigure the project after resolving the database error. No tool operation was performed.",
-                false,
-            ),
+            3 => {
+                failure = format!(
+                    "Project persistence could not be opened: {}. Read-only tools still work. Resolve the database error and rebind to retry. No tool operation was performed.",
+                    self.database_runtime_error.lock().as_deref().unwrap_or("unknown database error")
+                );
+                ("database_unavailable", failure.as_str(), false)
+            },
             _ => return None,
         };
         Some(crate::protocol::Response::error_with_data(
