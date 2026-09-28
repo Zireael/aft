@@ -1430,7 +1430,14 @@ pub fn write_kill_marker_if_absent(paths: &TaskPaths) -> io::Result<()> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let result = match open_task_artifact(paths, TaskArtifact::Exit) {
+        // The exit file is opened writable so an empty one can be filled in
+        // place; a read-only handle cannot be truncated (ftruncate fails with
+        // EINVAL on macOS and Linux). Writing in place keeps the file the
+        // child's inherited exit handle points at. If the path is replaced
+        // after this open, the handle refers to the unlinked original, whose
+        // zero link count makes validation report a concurrent replace, and
+        // the retry below re-opens the replacement.
+        let result = match open_task_artifact_for_write(paths, TaskArtifact::Exit) {
             Ok(file) if file.len()? > 0 => Ok(()),
             Ok(mut file) => file.replace_contents(b"killed"),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1563,6 +1570,8 @@ impl ValidatedArtifact {
         Ok(bytes)
     }
 
+    /// Requires a handle from `open_task_artifact_for_write`; a read-only
+    /// handle fails the truncate with EINVAL.
     pub fn replace_contents(&mut self, content: &[u8]) -> io::Result<()> {
         validate_regular_handle(&self.file)?;
         self.file.set_len(0)?;
@@ -1593,6 +1602,22 @@ pub fn open_task_artifact(
     paths: &TaskPaths,
     artifact: TaskArtifact,
 ) -> io::Result<ValidatedArtifact> {
+    open_task_artifact_with_access(paths, artifact, false)
+}
+
+/// Like `open_task_artifact`, but the handle can also rewrite the artifact.
+fn open_task_artifact_for_write(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+) -> io::Result<ValidatedArtifact> {
+    open_task_artifact_with_access(paths, artifact, true)
+}
+
+fn open_task_artifact_with_access(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+    write: bool,
+) -> io::Result<ValidatedArtifact> {
     validate_task_id(&paths.task_id)?;
     let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
     if resolved.paths.layout != paths.layout {
@@ -1611,7 +1636,7 @@ pub fn open_task_artifact(
     let file = resolved
         .dirs
         .io
-        .open_file(&resolved.paths.artifact_name(artifact), false)?;
+        .open_file(&resolved.paths.artifact_name(artifact), write)?;
     ValidatedArtifact::new(file)
 }
 

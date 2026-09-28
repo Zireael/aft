@@ -3062,13 +3062,16 @@ impl BgTaskRegistry {
                         )?;
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.status == BgTaskStatus::Killing {
-                        let _ = write_kill_marker_if_absent(&paths);
+                        let recovered = "recovered from inconsistent killing state on replay";
+                        let reason = match write_kill_marker_if_absent(&paths) {
+                            Ok(()) => recovered.to_string(),
+                            Err(error) => kill_marker_failure_reason(
+                                Some(recovered),
+                                &format!("failed to write kill marker: {error}"),
+                            ),
+                        };
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata.mark_terminal(
-                            BgTaskStatus::Killed,
-                            None,
-                            Some("recovered from inconsistent killing state on replay".to_string()),
-                        );
+                        metadata.mark_terminal(BgTaskStatus::Killed, None, Some(reason));
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -5093,9 +5096,9 @@ impl BgTaskRegistry {
                         *child_slot = None;
                         state.detached = true;
 
-                        if let Some(handles) = state.io_handles.as_mut() {
+                        let marker_written = if let Some(handles) = state.io_handles.as_mut() {
                             match handles.write(TaskArtifact::Exit, b"killed") {
-                                Ok(()) => {}
+                                Ok(()) => Ok(()),
                                 Err(error)
                                     if error.kind() == std::io::ErrorKind::Interrupted
                                         && error.to_string().contains(
@@ -5109,23 +5112,34 @@ impl BgTaskRegistry {
                                     // re-open by path and keep whichever is there.
                                     write_kill_marker_if_absent(&task.paths).map_err(|e| {
                                         format!("failed to write kill marker after replace: {e}")
-                                    })?;
+                                    })
                                 }
                                 Err(error) => {
-                                    return Err(format!(
-                                        "failed to write retained kill marker: {error}"
-                                    ));
+                                    Err(format!("failed to write retained kill marker: {error}"))
                                 }
                             }
                         } else {
                             write_kill_marker_if_absent(&task.paths)
-                                .map_err(|e| format!("failed to write kill marker: {e}"))?;
-                        }
+                                .map_err(|e| format!("failed to write kill marker: {e}"))
+                        };
+                        // The process group has already been terminated, so a
+                        // failed marker write must not leave the task in
+                        // `killing`: nothing would ever finish it. End it with
+                        // a reason that names the failed write instead.
+                        let terminal_reason = match marker_written {
+                            Ok(()) => reason.clone(),
+                            Err(error) => {
+                                crate::slog_warn!(
+                                    "background task {task_id} was terminated but its exit marker could not be written: {error}"
+                                );
+                                Some(kill_marker_failure_reason(reason.as_deref(), &error))
+                            }
+                        };
 
                         let exit_code = terminal_exit_code_for_status(&terminal_status);
                         state
                             .metadata
-                            .mark_terminal(terminal_status, exit_code, reason.clone());
+                            .mark_terminal(terminal_status, exit_code, terminal_reason);
 
                         state.pending_terminal_override = None;
                         task.mark_terminal_now();
@@ -7190,6 +7204,19 @@ fn terminal_metadata_from_marker(
         ),
     }
     metadata
+}
+
+/// Status reason for a task being ended as killed whose exit marker could not
+/// be written. The task still ends: its process group is already gone, and
+/// leaving it in `killing` would mean no completion is ever delivered. The
+/// reason keeps any caller-supplied reason and names the failed write so the
+/// missing marker is visible in `bash_status` and the completion.
+fn kill_marker_failure_reason(reason: Option<&str>, error: &str) -> String {
+    let failure = format!("the exit marker could not be written: {error}");
+    match reason {
+        Some(reason) => format!("{reason}; {failure}"),
+        None => failure,
+    }
 }
 
 fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i32> {
@@ -9883,6 +9910,207 @@ mod tests {
             "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
              after a marker-aware kill"
         );
+    }
+
+    /// Spawns a long-running piped task in one registry and then drops that
+    /// registry without killing the task, the way a daemon restart does. The
+    /// returned paths and metadata describe the task as it sits on disk: its
+    /// exit file exists (it is created at spawn) and is still empty.
+    #[cfg(unix)]
+    fn spawn_long_running_then_drop_registry(
+        storage: &Path,
+        session: &str,
+    ) -> (String, TaskPaths, PersistedTask) {
+        let original = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let task_id = original
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 60",
+                session.to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(120)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        let task = original.task_for_session(&task_id, session).unwrap();
+        let paths = task.paths.clone();
+        let metadata = task.state.lock().unwrap().metadata.clone();
+        original.detach();
+        assert_eq!(metadata.status, BgTaskStatus::Running);
+        assert_eq!(
+            fs::metadata(&paths.exit).unwrap().len(),
+            0,
+            "precondition: the exit file exists and is empty while the task runs"
+        );
+        (task_id, paths, metadata)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pending_completion(
+        registry: &BgTaskRegistry,
+        session: &str,
+        task_id: &str,
+    ) -> BgCompletion {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(completion) = registry
+                .pending_completions_for_session(session)
+                .into_iter()
+                .find(|completion| completion.task_id == task_id)
+            {
+                return completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no completion was queued for {task_id}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A task restored after a restart has no retained output handles, so its
+    /// kill writes the exit marker by path into the exit file created at spawn,
+    /// which is still empty while the task runs. That write once went through a
+    /// read-only handle and failed with EINVAL, after the process group was
+    /// already terminated, leaving the task in `killing` forever.
+    #[cfg(unix)]
+    #[test]
+    fn kill_of_restored_task_with_empty_exit_file_writes_marker_and_completes() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "restored-kill";
+        let (task_id, paths, _metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        let task = restarted.task_for_session(&task_id, session).unwrap();
+        {
+            let state = task.state.lock().unwrap();
+            assert_eq!(state.metadata.status, BgTaskStatus::Running);
+            assert!(
+                state.io_handles.is_none(),
+                "precondition: a restored task has no retained output handles"
+            );
+        }
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("kill of a restored task must succeed");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(snapshot.info.status_reason, None);
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// A task left in `killing` by a kill whose marker write failed (its
+    /// process group already gone) must end terminal on the next `bash_kill`.
+    #[cfg(unix)]
+    #[test]
+    fn repeat_kill_recovers_task_stuck_in_killing_with_empty_exit_file() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "stuck-killing-repeat";
+        let (task_id, paths, metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+        let pgid = metadata.pgid.expect("piped task records its process group");
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        let task = restarted.task_for_session(&task_id, session).unwrap();
+        // Reproduce the state the failed kill left behind: the process group
+        // is gone, the exit file is still empty, and the status is `killing`.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Killing;
+            write_task(&paths.json, &state.metadata).unwrap();
+        }
+        assert_eq!(fs::metadata(&paths.exit).unwrap().len(), 0);
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("a repeat kill must finish a task stuck in killing");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// A task persisted in `killing` with an empty exit file (the on-disk
+    /// shape a failed kill left behind) is finished by the next restore.
+    #[cfg(unix)]
+    #[test]
+    fn replay_recovers_task_stuck_in_killing_with_empty_exit_file() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "stuck-killing-replay";
+        let (task_id, paths, mut metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+        let pgid = metadata.pgid.expect("piped task records its process group");
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        metadata.status = BgTaskStatus::Killing;
+        write_task(&paths.json, &metadata).unwrap();
+        assert_eq!(fs::metadata(&paths.exit).unwrap().len(), 0);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+
+        let persisted = read_task(&paths.json).unwrap();
+        assert_eq!(persisted.status, BgTaskStatus::Killed);
+        assert_eq!(
+            persisted.status_reason.as_deref(),
+            Some("recovered from inconsistent killing state on replay")
+        );
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// When the process group has been terminated but the exit marker cannot
+    /// be written, the kill still ends the task, and the status reason names
+    /// the failed write instead of leaving the task in `killing`.
+    #[cfg(unix)]
+    #[test]
+    fn kill_whose_marker_write_fails_ends_task_with_reason_naming_the_failure() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "marker-write-fails";
+        let (task_id, paths, _metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        // A second hard link raises the exit file's link count above one,
+        // which artifact validation refuses as possible tampering, so the
+        // marker write fails however it is attempted.
+        fs::hard_link(&paths.exit, storage.path().join("exit-alias")).unwrap();
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("a kill that terminated the process group must not fail");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        let reason = snapshot.info.status_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("exit marker") && reason.contains("multiple hard links"),
+            "status reason must name the failed marker write: {reason:?}"
+        );
+        let persisted = read_task(&paths.json).unwrap();
+        assert_eq!(persisted.status, BgTaskStatus::Killed);
+        assert_eq!(persisted.status_reason.as_deref(), Some(reason.as_str()));
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
     }
 
     #[test]
