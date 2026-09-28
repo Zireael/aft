@@ -154,6 +154,7 @@ mod tool_call_parity_test;
 mod tool_call_preview_test;
 mod tool_disabled_test;
 mod trace_to_symbol_test;
+mod undo_path_lifecycle_test;
 mod url_fetch_test;
 mod view_assembly_wiring_test;
 mod vue_test;
