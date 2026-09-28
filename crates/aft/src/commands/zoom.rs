@@ -82,6 +82,8 @@ fn zoom_line_starts(source: &str) -> Vec<usize> {
 }
 
 fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) -> usize {
+    #[cfg(test)]
+    ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.set(count.get() + 1));
     let Some(&start) = starts.get(line as usize) else {
         return source.len();
     };
@@ -95,6 +97,14 @@ fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) ->
         .or_else(|| segment.strip_suffix('\n'))
         .unwrap_or(segment);
     start + (col as usize).min(text.len())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ZOOM_BODY_JOIN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_INDEXED_OFFSET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct ZoomEnrichment {
@@ -993,6 +1003,16 @@ fn zoom_one_symbol(
     }
 
     // Only join the body when the response actually displays it.
+    #[cfg(test)]
+    ZOOM_BODY_JOIN_BYTES.with(|bytes| {
+        bytes.set(
+            bytes.get()
+                + effective_lines[start..=end.min(effective_lines.len() - 1)]
+                    .iter()
+                    .map(|line| line.len())
+                    .sum::<usize>(),
+        )
+    });
     let content = if end < effective_lines.len() {
         effective_lines[start..=end].join("\n")
     } else {
@@ -1032,6 +1052,8 @@ fn zoom_one_symbol(
     };
     let (calls_out, called_by) = if include_callgraph {
         if !enrichments.contains_key(resolved_file_path) {
+            #[cfg(test)]
+            ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
             let symbols = match ctx.provider().list_symbols(resolved_file_path) {
                 Ok(symbols) => symbols,
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -1103,7 +1125,11 @@ fn zoom_one_symbol(
         // Preserve file-call order for each name when attributing nested symbols.
         let matching_calls: Vec<&RawCall> = all_file_calls
             .iter()
-            .filter(|call| call.name == target.name)
+            .filter(|call| {
+                #[cfg(test)]
+                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+                call.name == target.name
+            })
             .collect();
         let mut called_by: Vec<CallRef> = Vec::new();
         for sym in all_symbols {
@@ -2584,17 +2610,46 @@ function helper(value: number): number {
     }
 
     #[test]
+    fn indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file() {
+        let source = format!("{}last é\r\n", "line\n".repeat(20_000));
+        let starts = zoom_line_starts(&source);
+        let mut old_prefix_bytes = 0;
+        for _ in 0..80 {
+            let scanned = source
+                .split_inclusive('\n')
+                .take(20_001)
+                .map(str::len)
+                .sum::<usize>();
+            old_prefix_bytes += scanned;
+            assert_eq!(
+                zoom_line_col_to_byte(&source, &starts, 20_000, 5),
+                line_col_to_byte(&source, 20_000, 5)
+            );
+        }
+        let indexed_bytes = source.len();
+        assert!(old_prefix_bytes > indexed_bytes * 70);
+        eprintln!("coordinate prefix bytes: baseline {old_prefix_bytes}, indexed {indexed_bytes}");
+    }
+
+    #[test]
     fn batch_callgraph_reuses_file_enrichment_and_matches_individual_zoom() {
         let ctx = make_ctx();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many.ts");
-        let source = (0..80)
-            .map(|i| format!("function f{i}() {{ f0(); }}\n"))
-            .collect::<String>();
+        let source = format!(
+            "{}{}",
+            "// filler\n".repeat(20_000),
+            (0..80)
+                .map(|i| format!("function f{i}() {{ f0(); }}\n"))
+                .collect::<String>()
+        );
         std::fs::write(&path, &source).unwrap();
         let lines = source.lines().collect::<Vec<_>>();
         let names = (1..40).map(|i| format!("f{i}")).collect::<Vec<_>>();
         let req = make_zoom_request_cg("many", path.to_str().unwrap(), "f1");
+        ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.set(0));
+        ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
+        ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
         let mut enrichments = HashMap::new();
         for name in &names {
             let shared = zoom_one_symbol(
@@ -2627,6 +2682,30 @@ function helper(value: number): number {
             );
         }
         assert_eq!(enrichments.len(), 1);
+        assert_eq!(
+            ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()),
+            names.len() + 1
+        );
+        assert!(ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.get()) > names.len());
+        let enriched = &enrichments[&path];
+        let baseline_comparisons = enriched.symbols.len() * enriched.calls.len();
+        let target_calls = enriched
+            .calls
+            .iter()
+            .filter(|call| call.name == "f1")
+            .count();
+        let indexed_comparisons = enriched.calls.len() + enriched.symbols.len() * target_calls;
+        assert!(baseline_comparisons > indexed_comparisons * 20);
+        assert!(
+            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get())
+                <= enriched.calls.len() * names.len() * 2
+        );
+        eprintln!("zoom incoming call comparisons: baseline {baseline_comparisons}, indexed {indexed_comparisons}");
+        eprintln!(
+            "batch parses/extractions: baseline {}, shared {}",
+            names.len(),
+            enrichments.len()
+        );
     }
 
     #[test]
@@ -3017,9 +3096,29 @@ function helper(value: number): number {
             None,
         );
 
+        ZOOM_BODY_JOIN_BYTES.with(|bytes| bytes.set(0));
         let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
         let content = response["content"].as_str().unwrap();
         assert!(response["success"].as_bool().unwrap());
+        let joined = ZOOM_BODY_JOIN_BYTES.with(|bytes| bytes.get());
+        assert_eq!(joined, 0, "member menus must not build the discarded body");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let symbol = ctx
+            .provider()
+            .list_symbols(&path)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "LargeContainer")
+            .unwrap();
+        let baseline_joined_bytes = lines
+            [symbol.range.start_line as usize..=symbol.range.end_line as usize]
+            .join("\n")
+            .len();
+        eprintln!(
+            "container discarded body bytes: baseline {}, deferred {}",
+            baseline_joined_bytes, joined
+        );
         assert!(
             content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
             "expected member menu, got: {content}"

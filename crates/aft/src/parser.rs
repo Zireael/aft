@@ -1037,6 +1037,12 @@ fn content_hash_for_source(source: &str) -> blake3::Hash {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+    static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn cached_file_is_fresh(
     path: &Path,
     cached_mtime: SystemTime,
@@ -1044,6 +1050,13 @@ fn cached_file_is_fresh(
     cached_content_hash: blake3::Hash,
     fallback_mtime: SystemTime,
 ) -> bool {
+    #[cfg(test)]
+    FRESHNESS_TEST_BARRIERS.with(|slot| {
+        if let Some((arrived, released)) = slot.borrow_mut().take() {
+            arrived.wait();
+            released.wait();
+        }
+    });
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -1674,6 +1687,13 @@ impl FileParser {
                 current_mtime,
             ) {
                 if cached.mtime != current_mtime {
+                    #[cfg(test)]
+                    CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
+                        if let Some((arrived, released)) = slot.borrow_mut().take() {
+                            arrived.wait();
+                            released.wait();
+                        }
+                    });
                     let mut cache =
                         self.symbol_cache
                             .write()
@@ -10632,10 +10652,29 @@ fn body_macros_are_not_items() {
             .collect::<Vec<_>>()
             .join("\n");
         let cols = source_line_end_cols(&source);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headings.md");
+        std::fs::write(&path, &source).unwrap();
+        let mut parser = FileParser::new();
+        let headings = parser.extract_symbols(&path).unwrap();
+        assert_eq!(headings.len(), 5_000);
+        for heading in &headings {
+            let line = heading.range.end_line as usize;
+            assert_eq!(
+                heading.range.end_col,
+                source.lines().nth(line).unwrap_or("").len() as u32
+            );
+        }
         assert_eq!(cols.len(), source.lines().count());
         for (i, line) in source.lines().enumerate() {
             assert_eq!(cols[i], line.len() as u32);
         }
+        let old_line_visits: usize = (0..5_000)
+            .map(|i| source.lines().take(i * 2 + 2).count())
+            .sum();
+        let indexed_visits = cols.len();
+        assert!(old_line_visits > indexed_visits * 1_000);
+        eprintln!("heading line visits: baseline {old_line_visits}, indexed {indexed_visits}");
     }
 
     #[cfg(debug_assertions)]
@@ -10650,6 +10689,106 @@ fn body_macros_are_not_items() {
             assert_eq!(parser.extract_symbols(&file).unwrap()[0].name, "hello");
         }
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
+    }
+
+    #[test]
+    fn touched_cache_readers_do_not_hold_lock_and_observe_replacement() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, file, _, _, _) = cached_freshness_fixture("pub fn one() {}\n");
+        let mut initial = FileParser::new();
+        initial.extract_symbols(&file).unwrap();
+        let cache = initial.symbol_cache();
+        let arrived = Arc::new(Barrier::new(3));
+        let released = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let (file, cache, arrived, released) = (
+                    file.clone(),
+                    cache.clone(),
+                    arrived.clone(),
+                    released.clone(),
+                );
+                std::thread::spawn(move || {
+                    FRESHNESS_TEST_BARRIERS
+                        .with(|slot| *slot.borrow_mut() = Some((arrived, released)));
+                    FileParser::with_symbol_cache(cache)
+                        .extract_symbols(&file)
+                        .unwrap()[0]
+                        .name
+                        .clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        arrived.wait();
+        let unlocked = cache.try_write().is_ok();
+        if !unlocked {
+            released.wait();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            panic!("disk freshness checks must not hold the cache lock");
+        }
+        std::fs::write(&file, "pub fn two() {}\n").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(3, 0)).unwrap();
+        let mut replacement = FileParser::with_symbol_cache(cache);
+        assert_eq!(replacement.extract_symbols(&file).unwrap()[0].name, "two");
+        released.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), "two");
+        }
+    }
+
+    #[test]
+    fn touched_cache_refresh_retries_after_concurrent_replacement() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, file, _, _, _) = cached_freshness_fixture("pub fn one() {}\n");
+        let mut initial = FileParser::new();
+        initial.extract_symbols(&file).unwrap();
+        let cache = initial.symbol_cache();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+        let arrived = Arc::new(Barrier::new(3));
+        let released = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let (file, cache, arrived, released) = (
+                    file.clone(),
+                    cache.clone(),
+                    arrived.clone(),
+                    released.clone(),
+                );
+                std::thread::spawn(move || {
+                    CACHE_REFRESH_TEST_BARRIERS
+                        .with(|slot| *slot.borrow_mut() = Some((arrived, released)));
+                    FileParser::with_symbol_cache(cache)
+                        .extract_symbols(&file)
+                        .unwrap()[0]
+                        .name
+                        .clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        arrived.wait();
+        let unlocked = cache.try_write().is_ok();
+        if !unlocked {
+            released.wait();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            panic!("hashing must not hold the cache lock");
+        }
+        std::fs::write(&file, "pub fn two() {}\n").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(3, 0)).unwrap();
+        assert_eq!(
+            FileParser::with_symbol_cache(cache)
+                .extract_symbols(&file)
+                .unwrap()[0]
+                .name,
+            "two"
+        );
+        released.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), "two");
+        }
     }
 
     #[test]
