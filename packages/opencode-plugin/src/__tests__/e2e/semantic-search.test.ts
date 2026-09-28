@@ -178,13 +178,12 @@ maybeDescribe("e2e semantic search tool", () => {
       sdkCtx,
     );
 
-    // With semantic disabled, a natural-language query degrades to a lexical
-    // (literal grep) fallback rather than stranding the agent with zero
-    // results. The response stays honest — it still names that semantic is
-    // unavailable — but returns usable lexical matches. (Matches the v0.32
-    // degraded-fallback contract; see aft_search_contract_test.)
+    // The tool_call renderer reports incomplete coverage while retaining usable
+    // lexical matches; the raw semantic-disabled reason is structured metadata.
     expect(typeof output).toBe("string");
-    expect(output).toContain("Semantic search is not enabled.");
+    expect(output).toContain("src/lib.rs:1 [lexical match]");
+    expect(output).toContain("pub fn handle_request");
+    expect(output).toContain("Search status: partial/incomplete.");
   });
 
   test("aft_search handles a missing query parameter gracefully", async () => {

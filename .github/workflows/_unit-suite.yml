@@ -238,6 +238,66 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
+
+  plugin-e2e-linux:
+    name: Plugin e2e (${{ matrix.suite }}, Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: opencode-ndjson
+            package: opencode-plugin
+            args: "--path-ignore-patterns '**/subc-parity.e2e.test.ts'"
+          - suite: opencode-subc
+            package: opencode-plugin
+            args: "--test-name-pattern 'subc transport parity sweep'"
+          - suite: pi
+            package: pi-plugin
+            args: ""
+          - suite: bridge
+            package: aft-bridge
+            args: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-linux
+          cache-on-failure: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install search parity dependency
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+      - name: Build aft-bridge dist
+        run: bun run --cwd packages/aft-bridge build
+      - name: Build aft before running e2e
+        run: cargo build -p agent-file-tools --bin aft
+      - name: Fetch pinned subc-core
+        id: subc_core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          path="$(./scripts/fetch-subc-core.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+      # Real process startup, git fixtures and module attachment can exceed Bun's
+      # five-second unit default. Individual deadline assertions remain unchanged.
+      - name: Run e2e suite
+        working-directory: packages/${{ matrix.package }}
+        run: time bun test --timeout 30000 src/__tests__/e2e/ ${{ matrix.args }}
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
 
   unit-linux-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (Linux)
@@ -580,6 +640,7 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
 
   unit-macos-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (macOS)

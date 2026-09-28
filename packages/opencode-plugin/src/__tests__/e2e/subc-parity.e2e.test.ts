@@ -123,7 +123,7 @@ maybeDescribe(describeName, () => {
         const tag = read.hashline_tag as string;
         expect(tag).toBeString();
 
-        const config = { edit_mode: "hashline" } as const;
+        const config = { edit_mode: "hashline", disabled_tools: [] } as const;
         const pool = { getBridge: () => harness.bridge } as unknown as BridgePool;
         const tools = buildOpenCodeToolMap(
           {
@@ -167,7 +167,7 @@ maybeDescribe(describeName, () => {
     try {
       for (const transport of ["ndjson", "subc"] as const) {
         for (const testCase of cases) {
-          const pluginConfig = { edit_mode: testCase.pluginMode } as const;
+          const pluginConfig = { edit_mode: testCase.pluginMode, disabled_tools: [] } as const;
           const surface = buildOpenCodeToolMap(
             {
               pool: {} as PluginContext["pool"],
@@ -287,7 +287,8 @@ maybeDescribe(describeName, () => {
         // Transient index/store building states are honest output, not parity
         // gaps — poll BOTH sides to the converged state before comparing. A
         // side that never converges still fails the assertion verbatim.
-        const converged = (text: string) => !text.includes("building/retrying");
+        const converged = (text: string) =>
+          !text.includes("building/retrying") && !text.includes("[index: building]");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
         expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(

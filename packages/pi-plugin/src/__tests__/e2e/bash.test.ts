@@ -332,9 +332,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(response.success).toBe(true);
     expect(String(response.output)).toContain("lib.ts");
     expect(String(response.output)).toContain("needle");
-    // aft_search_registered defaults false here → footer points at the grep tool.
+    // The default tool surface includes aft_search, so the footer directs code searches there.
     expect(String(response.output)).toContain("DO NOT search code by running grep/rg in bash");
-    expect(String(response.output)).toContain("Use the `grep` tool instead");
+    expect(String(response.output)).toContain("Use the `aft_search` tool instead");
   }, 60_000);
 
   test("rewriter disabled runs cat as raw bash without footer", async () => {

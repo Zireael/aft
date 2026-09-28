@@ -150,8 +150,9 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     JSON.stringify(
       {
         storage_dir: storageDir,
-        search_index: false,
+        search_index: true,
         semantic_search: false,
+        disabled_tools: [],
         experimental_bash_background: true,
         bash_permissions: false,
       },
@@ -312,6 +313,9 @@ async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
 
   const subc = await resolveSubcCore();
   if (!subc.path) {
+    if (process.env.CI === "true" || process.env.SUBC_CORE_BIN?.trim()) {
+      throw new Error(`e2e setup failed: ${subc.skipReason}`);
+    }
     return {
       aftBinaryPath: null,
       subcCorePath: null,
@@ -393,7 +397,8 @@ function requireWireV2Core(
     path: null,
     skipReason:
       `wire-v2 e2e requires a subc-core wire version 2 daemon; ${source} reports ` +
-      `wire version ${reportedVersion}. No wire-v2 release asset is pinned yet.`,
+      `wire version ${reportedVersion}. Set SUBC_CORE_WIRE_VERSION=2 for a compatible daemon, ` +
+      `or unset SUBC_CORE_BIN to use scripts/fetch-subc-core.sh's pinned cache.`,
   };
 }
 
@@ -560,7 +565,9 @@ async function waitForAftCatalog(
     }
     await sleep(200);
   }
-  throw new Error(`timed out waiting for aft in subc catalog: ${lastError}`);
+  throw new Error(
+    `timed out waiting for aft in subc catalog: ${lastError}; stderr:\n${stderrChunks.join("")}`,
+  );
 }
 
 async function catalogHasAft(connectionFile: string): Promise<boolean> {
