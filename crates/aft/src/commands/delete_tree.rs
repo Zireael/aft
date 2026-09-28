@@ -99,8 +99,10 @@ pub(crate) enum UnsupportedKind {
     /// A mount point: removing it would delete another filesystem's contents.
     OtherFilesystem,
     /// Could be recreated, but is rare enough that it is not supported yet.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Fifo,
     /// Recreating one needs privileges the daemon does not have.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Device,
     /// The link target is not UTF-8, and the backup format stores it as text.
     SymlinkNonUtf8Target,
