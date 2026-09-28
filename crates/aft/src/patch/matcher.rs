@@ -217,6 +217,11 @@ fn non_whitespace_unit_count(input: &str) -> usize {
     strip_reflow_whitespace(input).chars().count()
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFLOW_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Find one unique whitespace-reflowed window, returning `(found_line, line_count)`; mirrors `patch-parser.ts:310-351`.
 pub fn find_reflow_match(
     lines: &[&str],
@@ -240,6 +245,8 @@ pub fn find_reflow_match(
         .collect();
 
     for start in start_index..lines.len() {
+        #[cfg(test)]
+        REFLOW_STARTS.with(|count| count.set(count.get() + 1));
         if !has_reflow_content(lines[start]) {
             continue;
         }
@@ -557,6 +564,104 @@ pub fn find_nearest_miss(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tiered_match_choice_matches_sliding_reference_on_mixed_text() {
+        use super::*;
+        let cases = [
+            (
+                vec!["  héllo", "\tworld", "target"],
+                vec![" héllo", " world"],
+                false,
+            ),
+            (vec!["before", "‘quoted’", "after"], vec!["'quoted'"], false),
+            (vec!["a  b", " c", "last"], vec!["a b c"], false),
+            (vec!["x\r", "  y\r", "z"], vec!["x", "y"], false),
+            (vec!["x", " \ty"], vec!["y"], true),
+        ];
+        for (lines, pattern, eof) in cases {
+            let expected = [
+                (
+                    MatchTier::Exact,
+                    try_match(&lines, &pattern, 0, |a, b| a == b, eof),
+                ),
+                (
+                    MatchTier::Rstrip,
+                    try_match(
+                        &lines,
+                        &pattern,
+                        0,
+                        |a, b| a.trim_end() == b.trim_end(),
+                        eof,
+                    ),
+                ),
+                (
+                    MatchTier::Trim,
+                    try_match(&lines, &pattern, 0, |a, b| a.trim() == b.trim(), eof),
+                ),
+                (
+                    MatchTier::Indent,
+                    try_match(
+                        &lines,
+                        &pattern,
+                        0,
+                        |a, b| normalize_indent(a).trim_end() == normalize_indent(b).trim_end(),
+                        eof,
+                    ),
+                ),
+                (
+                    MatchTier::Unicode,
+                    try_match(
+                        &lines,
+                        &pattern,
+                        0,
+                        |a, b| normalize_unicode(a.trim()) == normalize_unicode(b.trim()),
+                        eof,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .find_map(|(tier, found)| {
+                found.map(|found| SequenceMatch {
+                    found,
+                    tier,
+                    line_count: pattern.len(),
+                })
+            })
+            .or_else(|| {
+                (!eof)
+                    .then(|| find_reflow_match(&lines, &pattern, 0))
+                    .flatten()
+                    .map(|(found, line_count)| SequenceMatch {
+                        found,
+                        tier: MatchTier::Reflow,
+                        line_count,
+                    })
+            });
+            assert_eq!(seek_sequence_tiered(&lines, &pattern, 0, eof), expected);
+        }
+    }
+
+    #[test]
+    fn ambiguous_reflow_stops_after_second_window() {
+        let lines = vec!["x y"; 5_000];
+        super::REFLOW_STARTS.with(|count| count.set(0));
+        assert_eq!(super::find_reflow_match(&lines, &["x y"], 0), None);
+        let visited = super::REFLOW_STARTS.with(|count| count.get());
+        assert_eq!(visited, 2);
+        eprintln!(
+            "ambiguous reflow starts: baseline {}, early exit {visited}",
+            lines.len()
+        );
+        assert_eq!(
+            super::find_reflow_match(&[" ", "a b", "  "], &["a b"], 0),
+            Some((1, 1))
+        );
+        assert_eq!(
+            super::find_reflow_match(&["one", "two"], &["absent"], 0),
+            None
+        );
+    }
+
     #[test]
     fn normalized_search_is_linear_on_repeated_prefix_and_preserves_first_match() {
         use std::cell::Cell;
