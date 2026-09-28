@@ -309,6 +309,14 @@ pub(crate) fn prepare_tool_call(
         }
         return Err(result);
     }
+    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id) {
+        return Err(tool_call_result_from_response(
+            bare_name,
+            format_context,
+            response,
+            false,
+        ));
+    }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
         .canonical_cache_root_opt()

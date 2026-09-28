@@ -1509,7 +1509,7 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
 /// watcher, or a changed `.git` marker takes the full path, which is what
 /// schedules the reload, re-verifies, or re-probes topology.
 fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
-    if ctx.subc_unbound_quiesced() {
+    if ctx.subc_unbound_quiesced() || ctx.database_runtime_failed() {
         return false;
     }
     if ctx.cached_worktree_bridge(canonical_root).is_none() {
@@ -2955,6 +2955,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     home_match: ctx.is_home_root(),
                     format_tool_cache_clear_needed: false,
                     run_bash_replay: true,
+                    configure_database_runtime: false,
                     refresh_project_runtime: false,
                     sync_bash_compress_flag: false,
                     reset_filter_registry: false,
@@ -3139,6 +3140,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.shared_artifacts_read_only(),
     );
     if ctx.configure_generation() > 0
+        && !ctx.database_runtime_failed()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
@@ -3212,6 +3214,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 home_match,
                 format_tool_cache_clear_needed: false,
                 run_bash_replay: true,
+                configure_database_runtime: false,
                 refresh_project_runtime: false,
                 sync_bash_compress_flag: false,
                 reset_filter_registry: false,
@@ -3450,6 +3453,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
     ctx.begin_configure_ack_phase("state_commit");
+    ctx.begin_database_runtime();
     // Commit phase: no validation returns after this point.
     if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
         ctx.advance_semantic_fingerprint_generation();
@@ -3722,7 +3726,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    configure_database_runtime(ctx, &canonical_cache_root, &storage_root);
     ctx.begin_configure_ack_phase("maintenance_enqueue");
     let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
@@ -3735,6 +3738,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         home_match,
         format_tool_cache_clear_needed,
         run_bash_replay: !equivalent_warm_config || first_session_bind,
+        configure_database_runtime: true,
         refresh_project_runtime,
         sync_bash_compress_flag,
         reset_filter_registry: !equivalent_warm_config,
@@ -5538,6 +5542,10 @@ pub(crate) fn note_finished_load_handoff(
 }
 
 fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, storage_root: &Path) {
+    wait_on_configure_tail_stage_gate_for_test(
+        canonical_cache_root,
+        ConfigureMaintenanceStage::DatabaseRuntime,
+    );
     ctx.backup()
         .lock()
         .set_db_project_key(crate::path_identity::project_scope_key(
@@ -5549,6 +5557,7 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
         Ok(shared) => {
             ctx.backup().lock().set_db_pool(shared.clone());
             ctx.bash_background().set_db_pool(shared);
+            ctx.finish_database_runtime(true);
         }
         Err(err) => {
             // Do not clear the process-shared handle if another root is already
@@ -5557,8 +5566,9 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
             ctx.app().clear_db_for_path(&db_path);
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
+            ctx.finish_database_runtime(false);
             slog_warn!(
-                "failed to open aft.db at {}: {} — running with JSON-only persistence",
+                "failed to open aft.db at {}: {} — tools refused with database_unavailable",
                 db_path.display(),
                 err
             );
@@ -5646,6 +5656,7 @@ fn should_wait_for_callgraph_start(access: &CallgraphStoreAccess, receiver_prese
 enum ConfigureMaintenanceStage {
     #[default]
     Admission,
+    DatabaseRuntime,
     SessionReplay,
     BashRuntime,
     ProjectRuntime,
@@ -5662,6 +5673,7 @@ impl ConfigureMaintenanceStage {
     fn label(self) -> &'static str {
         match self {
             Self::Admission => "admission",
+            Self::DatabaseRuntime => "database_runtime",
             Self::SessionReplay => "session_replay",
             Self::BashRuntime => "bash_runtime",
             Self::ProjectRuntime => "project_runtime",
@@ -5690,6 +5702,7 @@ impl ConfigureMaintenanceStage {
         matches!(
             self,
             Self::Admission
+                | Self::DatabaseRuntime
                 | Self::SessionReplay
                 | Self::BashRuntime
                 | Self::ProjectRuntime
@@ -6066,7 +6079,9 @@ fn run_configure_maintenance_unit(
 ) -> ConfigureMaintenanceUnitResult {
     let stage = continuation.stage;
     ctx.note_configure_tail_stage(Some(stage.label()));
-    wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
+    if stage != ConfigureMaintenanceStage::DatabaseRuntime {
+        wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
+    }
     // Maintenance units run on whatever executor thread drains the tail, and
     // that thread's log session is left over from its last request. Tag every
     // line this unit logs with the session whose configure queued the job, so
@@ -6231,6 +6246,7 @@ fn run_configure_maintenance_unit_inner(
             }
 
             let session_only = job.run_bash_replay
+                && !job.configure_database_runtime
                 && !job.format_tool_cache_clear_needed
                 && !job.refresh_project_runtime
                 && !job.sync_bash_compress_flag
@@ -6240,6 +6256,13 @@ fn run_configure_maintenance_unit_inner(
                 && job.search_artifact_load_start.is_none()
                 && job.semantic_artifact_load_start.is_none();
             if session_only {
+                if ctx
+                    .database_runtime_refusal("configure-session-replay")
+                    .is_some()
+                {
+                    forget_configure_job_binding(ctx, job);
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
                 replay_configure_session(ctx, job);
                 return ConfigureMaintenanceUnitResult::Complete;
             }
@@ -6290,6 +6313,19 @@ fn run_configure_maintenance_unit_inner(
                 ctx.checkpoint()
                     .lock()
                     .set_storage_dir_for_harness(storage_dir, job.harness.clone());
+            }
+            continuation.stage = ConfigureMaintenanceStage::DatabaseRuntime;
+        }
+        ConfigureMaintenanceStage::DatabaseRuntime => {
+            // Opening SQLite can wait on another root's open or on a database
+            // writer, and can run migrations. Bind readiness does not depend on
+            // persistence, but session replay must use the selected database.
+            if job.configure_database_runtime {
+                configure_database_runtime(ctx, &job.canonical_cache_root, &job.storage_root);
+                if ctx.database_runtime_failed() {
+                    forget_configure_job_binding(ctx, job);
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
             }
             continuation.stage = ConfigureMaintenanceStage::SessionReplay;
         }

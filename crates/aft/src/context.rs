@@ -1426,6 +1426,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) home_match: bool,
     pub(crate) format_tool_cache_clear_needed: bool,
     pub(crate) run_bash_replay: bool,
+    pub(crate) configure_database_runtime: bool,
     pub(crate) refresh_project_runtime: bool,
     pub(crate) sync_bash_compress_flag: bool,
     pub(crate) reset_filter_registry: bool,
@@ -2758,6 +2759,9 @@ pub struct AppContext {
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
+    // 0: never configured, 1: opening, 2: ready, 3: failed. Dispatch must not
+    // run tools while the configured root's database is opening.
+    database_runtime_state: AtomicU8,
     /// Configure-tail work that stepped aside mid-drain so a queued
     /// interactive writer (usually a route bind) could take the actor. The
     /// next tail drain resumes it before anything newly enqueued.
@@ -3235,6 +3239,7 @@ impl AppContext {
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
+            database_runtime_state: AtomicU8::new(0),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
@@ -4760,6 +4765,44 @@ impl AppContext {
 
     pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
+    }
+
+    pub(crate) fn begin_database_runtime(&self) {
+        self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    pub(crate) fn finish_database_runtime(&self, success: bool) {
+        self.database_runtime_state
+            .store(if success { 2 } else { 3 }, Ordering::Release);
+    }
+
+    pub(crate) fn database_runtime_failed(&self) -> bool {
+        self.database_runtime_state.load(Ordering::Acquire) == 3
+    }
+
+    /// Refuse requests before any side effect rather than silently using a
+    /// JSON-only fallback while post-bind database initialization is pending.
+    /// Unconfigured library contexts retain their explicit in-memory behavior.
+    pub fn database_runtime_refusal(&self, request_id: &str) -> Option<crate::protocol::Response> {
+        let (code, message, retryable) = match self.database_runtime_state.load(Ordering::Acquire) {
+            1 => (
+                "database_initializing",
+                "Project persistence is still initializing after route bind; retry the tool shortly. No tool operation was performed.",
+                true,
+            ),
+            3 => (
+                "database_unavailable",
+                "Project persistence could not be opened; reconfigure the project after resolving the database error. No tool operation was performed.",
+                false,
+            ),
+            _ => return None,
+        };
+        Some(crate::protocol::Response::error_with_data(
+            request_id,
+            code,
+            message,
+            serde_json::json!({ "retryable": retryable }),
+        ))
     }
 
     pub(crate) fn compression_aggregate_cache(

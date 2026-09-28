@@ -6539,15 +6539,21 @@ async fn handle_tool_call(
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
 
-    // A tool the session's connect-time config disables is refused before
-    // any other handling: no permission ask, no bash spawn, no dispatch.
-    // `run_tool_call` checks the same snapshot again for the calls it runs.
+    // Refuse disabled tools and persistence-dependent work before admission:
+    // a database open can hold the maintenance lane, so checking only inside
+    // the executor would leave a tool queued behind that unbounded open.
+    // `run_tool_call` checks again when the admitted call runs.
     if let Some(response) = crate::tool_gate::refusal(
         &request_id,
         &bare_name,
         &arguments,
         &identity.disabled_tools,
-    ) {
+    )
+    .or_else(|| {
+        executor
+            .actor_context(&identity.root)
+            .and_then(|ctx| ctx.database_runtime_refusal(&request_id))
+    }) {
         let text = crate::subc_format::format_response_with_context(
             &bare_name,
             &response,
@@ -11028,6 +11034,7 @@ mod tests {
             home_match: false,
             format_tool_cache_clear_needed: false,
             run_bash_replay: false,
+            configure_database_runtime: false,
             refresh_project_runtime: false,
             sync_bash_compress_flag: false,
             reset_filter_registry: false,
@@ -12045,6 +12052,22 @@ mod tests {
     impl ConfiguredRoot {
         /// The caller holds `crate::test_env::hermetic_git_env_guard()`.
         fn new(executor: &Executor) -> Self {
+            let configured = Self::unconfigured(executor);
+            let first = configured.bind_request(0, "opencode");
+            let first = executor.submit(
+                configured.root.clone(),
+                Lane::Mutating,
+                first.id.clone(),
+                Box::new(move |ctx| crate::commands::configure::handle_configure(&first, ctx)),
+            );
+            let first = first
+                .recv_timeout(Duration::from_secs(30))
+                .expect("first bind completes");
+            assert!(first.success, "{}", first.data);
+            configured
+        }
+
+        fn unconfigured(executor: &Executor) -> Self {
             let storage = tempfile::tempdir().unwrap();
             let dir = tempfile::tempdir().unwrap();
             for file in 0..20 {
@@ -12082,25 +12105,13 @@ mod tests {
                 },
             ));
             assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-            let configured = Self {
+            Self {
                 root,
                 canonical_root,
                 ctx,
                 dir,
                 storage,
-            };
-            let first = configured.bind_request(0, "opencode");
-            let first = executor.submit(
-                configured.root.clone(),
-                Lane::Mutating,
-                first.id.clone(),
-                Box::new(move |ctx| crate::commands::configure::handle_configure(&first, ctx)),
-            );
-            let first = first
-                .recv_timeout(Duration::from_secs(30))
-                .expect("first bind completes");
-            assert!(first.success, "{}", first.data);
-            configured
+            }
         }
 
         fn bind_request(&self, index: usize, harness: &str) -> RawRequest {
@@ -12306,6 +12317,182 @@ mod tests {
                 "session {index} is bound"
             );
         }
+    }
+
+    fn assert_database_refuses_wire_tool(
+        executor: &Arc<Executor>,
+        fixture: &ConfiguredRoot,
+        name: &str,
+        expected_code: &str,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let route = route_key(41, 1);
+            let routes = HashMap::from([(route, route_identity(&fixture.root, "herd-session-0"))]);
+            let frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                41,
+                1,
+                7,
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "arguments": { "command": "printf persistence-ready", "background": true }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let (writer, mut replies) = mpsc::channel(8);
+            let (bash_tx, _bash_rx) = mpsc::channel(8);
+            let (touch_tx, _touch_rx) = mpsc::channel(8);
+            let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                handle_tool_call(
+                    &writer,
+                    &frame,
+                    PhaseTrace::new(Instant::now()),
+                    &routes,
+                    &HashMap::new(),
+                    &mut HashMap::new(),
+                    executor,
+                    &Arc::default(),
+                    &Arc::new(AtomicUsize::new(0)),
+                    &Arc::new(Notify::new()),
+                    &PersistentCancelSignal::new(),
+                    &bash_tx,
+                    &touch_tx,
+                    &Arc::new(DispatchPathMetrics::new()),
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                    &mut 1,
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                    |_, _| panic!("a persistence-unready tool must not dispatch"),
+                    &deferred_tx,
+                    false,
+                    1024 * 1024,
+                    &drain::ModuleDrainWindow::default(),
+                ),
+            )
+            .await
+            .expect("persistence refusal must not wait for the executor")
+            .unwrap();
+            let reply = replies.try_recv().expect("immediate tool refusal");
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["isError"], true, "{body}");
+            assert_eq!(body["structuredContent"]["code"], expected_code, "{body}");
+        });
+    }
+
+    #[test]
+    fn route_bind_acks_before_database_open_and_rebinds_beside_blocked_open() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let (_gate, reached, release) =
+            crate::commands::configure::gate_configure_tail_stage_for_test(
+                fixture.canonical_root.clone(),
+                "database_runtime",
+            );
+        let started = Instant::now();
+        let mut first = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
+        let deadline = started + Duration::from_secs(2);
+        let first_response = loop {
+            if let Ok(response) = first.try_recv() {
+                break Some(response);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let first_latency = started.elapsed();
+        if first_response.is_none() {
+            let _ = release.send(());
+            let _ = first.blocking_recv();
+            panic!("route bind waited for database open: {first_latency:?}");
+        }
+        assert!(first_response.unwrap().success);
+        assert!(
+            reached.try_recv().is_err(),
+            "database open ran before maintenance"
+        );
+        assert!(fixture.ctx.search_index_rx().read().unwrap().is_some());
+        assert!(fixture.ctx.search_index().read().unwrap().is_none());
+        let generation = fixture.ctx.configure_generation();
+        for name in ["bash", "aft_safety", "write", "db_set_state", "inspect"] {
+            assert_database_refuses_wire_tool(&executor, &fixture, name, "database_initializing");
+        }
+        assert!(!fixture.storage.path().join("aft.db").exists());
+        let tail = executor.submit_maintenance_async(
+            fixture.root.clone(),
+            Lane::MaintenanceCommit,
+            "subc-maintenance-drain-configure-tail-blocked-database".to_string(),
+            Box::new(|ctx| {
+                let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                Response::success("tail", json!({ "requeue": requeue }))
+            }),
+        );
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("database open reached after ack");
+        assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
+        assert!(!fixture.storage.path().join("aft.db").exists());
+        let mut second = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        let second_response = loop {
+            if let Ok(response) = second.try_recv() {
+                break Some(response);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let second_latency = started.elapsed();
+        let _ = release.send(());
+        assert!(tail.blocking_recv().unwrap().success);
+        if second_response.is_none() {
+            let _ = second.blocking_recv();
+        }
+        assert!(
+            second_response.is_some(),
+            "equivalent bind queued behind database open: {second_latency:?}"
+        );
+        assert!(second_response.unwrap().success);
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+        assert!(fixture.ctx.database_runtime_refusal("ready").is_none());
+        assert!(fixture.ctx.db().is_some());
+        assert!(fixture.storage.path().join("aft.db").is_file());
+        eprintln!("blocked database open: first bind {first_latency:?}, equivalent bind {second_latency:?}");
+    }
+
+    #[test]
+    fn failed_database_open_refuses_tools_and_rebind_retries_persistence() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let db_path = fixture.storage.path().join("aft.db");
+        std::fs::create_dir(&db_path).unwrap();
+        let first = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
+        assert!(first.blocking_recv().unwrap().success);
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+        assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_unavailable");
+        assert!(fixture.ctx.db().is_none());
+        std::fs::remove_dir(&db_path).unwrap();
+        let retry = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
+        assert!(retry.blocking_recv().unwrap().success);
+        assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+        assert!(fixture.ctx.database_runtime_refusal("ready").is_none());
+        assert!(fixture.ctx.db().is_some());
     }
 
     /// Poll a bind's diagnostics until `accept` holds or `within` passes.

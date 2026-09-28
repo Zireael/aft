@@ -3524,6 +3524,7 @@ pub(crate) fn configure_search_order_context_for_test(
         home_match: false,
         format_tool_cache_clear_needed: false,
         run_bash_replay: false,
+        configure_database_runtime: false,
         refresh_project_runtime: true,
         sync_bash_compress_flag: false,
         reset_filter_registry: false,
