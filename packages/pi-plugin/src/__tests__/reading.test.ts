@@ -277,6 +277,43 @@ describe("reading tool adapters", () => {
     expect(result.content[0].text).toContain("src/b.ts:1-1 [function bar]");
   });
 
+  test("aft_zoom parses JSON-stringified targets before dispatch", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+    for (const targets of [
+      [{ path: "src/a.ts", symbol: "foo" }],
+      [
+        { path: "src/a.ts", symbol: "foo" },
+        { path: "src/b.ts", symbol: "bar" },
+      ],
+    ]) {
+      await executeTool(tools.get("aft_zoom")!, { targets: JSON.stringify(targets) });
+      expect(toolArgs(calls.at(-1)!)).toEqual({
+        targets: targets.map(({ path, symbol }) => ({ filePath: path, symbol })),
+      });
+    }
+    await executeTool(tools.get("aft_zoom")!, {
+      targets: JSON.stringify({ path: "src/a.ts", symbol: "foo" }),
+    });
+    expect(toolArgs(calls.at(-1)!)).toEqual({
+      targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+    });
+    expect(calls).toHaveLength(3);
+  });
+
+  test("aft_zoom rejects malformed or wrong-type targets with a targets-specific error", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge();
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+    for (const targets of ["[{bad", "not JSON", "42", 42]) {
+      await expect(executeTool(tools.get("aft_zoom")!, { targets })).rejects.toThrow(
+        /targets must be an array of \{path, symbol\}/,
+      );
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   test("aft_zoom targets returns server partial text without throwing", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({

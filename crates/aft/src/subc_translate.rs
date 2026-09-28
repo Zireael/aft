@@ -120,11 +120,40 @@ fn normalize_zoom_target_aliases(target: &mut Value, index: usize) -> Result<(),
     normalize_path_alias_pair(object, "path", "filePath", true)
 }
 
+fn parse_stringified_collection(
+    value: &mut Value,
+    field: &str,
+    shape: &str,
+    allow_plain_string: bool,
+) -> Result<(), TranslateError> {
+    if let Value::String(raw) = value {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            *value = serde_json::from_str(trimmed).map_err(|_| {
+                invalid_request(format!(
+                    "{field} must be {shape} (got a string that is not valid JSON)"
+                ))
+            })?;
+        } else if !allow_plain_string {
+            return Err(invalid_request(format!(
+                "{field} must be {shape} (got a string that is not valid JSON)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
     normalize_path_alias_pair(map, "path", "filePath", false)?;
     let Some(targets) = map.get_mut("targets") else {
         return Ok(());
     };
+    parse_stringified_collection(targets, "targets", "an array of {path, symbol}", false)?;
+    if !targets.is_array() && !targets.is_object() && !targets.is_null() {
+        return Err(invalid_request(
+            "targets must be an array of {path, symbol} (got an invalid type)",
+        ));
+    }
     match targets {
         Value::Array(items) => {
             for (index, target) in items.iter_mut().enumerate() {
@@ -2576,8 +2605,24 @@ fn translate_inspect(args: Value, project_root: &Path) -> Result<Translated, Tra
     let mut out = Map::new();
 
     if let Some(sections) = map_in.get("sections") {
-        if !is_empty_param(sections) {
-            out.insert("sections".to_string(), sections.clone());
+        let mut sections = sections.clone();
+        parse_stringified_collection(
+            &mut sections,
+            "sections",
+            "a string or array of strings",
+            true,
+        )?;
+        if !is_empty_param(&sections) {
+            if !sections.is_string()
+                && !sections
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string))
+            {
+                return Err(invalid_request(
+                    "sections must be a string or array of strings (got an invalid type)",
+                ));
+            }
+            out.insert("sections".to_string(), sections);
         }
     }
 
@@ -2653,6 +2698,76 @@ mod tests {
         let error = subc_translate_owned("read", canonically_different, project)
             .expect_err("different Unicode normalization");
         assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn inspect_parses_stringified_sections_and_preserves_scalar_sections() {
+        let project = Path::new("/project");
+        for (input, expected) in [
+            (
+                serde_json::json!("[\"dead_code\"]"),
+                serde_json::json!(["dead_code"]),
+            ),
+            (
+                serde_json::json!("[\"todos\",\"dead_code\"]"),
+                serde_json::json!(["todos", "dead_code"]),
+            ),
+            (serde_json::json!("all"), serde_json::json!("all")),
+        ] {
+            let result =
+                subc_translate_owned("inspect", serde_json::json!({"sections":input}), project)
+                    .expect("inspect sections");
+            assert_eq!(result.args["sections"], expected);
+        }
+        let error = subc_translate_owned(
+            "inspect",
+            serde_json::json!({"sections":"[\"dead_code\""}),
+            project,
+        )
+        .expect_err("invalid JSON sections");
+        assert!(
+            error.message.contains("sections") && error.message.contains("valid JSON"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn zoom_parses_stringified_targets_and_rejects_wrong_types() {
+        let project = Path::new("/project");
+        for entries in [
+            serde_json::json!({ "path": "src/a.ts", "symbol": "foo" }),
+            serde_json::json!([{ "path": "src/a.ts", "symbol": "foo" }]),
+            serde_json::json!([
+                { "path": "src/a.ts", "symbol": "foo" },
+                { "path": "src/b.ts", "symbol": "bar" }
+            ]),
+        ] {
+            let parsed =
+                subc_translate_owned("zoom", serde_json::json!({ "targets": entries }), project)
+                    .expect("array targets");
+            let stringified = subc_translate_owned(
+                "zoom",
+                serde_json::json!({ "targets": entries.to_string() }),
+                project,
+            )
+            .expect("stringified targets");
+            assert_eq!(stringified, parsed);
+        }
+        for value in [
+            serde_json::json!("[{bad"),
+            serde_json::json!("not JSON"),
+            serde_json::json!(42),
+        ] {
+            let error =
+                subc_translate_owned("zoom", serde_json::json!({ "targets": value }), project)
+                    .expect_err("invalid targets");
+            assert!(
+                error
+                    .message
+                    .contains("targets must be an array of {path, symbol}"),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

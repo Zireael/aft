@@ -3,7 +3,7 @@
  * Structural overview and symbol/section inspection.
  */
 
-import { coerceBoolean, coerceTargetParam } from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceJsonCollectionParam, coerceTargetParam } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -475,9 +475,10 @@ export function registerReadingTools(
             if (Array.isArray(t)) return !t.every(entryEmpty);
             return !entryEmpty(t);
           };
+          const targetsInput = coerceJsonCollectionParam(params.targets, "targets");
           const hasPath = !isEmptyParam(params.path);
           const hasUrl = !isEmptyParam(params.url);
-          const hasTargets = hasTargetsProvided(params.targets);
+          const hasTargets = hasTargetsProvided(targetsInput);
           const hasSymbols = !isEmptyParam(params.symbols);
           // Coerce stringified booleans and numbers here so they reach the server
           // in the same form the main client sends.
@@ -496,9 +497,9 @@ export function registerReadingTools(
             if (hasPath || hasUrl || hasSymbols) {
               throw new Error("'targets' is mutually exclusive with 'path', 'url', and 'symbols'");
             }
-            const targets = Array.isArray(params.targets)
-              ? (params.targets as Array<{ path: string; symbol: string }>)
-              : ([params.targets] as Array<{ path: string; symbol: string }>);
+            const targets = Array.isArray(targetsInput)
+              ? (targetsInput as Array<{ path: string; symbol: string }>)
+              : ([targetsInput] as Array<{ path: string; symbol: string }>);
             if (targets.length === 0) {
               throw new Error("'targets' must be a non-empty object or array");
             }

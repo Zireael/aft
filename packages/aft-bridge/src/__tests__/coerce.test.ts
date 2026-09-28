@@ -2,9 +2,25 @@ import { describe, expect, test } from "bun:test";
 import {
   coerceAliasedStringParam,
   coerceBoolean,
+  coerceJsonCollectionParam,
   coerceStringArray,
   coerceTargetParam,
 } from "../coerce.js";
+
+describe("coerceJsonCollectionParam", () => {
+  test("parses JSON targets and sections without altering plain sections", () => {
+    expect(coerceJsonCollectionParam('[{"path":"a.ts","symbol":"foo"}]', "targets")).toEqual([
+      { path: "a.ts", symbol: "foo" },
+    ]);
+    expect(coerceJsonCollectionParam('["dead_code"]', "sections")).toEqual(["dead_code"]);
+    expect(coerceJsonCollectionParam("all", "sections")).toBe("all");
+  });
+
+  test("reports malformed JSON with the parameter name", () => {
+    expect(() => coerceJsonCollectionParam("[{bad", "targets")).toThrow(/targets.*valid JSON/);
+    expect(() => coerceJsonCollectionParam("[bad", "sections")).toThrow(/sections.*valid JSON/);
+  });
+});
 
 describe("coerceTargetParam", () => {
   test("passes a single path/URL string through unchanged", () => {

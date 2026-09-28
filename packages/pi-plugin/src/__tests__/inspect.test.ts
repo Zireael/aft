@@ -234,6 +234,34 @@ describe("Pi aft_inspect surface", () => {
     expect(calls[0]?.options).toMatchObject({ transportTimeoutMs: 150_000 });
   });
 
+  test("parses JSON-stringified sections and preserves scalar sections", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => freshTerminal());
+    registerInspectTool(api, makePluginContext(bridge));
+    for (const sections of ['["dead_code"]', '["todos","dead_code"]', "all"]) {
+      await executeTool(tools.get("aft_inspect")!, { sections }, makeExtContext(projectRoot));
+    }
+    expect(calls.map((call) => call.params.arguments.sections)).toEqual([
+      ["dead_code"],
+      ["todos", "dead_code"],
+      "all",
+    ]);
+  });
+
+  test("rejects malformed JSON sections before dispatch", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => freshTerminal());
+    registerInspectTool(api, makePluginContext(bridge));
+    await expect(
+      executeTool(
+        tools.get("aft_inspect")!,
+        { sections: '["dead_code"' },
+        makeExtContext(projectRoot),
+      ),
+    ).rejects.toThrow(/sections.*valid JSON/);
+    expect(calls).toHaveLength(0);
+  });
+
   test("sends explicit inspect arguments with the configured diagnostics budget", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => freshTerminal());

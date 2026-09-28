@@ -198,3 +198,30 @@ export function isEmptyParam(value: unknown): boolean {
   if (typeof value === "object") return Object.keys(value as object).length === 0;
   return false;
 }
+
+/** Decode collection-shaped model arguments without treating malformed JSON as a literal value. */
+export function coerceJsonCollectionParam(value: unknown, field: "targets" | "sections"): unknown {
+  const shape = field === "targets" ? "an array of {path, symbol}" : "a string or array of strings";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        value = JSON.parse(trimmed);
+      } catch {
+        throw new Error(`${field} must be ${shape} (got a string that is not valid JSON)`);
+      }
+    } else if (field === "targets") {
+      throw new Error(`${field} must be ${shape} (got a string that is not valid JSON)`);
+    }
+  }
+  if (value === undefined || value === null) return value;
+  if (field === "targets") {
+    if (Array.isArray(value) || typeof value === "object") return value;
+  } else if (
+    typeof value === "string" ||
+    (Array.isArray(value) && value.every((entry) => typeof entry === "string"))
+  ) {
+    return value;
+  }
+  throw new Error(`${field} must be ${shape} (got an invalid type)`);
+}

@@ -91,6 +91,7 @@ export { execFileSync, execSync, spawn, spawnSync, withWindowsHidden } from "./c
 export {
   coerceAliasedStringParam,
   coerceBoolean,
+  coerceJsonCollectionParam,
   coerceOptionalInt,
   coerceStringArray,
   coerceTargetParam,

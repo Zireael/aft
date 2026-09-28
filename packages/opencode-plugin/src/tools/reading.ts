@@ -1,4 +1,9 @@
-import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceJsonCollectionParam,
+  coerceTargetParam,
+  formatZoomText,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig, toolEnabled } from "../config.js";
@@ -233,9 +238,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           if (Array.isArray(t)) return !t.every(entryEmpty);
           return !entryEmpty(t);
         };
+        const targetsInput = coerceJsonCollectionParam(args.targets, "targets");
         const hasFilePath = !isEmptyParam(args.path);
         const hasUrl = !isEmptyParam(args.url);
-        const hasTargets = hasTargetsProvided(args.targets);
+        const hasTargets = hasTargetsProvided(targetsInput);
         const hasSymbols = !isEmptyParam(args.symbols);
         // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
         const wantCallgraph = coerceBoolean(args.callgraph);
@@ -254,7 +260,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // can't carry a title: OpenCode skips `tool.execute.after` when execute
         // throws, and the plugin `context.metadata()` callback is unbridged, so
         // the return value is the only channel that survives.)
-        const zoomTitle = buildZoomTitle(args);
+        const zoomTitle = buildZoomTitle({
+          ...args,
+          targets: targetsInput as Parameters<typeof buildZoomTitle>[0]["targets"],
+        });
         const zoomDisplay: Record<string, unknown> = { title: zoomTitle };
         if (hasFilePath) zoomDisplay.path = args.path;
         if (hasUrl) zoomDisplay.url = args.url;
@@ -262,7 +271,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           zoomDisplay.symbols =
             typeof args.symbols === "string" ? args.symbols : JSON.stringify(args.symbols);
         }
-        if (hasTargets) zoomDisplay.targets = JSON.stringify(args.targets);
+        if (hasTargets) zoomDisplay.targets = JSON.stringify(targetsInput);
         if (contextLines !== undefined) zoomDisplay.contextLines = contextLines;
         if (wantCallgraph) zoomDisplay.callgraph = true;
         const withMeta = (output: string): ToolResult => ({
@@ -278,9 +287,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           if (hasFilePath || hasUrl || hasSymbols) {
             throw new Error("'targets' is mutually exclusive with 'path', 'url', and 'symbols'");
           }
-          const targets = Array.isArray(args.targets)
-            ? (args.targets as Array<{ path: string; symbol: string }>)
-            : ([args.targets] as Array<{ path: string; symbol: string }>);
+          const targets = Array.isArray(targetsInput)
+            ? (targetsInput as Array<{ path: string; symbol: string }>)
+            : ([targetsInput] as Array<{ path: string; symbol: string }>);
           if (targets.length === 0) {
             throw new Error("'targets' must be a non-empty object or array");
           }

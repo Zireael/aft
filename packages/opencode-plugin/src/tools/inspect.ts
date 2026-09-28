@@ -1,3 +1,4 @@
+import { coerceJsonCollectionParam } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
@@ -336,7 +337,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       ),
     },
     execute: async (args, context): Promise<string> => {
-      const sections = normalizeStringOrArray(args.sections);
+      const sections = normalizeStringOrArray(coerceJsonCollectionParam(args.sections, "sections"));
       const scoped = await resolveAndGateScope(ctx, context, normalizeStringOrArray(args.scope));
       if (scoped.denial) return permissionDeniedResponse(scoped.denial);
       const rawArgs: Record<string, unknown> = {};

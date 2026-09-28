@@ -2,6 +2,7 @@
  * aft_inspect — blocking-fresh codebase health inspection.
  */
 
+import { coerceJsonCollectionParam } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -468,7 +469,9 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     parameters: InspectParams,
     async execute(_toolCallId, params: Static<typeof InspectParams>, _signal, _onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const sections = normalizeStringOrArray(params.sections);
+      const sections = normalizeStringOrArray(
+        coerceJsonCollectionParam(params.sections, "sections"),
+      );
       const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
       const topK = validateOptionalTopK(params.topK);
       const rawArgs: Record<string, unknown> = {};

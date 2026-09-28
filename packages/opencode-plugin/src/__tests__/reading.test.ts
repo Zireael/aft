@@ -271,6 +271,48 @@ describe("reading tool adapters", () => {
     expect(result).toContain("src/b.ts:10-20 [function bar]");
   });
 
+  test("aft_zoom parses JSON-stringified targets before dispatch", async () => {
+    const root = await tempProject();
+    const { toolCallCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      text: "ok",
+    }));
+    for (const targets of [
+      [{ path: "src/a.ts", symbol: "foo" }],
+      [
+        { path: "src/a.ts", symbol: "foo" },
+        { path: "src/b.ts", symbol: "bar" },
+      ],
+    ]) {
+      await tools.aft_zoom.execute(
+        { targets: JSON.stringify(targets) },
+        createMockSdkContext(root),
+      );
+      expect(toolCallCalls.at(-1)?.rawArgs).toEqual({
+        targets: targets.map(({ path, symbol }) => ({ filePath: path, symbol })),
+      });
+    }
+    await tools.aft_zoom.execute(
+      { targets: JSON.stringify({ path: "src/a.ts", symbol: "foo" }) },
+      createMockSdkContext(root),
+    );
+    expect(toolCallCalls.at(-1)?.rawArgs).toEqual({
+      targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+    });
+    expect(toolCallCalls).toHaveLength(3);
+  });
+
+  test("aft_zoom rejects malformed or wrong-type targets with a targets-specific error", async () => {
+    const root = await tempProject();
+    const { toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+    for (const targets of ["[{bad", "not JSON", "42", 42]) {
+      await expect(tools.aft_zoom.execute({ targets }, createMockSdkContext(root))).rejects.toThrow(
+        /targets must be an array of \{path, symbol\}/,
+      );
+    }
+    expect(toolCallCalls).toHaveLength(0);
+  });
+
   test("aft_zoom targets returns server-rendered per-entry failure text", async () => {
     const root = await tempProject();
     const { toolCallCalls, tools } = createMockReadingHarness(() => ({

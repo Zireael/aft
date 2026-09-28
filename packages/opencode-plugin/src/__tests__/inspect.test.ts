@@ -248,6 +248,26 @@ describe("aft_inspect tool", () => {
     expect(toolCallCalls[0]?.options).toMatchObject({ transportTimeoutMs: 150_000 });
   });
 
+  test("parses JSON-stringified sections and preserves scalar sections", async () => {
+    const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal());
+    for (const sections of ['["dead_code"]', '["todos","dead_code"]', "all"]) {
+      await tools.aft_inspect.execute({ sections }, createMockSdkContext(projectRoot));
+    }
+    expect(toolCallCalls.map((call) => call.rawArgs.sections)).toEqual([
+      ["dead_code"],
+      ["todos", "dead_code"],
+      "all",
+    ]);
+  });
+
+  test("rejects malformed JSON sections before dispatch", async () => {
+    const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal());
+    await expect(
+      tools.aft_inspect.execute({ sections: '["dead_code"' }, createMockSdkContext(projectRoot)),
+    ).rejects.toThrow(/sections.*valid JSON/);
+    expect(toolCallCalls).toHaveLength(0);
+  });
+
   test("sends explicit inspect arguments with the configured diagnostics budget", async () => {
     const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal(), {
       inspect: { diagnostics_timeout_ms: 180_000 },
