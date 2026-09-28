@@ -767,3 +767,34 @@ fn a_replaced_config_directory_is_watched_again() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_directory_replaced_under_the_same_name_is_attached_again() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path().join(".cortexkit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut attachment = DirAttachment::new(dir.clone());
+    let mut watched = Vec::new();
+    let mut op = |op: WatchOp<'_>| {
+        if let WatchOp::Watch(path) = op {
+            watched.push(path.to_path_buf());
+        }
+        Ok(())
+    };
+    assert!(attachment.attach(&mut op), "first attach checks the file");
+    assert!(
+        !attachment.attach(&mut op),
+        "an unchanged directory is left alone"
+    );
+
+    // Rename the directory aside and put a new one under the same name.
+    std::fs::rename(&dir, temp.path().join(".cortexkit-old")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    assert!(
+        attachment.attach(&mut op),
+        "the replacement must be attached and its file checked"
+    );
+    drop(op);
+    assert_eq!(watched, vec![dir.clone(), dir]);
+}

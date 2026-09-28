@@ -1004,51 +1004,19 @@ fn run_config_file_watch(
             return;
         }
     };
-    // The directory being watched (the file's own directory, or its parent
-    // while that directory does not exist) and its identity when attached.
-    // Backends that watch by inode keep following a directory that was
-    // renamed aside, so a directory replaced under the same name must be
-    // attached again.
-    let mut watching: Option<(PathBuf, Option<DirIdentity>)> = None;
-    let attach = |watcher: &mut notify::RecommendedWatcher,
-                  watching: &mut Option<(PathBuf, Option<DirIdentity>)>| {
-        let target = if dir.is_dir() {
-            dir.clone()
-        } else {
-            match dir.parent().filter(|parent| parent.is_dir()) {
-                Some(parent) => parent.to_path_buf(),
-                None => return false,
+    let mut attachment = DirAttachment::new(dir.clone());
+    let attach = |watcher: &mut notify::RecommendedWatcher, attachment: &mut DirAttachment| {
+        attachment.attach(&mut |op| match op {
+            WatchOp::Watch(path) => watcher
+                .watch(path, RecursiveMode::NonRecursive)
+                .map_err(|error| error.to_string()),
+            WatchOp::Unwatch(path) => {
+                let _ = watcher.unwatch(path);
+                Ok(())
             }
-        };
-        let identity = dir_identity(&target);
-        if watching
-            .as_ref()
-            .is_some_and(|(path, seen)| *path == target && *seen == identity)
-        {
-            return false;
-        }
-        if let Some((previous, _)) = watching.take() {
-            let _ = watcher.unwatch(&previous);
-        }
-        match watcher.watch(&target, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                // The directory may have been replaced between the identity
-                // read and the watch; the next tick then attaches again.
-                if dir_identity(&target) != identity {
-                    let _ = watcher.unwatch(&target);
-                    return false;
-                }
-                let moved_to_dir = target == dir;
-                *watching = Some((target, identity));
-                moved_to_dir
-            }
-            Err(error) => {
-                crate::slog_warn!("config watch on {} failed: {}", target.display(), error);
-                false
-            }
-        }
+        })
     };
-    attach(&mut watcher, &mut watching);
+    attach(&mut watcher, &mut attachment);
 
     while !shutdown.load(Ordering::Acquire) {
         match rx.recv_timeout(CONFIG_WATCH_POLL) {
@@ -1075,8 +1043,75 @@ fn run_config_file_watch(
         // On every event and every tick: the directory appeared, vanished or
         // was replaced. Move the watch, and check the file, which may have
         // changed together with its directory.
-        if attach(&mut watcher, &mut watching) {
+        if attach(&mut watcher, &mut attachment) {
             on_change();
+        }
+    }
+}
+
+/// A watch request made by [`DirAttachment`].
+pub(crate) enum WatchOp<'a> {
+    Watch(&'a Path),
+    Unwatch(&'a Path),
+}
+
+/// Which directory a config file watch is attached to: the file's own
+/// directory, or its parent while that directory does not exist, together
+/// with the directory's identity when it was attached. Backends that watch
+/// by inode keep following a directory that was renamed aside, so a
+/// directory replaced under the same name must be attached again.
+pub(crate) struct DirAttachment {
+    dir: PathBuf,
+    watching: Option<(PathBuf, Option<DirIdentity>)>,
+}
+
+impl DirAttachment {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            watching: None,
+        }
+    }
+
+    /// Attach, move or re-attach the watch as the directories on disk
+    /// require. Returns true when it (re)attached to the file's own directory,
+    /// so the caller should check the file.
+    pub(crate) fn attach(&mut self, op: &mut dyn FnMut(WatchOp<'_>) -> Result<(), String>) -> bool {
+        let target = if self.dir.is_dir() {
+            self.dir.clone()
+        } else {
+            match self.dir.parent().filter(|parent| parent.is_dir()) {
+                Some(parent) => parent.to_path_buf(),
+                None => return false,
+            }
+        };
+        let identity = dir_identity(&target);
+        if self
+            .watching
+            .as_ref()
+            .is_some_and(|(path, seen)| *path == target && *seen == identity)
+        {
+            return false;
+        }
+        if let Some((previous, _)) = self.watching.take() {
+            let _ = op(WatchOp::Unwatch(&previous));
+        }
+        match op(WatchOp::Watch(&target)) {
+            Ok(()) => {
+                // The directory may have been replaced between the identity
+                // read and the watch; the next tick then attaches again.
+                if dir_identity(&target) != identity {
+                    let _ = op(WatchOp::Unwatch(&target));
+                    return false;
+                }
+                let moved_to_dir = target == self.dir;
+                self.watching = Some((target, identity));
+                moved_to_dir
+            }
+            Err(error) => {
+                crate::slog_warn!("config watch on {} failed: {}", target.display(), error);
+                false
+            }
         }
     }
 }
