@@ -71,9 +71,6 @@ jobs:
   unit:
     name: Unit
     uses: ./.github/workflows/_unit-suite.yml
-    # Called workflows do not see the caller's secrets by default; the
-    # subc-core fetch needs the CK_CI_APP_* secrets to mint its read token.
-    secrets: inherit
     with:
       strict: false
 
