@@ -618,7 +618,7 @@ pub(crate) fn bounded_fallback_walk_files(
     )
 }
 
-fn bounded_fallback_walk_files_with_limits(
+pub(crate) fn bounded_fallback_walk_files_with_limits(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -634,7 +634,7 @@ fn bounded_fallback_walk_files_with_limits(
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         entries_visited += 1;
-        if started.elapsed() >= budget {
+        if started.elapsed() >= budget || entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
         }

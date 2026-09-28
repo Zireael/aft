@@ -1750,6 +1750,7 @@ fn handle_external_semantic_or_hybrid_search(
     );
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 
     search_response(
         req,
@@ -2385,6 +2386,7 @@ struct EngineRanking {
     /// Page entries dropped because their file is not on disk (stale index).
     missing_on_disk: usize,
     anchored_admission: (usize, usize),
+    exact_disclosures: Vec<String>,
 }
 
 /// Report page entries that were dropped because their file is not on disk,
@@ -2404,6 +2406,20 @@ fn disclose_missing_on_disk(
     text.push_str(&format!(
         "\n\n({missing_on_disk} indexed path(s) no longer on disk in this checkout were left out of this page; the index is out of date.)"
     ));
+}
+
+fn disclose_exact_gaps(
+    disclosures: &[String],
+    text: &mut String,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if disclosures.is_empty() { return; }
+    extras.insert("complete".into(), serde_json::json!(false));
+    extras.insert("exact_fallback_gap".into(), serde_json::json!(disclosures));
+    for disclosure in disclosures {
+        text.push('\n');
+        text.push_str(disclosure);
+    }
 }
 
 fn disclose_anchored_admission(
@@ -2652,9 +2668,10 @@ fn run_engine_ranking(
         })
         .collect::<Vec<_>>();
     let exact_input = plan.exact_input.as_deref().unwrap_or(query);
+    let mut exact_disclosures = Vec::new();
     let mut exact_candidates =
         if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
-            exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
+            let outcome = exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
                 .search(
                     Some(&index),
                     project_root,
@@ -2665,8 +2682,11 @@ fn run_engine_ranking(
                     usize::MAX,
                     None,
                 )
-                .map_err(|error| error.to_string())?
-                .results
+                .map_err(|error| error.to_string())?;
+            if let Some(disclosure) = outcome.bound_disclosure {
+                exact_disclosures.push(disclosure);
+            }
+            outcome.results
         } else {
             Vec::new()
         };
@@ -2684,7 +2704,7 @@ fn run_engine_ranking(
                     .map(|variant| (variant.text, false)),
             );
             for (fact_input, exact_form) in fact_inputs {
-                let mut fact_candidates = lane
+                let outcome = lane
                     .search(
                         Some(&index),
                         project_root,
@@ -2695,8 +2715,11 @@ fn run_engine_ranking(
                         usize::MAX,
                         None,
                     )
-                    .map_err(|error| error.to_string())?
-                    .results;
+                    .map_err(|error| error.to_string())?;
+                if let Some(disclosure) = outcome.bound_disclosure {
+                    exact_disclosures.push(disclosure);
+                }
+                let mut fact_candidates = outcome.results;
                 fact_candidates.retain(|candidate| candidate.evidence.kind == EvidenceKind::E1);
                 for candidate in &mut fact_candidates {
                     candidate.evidence.exact_form = exact_form;
@@ -3194,6 +3217,7 @@ fn run_engine_ranking(
         recall_audit,
         missing_on_disk,
         anchored_admission,
+        exact_disclosures,
     })
 }
 
@@ -3326,6 +3350,7 @@ fn handle_engine_only_search(
     }
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     search_response(
         req,
         SearchResponseParts {
@@ -3742,6 +3767,7 @@ fn handle_semantic_or_hybrid_search(
     }
     disclose_missing_on_disk(engine_ranking.missing_on_disk, &mut text, &mut extras);
     disclose_anchored_admission(engine_ranking.anchored_admission, &mut text, &mut extras);
+    disclose_exact_gaps(&engine_ranking.exact_disclosures, &mut text, &mut extras);
 
     search_response(
         req,
@@ -3876,6 +3902,7 @@ fn zero_result_escalation_response(
     extras.insert("escalation_target".to_string(), serde_json::json!("hybrid"));
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     search_response(
         req,
@@ -4056,6 +4083,7 @@ fn semantic_unavailable_or_fallback_response(
         extras.insert("structuredContent".to_string(), ranked.structured_content);
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 
         return search_response(
             req,

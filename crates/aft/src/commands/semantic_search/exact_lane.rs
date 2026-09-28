@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +95,7 @@ pub struct FallbackExactOptions {
 pub struct FallbackExactResult {
     pub verified_set: VerifiedExactSet,
     pub files_visited: usize,
+    pub entries_examined: usize,
     pub bound_reason: Option<String>,
 }
 
@@ -178,11 +178,20 @@ impl ExactLane {
     ) -> FallbackExactResult {
         let file_limit = options.file_limit.unwrap_or(self.fallback_file_limit);
         let result_limit = options.result_limit.unwrap_or(self.fallback_result_limit);
-        let deadline = options.time_limit.map(|d| Instant::now() + d);
+        let budget = options.time_limit.unwrap_or(crate::grep_executor::FALLBACK_WALK_BUDGET);
+        let deadline = Some(Instant::now() + budget);
 
-        // 1. Collect all project files
-        let mut files = Vec::new();
-        collect_files_recursive(project_root, &mut files);
+        // Sort a bounded discovery batch before verification, retaining a lookahead
+        // file and enough headroom to preserve small-directory path ordering.
+        // The shared walker rejects directory symlinks and foreign mounts.
+        let walk = crate::grep_executor::bounded_fallback_walk_files_with_limits(
+            project_root,
+            project_root,
+            &crate::search_index::PathFilters::default(),
+            file_limit.saturating_add(1).max(1024),
+            budget,
+        );
+        let mut files = walk.files;
 
         // Filter tests if needed
         if !include_tests {
@@ -210,8 +219,9 @@ impl ExactLane {
         let mut results = Vec::new();
         let mut file_digests = HashMap::new();
         let mut files_visited = 0;
-        let mut bound_reason: Option<String> = None;
-        let mut stability_void = false;
+        let timed_out = deadline.is_some_and(|dl| Instant::now() >= dl);
+        let mut bound_reason = timed_out.then(|| "time limit".to_string());
+        let mut stability_void = timed_out;
 
         for file_path in files {
             // Check watchdog timer
@@ -259,6 +269,10 @@ impl ExactLane {
             }
         }
 
+        if bound_reason.is_none() && (walk.walk_truncated || walk.skipped_foreign_mounts > 0) {
+            bound_reason = Some("enumeration limit or filesystem boundary".into());
+            stability_void = true;
+        }
         let bound_disclosure = if let Some(ref reason) = bound_reason {
             if reason == "time limit" {
                 Some(format!(
@@ -286,6 +300,7 @@ impl ExactLane {
                 stability_void,
             },
             files_visited,
+            entries_examined: walk.entries_visited,
             bound_reason,
         }
     }
@@ -313,8 +328,14 @@ impl ExactLane {
                 let snapshot = index.unwrap().snapshot();
                 Ok(self.execute_ready_mode(&snapshot, project_root, query, include_tests))
             } else {
-                let fallback =
+                let mut fallback =
                     self.execute_fallback_mode(project_root, query, include_tests, fallback_opts);
+                if let Some(disclosure) = &mut fallback.verified_set.bound_disclosure {
+                    disclosure.push_str(&format!(
+                        "; examined {} directory entries; narrow: path or query",
+                        fallback.entries_examined
+                    ));
+                }
                 Ok(fallback.verified_set)
             }
         })
@@ -344,30 +365,6 @@ impl SearchLane for ExactLane {
     }
 }
 
-/// Recursively collect all regular files in a directory.
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Skip hidden or target/node_modules/git dirs
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.')
-                    || name == "target"
-                    || name == "node_modules"
-                    || name == ".git"
-                {
-                    continue;
-                }
-            }
-            collect_files_recursive(&path, files);
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-}
 
 /// Verify exact matches in file text and return candidates.
 pub fn verify_exact_matches_in_text(

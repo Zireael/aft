@@ -182,7 +182,7 @@ fn test_fallback_determinism_with_injected_delays() {
     );
     assert_eq!(
         first_p20.bound_disclosure.as_deref(),
-        Some("exact pass: bounded (25 files, file limit)")
+        Some("exact pass: bounded (25 files, file limit); examined 37 directory entries; narrow: path or query")
     );
 
     for (p0, p10, p20, direct_p20) in &run_outcomes[1..] {
@@ -321,4 +321,28 @@ fn test_mutation_red_c4_omit_bounded_line() {
         !has_bounded_line,
         "mutant reply omitting bounded line must fail assertion"
     );
+}
+
+#[test]
+fn fallback_bounds_enumeration_of_ineligible_files() {
+    let (dir, paths) = create_temp_corpus_with_files(2000);
+    for name in &paths { fs::write(dir.path().join("src").join(name), [0u8; 32]).unwrap(); }
+    let started = std::time::Instant::now();
+    let result = ExactLane::new().execute_fallback_mode(dir.path(), "target phrase", true,
+        &FallbackExactOptions { file_limit: Some(8), ..Default::default() });
+    eprintln!("fallback: 2000 binary files, {:?}, entries={}, bound={:?}", started.elapsed(), result.entries_examined, result.bound_reason);
+    assert!(result.entries_examined < 2000);
+    assert!(result.bound_reason.is_some(), "enumeration must stop even when no file is eligible");
+}
+
+#[cfg(unix)]
+#[test]
+fn fallback_does_not_follow_directory_aliases() {
+    let (dir, _) = create_temp_corpus_with_files(1);
+    std::os::unix::fs::symlink(dir.path().join("src"), dir.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("src/cycle")).unwrap();
+    let started = std::time::Instant::now();
+    let result = ExactLane::new().execute_fallback_mode(dir.path(), "target phrase", true, &Default::default());
+    eprintln!("fallback cycle: {:?}, verified={}", started.elapsed(), result.files_visited);
+    assert_eq!(result.files_visited, 1, "directory aliases must not repeat verification");
 }
