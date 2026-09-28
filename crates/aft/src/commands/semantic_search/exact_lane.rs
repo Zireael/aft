@@ -275,22 +275,15 @@ impl ExactLane {
             bound_reason = Some("enumeration limit or filesystem boundary".into());
             stability_void = true;
         }
-        let bound_disclosure = if let Some(ref reason) = bound_reason {
+        let bound_disclosure = bound_reason.as_ref().map(|reason| {
             if reason == "time limit" {
-                Some(format!(
+                format!(
                     "exact pass: bounded ({files_visited} files, time limit) - page stability void"
-                ))
+                )
             } else {
-                Some(format!(
-                    "exact pass: bounded ({files_visited} files, {reason})"
-                ))
+                format!("exact pass: bounded ({files_visited} files, {reason})")
             }
-        } else {
-            // When index is not ready and walk completed without hitting other limits
-            Some(format!(
-                "exact pass: bounded ({files_visited} files, index not ready)"
-            ))
-        };
+        });
 
         results.sort_by(score_free_r3_cmp);
 

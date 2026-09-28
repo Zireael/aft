@@ -79,11 +79,9 @@ fn test_fallback_three_fixtures_name_specific_limits() {
     let res_ready = lane.execute_fallback_mode(dir.path(), "target phrase", false, &opts_ready);
     assert_eq!(res_ready.files_visited, 30);
     assert!(res_ready.bound_reason.is_none());
-    let disc_ready = res_ready.verified_set.bound_disclosure.unwrap();
-    assert_eq!(
-        disc_ready,
-        "exact pass: bounded (30 files, index not ready)"
-    );
+    // A walk that finished without hitting a limit withheld nothing, so it
+    // carries no bound disclosure and cannot mark the response incomplete.
+    assert_eq!(res_ready.verified_set.bound_disclosure, None);
 }
 
 #[test]

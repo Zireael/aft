@@ -612,7 +612,7 @@ fn test_read_directory_caps_entries_at_one_thousand() {
     assert_eq!(entries[999], "entry_0999.txt");
     assert_eq!(
         entries[1000],
-        "\n... and 5 more entries (truncated, showing first 1000)"
+        "\nshown 1000 of 1005 entries (display cap; examined 1005 directory entries) · narrow: subdirectory"
     );
 
     let status = aft.shutdown();
