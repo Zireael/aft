@@ -293,8 +293,9 @@ pub(super) fn build_manifest() -> ModuleManifest {
     build_manifest_for_host(crate::bash_background::powershell_available())
 }
 
-/// [`build_manifest`] without the tools `disabled` switches off, so a consumer
-/// that builds its tool surface from the catalog never offers them. The list
+/// [`build_manifest`] minus every tool whose canonical name is in `disabled`,
+/// so a consumer that builds its tool surface from the catalog never offers
+/// them. The list
 /// is the one read when the module connects; dispatch still refuses a disabled
 /// tool that is called anyway.
 pub(super) fn build_manifest_without(disabled: &[String]) -> ModuleManifest {

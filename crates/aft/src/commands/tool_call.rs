@@ -86,7 +86,8 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         // A later session that explicitly disables hashline has no configure
         // response, so its first tool call emits that session's one-shot warning.
         report_registration_downgrade,
-        // Standalone decides from the list configure resolved at connect.
+        // Standalone tool calls use the `disabled_tools` list configure resolved
+        // when the session connected (the root config).
         disabled_tools: None,
     };
 

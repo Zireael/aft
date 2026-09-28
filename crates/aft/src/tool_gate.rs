@@ -193,7 +193,8 @@ mod tests {
         }
         // Native snake_case companion calls are the plugins' plumbing.
         assert_eq!(gating_name("bash_status", &json!({ "task_id": "t" })), None);
-        // The catalog's camelCase spelling is an agent call.
+        // The catalog-style `taskId` argument marks an agent call; the plugins'
+        // native plumbing uses `task_id`.
         assert_eq!(
             gating_name("bash_status", &json!({ "taskId": "t" })),
             Some("bash_status")
