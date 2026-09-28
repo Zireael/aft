@@ -87,7 +87,14 @@ export type {
   SpawnSyncOptions,
   SpawnSyncReturns,
 } from "./child-process.js";
-export { execFileSync, execSync, spawn, spawnSync, withWindowsHidden } from "./child-process.js";
+export {
+  execFile,
+  execFileSync,
+  execSync,
+  spawn,
+  spawnSync,
+  withWindowsHidden,
+} from "./child-process.js";
 export {
   coerceAliasedStringParam,
   coerceBoolean,

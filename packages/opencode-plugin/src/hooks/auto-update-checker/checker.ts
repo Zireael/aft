@@ -1,10 +1,9 @@
-import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getOpenCodeCacheRoot } from "@cortexkit/aft-bridge";
+import { execFile, getOpenCodeCacheRoot } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { debug, log, warn } from "../../logger.js";
