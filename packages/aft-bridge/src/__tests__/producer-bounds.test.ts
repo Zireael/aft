@@ -27,3 +27,11 @@ test("slow durable sink bounds queued bytes and records dropped bytes", async ()
   expect(bytes).toBeLessThan(1100000);
   expect(writes.join("")).toContain("dropped 1048576 bytes");
 });
+
+test("stderr fragments preserve a surrogate pair crossing the cap", () => {
+  const bridge = new BinaryBridge("/fake/aft", process.cwd(), { maxRestarts: 0 });
+  const probe = bridge as unknown as { onStderrData(data: string): void; stderrTail: string[]; logVia(message: string): void };
+  probe.logVia = () => {};
+  probe.onStderrData(`${"x".repeat(65535)}😀tail\n`);
+  expect(probe.stderrTail.at(-1)).toBe("[aft] 😀tail");
+});
