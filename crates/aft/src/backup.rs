@@ -2769,6 +2769,34 @@ impl BackupStore {
         }
     }
 
+    /// Why no entry under `root` would be backed up, when that holds for the
+    /// whole tree: backups are disabled, or `root` lies under a system temp
+    /// directory (every entry of a tree walked without following links is
+    /// physically under its root, so it is under the same temp root).
+    /// `None` means entries under `root` are backed up normally.
+    pub(crate) fn whole_tree_skip_reason(&self, root: &Path) -> Option<BackupSkippedReason> {
+        if !self.policy.enabled || self.policy.max_file_size == Some(0) {
+            return Some(BackupSkippedReason::Disabled);
+        }
+        if self.temp_path_policy_applies() && crate::bash_permissions::is_system_temp_path(root) {
+            return Some(BackupSkippedReason::TempPath);
+        }
+        None
+    }
+
+    /// Record that a mutation of `path` in `op_id` has no undo snapshot, for a
+    /// caller that decided up front not to snapshot (a whole tree whose backups
+    /// are skipped) instead of asking once per entry.
+    pub(crate) fn record_skipped_without_snapshot(
+        &mut self,
+        session: &str,
+        path: &Path,
+        op_id: &str,
+        reason: BackupSkippedReason,
+    ) {
+        self.record_skipped_backup(session, path, Some(op_id), reason);
+    }
+
     fn temp_path_policy_applies(&self) -> bool {
         #[cfg(test)]
         if !self.enforce_temp_path_policy {

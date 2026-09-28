@@ -153,13 +153,30 @@ fn delete_one_or_dir(
         Err(resp) => return Err(resp),
     };
 
-    if is_symlink(&path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to inspect '{}': {}", file, e),
-        )
-    })? {
+    // Inspect the entry itself, never what a symlink points at: a link must be
+    // treated as a link even when its target is a directory or is missing.
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Response::error(
+                &req.id,
+                "file_not_found",
+                format!("delete_file: file not found: {}", file),
+            ));
+        }
+        Err(e) => {
+            return Err(Response::error(
+                &req.id,
+                "io_error",
+                format!("delete_file: failed to inspect '{}': {}", file, e),
+            ));
+        }
+    };
+    let is_symlink = metadata.file_type().is_symlink();
+    let is_dir = metadata.is_dir();
+    let no_backup = no_backup_reason(ctx, &path, is_dir);
+
+    if is_symlink && no_backup.is_none() {
         return Err(Response::error(
             &req.id,
             "invalid_request",
@@ -170,15 +187,7 @@ fn delete_one_or_dir(
         ));
     }
 
-    if !path.exists() {
-        return Err(Response::error(
-            &req.id,
-            "file_not_found",
-            format!("delete_file: file not found: {}", file),
-        ));
-    }
-
-    if path.is_dir() {
+    if is_dir {
         if !recursive {
             return Err(Response::error(
                 &req.id,
@@ -189,10 +198,17 @@ fn delete_one_or_dir(
                 ),
             ));
         }
-        return delete_directory(req, ctx, &path, file, op_id, budget);
+        return delete_directory(req, ctx, &path, file, op_id, budget, no_backup);
     }
 
-    if !path.is_file() {
+    if let Some(reason) = no_backup {
+        // Nothing here would be backed up, so there is no undo whose shape a
+        // symlink, hard link, or special file could break: delete the entry
+        // itself (never a link's target) and report why undo is unavailable.
+        return delete_entry_without_backup(req, ctx, &path, file, op_id, reason);
+    }
+
+    if !metadata.is_file() {
         return Err(Response::error(
             &req.id,
             "unsupported_directory_contents",
@@ -265,12 +281,50 @@ fn delete_one_or_dir(
     Ok(result)
 }
 
-fn is_symlink(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+/// Why nothing at `path` would be backed up, if that holds for the whole
+/// entry. A directory is judged by itself; any other entry by the directory
+/// that holds it, because judging a symlink by its own path would resolve the
+/// link and judge wherever it points instead.
+fn no_backup_reason(
+    ctx: &AppContext,
+    path: &Path,
+    is_dir: bool,
+) -> Option<crate::backup::BackupSkippedReason> {
+    let container = if is_dir {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    ctx.backup().lock().whole_tree_skip_reason(container)
+}
+
+/// Delete one non-directory entry that would not be backed up anyway.
+fn delete_entry_without_backup(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    file: &str,
+    op_id: &str,
+    reason: crate::backup::BackupSkippedReason,
+) -> Result<serde_json::Value, Response> {
+    // `remove_file` unlinks a symlink itself, never its target.
+    std::fs::remove_file(path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!("delete_file: failed to delete: {}", e),
+        )
+    })?;
+    ctx.backup()
+        .lock()
+        .record_skipped_without_snapshot(req.session(), path, op_id, reason);
+    ctx.lsp_notify_watched_config_file(path, FileChangeType::DELETED);
+    let mut result = serde_json::json!({
+        "file": file,
+        "deleted": true,
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, Some(path));
+    Ok(result)
 }
 
 #[cfg(unix)]
@@ -295,6 +349,7 @@ fn delete_directory(
     original: &str,
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
+    no_backup: Option<crate::backup::BackupSkippedReason>,
 ) -> Result<serde_json::Value, Response> {
     // A vanished mounted child can make std::fs::ReadDir::drop panic after
     // closedir returns ENXIO, aborting the daemon. Capture the root device before
@@ -309,6 +364,9 @@ fn delete_directory(
             ),
         )
     })?;
+    if let Some(reason) = no_backup {
+        return delete_directory_without_backups(req, ctx, path, original, op_id, &boundary, reason);
+    }
     // Bound the backup before anything else walks the tree: validation below
     // reads every directory, so it runs only on a tree already known to fit.
     let collected = match collect_files_within_budget(path, &boundary, budget) {
@@ -431,6 +489,120 @@ fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &
     let mut backup = ctx.backup().lock();
     for path in paths {
         backup.discard_latest_operation_entry_for_path(session, op_id, path);
+    }
+}
+
+/// Recursively delete a directory none of whose entries would be backed up
+/// (it is under a system temp directory, or backups are disabled).
+///
+/// With no undo to keep whole, symlinks, hard links, empty directories and
+/// special files need no refusal and there is no copy to budget. A directory
+/// on another filesystem is still refused: removing the tree would descend into
+/// it and delete that filesystem's contents.
+fn delete_directory_without_backups(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    original: &str,
+    op_id: &str,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    reason: crate::backup::BackupSkippedReason,
+) -> Result<serde_json::Value, Response> {
+    let mut files = Vec::new();
+    let mut mounts = Vec::new();
+    collect_for_unbacked_delete(path, boundary, &mut files, &mut mounts).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: failed to walk directory '{}': {}",
+                original, e
+            ),
+        )
+    })?;
+    if !mounts.is_empty() {
+        return Err(Response::error(
+            &req.id,
+            "unsupported_directory_contents",
+            other_filesystem_message(&mounts),
+        ));
+    }
+
+    // Rust's remove_dir_all unlinks symlinks without following them.
+    std::fs::remove_dir_all(path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: failed to remove directory '{}': {}",
+                original, e
+            ),
+        )
+    })?;
+    ctx.backup()
+        .lock()
+        .record_skipped_without_snapshot(req.session(), path, op_id, reason);
+    for file_path in &files {
+        ctx.lsp_notify_watched_config_file(file_path.as_path(), FileChangeType::DELETED);
+    }
+
+    let mut result = serde_json::json!({
+        "file": original,
+        "deleted": true,
+        "is_directory": true,
+        "files_deleted": files.len(),
+        "backup_ids": Vec::<String>::new(),
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
+    Ok(result)
+}
+
+/// Collect every non-directory entry (for change notifications) and every
+/// directory on another filesystem, without following symlinks.
+fn collect_for_unbacked_delete(
+    dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    files: &mut Vec<PathBuf>,
+    mounts: &mut Vec<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // `DirEntry::file_type` does not follow symlinks.
+        if entry.file_type()?.is_dir() {
+            if boundary.should_descend(&path)? {
+                collect_for_unbacked_delete(&path, boundary, files, mounts)?;
+            } else {
+                mounts.push(path.display().to_string());
+            }
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn other_filesystem_message(paths: &[String]) -> String {
+    let mut message = String::from(
+        "aft_delete refuses to delete a directory tree that contains a mount point of another filesystem: removing the tree would delete that filesystem's contents. Unmount it first.",
+    );
+    append_offending_paths(&mut message, paths);
+    message
+}
+
+fn append_offending_paths(message: &mut String, paths: &[String]) {
+    const MAX_PATHS: usize = 5;
+    message.push_str(" Offending path(s): ");
+    message.push_str(
+        &paths
+            .iter()
+            .take(MAX_PATHS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if paths.len() > MAX_PATHS {
+        message.push_str(&format!(", ... and {} more", paths.len() - MAX_PATHS));
     }
 }
 

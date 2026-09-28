@@ -1209,6 +1209,117 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
     assert!(status.success());
 }
 
+/// Under a system temp directory no entry is backed up, so there is no undo
+/// whose shape an empty directory, symlink, hard link or socket could break.
+/// The delete must go through, remove links without touching what they point
+/// at, and report that undo is unavailable.
+#[cfg(unix)]
+#[test]
+fn temp_tree_without_backups_deletes_links_empty_dirs_and_sockets() {
+    use std::os::unix::net::UnixListener;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let tree = scratch.path().join("tree");
+    fs::create_dir_all(tree.join("empty")).unwrap();
+    fs::write(tree.join("file.txt"), "content").unwrap();
+    fs::hard_link(tree.join("file.txt"), tree.join("file-link.txt")).unwrap();
+    let outside_file = outside.path().join("outside.txt");
+    fs::write(&outside_file, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside_file, tree.join("to-outside")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tree.join("to-outside-dir")).unwrap();
+    std::os::unix::fs::symlink("missing-target", tree.join("dangling")).unwrap();
+    let _listener = UnixListener::bind(tree.join("s.sock")).unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_ALLOW_TEMP_BACKUPS",
+        std::ffi::OsStr::new("0"),
+    )]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-tree-delete",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["backup_skipped_reason"], "temp_path", "{resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err(), "tree must be gone");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+    assert!(outside.path().is_dir(), "a linked directory must survive");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// A single symlink under a system temp directory has no undo to protect
+/// either; deleting it removes the link and leaves its target alone.
+#[cfg(unix)]
+#[test]
+fn temp_symlink_without_backups_is_deleted_without_touching_its_target() {
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("target.txt");
+    let link = scratch.path().join("link.txt");
+    fs::write(&target, "target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_ALLOW_TEMP_BACKUPS",
+        std::ffi::OsStr::new("0"),
+    )]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-symlink-delete",
+            "command": "delete_file",
+            "file": link.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["backup_skipped_reason"], "temp_path");
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// The backup budget bounds how much a delete copies into the undo store. A
+/// tree under a system temp directory copies nothing, so it has no budget.
+#[test]
+fn temp_tree_without_backups_is_not_limited_by_the_backup_budget() {
+    let scratch = tempfile::tempdir().unwrap();
+    let tree = scratch.path().join("node_modules");
+    for index in 0..2_100 {
+        let package = tree.join(format!("pkg-{:03}", index / 50));
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join(format!("f{index}.js")), "x").unwrap();
+    }
+
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_ALLOW_TEMP_BACKUPS",
+        std::ffi::OsStr::new("0"),
+    )]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-tree-over-budget",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["files_deleted"], 2_100);
+    assert_eq!(resp["backup_skipped_reason"], "temp_path");
+    assert!(!tree.exists());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn regular_tree_with_files_works_after_validation() {
     let dir = temp_dir("delete_recursive_regular_tree");
