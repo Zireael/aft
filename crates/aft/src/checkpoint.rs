@@ -376,7 +376,19 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, backup_store, None)
+        self.create_impl(session, name, files, Some(backup_store), None)
+    }
+
+    /// Checkpoint exactly `files`, with no fallback to the backup store's
+    /// tracked files. Used by undo to preserve content changed outside AFT
+    /// while the backup store is already borrowed for the restore.
+    pub fn create_for_files(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+    ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, None, None)
     }
 
     pub(crate) fn create_from_captures(
@@ -387,7 +399,7 @@ impl CheckpointStore {
         backup_store: &BackupStore,
         captures: &mut HashMap<PathBuf, CapturedRegularFile>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, backup_store, Some(captures))
+        self.create_impl(session, name, files, Some(backup_store), Some(captures))
     }
 
     fn create_impl(
@@ -395,7 +407,7 @@ impl CheckpointStore {
         session: &str,
         name: &str,
         files: Vec<PathBuf>,
-        backup_store: &BackupStore,
+        backup_store: Option<&BackupStore>,
         mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
@@ -403,10 +415,9 @@ impl CheckpointStore {
         self.run_process_maintenance_once_locked()?;
         self.hydrate_session_locked(session)?;
         let explicit_request = !files.is_empty();
-        let file_list = if files.is_empty() {
-            backup_store.tracked_files(session)
-        } else {
-            files
+        let file_list = match backup_store {
+            Some(backup_store) if files.is_empty() => backup_store.tracked_files(session),
+            _ => files,
         };
 
         let mut file_contents = HashMap::new();

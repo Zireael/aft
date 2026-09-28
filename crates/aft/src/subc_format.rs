@@ -689,8 +689,17 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                                 .into_iter()
                                 .flatten()
                                 .filter_map(Value::as_str)
+                                .filter(|marker| *marker != "external_change_checkpoint")
                                 .map(|marker| marker.replace('_', " "))
                                 .collect::<Vec<_>>();
+                            if let Some(checkpoint) = entry
+                                .get("external_change_checkpoint")
+                                .and_then(Value::as_str)
+                            {
+                                labels.push(format!(
+                                    "external change saved as checkpoint '{checkpoint}'"
+                                ));
+                            }
                             if entry.get("previous_file").and_then(Value::as_bool) == Some(true) {
                                 let generation = entry
                                     .get("generation")

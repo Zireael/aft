@@ -1,22 +1,78 @@
 use crate::context::AppContext;
+use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Name for the checkpoint that preserves files changed outside AFT before
+/// an undo overwrites them: `external-change-<file>-<nanoseconds>`, with
+/// `-and-<n>-more` when an operation undo covers several files.
+fn external_change_checkpoint_name(paths: &[PathBuf]) -> String {
+    let file = paths
+        .first()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string())
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let more = match paths.len() {
+        0 | 1 => String::new(),
+        count => format!("-and-{}-more", count - 1),
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("external-change-{file}{more}-{nanos}")
+}
+
+/// Save `paths` as one session-scoped checkpoint. Every file must make it
+/// in; a partial checkpoint would let undo overwrite the file left out.
+fn save_external_change(
+    ctx: &AppContext,
+    session: &str,
+    paths: &[PathBuf],
+) -> Result<String, AftError> {
+    let name = external_change_checkpoint_name(paths);
+    let mut checkpoints = ctx.checkpoint().lock();
+    let info = checkpoints.create_for_files(session, &name, paths.to_vec())?;
+    if let Some((path, error)) = info.skipped.first() {
+        checkpoints.delete(session, &name);
+        return Err(AftError::IoError {
+            path: path.display().to_string(),
+            message: format!(
+                "undo refused: the file changed outside AFT and could not be saved to a \
+                 checkpoint before the restore: {error}"
+            ),
+        });
+    }
+    Ok(name)
+}
 
 /// Handle the `undo` command: restore the latest operation, or one file when requested.
 ///
 /// Params: `file` (string, optional) — path to a single file to undo.
-/// Returns: `{ path, backup_id }` on success, or `no_undo_history` error.
+/// Returns: `{ path, backup_id }` on success, or `no_undo_history` error. When
+/// the file had changed outside AFT, its content is first saved as a
+/// checkpoint, named in `external_change_checkpoint` and in `warning`.
 pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut backup = ctx.backup().lock();
+    let session = req.session();
+    let mut save = |paths: &[PathBuf]| save_external_change(ctx, session, paths);
 
     let Some(file) = req.params.get("file").and_then(|v| v.as_str()) else {
         if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
             return backup_skipped_response(req, reason);
         }
-        return match backup.restore_last_operation(req.session()) {
-            Ok(operation) => Response::success(
-                &req.id,
-                serde_json::json!({
+        return match backup.restore_last_operation_preserving(req.session(), &mut save) {
+            Ok(operation) => {
+                let mut result = serde_json::json!({
                     "operation": true,
                     "op_id": operation.op_id,
                     "restored_count": operation.restored.len(),
@@ -25,15 +81,19 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
                             "path": file.path.display().to_string(),
                             "backup_id": file.backup_id,
                         });
-                        if let Some(preserved) = file.preserved_external_change {
-                            restored["preserved_external_change"] =
-                                serde_json::Value::String(preserved);
+                        if let Some(checkpoint) = file.external_change_checkpoint {
+                            restored["external_change_checkpoint"] =
+                                serde_json::Value::String(checkpoint);
                         }
                         restored
                     }).collect::<Vec<_>>(),
                     "warnings": operation.warnings,
-                }),
-            ),
+                });
+                if let Some(checkpoint) = operation.external_change_checkpoint {
+                    result["external_change_checkpoint"] = serde_json::Value::String(checkpoint);
+                }
+                Response::success(&req.id, result)
+            }
             Err(e) => Response::error(&req.id, e.code(), e.to_string()),
         };
     };
@@ -54,7 +114,7 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         return backup_skipped_response(req, reason);
     }
 
-    match backup.restore_latest_detailed(req.session(), &resolved) {
+    match backup.restore_latest_detailed(req.session(), &resolved, &mut save) {
         Ok(restored) => {
             let mut result = serde_json::json!({
                 "path": file,
@@ -63,11 +123,8 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
             if let Some(w) = restored.warning {
                 result["warning"] = serde_json::Value::String(w);
             }
-            // Content that changed outside AFT was saved as a new backup
-            // before the restore overwrote it; report that backup's id.
-            // Undoing the file again restores the saved content.
-            if let Some(preserved) = restored.preserved_external_change {
-                result["preserved_external_change"] = serde_json::Value::String(preserved);
+            if let Some(checkpoint) = restored.external_change_checkpoint {
+                result["external_change_checkpoint"] = serde_json::Value::String(checkpoint);
             }
             Response::success(&req.id, result)
         }
