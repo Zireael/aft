@@ -31,12 +31,9 @@ daemon connections report `synapse_daemon_unavailable`; a missing management
 surface reports `synapse_capability_unavailable`. These reasons explain why the
 semantic index is not ready; lexical search remains usable.
 
-The Rust schema/resolver and OpenCode plugin schema already accept `semantic.backend: "synapse"`, carry
-`subc.connection_file` from user config, and reject an implicit/default model by
-leaving the model unset. The Pi plugin's Zod backend enum still omits `synapse`
-(`packages/pi-plugin/src/config.ts`), despite its TypeScript backend union including
-it. That input-validation schema must be updated in the Pi plugin before users can select Synapse
-end to end. The semantic index already records the served
+The Rust schema/resolver and both plugin schemas accept `semantic.backend:
+"synapse"`, carry `subc.connection_file` from user config, and reject an
+implicit/default model by leaving the model unset. The semantic index already records the served
 fingerprint and reports initialization failures. Setup has no provider picker,
 and doctor does not probe Synapse specifically: inspect live semantic-index
 status in a running AFT session rather than interpreting installed binaries as
@@ -65,10 +62,13 @@ Synapse uses the same SubC connection file and management-route identity as
 embeddings, but requires `models.list` and `rerank.score`, not embedding ops.
 The caller must supply whether AFT is running under SubC. A backend constructor
 accepts a rerank model, an optional explicit fingerprint, and a queue budget.
-Without an override, first use (including `fingerprint()`) discovers the model
-via `models.list` and pins its served fingerprint. Discovery failure gives
-`fingerprint()` an `unavailable` revision; scoring reports the actual error.
-Once discovered, the pin does not change until the backend is rebuilt. Every
+Without an override, the first `score()` discovers the model via `models.list`
+under that score call's deadline and pins its served fingerprint. `fingerprint()`
+never performs I/O: it returns the pin or the distinct `undiscovered` revision
+when discovery has not succeeded. The search core must not freeze a rerank result
+under `undiscovered`. Once discovered, the pin does not change until the backend
+is rebuilt. Concurrent score calls wait for the transport and discovery locks
+up to their own deadlines; an expired wait returns `Timeout`. Every
 score request sends `required_fingerprint`, refuses equivalent substitutions,
 and sends both `max_queue_ms` and `deadline_ms`. A refused substitution is
 reported with the old and new pins when discovery still fits the deadline.

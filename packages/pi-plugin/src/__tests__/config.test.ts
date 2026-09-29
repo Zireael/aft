@@ -1123,6 +1123,14 @@ describe("loadAftConfig", () => {
     expect(AftConfigSchema.safeParse({ experimental_search_index: true }).success).toBe(false);
   });
 
+  test("accepts synapse semantic backend in Pi config schema", () => {
+    expect(
+      AftConfigSchema.parse({
+        semantic: { backend: "synapse", model: "gte-modernbert-base-f16" },
+      }).semantic,
+    ).toEqual({ backend: "synapse", model: "gte-modernbert-base-f16" });
+  });
+
   test("accepts formatter_timeout_secs in Pi config schema", () => {
     expect(AftConfigSchema.parse({ formatter_timeout_secs: 7 }).formatter_timeout_secs).toBe(7);
     expect(AftConfigSchema.safeParse({ formatter_timeout_secs: 0 }).success).toBe(false);

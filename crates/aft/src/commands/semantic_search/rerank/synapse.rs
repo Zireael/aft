@@ -1,5 +1,9 @@
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+//! Synapse reranking discovers its model pin only while scoring. `fingerprint()`
+//! performs no I/O and reports `undiscovered` until discovery succeeds. The search
+//! core must not freeze a rerank result under the `undiscovered` revision.
+
+use parking_lot::Mutex;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -49,38 +53,27 @@ impl SynapseReranker {
 }
 
 impl SynapseReranker {
-    fn pin(&self, deadline: Instant) -> Result<String, RerankError> {
-        if let Some(pin) = self
-            .required_fingerprint
-            .lock()
-            .map_err(|_| RerankError::Failed("Synapse pin lock poisoned".into()))?
-            .clone()
-        {
-            return Ok(pin);
-        }
-        let mut transport = self
-            .transport
-            .try_lock()
-            .map_err(|_| RerankError::Unavailable("Synapse rerank transport is busy".into()))?;
-        self.pin_with(&mut transport, deadline)
-    }
     fn pin_with(
         &self,
         transport: &mut SynapseRerankTransport,
         deadline: Instant,
     ) -> Result<String, RerankError> {
-        let mut pin = self
+        if let Some(pin) = self
             .required_fingerprint
-            .lock()
-            .map_err(|_| RerankError::Failed("Synapse pin lock poisoned".into()))?;
-        if let Some(pin) = pin.as_ref() {
-            return Ok(pin.clone());
+            .try_lock_until(deadline)
+            .ok_or(RerankError::Timeout)?
+            .clone()
+        {
+            return Ok(pin);
         }
         let response = transport
             .call("models.list", json!({}), deadline)
             .map_err(transport_error)?;
         let discovered = discover_pin(&response, &self.model)?;
-        *pin = Some(discovered.clone());
+        *self
+            .required_fingerprint
+            .try_lock_until(deadline)
+            .ok_or(RerankError::Timeout)? = Some(discovered.clone());
         Ok(discovered)
     }
 }
@@ -124,8 +117,10 @@ impl RerankBackend for SynapseReranker {
             backend: "synapse",
             model: self.model.clone(),
             revision: self
-                .pin(Instant::now() + Duration::from_millis(1500))
-                .unwrap_or_else(|_| "unavailable".into()),
+                .required_fingerprint
+                .lock()
+                .clone()
+                .unwrap_or_else(|| "undiscovered".into()),
         }
     }
     fn max_batch(&self) -> usize {
@@ -148,8 +143,8 @@ impl RerankBackend for SynapseReranker {
         // Never wait behind another request beyond this call's deadline.
         let mut transport = self
             .transport
-            .try_lock()
-            .map_err(|_| RerankError::Unavailable("Synapse rerank transport is busy".into()))?;
+            .try_lock_until(deadline)
+            .ok_or(RerankError::Timeout)?;
         let pin = self.pin_with(&mut transport, deadline)?;
         let result = score_via(
             &self.model,
@@ -291,6 +286,18 @@ mod tests {
         std::path::PathBuf,
         std::thread::JoinHandle<Vec<Value>>,
     ) {
+        fake_daemon_gated(responses, registered, None)
+    }
+
+    type DiscoveryGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+    fn connection_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::net::TcpListener,
+        Vec<u8>,
+        [u8; subc_transport::DAEMON_ID_LEN],
+    ) {
         use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("connection.json");
@@ -314,6 +321,19 @@ mod tests {
             },
         )
         .unwrap();
+        (directory, path, listener, key, daemon_id)
+    }
+
+    fn fake_daemon_gated(
+        responses: Vec<Option<Value>>,
+        registered: bool,
+        gate: Option<DiscoveryGate>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::thread::JoinHandle<Vec<Value>>,
+    ) {
+        let (directory, path, listener, key, daemon_id) = connection_fixture();
         let server = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -333,9 +353,14 @@ mod tests {
                     assert_eq!(route_body["target"], json!({"kind":"management_surface","module_id":"synapse"}));
                     respond(&mut stream, &route, json!({"op":"route.open","route_channel":7,"route_epoch":1})).await;
                     let mut requests = Vec::new();
+                    let mut gate = gate;
                     for response in responses {
                         let request = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
                         requests.push(serde_json::from_slice(&request.body).unwrap());
+                        if let Some((entered, release)) = gate.take() {
+                            entered.send(()).unwrap();
+                            release.recv_timeout(Duration::from_secs(2)).unwrap();
+                        }
                         if let Some(response) = response { respond(&mut stream, &request, response).await; }
                         else {
                             // Withhold the reply until the client has timed out, then detect any retry.
@@ -373,6 +398,139 @@ mod tests {
     }
 
     #[test]
+    fn synapse_fingerprint_never_routes_and_stays_undiscovered_after_failure() {
+        let (_directory, path, listener, _, _) = connection_fixture();
+        let backend =
+            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
+        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let (_directory, path, server) =
+            fake_daemon(vec![Some(json!({"result":{"models":[]}}))], true);
+        let backend =
+            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
+        assert!(matches!(
+            backend.score(
+                "q",
+                &[RerankDoc { text: "a" }],
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(RerankError::Unavailable(_))
+        ));
+        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    fn spawn_score(
+        backend: std::sync::Arc<SynapseReranker>,
+    ) -> std::thread::JoinHandle<Result<Vec<f32>, RerankError>> {
+        std::thread::spawn(move || {
+            backend.score(
+                "q",
+                &[RerankDoc { text: "a" }],
+                Instant::now() + Duration::from_secs(2),
+            )
+        })
+    }
+
+    #[test]
+    fn synapse_concurrent_scores_wait_for_discovery_and_both_succeed() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (_directory, path, server) = fake_daemon_gated(
+            vec![
+                Some(json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp"]}]}})),
+                Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
+                Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
+            ],
+            true,
+            Some((entered_tx, release_rx)),
+        );
+        let backend = std::sync::Arc::new(
+            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap(),
+        );
+        let first = spawn_score(backend.clone());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Identity remains a cheap read even while discovery is waiting on the daemon.
+        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = backend.score(
+                "q",
+                &[RerankDoc { text: "a" }],
+                Instant::now() + Duration::from_secs(2),
+            );
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waiting = matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            waiting,
+            "second score must wait for the transport rather than skip reranking"
+        );
+        assert_eq!(first.join().unwrap().unwrap(), vec![2.0]);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            vec![2.0]
+        );
+        second.join().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "models.list")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn synapse_concurrent_score_times_out_at_its_lock_deadline() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (_directory, path, server) = fake_daemon_gated(
+            vec![
+                Some(json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp"]}]}})),
+                Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
+            ],
+            true,
+            Some((entered_tx, release_rx)),
+        );
+        let backend = std::sync::Arc::new(
+            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap(),
+        );
+        let first = spawn_score(backend.clone());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+        let result = backend.score("q", &[RerankDoc { text: "a" }], deadline);
+        let finished = Instant::now();
+        release_tx.send(()).unwrap();
+        assert!(matches!(result, Err(RerankError::Timeout)));
+        assert!(
+            finished >= deadline,
+            "lock timeout must not fail before the caller's deadline"
+        );
+        assert!(
+            finished < started + Duration::from_secs(1),
+            "lock wait must stay bounded"
+        );
+        assert_eq!(first.join().unwrap().unwrap(), vec![2.0]);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
     fn synapse_transport_discovers_once_and_keeps_pin_after_model_change() {
         let models =
             |pin| json!({"result":{"models":[{"model_id":"reranker","fingerprints":[pin]}]}});
@@ -387,7 +545,7 @@ mod tests {
         );
         let backend =
             SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
-        assert_eq!(backend.fingerprint().revision, "fp-old");
+        assert_eq!(backend.fingerprint().revision, "undiscovered");
         assert_eq!(
             backend
                 .score(

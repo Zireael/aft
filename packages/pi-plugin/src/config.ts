@@ -680,7 +680,7 @@ const IndexConfigSchema = z.object({
 });
 
 const SemanticConfigSchema = z.object({
-  backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
+  backend: z.enum(["fastembed", "openai_compatible", "ollama", "synapse"]).optional(),
   model: z.string().trim().min(1).optional(),
   base_url: z.string().trim().min(1).optional(),
   api_key_env: z.string().trim().min(1).optional(),
