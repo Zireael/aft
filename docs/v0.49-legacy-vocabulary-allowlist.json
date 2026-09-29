@@ -1585,11 +1585,11 @@
     },
     {
       "path": "crates/aft/tests/integration/standalone_search_deferred_test.rs",
-      "line": 932,
+      "line": 935,
       "column": 14,
       "token": "filePath",
       "text": "\"filePath\": \"source.ts\",",
-      "location": "line 932, column 14",
+      "location": "line 935, column 14",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
