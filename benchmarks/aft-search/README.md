@@ -461,6 +461,25 @@ Re-records so far:
   0.220238 -> 0.228423 (56 rows), census-weighted MRR 0.162052 -> 0.239927,
   the new `regex` shape and `identifier_not_definition_first` mechanism both
   MRR@10 0.285714. Exact recall (1.000) and concept recall are unchanged.
+- 2026-09-29, after train 238 ranked the complete regex/literal candidate set
+  before cutting each page (#375). Replayed the unchanged 56-row reference on
+  release builds of `57fb117b9` and `2b7e26e4e` in the same Linux aarch64
+  container. The old binary reproduced every reference row byte-for-byte;
+  the new binary changed only the seven regex rows, `followup-census:900003`–
+  `900009`. Rows `900003`–`900007` went from recorded page-invariance misses
+  to invariant rank-1 hits. Row `900008` was already a scored rank-1 hit,
+  but its retrieval depth fell 31 -> 3 and two lower-ranked paths swapped.
+  Row `900009` kept its ranked paths and rank-1 hit while its retrieval depth
+  fell 8 -> 2. The complete-set ranking removes scan-order paging defects
+  without displacing any other row. Re-recorded with
+  `scripts/telemetry/cost-gate.sh --search-quality --mode record-reference`
+  on the release build of `2b7e26e4e` (Linux aarch64, binary sha256
+  `11ade1376560...`). `paged` MRR@10 0.228423 -> 0.317708, hit@5 0.357143
+  -> 0.446429, census-weighted MRR 0.239927 -> 0.434615; the
+  `identifier_not_definition_first` MRR@10 rose 0.285714 -> 1.000000.
+  Exact recall stayed 1.000 and concept recall stayed 0.639423, both
+  re-measured in the recording run. The six `reference_not_page_invariant`
+  flags remain for a separate change.
 
 ## Prefrontal search-miss rows
 

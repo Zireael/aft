@@ -8,7 +8,8 @@
     "paging"
   ],
   "slices": [
-    "repeat-breaker-observes-bash"
+    "repeat-breaker-observes-bash",
+    "rerecord-reference-after-regex-route-ranking"
   ],
-  "note": "The repeat breaker observes bash and powershell calls on the subc path and the standalone raw-bash path. No ranking-fence files."
+  "note": "The repeat breaker observes bash and powershell calls on the subc path and the standalone raw-bash path. Re-records the real-query reference after train 238 ranked the complete regex candidate set before paging (#375), so later non-ranking trains compare against the engine now on main. No ranking-fence files."
 }
