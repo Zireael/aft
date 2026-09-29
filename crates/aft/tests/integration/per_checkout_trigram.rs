@@ -412,11 +412,21 @@ fn trigram_inflight_reconcile_cannot_clear_intent() {
 
 #[test]
 fn trigram_ten_and_forty_view_memory() {
-    let files: &[(&str, &[u8])] = &[
-        ("a.txt", b"needle alphabet\n"),
-        ("b.txt", b"second needle\n"),
-    ];
-    let shared = segment(files);
+    let corpus = (0..128)
+        .map(|file| {
+            (
+                format!("src/file_{file}.txt"),
+                format!("fn example_{file}() {{ needle }}\n")
+                    .repeat(64)
+                    .into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let files = corpus
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let shared = segment(&files);
     let encoded = segment_store::assemble(
         &policy(),
         files.iter().map(|(path, bytes)| {
@@ -433,15 +443,31 @@ fn trigram_ten_and_forty_view_memory() {
     .unwrap()
     .bytes
     .len();
+    let shared_resident = std::mem::size_of::<SegmentReader>()
+        + shared
+            .files()
+            .iter()
+            .map(|file| std::mem::size_of_val(file) + file.rel_path.as_bytes().len())
+            .sum::<usize>()
+        + shared.trigram_count() * std::mem::size_of::<(u32, u64, u32)>()
+        + files
+            .iter()
+            .map(|(_, bytes)| {
+                TrigramPayload::extract(bytes, &policy()).records.len()
+                    * std::mem::size_of::<segment_store::Posting>()
+            })
+            .sum::<usize>();
     for count in [10, 40] {
         let views = (0..count)
             .map(|_| {
-                let mut delta = LiveDelta::new(generation(files, "a"));
-                delta.apply(
-                    rel("added.txt"),
-                    live_delta::entry(b"local needle\n", &policy(), 1),
-                );
-                (index(shared.clone(), &delta, files), delta)
+                let mut delta = LiveDelta::new(generation(&files, "a"));
+                for edit in 0..4 {
+                    delta.apply(
+                        rel(&format!("local_{edit}.txt")),
+                        live_delta::entry(b"local needle\n", &policy(), 1),
+                    );
+                }
+                (index(shared.clone(), &delta, &files), delta)
             })
             .collect::<Vec<_>>();
         assert_eq!(Arc::strong_count(&shared), count + 1);
@@ -450,6 +476,28 @@ fn trigram_ten_and_forty_view_memory() {
             .map(|(index, delta)| {
                 index.checkout_bytes()
                     + std::mem::size_of::<LiveDelta>()
+                    + delta
+                        .base()
+                        .manifest()
+                        .entries()
+                        .map(|(path, entry)| {
+                            path.as_bytes().len()
+                                + std::mem::size_of_val(entry)
+                                + entry
+                                    .plane_state(aft::blob_store::v2::FamilyPlane::Trigram)
+                                    .map_or(0, |state| match state {
+                                        PlaneState::Ready { key } => key.len(),
+                                        _ => 0,
+                                    })
+                        })
+                        .sum::<usize>()
+                    + delta
+                        .journal()
+                        .iter()
+                        .map(|record| {
+                            std::mem::size_of_val(record) + record.rel_path.as_bytes().len()
+                        })
+                        .sum::<usize>()
                     + delta
                         .snapshot()
                         .live_entries()
@@ -471,7 +519,7 @@ fn trigram_ten_and_forty_view_memory() {
                         .sum::<usize>()
             })
             .sum::<usize>();
-        eprintln!("trigram memory views={count} shared_segment_encoded_bytes={encoded} checkout_live_logical_bytes={checkout_bytes} (allocator and manifest overhead excluded)");
+        eprintln!("trigram memory views={count} corpus_files=128 local_edits_per_view=4 shared_segment_encoded_bytes={encoded} shared_segment_resident_estimate={shared_resident} checkout_metadata_and_live_logical_bytes={checkout_bytes} (allocator/BTree node/Arc overhead excluded)");
     }
 }
 
@@ -625,7 +673,6 @@ fn trigram_real_restart_and_kill_strict_reconcile() {
 fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
     use aft::blob_store::v2::FamilyPlane;
     use aft::views::contracts::ViewAccess;
-    use aft::views::first_load::{FirstLoadDriver, QueryState};
     use aft::views::trigram::{Opener, Publisher, TrigramDriver};
     let storage = tempfile::tempdir().unwrap();
     let root = storage.path().join("checkout");
@@ -683,4 +730,152 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
         driver.installed_state(&access, FamilyPlane::Trigram).1,
         vec![root.join("a.txt")]
     );
+}
+
+#[test]
+fn trigram_write_success_and_validation_rollback_without_watcher() {
+    use aft::{config::Config, context::AppContext, language::StubProvider, protocol::RawRequest};
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    let files: &[(&str, &[u8])] = &[("a.ts", b"const old = 1;\n")];
+    write(&root, "a.ts", files[0].1);
+    let delta = Arc::new(Mutex::new(LiveDelta::new(generation(files, "a"))));
+    intent::register(&root, &delta);
+    let plane = index(segment(files), &delta.lock().unwrap(), files);
+    let ctx = AppContext::new(
+        Box::new(StubProvider),
+        Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        },
+    );
+    let request = |content: &str| {
+        serde_json::from_value::<RawRequest>(serde_json::json!({"id":"intent-write", "command":"write", "file":root.join("a.ts"), "content":content})).unwrap()
+    };
+    let success = aft::commands::write::handle_write(&request("const needle = 2;\n"), &ctx);
+    assert_eq!(serde_json::to_value(success).unwrap()["success"], true);
+    assert_eq!(
+        plane
+            .query(&root, &delta.lock().unwrap().snapshot(), "needle")
+            .matches
+            .len(),
+        1
+    );
+    live_delta::reconcile(&mut delta.lock().unwrap(), &root, &policy());
+    let invalid = aft::commands::write::handle_write(&request("const needle = {\n"), &ctx);
+    let invalid = serde_json::to_value(invalid).unwrap();
+    assert_eq!(invalid["syntax_valid"], false, "{invalid}");
+    assert_eq!(
+        fs::read_to_string(root.join("a.ts")).unwrap(),
+        "const needle = 2;\n"
+    );
+    assert!(delta
+        .lock()
+        .unwrap()
+        .snapshot()
+        .pending_intent()
+        .next()
+        .is_some());
+    parity(&root, &delta.lock().unwrap(), &plane, "needle");
+}
+
+#[test]
+fn trigram_partial_io_error_keeps_written_bytes_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
+    write(directory.path(), "a.txt", files[0].1);
+    let delta = Arc::new(Mutex::new(LiveDelta::new(generation(files, "a"))));
+    intent::register(directory.path(), &delta);
+    let plane = index(segment(files), &delta.lock().unwrap(), files);
+    let failed_write = || -> std::io::Result<()> {
+        let path = directory.path().join("a.txt");
+        let _intent = intent::record_paths([path.as_path()]);
+        fs::write(path, b"partial needle\n")?;
+        // A real error after the first write models a multi-file mutator's
+        // partial failure, rather than pretending the operation was atomic.
+        fs::write(directory.path(), b"cannot write a directory")?;
+        Ok(())
+    };
+    assert!(failed_write().is_err());
+    let delta = delta.lock().unwrap();
+    assert!(delta.snapshot().pending_intent().next().is_some());
+    assert_eq!(
+        plane
+            .query(directory.path(), &delta.snapshot(), "needle")
+            .matches
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn trigram_materializer_preserves_shared_segment_and_other_planes() {
+    use aft::blob_store::v2::FamilyPlane;
+    use aft::views::contracts::{PlaneAdapter, ViewAccess};
+    use aft::views::trigram::{materialize, TrigramAdapter};
+    let storage = tempfile::tempdir().unwrap();
+    let root = storage.path().join("checkout");
+    fs::create_dir_all(&root).unwrap();
+    write(&root, "a.txt", b"old\n");
+    let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+    let registration = registry.register_view("scope", &root).unwrap();
+    let access = ViewAccess::Owner(registration.clone());
+    let mut manifest = generation(&[("a.txt", b"old\n")], "a").manifest().clone();
+    if let EntryV2::Regular { planes, .. } = manifest.get_mut(&rel("a.txt")).unwrap() {
+        planes.semantic = Some(PlaneState::pending("model work"));
+    }
+    let observed = live_delta::strict_walk(&root, &policy(), 1);
+    let first = materialize(
+        &registration,
+        &root,
+        &mut manifest,
+        &observed.entries,
+        policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest
+            .get(&rel("a.txt"))
+            .unwrap()
+            .plane_state(FamilyPlane::Semantic),
+        Some(&PlaneState::pending("model work"))
+    );
+    let first_generation = Arc::new(OpenGeneration::new("a", manifest.clone(), None));
+    let adapter = TrigramAdapter::new(storage.path().to_path_buf(), policy());
+    adapter.open_generation(&access, &first_generation).unwrap();
+    fs::rename(root.join("a.txt"), root.join("renamed.txt")).unwrap();
+    write(&root, "renamed.txt", b"new needle\n");
+    manifest.set(rel("a.txt"), None).unwrap();
+    manifest
+        .set(
+            rel("renamed.txt"),
+            generation(&[("renamed.txt", b"new needle\n")], "b")
+                .manifest()
+                .get(&rel("renamed.txt"))
+                .cloned(),
+        )
+        .unwrap();
+    let observed = live_delta::strict_walk(&root, &policy(), 2);
+    let next = materialize(
+        &registration,
+        &root,
+        &mut manifest,
+        &observed.entries,
+        policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        first.segment, next.segment,
+        "a checkout edit must retain the shared segment"
+    );
+    let next_generation = Arc::new(OpenGeneration::new("b", manifest, None));
+    adapter.open_generation(&access, &next_generation).unwrap();
+    let a = adapter.resident("scope", "a").unwrap();
+    let b = adapter.resident("scope", "b").unwrap();
+    assert!(Arc::ptr_eq(&a.segment, &b.segment));
+    let delta = LiveDelta::new(next_generation);
+    parity(&root, &delta, &b, "needle");
+    assert_eq!(b.query(&root, &delta.snapshot(), "needle").matches.len(), 1);
+    adapter.release_generation(&access, "a");
+    assert!(adapter.resident("scope", "a").is_none());
 }

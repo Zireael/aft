@@ -362,8 +362,9 @@ pub type Opener = dyn Fn(
     + Send
     + Sync;
 
-/// Implements `FirstLoadDriver` for strict source loading and `QueryState`
-/// for queries that need an atomically installed generation and live delta.
+/// Checkout-local trigram helpers for the runtime's composite driver. This
+/// type does not implement or register `FirstLoadDriver` or `QueryState`;
+/// the runtime alone combines all planes into those contracts.
 /// Construction is opt-in; it does not register global search routing.
 pub struct TrigramDriver {
     root: PathBuf,
@@ -434,14 +435,14 @@ fn revision(delta: &super::snapshot::LiveDelta) -> u64 {
         .wrapping_add(snapshot.epoch())
 }
 
-impl super::first_load::FirstLoadDriver for TrigramDriver {
-    fn producers(&self, _: &super::contracts::ViewAccess) -> super::manifest_v2::Producers {
+impl TrigramDriver {
+    pub fn producers(&self, _: &super::contracts::ViewAccess) -> super::manifest_v2::Producers {
         self.producers.clone()
     }
-    fn head_tree(&self, _: &super::contracts::ViewAccess) -> Option<String> {
+    pub fn head_tree(&self, _: &super::contracts::ViewAccess) -> Option<String> {
         None
     }
-    fn reconcile(
+    pub fn reconcile(
         &self,
         access: &super::contracts::ViewAccess,
     ) -> Result<super::first_load::ReconciledCheckout, super::contracts::PlaneError> {
@@ -459,10 +460,10 @@ impl super::first_load::FirstLoadDriver for TrigramDriver {
             entries: walk.entries,
         })
     }
-    fn revision(&self, _: &super::contracts::ViewAccess) -> u64 {
+    pub fn revision(&self, _: &super::contracts::ViewAccess) -> u64 {
         revision(&self.delta.lock().unwrap_or_else(|e| e.into_inner()))
     }
-    fn build_own_generation(
+    pub fn build_own_generation(
         &self,
         access: &super::contracts::ViewAccess,
         snapshot: &Snapshot,
@@ -471,7 +472,7 @@ impl super::first_load::FirstLoadDriver for TrigramDriver {
         self.validate(access)?;
         (self.publish)(access, snapshot, seed_derived)
     }
-    fn install(
+    pub fn install(
         &self,
         access: &super::contracts::ViewAccess,
         snapshot: &Snapshot,
@@ -498,8 +499,8 @@ impl super::first_load::FirstLoadDriver for TrigramDriver {
     }
 }
 
-impl super::first_load::QueryState for TrigramDriver {
-    fn installed_state(
+impl TrigramDriver {
+    pub fn installed_state(
         &self,
         access: &super::contracts::ViewAccess,
         plane: FamilyPlane,
@@ -611,6 +612,28 @@ pub fn materialize(
             content: *content,
             size: *size,
         });
+    }
+    let existing_segment = manifest
+        .header()
+        .segment
+        .as_ref()
+        .and_then(|id| crate::blob_store::v2::parse_hex32(id));
+    if let Some(id) = existing_segment {
+        pin.protect_segment(&id)
+            .map_err(|e| plane_error(e.to_string()))?;
+        let path = crate::blob_store::v2::segment_path(
+            registration.registry().storage(),
+            registration.family(),
+            &id,
+        )
+        .map_err(|e| plane_error(e.to_string()))?;
+        let segment = SegmentReader::open(&path).map_err(|e| plane_error(e.to_string()))?;
+        if segment.id() != id || segment.policy_fingerprint() != policy.fingerprint() {
+            return Err(plane_error("seed segment identity or producer mismatch"));
+        }
+        // Keep the verified shared segment. Replacement keys and tombstones in
+        // the projected manifest become the generation's small overlay at open.
+        return Ok(MaterializedTrigrams { pin, segment: id });
     }
     let segment = super::segment_store::build_from_blobs(&store, &members, &policy)
         .map_err(|e| plane_error(e.to_string()))?;
