@@ -3037,6 +3037,32 @@ fn subc_bridge_repeat_breaker_uses_shared_transport_fixture() {
 }
 
 #[test]
+fn subc_bridge_repeat_breaker_steers_a_rewritten_bash_grep() {
+    // Production mode applies the route bind's config document, which is what
+    // turns the bash rewrite on.
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_repeat_breaker_steers_a_rewritten_bash_grep",
+        Duration::from_secs(90),
+        drive_rewritten_bash_repeat_breaker_daemon,
+        |_, _, _| {},
+        rewritten_bash_repeat_dispatch,
+    );
+}
+
+fn rewritten_bash_repeat_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected rewritten bash repeat command: {other}"),
+        ),
+    }
+}
+
+#[test]
 fn subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response",
@@ -4124,6 +4150,69 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
             "bash_drain_completions",
             json!({}),
             "repeat breaker drain between agent calls",
+        )
+        .await;
+        if index < 2 {
+            tokio::time::sleep(Duration::from_secs(16)).await;
+        }
+    }
+
+    super::repeat_breaker_test::assert_transport_repeat_sequence(&texts);
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Subc answers bash on its own deferred path rather than through the shared
+/// tool-call runner. A model repeating one bash grep that the rewrite answers
+/// must still be steered on the third call.
+async fn drive_rewritten_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    super::repeat_breaker_test::write_rewritten_grep_fixture(&root1);
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "repeat-breaker-bash-session",
+        json!({
+            "bash": { "rewrite": true },
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+    let mut texts = Vec::new();
+
+    for (index, description) in super::repeat_breaker_test::DESCRIPTIONS
+        .into_iter()
+        .enumerate()
+    {
+        let corr = 900 + index as u64;
+        let response = call_tool_response(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            super::repeat_breaker_test::rewritten_bash_grep_arguments(description),
+            "repeated rewritten bash grep",
+        )
+        .await;
+        assert_tool_success(&response, "repeated rewritten bash grep");
+        let text = response["text"].as_str().unwrap_or_default().to_string();
+        super::repeat_breaker_test::assert_answered_by_rewrite(&text);
+        texts.push(text);
+        // The plugin drains completions after every agent tool call on the
+        // same route; the breaker must not count that plumbing as a call.
+        let _drain = call_tool_response(
+            &mut stream,
+            1,
+            corr + 50,
+            "bash_drain_completions",
+            json!({}),
+            "repeat breaker drain between bash calls",
         )
         .await;
         if index < 2 {

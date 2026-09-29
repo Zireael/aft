@@ -448,6 +448,80 @@ pub(crate) fn finish_tool_call_response(
     ToolCallResult { text, response }
 }
 
+/// One agent tool call as the repeat breaker sees it, captured from the call's
+/// arguments before execution consumes them.
+///
+/// Every path that answers an agent tool call must observe it exactly once,
+/// through this type. The shared runner does so for most tools; subc answers
+/// `bash` and `powershell` on its own deferred path and observes there. A
+/// path that skips observation leaves the breaker blind to that tool: a model
+/// can then repeat one bash command indefinitely without being steered.
+#[derive(Debug, Clone)]
+pub(crate) struct RepeatObservation {
+    session_id: String,
+    tool: String,
+    semantic_key: String,
+}
+
+impl RepeatObservation {
+    /// Returns `None` for calls the breaker must not count.
+    ///
+    /// Plumbing calls are the plugin's, not the model's: after every agent tool
+    /// call the plugin drains completions (`bash_drain_completions`) under the
+    /// same session, so counting them would reset the run on every agent call
+    /// and the breaker could never see two agent calls in a row. The first live
+    /// probe found exactly that: five identical bash calls over 78 s, no steer.
+    ///
+    /// A preview is the first half of a hoisted mutation (`write`, `edit`,
+    /// `apply_patch`): the plugin previews, asks for permission, then applies,
+    /// all for one model call. Counting the preview as well would count every
+    /// mutation twice, fire on the second genuine repeat, and misread the
+    /// preview's different text as drifting output.
+    ///
+    /// The key is taken from the arguments the model sent. A bash command that
+    /// AFT answers by rewriting it into another tool (for example `grep` into
+    /// the grep tool) still keys as `bash` with its `command` and `workdir`,
+    /// because that is the call the model repeats.
+    pub(crate) fn for_agent_call(
+        session_id: &str,
+        tool: &str,
+        args: &Value,
+        preview: bool,
+    ) -> Option<Self> {
+        if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
+        })
+    }
+
+    /// Records the call and appends the breaker's reminder to `text` when the
+    /// call is a repeat worth steering.
+    ///
+    /// `text` must be the rendered tool text before the status bar, alerts, and
+    /// trailers are attached. Those decorations carry moving counts, so hashing
+    /// afterward would make identical results appear different forever and
+    /// silently prevent the breaker from firing.
+    pub(crate) fn observe(self, app_ctx: &AppContext, text: &mut String) {
+        let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
+        if let Some(intervention) = app_ctx.repeat_breaker().observe(
+            &self.session_id,
+            &self.tool,
+            self.semantic_key,
+            output_hash,
+        ) {
+            crate::response_finalize::append_repeat_breaker_reminder(
+                text,
+                &self.session_id,
+                &intervention,
+            );
+        }
+    }
+}
+
 pub fn run_tool_call(
     bare_name: &str,
     args: Value,
@@ -461,7 +535,11 @@ pub fn run_tool_call(
     // The preflight below and the dispatched command share one config
     // snapshot, even if a live config reload publishes in between.
     let _config_pin = app_ctx.pin_config();
-    let semantic_key = crate::response_finalize::repeat_breaker::semantic_key(bare_name, &args);
+    let session_id = ctx
+        .session_id
+        .as_deref()
+        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+    let repeat = RepeatObservation::for_agent_call(session_id, bare_name, &args, ctx.preview);
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
@@ -517,37 +595,8 @@ pub fn run_tool_call(
         }
     };
 
-    let session_id = ctx
-        .session_id
-        .as_deref()
-        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    // Plumbing calls are the plugin's, not the model's: after every agent tool
-    // call the plugin drains completions (`bash_drain_completions`) under the
-    // same session, so counting them would reset the run on every agent call
-    // and the breaker could never see two agent calls in a row. The first live
-    // probe found exactly that: five identical bash calls over 78 s, no steer.
-    // Hash the rendered tool text before status bars, alerts, and trailers are attached. Those
-    // decorations carry moving counts, so hashing afterward would make identical results appear
-    // different forever and silently prevent the breaker from firing.
-    let output_hash = crate::response_finalize::repeat_breaker::output_hash(&result.text);
-    // A preview is the first half of a hoisted mutation (`write`, `edit`,
-    // `apply_patch`): the plugin previews, asks for permission, then applies,
-    // all for one model call. Counting the preview as well would count every
-    // mutation twice, fire on the second genuine repeat, and misread the
-    // preview's different text as drifting output.
-    let intervention = if crate::subc::is_subc_native_plumbing_tool(bare_name) || ctx.preview {
-        None
-    } else {
-        app_ctx
-            .repeat_breaker()
-            .observe(session_id, bare_name, semantic_key, output_hash)
-    };
-    if let Some(intervention) = intervention {
-        crate::response_finalize::append_repeat_breaker_reminder(
-            &mut result.text,
-            session_id,
-            &intervention,
-        );
+    if let Some(repeat) = repeat {
+        repeat.observe(app_ctx, &mut result.text);
     }
     // Finalize after hashing: the status bar the finalizer may append carries moving counts.
     if finalize_after_breaker {

@@ -301,11 +301,17 @@ fn finalized_bash_result(
     session_id: &str,
     format_context: &crate::subc_format::FormatContext,
     allow_bg_completions: bool,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
+    // Observe before finalizing: the status bar the finalizer appends carries
+    // moving counts that would make identical results hash differently.
+    if let Some(repeat) = repeat {
+        repeat.observe(ctx, &mut text);
+    }
     crate::response_finalize::finalize_tool_response(
         &mut response,
         &mut text,
@@ -345,6 +351,7 @@ fn finish_bash_spawn_immediate(
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashSpawnControl>>,
     allow_bg_completions: bool,
+    repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
     let result = finalized_bash_result(
         response,
@@ -352,6 +359,7 @@ fn finish_bash_spawn_immediate(
         session_id,
         format_context,
         allow_bg_completions,
+        repeat.take(),
     );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
@@ -371,6 +379,7 @@ fn finish_bash_poll_done(
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
     allow_bg_completions: bool,
+    repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
     let result = finalized_bash_result(
         response,
@@ -378,6 +387,7 @@ fn finish_bash_poll_done(
         session_id,
         format_context,
         allow_bg_completions,
+        repeat.take(),
     );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
@@ -411,6 +421,7 @@ pub(super) fn submit_deferred_bash(
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
     permissions_granted: Option<Vec<String>>,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -420,6 +431,14 @@ pub(super) fn submit_deferred_bash(
     let session_for_spawn = session_id.clone();
     let project_root_for_spawn = project_root.clone();
     let format_context_for_spawn = format_context.clone();
+    // A call that returns its result ends in exactly one of three places: the
+    // spawn job answers it at once (a rewritten command, an error, or a
+    // background launch), a poll job answers it when the foreground wait
+    // finishes, or the promote job answers it when the wait window closes. Each
+    // gets its own copy; only the one that answers observes the call. A held
+    // call the module loop answers instead (drain or cancel) carries no result
+    // and is not observed.
+    let mut repeat_for_spawn = repeat.clone();
     let spawn_rx = executor.submit_async(
         root_for_spawn,
         Lane::Mutating,
@@ -439,6 +458,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         false,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -474,6 +494,7 @@ pub(super) fn submit_deferred_bash(
                             &mut spawn_text_tx,
                             &mut spawn_control_tx,
                             true,
+                            &mut repeat_for_spawn,
                         );
                     }
                 };
@@ -510,6 +531,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -527,6 +549,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 };
                 if response.data.get("status").and_then(Value::as_str) != Some("running") {
@@ -538,6 +561,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -558,6 +582,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -678,6 +703,7 @@ pub(super) fn submit_deferred_bash(
                     format_context,
                     cancel,
                     claim,
+                    repeat,
                 )
                 .await;
             }
@@ -726,6 +752,7 @@ async fn run_deferred_bash_wait(
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) {
     let Some(wait_ctx) = executor.actor_context(&root) else {
         send_bash_deferred_completion(
@@ -845,6 +872,7 @@ async fn run_deferred_bash_wait(
                 let project_root_for_poll = project_root.clone();
                 let format_context_for_poll = format_context.clone();
                 let claim_for_poll = Arc::clone(&claim);
+                let mut repeat_for_poll = repeat.clone();
                 let poll_rx = executor.submit_async(
                     root_for_poll,
                     Lane::PureRead,
@@ -889,6 +917,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     true,
+                                    &mut repeat_for_poll,
                                 );
                             };
 
@@ -922,6 +951,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     false,
+                                    &mut repeat_for_poll,
                                 );
                             }
                             if detach_on_user_message
@@ -951,6 +981,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     false,
+                                    &mut repeat_for_poll,
                                 );
                             }
                             match crate::commands::bash_orchestrate::decide_bash_step(
@@ -983,6 +1014,7 @@ async fn run_deferred_bash_wait(
                                         &mut poll_text_tx,
                                         &mut poll_control_tx,
                                         true,
+                                        &mut repeat_for_poll,
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
@@ -1106,6 +1138,7 @@ async fn run_deferred_bash_wait(
                             timeout,
                             wait_window_ms,
                             format_context.clone(),
+                            repeat.clone(),
                         )
                         .await;
                         let fatal = response_is_fatal_panic(&result.response);
@@ -1140,6 +1173,7 @@ async fn submit_bash_promote(
     timeout: Option<u64>,
     wait_window_ms: u64,
     format_context: crate::subc_format::FormatContext,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let request_id_for_promote = request_id.clone();
@@ -1179,6 +1213,7 @@ async fn submit_bash_promote(
                     &session_for_promote,
                     &format_context_for_promote,
                     false,
+                    repeat,
                 );
                 let ToolCallResult { text, response } = result;
                 let _ = text_tx.send(text);
@@ -1456,6 +1491,7 @@ mod grant_path_tests {
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
                 None,
                 None,
+                None,
             );
         }
 
@@ -1581,6 +1617,7 @@ mod grant_path_tests {
             },
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
         );

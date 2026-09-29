@@ -1112,6 +1112,9 @@ struct PendingBashAsk {
     format_context: crate::subc_format::FormatContext,
     cancel: bash::BashWaitCancel,
     grants: Vec<String>,
+    /// The call as the repeat breaker counts it, observed once the ask is
+    /// allowed and the command answers.
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -2514,6 +2517,7 @@ async fn handle_bash_elicitation_reply(
                 pending.spawn_principal,
                 pending.edit_slot_survives,
                 Some(pending.grants),
+                pending.repeat,
             );
             return Ok(());
         }
@@ -6774,6 +6778,14 @@ async fn handle_tool_call(
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
+        // Subc answers bash on its own deferred path, not the shared tool-call
+        // runner, so it captures the call for the repeat breaker here.
+        let repeat = crate::run_tool_call::RepeatObservation::for_agent_call(
+            &identity.session,
+            &bare_name,
+            &arguments,
+            call.preview,
+        );
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
             // drain; the command has not run, so answer with the retryable
@@ -6879,6 +6891,7 @@ async fn handle_tool_call(
                     format_context,
                     cancel,
                     grants: plan.grants,
+                    repeat,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -6928,6 +6941,7 @@ async fn handle_tool_call(
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
             None,
+            repeat,
         );
         return Ok(());
     }

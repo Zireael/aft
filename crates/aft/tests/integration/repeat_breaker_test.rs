@@ -20,6 +20,36 @@ pub(super) fn transport_fixture_arguments(root: &Path, description: &str) -> Val
     })
 }
 
+/// File the rewritten-grep fixtures search; one line matches the needle.
+pub(super) const REWRITE_FIXTURE_FILE: &str = "historian.repeat-fixture";
+
+pub(super) fn write_rewritten_grep_fixture(root: &Path) {
+    std::fs::write(
+        root.join(REWRITE_FIXTURE_FILE),
+        "historian response dumped\n",
+    )
+    .expect("write rewritten grep fixture");
+}
+
+/// A bash call that AFT answers with its grep tool instead of running a shell
+/// (the bash rewrite), so these fixtures exercise the path where the reply is
+/// produced without a spawned process. Only the description varies, as it does
+/// when a model repeats a command.
+pub(super) fn rewritten_bash_grep_arguments(description: &str) -> Value {
+    json!({
+        "command": format!("grep -rn \"historian response dumped\" {REWRITE_FIXTURE_FILE}"),
+        "description": description,
+    })
+}
+
+/// The rewritten grep renders a match summary; a native shell grep does not.
+pub(super) fn assert_answered_by_rewrite(text: &str) {
+    assert!(
+        text.contains("Found 1 match"),
+        "bash grep must be answered by the rewrite: {text:?}"
+    );
+}
+
 pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
     assert_eq!(texts.len(), 3);
     assert!(
@@ -517,6 +547,56 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
                 .contains("<system-reminder>"),
             "plumbing calls must not accumulate a repeat count: {drain:?}"
         );
+        if index < 2 {
+            std::thread::sleep(Duration::from_secs(16));
+        }
+    }
+
+    assert_transport_repeat_sequence(&texts);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
+    let project = tempfile::tempdir().expect("rewritten bash repeat project");
+    write_rewritten_grep_fixture(project.path());
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "config": crate::test_helpers::user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "configure: {configured:?}");
+    let mut texts = Vec::new();
+
+    for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
+        let response = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": format!("repeat-ndjson-bash-{index}"),
+                "command": "tool_call",
+                "session_id": SESSION,
+                "name": "bash",
+                "arguments": rewritten_bash_grep_arguments(description),
+            }))
+            .expect("serialize rewritten bash request"),
+            Duration::from_secs(10),
+        );
+        let text = response["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool response missing text: {response:?}"))
+            .to_string();
+        assert_answered_by_rewrite(&text);
+        texts.push(text);
         if index < 2 {
             std::thread::sleep(Duration::from_secs(16));
         }
