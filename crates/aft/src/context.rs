@@ -2389,8 +2389,11 @@ impl App {
                 Some((cache_root, context))
             })
             .find_map(|(cache_root, context)| {
-                if context.cached_artifact_cache_key(&cache_root).as_deref()
-                    != Some(artifact_cache_key)
+                // Only the artifact writer may donate a snapshot. Another
+                // checkout's RAM delta describes that checkout, not this one.
+                if context.shared_artifacts_read_only()
+                    || context.cached_artifact_cache_key(&cache_root).as_deref()
+                        != Some(artifact_cache_key)
                     || !matches!(
                         &*context
                             .semantic_index_status()
@@ -9951,6 +9954,42 @@ mod subc_lifecycle_admission_tests {
         let snapshot = ctx.try_health_snapshot(Path::new("borrow-only-root"));
 
         assert_eq!(snapshot.tier2.expect("tier2 health").status, "disabled");
+    }
+
+    #[test]
+    fn revision_borrower_is_not_a_resident_semantic_donor() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = App::default_shared();
+        let donor_root = temp.path().join("other_branch");
+        let target = temp.path().join("late_branch");
+        std::fs::create_dir_all(&donor_root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let donor = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+        donor.set_canonical_cache_root(donor_root.clone());
+        donor
+            .artifact_cache_keys
+            .lock()
+            .insert(donor_root.clone(), "family".into());
+        donor.set_cache_writer_capabilities(false, true);
+        let config = crate::config::SemanticBackendConfig::default();
+        let mut index = SemanticIndex::new(donor_root.clone(), 3);
+        index.set_fingerprint(
+            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&config, 3),
+        );
+        *donor.semantic_index().write().unwrap() = Some(index);
+        *donor.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        app.register_memory_context(donor_root, &donor);
+        assert!(
+            app.adopt_resident_semantic_index("family", &target, &config)
+                .is_none(),
+            "another borrower must never donate branch-local state"
+        );
+        donor.set_cache_writer_capabilities(true, true);
+        assert!(
+            app.adopt_resident_semantic_index("family", &target, &config)
+                .is_some(),
+            "the same matching snapshot is eligible only when owned by the writer"
+        );
     }
 
     #[test]

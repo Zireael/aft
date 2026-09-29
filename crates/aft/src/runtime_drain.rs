@@ -1104,16 +1104,47 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 cold_seed_resumes.push(resume);
             }
             SemanticIndexEvent::Ready(mut index) => {
+                let borrowed_paths = if ctx.shared_artifacts_read_only() {
+                    crate::commands::configure::borrowed_semantic_refresh_paths(ctx, &index)
+                } else {
+                    Ok(Vec::new())
+                };
+                // Hide rows whose hashes differ in this checkout before the
+                // watcher filter runs: matching sizes and mtimes must not make
+                // that filter discard a content difference found at adoption.
+                if let Ok(paths) = &borrowed_paths {
+                    index.invalidate_files(paths);
+                }
                 let committed = ctx.with_current_semantic_index_rx(
                     receiver_generation,
                     receiver_epoch,
                     |receiver| {
                         mark_semantic_corpus_refresh_success(ctx);
-                        let refresh_paths = ctx
+                        let mut refresh_paths = ctx
                             .take_pending_semantic_index_paths()
                             .into_iter()
                             .filter(|path| watcher_path_is_semantic_source(path))
                             .collect::<Vec<_>>();
+                        match borrowed_paths {
+                            Ok(paths) => refresh_paths.extend(paths),
+                            Err(error) => {
+                                *ctx.semantic_index()
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                                *ctx.semantic_index_status()
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    SemanticIndexStatus::Failed(error);
+                                *receiver = None;
+                                return (
+                                    ctx.take_semantic_cold_seed_resume(false),
+                                    Vec::new(),
+                                    false,
+                                );
+                            }
+                        }
+                        refresh_paths.sort();
+                        refresh_paths.dedup();
                         // Events that arrived during the build only matter for
                         // files whose content moved past what the build read.
                         let refresh_paths =
@@ -1659,10 +1690,23 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 status_changed = true;
             }
             SemanticRefreshEvent::Completed {
-                added_entries,
-                updated_metadata,
-                completed_paths,
+                mut added_entries,
+                mut updated_metadata,
+                mut completed_paths,
             } => {
+                // A worker generation can finish an older batch after the
+                // watcher has invalidated a second edit. Do not resurrect that
+                // batch or clear its successor's pending path.
+                let stale = updated_metadata.iter().filter_map(|(path, record)| {
+                    (!matches!(aft::cache_freshness::verify_file_strict(path, record),
+                        aft::cache_freshness::FreshnessVerdict::HotFresh |
+                        aft::cache_freshness::FreshnessVerdict::ContentFresh { .. }) ||
+                        watcher_path_is_ignored_by_current_matcher(ctx, path)).then(|| path.clone())
+                }).collect::<HashSet<_>>();
+                added_entries.retain(|entry| !stale.contains(entry.file()));
+                updated_metadata.retain(|(path, _)| !stale.contains(path));
+                completed_paths.retain(|path| !stale.contains(path));
+                replay_refresh_paths.extend(stale.into_iter().filter(|path| !watcher_path_is_ignored_by_current_matcher(ctx, path)));
                 if let Some(index) = ctx
                     .semantic_index()
                     .write()
@@ -1691,6 +1735,15 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 deleted,
                 total_processed,
             } => {
+                let snapshot_changes = match crate::commands::configure::borrowed_semantic_refresh_paths(ctx, &index) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        aft::slog_warn!("semantic corpus completion could not verify current files: {}", error);
+                        ctx.mark_pending_semantic_corpus_refresh();
+                        continue;
+                    }
+                };
+                index.invalidate_files(&snapshot_changes);
                 aft::runtime_drain::mark_semantic_corpus_refresh_success(ctx);
                 if changed > 0 || added > 0 || deleted > 0 {
                     aft::slog_info!(
@@ -1701,11 +1754,14 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                         total_processed
                     );
                 }
-                let pending_paths = ctx
+                let mut pending_paths = ctx
                     .take_pending_semantic_index_paths()
                     .into_iter()
                     .filter(|path| aft::runtime_drain::watcher_path_is_semantic_source(path))
                     .collect::<Vec<_>>();
+                pending_paths.extend(snapshot_changes);
+                pending_paths.sort();
+                pending_paths.dedup();
                 let invalidated_paths = semantic_paths_with_changed_content(ctx, &index, pending_paths);
                 for path in &invalidated_paths {
                     if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, path) {
@@ -5830,6 +5886,182 @@ mod tests {
             ctx.semantic_refresh_event_rx().lock().is_some(),
             "the stale drain must not clear the replacement refresh receiver"
         );
+    }
+
+    #[test]
+    fn revision_borrowed_disk_ready_masks_different_checkout() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = owner.path().join("lib.rs");
+        std::fs::write(&file, "pub fn donor_only() {}\n").unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn local_only() {}\n").unwrap();
+        std::fs::write(root.path().join("added.rs"), "pub fn added_only() {}\n").unwrap();
+        let index = crate::semantic_index::SemanticIndex::build(
+            owner.path(),
+            &[file],
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+            8,
+        )
+        .unwrap();
+        let artifact = storage.path().join("semantic/borrowed-disk/semantic.bin");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, index.to_bytes()).unwrap();
+        let borrowed = crate::semantic_index::SemanticIndex::read_from_disk_borrow_tolerant(
+            storage.path(),
+            "borrowed-disk",
+            root.path(),
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(false, true);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_index_rx(rx, ctx.configure_generation());
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        tx.send(SemanticIndexEvent::Ready(borrowed)).unwrap();
+        drain_semantic_index_events(&ctx);
+        assert_eq!(
+            ctx.semantic_index().read().unwrap().as_ref().unwrap().len(),
+            0,
+            "disk adoption published another tree's rows"
+        );
+        assert!(
+            matches!(request_rx.try_recv(), Ok(SemanticRefreshRequest::Files { paths }) if paths.contains(&root.path().join("lib.rs")) && paths.contains(&root.path().join("added.rs"))),
+            "disk adoption must schedule changed and added files without watcher events"
+        );
+    }
+
+    #[test]
+    fn revision_same_worker_stale_batch_cannot_resurrect_second_edit() {
+        assert_same_worker_completion_is_fresh(false);
+    }
+
+    #[test]
+    fn revision_same_worker_stale_corpus_cannot_resurrect_second_edit() {
+        assert_same_worker_completion_is_fresh(true);
+    }
+
+    fn assert_same_worker_completion_is_fresh(corpus: bool) {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("lib.rs");
+        std::fs::write(&file, "pub fn original() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let mut serving = crate::semantic_index::SemanticIndex::build(
+            root.path(),
+            std::slice::from_ref(&file),
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+            8,
+        )
+        .unwrap();
+        let mut worker = serving.fork_for_refresh();
+        std::fs::write(&file, "pub fn first_edit() {}\n").unwrap();
+        let first = worker
+            .refresh_invalidated_files(
+                root.path(),
+                std::slice::from_ref(&file),
+                &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        let first_snapshot = worker.clone();
+        std::fs::write(&file, "pub fn second_edit() {}\n").unwrap();
+        serving.invalidate_file(&file);
+        assert_eq!(
+            semantic_paths_with_changed_content(&ctx, &serving, vec![file.clone()]),
+            vec![file.clone()]
+        );
+        *ctx.semantic_index().write().unwrap() = Some(serving);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        if !corpus {
+            ctx.add_pending_semantic_index_paths([file.clone()]);
+        }
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        event_tx
+            .send(if corpus {
+                SemanticRefreshEvent::CorpusCompleted {
+                    index: first_snapshot,
+                    changed: 1,
+                    added: 0,
+                    deleted: 0,
+                    total_processed: 1,
+                }
+            } else {
+                SemanticRefreshEvent::Completed {
+                    added_entries: first.added_entries,
+                    updated_metadata: first.updated_metadata,
+                    completed_paths: first.completed_paths,
+                }
+            })
+            .unwrap();
+        drain_semantic_refresh_events(&ctx);
+        assert_eq!(
+            ctx.semantic_index().read().unwrap().as_ref().unwrap().len(),
+            0,
+            "stale completion resurrected first edit"
+        );
+        assert!(
+            matches!(request_rx.try_recv(), Ok(SemanticRefreshRequest::Files { paths }) if paths.contains(&file)),
+            "newer edit must be retried"
+        );
+        let second = worker
+            .refresh_invalidated_files(
+                root.path(),
+                std::slice::from_ref(&file),
+                &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        event_tx
+            .send(SemanticRefreshEvent::Completed {
+                added_entries: second.added_entries,
+                updated_metadata: second.updated_metadata,
+                completed_paths: second.completed_paths,
+            })
+            .unwrap();
+        drain_semantic_refresh_events(&ctx);
+        assert!(ctx
+            .semantic_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .search(&[1.0, 0.0, 0.0], 100)
+            .iter()
+            .any(|row| row.snippet.contains("second_edit")));
     }
 
     #[test]

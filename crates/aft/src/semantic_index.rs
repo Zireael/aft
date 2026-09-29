@@ -3549,6 +3549,10 @@ pub struct EmbeddingEntry {
 }
 
 impl EmbeddingEntry {
+    pub(crate) fn file(&self) -> &Path {
+        &self.chunk.file
+    }
+
     fn new(chunk: SemanticChunk, vector: Vec<f32>) -> Self {
         let norm = vector_norm(&vector);
         Self {
@@ -3661,6 +3665,9 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
 #[derive(Debug)]
 struct SharedSemanticBase {
     entries: Vec<EmbeddingEntry>,
+    /// Files with embedding rows, including those lacking recorded mtimes.
+    /// Membership must not require scanning every row during invalidation.
+    entry_files: HashSet<PathBuf>,
     file_mtimes: HashMap<PathBuf, SystemTime>,
     file_sizes: HashMap<PathBuf, u64>,
     any_missing_sizes: bool,
@@ -3764,6 +3771,7 @@ impl SharedSemanticBase {
                     .chain(self.file_sizes.keys())
                     .chain(self.file_hashes.keys())
                     .chain(self.deferred_files.iter())
+                    .chain(self.entry_files.iter())
                     .map(|path| crate::memory::path_bytes(path))
                     .fold(0u64, u64::saturating_add),
             )
@@ -4356,55 +4364,20 @@ impl SemanticIndex {
         }
 
         if let Some(base) = self.shared_base.as_ref() {
-            if !self.paths_are_shareable() {
+            if !base
+                .fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint.matches(&expected))
+            {
                 return None;
             }
-            // Late borrowers need the donor's complete current state, not just
-            // its original base. Rebase only the delta so an edited donor does
-            // not force another full corpus allocation through a disk reload.
-            let project = |path: &Path| {
-                project_root.join(
-                    cache_relative_path(&self.project_root, path)
-                        .expect("shareable delta path must remain inside its root"),
-                )
-            };
-            let mut adopted = Self::from_shared_base(project_root.to_path_buf(), Arc::clone(base));
-            adopted.entries = self
-                .entries
-                .iter()
-                .cloned()
-                .map(|mut entry| {
-                    entry.chunk.file = project(&entry.chunk.file);
-                    entry
-                })
-                .collect();
-            adopted.file_mtimes = self
-                .file_mtimes
-                .iter()
-                .map(|(path, value)| (project(path), *value))
-                .collect();
-            adopted.file_sizes = self
-                .file_sizes
-                .iter()
-                .map(|(path, value)| (project(path), *value))
-                .collect();
-            adopted.file_hashes = self
-                .file_hashes
-                .iter()
-                .map(|(path, value)| (project(path), *value))
-                .collect();
-            adopted.deferred_files = self
-                .deferred_files
-                .iter()
-                .map(|path| project(path))
-                .collect();
-            adopted.tombstones = self.tombstones.clone();
-            adopted.any_missing_sizes = self.any_missing_sizes;
-            adopted.dimension = self.dimension;
-            adopted.fingerprint = self.fingerprint.clone();
-            adopted.skipped_rows = self.skipped_rows;
-            adopted.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
-            return Some(adopted);
+            // The donor is the artifact writer, but even its delta belongs to
+            // its checkout. Borrow the immutable seed only; the receiving root
+            // verifies that seed against its own files before publishing it.
+            return Some(Self::from_shared_base(
+                project_root.to_path_buf(),
+                Arc::clone(base),
+            ));
         }
 
         if !self.paths_are_shareable() {
@@ -4504,6 +4477,11 @@ impl SemanticIndex {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(SharedSemanticBase {
+            entry_files: self
+                .entries
+                .iter()
+                .map(|entry| entry.chunk.file.clone())
+                .collect(),
             entries: self.entries,
             file_mtimes,
             file_sizes,
@@ -4563,15 +4541,39 @@ impl SemanticIndex {
             .collect()
     }
 
+    /// Compare a borrowed snapshot with the receiving checkout, including added
+    /// and deleted files. Stat equality across checkouts is not proof of content
+    /// equality, so adoption always verifies recorded hashes.
+    pub(crate) fn borrowed_changed_paths(&self, current_files: &[PathBuf]) -> Vec<PathBuf> {
+        let current = current_files.iter().collect::<HashSet<_>>();
+        let mut paths = self.indexed_paths();
+        paths.extend(self.live_entries().map(|(path, _)| path.into_owned()));
+        paths.extend(
+            self.tombstones
+                .iter()
+                .map(|path| self.project_root.join(path)),
+        );
+        paths.extend(current_files.iter().cloned());
+        paths
+            .into_iter()
+            .filter(|path| {
+                !current.contains(path)
+                    || self.recorded_file_freshness(path).is_none_or(|record| {
+                        !matches!(
+                            cache_freshness::verify_file_strict(path, &record),
+                            FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. }
+                        )
+                    })
+            })
+            .collect()
+    }
+
     fn hide_base_files<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
         if let Some(base) = &self.shared_base {
             for path in paths {
                 if let Ok(relative) = path.strip_prefix(&self.project_root) {
                     if base.file_mtimes.contains_key(relative)
-                        || base
-                            .entries
-                            .iter()
-                            .any(|entry| entry.chunk.file == relative)
+                        || base.entry_files.contains(relative)
                     {
                         self.tombstones.insert(relative.to_path_buf());
                     }
@@ -7438,21 +7440,6 @@ impl SemanticIndex {
                     base,
                 ));
             }
-            if registry.keys().any(|existing| {
-                existing.artifact_cache_key == key.artifact_cache_key && existing != &key
-            }) {
-                slog_warn!(
-                    "semantic shared-base fingerprint or artifact hash changed for key {}; loading a private borrowed copy",
-                    project_key
-                );
-                return Self::read_from_disk(
-                    storage_dir,
-                    project_key,
-                    current_canonical_root,
-                    true,
-                    None,
-                );
-            }
         }
 
         let private = Self::read_from_disk(
@@ -7462,13 +7449,18 @@ impl SemanticIndex {
             true,
             Some(&key.fingerprint),
         )?;
-        let Ok(base) = private.clone().into_shared_base() else {
-            slog_warn!(
-                "semantic shared-base paths could not be normalized for key {}; loading a private borrowed copy",
-                project_key
-            );
-            return Some(private);
+        let base = match private.into_shared_base() {
+            Ok(base) => base,
+            Err(private) => return Some(private),
         };
+        // The writer can replace semantic.bin between hashing and reading it.
+        // Register the loaded rows only if the file's fingerprint and content
+        // hash still match the registry key sampled before the read.
+        if borrowed_artifact_identity(&data_path).ok()
+            != Some((key.fingerprint.clone(), key.artifact_content_hash))
+        {
+            return None;
+        }
         let base = Arc::new(base);
 
         let mut registry = shared_semantic_bases()
@@ -7481,15 +7473,6 @@ impl SemanticIndex {
                 current_canonical_root.to_path_buf(),
                 existing,
             ));
-        }
-        if registry.keys().any(|existing| {
-            existing.artifact_cache_key == key.artifact_cache_key && existing != &key
-        }) {
-            slog_warn!(
-                "semantic shared-base identity changed while loading key {}; retaining a private borrowed copy",
-                project_key
-            );
-            return Some(private);
         }
         registry.insert(key, Arc::downgrade(&base));
         SHARED_SEMANTIC_BASE_LOADS.fetch_add(1, Ordering::Relaxed);
@@ -10054,6 +10037,151 @@ Connection: close
     }
 
     #[test]
+    #[ignore = "large-base serving-lock benchmark"]
+    fn revision_new_file_batch_has_bounded_serving_lock_time() {
+        let root = test_project_root();
+        let mut private = SemanticIndex::new(root.clone(), 2);
+        add_invalidation_fixture_entry(&mut private, root.join("entry_only.rs"), 0);
+        let row = private.entries.pop().unwrap();
+        private.entries = vec![row; 1_000_000];
+        private.file_mtimes.clear();
+        private.file_sizes.clear();
+        private.file_hashes.clear();
+        let base = Arc::new(private.into_shared_base().unwrap());
+        let mut serving = SemanticIndex::from_shared_base(root.clone(), base);
+        let added = (0..512)
+            .map(|i| root.join(format!("new_{i}.rs")))
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+        serving.invalidate_files(&added);
+        let elapsed = start.elapsed();
+        eprintln!("million-entry base, 512 new files, serving write-lock work: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "new-file batch scanned the base: {elapsed:?}"
+        );
+        assert_eq!(serving.len(), 1_000_000);
+        serving.invalidate_file(&root.join("entry_only.rs"));
+        assert_eq!(
+            serving.len(),
+            0,
+            "entry-only files must be in the membership set"
+        );
+    }
+
+    #[test]
+    fn revision_borrower_tree_is_checked_with_hashes_before_serving() {
+        let owner = tempfile::tempdir().unwrap();
+        let borrower = tempfile::tempdir().unwrap();
+        let a = owner.path().join("a.rs");
+        let gone = owner.path().join("gone.rs");
+        write_rust_file(&a, "owner_name");
+        write_rust_file(&gone, "deleted_in_borrower");
+        let mut source = build_test_index(owner.path(), &[a.clone(), gone]);
+        let config = SemanticBackendConfig::default();
+        source.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 3));
+        let local = borrower.path().join("a.rs");
+        let added = borrower.path().join("added.rs");
+        write_rust_file(&local, "local_name");
+        filetime::set_file_mtime(
+            &local,
+            filetime::FileTime::from_system_time(source.file_mtimes[&a]),
+        )
+        .unwrap();
+        write_rust_file(&added, "new_local");
+        let mut adopted = source
+            .adopt_frozen_base_for_root(borrower.path(), &config)
+            .unwrap();
+        let paths = adopted.borrowed_changed_paths(&[local.clone(), added.clone()]);
+        assert_eq!(
+            paths.len(),
+            3,
+            "same size and timestamp must not hide different branch contents"
+        );
+        adopted.invalidate_files(&paths);
+        assert!(adopted.search(&[1.0, 0.0, 0.0], 100).is_empty());
+        assert_eq!(
+            adopted.retain_files_with_changed_content(vec![local.clone()]),
+            vec![local.clone()],
+            "tombstone-only paths recover without a metadata record"
+        );
+        adopted
+            .refresh_invalidated_files(
+                borrower.path(),
+                &paths,
+                &mut test_vector_for_texts,
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        let mut oracle = build_test_index(borrower.path(), &[local, added]);
+        oracle.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 3));
+        assert_eq!(adopted.to_bytes(), oracle.to_bytes());
+        assert!(adopted
+            .search(&[1.0, 0.0, 0.0], 100)
+            .iter()
+            .all(|row| row.name != "owner_name" && row.name != "deleted_in_borrower"));
+    }
+
+    #[test]
+    fn revision_tombstone_without_content_change_is_recoverable() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("lib.rs");
+        write_rust_file(&file, "unchanged");
+        let mut index = build_test_index(temp.path(), std::slice::from_ref(&file));
+        let _worker = index.fork_for_refresh();
+        assert!(index
+            .retain_files_with_changed_content(vec![file.clone()])
+            .is_empty());
+        index.remove_indexed_files(std::slice::from_ref(&file));
+        assert_eq!(index.len(), 0);
+        assert!(index.recorded_file_freshness(&file).is_none());
+        assert_eq!(
+            index.retain_files_with_changed_content(vec![file.clone()]),
+            vec![file.clone()]
+        );
+        index
+            .refresh_invalidated_files(
+                temp.path(),
+                &[file],
+                &mut test_vector_for_texts,
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(index.len() > 0);
+    }
+
+    #[test]
+    fn revision_live_base_preserves_dimension_guard_for_added_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("base.rs");
+        write_rust_file(&file, "existing");
+        let mut index = build_test_index(temp.path(), &[file]);
+        let _worker = index.fork_for_refresh();
+        assert!(index.entries.is_empty());
+        assert!(index.len() > 0);
+        let added = temp.path().join("added.rs");
+        write_rust_file(&added, "new_one");
+        let before = index.to_bytes();
+        let result = index.refresh_invalidated_files(
+            temp.path(),
+            &[added],
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            8,
+            100,
+            &mut |_, _| {},
+        );
+        assert!(
+            result.is_err(),
+            "nonempty inherited rows must constrain the embedding dimension"
+        );
+        assert_eq!(index.to_bytes(), before);
+    }
+
+    #[test]
     fn shared_overlay_equivalence_and_sharing() {
         let temp = tempfile::tempdir().unwrap();
         let owner_root = temp.path().join("owner");
@@ -10169,7 +10297,7 @@ Connection: close
     }
 
     #[test]
-    fn shared_overlay_late_borrower_inherits_only_donor_delta() {
+    fn revision_late_borrower_starts_from_owner_base_not_owner_delta() {
         let temp = tempfile::tempdir().unwrap();
         let owner_root = temp.path().join("owner");
         let borrower_root = temp.path().join("borrower");
@@ -10196,10 +10324,14 @@ Connection: close
             worker.shared_base.as_ref().unwrap(),
             borrower.shared_base.as_ref().unwrap()
         ));
-        assert_eq!(borrower.entries.len(), 2);
-        assert_eq!(borrower.file_mtimes.len(), 2);
-        assert_eq!(borrower.to_bytes(), owner.to_bytes());
-        let expected = owner
+        assert_eq!(
+            borrower.entries.len(),
+            0,
+            "owner checkout deltas must not cross roots"
+        );
+        assert_eq!(borrower.file_mtimes.len(), 0);
+        assert_eq!(borrower.to_bytes(), worker.to_bytes());
+        let expected = worker
             .search(&[1.0, 1.0], 1000)
             .into_iter()
             .map(|mut row| {
@@ -10215,7 +10347,7 @@ Connection: close
                 .collect::<Vec<_>>(),
             expected
         );
-        borrower.invalidate_file(&borrower_root.join("added.rs"));
+        borrower.invalidate_file(&borrower_root.join("file_2.rs"));
         assert_eq!(
             owner.entries.len(),
             2,
@@ -10664,7 +10796,7 @@ Connection: close
     }
 
     #[test]
-    fn borrowed_snapshot_hash_change_falls_back_to_private_copy() {
+    fn revision_rebuilt_generation_is_shared_while_old_base_is_live() {
         let owner = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let borrower_a = tempfile::tempdir().unwrap();
@@ -10727,6 +10859,12 @@ Connection: close
         let changed_vector = vec![0.0, 1.0];
         index.entries[0].norm = vector_norm(&changed_vector);
         index.entries[0].vector = changed_vector;
+        index
+            .fingerprint
+            .as_mut()
+            .unwrap()
+            .model
+            .push_str("-rebuilt");
         fs::write(dir.join("semantic.bin"), index.to_bytes()).unwrap();
         let fallback = SemanticIndex::read_from_disk_borrow_tolerant(
             storage.path(),
@@ -10734,11 +10872,24 @@ Connection: close
             borrower_b.path(),
         )
         .unwrap();
-        assert!(
-            fallback.shared_base.is_none(),
-            "a different byte identity must not join the live shared generation"
-        );
+        let new_base = fallback
+            .shared_base
+            .as_ref()
+            .expect("new generation must stay shared");
+        let second = SemanticIndex::read_from_disk_borrow_tolerant(
+            storage.path(),
+            &project_key,
+            borrower_b.path(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(new_base, second.shared_base.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(new_base, shared.shared_base.as_ref().unwrap()));
+        assert_eq!(shared.search(&[1.0, 0.0], 1)[0].score, 1.1);
+        assert_eq!(fallback.search(&[1.0, 0.0], 1)[0].score, 0.0);
+        let old_weak = Arc::downgrade(shared.shared_base.as_ref().unwrap());
         drop(shared);
+        assert!(old_weak.upgrade().is_none());
+        assert_eq!(second.entry_count(), 1);
     }
 
     #[test]

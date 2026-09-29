@@ -921,6 +921,14 @@ impl Drop for SemanticWorkerMemory {
     }
 }
 
+fn fork_semantic_refresh_index(index: &mut SemanticIndex) -> (SemanticIndex, u64) {
+    let worker = index.fork_for_refresh();
+    // The fork moves unchanged entries into an Arc counted once for the whole
+    // process. The pending-install slot counts only this index's private delta.
+    let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
+    (worker, pending_bytes)
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -3880,6 +3888,18 @@ struct ArtifactLoadNeeds {
     semantic: bool,
 }
 
+pub(crate) fn borrowed_semantic_refresh_paths(
+    ctx: &AppContext,
+    index: &SemanticIndex,
+) -> Result<Vec<PathBuf>, String> {
+    let max_files = ctx.config().semantic.max_files;
+    let files = walk_semantic_project_files_bounded(&ctx.canonical_cache_root(), max_files)
+        .map_err(|_| {
+            format!("borrowed semantic freshness check exceeds max_files ({max_files})")
+        })?;
+    Ok(index.borrowed_changed_paths(&files))
+}
+
 fn adopt_resident_semantic_index_if_available(
     ctx: &AppContext,
     semantic_search: bool,
@@ -3889,13 +3909,27 @@ fn adopt_resident_semantic_index_if_available(
     if !semantic_search || !ctx.shared_artifacts_read_only() {
         return false;
     }
-    let Some(index) = ctx.app().adopt_resident_semantic_index(
+    let Some(mut index) = ctx.app().adopt_resident_semantic_index(
         project_key,
         &ctx.canonical_cache_root(),
         semantic_config,
     ) else {
         return false;
     };
+    let refresh_paths = match borrowed_semantic_refresh_paths(ctx, &index) {
+        Ok(paths) => paths,
+        Err(error) => {
+            *ctx.semantic_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Failed(error);
+            return true;
+        }
+    };
+    index.invalidate_files(&refresh_paths);
     *ctx.semantic_index()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
@@ -3903,6 +3937,14 @@ fn adopt_resident_semantic_index_if_available(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
     let _ = ensure_ready_semantic_refresh_worker(ctx);
+    if ctx.ram_overlay_active() && !refresh_paths.is_empty() {
+        ctx.add_pending_semantic_index_paths(refresh_paths.clone());
+        if let Some(sender) = ctx.semantic_refresh_sender() {
+            let _ = sender.send(SemanticRefreshRequest::Files {
+                paths: refresh_paths,
+            });
+        }
+    }
     slog_info!("semantic index adopted from matching resident artifact family");
     true
 }
@@ -5491,13 +5533,13 @@ fn schedule_artifact_loads(
                                 verified_artifact_generation,
                             );
                         }
-                        finished_bytes =
-                            Some(index.estimated_memory().estimated_bytes.unwrap_or(0));
                         semantic_lifecycle.run_if_current(
                             semantic_generation_flag.as_ref(),
                             publish_generation,
                             || {
-                                let worker_index = index.fork_for_refresh();
+                                let (worker_index, pending_bytes) =
+                                    fork_semantic_refresh_index(&mut index);
+                                finished_bytes = Some(pending_bytes);
                                 let worker_handle = spawn_semantic_refresh_worker(
                                     root_clone.clone(),
                                     worker_index,
@@ -9568,6 +9610,33 @@ mod tests {
     }
 
     #[test]
+    fn revision_pending_install_counts_only_post_freeze_private_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("lib.rs");
+        std::fs::write(&file, "pub fn payload() {}\n").unwrap();
+        let mut index = SemanticIndex::build(
+            temp.path(),
+            &[file],
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0; 768]).collect()),
+            8,
+        )
+        .unwrap();
+        assert!(index.estimated_memory().estimated_bytes.unwrap() > 3000);
+        let (worker, queued_bytes) = super::fork_semantic_refresh_index(&mut index);
+        assert!(index.uses_shared_base_for_test());
+        assert!(worker.uses_shared_base_for_test());
+        assert_eq!(
+            queued_bytes, 0,
+            "pending-install must not recount the frozen corpus"
+        );
+        assert_eq!(
+            queued_bytes,
+            index.estimated_memory().estimated_bytes.unwrap()
+        );
+        assert_eq!(worker.estimated_memory().estimated_bytes, Some(0));
+    }
+
+    #[test]
     fn matching_worktree_adopts_resident_parent_semantic_base_without_disk_load() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -9700,6 +9769,188 @@ mod tests {
             .semantic_index()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            borrower_index
+                .as_ref()
+                .is_some_and(SemanticIndex::uses_shared_base_for_test),
+            "the worktree should point at the resident frozen base"
+        );
+        assert!(
+            owner_ctx
+                .semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(SemanticIndex::uses_shared_base_for_test),
+            "the parent should retain the same frozen base"
+        );
+    }
+
+    #[test]
+    fn revision_late_adoption_masks_different_checkout_before_queries() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let canonical_main = crate::inspect::job::canonicalize_normalized(&main);
+        let canonical_worktree = crate::inspect::job::canonicalize_normalized(&worktree);
+        let app = App::default_shared();
+        let executor = crate::executor::Executor::new();
+        let owner_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let owner_root = crate::path_identity::ProjectRootId::from_path(&canonical_main).unwrap();
+        let owner_memory_root = owner_root.as_path().to_path_buf();
+        assert!(executor.register_actor(owner_root, Arc::clone(&owner_ctx)));
+        let request = configure_semantic_with_options(
+            &canonical_main,
+            &storage,
+            "http://127.0.0.1:9/v1",
+            true,
+            64,
+            false,
+        );
+        assert!(handle_configure_for_test(&request, &owner_ctx).success);
+        owner_ctx.retire_semantic_index_rx("test replaces the configure load");
+        let shared = canonical_main.join("shared.rs");
+        let deleted = canonical_main.join("deleted.rs");
+        std::fs::write(&shared, "pub fn donor_only() { println!(\"donor\"); }\n").unwrap();
+        std::fs::write(
+            &deleted,
+            "pub fn deleted_here() { println!(\"deleted\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_worktree.join("shared.rs"),
+            "pub fn local_only() { println!(\"local\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_worktree.join("added.rs"),
+            "pub fn added_here() { println!(\"added\"); }\n",
+        )
+        .unwrap();
+        let mut owner_index = SemanticIndex::build(
+            &canonical_main,
+            &[shared, deleted],
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+            8,
+        )
+        .unwrap();
+        owner_index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
+            &owner_ctx.config().semantic,
+            3,
+        ));
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        owner_ctx.install_semantic_index_rx(ready_rx, owner_ctx.configure_generation());
+        ready_tx
+            .send(crate::context::SemanticIndexEvent::Ready(owner_index))
+            .expect("queue resident semantic index");
+        crate::runtime_drain::drain_semantic_index_events(&owner_ctx);
+        assert!(
+            owner_ctx
+                .semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(SemanticIndex::uses_shared_base_for_test),
+            "ready resident indexes should freeze before a worktree bind arrives"
+        );
+        let owner_cache_root = owner_ctx.canonical_cache_root();
+        let project_key = owner_ctx
+            .cached_artifact_cache_key(&owner_cache_root)
+            .expect("owner artifact key");
+        // An equivalent registry spelling must still find the cache entry under
+        // the context's stored root without changing either stored path form.
+        app.unregister_memory_context(&owner_memory_root, &owner_ctx);
+        app.register_memory_context(canonical_main.join(".git").join(".."), &owner_ctx);
+        let semantic_artifact = storage
+            .join("semantic")
+            .join(&project_key)
+            .join("semantic.bin");
+        assert!(
+            !semantic_artifact.exists(),
+            "the control requires adoption to succeed without a disk snapshot"
+        );
+
+        let mut mismatched_config = owner_ctx.config().semantic.clone();
+        mismatched_config.model = "different-resident-model".to_string();
+        assert!(
+            app.adopt_resident_semantic_index(
+                &project_key,
+                &canonical_worktree,
+                &mismatched_config,
+            )
+            .is_none(),
+            "a mismatched semantic fingerprint must not adopt the resident base"
+        );
+
+        let borrower_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let borrower_root =
+            crate::path_identity::ProjectRootId::from_path(&canonical_worktree).unwrap();
+        assert!(executor.register_actor(borrower_root, Arc::clone(&borrower_ctx)));
+        let borrower_request = configure_semantic_with_options(
+            &canonical_worktree,
+            &storage,
+            "http://127.0.0.1:9/v1",
+            true,
+            64,
+            false,
+        );
+        let response = handle_configure_for_test(&borrower_request, &borrower_ctx);
+
+        assert!(response.success);
+        assert_eq!(borrower_ctx.cache_role(), "worktree");
+        // The RAM overlay is on by default, so the borrow-only root runs a
+        // refresh worker that embeds only files it changes after bind; the
+        // adopted resident base itself is never rebuilt (checked below).
+        assert!(
+            borrower_ctx.ram_overlay_active(),
+            "the default config overlays borrow-only roots"
+        );
+        assert!(
+            borrower_ctx.semantic_refresh_sender().is_some(),
+            "with the RAM overlay on, resident adoption keeps a changed-files-only semantic refresh worker"
+        );
+        assert!(
+            borrower_ctx.semantic_index_rx().lock().is_none(),
+            "resident adoption must not schedule a semantic disk loader"
+        );
+        let borrower_index = borrower_ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            borrower_index
+                .as_ref()
+                .unwrap()
+                .search(&[1.0, 0.0, 0.0], 100)
+                .is_empty(),
+            "different-tree donor rows must be masked before queries"
+        );
         assert!(
             borrower_index
                 .as_ref()
