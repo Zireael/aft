@@ -101,7 +101,7 @@ pub fn append_envelope_trailer(
     input_line_count: usize,
 ) -> Option<ListEnvelope> {
     let envelope = build_envelope_from_output(agent_received_output, input_line_count)?;
-    assert!(envelope.shown < input_line_count);
+    debug_assert!(envelope.shown < input_line_count);
     let trailer = envelope_trailer(&envelope);
     if !agent_received_output.is_empty() && !agent_received_output.ends_with('\n') {
         agent_received_output.push('\n');
