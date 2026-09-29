@@ -840,6 +840,11 @@ impl FirstLoadDriver for CheckoutDriver {
     }
     fn reconcile(&self, access: &ViewAccess) -> Result<ReconciledCheckout, PlaneError> {
         self.check_owner(access)?;
+        if super::intent::active(self.owner.root()) {
+            return Err(SiblingLoader::error(
+                "checkout write still active during reconciliation",
+            ));
+        }
         let revision = self.revision(access);
         let mut entries = BTreeMap::new();
         // No git diff or stat shortcut: copied trees and non-git roots take
@@ -1621,6 +1626,14 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    pub fn record_absolute_change(&self, absolute: &std::path::Path) {
+        if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
+            if let Ok(path) = RelPath::from_os_path(relative) {
+                self.record_change(path);
+            }
+        }
+    }
+
     /// Subscribe before serving the first snapshot. Weak writer registration
     /// stops notifying this checkout automatically when its driver is dropped.
     pub fn register_write_intent(self: &Arc<Self>) {
@@ -1760,5 +1773,151 @@ mod integrated_plane_tests {
                 failed: 0
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod checkout_kind_tests {
+    use super::super::contracts::PlaneLoader;
+    use super::*;
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn all_checkout_kinds_have_independent_writable_generations_and_cold_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        git(&primary, &["init", "-q"]);
+        git(&primary, &["config", "user.email", "test@example.invalid"]);
+        git(&primary, &["config", "user.name", "Test"]);
+        std::fs::write(primary.join("file.rs"), b"fn seed() {}\n").unwrap();
+        git(&primary, &["add", "file.rs"]);
+        git(&primary, &["commit", "-qm", "fixture"]);
+        let linked = temp.path().join("linked");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let shared = temp.path().join("shared");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                "--shared",
+                primary.to_str().unwrap(),
+                shared.to_str().unwrap(),
+            ],
+        );
+        let plain = temp.path().join("plain");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                primary.to_str().unwrap(),
+                plain.to_str().unwrap(),
+            ],
+        );
+        let copied = temp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(primary.join("file.rs"), copied.join("file.rs")).unwrap();
+        let storage = temp.path().join("storage");
+        let registry = super::super::registry::FamilyRegistry::open(&storage, "family").unwrap();
+        for (scope, root) in [
+            ("primary", primary),
+            ("linked", linked),
+            ("shared", shared),
+            ("plain", plain),
+            ("copied", copied),
+        ] {
+            std::fs::write(root.join("file.rs"), format!("fn {scope}_local() {{}}\n")).unwrap();
+            std::fs::write(root.join("untracked.rs"), b"fn untracked() {}\n").unwrap();
+            std::fs::write(root.join(".aftignore"), b"excluded.rs\n").unwrap();
+            std::fs::write(root.join("excluded.rs"), b"fn excluded() {}\n").unwrap();
+            let owner = registry.register_view(scope, &root).unwrap();
+            let policy = crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            };
+            let trigram = Arc::new(TrigramBridge::new(storage.clone(), policy));
+            let callgraph = Arc::new(CallgraphBridge::default());
+            let driver = Arc::new(
+                CheckoutDriver::new(
+                    owner.clone(),
+                    Producers {
+                        trigram: policy.fingerprint_hex(),
+                        semantic: None,
+                        callgraph: super::super::callgraph::PRODUCER.into(),
+                    },
+                    None,
+                    Arc::new(ConfiguredMembershipWalker),
+                    vec![trigram.clone(), callgraph.clone()],
+                )
+                .with_adapters(vec![trigram.adapter.clone(), callgraph.adapter.clone()]),
+            );
+            let started = std::time::Instant::now();
+            let loaded = SiblingLoader::new(
+                driver,
+                vec![trigram.adapter.clone(), callgraph.adapter.clone()],
+            )
+            .load(&ViewAccess::Owner(owner.clone()))
+            .unwrap();
+            assert!(
+                loaded.pending_planes.is_empty(),
+                "{scope}: {:?}",
+                loaded.pending_planes
+            );
+            // Independent source oracle, with no tested seed/blob/generation reuse.
+            let cold = super::super::live_delta::strict_walk(&root, &policy, 0);
+            assert!(cold.gaps.is_empty());
+            let cold_members = cold
+                .entries
+                .iter()
+                .map(|(path, entry)| (path.clone(), entry.disk))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(loaded.snapshot.membership(), cold_members, "{scope}");
+            assert!(!loaded
+                .snapshot
+                .membership()
+                .contains_key(&RelPath::new(b"excluded.rs".to_vec()).unwrap()));
+            let index = trigram
+                .adapter
+                .resident(scope, loaded.snapshot.generation().name())
+                .unwrap();
+            let answer = index.query(&root, &loaded.snapshot, &format!("{scope}_local"));
+            assert_eq!(answer.matches.len(), 1, "{scope}");
+            assert!(answer.gaps.is_empty());
+            eprintln!(
+                "checkout={scope} files={} elapsed_ms={} snapshot_metadata_lower_bound_bytes={}",
+                loaded.snapshot.membership().len(),
+                started.elapsed().as_millis(),
+                loaded.snapshot.membership().len()
+                    * std::mem::size_of::<super::super::snapshot::DiskState>()
+            );
+            let path = owner
+                .view_store()
+                .unwrap()
+                .manifest_path(loaded.snapshot.generation().name())
+                .unwrap();
+            assert!(path.is_file());
+        }
     }
 }

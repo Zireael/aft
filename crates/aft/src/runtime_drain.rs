@@ -2685,6 +2685,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
+                    ctx.record_checkout_watcher_change(path);
                     if heavy_root_work_allowed && ctx.inspect_writer() {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                             ctx.add_pending_tier2_paths([path.to_path_buf()]);

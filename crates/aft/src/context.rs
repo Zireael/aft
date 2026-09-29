@@ -2782,6 +2782,7 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    checkout_driver: RwLock<Option<Arc<crate::views::first_load::CheckoutDriver>>>,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
@@ -3304,6 +3305,7 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            checkout_driver: RwLock::new(None),
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
@@ -5616,6 +5618,10 @@ impl AppContext {
 
     pub(crate) fn clear_view_runtime(&self) {
         *self
+            .checkout_driver
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
             .checkout_query_runtime
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -6304,6 +6310,27 @@ impl AppContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Binds watcher invalidation and synchronous write intent to the same driver.
+    /// Called explicitly alongside query activation, never by legacy configure.
+    pub fn install_checkout_driver(&self, driver: Arc<crate::views::first_load::CheckoutDriver>) {
+        driver.register_write_intent();
+        *self
+            .checkout_driver
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+    }
+
+    pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
+        let driver = self
+            .checkout_driver
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(driver) = driver {
+            driver.record_absolute_change(path);
+        }
     }
 
     /// Activates a supplied, already loaded checkout runtime for this root.
