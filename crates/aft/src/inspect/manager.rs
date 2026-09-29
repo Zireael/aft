@@ -1826,11 +1826,33 @@ impl InspectManager {
         }
     }
 
-    /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
-    ///
-    /// The blocking inspect path must not turn an unfinished reuse job into a
-    /// partial response. A caller either receives the completed aggregate or a
-    /// failure from the worker; it never receives a timeout-shaped `Pending`.
+    /// Run against the request's already waited, pinned view reader. This path
+    /// bypasses background reuse so a previous generation cannot answer a newer
+    /// request. An unavailable reader never falls back to a legacy database.
+    pub fn tier2_run_with_pinned_view(
+        self: &Arc<Self>,
+        mut snapshot: InspectSnapshot,
+        category: InspectCategory,
+        scope: JobScope,
+        store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
+    ) -> JobOutcome {
+        let projected = store.as_ref().and_then(|store| {
+            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                .ok()
+                .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+        });
+        let mut config = (*snapshot.config).clone();
+        config.indexes.callgraph = false;
+        snapshot.config = Arc::new(config);
+        let mut job = self.tier2_reuse_job(snapshot, category, projected);
+        job.scope_files = scope_files(
+            &job.project_root,
+            &JobScope::for_project(job.project_root.clone()),
+        );
+        let result = run_tier2_scan(&job, None);
+        filter_outcome_for_scope(self.completion_outcome(result), &scope)
+    }
+
     pub fn tier2_run_with_reuse_blocking(
         self: &Arc<Self>,
         snapshot: InspectSnapshot,

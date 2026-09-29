@@ -498,6 +498,22 @@ fn handle_inspect_payload(
         return inspect_interrupted_response(&req.id);
     }
 
+    // Wait while the request's config/query guard is alive. The result is pinned
+    // once and handed into workers; they must not open another generation.
+    let routed_store = if ctx.checkout_query_runtime_active() {
+        ctx.callgraph_store_for_ops()
+    } else {
+        crate::context::CallgraphStoreAccess::Unavailable
+    };
+    let checkout_routed = ctx.checkout_query_outcome().is_some();
+    let checkout_store = if checkout_routed {
+        match routed_store {
+            crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let manager = ctx.inspect_manager();
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
@@ -544,6 +560,7 @@ fn handle_inspect_payload(
             continue;
         }
         let manager = manager.clone();
+        let checkout_store = checkout_store.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
         let callgraph_phase = phase_log.and_then(|phase_log| {
@@ -572,7 +589,9 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         std::thread::spawn(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if force_root_diagnostics {
+            let outcome = if checkout_routed {
+                manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
+            } else if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
             } else {
                 manager.tier2_run_with_reuse_blocking(snapshot, category, scope)
@@ -839,10 +858,15 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+        if ctx.checkout_query_runtime_active() {
+            // Pin the one final wait outcome even when diagnostics terminate
+            // before Tier-2 submission. Finalization below uses this same guard.
+            let _ = ctx.callgraph_store_for_ops();
+        }
         // Queueing instead of sharing a response keeps request-specific scopes,
         // phase logs, and terminals independent while bounding expensive work to
         // one detached inspect body per root.
-        let response = match DeferredInspectRootPermit::acquire(root, deadline) {
+        let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
             Some(_permit) => {
                 run_blocking_inspect_body(&request, &ctx, applicability, phase_log, deadline)
             }
@@ -855,6 +879,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
                 request_deadline_terminal(next_phase(&applicability), deadline),
             ),
         };
+        crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {
@@ -5341,5 +5366,120 @@ mod deferred_terminal_tests {
             "build_denied (borrow-only)"
         );
         assert_eq!(InspectBuilderState::Absent.as_str(), "absent");
+    }
+}
+
+#[cfg(test)]
+mod checkout_deferred_tests {
+    use super::*;
+    use crate::views::contracts::{QueryWait, ViewAccess, WaitOutcome};
+    use crate::views::manifest_v2::{ManifestHeader, ManifestV2, Producers};
+    use crate::views::snapshot::{LiveDelta, OpenGeneration, Snapshot};
+
+    struct Timeout {
+        snapshot: Snapshot,
+        gap: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl QueryWait for Timeout {
+        fn wait_for(
+            &self,
+            _: &ViewAccess,
+            _: crate::blob_store::v2::FamilyPlane,
+            _: Duration,
+        ) -> WaitOutcome {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WaitOutcome::TimedOut {
+                snapshot: self.snapshot.clone(),
+                unreflected: vec![self.gap.clone()],
+            }
+        }
+    }
+    fn run(active: bool) -> (Response, usize) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# Fixture\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.path().to_path_buf());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: "test".into(),
+                semantic: None,
+                callgraph: crate::views::callgraph::PRODUCER.into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        let snapshot =
+            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest, None))).snapshot();
+        let waiter = Arc::new(Timeout {
+            snapshot,
+            gap: root.path().join("pending.ts"),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        if active {
+            let registry =
+                crate::views::registry::FamilyRegistry::open(storage.path(), "inspect-test")
+                    .unwrap();
+            let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+            ctx.install_checkout_query_runtime(Arc::new(
+                crate::views::query_wait::CheckoutQueryRuntime {
+                    access,
+                    waiter: waiter.clone(),
+                    callgraph: Arc::new(crate::views::callgraph::CallgraphPlane::default()),
+                },
+            ));
+        }
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"deferred-checkout", "command":"inspect"}),
+        )
+        .unwrap();
+        let (started, release) = install_deferred_inspect_stat_gate_for_test();
+        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred(&request, ctx.clone())
+        else {
+            panic!("expected deferred inspect");
+        };
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let response = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        (
+            response,
+            waiter.calls.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[test]
+    fn deferred_checkout_timeout_attaches_named_gaps_before_guard_drops() {
+        let _serial = deferred_inspect_test_lock();
+        let (response, calls) = run(true);
+        assert_eq!(calls, 1, "one wait budget per worker request");
+        assert_eq!(response.data["complete"], false);
+        let gaps = response.data["gaps"].as_array().unwrap();
+        assert!(gaps.iter().any(|gap| gap["kind"] == "view_pending"
+            && gap["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("pending.ts"))));
+    }
+    #[test]
+    fn default_deferred_inspect_has_no_checkout_wait_or_gap_fields() {
+        let _serial = deferred_inspect_test_lock();
+        let (response, calls) = run(false);
+        assert_eq!(calls, 0);
+        assert_eq!(response.data["inspect_terminal"], "fresh");
+        assert!(response.data.get("complete").is_none());
+        assert!(response.data.get("gaps").is_none());
     }
 }
