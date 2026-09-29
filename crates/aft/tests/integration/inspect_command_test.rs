@@ -4649,12 +4649,15 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     .unwrap();
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], false);
-    assert!(
-        response["summary"]["todos"]["count"]
-            .as_u64()
-            .is_some_and(|n| n > 0),
-        "{response:#}"
-    );
+    // The TODO scan shares the remaining budget. On a slow runner (Windows CI)
+    // it can run out too, which must surface as a named gap rather than a
+    // silent zero; either outcome is honest.
+    let todos = &response["summary"]["todos"];
+    let todos_counted = todos["count"].as_u64().is_some_and(|n| n > 0);
+    let todos_gap_named = todos["gaps"]
+        .as_array()
+        .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "analysis_incomplete"));
+    assert!(todos_counted || todos_gap_named, "{response:#}");
     let details = response["details"]["diagnostics"].as_array().unwrap();
     assert!(
         details.iter().any(|item| item["complete"] == false
