@@ -638,8 +638,10 @@ impl PairScorer for CountingScorer {
         docs: &[String],
         _deadline: Instant,
     ) -> Result<Vec<f32>, RerankError> {
-        std::thread::sleep(self.delay);
+        // Counted when inference starts, so a test can tell a dropped request
+        // from one that was computed after its caller gave up.
         self.computed.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
         Ok(docs.iter().map(|doc| doc.len() as f32).collect())
     }
 }
