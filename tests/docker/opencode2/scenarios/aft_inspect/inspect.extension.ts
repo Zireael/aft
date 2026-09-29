@@ -1,7 +1,7 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
+import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const expectedIds = ["inspect/T1/happy","inspect/T2/invalid_arguments","inspect/T4/abort","inspect/T6/inspect-payload-details/complete","inspect/T6/inspect-payload-details/incomplete","inspect/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
@@ -17,14 +17,5 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
   if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("inspect" + " mutation controls missing");
 }
-async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
-  if (context.scenario.id === "inspect/T4/abort") {
-    const lines = Array.from(
-      { length: 10_000 },
-      (_, index) => `// TODO: cancellation fixture work item ${index}`,
-    );
-    await writeFile(join(context.project_root, "abort-load.ts"), `${lines.join("\n")}\n`);
-  }
-}
-const extension: HarnessExtension = { name: "inspect-scenarios-v1", validate, beforeScenario };
+const extension: HarnessExtension = { name: "inspect-scenarios-v1", validate };
 export default extension;

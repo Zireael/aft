@@ -299,6 +299,7 @@ describe("scenario isolation and liveness", () => {
     const isolated = await createScenarioIsolation({
       parent: join(parent, "runs"),
       scenarioId: "read/T1/happy",
+      scenarioEnv: { AFT_TEST_INSPECT_DELAY_MS: "30000", HOME: "/not-isolated" },
       fixture,
       pluginTarball: tarball,
       pluginDirectory,
@@ -328,6 +329,8 @@ describe("scenario isolation and liveness", () => {
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
     expect(isolated.env.OPENCODE_DB).toBe("opencode2.db");
     expect(isolated.env.AFT_BINARY_PATH).toBe("/native/aft");
+    expect(isolated.env.AFT_TEST_INSPECT_DELAY_MS).toBe("30000");
+    expect(process.env.AFT_TEST_INSPECT_DELAY_MS).not.toBe("30000");
     const aftConfig = JSON.parse(
       await readFile(join(isolated.project, ".cortexkit", "aft.jsonc"), "utf8"),
     );

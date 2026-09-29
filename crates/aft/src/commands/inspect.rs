@@ -181,6 +181,48 @@ fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
     false
 }
 
+// Host abort tests need the call to remain in flight, regardless of project size.
+// This environment-only seam also obeys the request budget and cancellation so
+// an abort never has to wait for the artificial delay to expire.
+fn delay_inspect_body_from_env_for_test(deadline: InspectRequestDeadline) {
+    let Some(delay) = std::env::var("AFT_TEST_INSPECT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+    else {
+        return;
+    };
+    wait_inspect_test_delay(
+        delay,
+        deadline,
+        crate::executor::current_job_cancellation().as_ref(),
+    );
+}
+
+fn wait_inspect_test_delay(
+    delay: Duration,
+    deadline: InspectRequestDeadline,
+    cancellation: Option<&crate::executor::JobCancellation>,
+) {
+    let started = Instant::now();
+    loop {
+        let remaining = delay
+            .saturating_sub(started.elapsed())
+            .min(deadline.work_at().saturating_duration_since(Instant::now()));
+        if remaining.is_zero() {
+            return;
+        }
+        let wait = remaining.min(Duration::from_millis(50));
+        if let Some(token) = cancellation {
+            if token.wait_for_cancellation(wait) {
+                return;
+            }
+        } else {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
 struct DeferredInspectRootPermit {
     root: PathBuf,
 }
@@ -942,6 +984,7 @@ fn run_blocking_inspect_body(
         }
     };
     wait_at_deferred_inspect_body_gate_for_test(deadline);
+    delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
@@ -4290,6 +4333,52 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     use super::*;
+
+    #[test]
+    fn inspect_test_delay_holds_until_elapsed() {
+        let started = Instant::now();
+        wait_inspect_test_delay(
+            Duration::from_millis(60),
+            InspectRequestDeadline::new(Duration::from_secs(5), Duration::ZERO),
+            None,
+        );
+        assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[test]
+    fn inspect_test_delay_wakes_on_cancellation() {
+        let token = crate::executor::JobCancellation::new();
+        let worker_token = token.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            wait_inspect_test_delay(
+                Duration::from_secs(30),
+                InspectRequestDeadline::new(Duration::from_secs(60), Duration::ZERO),
+                Some(&worker_token),
+            );
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(60)).is_err());
+        token.request_cancel();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation must wake the hold");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn inspect_test_delay_obeys_request_budget() {
+        let started = Instant::now();
+        wait_inspect_test_delay(
+            Duration::from_secs(30),
+            InspectRequestDeadline::new(Duration::from_millis(60), Duration::ZERO),
+            None,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn deferred_preflight_uses_one_terminal_poll_response() {

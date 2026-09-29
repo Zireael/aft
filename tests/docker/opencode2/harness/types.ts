@@ -164,6 +164,8 @@ export interface ScenarioDefinition {
   expected_fail_issue?: string;
   preconditions?: ScenarioPrecondition[];
   project_config?: Record<string, unknown>;
+  /** Environment overrides for this scenario's isolated host and native engine. */
+  env?: Record<string, string>;
   metadata?: Record<string, unknown>;
   /** Added by the loader so fixture paths can stay registration-relative. */
   registration_path?: string;
