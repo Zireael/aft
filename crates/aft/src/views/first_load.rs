@@ -727,6 +727,8 @@ pub trait MembershipWalker: Send + Sync {
 struct InstalledCheckout {
     revision: u64,
     snapshot: Snapshot,
+    prepared_generation: Option<String>,
+    own_installed: bool,
 }
 
 /// Composite checkout driver shared by the loader and query-wait router.
@@ -738,6 +740,7 @@ pub struct CheckoutDriver {
     head_tree: Option<String>,
     walker: Arc<dyn MembershipWalker>,
     planes: Vec<Arc<dyn CompositePlane>>,
+    adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
     installed: std::sync::Mutex<InstalledCheckout>,
 }
 
@@ -764,11 +767,21 @@ impl CheckoutDriver {
             head_tree,
             walker,
             planes,
+            adapters: Vec::new(),
             installed: std::sync::Mutex::new(InstalledCheckout {
                 revision: 0,
                 snapshot: delta.snapshot(),
+                prepared_generation: None,
+                own_installed: false,
             }),
         }
+    }
+
+    /// Registers resident plane readers for atomic installation with snapshots.
+    /// The driver remains opt-in; this does not change process-global routing.
+    pub fn with_adapters(mut self, adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>) -> Self {
+        self.adapters = adapters;
+        self
     }
 
     /// Invalidates in-flight walks/builds and records an unreflected path under
@@ -863,7 +876,21 @@ impl FirstLoadDriver for CheckoutDriver {
                 "checkout changed before snapshot installation",
             ));
         }
+        let own_installed =
+            installed.prepared_generation.as_deref() == Some(snapshot.generation().name());
+        for adapter in &self.adapters {
+            if adapter.plane() != FamilyPlane::Callgraph || own_installed {
+                adapter.open_generation(access, snapshot.generation())?;
+            }
+        }
+        let old_name = installed.snapshot.generation().name().to_owned();
         installed.snapshot = snapshot.clone();
+        installed.own_installed = own_installed;
+        if old_name != snapshot.generation().name() {
+            for adapter in &self.adapters {
+                adapter.release_generation(access, &old_name);
+            }
+        }
         Ok(())
     }
     fn build_own_generation(
@@ -953,9 +980,17 @@ impl FirstLoadDriver for CheckoutDriver {
             .registry()
             .register_reader("installed-owner")
             .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        super::read::open_foreign_generation(&reader, self.owner.scope(), &self.producers)
-            .map_err(|error| SiblingLoader::error(error.to_string()))?
-            .ok_or_else(|| SiblingLoader::error("own publication has no installed generation"))
+        let generation =
+            super::read::open_foreign_generation(&reader, self.owner.scope(), &self.producers)
+                .map_err(|error| SiblingLoader::error(error.to_string()))?
+                .ok_or_else(|| {
+                    SiblingLoader::error("own publication has no installed generation")
+                })?;
+        self.installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prepared_generation = Some(generation.name().to_owned());
+        Ok(generation)
     }
 }
 
@@ -976,6 +1011,21 @@ impl QueryState for CheckoutDriver {
                 .any(|driver| driver.plane() == plane && driver.applies_to(path))
         };
         let mut gaps = std::collections::BTreeSet::new();
+        if self.adapters.iter().any(|adapter| {
+            adapter.plane() == plane
+                && matches!(
+                    adapter.readiness(&snapshot),
+                    super::readiness::PlaneReadiness::Absent
+                        | super::readiness::PlaneReadiness::Building
+                )
+        }) {
+            gaps.extend(
+                snapshot
+                    .membership()
+                    .into_keys()
+                    .filter(|path| applicable(path)),
+            );
+        }
         gaps.extend(
             snapshot
                 .pending_intent()
@@ -990,10 +1040,11 @@ impl QueryState for CheckoutDriver {
         );
         for (path, entry) in snapshot.generation().manifest().entries() {
             if applicable(path)
-                && !matches!(
-                    entry.plane_state(plane),
-                    Some(super::readiness::PlaneState::Ready { .. })
-                )
+                && ((plane == FamilyPlane::Callgraph && !installed.own_installed)
+                    || !matches!(
+                        entry.plane_state(plane),
+                        Some(super::readiness::PlaneState::Ready { .. })
+                    ))
             {
                 gaps.insert(path.clone());
             }
@@ -1238,5 +1289,227 @@ mod composite_tests {
             driver.installed_state(&access, FamilyPlane::Trigram).1,
             vec![root.path().join("file.rs")]
         );
+    }
+}
+
+/// Bridges the ruled callgraph extractor/materializer into the composite loader.
+/// Pass `adapter` to `CheckoutDriver::with_adapters`; use `callgraph::PRODUCER`
+/// in the driver's producer header. No global registration occurs here.
+#[derive(Default)]
+pub struct CallgraphBridge {
+    pub adapter: Arc<super::callgraph::CallgraphPlane>,
+}
+
+impl CompositePlane for CallgraphBridge {
+    fn plane(&self) -> FamilyPlane {
+        FamilyPlane::Callgraph
+    }
+    fn applies_to(&self, path: &RelPath) -> bool {
+        use super::contracts::PlaneAdapter;
+        self.adapter.applies_to(path)
+    }
+    fn attachment(
+        &self,
+        path: &RelPath,
+        bytes: &[u8],
+    ) -> Result<super::snapshot::PlaneAttachment, PlaneError> {
+        let language = if super::assembly::is_resolution_input(path.as_bytes()) {
+            "config".to_string()
+        } else {
+            let path = std::str::from_utf8(path.as_bytes()).map_err(|error| PlaneError {
+                plane: FamilyPlane::Callgraph,
+                reason: error.to_string(),
+            })?;
+            format!(
+                "{:?}",
+                crate::parser::detect_language(std::path::Path::new(path)).ok_or_else(|| {
+                    PlaneError {
+                        plane: FamilyPlane::Callgraph,
+                        reason: format!("unsupported callgraph member: {path}"),
+                    }
+                })?
+            )
+            .to_lowercase()
+        };
+        let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(bytes), 0);
+        let attachment = super::callgraph::attach(&mut entry, bytes, &language)?;
+        Ok(Arc::new(attachment))
+    }
+    fn materialize(
+        &self,
+        owner: &super::registry::ViewRegistration,
+        generation: &str,
+        snapshot: &Snapshot,
+        manifest: &mut super::manifest_v2::ManifestV2,
+        live: &mut crate::pins::LivePin,
+        seed_derived: bool,
+    ) -> Result<(), PlaneError> {
+        let error = |reason: String| PlaneError {
+            plane: FamilyPlane::Callgraph,
+            reason,
+        };
+        if seed_derived {
+            return Err(error("derived callgraph seed reuse is not enabled".into()));
+        }
+        let store = owner
+            .open_store(FamilyPlane::Callgraph)
+            .map_err(|e| error(e.to_string()))?;
+        for (path, entry) in snapshot.live_entries() {
+            if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
+                continue;
+            }
+            let attachment = entry
+                .attachments
+                .get(&FamilyPlane::Callgraph)
+                .and_then(|value| value.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .ok_or_else(|| error(format!("{path:?}: callgraph attachment missing")))?;
+            live.protect(&[attachment.key])
+                .map_err(|e| error(e.to_string()))?;
+            let bytes = attachment
+                .blob
+                .to_bytes()
+                .map_err(|e| error(e.to_string()))?;
+            store
+                .put_or_touch(&attachment.key, &bytes)
+                .map_err(|e| error(e.to_string()))?;
+            if let Some(super::manifest_v2::EntryV2::Regular {
+                planes,
+                resolution_input,
+                ..
+            }) = manifest.get_mut(path)
+            {
+                planes.callgraph = Some(super::readiness::PlaneState::ready(&attachment.key));
+                *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+            }
+        }
+        // Joining uses only protected immutable blobs and the projected manifest,
+        // not a source root or a sibling's derived database.
+        let reader = super::callgraph::BlobReader(
+            crate::blob_store::v2::FamilyStoreReader::open_existing(
+                owner.registry().storage(),
+                owner.family(),
+                FamilyPlane::Callgraph,
+            )
+            .map_err(|e| error(e.to_string()))?
+            .ok_or_else(|| error("callgraph blob store unavailable".into()))?,
+        );
+        let database = super::resolve_derived_path(owner.view_dir(), generation)
+            .map_err(|e| error(e.to_string()))?;
+        super::callgraph::materialize(&database, manifest, &reader)
+    }
+    fn finish_generation(
+        &self,
+        owner: &super::registry::ViewRegistration,
+        staging: &str,
+        published: &str,
+    ) -> Result<(), PlaneError> {
+        let error = |e: super::ViewError| PlaneError {
+            plane: FamilyPlane::Callgraph,
+            reason: e.to_string(),
+        };
+        let staging_path = super::resolve_derived_path(owner.view_dir(), staging).map_err(error)?;
+        let (busy, frames, checkpointed) = super::sqlite_full_sync_checkpoint(
+            &staging_path,
+            "first_load::CallgraphBridge::finish_generation",
+        )
+        .map_err(error)?;
+        if busy != 0 || (frames >= 0 && checkpointed != frames) {
+            return Err(PlaneError {
+                plane: FamilyPlane::Callgraph,
+                reason: "private callgraph checkpoint incomplete".into(),
+            });
+        }
+        let published_path =
+            super::resolve_derived_path(owner.view_dir(), published).map_err(error)?;
+        if staging_path != published_path {
+            if crate::db::file_identity::open_connections(&staging_path) != 0
+                || published_path.exists()
+            {
+                return Err(PlaneError {
+                    plane: FamilyPlane::Callgraph,
+                    reason: "private callgraph install would replace a live database".into(),
+                });
+            }
+            crate::db::file_identity::guard_replacement(&staging_path, "first-load derived rename");
+            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+        }
+        super::sync_directory(owner.view_dir()).map_err(|e| error(e.into()))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod callgraph_bridge_tests {
+    use super::super::contracts::PlaneAdapter;
+    use super::*;
+
+    struct Walker;
+    impl MembershipWalker for Walker {
+        fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
+            Ok(vec![root.join("file.rs")])
+        }
+    }
+    #[test]
+    fn real_callgraph_bridge_installs_reader_before_wait_reports_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file.rs"),
+            b"fn target() {}\nfn caller() { target(); }\n",
+        )
+        .unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let owner = registry.register_view("local", root.path()).unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                None,
+                Arc::new(Walker),
+                vec![bridge.clone()],
+            )
+            .with_adapters(vec![bridge.adapter.clone()]),
+        );
+        let access = ViewAccess::Owner(owner);
+        let loader = SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()]);
+        let seed = loader.seed(&access).unwrap();
+        let (seed_snapshot, revision) = loader.reconciled(&access, seed).unwrap();
+        driver.install(&access, &seed_snapshot, revision).unwrap();
+        assert_eq!(
+            driver.installed_state(&access, FamilyPlane::Callgraph).1,
+            vec![root.path().join("file.rs")]
+        );
+        let own = driver
+            .build_own_generation(&access, &seed_snapshot, false)
+            .unwrap();
+        let (snapshot, revision) = loader.reconciled(&access, own).unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        assert_eq!(
+            bridge.adapter.readiness(&snapshot),
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0
+            }
+        );
+        let reader = bridge.adapter.reader(&access, &snapshot).unwrap();
+        assert_eq!(reader.store.indexed_file_count().unwrap(), 1);
+        assert_eq!(
+            reader
+                .store
+                .direct_callers_of(std::path::Path::new("file.rs"), "target")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(driver
+            .installed_state(&access, FamilyPlane::Callgraph)
+            .1
+            .is_empty());
     }
 }
