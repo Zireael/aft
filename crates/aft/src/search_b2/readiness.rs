@@ -12,9 +12,10 @@ const SYMBOL_REASON: &str = "symbol:";
 
 /// Samples all sources at admission and retains the resources selected by that sample.
 ///
-/// The expensive first-search wait is used only when the first observation has no
-/// ready source. A completed wait is followed by exactly one new observation, and
-/// only that second observation is allowed to select the plan.
+/// The expensive first-search wait is used when neither retrieval index is ready.
+/// A warm symbol cache alone cannot serve lexical or semantic matches. A completed
+/// wait is followed by exactly one new observation, and only that second
+/// observation is allowed to select the plan.
 pub fn sample<'a>(root: &Root<'a>) -> Readiness<'a> {
     if let Some(readiness) = root.fixed_readiness() {
         return readiness.clone();
@@ -23,7 +24,7 @@ pub fn sample<'a>(root: &Root<'a>) -> Readiness<'a> {
         .source()
         .expect("a non-fixed readiness root carries a runtime source");
     let first = sample_once(source.sample());
-    if first.semantic_index || first.lexical_index || first.symbol_index {
+    if first.semantic_index || first.lexical_index {
         return first;
     }
 

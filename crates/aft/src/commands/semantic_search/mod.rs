@@ -7003,6 +7003,49 @@ mod tests {
     }
 
     #[test]
+    fn ready_symbols_with_pending_trigram_retain_lexical_fallback_results() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        let source = "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n";
+        std::fs::write(&source_file, source).unwrap();
+        let ctx = test_context(project.path());
+        ctx.update_config(|config| config.indexes.semantic = false);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+        ctx.symbol_cache().write().unwrap().insert(
+            source_file.clone(),
+            std::fs::metadata(&source_file).unwrap().modified().unwrap(),
+            source.len() as u64,
+            blake3::hash(source.as_bytes()),
+            Vec::new(),
+        );
+
+        // Publication is queued, but not resident at admission. This fixes the
+        // startup ordering without relying on thread scheduling or a sleep.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, source.as_bytes());
+        index.ready = true;
+        tx.send(index).unwrap();
+        assert!(ctx.search_index().read().unwrap().is_none());
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("request authentication handler", 5),
+            &ctx,
+        ));
+        let text = response["text"].as_str().expect("search text");
+        assert!(text.contains("pub fn handle_request"), "{response}");
+        assert!(text.contains("[lexical match]"), "{response}");
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["semantic_status"], "disabled");
+        assert_eq!(
+            response["structuredContent"]["plan"]["readiness"]["lexical_index"],
+            true
+        );
+    }
+
+    #[test]
     fn first_search_waits_for_slow_borrowed_base_and_returns_results() {
         assert_eq!(
             FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET,
