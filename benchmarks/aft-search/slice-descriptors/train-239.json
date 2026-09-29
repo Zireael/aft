@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "repeat-breaker-observes-bash"
+  ],
+  "note": "The repeat breaker observes bash and powershell calls on the subc path and the standalone raw-bash path. No ranking-fence files."
+}
