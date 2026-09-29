@@ -19,8 +19,31 @@ pub mod materialization;
 mod profile;
 pub(crate) mod read;
 
+// Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
+// trigram segments, the plane contracts and the parity harness.
+pub mod contracts;
+pub mod manifest_v2;
+pub mod parity_harness;
+pub mod readiness;
+pub mod registry;
+pub mod segment_store;
+pub mod snapshot;
+
+// Plane and runtime modules of the per-checkout views, declared here so their
+// owners never edit this file concurrently. Each starts empty.
+pub mod callgraph;
+pub mod first_load;
+pub mod intent;
+pub mod live_delta;
+pub mod query_wait;
+pub mod semantic;
+pub mod semantic_arena;
+pub mod trigram;
+
 #[cfg(test)]
 mod dispatch_parity_probe;
+#[cfg(test)]
+mod per_checkout_core_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -75,9 +98,18 @@ pub enum ViewError {
     Json(serde_json::Error),
     InvalidManifest(String),
     ManifestAlreadyExists(String),
-    MissingBlob { plane: ArtifactPlane, key: String },
+    MissingBlob {
+        plane: ArtifactPlane,
+        key: String,
+    },
     MissingTrigram,
     MissingAlias(String),
+    /// A manifest or completion was produced by a different producer (model,
+    /// extractor or trigram policy) than the one the reader requires.
+    ProducerMismatch(String),
+    /// A generation's name does not match the content fingerprint of its
+    /// manifest.
+    GenerationMismatch(String),
 }
 
 impl fmt::Display for ViewError {
@@ -107,6 +139,12 @@ impl fmt::Display for ViewError {
                 formatter,
                 "published generation references missing alias {oid}"
             ),
+            Self::ProducerMismatch(message) => {
+                write!(formatter, "view producer mismatch: {message}")
+            }
+            Self::GenerationMismatch(message) => {
+                write!(formatter, "view generation mismatch: {message}")
+            }
         }
     }
 }
@@ -145,7 +183,7 @@ pub type Result<T> = std::result::Result<T, ViewError>;
 
 /// A byte-exact manifest value. JSON uses a UTF-8 string when possible and a
 /// `{"b64": ...}` object otherwise, so no path bytes are lost at the boundary.
-#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ByteString(Vec<u8>);
 
 impl ByteString {
@@ -218,7 +256,7 @@ impl<'de> Deserialize<'de> for ByteString {
 }
 
 /// A relative path key stored as exact bytes in bytewise canonical order.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RelPath(ByteString);
 
 impl RelPath {
@@ -665,6 +703,25 @@ impl ViewStore {
         let store = Self { view_dir };
         store.initialize_pointer()?;
         Ok(store)
+    }
+
+    /// Opens (creating when absent) a view directory at an explicit path. The
+    /// per-checkout (v2) layout keeps views under `views/v2/<scope>` and
+    /// reaches this only through a registered view.
+    pub(crate) fn open_dir(view_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&view_dir)?;
+        let store = Self { view_dir };
+        store.initialize_pointer()?;
+        Ok(store)
+    }
+
+    /// A view directory that already has a pointer database, without creating
+    /// or initializing anything. Registry readers use this.
+    pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
+        view_dir
+            .join(POINTER_DATABASE)
+            .is_file()
+            .then_some(Self { view_dir })
     }
 
     pub fn view_dir(&self) -> &Path {

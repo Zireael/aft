@@ -11,9 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::blob_store::v2::{FamilyKey, FamilyStore, TouchReport};
 use crate::blob_store::FullKey;
 use crate::fs_lock;
 use crate::root_cache::{self, ReadMarker};
+
+mod live;
+pub use live::LivePin;
 
 /// A pin remains live for thirty minutes after its most recent successful renewal.
 pub const PIN_TTL_MS: u64 = 30 * 60 * 1_000;
@@ -96,9 +100,41 @@ impl AssemblyPin {
         generation: impl Into<String>,
         keys: &[FullKey],
     ) -> Result<Self, PinError> {
-        let family = family.into();
-        let view = view.into();
-        let generation = generation.into();
+        Self::create_with_hex_keys(
+            view_dir,
+            family.into(),
+            view.into(),
+            generation.into(),
+            keys.iter().map(FullKey::to_hex).collect(),
+        )
+    }
+
+    /// Creates a pin for per-checkout (v2) work. It must list every key the
+    /// work will rely on, in every plane, including keys that are already
+    /// stored; see [`protect_then_touch`].
+    pub fn create_v2(
+        view_dir: &Path,
+        family: impl Into<String>,
+        view: impl Into<String>,
+        generation: impl Into<String>,
+        keys: &[FamilyKey],
+    ) -> Result<Self, PinError> {
+        Self::create_with_hex_keys(
+            view_dir,
+            family.into(),
+            view.into(),
+            generation.into(),
+            keys.iter().map(FamilyKey::to_hex).collect(),
+        )
+    }
+
+    fn create_with_hex_keys(
+        view_dir: &Path,
+        family: String,
+        view: String,
+        generation: String,
+        keys: Vec<String>,
+    ) -> Result<Self, PinError> {
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
         fs::create_dir_all(&pins_dir)?;
@@ -133,6 +169,24 @@ impl AssemblyPin {
 
     pub fn keys_path(&self) -> &Path {
         &self.keys_path
+    }
+
+    /// Checks, before a publisher's CAS, that its pin files still exist with
+    /// its own metadata. A sweep may have reclaimed a pin it wrongly judged
+    /// dead; publishing without it would expose keys nothing protected.
+    pub fn verify_held(&self) -> Result<(), PinError> {
+        let stored: PinMetadata = serde_json::from_slice(&fs::read(&self.metadata_path)?)?;
+        if stored.owner != self.metadata.owner
+            || stored.generation != self.metadata.generation
+            || stored.family != self.metadata.family
+            || !self.keys_path.is_file()
+        {
+            return Err(PinError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the assembly pin was replaced or reclaimed",
+            )));
+        }
+        Ok(())
     }
 
     /// Renews the pin when a put is due. A renewal error is returned before the
@@ -201,6 +255,47 @@ pub(crate) fn pin_paths(view_dir: &Path, generation: &str) -> (PathBuf, PathBuf)
     )
 }
 
+/// Something whose key list is durable on disk, where a family sweep reads it.
+pub trait Protection {
+    fn durable_keys_path(&self) -> &Path;
+}
+
+impl Protection for AssemblyPin {
+    fn durable_keys_path(&self) -> &Path {
+        &self.keys_path
+    }
+}
+
+/// Touches `keys` in `store`, but only after checking that every one of them
+/// is already listed in `protection`'s durable key file. This is the
+/// "protect, then touch" order the family GC relies on: a sweep either saw
+/// the protection while marking, or the touch landed at its new epoch.
+/// Keys reported missing must be put again from the caller's bytes.
+pub fn protect_then_touch(
+    protection: &dyn Protection,
+    store: &FamilyStore,
+    keys: &[FamilyKey],
+) -> Result<TouchReport, PinError> {
+    let listed = read_keys(protection.durable_keys_path())?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(unprotected) = keys.iter().find(|key| !listed.contains(key.as_bytes())) {
+        return Err(PinError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("key {unprotected} is touched before it is protected"),
+        )));
+    }
+    store
+        .touch(keys)
+        .map_err(|error| PinError::Io(io::Error::other(error.to_string())))
+}
+
+/// Reads a pin's metadata, failing on anything unreadable or malformed. The
+/// family sweep aborts on such an error instead of skipping the pin.
+pub(crate) fn read_metadata_strict(path: &Path) -> Result<PinMetadata, PinError> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
 pub(crate) fn read_keys(path: &Path) -> Result<Vec<[u8; 32]>, PinError> {
     let contents = fs::read_to_string(path)?;
     contents.lines().map(parse_hex_key).collect()
@@ -230,8 +325,7 @@ fn validate_generation(generation: &str) -> Result<(), PinError> {
     Ok(())
 }
 
-fn write_keys(path: &Path, keys: &[FullKey]) -> Result<(), PinError> {
-    let mut encoded = keys.iter().map(FullKey::to_hex).collect::<Vec<_>>();
+fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.sort_unstable();
     encoded.dedup();
     let mut file = create_private(path)?;
