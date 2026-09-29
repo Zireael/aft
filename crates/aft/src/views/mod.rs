@@ -29,8 +29,8 @@ pub mod registry;
 pub mod segment_store;
 pub mod snapshot;
 
-// Plane and runtime modules of the per-checkout views, declared here so their
-// owners never edit this file concurrently. Each starts empty.
+// Plane and runtime modules of the per-checkout views. Each starts as a
+// documented empty module that its plane fills in.
 pub mod callgraph;
 pub mod first_load;
 pub mod intent;

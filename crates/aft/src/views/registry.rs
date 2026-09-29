@@ -39,8 +39,8 @@ use crate::blob_store::v2::{
 use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 use crate::pins::PinOwner;
 
-/// Schema version of `members.sqlite`. Later slices extend the registry (for
-/// example with the import table) by bumping this and migrating forward.
+/// Schema version of `members.sqlite`. A newer version is refused rather than
+/// read; extending the registry means bumping this and migrating forward.
 pub const REGISTRY_SCHEMA_VERSION: i64 = 1;
 pub const REGISTRY_FILE: &str = "members.sqlite";
 /// Consecutive sweeps that must find a missing-root member with no protection

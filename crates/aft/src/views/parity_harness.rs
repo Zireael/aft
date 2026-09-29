@@ -265,9 +265,13 @@ pub struct EditSchedule {
     pub steps: Vec<EditStep>,
 }
 
+/// The ignore file the standard schedules edit. `.aftignore` applies with or
+/// without a git repository, so fixtures need no `git init`.
+pub const FIXTURE_IGNORE_FILE: &str = ".aftignore";
+
 /// The shared schedules every plane runs. `base` names a file that exists in
-/// the fixture with `base_bytes`; `ignored` is a path the fixture's ignore file
-/// excludes.
+/// the fixture with `base_bytes`; `ignored` is a path the fixture's
+/// [`FIXTURE_IGNORE_FILE`] excludes.
 pub fn standard_schedules(base: &str, base_bytes: &[u8], ignored: &str) -> Vec<EditSchedule> {
     let edited = [base_bytes, b"\n// edited\n".as_slice()].concat();
     vec![
@@ -320,7 +324,7 @@ pub fn standard_schedules(base: &str, base_bytes: &[u8], ignored: &str) -> Vec<E
             name: "ignore file change",
             steps: vec![
                 EditStep::write(ignored, b"ignored".to_vec()),
-                EditStep::write(".gitignore", b"".to_vec()),
+                EditStep::write(FIXTURE_IGNORE_FILE, b"".to_vec()),
             ],
         },
     ]

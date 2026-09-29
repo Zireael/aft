@@ -1,5 +1,5 @@
-//! Per-checkout views, slice 1: the family registry, v2 stores, the GC
-//! protection protocol, and publication durability, across real processes.
+//! Per-checkout views: the family registry, v2 stores, the GC protection
+//! protocol, and publication durability, across real processes.
 //!
 //! Child processes re-run this test binary with `--ignored --exact
 //! per_checkout_registry::per_checkout_child`; the scenario and the pause
@@ -298,7 +298,7 @@ fn a_touch_needs_a_durable_protection_first() {
     assert_eq!(report.touched, 1);
 }
 
-/// r4: a removed root with a live marker-only reader survives two sweeps; it
+/// A removed root with a live marker-only reader survives two sweeps; it
 /// is removed only after the reader leaves and two further sweeps run.
 #[test]
 fn a_removed_root_with_a_marker_only_reader_is_kept_until_two_sweeps_after_it_leaves() {
@@ -852,4 +852,151 @@ fn a_generation_published_by_an_exited_process_survives_restart_and_sweeps() {
         .map(|(path, _)| String::from_utf8(path.as_bytes().to_vec()).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["a.txt", "c.txt"]);
+}
+
+// ---------------------------------------------------------------------------
+// Parity harness
+
+/// The membership plane of a view: a generation built from the walker plus a
+/// live delta fed with the paths each edit touched (and a full membership
+/// reconcile after an ignore-file change), compared after every step and
+/// after a fold with an independent cold rebuild of the frozen checkout.
+struct MembershipOracle {
+    delta: std::cell::RefCell<aft::views::snapshot::LiveDelta>,
+}
+
+type Membership = std::collections::BTreeMap<RelPath, aft::views::snapshot::DiskState>;
+
+fn manifest_of(membership: &Membership) -> ManifestV2 {
+    let mut manifest = ManifestV2::new(ManifestHeader {
+        producers: producers(),
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    for (rel_path, state) in membership {
+        if let aft::views::snapshot::DiskState::Present { content, size } = state {
+            manifest
+                .insert(
+                    rel_path.clone(),
+                    EntryV2::regular(*content, *size, EntryPlanes::default()),
+                )
+                .unwrap();
+        }
+    }
+    manifest
+}
+
+impl MembershipOracle {
+    fn apply_paths(&self, root: &Path, paths: &[PathBuf]) {
+        use aft::views::snapshot::{DiskState, LiveEntry};
+        let walked = aft::views::parity_harness::walker_membership(root).unwrap();
+        let mut delta = self.delta.borrow_mut();
+        let reconcile_all = paths
+            .iter()
+            .any(|path| path == Path::new(aft::views::parity_harness::FIXTURE_IGNORE_FILE));
+        let touched: Vec<RelPath> = if reconcile_all {
+            let snapshot = delta.snapshot();
+            let mut all = walked
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            all.extend(snapshot.membership().into_keys());
+            all.into_iter().collect()
+        } else {
+            paths
+                .iter()
+                .map(|path| RelPath::from_os_path(path).unwrap())
+                .collect()
+        };
+        for rel_path in touched {
+            let state = walked.get(&rel_path).copied().unwrap_or(DiskState::Absent);
+            delta.apply(rel_path, LiveEntry::new(state, 0));
+        }
+    }
+
+    fn fold(&self, root: &Path) {
+        use aft::views::snapshot::{carry_disk_state_only, derive_successor, OpenGeneration};
+        let walked = aft::views::parity_harness::walker_membership(root).unwrap();
+        let successor =
+            std::sync::Arc::new(OpenGeneration::new("folded", manifest_of(&walked), None));
+        let mut delta = self.delta.borrow_mut();
+        let draft = derive_successor(&delta.cut(), successor, &carry_disk_state_only);
+        delta
+            .replay_and_swap(draft, &carry_disk_state_only)
+            .unwrap();
+    }
+}
+
+impl aft::views::parity_harness::PlaneOracle for MembershipOracle {
+    type Observation = Membership;
+
+    fn name(&self) -> &str {
+        "membership"
+    }
+
+    fn observe_view(&self, _root: &Path) -> Membership {
+        self.delta.borrow().snapshot().membership()
+    }
+
+    fn rebuild_cold(
+        &self,
+        frozen: &aft::views::parity_harness::FrozenCheckout,
+        store: &aft::views::parity_harness::IsolatedStore,
+    ) -> Membership {
+        // Publish the frozen checkout into the empty store and read it back.
+        let registry = FamilyRegistry::open(store.path(), FAMILY).unwrap();
+        let view = registry.register_view("cold", frozen.root()).unwrap();
+        let manifest =
+            manifest_of(&aft::views::parity_harness::walker_membership(frozen.root()).unwrap());
+        let view_store = view.view_store().unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = view_store.prepare_v2(&name, None, &manifest, None).unwrap();
+        view_store.commit_v2(prepared, None).unwrap();
+        let generation = view_store.current_generation().unwrap().unwrap();
+        let loaded = view_store.load_manifest_v2(&generation).unwrap();
+        let open = aft::views::snapshot::OpenGeneration::new(generation, loaded, None);
+        aft::views::snapshot::LiveDelta::new(std::sync::Arc::new(open))
+            .snapshot()
+            .membership()
+    }
+}
+
+#[test]
+fn membership_parity_holds_through_the_standard_schedules_and_folds() {
+    use aft::views::parity_harness::{check_parity, standard_schedules, FIXTURE_IGNORE_FILE};
+    let base_bytes: &[u8] = b"base file\n";
+    for schedule in standard_schedules("src/base.txt", base_bytes, "ignored.txt") {
+        let checkout = tempdir().unwrap();
+        let root = checkout.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/base.txt"), base_bytes).unwrap();
+        fs::write(root.join("src/other.txt"), b"other\n").unwrap();
+        fs::write(root.join(FIXTURE_IGNORE_FILE), b"ignored.txt\n").unwrap();
+        let initial = aft::views::parity_harness::walker_membership(root).unwrap();
+        let oracle = MembershipOracle {
+            delta: std::cell::RefCell::new(aft::views::snapshot::LiveDelta::new(
+                std::sync::Arc::new(aft::views::snapshot::OpenGeneration::new(
+                    "initial",
+                    manifest_of(&initial),
+                    None,
+                )),
+            )),
+        };
+        for (index, step) in schedule.steps.iter().enumerate() {
+            step.apply(root).unwrap();
+            oracle.apply_paths(root, &step.paths());
+            let scratch = tempdir().unwrap();
+            let context = format!("{} step {index} ({step:?})", schedule.name);
+            if let Err(mismatch) = check_parity(&oracle, root, scratch.path(), &context).unwrap() {
+                panic!("{mismatch}");
+            }
+        }
+        oracle.fold(root);
+        let scratch = tempdir().unwrap();
+        let context = format!("{} after fold", schedule.name);
+        if let Err(mismatch) = check_parity(&oracle, root, scratch.path(), &context).unwrap() {
+            panic!("{mismatch}");
+        }
+    }
 }

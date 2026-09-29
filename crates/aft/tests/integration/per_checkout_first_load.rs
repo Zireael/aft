@@ -1,4 +1,4 @@
-//! Per-checkout views, slice 5: sibling-seeded first load and runtime integration.
+//! Per-checkout views: sibling-seeded first load and runtime integration.
 //!
-//! Registered ahead of the slice so its owner never edits the shared test
-//! registration. The slice-1 harness is `aft::views::parity_harness`.
+//! Empty until that plane lands. Cold-rebuild parity checks use
+//! `aft::views::parity_harness`.
