@@ -189,7 +189,13 @@ fn main() {
         for (n, root) in roots.iter().enumerate() {
             bind(&mut stream, n as u16 + 1, root, RouteTarget::ToolProvider {module_id:"aft".into()}, &mut corr, &out).await;
             if scaling {
-                tokio::time::sleep(Duration::from_secs(if n == 0 { 120 } else { 5 })).await;
+                // Cold parsing and embedding can exceed two minutes on a loaded
+                // host. Allow a longer owner warmup before any borrower binds.
+                let owner_warmup = std::env::var("AFT_SOAK_OWNER_WARMUP_SECS")
+                    .ok()
+                    .map(|value| value.parse::<u64>().expect("owner warmup must be seconds"))
+                    .unwrap_or(120);
+                tokio::time::sleep(Duration::from_secs(if n == 0 { owner_warmup } else { 5 })).await;
                 request(&mut stream, 100, &mut corr, json!({"op":"memory.census"}), &out).await;
             } else {
                 request(&mut stream, n as u16 + 1, &mut corr, json!({"name":"inspect","arguments":{"sections":"all"}}), &out).await;

@@ -4356,20 +4356,55 @@ impl SemanticIndex {
         }
 
         if let Some(base) = self.shared_base.as_ref() {
-            if !self.tombstones.is_empty()
-                || !self.entries.is_empty()
-                || !self.file_mtimes.is_empty()
-                || !base
-                    .fingerprint
-                    .as_ref()
-                    .is_some_and(|fingerprint| fingerprint.matches(&expected))
-            {
+            if !self.paths_are_shareable() {
                 return None;
             }
-            return Some(Self::from_shared_base(
-                project_root.to_path_buf(),
-                Arc::clone(base),
-            ));
+            // Late borrowers need the donor's complete current state, not just
+            // its original base. Rebase only the delta so an edited donor does
+            // not force another full corpus allocation through a disk reload.
+            let project = |path: &Path| {
+                project_root.join(
+                    cache_relative_path(&self.project_root, path)
+                        .expect("shareable delta path must remain inside its root"),
+                )
+            };
+            let mut adopted = Self::from_shared_base(project_root.to_path_buf(), Arc::clone(base));
+            adopted.entries = self
+                .entries
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    entry.chunk.file = project(&entry.chunk.file);
+                    entry
+                })
+                .collect();
+            adopted.file_mtimes = self
+                .file_mtimes
+                .iter()
+                .map(|(path, value)| (project(path), *value))
+                .collect();
+            adopted.file_sizes = self
+                .file_sizes
+                .iter()
+                .map(|(path, value)| (project(path), *value))
+                .collect();
+            adopted.file_hashes = self
+                .file_hashes
+                .iter()
+                .map(|(path, value)| (project(path), *value))
+                .collect();
+            adopted.deferred_files = self
+                .deferred_files
+                .iter()
+                .map(|path| project(path))
+                .collect();
+            adopted.tombstones = self.tombstones.clone();
+            adopted.any_missing_sizes = self.any_missing_sizes;
+            adopted.dimension = self.dimension;
+            adopted.fingerprint = self.fingerprint.clone();
+            adopted.skipped_rows = self.skipped_rows;
+            adopted.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
+            return Some(adopted);
         }
 
         if !self.paths_are_shareable() {
@@ -6797,7 +6832,7 @@ impl SemanticIndex {
                                 self.set_dirty_paths(Some(BTreeSet::new()));
                                 slog_info!(
                                     "semantic index persisted: {} entries, {:.1} KB",
-                                    self.entries.len(),
+                                    self.entry_count(),
                                     bytes_written as f64 / 1024.0
                                 );
                                 crate::write_ledger::credit(
@@ -6932,7 +6967,7 @@ impl SemanticIndex {
                 );
                 slog_info!(
                     "semantic index persisted: {} entries, {:.1} KB",
-                    self.entries.len(),
+                    self.entry_count(),
                     bytes_written as f64 / 1024.0
                 );
                 true
@@ -10139,6 +10174,61 @@ Connection: close
         assert!(
             weak.upgrade().is_none(),
             "the last index must release its base"
+        );
+    }
+
+    #[test]
+    fn shared_overlay_late_borrower_inherits_only_donor_delta() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner_root = temp.path().join("owner");
+        let borrower_root = temp.path().join("borrower");
+        fs::create_dir(&owner_root).unwrap();
+        fs::create_dir(&borrower_root).unwrap();
+        let mut owner = SemanticIndex::new(owner_root.clone(), 2);
+        let config = SemanticBackendConfig::default();
+        owner.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
+        for i in 0..64 {
+            add_invalidation_fixture_entry(&mut owner, owner_root.join(format!("file_{i}.rs")), i);
+        }
+        let worker = owner.fork_for_refresh();
+        owner.invalidate_files(&[owner_root.join("file_0.rs"), owner_root.join("file_1.rs")]);
+        add_invalidation_fixture_entry(&mut owner, owner_root.join("file_0.rs"), 100);
+        add_invalidation_fixture_entry(&mut owner, owner_root.join("added.rs"), 101);
+        let mut borrower = owner
+            .adopt_frozen_base_for_root(&borrower_root, &config)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            owner.shared_base.as_ref().unwrap(),
+            borrower.shared_base.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            worker.shared_base.as_ref().unwrap(),
+            borrower.shared_base.as_ref().unwrap()
+        ));
+        assert_eq!(borrower.entries.len(), 2);
+        assert_eq!(borrower.file_mtimes.len(), 2);
+        assert_eq!(borrower.to_bytes(), owner.to_bytes());
+        let expected = owner
+            .search(&[1.0, 1.0], 1000)
+            .into_iter()
+            .map(|mut row| {
+                row.file = borrower_root.join(row.file.strip_prefix(&owner_root).unwrap());
+                format!("{row:?}")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            borrower
+                .search(&[1.0, 1.0], 1000)
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        borrower.invalidate_file(&borrower_root.join("added.rs"));
+        assert_eq!(
+            owner.entries.len(),
+            2,
+            "borrower edits must not mutate the donor delta"
         );
     }
 
