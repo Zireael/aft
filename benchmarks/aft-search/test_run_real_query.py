@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import struct
 import tempfile
@@ -207,7 +209,12 @@ class SplitQueryRunnerTests(unittest.TestCase):
         self.assertTrue({(row["query"], row["pattern"]) for row in rows}.isdisjoint({(row["query"], row["pattern"]) for row in tuning["rows"]}))
         self.assertTrue(all(row["row_source"] and row["answer_key_basis"] for row in rows + tuning["rows"]))
         from run_real_query import load_manifest_and_tree
-        _, tree, _, _ = load_manifest_and_tree(Path(__file__).with_name("real-query-manifest.json"))
+        manifest_path = Path(__file__).with_name("real-query-manifest.json")
+        # The self-test runs before the gate provisions the pinned evidence tree,
+        # so materialize it here; provision() reuses an already-matching tree.
+        with contextlib.redirect_stdout(io.StringIO()):
+            provision(manifest_path)
+        _, tree, _, _ = load_manifest_and_tree(manifest_path)
         import re
         broad = next(row for row in rows if row["split_kind"] == "R3")
         matched = [path for path in (tree / "crates/aft/src").rglob("*.rs") if re.search(broad["pattern"], path.read_text(), re.MULTILINE)]
