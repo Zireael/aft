@@ -68,9 +68,11 @@ const ISSUE_CLOSE_REASONS: &[&str] = &["completed", "not_planned"];
 // still require a matching signed manifest declaration. A rerun is
 // administration rather than governed bot speech: it has no public attribution
 // surface, while granting speech Apps actions:write would widen the compromise
-// surface. `run cancel` remains deliberately absent because it is destructive
-// and rarely needed, so the operator bypass cannot enable it by accident.
+// surface. v15 admits cancellation under the same audited operator authority:
+// a hung CI run must not hold a seat until GitHub's timeout. `--force` still
+// cancels only the selected run, so it has the same authority as plain cancel.
 const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
+const V15_ADMIN_TUPLES: &[&str] = &["run cancel"];
 // v13 adds operator-only release maintenance while keeping release deletion
 // and release delete-prefixed flags outside the bypass allowlist.
 const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
@@ -3632,6 +3634,7 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 11 && V11_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 15 && V15_ADMIN_TUPLES.contains(&tuple))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -7132,6 +7135,169 @@ mod tests {
         assert!(!is_reviewed_admin_tuple(10, "run cancel"));
         assert!(matches!(
             classify(&run_cancel, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    fn v15_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v15-manifest.json"))
+            .expect("synthetic v15 manifest fixture")
+    }
+
+    #[test]
+    fn v15_cancel_bypass_is_admitted_and_audited_before_execution() {
+        let _lock = crate::test_env::process_env_lock();
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v15_manifest();
+        manifest.validate().unwrap();
+        let rung = RungDetermination::r3(TEST_NOW, 15, &test_rung_provenance()).record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "alfonso-aft".into(),
+        };
+        for force in [false, true] {
+            let mut args = os_args(&["run", "cancel", "123", "--repo", "cortexkit/aft"]);
+            if force {
+                args.push("--force".into());
+            }
+            assert!(
+                matches!(classify(&args, &manifest, "macos"), Classification::Admin { tuple } if tuple == "run cancel")
+            );
+            let status = dispatch_r3(
+                &args,
+                classify(&args, &manifest, "macos"),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |forwarded| {
+                    assert_eq!(forwarded, args);
+                    let (records, error) = read_bypass_audit(&paths);
+                    assert!(error.is_none());
+                    let records = records.unwrap();
+                    assert_eq!(records.len(), if force { 2 } else { 1 });
+                    assert_eq!(records.last().unwrap()["tuple"], "run cancel");
+                    assert_eq!(records.last().unwrap()["repository"], "cortexkit/aft");
+                    73
+                },
+            );
+            assert_eq!(status, 73);
+        }
+    }
+
+    #[test]
+    fn v15_cancel_without_bypass_is_admin_refused() {
+        let _lock = crate::test_env::process_env_lock();
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v15_manifest();
+        let args = os_args(&["run", "cancel", "123"]);
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
+            Classification::Admin { .. }
+        ));
+        let rung = RungDetermination::r3(TEST_NOW, 15, &test_rung_provenance()).record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "alfonso-aft".into(),
+        };
+        assert_eq!(
+            dispatch_r3(
+                &args,
+                classify(&args, &manifest, "macos"),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |_| panic!("cancel without bypass reached upstream")
+            ),
+            REFUSAL_EXIT_STATUS
+        );
+        assert!(!paths.bypass_audit.exists());
+    }
+
+    #[test]
+    fn v15_cancel_unbound_write_requires_audited_bypass() {
+        let _lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v15_manifest();
+        let args = os_args(&[
+            "run",
+            "cancel",
+            "123",
+            "--repo",
+            "unbound/example",
+            "--force",
+        ]);
+        assert!(!is_unbound_safe(&args));
+        let write = unbound_write(
+            &args,
+            &manifest,
+            "macos",
+            &TargetRepository::from_invocation(&args),
+            directory.path(),
+        )
+        .expect("unbound cancel is a write");
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            assert_eq!(
+                dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |_| panic!(
+                    "unbound cancel without bypass reached upstream"
+                )),
+                REFUSAL_EXIT_STATUS
+            );
+            assert!(!paths.bypass_audit.exists());
+        }
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+        assert_eq!(
+            dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |forwarded| {
+                assert_eq!(forwarded, args);
+                let records = read_bypass_audit(&paths).0.unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["tuple"], "run cancel");
+                assert_eq!(records[0]["repository"], "unbound/example");
+                73
+            }),
+            73
+        );
+    }
+
+    #[test]
+    fn v15_cancel_preserves_refused_mutation_flags_and_manifest_gate() {
+        let mut manifest = v15_manifest();
+        for flag in ["--delete-last", "--create-if-none", "--edit-last"] {
+            assert!(
+                matches!(
+                    classify(
+                        &os_args(&["run", "cancel", "123", flag]),
+                        &manifest,
+                        "macos"
+                    ),
+                    Classification::Unclassified
+                ),
+                "{flag}"
+            );
+        }
+        let args = os_args(&["run", "cancel", "123", "--force"]);
+        manifest.manifest_version = 14;
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+        manifest.manifest_version = 15;
+        manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .unwrap()
+            .retain(|decl| decl.tuple() != "run cancel");
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
             Classification::Unclassified
         ));
     }

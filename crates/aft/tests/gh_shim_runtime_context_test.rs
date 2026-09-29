@@ -1385,6 +1385,72 @@ fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_re
 }
 
 #[test]
+fn gh_shim_v15_cancel_uses_named_admin_refusal_and_operator_bypass() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest_from_fixture(
+        &state_home,
+        now,
+        include_str!("fixtures/gh_shim/v15-manifest.json"),
+        15,
+    );
+    write_fresh_r3_cache_for_manifest(&state_home, now, 15);
+    write_user_config(&config_home, &connection_file, None);
+    let args = ["run", "cancel", "123", "--force"];
+    let refused = shim_command(
+        &args,
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .unwrap();
+    assert_eq!(refused.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        admin_refusal("run cancel")
+    );
+    assert!(!recorder.exists());
+    let admitted = shim_command(
+        &args,
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .unwrap();
+    assert_eq!(admitted.status.code(), Some(73), "{:?}", admitted);
+    assert_eq!(
+        fs::read_to_string(recorder).unwrap(),
+        "run cancel 123 --force\n"
+    );
+    let audit =
+        fs::read_to_string(state_home.join("cortexkit/aft/gh-shim/operator-bypass.jsonl")).unwrap();
+    let rows: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["tuple"], "run cancel");
+    assert_eq!(rows[0]["repository"], "cortexkit/aft");
+}
+
+#[test]
 fn gh_shim_bound_v13_release_view_delegates_to_upstream() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");

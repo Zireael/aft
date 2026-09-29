@@ -136,12 +136,33 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
+| `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `release edit`, `release upload` | ADMINISTRATION | v13 |
 | `api` PUT and DELETE `/repos/*/*/branches/*/protection` | ADMINISTRATION | v13 |
 | **`issue edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | **`pr edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | **`label create`, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | `release delete`, `release delete-asset`, and any `release` verb with a `--delete-*` flag | refused as destructive | — |
+
+`run cancel` uses the same operator gate as `run rerun`: without
+`GH_SHIM_BYPASS=operator` it returns `gh_shim_admin_tier`; with the bypass
+it appends and syncs the audit before upstream execution. Hung CI runs can
+otherwise hold a seat until GitHub's timeout. `--force` is allowed because it
+only changes the single selected run's cancellation endpoint to `force-cancel`,
+not the scope of the operation (checked against gh 2.93.0 help and source).
+Neither rerun nor cancel belongs in the unbound safe-read list: the existing
+unbound-write refusal and audited bypass apply unchanged. The signed manifest
+must declare cancellation at v15 or later on the bound-repository path; older
+manifests retain their existing behavior. Code availability is not activation:
+the credential-custody owner (CKCRED) signs the exact unsigned payload bytes for
+an envelope-version-2 manifest, and the Subconscious daemon owner (SUBC)
+coordinates placement. Production payloads and signing handoffs stay
+outside git in `.alfonso/ceremonies/gh-routing-manifest-v15/`, never in public
+docs or test fixtures. Prepare the payload from the trusted production v13
+envelope with `python3 scripts/prepare-gh-shim-v15.py /path/to/v13-envelope.json`;
+the script prints its SHA-256 and defaults to that private ceremony directory.
+An optional second argument selects another output path. Verify the printed hash
+before signing, and do not re-serialize the payload after signing.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.
