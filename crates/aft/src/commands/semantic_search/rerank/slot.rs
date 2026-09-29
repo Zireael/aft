@@ -30,7 +30,8 @@ pub(crate) struct BuildInputs {
     pub(crate) search: SearchConfig,
     /// The embedding connection settings; the Synapse reranker reuses them.
     pub(crate) semantic: SemanticBackendConfig,
-    /// True when the process serves requests for the SubC daemon.
+    /// True when the process serves requests for the SubC daemon (the shared
+    /// multi-project host); the Synapse reranker is reachable only then.
     pub(crate) under_subc: bool,
 }
 
@@ -60,8 +61,9 @@ pub(crate) type Constructor =
 pub(crate) enum Installed {
     /// Reranking is off: no rerank and no note.
     Off,
-    /// No backend yet (building, or the last build failed): skip with this
-    /// reason and commit nothing.
+    /// No backend yet (a build is running, or the last build failed): the
+    /// search keeps fused order, shows this reason, and commits no order or
+    /// skip for its list.
     NotReady(String),
     Ready(SelectedBackend),
 }
@@ -145,8 +147,8 @@ impl BackendSlot {
     }
 
     /// The installed backend for `inputs`, without I/O and without waiting.
-    /// Inputs the slot has not seen (a config published before the slot was
-    /// told, or a daemon-mode change) start a build and read as not ready.
+    /// If the slot has not built or started building for these inputs, this
+    /// starts a build and returns `NotReady` until it finishes.
     pub(crate) fn read(&self, inputs: BuildInputs) -> Installed {
         {
             let state = lock(&self.state);
@@ -241,14 +243,16 @@ pub(crate) fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBacke
 }
 
 /// Builds the HTTP rerank backend from `inputs.search.rerank` (endpoint,
-/// api_key_env, model). Not part of this build yet.
+/// api_key_env, model). Until that backend exists this returns an error, so a
+/// configured remote reranker is skipped with this reason.
 fn build_remote(_inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
     Err("remote backend unavailable".to_string())
 }
 
 /// Builds the Synapse rerank backend from the embedding connection settings
 /// in `inputs.semantic` when `inputs.under_subc` is set; this is where it asks
-/// Synapse which model it serves. Not part of this build yet.
+/// Synapse which model it serves. Until that backend exists this returns an
+/// error, so a configured Synapse reranker is skipped with this reason.
 fn build_synapse(_inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
     Err("synapse backend unavailable".to_string())
 }

@@ -1059,8 +1059,9 @@ fn onnx_worker_drops_a_request_whose_deadline_passed_and_refuses_while_busy() {
 /// Provisions the pinned gte-reranker-modernbert-base into the model cache
 /// named by `AFT_RERANK_ONNX_TEST_CACHE_DIR` (downloading the pinned commit and
 /// verifying every file hash when it is not already there), loads it, scores
-/// 20 query/document pairs and prints the latency. Skipped when the variable
-/// is unset, because it needs the network or a populated cache.
+/// 20 query/document pairs and prints the latency. Runs only when the variable
+/// is set (it needs the network or a populated cache); otherwise it returns
+/// without loading anything.
 #[test]
 fn real_onnx_model_scores_twenty_pairs_when_available() {
     let Some(cache_dir) = std::env::var_os("AFT_RERANK_ONNX_TEST_CACHE_DIR").map(PathBuf::from)
