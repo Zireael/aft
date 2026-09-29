@@ -107,21 +107,40 @@ fn bun_subcommand(command: &str) -> Option<String> {
 
 fn compress_package(output: &str) -> String {
     let mut result = Vec::new();
+    let mut last_content_line = None;
     for line in output.lines() {
         if is_bun_progress(line) {
             continue;
         }
         let trimmed = line.trim_start();
+        if !trimmed.is_empty() {
+            last_content_line = Some(line);
+        }
         if trimmed.contains("packages installed")
             || trimmed.contains("package installed")
+            || is_bun_install_summary(trimmed)
             || trimmed.starts_with("error:")
+            || trimmed.starts_with("warn:")
             || trimmed.starts_with("bun install error:")
             || trimmed.starts_with("Saved lockfile")
         {
             result.push(line.to_string());
         }
     }
+    // Never reduce a non-empty install to nothing: whatever bun printed last
+    // is its verdict, and an empty reply hides whether the install ran at all.
+    if result.is_empty() {
+        if let Some(line) = last_content_line {
+            result.push(line.to_string());
+        }
+    }
     trim_trailing_lines(&result.join("\n"))
+}
+
+/// Bun's closing summary when an install had nothing to add, e.g.
+/// `Checked 437 installs across 463 packages (no changes) [18.00ms]`.
+fn is_bun_install_summary(trimmed: &str) -> bool {
+    trimmed.starts_with("Checked ") && trimmed.contains(" installs across ")
 }
 
 fn compress_build(output: &str) -> CompressionResult {
@@ -539,5 +558,32 @@ mod tests {
         assert!(compressed.text.contains("Cannot find module"));
         assert!(compressed.text.contains("Ran 0 tests"));
         assert_ne!(compressed.text, "bun test\nRan 0 tests across 1 file.");
+    }
+
+    #[test]
+    fn bun_install_with_no_changes_keeps_its_summary() {
+        let output = "bun install v1.4.2 (744846f84)\n\nChecked 437 installs across 463 packages (no changes) [18.00ms]\n";
+
+        let compressed = BunCompressor.compress("bun install --frozen-lockfile", output);
+
+        assert_eq!(
+            compressed.text,
+            "Checked 437 installs across 463 packages (no changes) [18.00ms]"
+        );
+    }
+
+    #[test]
+    fn bun_install_keeps_warnings_and_never_returns_empty() {
+        let output = "bun install v1.4.2 (744846f84)\nwarn: incorrect peer dependency \"typebox@1.1.38\"\n\n+ typebox@1.1.38\n\n1 package installed [120.00ms]\n";
+        let compressed = BunCompressor.compress("bun install", output);
+        assert_eq!(
+            compressed.text,
+            "warn: incorrect peer dependency \"typebox@1.1.38\"\n1 package installed [120.00ms]"
+        );
+
+        // An unfamiliar closing line is still shown rather than dropped.
+        let unfamiliar = "bun install v9.9.9\n\nDone in 4 steps\n";
+        let compressed = BunCompressor.compress("bun install", unfamiliar);
+        assert_eq!(compressed.text, "Done in 4 steps");
     }
 }
