@@ -353,3 +353,51 @@ fn registry_free_discovery_resolves_every_cut() {
         validate_exclusion_reasons(EXCLUSIONS),
     );
 }
+
+#[test]
+fn producer_bounds_resolve_to_their_real_surfaces_or_internal_exclusions() {
+    let cuts = super::support::discover_list_cutting_sites();
+    for (file, item, expected) in [
+        (
+            "commands/outline.rs",
+            "collect_outline_files_breadth_first_with_device_lookup",
+            "payload.files",
+        ),
+        ("commands/read.rs", "handle_directory", "payload.entries"),
+        (
+            "commands/semantic_search/exact_lane.rs",
+            "execute_fallback_mode",
+            "payload.results",
+        ),
+        (
+            "commands/outline.rs",
+            "inspect_outline_file_content",
+            "bounded line-count byte reader",
+        ),
+        (
+            "commands/read.rs",
+            "handle_streaming_range_read",
+            "bounded streamed line window",
+        ),
+    ] {
+        let sites = cuts
+            .iter()
+            .filter(|site| site.file == file && site.enclosing_item == item)
+            .collect::<Vec<_>>();
+        assert!(
+            !sites.is_empty(),
+            "discovery did not attribute any cuts to {file}:{item}"
+        );
+        for site in sites {
+            assert_eq!(
+                super::support::resolve_cut(site).unwrap(),
+                expected,
+                "{site:?}"
+            );
+        }
+    }
+    assert!(!cuts.iter().any(|site| matches!(
+        site.enclosing_item.as_str(),
+        "LINE_COUNT_BYTES" | "ENTRY_BUDGET" | "MAX_DIRECTORY_SCAN"
+    )));
+}

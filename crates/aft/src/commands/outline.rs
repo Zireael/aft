@@ -1,3 +1,6 @@
+const LINE_COUNT_BYTES: u64 = 1024 * 1024;
+const ENTRY_BUDGET: usize = 10_000;
+
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -1108,7 +1111,6 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
         });
     }
 
-    const LINE_COUNT_BYTES: u64 = 1024 * 1024;
     if file.metadata()?.len() > LINE_COUNT_BYTES {
         return Ok(OutlineFileContentStats {
             binary: false,
@@ -1535,7 +1537,6 @@ where
 {
     let mut pending = VecDeque::from([directory.to_path_buf()]);
     let mut entries_examined = 0usize;
-    const ENTRY_BUDGET: usize = 10_000;
 
     while let Some(current) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {

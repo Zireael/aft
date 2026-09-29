@@ -237,6 +237,14 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: WALK_BUDGET,
     },
     SurfaceSpec {
+        command: "read",
+        mode: "directory",
+        list_id: "payload.entries",
+        unit: Unit::Items,
+        narrow: &["path"],
+        reasons: WALK_CAP,
+    },
+    SurfaceSpec {
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -346,6 +354,11 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             false,
             0,
         ),
+        ("read", "directory") => aft::list_surfaces::read::build_directory_envelope(
+            10,
+            if has(Reason::Cap) { 20 } else { 10 },
+            has(Reason::Walk),
+        ),
         ("inspect", "") => build_inspect_envelope(2, 4),
         ("bash", "") => build_bash_output_envelope(61, 4000),
         other => panic!("no conformance builder for {other:?}"),
@@ -393,6 +406,14 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
                 Total::AtLeast(if has(Reason::Budget) { 1980 } else { 412 })
             } else {
                 Total::Exact(1980)
+            }
+        }
+        ("read", "directory") => {
+            let total = if has(Reason::Cap) { 20 } else { 10 };
+            if has(Reason::Walk) {
+                Total::AtLeast(total)
+            } else {
+                Total::Exact(total)
             }
         }
         ("inspect", "") => Total::Exact(4),
@@ -709,6 +730,17 @@ fn push_root_fixture(
 
 pub fn capped_fixtures() -> Vec<FixtureRecord> {
     let mut fixtures = Vec::new();
+    for name in ["cap", "walk", "walk_and_cap"] {
+        push_root_fixture(
+            &mut fixtures,
+            &format!("read/{name}"),
+            "read",
+            "directory",
+            "payload.entries",
+            load_json(&format!("tests/fixtures/read_directory/{name}.json")),
+            "entries_list_envelope",
+        );
+    }
 
     for name in [
         "more_available_only",
@@ -1497,6 +1529,13 @@ pub struct CappedParityFixture {
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
         CappedParityFixture {
+            name: "read/walk_and_cap",
+            command: "read",
+            mode: "directory",
+            list_id: "payload.entries",
+            reply: load_json("tests/fixtures/read_directory/walk_and_cap.json"),
+        },
+        CappedParityFixture {
             name: "callgraph/impact_21",
             command: "callgraph",
             mode: "impact",
@@ -1627,7 +1666,7 @@ pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
             .unwrap_or("")
             .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
             .replace(GLOB_TRUNCATED_MESSAGE, "")
-    } else if fixture.command == "callgraph" {
+    } else if matches!(fixture.command, "callgraph" | "read") {
         let wire_key = derive_wire_key(fixture.list_id, false);
         let env: Option<ListEnvelope> = fixture
             .reply
@@ -1685,6 +1724,8 @@ pub fn render_complete_transports(fixture: &CompleteFixture) -> (String, String)
             s.command == "callgraph" && s.mode == "callers"
         } else if fixture.name.starts_with("callgraph/tree") {
             s.command == "callgraph" && s.mode == "call_tree"
+        } else if fixture.name.starts_with("read/") {
+            s.command == "read" && s.mode == "directory"
         } else if fixture.name.starts_with("outline/") {
             s.command == "outline" && s.mode == "files"
         } else if fixture.name.starts_with("search/") {
@@ -1753,6 +1794,15 @@ fn push_complete(
 
 pub fn complete_fixtures() -> Vec<CompleteFixture> {
     let mut fixtures = Vec::new();
+    push_complete(
+        &mut fixtures,
+        "read/directory_complete",
+        "read",
+        "directory",
+        json!({"entries": ["a.rs", "src/"], "complete": true}),
+        "a.rs\nsrc/".into(),
+        None,
+    );
 
     let search = load_json("tests/fixtures/search/complete_4_result.json")["data"].clone();
     let search_golden = search["text"].as_str().unwrap().to_string();
@@ -2164,7 +2214,12 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         "grep" => file == "commands/grep.rs" || file == "subc_format.rs",
         "glob" => file == "commands/glob.rs" || file == "subc_format.rs",
         "callgraph" => file == "commands/callgraph_store_adapter.rs" || file == "subc_format.rs",
-        "search" => file == "commands/semantic_search/mod.rs" || file == "subc_format.rs",
+        "search" => {
+            file == "commands/semantic_search/mod.rs"
+                || file == "commands/semantic_search/exact_lane.rs"
+                || file == "subc_format.rs"
+        }
+        "read" => file == "commands/read.rs" || file == "subc_format.rs",
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
         "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
         "bash" => {

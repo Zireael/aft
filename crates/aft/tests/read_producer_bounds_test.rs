@@ -80,6 +80,11 @@ fn directory_listing_stops_enumeration() {
         "must not exhaust the directory for a capped listing"
     );
     assert_eq!(response.data["complete"], false);
+    let envelope = &response.data["entries_list_envelope"];
+    assert_eq!(envelope["reason"], "walk");
+    assert_eq!(envelope["total"]["kind"], "at_least");
+    assert_eq!(envelope["shown"], 1000);
+    assert_eq!(envelope["causes"], json!(["walk", "cap"]));
 }
 
 #[test]

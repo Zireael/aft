@@ -8,6 +8,7 @@ pub mod grep;
 pub mod impact;
 pub mod inspect;
 pub mod outline;
+pub mod read;
 pub mod search;
 pub mod trace_data;
 pub mod trace_to;
@@ -148,7 +149,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted, execute_fallback_mode",
             },
             ReasonEntry {
                 reason: Reason::Depth,
@@ -221,6 +222,25 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
                 predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+            },
+        ],
+    },
+    SurfaceEntry {
+        command: "read",
+        mode: "directory",
+        list_id: "payload.entries",
+        unit: Unit::Items,
+        narrow: &["path"],
+        reasons: &[
+            ReasonEntry {
+                reason: Reason::Walk,
+                kind: ReasonKind::Bounding,
+                predicate_name: "handle_directory",
+            },
+            ReasonEntry {
+                reason: Reason::Cap,
+                kind: ReasonKind::Selecting,
+                predicate_name: "handle_directory",
             },
         ],
     },
@@ -322,10 +342,16 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "error message preview of offending non-regular file paths is diagnostic formatting, not a returned list payload",
     },
     ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "inspect_outline_file_content",
+        location_or_primitive: "bounded line-count byte reader",
+        reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
+    },
+    ExclusionEntry {
         file: "commands/read.rs",
-        enclosing_item: "handle_directory",
-        location_or_primitive: "commands::read::MAX_DIRECTORY_ENTRIES",
-        reason: "raw directory entry read mode limits directory listing entries to MAX_DIRECTORY_ENTRIES",
+        enclosing_item: "handle_streaming_range_read",
+        location_or_primitive: "bounded streamed line window",
+        reason: "limits bytes retained while reading a selected text line; truncated content and scan gaps are disclosed by the read response, not a cut to a list of files or result records",
     },
     ExclusionEntry {
         file: "commands/lsp_diagnostics.rs",

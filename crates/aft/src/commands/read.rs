@@ -32,6 +32,7 @@ const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024; // 50KB output cap
 const MAX_FILE_READ_BYTES: u64 = 50 * 1024 * 1024; // 50MB input guard
 const MAX_DIRECTORY_ENTRIES: usize = 1000;
+const MAX_DIRECTORY_SCAN: usize = 10_000;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const MEDIA_MAGIC_BYTES: usize = 16;
 const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded payload cap
@@ -1772,7 +1773,6 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         }
     };
 
-    const MAX_DIRECTORY_SCAN: usize = 10_000;
     let mut examined = 0;
     let mut enumeration_cut = false;
     for entry_result in read_dir.take(MAX_DIRECTORY_SCAN + 1) {
@@ -1805,25 +1805,32 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
     let truncated = enumeration_cut || total > MAX_DIRECTORY_ENTRIES;
     if truncated {
         entries.truncate(MAX_DIRECTORY_ENTRIES);
-        let shown = entries.len();
-        let bound = if enumeration_cut { "at least " } else { "" };
-        entries.push(format!(
-            "\nshown {shown} of {bound}{total} entries ({}; examined {examined} directory entries) · narrow: subdirectory",
-            if enumeration_cut { "enumeration cap" } else { "display cap" }
-        ));
     }
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "entries": entries,
-            "complete": !truncated,
-            "truncated": truncated,
-            "total_entries": total,
-            "total_entries_exact": !enumeration_cut,
-            "entries_examined": examined,
-            "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
-        }),
-    )
+    let envelope =
+        crate::list_surfaces::read::build_directory_envelope(entries.len(), total, enumeration_cut);
+    // Keep the trailer in the raw entry rendering used by existing read clients.
+    if let Some(envelope) = &envelope {
+        let trailer = crate::ndjson_text::build_ndjson_text(
+            "",
+            &serde_json::json!({"entries_list_envelope": envelope}),
+            Some("payload.entries"),
+            false,
+        );
+        entries.push(format!("\n{trailer}"));
+    }
+    let mut data = serde_json::json!({
+        "entries": entries,
+        "complete": !truncated,
+        "truncated": truncated,
+        "total_entries": total,
+        "total_entries_exact": !enumeration_cut,
+        "entries_examined": examined,
+        "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
+    });
+    if let Some(envelope) = envelope {
+        data["entries_list_envelope"] = serde_json::to_value(envelope).expect("directory envelope");
+    }
+    Response::success(&req.id, data)
 }
 
 #[cfg(test)]

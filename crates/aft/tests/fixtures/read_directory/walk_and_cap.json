@@ -1,0 +1,1 @@
+{"entries":["a.rs","\nshown 1 of ≥2 items (walk) · narrow: path"],"complete":false,"truncated":true,"total_entries":2,"total_entries_exact":false,"entries_examined":10001,"entries_list_envelope":{"shown":1,"total":{"kind":"at_least","value":2},"unit":"items","reason":"walk","causes":["walk","cap"],"narrow":["path"]}}
