@@ -420,10 +420,31 @@ impl From<rusqlite::Error> for OpenError {
 /// current schema version up to [`CURRENT_SCHEMA_VERSION`], and returns the
 /// configured connection.
 pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
+    open_with_mode(path, OpenMode::Deferred)
+}
+
+pub(crate) const TOOL_RETRY_BUSY_WAIT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    Deferred,
+    SingleAttempt,
+}
+
+pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
+    }
+
+    if mode == OpenMode::SingleAttempt {
+        // Request-path retries must not repeat the deferred ten-second wait.
+        let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
+        apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
+        run_migrations(&mut conn)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        return Ok(conn);
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

@@ -5585,6 +5585,20 @@ pub(crate) fn configure_database_runtime(
     canonical_cache_root: &Path,
     storage_root: &Path,
 ) {
+    configure_database_runtime_with_mode(
+        ctx,
+        canonical_cache_root,
+        storage_root,
+        crate::db::OpenMode::Deferred,
+    );
+}
+
+pub(crate) fn configure_database_runtime_with_mode(
+    ctx: &AppContext,
+    canonical_cache_root: &Path,
+    storage_root: &Path,
+    mode: crate::db::OpenMode,
+) {
     wait_on_configure_tail_stage_gate_for_test(
         canonical_cache_root,
         ConfigureMaintenanceStage::DatabaseRuntime,
@@ -5601,7 +5615,7 @@ pub(crate) fn configure_database_runtime(
     if let Some(delay_ms) = std::env::var("AFT_TEST_DATABASE_OPEN_DELAY_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|delay| *delay > 0)
+        .filter(|delay| *delay > 0 && mode == crate::db::OpenMode::Deferred)
     {
         slog_info!(
             "delaying database open by {}ms at {}",
@@ -5610,7 +5624,7 @@ pub(crate) fn configure_database_runtime(
         );
         thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
     }
-    match ctx.app().open_db(&db_path) {
+    match ctx.app().open_db_with_mode(&db_path, mode) {
         Ok(shared) => {
             ctx.backup().lock().set_db_pool(shared.clone());
             ctx.bash_background().set_db_pool(shared);

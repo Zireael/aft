@@ -392,3 +392,46 @@ fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
     assert_eq!(response["success"], true, "{response}");
     assert!(aft.shutdown().success());
 }
+
+#[test]
+fn standalone_database_retry_does_not_block_read_only_requests() {
+    use std::time::{Duration, Instant};
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let path = project.path().join("readable.txt");
+    fs::write(&path, "available during database contention\n").unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let exhausted = set_host_state(&mut aft, "initial", "no");
+    assert_eq!(exhausted["retryable"], true, "{exhausted}");
+    assert_eq!(exhausted["code"], "database_unavailable", "{exhausted}");
+
+    // Keep the lock held through both responses. Send the read behind the retry
+    // so a long synchronous retry cannot masquerade as a responsive main loop.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    aft.send_silent(&json!({"id": "retry-held", "command": "db_set_host_state", "params": {"key": "retry", "value": "no"}}).to_string());
+    aft.send_silent(&json!({"id": "read-held", "command": "read", "file": path}).to_string());
+    let mut saw_read = false;
+    let mut saw_retry = false;
+    while !saw_read || !saw_retry {
+        let response = aft
+            .try_read_next_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("read-only request must answer within two seconds while SQLite remains locked");
+        match response["id"].as_str() {
+            Some("read-held") => {
+                assert_eq!(response["success"], true, "{response}");
+                saw_read = true;
+            }
+            Some("retry-held") => {
+                assert_eq!(response["success"], false, "{response}");
+                assert_eq!(response["retryable"], true, "{response}");
+                saw_retry = true;
+            }
+            _ => {}
+        }
+    }
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(set_host_state(&mut aft, "released", "yes")["success"], true);
+    assert!(aft.shutdown().success());
+}

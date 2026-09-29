@@ -2418,6 +2418,14 @@ impl App {
         &self,
         path: &Path,
     ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
+        self.open_db_with_mode(path, crate::db::OpenMode::Deferred)
+    }
+
+    pub(crate) fn open_db_with_mode(
+        &self,
+        path: &Path,
+        mode: crate::db::OpenMode,
+    ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
         let mut slot = self.db.lock();
         if let Some((existing_path, conn)) = slot.as_ref() {
@@ -2426,7 +2434,7 @@ impl App {
             }
         }
 
-        let conn = Arc::new(Mutex::new(crate::db::open(path)?));
+        let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         *slot = Some((key, Arc::clone(&conn)));
         Ok(conn)
     }
@@ -4888,11 +4896,19 @@ impl AppContext {
     }
 
     pub fn retry_database_runtime(&self) {
-        let root = self
-            .canonical_cache_root_opt()
-            .expect("configured database root");
+        let Some(root) = self.canonical_cache_root_opt() else {
+            let error = "Cannot retry project persistence: configured database root is missing";
+            log::warn!("{error}");
+            self.finish_database_runtime_error(error.into(), false);
+            return;
+        };
         let storage = crate::bash_background::storage_dir(self.config().storage_dir.as_deref());
-        crate::commands::configure::configure_database_runtime(self, &root, &storage);
+        crate::commands::configure::configure_database_runtime_with_mode(
+            self,
+            &root,
+            &storage,
+            crate::db::OpenMode::SingleAttempt,
+        );
     }
 
     pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
@@ -13037,6 +13053,31 @@ mod harness_path_tests {
 mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn database_retry_without_configured_root_refuses_without_panicking() {
+        let ctx = AppContext::from_app(App::default_shared(), Config::default());
+        assert!(ctx.canonical_cache_root_opt().is_none());
+        ctx.finish_database_runtime_error("database busy".into(), true);
+        assert!(ctx
+            .database_runtime_refusal("first", "db_set_host_state")
+            .is_some());
+        assert!(ctx.claim_database_runtime_retry("db_set_host_state"));
+        ctx.retry_database_runtime();
+        let response = serde_json::to_value(
+            ctx.database_runtime_refusal("retry", "db_set_host_state")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["code"], "database_unavailable");
+        assert_eq!(response["retryable"], false);
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("configured database root is missing"));
+        assert!(!ctx.claim_database_runtime_retry("db_set_host_state"));
+        assert!(ctx.database_runtime_refusal("read", "read").is_none());
+    }
 
     #[test]
     fn app_contexts_share_one_database_connection() {
