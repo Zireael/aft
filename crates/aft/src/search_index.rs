@@ -5262,7 +5262,7 @@ fn walk_project_files_from_inner(
     )
 }
 
-fn project_walk_builder(search_root: &Path) -> WalkBuilder {
+pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.

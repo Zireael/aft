@@ -380,6 +380,8 @@ fn snapshot_affected_files(
 }
 
 fn rollback_rename(ctx: &AppContext, session: &str, rollback: &RenameRollback) {
+    let _view_intent =
+        crate::views::intent::record_paths(rollback.files.iter().map(|path| path.as_path()));
     let restored = ctx
         .checkpoint()
         .lock()
@@ -407,6 +409,8 @@ fn apply_collected_changes(
     captures: &HashMap<PathBuf, CapturedRegularFile>,
     ctx: &AppContext,
 ) -> Result<Vec<FileChange>, LspError> {
+    let _view_intent =
+        crate::views::intent::record_paths(file_changes.keys().map(|path| path.as_path()));
     let mut results = Vec::with_capacity(file_changes.len());
 
     for (path, edits) in file_changes {

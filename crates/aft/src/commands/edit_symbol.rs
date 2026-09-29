@@ -277,6 +277,8 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         return edit::no_change_response(&req.id);
     }
 
+    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+
     // Auto-backup before writing
     let backup_id = match edit::auto_backup(
         ctx,

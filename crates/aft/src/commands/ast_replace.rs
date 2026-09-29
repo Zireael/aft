@@ -390,6 +390,9 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if !dry_run {
+        let _view_intent = crate::views::intent::record_paths(
+            changes_to_apply.iter().map(|(_, path, _)| path.as_path()),
+        );
         for (change, validated_path, _) in &changes_to_apply {
             if let Err(e) = std::fs::OpenOptions::new()
                 .write(true)

@@ -98,6 +98,8 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    let _view_intent = crate::views::intent::record_paths([src_path.as_path(), dst_path.as_path()]);
+
     // Backup source before moving
     let backup_id = match edit::auto_backup(
         ctx,

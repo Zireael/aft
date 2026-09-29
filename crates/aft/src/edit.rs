@@ -637,6 +637,7 @@ pub fn write_format_validate(
         None
     };
 
+    let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
     std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
         message: format!("failed to write file: {}", e),

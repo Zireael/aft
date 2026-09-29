@@ -66,6 +66,8 @@ fn handle_restore_checkpoint_impl(
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
 
+    let _view_intent =
+        crate::views::intent::record_paths(restore_paths.iter().map(|path| path.as_path()));
     match checkpoint_store.restore_validated(req.session(), name, &restore_paths) {
         Ok(info) => {
             let storage_path = info
