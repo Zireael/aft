@@ -97,6 +97,13 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         ):
             continue
 
+        # Compiler warnings (for example the macOS linker's `__eh_frame section too
+        # large` note once the lib test binary passes 16 MB of unwind data) print
+        # a `warning:` line plus `|` and `= note:` continuation lines before the
+        # listing. They carry no test entries.
+        if stripped.startswith(("warning:", "= note:", "= help:")) or stripped == "|":
+            continue
+
         if stripped.startswith("Doc-tests "):
             current_kind = "doc"
             current_suite = stripped.removeprefix("Doc-tests ")
