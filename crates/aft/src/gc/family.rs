@@ -202,7 +202,9 @@ fn delete_unmarked(
         if total <= policy.byte_budget {
             break;
         }
-        if marked.contains(row.key.as_bytes()) || row.ref_epoch >= epoch {
+        // The epoch check happens in the DELETE itself, not here: a touch can
+        // land between this listing and the delete.
+        if marked.contains(row.key.as_bytes()) {
             continue;
         }
         if store.delete_if_unreferenced_since(&row.key, epoch)? {
@@ -216,7 +218,7 @@ fn delete_unmarked(
         if total <= policy.byte_budget {
             break;
         }
-        if marked.contains(&segment.segment_id) || segment.ref_epoch >= epoch {
+        if marked.contains(&segment.segment_id) {
             continue;
         }
         let file = segment_path(registry.storage(), registry.family(), &segment.segment_id)?;
