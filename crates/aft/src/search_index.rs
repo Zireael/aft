@@ -6870,6 +6870,8 @@ fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_modified_time(path: &Path) -> Option<SystemTime> {
+    #[cfg(test)]
+    cache_freshness::record_metadata_call(path);
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -6947,14 +6949,22 @@ fn verify_file_mtimes(
     verify_strategy: cache_freshness::VerifyStrategy,
 ) -> bool {
     let filters = PathFilters::default();
-    let current_files = walk_project_files(&index.project_root, &filters);
-    let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
+    let current_files = walk_project_files_from_inner(
+        &index.project_root,
+        &index.project_root,
+        &filters,
+        None,
+        false,
+    )
+    .expect("unbounded project walk cannot exceed a file limit");
+    let current_file_set: HashSet<&PathBuf> = current_files.iter().collect();
     let mut stale_paths = Vec::new();
     let mut removed_paths = Vec::new();
     let mut changed = false;
     let mut canonical_parents = ParentCanonicalizationMemo::default();
 
-    for entry in Arc::make_mut(&mut index.files).iter_mut() {
+    let mut to_verify = Vec::new();
+    for (file_id, entry) in index.files.iter().enumerate() {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
         }
@@ -6962,32 +6972,31 @@ fn verify_file_mtimes(
             removed_paths.push(entry.path.clone());
             continue;
         }
-        let cached = FileFreshness {
-            mtime: entry.modified,
-            size: entry.size,
-            content_hash: entry.content_hash,
-        };
-        let verdict = match verify_strategy {
-            cache_freshness::VerifyStrategy::StatFirst => {
-                cache_freshness::verify_file(&entry.path, &cached)
-            }
-            cache_freshness::VerifyStrategy::Strict => {
-                cache_freshness::verify_file_strict(&entry.path, &cached)
-            }
-        };
+        to_verify.push((
+            file_id,
+            entry.path.clone(),
+            FileFreshness {
+                mtime: entry.modified,
+                size: entry.size,
+                content_hash: entry.content_hash,
+            },
+        ));
+    }
+    // Hash against immutable snapshots in the bounded pool before changing the index.
+    let verdicts = cache_freshness::verify_files_bounded(to_verify, verify_strategy);
+    for (file_id, path, verdict) in verdicts {
         match verdict {
             FreshnessVerdict::HotFresh => {}
             FreshnessVerdict::ContentFresh {
                 new_mtime,
                 new_size,
             } => {
+                let entry = &mut Arc::make_mut(&mut index.files)[file_id];
                 entry.modified = new_mtime;
                 entry.size = new_size;
                 changed = true;
             }
-            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
-                stale_paths.push(entry.path.clone())
-            }
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => stale_paths.push(path),
         }
     }
 
@@ -10115,6 +10124,137 @@ mod tests {
 #[cfg(test)]
 mod warm_reload_verification_tests {
     use super::*;
+
+    #[test]
+    fn warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for n in 0..128 {
+            fs::write(root.join(format!("file-{n}.rs")), vec![b'x'; 64 * 1024]).unwrap();
+        }
+        let mut index = SearchIndex::build(&root);
+        cache_freshness::watch_verify_stats(&root);
+        verify_file_mtimes(&mut index, cache_freshness::VerifyStrategy::Strict);
+        let stats = cache_freshness::take_verify_stats();
+        let mut counts = HashMap::new();
+        let mut threads = HashSet::new();
+        for (path, thread) in stats.calls {
+            *counts.entry(path).or_insert(0) += 1;
+            threads.insert(thread);
+        }
+        for path in index.path_to_id.keys() {
+            assert_eq!(
+                counts.get(path),
+                Some(&1),
+                "indexed file stat count: {}",
+                path.display()
+            );
+        }
+        if cache_freshness::strict_verify_pool_size() > 1 {
+            assert!(
+                threads.len() > 1,
+                "strict warm verification must use multiple workers"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_verify_matches_serial_reconciliation_for_both_strategies() {
+        for strategy in [
+            cache_freshness::VerifyStrategy::Strict,
+            cache_freshness::VerifyStrategy::StatFirst,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(dir.path()).unwrap();
+            for name in ["changed.rs", "deleted.rs", "touched.rs", "unchanged.rs"] {
+                fs::write(root.join(name), format!("// {name}\n")).unwrap();
+            }
+            let mut parallel = SearchIndex::build(&root);
+            let mut serial = parallel.clone();
+            fs::write(root.join("changed.rs"), "// different bytes\n").unwrap();
+            fs::remove_file(root.join("deleted.rs")).unwrap();
+            filetime::set_file_mtime(
+                root.join("touched.rs"),
+                filetime::FileTime::from_unix_time(1, 0),
+            )
+            .unwrap();
+            fs::write(root.join("new.rs"), "// new\n").unwrap();
+
+            // Preserve the former serial algorithm as a reference for the complete
+            // path reconciliation, not merely the per-file freshness verdicts.
+            let walked = walk_project_files(&root, &PathFilters::default());
+            let walked_set: HashSet<PathBuf> = walked.iter().cloned().collect();
+            let mut stale = Vec::new();
+            let mut removed = Vec::new();
+            for entry in Arc::make_mut(&mut serial.files).iter_mut() {
+                if entry.path.as_os_str().is_empty() {
+                    continue;
+                }
+                if !walked_set.contains(&entry.path) {
+                    removed.push(entry.path.clone());
+                    continue;
+                }
+                let cached = FileFreshness {
+                    mtime: entry.modified,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
+                };
+                let verdict = match strategy {
+                    cache_freshness::VerifyStrategy::Strict => {
+                        cache_freshness::verify_file_strict(&entry.path, &cached)
+                    }
+                    cache_freshness::VerifyStrategy::StatFirst => {
+                        cache_freshness::verify_file(&entry.path, &cached)
+                    }
+                };
+                match verdict {
+                    FreshnessVerdict::HotFresh => {}
+                    FreshnessVerdict::ContentFresh {
+                        new_mtime,
+                        new_size,
+                    } => {
+                        entry.modified = new_mtime;
+                        entry.size = new_size;
+                    }
+                    FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
+                        stale.push(entry.path.clone())
+                    }
+                }
+            }
+            assert_eq!(removed, vec![root.join("deleted.rs")]);
+            assert!(stale.contains(&root.join("changed.rs")));
+            assert!(!stale.contains(&root.join("touched.rs")));
+            let mut memo = ParentCanonicalizationMemo::default();
+            for path in &removed {
+                serial.remove_file_with_canonicalization_memo(path, &mut memo);
+            }
+            for path in &stale {
+                if walked_set.contains(path) {
+                    serial.update_file_with_canonicalization_memo(path, &mut memo);
+                } else {
+                    serial.remove_file_with_canonicalization_memo(path, &mut memo);
+                }
+            }
+            for path in walked {
+                if !serial.path_to_id.contains_key(&path) {
+                    serial.update_file_with_canonicalization_memo(&path, &mut memo);
+                }
+            }
+            assert!(verify_file_mtimes(&mut parallel, strategy));
+            for name in ["changed.rs", "touched.rs", "unchanged.rs", "new.rs"] {
+                let path = root.join(name);
+                let actual = &parallel.files[parallel.path_to_id[&path] as usize];
+                let expected = &serial.files[serial.path_to_id[&path] as usize];
+                assert_eq!(
+                    (actual.modified, actual.size, actual.content_hash),
+                    (expected.modified, expected.size, expected.content_hash),
+                    "{name}"
+                );
+            }
+            assert!(!parallel.path_to_id.contains_key(&root.join("deleted.rs")));
+            assert_eq!(parallel.path_to_id.len(), serial.path_to_id.len());
+        }
+    }
 
     #[test]
     fn warm_disk_verification_uses_stat_first_and_hashes_changed_stats() {
