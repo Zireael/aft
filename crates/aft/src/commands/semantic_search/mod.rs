@@ -14,6 +14,7 @@ pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
+pub(crate) mod rerank;
 pub mod scoring;
 mod snippet_bounds;
 pub mod telemetry;
