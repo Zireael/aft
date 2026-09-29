@@ -300,6 +300,15 @@ jobs:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
           SUBC_CORE_WIRE_VERSION: "2"
+          AFT_SUBC_E2E_LOG_DIR: ${{ runner.temp }}/aft-subc-e2e-logs
+      - name: Upload subc diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: subc-e2e-logs-${{ matrix.suite }}-linux
+          path: ${{ runner.temp }}/aft-subc-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
   unit-linux-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (Linux)

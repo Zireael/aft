@@ -5553,6 +5553,20 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
         ));
 
     let db_path = storage_root.join("aft.db");
+    // In debug builds, optionally delay opening the database to exercise readiness handling.
+    #[cfg(debug_assertions)]
+    if let Some(delay_ms) = std::env::var("AFT_TEST_DATABASE_OPEN_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|delay| *delay > 0)
+    {
+        slog_info!(
+            "delaying database open by {}ms at {}",
+            delay_ms.min(60_000),
+            db_path.display()
+        );
+        thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
+    }
     match ctx.app().open_db(&db_path) {
         Ok(shared) => {
             ctx.backup().lock().set_db_pool(shared.clone());

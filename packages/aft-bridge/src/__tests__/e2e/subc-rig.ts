@@ -1,5 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { constants } from "node:fs";
+import { appendFileSync, constants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
@@ -61,6 +61,7 @@ export interface AftModuleRuntime {
 
 export interface SubcRig {
   readonly tempDir: string;
+  readonly logDir: string;
   readonly homeDir: string;
   readonly configHome: string;
   readonly runtimeDir: string;
@@ -139,7 +140,21 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const cacheDir = join(tempDir, "cache");
   const storageDir = join(tempDir, "aft-storage");
   const connectionFile = join(runtimeDir, "subc-connection.json");
-  const stderrPath = join(tempDir, "subc-core.stderr.log");
+  // Logs live outside the disposable fixture, including on startup failure.
+  const logRoot = resolve(process.env.AFT_SUBC_E2E_LOG_DIR || join(tmpdir(), "aft-subc-e2e-logs"));
+  await mkdir(logRoot, { recursive: true });
+  const logDir = await mkdtemp(join(logRoot, "rig-"));
+  const stderrPath = join(logDir, "subc-core.stderr.log");
+  console.info(`[subc e2e] diagnostics: ${logDir}`);
+  const moduleStderrPath = join(logDir, "aft.stderr.log");
+  const moduleWrapper = join(tempDir, "aft-with-stderr.sh");
+  // exec preserves the module PID and protocol descriptors; only stderr is redirected.
+  // Capture panics too, which do not necessarily reach AFT's structured file logger.
+  if (process.platform !== "win32") {
+    await writeFile(moduleWrapper, '#!/bin/sh\nlog=$1\nshift\nexec "$@" 2>>"$log"\n', {
+      mode: 0o700,
+    });
+  }
 
   await mkdir(join(configHome, "cortexkit"), { recursive: true });
   await Promise.all([mkdir(homeDir, { recursive: true }), mkdir(runtimeDir, { recursive: true })]);
@@ -172,14 +187,16 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
         storage: { backend: "sqlite", data_home: dataHome },
         modules: {
           aft: {
-            program: prepared.aftBinaryPath,
-            args: [],
+            program: process.platform === "win32" ? prepared.aftBinaryPath : moduleWrapper,
+            args: process.platform === "win32" ? [] : [moduleStderrPath, prepared.aftBinaryPath],
             env: {
               HOME: homeDir,
               XDG_CONFIG_HOME: configHome,
               XDG_DATA_HOME: dataHome,
               AFT_CACHE_DIR: cacheDir,
               AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
+              RUST_BACKTRACE: "1",
+              AFT_TEST_DATABASE_OPEN_DELAY_MS: process.env.AFT_TEST_DATABASE_OPEN_DELAY_MS || "0",
             },
             enabled: true,
           },
@@ -211,6 +228,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   let cleaned = false;
   return {
     tempDir,
+    logDir,
     homeDir,
     configHome,
     runtimeDir,
@@ -526,7 +544,8 @@ async function spawnReadyDaemon(
     daemon.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       stderrChunks.push(text);
-      void writeFile(dirs.stderrPath, stderrChunks.join(""), "utf8").catch(() => undefined);
+      // Append synchronously so retries cannot race outstanding writes to this file.
+      appendFileSync(dirs.stderrPath, text);
     });
     daemon.stdout.resume();
     trackDaemon(daemon);
