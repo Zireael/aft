@@ -259,10 +259,10 @@ pub(crate) fn authorize_with(
         });
     }
 
-    // Deliberately free of the words the "runtime missing" classifier keys on
-    // (dlopen, not found, ...): reinstalling through `doctor --fix` would not
-    // help while a tampered file sits in the folder, so this must not be
-    // reported as a missing runtime.
+    // Worded so `semantic_index::is_onnx_runtime_unavailable` does not match it
+    // (that check looks for "dlopen", "not found" and similar): a match would
+    // report a missing runtime and suggest `doctor --fix`, which cannot help
+    // while a tampered file still sits in the folder.
     Err(format!(
         "onnx runtime library hash mismatch at {}: sha256 {sha256} is not a pinned ONNX \
          Runtime build, so semantic search is unavailable. Remove the file and reinstall \
@@ -413,8 +413,8 @@ mod tests {
         let hash = hash_of(&path);
         let pinned = [hash.as_str()];
         let roots = [dir.path().to_path_buf()];
-        // Inside the managed folder and not named at spawn: only the pin can
-        // admit it.
+        // Inside the managed folder and not named by ORT_DYLIB_PATH at spawn,
+        // so only a matching pinned hash can admit it.
         let policy = policy(None, true, &roots, &pinned);
 
         let loads = Cell::new(0);
@@ -503,7 +503,8 @@ mod tests {
         let roots = [storage.path().join("onnxruntime")];
         let pinned = ["872533f130f1839a5bc01788ddb4f75c83a189763441ba1178788ed965449289"];
         // The bridge passes its managed path at spawn; that is AFT's own
-        // download, so a bad hash is refused in both modes.
+        // download, so a bad hash is refused whether or not the process is
+        // the supervised module (require_pinned true or false).
         for require_pinned in [false, true] {
             let policy = policy(Some(path.as_os_str()), require_pinned, &roots, &pinned);
             let error = authorize_with(&policy, Some(path.as_os_str()))
@@ -617,9 +618,10 @@ mod tests {
 
     #[test]
     fn installer_pins_the_same_library_hashes() {
-        // The installer checks a download against its own copy of these hashes
-        // before publishing it; the two lists drifting apart would either
-        // install builds AFT then refuses, or refuse builds AFT would load.
+        // The bridge installer (onnx-runtime.ts, `librarySha256`) checks a
+        // download against its own copy of PINNED_ORT_LIBRARIES before
+        // publishing it. If the two lists drift apart, the installer publishes
+        // builds AFT then refuses, or refuses builds AFT would load.
         let installer = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../packages/aft-bridge/src/onnx-runtime.ts");
         let Ok(source) = std::fs::read_to_string(&installer) else {

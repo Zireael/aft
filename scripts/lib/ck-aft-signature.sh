@@ -3,10 +3,12 @@
 # supervised AFT module (ck-aft). Sourced by scripts/stage-card.sh and
 # scripts/verify-placed-card.sh so staging and placement check the same rule.
 #
-# The rule: identifier ck-aft (capability grants key on it), hardened runtime,
-# no get-task-allow, and exactly one hardened-runtime exception,
-# com.apple.security.cs.disable-library-validation, which AFT needs to load
-# the downloaded ONNX Runtime library (it has no Team ID).
+# The rule: identifier ck-aft (macOS permission grants given to the module are
+# recorded against this identifier, so it must not change between cards),
+# hardened runtime, no get-task-allow, and exactly one hardened-runtime
+# exception, com.apple.security.cs.disable-library-validation. AFT needs it to
+# load the ONNX Runtime library downloaded from Microsoft's releases, which is
+# signed without a Team ID and would otherwise be refused.
 
 CK_AFT_IDENTIFIER="ck-aft"
 CK_AFT_ENTITLEMENTS="${CK_AFT_ENTITLEMENTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ck-aft.entitlements.plist}"
@@ -54,8 +56,8 @@ ck_aft_check_signature() {
   echo "    entitlements: ${entitlements_xml:-<none>}"
   plist="$(mktemp "${TMPDIR:-/tmp}/ck-aft-entitlements.XXXXXX")"
   printf '%s' "$entitlements_xml" > "$plist"
-  # PlistBuddy, not plutil: entitlement keys contain dots, which plutil reads
-  # as a key path.
+  # PlistBuddy, not plutil: the keys must be read literally, and plutil splits
+  # a key on its dots as a key path.
   keys="$(/usr/libexec/PlistBuddy -c Print "$plist" 2>/dev/null | sed -n 's/^    \([^ ]*\) = .*/\1/p')"
   if /usr/libexec/PlistBuddy -c "Print :com.apple.security.get-task-allow" "$plist" >/dev/null 2>&1; then
     rm -f "$plist"

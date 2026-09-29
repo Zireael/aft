@@ -238,8 +238,9 @@ fn main() {
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
     if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
         aft::slog_info!("subc mode, pid {}", std::process::id());
-        // The supervised module holds a launch secret; it must never load an
-        // ONNX Runtime found by bare name on the loader search path.
+        // The supervised module holds the secret it authenticates to the
+        // daemon with, so it loads only an ONNX Runtime it could hash first
+        // (see ort_pin), never one found by bare name on the loader search path.
         aft::ort_pin::require_pinned_onnx_runtime();
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
