@@ -10077,31 +10077,22 @@ Connection: close
                 temp.path().join(format!("borrower_{i}"))
             };
             fs::create_dir_all(&root).unwrap();
-            for file in &files {
+            let mut oracle_files = Vec::new();
+            for (ordinal, file) in files.iter().enumerate() {
+                let path = root.join(file.file_name().unwrap());
                 if i != 0 {
-                    fs::copy(file, root.join(file.file_name().unwrap())).unwrap();
+                    // Later roots must start with the original contents and
+                    // mtimes, not changes made by earlier loop iterations.
+                    write_rust_file(&path, &format!("symbol_{ordinal}"));
+                    filetime::set_file_mtime(
+                        &path,
+                        filetime::FileTime::from_system_time(original.file_mtimes[file]),
+                    )
+                    .unwrap();
                 }
+                oracle_files.push(path);
             }
-            let mut oracle = original.clone();
-            oracle.project_root = root.clone();
-            for entry in &mut oracle.entries {
-                entry.chunk.file = root.join(entry.chunk.file.file_name().unwrap());
-            }
-            oracle.file_mtimes = original
-                .file_mtimes
-                .iter()
-                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
-                .collect();
-            oracle.file_sizes = original
-                .file_sizes
-                .iter()
-                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
-                .collect();
-            oracle.file_hashes = original
-                .file_hashes
-                .iter()
-                .map(|(p, v)| (root.join(p.file_name().unwrap()), *v))
-                .collect();
+            let mut oracle = build_test_index(&root, &oracle_files);
             let mut serving = SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base));
             let mut worker = serving.clone();
             for (name, symbol) in [
