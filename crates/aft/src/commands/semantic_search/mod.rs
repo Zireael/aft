@@ -7210,6 +7210,48 @@ mod tests {
     }
 
     #[test]
+    fn disabled_semantic_first_search_names_held_trigram_build_in_rendered_text() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/lib.rs"),
+            "pub fn handle_request(token: &str) -> bool {\n  !token.is_empty()\n}\n\npub struct AuthService;\n",
+        ).unwrap();
+        let ctx = test_context(project.path());
+        ctx.update_config(|config| config.indexes.semantic = false);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+        let (publish, receiver) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(receiver, ctx.configure_generation());
+
+        // The live sender is a publication gate: no generation can become ready
+        // until this test releases it, regardless of the machine's scheduling.
+        let response = with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
+            handle_semantic_search(&semantic_request("request authentication handler", 5), &ctx)
+        });
+        let text = crate::subc_format::format_response("search", &response, false);
+        assert!(!response.success, "{text}");
+        assert!(
+            text.lines().any(|line| line == "trigram: building"),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line == "semantic: unavailable: disabled"),
+            "{text}"
+        );
+        assert!(!text.contains("Found 0 results."), "{text}");
+        assert!(!text.contains("see lanes"), "{text}");
+
+        publish.send(SearchIndex::build(project.path())).unwrap();
+        crate::runtime_drain::drain_search_index_events(&ctx);
+        let response =
+            handle_semantic_search(&semantic_request("request authentication handler", 5), &ctx);
+        let text = crate::subc_format::format_response("search", &response, false);
+        assert!(response.success, "{text}");
+        assert!(text.contains("src/lib.rs:1 [lexical match]"), "{text}");
+    }
+
+    #[test]
     fn refusal_message_names_both_lane_states() {
         let project = tempfile::tempdir().unwrap();
         let ctx = test_context(project.path());
