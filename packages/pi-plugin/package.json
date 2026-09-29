@@ -26,7 +26,6 @@
     "@cortexkit/aft-bridge": "0.58.0",
     "comment-json": "^5.0.0",
     "diff": "^8.0.4",
-    "typebox": "1.1.38",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
@@ -42,11 +41,14 @@
     "@earendil-works/pi-ai": "^0.80.2",
     "@earendil-works/pi-tui": "^0.80.2",
     "@types/node": "^22.0.0",
+    "typebox": "1.1.38",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "exports": {
     ".": {
