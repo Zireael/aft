@@ -785,7 +785,10 @@ jobs:
   unit-windows-libtest:
     name: Cargo libtest + watcher (Windows)
     runs-on: windows-2022
-    timeout-minutes: 25
+    # A normal run takes about 18 minutes (build, lib tests, then the serial
+    # watcher suite). Windows runners vary by up to 1.6x in speed, which
+    # pushed a run with no failing test past a 25-minute limit.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 
