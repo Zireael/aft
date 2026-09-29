@@ -3091,7 +3091,7 @@ fn run_subc_mode_inner(
         loop_result,
         Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
     ) {
-        flush_actor_indexes_on_graceful_shutdown(&actor_contexts);
+        flush_actor_indexes_on_graceful_shutdown(&actor_contexts, exit_started);
     }
     log::info!(
         "subc exit phase=index_flush_done elapsed_ms={}",
@@ -3188,7 +3188,26 @@ fn note_fatal_panic_response(response: &Response) -> bool {
     fatal
 }
 
-fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
+/// Flush every root's search index and the queued call-graph refreshes on a
+/// graceful exit. `drained_at` is when the module loop ended; both flushes
+/// finish by [`crate::callgraph_store::exit_index_flush_deadline`] so that
+/// LSP shutdown still fits the exit budget. Returns the logged summary line.
+fn flush_actor_indexes_on_graceful_shutdown(
+    actor_contexts: &[Arc<AppContext>],
+    drained_at: Instant,
+) -> String {
+    flush_actor_indexes_on_graceful_shutdown_with(
+        actor_contexts,
+        drained_at,
+        crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown,
+    )
+}
+
+fn flush_actor_indexes_on_graceful_shutdown_with(
+    actor_contexts: &[Arc<AppContext>],
+    drained_at: Instant,
+    callgraph_flush: impl FnOnce() -> bool + Send + 'static,
+) -> String {
     // Index deltas can be rebuilt after a restart. Give the independent roots
     // one short shared window to persist them, without extending the outage
     // when a rebuild or a cache lock holds one root for several seconds.
@@ -3202,7 +3221,9 @@ fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) 
     }
     drop(tx);
     let started = Instant::now();
-    let deadline = started + Duration::from_millis(300);
+    let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
+    let deadline =
+        (started + crate::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline);
     let mut completed = 0;
     let mut flushed = 0;
     while completed < actor_contexts.len() {
@@ -3214,13 +3235,26 @@ fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) 
             Err(_) => break,
         }
     }
-    // Refreshes are reconstructible and the worker already uses a 100 ms
-    // shared shutdown budget; run it after the root flush window.
-    let refreshed = crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
-    log::info!(
-        "subc exit phase=index_flush roots={} completed={} flushed={} callgraph_drained={} elapsed_ms={}",
-        actor_contexts.len(), completed, flushed, refreshed, started.elapsed().as_millis()
+    // Refreshes are reconstructible, so exit waits for them only until the
+    // flush deadline and otherwise leaves them to the next start.
+    let refreshed =
+        crate::callgraph_store::run_exit_callgraph_flush_before(flush_deadline, callgraph_flush);
+    let line = format!(
+        "subc exit phase=index_flush roots={} completed={} flushed={} callgraph={} elapsed_ms={}",
+        actor_contexts.len(),
+        completed,
+        flushed,
+        refreshed.as_str(),
+        started.elapsed().as_millis()
     );
+    if refreshed == crate::callgraph_store::ExitCallgraphFlush::Abandoned {
+        log::warn!(
+            "{line}: abandoned an unfinished call-graph refresh to exit on time; the next start refreshes the call graph"
+        );
+    } else {
+        log::info!("{line}");
+    }
+    line
 }
 
 /// Test-only entry that enables the non-manifest native-command passthrough on
@@ -9356,6 +9390,30 @@ mod tests {
     }
 
     #[test]
+    fn a_held_callgraph_flush_is_abandoned_within_the_exit_budget() {
+        // The flush is held for 3 s, like a refresh worker still inside a
+        // long refresh or store checkpoint when exit begins.
+        let drained_at = Instant::now();
+        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, || {
+            std::thread::sleep(Duration::from_secs(3));
+            true
+        });
+        let flush_window = crate::callgraph_store::exit_index_flush_deadline(drained_at)
+            .saturating_duration_since(drained_at);
+        let elapsed = drained_at.elapsed();
+        assert!(
+            elapsed < flush_window + Duration::from_millis(200),
+            "exit waited {elapsed:?} on a held call-graph flush (window {flush_window:?})"
+        );
+        // The rest of the exit, LSP shutdown, still fits in the exit budget.
+        assert!(
+            flush_window + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
+                <= crate::callgraph_store::EXIT_BUDGET_AFTER_DRAIN
+        );
+        assert!(line.contains("callgraph=abandoned"), "{line}");
+    }
+
+    #[test]
     fn graceful_shutdown_flushes_every_actor_search_index() {
         let storage = tempfile::tempdir().expect("storage tempdir");
         let (root1_dir, root1) = test_root("shutdown-flush-root-1");
@@ -9379,7 +9437,7 @@ mod tests {
         assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
-        flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts());
+        flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts(), Instant::now());
 
         let mut restored1 =
             crate::search_index::SearchIndex::read_from_disk(&cache_dir1, &canonical_root1)

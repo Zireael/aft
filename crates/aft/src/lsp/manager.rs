@@ -36,7 +36,7 @@ use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 /// The total grace period for draining every LSP client during process shutdown.
-const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_millis(1500);
+pub const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_millis(1500);
 
 fn server_key_for_definition(
     def: &ServerDef,

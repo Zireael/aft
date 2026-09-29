@@ -599,17 +599,24 @@ fn main() {
         }
     }
     aft::slog_info!("shutdown phase=pending_responses_drained");
+    // Everything from here to exit fits in the exit budget measured from this
+    // point: the index flushes end by `flush_deadline`, then LSP shutdown
+    // takes at most its own budget.
+    let drained_at = Instant::now();
     if graceful_stdin_shutdown {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
+        let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
         let runtime = Arc::clone(registry.current());
         aft::slog_info!("shutdown phase=search_index_flush_start");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
         });
-        let flushed = rx.recv_timeout(Duration::from_millis(300));
+        let search_wait = aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT
+            .min(flush_deadline.saturating_duration_since(Instant::now()));
+        let flushed = rx.recv_timeout(search_wait);
         aft::slog_info!(
             "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
             flushed.is_ok(),
@@ -617,12 +624,19 @@ fn main() {
             shutdown_started.elapsed().as_millis()
         );
         aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
-        let drained = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+        let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
         aft::slog_info!(
-            "shutdown phase=callgraph_refresh_flush_done drained={} elapsed_ms={}",
-            drained,
+            "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
+            outcome.as_str(),
+            outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
             shutdown_started.elapsed().as_millis()
         );
+        if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
+            aft::slog_warn!(
+                "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
+                aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
+            );
+        }
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();

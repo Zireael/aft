@@ -1911,6 +1911,90 @@ pub fn flush_callgraph_store_refreshes_on_graceful_shutdown() -> bool {
     flush_callgraph_store_refreshes_with_budget(REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET)
 }
 
+/// How long a graceful exit may take once in-flight requests are drained:
+/// index flushes, then LSP shutdown. The daemon kills a module that takes
+/// longer than 25 s to exit, and a restart waits on this exit, so it is kept
+/// to about 2 s.
+pub const EXIT_BUDGET_AFTER_DRAIN: Duration = Duration::from_secs(2);
+
+/// How long the search-index flush may hold a graceful exit.
+pub const EXIT_SEARCH_INDEX_FLUSH_WAIT: Duration = Duration::from_millis(300);
+
+// The index flushes get what the exit budget leaves after LSP shutdown, and
+// the call-graph flush must still have time after the search-index wait.
+const _: () = assert!(
+    EXIT_SEARCH_INDEX_FLUSH_WAIT.as_millis()
+        + REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET.as_millis()
+        + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis()
+        < EXIT_BUDGET_AFTER_DRAIN.as_millis(),
+    "the exit budget must cover the index flushes and LSP shutdown"
+);
+
+/// When the index flushes of a graceful exit must be finished, so that LSP
+/// shutdown still fits in the exit budget. `drained_at` is when the process
+/// finished draining its in-flight requests.
+pub fn exit_index_flush_deadline(drained_at: Instant) -> Instant {
+    drained_at + EXIT_BUDGET_AFTER_DRAIN - crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
+}
+
+/// What happened to queued call-graph refreshes at process exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitCallgraphFlush {
+    /// Every queued refresh finished and the worker stopped.
+    Drained,
+    /// The worker's own flush budget ran out; unfinished refreshes were
+    /// deferred to the next start.
+    Deferred,
+    /// The flush had not returned by the exit deadline (for example the
+    /// worker was still finishing a refresh or a store checkpoint), so exit
+    /// went ahead without it. The next start rebuilds or refreshes the graph.
+    Abandoned,
+}
+
+impl ExitCallgraphFlush {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::Deferred => "deferred",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Flush queued call-graph refreshes for a graceful exit, waiting no later
+/// than `deadline`. The flush's own budget bounds its wait for the worker,
+/// but not the join of a worker still inside a refresh or checkpoint, so it
+/// runs on its own thread and exit stops waiting for it at the deadline.
+pub fn flush_callgraph_store_refreshes_before(deadline: Instant) -> ExitCallgraphFlush {
+    run_exit_callgraph_flush_before(
+        deadline,
+        flush_callgraph_store_refreshes_on_graceful_shutdown,
+    )
+}
+
+/// [`flush_callgraph_store_refreshes_before`] with the flush supplied, so a
+/// test can hold it open.
+#[doc(hidden)]
+pub fn run_exit_callgraph_flush_before(
+    deadline: Instant,
+    flush: impl FnOnce() -> bool + Send + 'static,
+) -> ExitCallgraphFlush {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("aft-callgraph-exit-flush".to_string())
+        .spawn(move || {
+            let _ = tx.send(flush());
+        });
+    if spawned.is_err() {
+        return ExitCallgraphFlush::Abandoned;
+    }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(true) => ExitCallgraphFlush::Drained,
+        Ok(false) => ExitCallgraphFlush::Deferred,
+        Err(_) => ExitCallgraphFlush::Abandoned,
+    }
+}
+
 #[doc(hidden)]
 pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
     let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
