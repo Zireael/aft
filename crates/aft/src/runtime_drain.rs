@@ -1697,11 +1697,22 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 // A worker generation can finish an older batch after the
                 // watcher has invalidated a second edit. Do not resurrect that
                 // batch or clear its successor's pending path.
+                let files_with_rows = added_entries.iter().map(|entry| entry.file()).collect::<HashSet<_>>();
                 let stale = updated_metadata.iter().filter_map(|(path, record)| {
-                    (!matches!(aft::cache_freshness::verify_file_strict(path, record),
-                        aft::cache_freshness::FreshnessVerdict::HotFresh |
-                        aft::cache_freshness::FreshnessVerdict::ContentFresh { .. }) ||
-                        watcher_path_is_ignored_by_current_matcher(ctx, path)).then(|| path.clone())
+                    // Oversized files deliberately produce no rows and no hash.
+                    // A matching size/mtime can acknowledge that empty result;
+                    // demanding a hash here would retry the skipped file forever.
+                    let current = if record.size > aft::cache_freshness::CONTENT_HASH_SIZE_CAP
+                        && !files_with_rows.contains(path.as_path())
+                    {
+                        std::fs::metadata(path).is_ok_and(|metadata|
+                            metadata.len() == record.size && metadata.modified().ok() == Some(record.mtime))
+                    } else {
+                        matches!(aft::cache_freshness::verify_file_strict(path, record),
+                            aft::cache_freshness::FreshnessVerdict::HotFresh |
+                            aft::cache_freshness::FreshnessVerdict::ContentFresh { .. })
+                    };
+                    (!current || watcher_path_is_ignored_by_current_matcher(ctx, path)).then(|| path.clone())
                 }).collect::<HashSet<_>>();
                 added_entries.retain(|entry| !stale.contains(entry.file()));
                 updated_metadata.retain(|(path, _)| !stale.contains(path));
@@ -5886,6 +5897,71 @@ mod tests {
             ctx.semantic_refresh_event_rx().lock().is_some(),
             "the stale drain must not clear the replacement refresh receiver"
         );
+    }
+
+    #[test]
+    fn revision_oversized_empty_completion_does_not_retry_forever() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("large.rs");
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(aft::cache_freshness::CONTENT_HASH_SIZE_CAP + 1)
+            .unwrap();
+        let mut worker = crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3);
+        let update = worker
+            .refresh_invalidated_files(
+                root.path(),
+                std::slice::from_ref(&file),
+                &mut |_| panic!("oversized file must not embed"),
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(update.added_entries.is_empty());
+        assert_eq!(update.updated_metadata.len(), 1);
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        *ctx.semantic_index().write().unwrap() = Some(crate::semantic_index::SemanticIndex::new(
+            root.path().to_path_buf(),
+            3,
+        ));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        event_tx
+            .send(SemanticRefreshEvent::Completed {
+                added_entries: update.added_entries,
+                updated_metadata: update.updated_metadata,
+                completed_paths: update.completed_paths,
+            })
+            .unwrap();
+        drain_semantic_refresh_events(&ctx);
+        assert!(
+            request_rx.try_recv().is_err(),
+            "unchanged oversized skip was requeued"
+        );
+        assert!(ctx
+            .semantic_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .recorded_file_freshness(&file)
+            .is_some());
     }
 
     #[test]
