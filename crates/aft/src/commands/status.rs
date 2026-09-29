@@ -9,6 +9,10 @@ use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 pub struct CompressionStats {
     pub project: CompressionAggregateSerde,
     pub session: CompressionAggregateSerde,
+    /// True when another thread held the database connection, so the totals
+    /// are the last ones this process computed (zero if it never had any).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -488,18 +492,31 @@ impl AppContext {
         let Some(db) = self.db() else {
             return compression;
         };
-        let Ok(conn) = db.lock() else {
-            return compression;
-        };
-
         let harness = self.harness().storage_segment();
         let project_key = crate::path_identity::project_scope_key(&project_root);
-        if let Ok((project, session)) = self.compression_aggregate_cache().aggregates_for_session(
-            &conn,
-            &harness,
-            &project_key,
-            session_id,
-        ) {
+        let cache = self.compression_aggregate_cache();
+        // Status is polled with a short client timeout and must answer from
+        // memory. The connection mutex can be held for as long as another
+        // thread's statement waits on a different process's lock, so never
+        // block on it: fall back to the last totals this process computed.
+        let conn = match db.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                compression.stale = true;
+                if let Some((project, session)) =
+                    cache.cached_for_session(&harness, &project_key, session_id)
+                {
+                    compression.project = project.into();
+                    compression.session = session.into();
+                }
+                return compression;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return compression,
+        };
+
+        if let Ok((project, session)) =
+            cache.aggregates_for_session(&conn, &harness, &project_key, session_id)
+        {
             compression.project = project.into();
             compression.session = session.into();
         }

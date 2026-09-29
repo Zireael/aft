@@ -1201,6 +1201,8 @@ impl HealthDiagnosticRollup {
             "bash_task_retention": {
                 "eligible_but_unpruned_rows": Value::Null,
                 "last_sweep_skip_reason": Value::Null,
+                "sweeps_skipped_total": crate::db::compression_events::retention_sweep_skip_counts().0,
+                "consecutive_skips": crate::db::compression_events::retention_sweep_skip_counts().1,
                 "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
             },
             "mutating_lanes": { "scheduler_busy": true },
@@ -1595,9 +1597,13 @@ fn bash_task_retention_metrics(shared_app: &App) -> Value {
         ),
         None => (None, None),
     };
+    let (sweeps_skipped_total, consecutive_skips) =
+        crate::db::compression_events::retention_sweep_skip_counts();
     json!({
         "eligible_but_unpruned_rows": eligible_but_unpruned_rows,
         "last_sweep_skip_reason": last_sweep_skip_reason,
+        "sweeps_skipped_total": sweeps_skipped_total,
+        "consecutive_skips": consecutive_skips,
         "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
     })
 }
@@ -2008,6 +2014,10 @@ pub(super) fn build_health_report(
     metrics.insert(
         "write_ledger_top_10m".to_string(),
         json!(crate::write_ledger::recent_top_writers()),
+    );
+    metrics.insert(
+        "write_ledger_folds_deferred_total".to_string(),
+        json!(crate::db::write_ledger::folds_deferred_total()),
     );
     budget_health_metrics(&mut metrics);
 

@@ -387,10 +387,7 @@ impl OpenError {
             | Self::MigrationFailed { error, .. } => error,
             _ => return false,
         };
-        matches!(
-            error.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-        )
+        is_busy_error(error)
     }
 }
 
@@ -424,6 +421,57 @@ pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
 }
 
 pub(crate) const TOOL_RETRY_BUSY_WAIT: Duration = Duration::from_millis(250);
+
+/// How long a statement on an open AFT connection waits for another process's
+/// lock before SQLite reports `database is locked`.
+pub(crate) const STEADY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// True for SQLite's lock-contention results (`SQLITE_BUSY`, `SQLITE_LOCKED`).
+pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Run background work on a shared connection with a shorter busy wait.
+///
+/// Maintenance threads hold the process-wide connection mutex while SQLite
+/// waits for another process's write lock. With the steady five-second wait,
+/// one busy `aft.db` stalled every request that needed the connection, `status`
+/// included, for five seconds. A short wait makes maintenance give up and try
+/// again later instead. The steady wait is restored before the mutex is released.
+pub(crate) fn with_busy_wait<C, T>(
+    conn: &mut C,
+    wait: Duration,
+    work: impl FnOnce(&mut C) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T>
+where
+    C: std::ops::DerefMut<Target = Connection>,
+{
+    conn.busy_timeout(wait)?;
+    let result = work(conn);
+    let restored = conn.busy_timeout(STEADY_BUSY_TIMEOUT);
+    let value = result?;
+    restored?;
+    Ok(value)
+}
+
+/// Minimum spacing between runs of the once-a-minute storage maintenance
+/// (write-ledger fold, bash task retention).
+///
+/// `AFT_TEST_MAINTENANCE_INTERVAL_MS` shortens it so integration tests can
+/// observe several runs; production always uses one minute.
+pub(crate) fn maintenance_interval() -> Duration {
+    static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("AFT_TEST_MAINTENANCE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map_or(Duration::from_secs(60), Duration::from_millis)
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenMode {
