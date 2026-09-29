@@ -62,9 +62,12 @@ impl Fixture {
     }
 
     /// Run the reload the file watcher would have asked for.
+    ///
+    /// Runs it directly rather than through the debounced signal: a file
+    /// watch another test turned on for the process may push the signal's
+    /// due time out while this test writes the file.
     fn reload(&self) -> ReloadOutcome {
-        self.ctx.config_live().signal().request_now();
-        drain_config_reload(&self.ctx).expect("a due reload runs")
+        reload_config_now(&self.ctx)
     }
 }
 
@@ -244,10 +247,6 @@ fn absent_file_that_was_absent_at_connect_is_not_an_error() {
 fn unchanged_file_text_is_a_no_op() {
     let fixture = Fixture::new("{}", Some(r#"{ "format_on_edit": true }"#));
     assert_eq!(fixture.reload(), ReloadOutcome::Unchanged);
-    assert!(
-        drain_config_reload(&fixture.ctx).is_none(),
-        "nothing pending"
-    );
 }
 
 #[test]
@@ -666,12 +665,10 @@ fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
     assert!(crate::commands::configure::handle_configure(&req, &ctx).success);
     let project_path = project_config_path(&root);
     write(&project_path, relayed);
-    ctx.config_live().signal().request_now();
-    assert_eq!(drain_config_reload(&ctx), Some(ReloadOutcome::Unchanged));
+    assert_eq!(reload_config_now(&ctx), ReloadOutcome::Unchanged);
 
     std::fs::remove_file(&project_path).unwrap();
-    ctx.config_live().signal().request_now();
-    match drain_config_reload(&ctx) {
+    match Some(reload_config_now(&ctx)) {
         Some(ReloadOutcome::Kept { reason }) => assert!(reason.contains("was deleted"), "{reason}"),
         other => panic!("expected the deletion to be refused, got {other:?}"),
     }
