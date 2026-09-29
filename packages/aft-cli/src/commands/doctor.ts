@@ -73,11 +73,7 @@ import { formatFsError } from "../lib/fs-errors.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
-import {
-  capBodyToGithubLimit,
-  extractRecentErrors,
-  filterLogToSession,
-} from "../lib/issue-body.js";
+import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import {
   AFT_SCHEMA_URL,
   ensureAftSchemaUrl,
@@ -90,6 +86,7 @@ import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { readSessionLog } from "../lib/session-log.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
   checkGhStatus,
@@ -2022,37 +2019,26 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  // Build per-harness log sections (last 200 lines each) AND scan a wider
-  // window (last 4000 lines per harness, deduped/sanitized) for error-
-  // shaped lines that survive even when the main log tail needs heavy
-  // truncation to fit GitHub's 64KB body limit.
-  const logSections = adapters
-    .map((adapter) => {
-      const path = adapter.getLogFile();
-      const tail = tailLogFile(path, 200);
-      const scopedTail = selectedBareSessionId
-        ? filterLogToSession(tail, selectedBareSessionId)
-        : tail;
-      return `#### ${adapter.displayName} log (${path})\n\n\`\`\`\n${scopedTail || "<no log output>"}\n\`\`\`\n`;
-    })
-    .join("\n");
-
-  // Wider scan (4000 lines per harness) so a flood of recent debug noise
-  // doesn't push the actual error out of view. Each harness's wide tail
-  // is sanitized independently (sanitizeContent walks the whole string;
-  // running it twice on the same content is a no-op), then we extract
-  // the 20 most-recent ERROR-shaped lines from the merged result.
-  const errorScanWindow = adapters
-    .map((adapter) => {
-      const path = adapter.getLogFile();
-      const tail = tailLogFile(path, 4000);
-      const scopedTail = selectedBareSessionId
-        ? filterLogToSession(tail, selectedBareSessionId)
-        : tail;
-      return sanitizeContent(scopedTail);
-    })
-    .join("\n");
-  const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
+  // Session reports scan backwards within a byte budget; general reports retain
+  // their ordinary recent-log tails.
+  const logResults = adapters.map((adapter) => {
+    const path = adapter.getLogFile();
+    const scoped = selectedSession ? readSessionLog(path, selectedSession) : null;
+    const logText = scoped ? scoped.lines.join("\n") : tailLogFile(path, 200);
+    const notice = [
+      ...(scoped?.boundHit ? ["[scan limit reached; older session lines may be missing]"] : []),
+      ...(scoped && scoped.lines.length === 0 ? ["[no lines found for selected session]"] : []),
+    ].join("\n");
+    return {
+      section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
+      errors: scoped ? scoped.errors.join("\n") : sanitizeContent(tailLogFile(path, 4000)),
+    };
+  });
+  const logSections = logResults.map((result) => result.section).join("\n");
+  const recentErrorLines = extractRecentErrors(
+    logResults.map((result) => sanitizeContent(result.errors)).join("\n"),
+    20,
+  );
   const recentErrorsSection =
     recentErrorLines.length === 0
       ? "_No error-shaped log lines found in recent history._"
@@ -2081,7 +2067,9 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     "",
     toolFailuresSection,
     "",
-    "## Logs (last 200 lines per harness)",
+    selectedSession
+      ? `## Logs (last 200 lines for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
+      : "## Logs (last 200 lines per harness)",
     logSections,
     "_Usernames and home paths have been stripped from this report._",
   ].join("\n");
