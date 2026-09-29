@@ -130,6 +130,7 @@ class NdjsonClient:
             raise AftProtocolError("aft_protocol:pipes_unavailable")
         self._stream = NdjsonStream(self.proc.stdout)
         self._next_id = 0
+        self.allow_building = False
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -222,8 +223,9 @@ class NdjsonClient:
             "tool_call",
             {"session_id": "aft-search-real-query", "name": "search", "arguments": dict(arguments)},
         )
-        if response.get("success") is not True or response.get("status") != "ready":
-            raise AftProtocolError(f"aft_search_failed:{response}")
+        allowed_statuses = {"ready", "building"} if self.allow_building else {"ready"}
+        if response.get("success") is not True or response.get("status") not in allowed_statuses:
+            raise AftProtocolError(f"aft_search_failed:success={response.get('success')}:status={response.get('status')}:code={response.get('code')}")
         if not isinstance(response.get("results"), list):
             raise AftProtocolError("aft_search_failed:results_not_array")
         return response
@@ -708,7 +710,7 @@ def fixture_endpoint(pack: Mapping[str, Any], log_path: Path, corpus_release: Op
     template = pack.get("embed_template_version")
     if not isinstance(vectors, Mapping) or not isinstance(template, str) or not vectors:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
-    server = Server(("127.0.0.1", 0), vectors, template, log_path, corpus_release=corpus_release)
+    server = Server(("127.0.0.1", 0), vectors, template, log_path, corpus_release=corpus_release, unheld_corpus_texts={PROBE_TEXT})
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -791,18 +793,20 @@ def run(args: argparse.Namespace) -> int:
                 if any(row.get("semantic_state") == "building" for row in manifest["rows"]):
                     with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
                         building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
+                        building.allow_building = True
                         try:
                             building.configure(building_endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
                             deadline = time.monotonic() + args.ready_timeout
                             while time.monotonic() < deadline:
                                 status = building.call("status")
-                                if status.get("search_index", {}).get("status") == "ready":
-                                    if status.get("semantic_index", {}).get("status") != "building":
-                                        raise InputFault(f"semantic_building_fixture_not_building:{status}")
+                                semantic_status = status.get("semantic_index", {}).get("status")
+                                if semantic_status in {"ready", "failed", "unavailable"}:
+                                    raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
+                                if status.get("search_index", {}).get("status") == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
                                     break
                                 time.sleep(0.1)
                             else:
-                                raise InputFault("semantic_building_fixture_lexical_timeout")
+                                raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
                             rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
                         finally:
                             building.close()

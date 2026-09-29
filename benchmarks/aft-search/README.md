@@ -337,8 +337,10 @@ five selected declarations concern output compression, and the other files
 concern unrelated systems. Actual prose-lane membership depends on the semantic
 index, so exact overlap is not a gate. Split scores preserve the pattern summary
 and the first eight text lines for inspection. R6 uses a separate AFT process
-whose corpus embeddings are held by an event while query embeddings remain
-available. The runner waits for lexical ready and verifies semantic building;
+whose corpus embeddings are held by an event while query embeddings and the
+model-initialization probe remain available. The runner waits for the trigram
+index's `ready` status and the semantic index's `building` status (or its initial
+`loading / embedding_symbols` stage);
 it does not race a normally progressing semantic index or alter the 56 old rows.
 
 `split-tuning-manifest.json` contains **8 additional tuning-only rows**
@@ -385,6 +387,37 @@ with `cost-gate.sh --search-quality --mode record-reference`, and say in the
 commit message which change moved the rows and why it was the right direction.
 
 Re-records so far:
+
+- 2026-09-29, when 12 query/pattern rows were added (see Split query/pattern
+  rows above). Recorded in Linux x86_64 on the unchanged local-main release
+  build `d361e160d142` (`aft 0.58.0`, binary sha256
+  `0c8b5d45de80313d8842d31a4ddc2b68a156c7824bc90a04ba635db180df0325`).
+  The binary's invalid-pattern probe reported legacy/ignored input, so all
+  new rows are joined-form references. The old manifest replay reproduced all
+  56 reference rows byte-for-byte, and the expanded replay preserved those
+  same 56 rows byte-for-byte. A second expanded replay reproduced all 68 rows.
+  Exact recall stayed 1.000 and concept recall stayed 0.639423, re-measured.
+  `paged` real-query MRR@10 0.317708 -> 0.297672, hit@5 0.446429 -> 0.426471;
+  the added split mechanism/shape/fixture group has MRR@10 0.204167,
+  hit@1 0.166667, hit@5 0.333333. Census-weighted report-only MRR
+  0.434615 -> 0.436247. No old answer moved: aggregate changes are solely
+  the addition of new rows, not a ranking change. Joined answer ranks, in
+  row-ID order: miss, miss, miss, miss, miss, 1, 5, miss, 4, 1, miss, miss.
+  R6's held semantic build returned `complete: false`; the initial index reports
+  `loading / embedding_symbols` while unpublished, and search reports `building`.
+  The gate was green with a `non_ranking`/`harness` descriptor against
+  `d361e160`, the local-main base. `origin/main` was still behind that base's
+  engine-unwired per-checkout-index change, so the local-main base avoids mixing
+  its descriptor class with this benchmark change.
+
+  Recording procedure: old-manifest `cost-gate.sh --search-quality --mode verify`
+  on that binary, then `--mode record-reference --manifest-changed --old-score
+  <old-score> --base-ref d361e160`. The real-query stage initially failed because
+  the fixture also held model initialization; after exempting the initialization
+  probe, awaiting `embedding_symbols`, and permitting the explicit building
+  response for that fixture client only, the failed stage was rerun and the
+  resulting score recorded with `search_quality.py` using the same arguments.
+  A full `cost-gate.sh --search-quality --mode evaluate` replay then passed.
 
 - 2026-09-18, after ranking slice 3, and 2026-09-20, after the `includeTests`
   coercion moved the capability schema hash. Both are written up in

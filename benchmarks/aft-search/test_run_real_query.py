@@ -140,6 +140,19 @@ class SplitQueryRunnerTests(unittest.TestCase):
         document["rows"][0].update(pattern=pattern, answer_kind="concept", split_kind="R2")
         return document
 
+    def test_partial_search_reply_is_allowed_only_for_building_fixture_client(self) -> None:
+        from run_real_query import NdjsonClient, AftProtocolError
+        client = object.__new__(NdjsonClient)
+        client.call = lambda *args, **kwargs: {"success": True, "status": "building", "complete": False, "results": []}
+        client.allow_building = False
+        with self.assertRaises(AftProtocolError):
+            client.search({"query": "question"})
+        client.allow_building = True
+        self.assertIs(client.search({"query": "question"})["complete"], False)
+        client.call = lambda *args, **kwargs: {"success": True, "status": "failed", "results": []}
+        with self.assertRaises(AftProtocolError):
+            client.search({"query": "question"})
+
     def test_split_replay_refuses_a_vector_rejected_by_its_endpoint(self) -> None:
         from run_real_query import fixture_endpoint
         with tempfile.TemporaryDirectory() as directory:
@@ -154,8 +167,8 @@ class SplitQueryRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             release = threading.Event()
             template = "test"
-            vectors = {corpus_key("chunk", template): [1.0], query_key("question", template): [2.0]}
-            server = Server(("127.0.0.1", 0), vectors, template, Path(directory) / "log", corpus_release=release)
+            vectors = {corpus_key("chunk", template): [1.0], query_key("question", template): [2.0], corpus_key("model probe", template): [3.0]}
+            server = Server(("127.0.0.1", 0), vectors, template, Path(directory) / "log", corpus_release=release, unheld_corpus_texts={"model probe"})
             serving = threading.Thread(target=server.serve_forever, daemon=True)
             serving.start()
             replies = []
@@ -168,6 +181,7 @@ class SplitQueryRunnerTests(unittest.TestCase):
                 corpus.start()
                 self.assertTrue(server.corpus_waiting.wait(3), "corpus embedding reached the held endpoint")
                 self.assertEqual(embed("question")["data"][0]["embedding"], [2.0])
+                self.assertEqual(embed("model probe")["data"][0]["embedding"], [3.0])
                 self.assertEqual(replies, [], "semantic indexing must still be held")
             finally:
                 release.set()

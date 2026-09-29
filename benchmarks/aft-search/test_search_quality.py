@@ -95,6 +95,12 @@ class SplitPairedTests(unittest.TestCase):
         partial["rows"][0].update(split_kind="R6", envelope_complete=False)
         self.assertEqual(split_paired_failures(partial), [])
 
+    def test_tuning_score_is_not_gate_eligible(self) -> None:
+        document, _, score = synthetic_documents()
+        score["tuning_only"] = True
+        with self.assertRaisesRegex(InputFault, "tuning_only_score_not_gate_eligible"):
+            validate_scored_population(document, score)
+
     def test_tuning_manifest_is_not_gate_eligible(self) -> None:
         with self.assertRaisesRegex(InputFault, "tuning_only_manifest_not_gate_eligible"):
             included_manifest_ids(json.loads(Path(__file__).with_name("split-tuning-manifest.json").read_text()))
