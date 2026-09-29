@@ -637,7 +637,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
-            request_timeout: Duration::from_secs(5),
+            relay_budget: Duration::from_secs(5),
         },
     );
     (status, upstream_reached)
@@ -854,17 +854,14 @@ fn a_changed_binding_generation_triggers_a_new_check() {
 }
 
 #[test]
-fn production_request_budget_is_thirty_seconds() {
-    assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(30));
+fn production_relay_budget_is_thirty_seconds() {
+    assert_eq!(RELAY_BUDGET, Duration::from_secs(30));
     if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
-        assert_eq!(
-            RelayContext::from_process().request_timeout,
-            REQUEST_TIMEOUT
-        );
+        assert_eq!(RelayContext::from_process().relay_budget, RELAY_BUDGET);
     }
 }
 
-/// A write that gets no reply within the per-attempt budget is an unknown
+/// A write that gets no reply within the relay budget is an unknown
 /// outcome, reported with the budget that actually applied, and never resent.
 #[test]
 fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
@@ -906,7 +903,7 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
             connection_file: Some(harness.connection_file.clone()),
             ticket: live.value().map(str::to_string),
             transient_delays: [Duration::from_millis(1); 2],
-            request_timeout: Duration::from_millis(400),
+            relay_budget: Duration::from_millis(400),
         },
     );
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
@@ -915,4 +912,130 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
     assert_eq!(probe.stage, "request");
     assert_eq!(probe.elapsed_ms, 400);
     assert!(super::super::outcome_unknown_text(probe.elapsed_ms).contains("within 400 ms"));
+}
+
+/// Run a governed comment through dispatch with explicit relay timing and
+/// report the exit status and how long the whole invocation took.
+fn dispatch_timed(
+    harness: &Harness,
+    ticket: Option<&str>,
+    transient_delays: [Duration; 2],
+    relay_budget: Duration,
+) -> (i32, Duration) {
+    let manifest = v12_manifest();
+    let args = comment_args("hi");
+    let classification = classify(&args, &manifest, "macos");
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let started = std::time::Instant::now();
+    let status = dispatch_r3_with_relay(
+        &args,
+        classification,
+        &manifest,
+        &harness.paths,
+        &rung,
+        &binding,
+        TEST_NOW,
+        |_| panic!("reached upstream gh"),
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: ticket.map(str::to_string),
+            transient_delays,
+            relay_budget,
+        },
+    );
+    (status, started.elapsed())
+}
+
+/// Transient refusals whose retries would outlast the relay budget stop at
+/// the budget instead of sleeping past it. Each refusal proves nothing was
+/// written, so the command exits with the named refusal (86).
+#[test]
+fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget", "call-b", "/p");
+    // Every write attempt takes 400 ms and is refused as transient, and each
+    // retry sleeps 700 ms. After the second attempt ends (about 1.5 s) the
+    // next sleep would end past the 2 s budget, so the shim stops there;
+    // all three attempts would need 2.6 s.
+    let handler: Handler = Arc::new(|body: &Value| {
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return bindings_ok();
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        plexus_refused("store_failure")
+    });
+    let harness = harness(handler);
+    let budget = Duration::from_secs(2);
+    let (status, elapsed) = dispatch_timed(
+        &harness,
+        live.value(),
+        [Duration::from_millis(700); 2],
+        budget,
+    );
+    assert_eq!(status, REFUSAL_EXIT_STATUS);
+    assert!(
+        elapsed < budget,
+        "took {elapsed:?} against a {budget:?} budget"
+    );
+    let sent = nonces(&harness);
+    assert_eq!(sent.len(), 2, "the second retry would pass the budget");
+    assert_eq!(sent[0], sent[1], "a retry reuses the request nonce");
+    let seam = super::super::seam_state(&harness.paths);
+    assert_eq!(seam.last_seam_refusal.unwrap().code, "store_failure");
+}
+
+/// A retried attempt only gets what is left of the relay budget, so a silent
+/// reply to it is reported as an unknown outcome (87) at the budget, not a
+/// fresh full budget after the retry sleep.
+#[test]
+fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget-silent", "call-bs", "/p");
+    let attempts = Arc::new(Mutex::new(0_usize));
+    let handler_attempts = Arc::clone(&attempts);
+    let handler: Handler = Arc::new(move |body: &Value| {
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return bindings_ok();
+        }
+        let mut attempts = handler_attempts.lock().unwrap();
+        *attempts += 1;
+        if *attempts == 1 {
+            plexus_refused("nonce_in_flight")
+        } else {
+            Value::Null
+        }
+    });
+    let harness = harness(handler);
+    let budget = Duration::from_millis(1_000);
+    let (status, elapsed) = dispatch_timed(
+        &harness,
+        live.value(),
+        [Duration::from_millis(400); 2],
+        budget,
+    );
+    assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
+    // Setup (connect, catalog, route open) runs before the budget starts, so
+    // allow a little over it; a fresh budget for the retry would take 1.4 s.
+    assert!(
+        elapsed < budget + Duration::from_millis(250),
+        "took {elapsed:?} against a {budget:?} budget"
+    );
+    assert_eq!(
+        nonces(&harness).len(),
+        2,
+        "the silent retry is never resent"
+    );
+    let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
+    assert_eq!(probe.elapsed_ms, 1_000);
 }
