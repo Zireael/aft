@@ -283,21 +283,21 @@ fn db_set_host_state_concurrent_insert() {
     let thread_a = std::thread::spawn(move || {
         barrier_a.wait();
         let response = set_host_state(&mut aft_a, "alpha", "one");
-        let ok = response["success"] == true;
         assert!(aft_a.shutdown().success());
-        ok
+        response
     });
     let barrier_b = barrier.clone();
     let thread_b = std::thread::spawn(move || {
         barrier_b.wait();
         let response = set_host_state(&mut aft_b, "beta", "two");
-        let ok = response["success"] == true;
         assert!(aft_b.shutdown().success());
-        ok
+        response
     });
 
-    assert!(thread_a.join().unwrap());
-    assert!(thread_b.join().unwrap());
+    let response_a = thread_a.join().unwrap();
+    let response_b = thread_b.join().unwrap();
+    assert_eq!(response_a["success"], true, "alpha: {response_a}");
+    assert_eq!(response_b["success"], true, "beta: {response_b}");
     assert_eq!(
         host_state_value(storage.path(), "alpha"),
         Some("one".into())
