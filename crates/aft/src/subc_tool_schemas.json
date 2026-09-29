@@ -172,25 +172,25 @@
         "type": "string"
       },
       "startLine": {
-        "description": "1-based line to start reading from",
+        "description": "1-based line or directory entry to start reading from",
         "type": "integer",
         "minimum": 1,
         "maximum": 9007199254740991
       },
       "endLine": {
-        "description": "1-based line to stop reading at (inclusive)",
+        "description": "1-based line or directory entry to stop reading at (inclusive)",
         "type": "integer",
         "minimum": 1,
         "maximum": 9007199254740991
       },
       "limit": {
-        "description": "Max lines to return (default: 2000)",
+        "description": "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
         "type": "integer",
         "minimum": 1,
         "maximum": 9007199254740991
       },
       "offset": {
-        "description": "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+        "description": "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
         "type": "integer",
         "minimum": 1,
         "maximum": 9007199254740991
@@ -199,7 +199,7 @@
     "required": [
       "filePath"
     ],
-    "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n"
+    "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n"
   },
   "write": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -1801,15 +1801,56 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
     entries.sort();
 
+    // Hosts normalize ranges to snake_case; accept the public aliases too for
+    // direct protocol callers. Positions address the sorted, bounded listing.
+    let number = |key: &str| {
+        req.params.get(key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.parse::<u64>().ok())
+        })
+    };
+    let start = number("start_line")
+        .or_else(|| number("startLine"))
+        .or_else(|| number("offset"))
+        .unwrap_or(1)
+        .max(1);
+    let requested_limit = number("limit").unwrap_or(MAX_DIRECTORY_ENTRIES as u64);
+    let limit = requested_limit.min(MAX_DIRECTORY_ENTRIES as u64) as usize;
+    let end = number("end_line").or_else(|| number("endLine"));
+    let count = end
+        .map(|end| {
+            end.saturating_sub(start.saturating_sub(1))
+                .min(MAX_DIRECTORY_ENTRIES as u64) as usize
+        })
+        .unwrap_or(limit);
     let total = entries.len();
-    let truncated = enumeration_cut || total > MAX_DIRECTORY_ENTRIES;
-    if truncated {
-        entries.truncate(MAX_DIRECTORY_ENTRIES);
-        let shown = entries.len();
+    let skip = start.saturating_sub(1).min(total as u64) as usize;
+    entries = entries.into_iter().skip(skip).take(count).collect();
+    let shown = entries.len();
+    let truncated = enumeration_cut || shown < total;
+    if truncated || start > total as u64 && start > 1 {
         let bound = if enumeration_cut { "at least " } else { "" };
+        let reason = if enumeration_cut {
+            "enumeration cap"
+        } else if start > total as u64 && start > 1 {
+            "offset past end"
+        } else if start > 1 {
+            "offset/limit"
+        } else if end.is_some() {
+            "range"
+        } else if requested_limit < MAX_DIRECTORY_ENTRIES as u64 {
+            "limit"
+        } else {
+            "display cap"
+        };
+        let note = if start > total as u64 && !enumeration_cut && start > 1 {
+            format!("; offset {start} exceeds {total} entries")
+        } else {
+            String::new()
+        };
         entries.push(format!(
-            "\nshown {shown} of {bound}{total} entries ({}; examined {examined} directory entries) · narrow: subdirectory",
-            if enumeration_cut { "enumeration cap" } else { "display cap" }
+            "\nshown {shown} of {bound}{total} entries ({reason}; examined {examined} directory entries{note}) · narrow: offset, limit, subdirectory"
         ));
     }
     Response::success(
@@ -1819,6 +1860,7 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             "complete": !truncated,
             "truncated": truncated,
             "total_entries": total,
+            "entries_shown": shown,
             "total_entries_exact": !enumeration_cut,
             "entries_examined": examined,
             "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),

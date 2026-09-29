@@ -612,7 +612,7 @@ fn test_read_directory_caps_entries_at_one_thousand() {
     assert_eq!(entries[999], "entry_0999.txt");
     assert_eq!(
         entries[1000],
-        "\nshown 1000 of 1005 entries (display cap; examined 1005 directory entries) · narrow: subdirectory"
+        "\nshown 1000 of 1005 entries (display cap; examined 1005 directory entries) · narrow: offset, limit, subdirectory"
     );
 
     let status = aft.shutdown();
@@ -840,4 +840,31 @@ fn test_zoom_supports_csharp_symbols() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn read_directory_pages_through_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..2620 {
+        fs::write(dir.path().join(format!("entry-{n:04}")), "").unwrap();
+    }
+    let mut aft = AftProcess::spawn();
+    for args in [
+        serde_json::json!({"offset": 11, "limit": 10}),
+        serde_json::json!({"offset": "11", "limit": "10"}),
+        serde_json::json!({"start_line": 11, "end_line": 20}),
+    ] {
+        let mut request = args;
+        request["id"] = "directory-window".into();
+        request["command"] = "read".into();
+        request["file"] = serde_json::json!(dir.path());
+        let response = aft.send(&request.to_string());
+        assert_eq!(response["success"], true);
+        assert_eq!(response["entries"].as_array().unwrap().len(), 11);
+        assert_eq!(response["entries"][0], "entry-0010");
+        assert_eq!(response["entries"][9], "entry-0019");
+        assert_eq!(response["entries_shown"], 10);
+        assert_eq!(response["complete"], false);
+    }
+    assert!(aft.shutdown().success());
 }
