@@ -649,6 +649,59 @@ function buildSchema(): Record<string, unknown> {
         description: "External semantic backend configuration for embedding and retrieval.",
       },
 
+      search: {
+        type: "object",
+        properties: {
+          rerank: {
+            type: "object",
+            properties: {
+              backend: {
+                type: "string",
+                enum: ["off", "onnx", "remote", "synapse"],
+                default: "off",
+                description:
+                  "Cross-encoder reranker for the head of aft_search results. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls an HTTP rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
+              },
+              model: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3 or jina-reranker-v1-turbo. User config only.",
+              },
+              endpoint: {
+                type: "string",
+                minLength: 1,
+                description: "URL of the remote rerank endpoint. User config only.",
+              },
+              api_key_env: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Environment variable holding the remote rerank endpoint's API key. User config only.",
+              },
+              top_n: {
+                type: "integer",
+                minimum: 1,
+                default: 20,
+                description:
+                  "How many leading results are reranked (default 20, at most 200). User config only.",
+              },
+              timeout_ms: {
+                type: "integer",
+                minimum: 1,
+                default: 1500,
+                description:
+                  "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only.",
+              },
+            },
+            additionalProperties: false,
+            description: "Optional cross-encoder reranking of aft_search results. Default off.",
+          },
+        },
+        additionalProperties: false,
+        description: "aft_search settings.",
+      },
+
       bridge: {
         type: "object",
         properties: {

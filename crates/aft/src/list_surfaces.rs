@@ -329,6 +329,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "engine-internal interval cut when building L over frozen blocks; the served page's envelope and paging trailer are the search surface's",
     },
     ExclusionEntry {
+        file: "commands/semantic_search/rerank/mod.rs",
+        enclosing_item: "rerank_canonical_head",
+        location_or_primitive: "page take",
+        reason: "re-cuts the served page from the reranked canonical list with the same offset and topK as the block builder; the search surface computes the envelope and paging trailer from that page afterwards",
+    },
+    ExclusionEntry {
         file: "commands/bash_status.rs",
         enclosing_item: "handle",
         location_or_primitive: "bash_status / bash live-tail",

@@ -1,0 +1,7 @@
+{
+  "search": {
+    "rerank": {
+      "backend": "off"
+    }
+  }
+}

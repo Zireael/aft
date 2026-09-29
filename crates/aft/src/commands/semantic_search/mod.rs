@@ -1809,6 +1809,7 @@ fn handle_external_semantic_or_hybrid_search(
         serde_json::json!(ranked.engine_capped),
     );
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 
@@ -2527,6 +2528,16 @@ struct EngineRanking {
     missing_on_disk: usize,
     anchored_admission: (usize, usize),
     exact_disclosures: Vec<String>,
+    /// One short line when a configured reranker was skipped (for example on
+    /// a timeout) and the fused order was kept.
+    rerank_note: Option<String>,
+}
+
+/// Append the reranker's skip note, if any, to the response text.
+fn disclose_rerank_note(note: &Option<String>, text: &mut String) {
+    if let Some(note) = note {
+        text.push_str(&format!("\n\n({note})"));
+    }
 }
 
 /// Report page entries that were dropped because their file is not on disk,
@@ -3207,6 +3218,22 @@ fn run_engine_ranking(
             .cloned()
             .collect();
     }
+    // Optional cross-encoder rerank of the head of the first canonical block
+    // (off unless `search.rerank` selects a backend). The first request for a
+    // list commits the order (or the decision to skip) and later pages of the
+    // same list reuse it. It re-cuts the page itself, before anything reads
+    // the page.
+    let rerank_note = rerank::rerank_canonical_head(
+        &mut page.reply,
+        page_request.offset(),
+        page_request.top_k(),
+        rerank::RerankRequest {
+            search: &ctx.config().search,
+            project_root,
+            prose: Some(query),
+            path_scope: path_scope.as_ref(),
+        },
+    )?;
     // Backstop against a stale index (for example a borrowed snapshot that
     // still lists another checkout's files): drop page entries whose file is
     // not on disk. Only the returned page is checked, and nothing is re-ranked
@@ -3363,6 +3390,7 @@ fn run_engine_ranking(
         missing_on_disk,
         anchored_admission,
         exact_disclosures,
+        rerank_note,
     })
 }
 
@@ -3494,6 +3522,7 @@ fn handle_engine_only_search(
         extras.insert("note".to_string(), serde_json::json!(disclosure.note));
     }
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     search_response(
@@ -3911,6 +3940,7 @@ fn handle_semantic_or_hybrid_search(
         extras.insert("note".to_string(), serde_json::json!(disclosure));
     }
     disclose_missing_on_disk(engine_ranking.missing_on_disk, &mut text, &mut extras);
+    disclose_rerank_note(&engine_ranking.rerank_note, &mut text);
     disclose_anchored_admission(engine_ranking.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&engine_ranking.exact_disclosures, &mut text, &mut extras);
 
@@ -4046,6 +4076,7 @@ fn zero_result_escalation_response(
     );
     extras.insert("escalation_target".to_string(), serde_json::json!("hybrid"));
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
@@ -4227,6 +4258,7 @@ fn semantic_unavailable_or_fallback_response(
         );
         extras.insert("structuredContent".to_string(), ranked.structured_content);
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+        disclose_rerank_note(&ranked.rerank_note, &mut text);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
         disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
 

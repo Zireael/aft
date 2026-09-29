@@ -469,6 +469,56 @@ impl Default for WorktreeConfig {
 
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
+/// Which reranker, if any, reorders the head of `aft_search` results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankBackendKind {
+    Off,
+    Onnx,
+    Remote,
+    Synapse,
+}
+
+impl RerankBackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Onnx => "onnx",
+            Self::Remote => "remote",
+            Self::Synapse => "synapse",
+        }
+    }
+}
+
+/// The `search.rerank` block exactly as the tiers supplied it. Only parsing
+/// and the user/project trust boundary happen in config resolution; defaults,
+/// clamps and the reranked depth are decided by the search engine, so a change
+/// to them is a ranking change measured by the search-quality gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<RerankBackendKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Search settings outside the semantic embedding backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankConfig>,
+}
+
 impl Config {
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
@@ -598,6 +648,8 @@ pub struct Config {
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
     pub semantic: SemanticBackendConfig,
+    /// `search.*` settings; today only the optional reranker.
+    pub search: SearchConfig,
     pub inspect: InspectConfig,
     pub backup: BackupConfig,
     /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
@@ -698,6 +750,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
+            search: SearchConfig::default(),
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
             worktree: WorktreeConfig::default(),

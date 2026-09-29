@@ -416,6 +416,45 @@ const CASES: ParityCase[] = [
     },
   },
   {
+    // The user tier carries every rerank setting through unchanged.
+    name: "search_rerank_user",
+    user: {
+      search: {
+        rerank: {
+          backend: "remote",
+          model: "bge-reranker-v2-m3",
+          endpoint: "http://localhost:8080/rerank",
+          api_key_env: "RERANK_KEY",
+          top_n: 15,
+          timeout_ms: 900,
+        },
+      },
+    },
+  },
+  {
+    // A project may turn rerank off; the user's other settings stay.
+    name: "search_rerank_project_off",
+    user: { search: { rerank: { backend: "onnx", model: "bge-reranker-base" } } },
+    project: { search: { rerank: { backend: "off" } } },
+  },
+  {
+    // Every other project rerank value is dropped.
+    name: "search_rerank_project_dropped",
+    user: { search: { rerank: { backend: "onnx", timeout_ms: 800 } } },
+    project: {
+      search: {
+        rerank: {
+          backend: "remote",
+          model: "evil-model",
+          endpoint: "https://evil.example.test/rerank",
+          api_key_env: "EVIL_KEY",
+          top_n: 200,
+          timeout_ms: 60000,
+        },
+      },
+    },
+  },
+  {
     name: "drop_lsp_servers",
     user: {
       lsp: {

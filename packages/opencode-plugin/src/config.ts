@@ -174,6 +174,35 @@ const SemanticConfigSchema = z.object({
   max_files: z.number().int().positive().optional(),
 });
 
+const RerankConfigSchema = z.object({
+  /**
+   * Reranker for the head of aft_search results: "off" (default), "onnx"
+   * (local ONNX Runtime), "remote" (an HTTP rerank endpoint) or "synapse".
+   * A project config may only set "off".
+   */
+  backend: z.enum(["off", "onnx", "remote", "synapse"]).optional(),
+  /**
+   * Reranker model. For "onnx": bge-reranker-base (default),
+   * bge-reranker-v2-m3 or jina-reranker-v1-turbo.
+   */
+  model: z.string().trim().min(1).optional(),
+  /** URL of the "remote" rerank endpoint. User config only. */
+  endpoint: z.string().trim().min(1).optional(),
+  /** Environment variable holding the "remote" endpoint's API key. User config only. */
+  api_key_env: z.string().trim().min(1).optional(),
+  /** How many leading results are reranked (default 20). */
+  top_n: z.number().int().positive().optional(),
+  /** Reranking budget per search in milliseconds (default 1500). */
+  timeout_ms: z.number().int().positive().optional(),
+});
+
+const SearchConfigSchema = z.object({
+  /** Optional cross-encoder reranking of aft_search results. Default off. */
+  rerank: RerankConfigSchema.optional(),
+});
+
+type RerankConfig = z.infer<typeof RerankConfigSchema>;
+
 const LspExtensionSchema = z
   .string()
   .trim()
@@ -587,6 +616,8 @@ const AftConfigFieldsSchema = z.object({
   url_fetch_allow_private: z.boolean().optional(),
   /** External semantic backend configuration for embedding and retrieval. */
   semantic: SemanticConfigSchema.optional(),
+  /** aft_search settings; a project config may only turn reranking off. */
+  search: SearchConfigSchema.optional(),
   /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
   auto_update: z.boolean().optional(),
   /** Per-bridge transport timeout and stalled-connection handling; user-only across the shared pool. */
@@ -851,6 +882,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  const rerank = definedEntries(config.search?.rerank);
+  if (rerank !== undefined) overrides.search = { rerank };
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
@@ -1851,7 +1884,36 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
+  stripped.push(...projectRerankStrippedKeys(override.search?.rerank));
   return stripped;
+}
+
+/** Project rerank keys that are ignored: everything except `backend: "off"`. */
+function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
+  if (rerank === undefined) return [];
+  const stripped: string[] = [];
+  if (rerank.backend !== undefined && rerank.backend !== "off")
+    stripped.push("search.rerank.backend");
+  for (const key of ["model", "endpoint", "api_key_env", "top_n", "timeout_ms"] as const) {
+    if (rerank[key] !== undefined) stripped.push(`search.rerank.${key}`);
+  }
+  return stripped;
+}
+
+/** A project may set `search.rerank.backend: "off"` and nothing else. */
+function mergeProjectSearchConfig(
+  base: AftConfig["search"],
+  project: AftConfig["search"],
+): AftConfig["search"] {
+  if (project?.rerank?.backend !== "off") return base;
+  return { ...base, rerank: { ...base?.rerank, backend: "off" } };
+}
+
+/** A copy of `value` without its undefined entries, or undefined when none are left. */
+function definedEntries<T extends object>(value: T | undefined): Partial<T> | undefined {
+  if (value === undefined) return undefined;
+  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
+  return entries.length > 0 ? (Object.fromEntries(entries) as Partial<T>) : undefined;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
@@ -1868,6 +1930,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
@@ -1906,6 +1969,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
     semantic,
+    // Same for search: only the project-safe rerank disable is merged.
+    search,
     ...(bridge !== undefined ? { bridge } : {}),
     ...(indexes !== undefined ? { indexes } : {}),
     // Union — both levels contribute to the disabled set

@@ -179,6 +179,29 @@ export interface SemanticConfig {
   max_files?: number;
 }
 
+export interface RerankConfig {
+  /**
+   * Reranker for the head of aft_search results: "off" (default), "onnx",
+   * "remote" or "synapse". A project config may only set "off".
+   */
+  backend?: "off" | "onnx" | "remote" | "synapse";
+  /** For "onnx": bge-reranker-base (default), bge-reranker-v2-m3 or jina-reranker-v1-turbo. */
+  model?: string;
+  /** URL of the "remote" rerank endpoint. User config only. */
+  endpoint?: string;
+  /** Environment variable holding the "remote" endpoint's API key. User config only. */
+  api_key_env?: string;
+  /** How many leading results are reranked (default 20). */
+  top_n?: number;
+  /** Reranking budget per search in milliseconds (default 1500). */
+  timeout_ms?: number;
+}
+
+export interface SearchConfig {
+  /** Optional cross-encoder reranking of aft_search results. Default off. */
+  rerank?: RerankConfig;
+}
+
 export interface LspServerConfig {
   id: string;
   /** Omitted when overriding a built-in server to inherit its extensions. */
@@ -429,6 +452,8 @@ export interface AftConfig {
   lsp?: LspConfig;
   url_fetch_allow_private?: boolean;
   semantic?: SemanticConfig;
+  /** aft_search settings; a project config may only turn reranking off. */
+  search?: SearchConfig;
   bridge?: BridgeConfig;
   subc?: SubcConfig;
   github?: GithubConfig;
@@ -665,6 +690,19 @@ const SemanticConfigSchema = z.object({
   max_batch_size: z.number().int().positive().optional(),
   max_input_tokens: z.number().int().positive().optional(),
   max_files: z.number().int().positive().optional(),
+});
+
+const RerankConfigSchema = z.object({
+  backend: z.enum(["off", "onnx", "remote", "synapse"]).optional(),
+  model: z.string().trim().min(1).optional(),
+  endpoint: z.string().trim().min(1).optional(),
+  api_key_env: z.string().trim().min(1).optional(),
+  top_n: z.number().int().positive().optional(),
+  timeout_ms: z.number().int().positive().optional(),
+});
+
+const SearchConfigSchema = z.object({
+  rerank: RerankConfigSchema.optional(),
 });
 
 const LspExtensionSchema = z
@@ -937,6 +975,7 @@ const AftConfigFieldsSchema = z.object({
   lsp: LspConfigSchema.optional(),
   url_fetch_allow_private: z.boolean().optional(),
   semantic: SemanticConfigSchema.optional(),
+  search: SearchConfigSchema.optional(),
   bridge: BridgeConfigSchema.optional(),
   subc: SubcConfigSchema.optional(),
   github: GithubConfigSchema.optional(),
@@ -1097,6 +1136,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  const rerank = definedEntries(config.search?.rerank);
+  if (rerank !== undefined) overrides.search = { rerank };
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
@@ -1858,7 +1899,36 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
+  stripped.push(...projectRerankStrippedKeys(override.search?.rerank));
   return stripped;
+}
+
+/** Project rerank keys that are ignored: everything except `backend: "off"`. */
+function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
+  if (rerank === undefined) return [];
+  const stripped: string[] = [];
+  if (rerank.backend !== undefined && rerank.backend !== "off")
+    stripped.push("search.rerank.backend");
+  for (const key of ["model", "endpoint", "api_key_env", "top_n", "timeout_ms"] as const) {
+    if (rerank[key] !== undefined) stripped.push(`search.rerank.${key}`);
+  }
+  return stripped;
+}
+
+/** A project may set `search.rerank.backend: "off"` and nothing else. */
+function mergeProjectSearchConfig(
+  base: SearchConfig | undefined,
+  project: SearchConfig | undefined,
+): SearchConfig | undefined {
+  if (project?.rerank?.backend !== "off") return base;
+  return { ...base, rerank: { ...base?.rerank, backend: "off" } };
+}
+
+/** A copy of `value` without its undefined entries, or undefined when none are left. */
+function definedEntries<T extends object>(value: T | undefined): Partial<T> | undefined {
+  if (value === undefined) return undefined;
+  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
+  return entries.length > 0 ? (Object.fromEntries(entries) as Partial<T>) : undefined;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
@@ -1873,6 +1943,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
@@ -1909,6 +1980,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(pi !== undefined ? { pi } : {}),
     experimental,
     semantic,
+    // Only the project-safe rerank disable is merged.
+    search,
     ...(bridge !== undefined ? { bridge } : {}),
     ...(indexes !== undefined ? { indexes } : {}),
     ...(disabledTools !== undefined ? { disabled_tools: disabledTools } : {}),

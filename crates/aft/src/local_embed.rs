@@ -64,11 +64,11 @@ enum CgroupCpuQuota {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IntraThreadDerivation {
-    threads: usize,
-    source: &'static str,
-    available_parallelism: usize,
-    quota_threads: Option<usize>,
+pub(crate) struct IntraThreadDerivation {
+    pub(crate) threads: usize,
+    pub(crate) source: &'static str,
+    pub(crate) available_parallelism: usize,
+    pub(crate) quota_threads: Option<usize>,
 }
 
 fn quota_threads(quota: u64, period: u64) -> Option<usize> {
@@ -170,7 +170,7 @@ fn read_first(paths: &[&str]) -> Option<String> {
         .find_map(|path| std::fs::read_to_string(path).ok())
 }
 
-fn intra_thread_derivation() -> IntraThreadDerivation {
+pub(crate) fn intra_thread_derivation() -> IntraThreadDerivation {
     let available_parallelism = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1);

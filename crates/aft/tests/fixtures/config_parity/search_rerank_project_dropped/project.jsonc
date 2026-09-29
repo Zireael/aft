@@ -1,0 +1,12 @@
+{
+  "search": {
+    "rerank": {
+      "backend": "remote",
+      "model": "evil-model",
+      "endpoint": "https://evil.example.test/rerank",
+      "api_key_env": "EVIL_KEY",
+      "top_n": 200,
+      "timeout_ms": 60000
+    }
+  }
+}

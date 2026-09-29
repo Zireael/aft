@@ -824,6 +824,9 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("semantic.max_input_tokens", semantic.max_input_tokens);
     later!("semantic.max_files", semantic.max_files);
     later!("subc.connection_file", semantic.subc_connection_file);
+    // Search reranking is read per request, so a change applies to the next
+    // search.
+    live!("search.rerank", search.rerank);
     // Integrations.
     later!("github.shim", github.shim);
     later!("github.read", github.read);
@@ -884,6 +887,7 @@ fn classification_is_exhaustive(config: &Config) {
         bash,
         sandbox,
         semantic,
+        search: _,
         inspect,
         backup,
         worktree: _,
