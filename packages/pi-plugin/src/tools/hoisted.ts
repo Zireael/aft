@@ -284,9 +284,21 @@ const ReadParams = Type.Object({
   path: Type.String({
     description: "Path to the file or directory to read (absolute or relative to project root)",
   }),
-  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line or directory entry to start reading from"),
-  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line or directory entry to stop reading at (inclusive)"),
-  limit: optionalInt(1, Number.MAX_SAFE_INTEGER, "Max lines (default: 2000) or directory entries (default and cap: 1000) to return"),
+  startLine: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based line or directory entry to start reading from",
+  ),
+  endLine: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based line or directory entry to stop reading at (inclusive)",
+  ),
+  limit: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+  ),
   offset: optionalInt(
     1,
     Number.MAX_SAFE_INTEGER,

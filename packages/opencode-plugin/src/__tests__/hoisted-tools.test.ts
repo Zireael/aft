@@ -292,7 +292,10 @@ describe("Hoisted tool execute handlers", () => {
     };
     const artifactPath = resolve(tmpDir, "../bash-task.stdout");
     const { calls, tools } = createMockHoistedHarness(
-      () => ({ success: true, text: "1: full bash output\n" }),
+      (command) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: true }
+          : { success: true, text: "1: full bash output\n" },
       { restrict_to_project_root: true } as PluginContext["config"],
     );
 
@@ -300,8 +303,12 @@ describe("Hoisted tool execute handlers", () => {
 
     expect(text(result)).toContain("full bash output");
     expect(askCalls.map((call) => call.permission)).toEqual(["read"]);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
+      command: "bash_artifact_owned",
+      params: { path: artifactPath },
+    });
+    expect(calls[1]).toMatchObject({
       command: "read",
       params: { filePath: artifactPath },
     });
