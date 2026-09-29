@@ -503,6 +503,8 @@ fn main() {
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
                 runtime.note_request();
+                // Keep the query snapshot/gaps pinned through standalone finalization.
+                let _request_pin = runtime.pin_config();
                 let gates_on_validation = offloads_full_validation(&req, runtime);
                 let dispatch_result = if req.command == "cancel_request" {
                     Ok(DispatchOutcome::Immediate(handle_cancel_request(
@@ -1127,7 +1129,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let _config_pin = ctx.pin_config();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
-    let response = dispatch_command(req, ctx);
+    let mut response = dispatch_command(req, ctx);
+    aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
     // Every mutation this request made is on disk now; record what it left so
     // a later undo can tell AFT's own result from a change made outside AFT.
     ctx.backup().lock().record_post_mutation_states();

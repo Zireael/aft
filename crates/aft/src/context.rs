@@ -55,6 +55,11 @@ thread_local! {
 }
 
 thread_local! {
+    static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// Set while this thread runs a closure under the configuration write
     /// lock (`update_config`). Reading the configuration there would wait on
     /// that same lock forever, so the read path panics instead.
@@ -122,6 +127,11 @@ pub struct ConfigPinGuard {
 impl Drop for ConfigPinGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+                outcomes
+                    .borrow_mut()
+                    .retain(|(pinned_key, _)| *pinned_key != key)
+            });
             CONFIG_PINS.with(|pins| {
                 pins.borrow_mut()
                     .retain(|(pinned_key, _)| *pinned_key != key)
@@ -2772,6 +2782,7 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
@@ -3293,6 +3304,7 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
@@ -5200,6 +5212,9 @@ impl AppContext {
             pins.push((key, snapshot));
             true
         });
+        if pushed {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| outcomes.borrow_mut().push((key, None)));
+        }
         ConfigPinGuard {
             key: pushed.then_some(key),
             _not_send: std::marker::PhantomData,
@@ -5600,6 +5615,10 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        *self
+            .checkout_query_runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self
             .view_runtime
             .write()
@@ -6279,8 +6298,77 @@ impl AppContext {
         *guard = None;
     }
 
+    /// True only after explicit per-checkout activation, never from defaults.
+    pub fn checkout_query_runtime_active(&self) -> bool {
+        self.checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Activates a supplied, already loaded checkout runtime for this root.
+    /// Nothing calls this from legacy configure; defaults remain unchanged.
+    pub fn install_checkout_query_runtime(
+        &self,
+        runtime: Arc<crate::views::query_wait::CheckoutQueryRuntime>,
+    ) {
+        *self
+            .checkout_query_runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(runtime);
+    }
+
+    /// The one final post-wait outcome pinned by this request, including gaps.
+    pub fn checkout_query_outcome(&self) -> Option<crate::views::contracts::WaitOutcome> {
+        CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+            outcomes
+                .borrow()
+                .iter()
+                .find(|(key, _)| *key == self.config_pin_key())
+                .and_then(|(_, outcome)| outcome.clone())
+        })
+    }
+
+    fn wait_checkout_query(
+        &self,
+        runtime: &crate::views::query_wait::CheckoutQueryRuntime,
+        wait: Duration,
+    ) -> crate::views::contracts::WaitOutcome {
+        if !wait.is_zero() {
+            if let Some(outcome) = self.checkout_query_outcome() {
+                return outcome;
+            }
+        }
+        let outcome = runtime.waiter.wait_for(
+            &runtime.access,
+            crate::blob_store::v2::FamilyPlane::Callgraph,
+            wait,
+        );
+        if !wait.is_zero() {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+                if let Some((_, slot)) = outcomes
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|(key, _)| *key == self.config_pin_key())
+                {
+                    *slot = Some(outcome.clone());
+                }
+            });
+        }
+        outcome
+    }
+
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(callgraph_build_wait_window())
+        let active = self
+            .checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        self.callgraph_store_for_ops_with_wait(if active {
+            crate::views::contracts::CALLGRAPH_QUERY_WAIT
+        } else {
+            callgraph_build_wait_window()
+        })
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
@@ -6304,6 +6392,22 @@ impl AppContext {
         // A disabled index never starts: refuse before any open or cold build.
         if !self.config().indexes.callgraph {
             return CallgraphStoreAccess::Off;
+        }
+        let checkout = self
+            .checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(runtime) = checkout {
+            let outcome = self.wait_checkout_query(&runtime, wait);
+            let snapshot = match &outcome {
+                crate::views::contracts::WaitOutcome::Installed(snapshot)
+                | crate::views::contracts::WaitOutcome::TimedOut { snapshot, .. } => snapshot,
+            };
+            return match runtime.callgraph.reader(&runtime.access, snapshot) {
+                Ok(reader) => CallgraphStoreAccess::Ready(Arc::clone(&reader.store)),
+                Err(_) => CallgraphStoreAccess::Building,
+            };
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
             if let Some(view) = self.pinned_view_runtime() {

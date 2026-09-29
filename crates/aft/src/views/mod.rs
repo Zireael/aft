@@ -83,6 +83,14 @@ pub(crate) fn generation_matches_head(generation: &str, head_fingerprint: &str) 
     !head_fingerprint.is_empty() && generation.ends_with(head_fingerprint)
 }
 
+pub fn callgraph_paths_match_v2(
+    manifest: &manifest_v2::ManifestV2,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<bool> {
+    read::callgraph_paths_match_v2(manifest, root, paths)
+}
+
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {
         view_dir: view_dir.to_path_buf(),

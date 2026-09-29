@@ -564,6 +564,7 @@ pub fn run_tool_call(
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
             if response.success && response.data.get("backup_skipped_reason").is_none() {
                 let session = ctx
                     .session_id

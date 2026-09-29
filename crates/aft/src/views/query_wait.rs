@@ -40,3 +40,25 @@ impl QueryWait for BoundedQueryWait {
         }
     }
 }
+
+/// Explicit opt-in binding for a checkout's query runtime. Configuring the
+/// legacy runtime never constructs this value; cutover supplies it per root.
+pub struct CheckoutQueryRuntime {
+    pub access: ViewAccess,
+    pub waiter: Arc<dyn QueryWait>,
+    pub callgraph: Arc<super::callgraph::CallgraphPlane>,
+}
+
+impl CheckoutQueryRuntime {
+    pub fn new(
+        access: ViewAccess,
+        state: Arc<dyn QueryState>,
+        callgraph: Arc<super::callgraph::CallgraphPlane>,
+    ) -> Self {
+        Self {
+            access,
+            waiter: Arc::new(BoundedQueryWait::new(state)),
+            callgraph,
+        }
+    }
+}

@@ -26,6 +26,32 @@ pub(crate) fn callgraph_paths_match(
     root: &std::path::Path,
     paths: &[PathBuf],
 ) -> super::Result<bool> {
+    callgraph_paths_match_with_producer(
+        manifest,
+        root,
+        paths,
+        crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
+    )
+}
+
+/// Content verification for an opted-in ruled callgraph generation. Legacy
+/// payload keys are intentionally incompatible with its dispatch-hint producer.
+pub fn callgraph_paths_match_v2(
+    manifest: &super::manifest_v2::ManifestV2,
+    root: &std::path::Path,
+    paths: &[PathBuf],
+) -> super::Result<bool> {
+    let projected = super::callgraph::project_manifest(manifest)
+        .map_err(|error| super::ViewError::InvalidManifest(error.to_string()))?;
+    callgraph_paths_match_with_producer(&projected, root, paths, super::callgraph::PRODUCER)
+}
+
+fn callgraph_paths_match_with_producer(
+    manifest: &super::Manifest,
+    root: &std::path::Path,
+    paths: &[PathBuf],
+    producer: &str,
+) -> super::Result<bool> {
     for path in paths {
         let Ok(relative) = path.strip_prefix(root) else {
             return Ok(false);
@@ -53,7 +79,7 @@ pub(crate) fn callgraph_paths_match(
         // still be scanned, but they cannot change this published graph.
         let Some(entry) = entry else { continue };
         if let super::ManifestEntry::Regular { planes, .. } = entry {
-            let current = crate::blob_store::CallgraphKey::for_current(&source, language)
+            let current = crate::blob_store::CallgraphKey::from_bytes(&source, language, producer)
                 .full_key()
                 .to_hex();
             if planes.callgraph.as_deref() != Some(current.as_str()) {
@@ -92,4 +118,50 @@ pub fn open_foreign_generation(
             Some(super::snapshot::Residency::Protected(protected)),
         ),
     )))
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+    #[test]
+    fn ruled_callgraph_content_match_accepts_unchanged_and_rejects_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let absolute = root.path().join("file.rs");
+        let bytes = b"fn target() {}";
+        std::fs::write(&absolute, bytes).unwrap();
+        let mut entry = super::super::snapshot::LiveEntry::new(
+            super::super::snapshot::DiskState::of_bytes(bytes),
+            0,
+        );
+        let attachment = super::super::callgraph::attach(&mut entry, bytes, "rust").unwrap();
+        let mut manifest =
+            super::super::manifest_v2::ManifestV2::new(super::super::manifest_v2::ManifestHeader {
+                producers: super::super::manifest_v2::Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            });
+        manifest
+            .insert(
+                super::super::RelPath::new(b"file.rs".to_vec()).unwrap(),
+                super::super::manifest_v2::EntryV2::regular(
+                    crate::blob_store::v2::ContentHash::of(bytes),
+                    bytes.len() as u64,
+                    super::super::manifest_v2::EntryPlanes {
+                        callgraph: Some(super::super::readiness::PlaneState::ready(
+                            &attachment.key,
+                        )),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(callgraph_paths_match_v2(&manifest, root.path(), &[absolute.clone()]).unwrap());
+        std::fs::write(&absolute, b"fn changed() {}").unwrap();
+        assert!(!callgraph_paths_match_v2(&manifest, root.path(), &[absolute]).unwrap());
+    }
 }

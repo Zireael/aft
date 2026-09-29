@@ -702,6 +702,7 @@ pub trait CompositePlane: Send + Sync {
         owner: &super::registry::ViewRegistration,
         generation: &str,
         snapshot: &Snapshot,
+        observed: &BTreeMap<RelPath, LiveEntry>,
         manifest: &mut super::manifest_v2::ManifestV2,
         live: &mut crate::pins::LivePin,
         seed_derived: bool,
@@ -728,6 +729,7 @@ struct InstalledCheckout {
     revision: u64,
     snapshot: Snapshot,
     prepared_generation: Option<String>,
+    uncertain_paths: std::collections::BTreeSet<std::path::PathBuf>,
     own_installed: bool,
 }
 
@@ -741,6 +743,7 @@ pub struct CheckoutDriver {
     walker: Arc<dyn MembershipWalker>,
     planes: Vec<Arc<dyn CompositePlane>>,
     adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
+    observed: std::sync::Mutex<BTreeMap<RelPath, LiveEntry>>,
     installed: std::sync::Mutex<InstalledCheckout>,
 }
 
@@ -768,10 +771,12 @@ impl CheckoutDriver {
             walker,
             planes,
             adapters: Vec::new(),
+            observed: std::sync::Mutex::new(BTreeMap::new()),
             installed: std::sync::Mutex::new(InstalledCheckout {
                 revision: 0,
                 snapshot: delta.snapshot(),
                 prepared_generation: None,
+                uncertain_paths: std::collections::BTreeSet::new(),
                 own_installed: false,
             }),
         }
@@ -858,6 +863,10 @@ impl FirstLoadDriver for CheckoutDriver {
             }
             entries.insert(path, entry);
         }
+        *self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = entries.clone();
         Ok(ReconciledCheckout { revision, entries })
     }
     fn install(
@@ -879,12 +888,15 @@ impl FirstLoadDriver for CheckoutDriver {
         let own_installed =
             installed.prepared_generation.as_deref() == Some(snapshot.generation().name());
         for adapter in &self.adapters {
-            if adapter.plane() != FamilyPlane::Callgraph || own_installed {
+            if snapshot.generation().name() != "empty"
+                && (adapter.plane() != FamilyPlane::Callgraph || own_installed)
+            {
                 adapter.open_generation(access, snapshot.generation())?;
             }
         }
         let old_name = installed.snapshot.generation().name().to_owned();
         installed.snapshot = snapshot.clone();
+        installed.uncertain_paths.clear();
         installed.own_installed = own_installed;
         if old_name != snapshot.generation().name() {
             for adapter in &self.adapters {
@@ -944,11 +956,17 @@ impl FirstLoadDriver for CheckoutDriver {
             live.protect_segment(&segment)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
         }
+        let observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         for plane in &self.planes {
             plane.materialize(
                 &self.owner,
                 &assembly_name,
                 snapshot,
+                &observed,
                 &mut manifest,
                 &mut live,
                 seed_derived,
@@ -1049,7 +1067,7 @@ impl QueryState for CheckoutDriver {
                 gaps.insert(path.clone());
             }
         }
-        let paths = gaps
+        let mut paths: Vec<_> = gaps
             .into_iter()
             .map(|path| {
                 #[cfg(unix)]
@@ -1063,6 +1081,9 @@ impl QueryState for CheckoutDriver {
                 self.owner.root().join(relative)
             })
             .collect();
+        paths.extend(installed.uncertain_paths.iter().cloned());
+        paths.sort();
+        paths.dedup();
         (snapshot, paths)
     }
 }
@@ -1107,6 +1128,7 @@ mod composite_tests {
             owner: &super::super::registry::ViewRegistration,
             _: &str,
             snapshot: &Snapshot,
+            _observed: &BTreeMap<RelPath, LiveEntry>,
             manifest: &mut ManifestV2,
             live: &mut crate::pins::LivePin,
             seed_derived: bool,
@@ -1339,7 +1361,8 @@ impl CompositePlane for CallgraphBridge {
         &self,
         owner: &super::registry::ViewRegistration,
         generation: &str,
-        snapshot: &Snapshot,
+        _snapshot: &Snapshot,
+        observed: &BTreeMap<RelPath, LiveEntry>,
         manifest: &mut super::manifest_v2::ManifestV2,
         live: &mut crate::pins::LivePin,
         seed_derived: bool,
@@ -1354,7 +1377,7 @@ impl CompositePlane for CallgraphBridge {
         let store = owner
             .open_store(FamilyPlane::Callgraph)
             .map_err(|e| error(e.to_string()))?;
-        for (path, entry) in snapshot.live_entries() {
+        for (path, entry) in observed {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
                 continue;
             }
@@ -1511,5 +1534,231 @@ mod callgraph_bridge_tests {
             .installed_state(&access, FamilyPlane::Callgraph)
             .1
             .is_empty());
+    }
+}
+
+/// Configured walker membership with traversal errors retained. Source content
+/// reads belong exclusively to CheckoutDriver's strict same-buffer reconciliation.
+pub struct ConfiguredMembershipWalker;
+impl MembershipWalker for ConfiguredMembershipWalker {
+    fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
+        let mut files = Vec::new();
+        for result in crate::search_index::project_walk_builder(root).build() {
+            let item = result
+                .map_err(|error| SiblingLoader::error(format!("{}: {error}", root.display())))?;
+            if let Some(error) = item.error() {
+                return Err(SiblingLoader::error(format!(
+                    "{}: {error}",
+                    item.path().display()
+                )));
+            }
+            if item.file_type().is_some_and(|kind| kind.is_file()) {
+                files.push(item.into_path());
+            }
+        }
+        Ok(files)
+    }
+}
+
+pub struct TrigramBridge {
+    pub adapter: Arc<super::trigram::TrigramAdapter>,
+    policy: crate::blob_store::v2::TrigramPolicy,
+}
+impl TrigramBridge {
+    pub fn new(storage: std::path::PathBuf, policy: crate::blob_store::v2::TrigramPolicy) -> Self {
+        Self {
+            adapter: Arc::new(super::trigram::TrigramAdapter::new(storage, policy)),
+            policy,
+        }
+    }
+}
+impl CompositePlane for TrigramBridge {
+    fn plane(&self) -> FamilyPlane {
+        FamilyPlane::Trigram
+    }
+    fn applies_to(&self, path: &RelPath) -> bool {
+        !path.is_synthetic()
+    }
+    fn attachment(
+        &self,
+        _: &RelPath,
+        bytes: &[u8],
+    ) -> Result<super::snapshot::PlaneAttachment, PlaneError> {
+        Ok(super::live_delta::entry(bytes, &self.policy, 0)
+            .attachments
+            .remove(&FamilyPlane::Trigram)
+            .expect("trigram attachment"))
+    }
+    fn materialize(
+        &self,
+        owner: &super::registry::ViewRegistration,
+        _: &str,
+        _: &Snapshot,
+        observed: &BTreeMap<RelPath, LiveEntry>,
+        manifest: &mut super::manifest_v2::ManifestV2,
+        live: &mut crate::pins::LivePin,
+        _: bool,
+    ) -> Result<(), PlaneError> {
+        let materialized =
+            super::trigram::materialize(owner, owner.root(), manifest, observed, self.policy)?;
+        // Transfer protection while the materializer's pin is still held; the
+        // composite live pin survives publication and verified reader admission.
+        live.protect(&manifest.ready_keys().collect::<Vec<_>>())
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        live.protect_segment(&materialized.segment)
+            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        drop(materialized);
+        Ok(())
+    }
+    fn finish_generation(
+        &self,
+        _: &super::registry::ViewRegistration,
+        _: &str,
+        _: &str,
+    ) -> Result<(), PlaneError> {
+        Ok(())
+    }
+}
+
+impl CheckoutDriver {
+    /// Subscribe before serving the first snapshot. Weak writer registration
+    /// stops notifying this checkout automatically when its driver is dropped.
+    pub fn register_write_intent(self: &Arc<Self>) {
+        let listener: Arc<dyn super::intent::WriteIntentListener> = self.clone();
+        super::intent::register_listener(&listener);
+    }
+}
+impl super::intent::WriteIntentListener for CheckoutDriver {
+    fn record_change(&self, change: &super::intent::WriteIntent, _: super::intent::WritePhase) {
+        match change {
+            super::intent::WriteIntent::Paths(paths) => {
+                for absolute in paths {
+                    if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
+                        if let Ok(path) = RelPath::from_os_path(relative) {
+                            self.record_change(path);
+                        }
+                    }
+                }
+            }
+            super::intent::WriteIntent::Directory(absolute) => {
+                if !absolute.starts_with(self.owner.root()) {
+                    return;
+                }
+                {
+                    let mut installed = self
+                        .installed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    installed.revision += 1;
+                    installed.uncertain_paths.insert(absolute.clone());
+                }
+                let snapshot = self
+                    .installed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .snapshot
+                    .clone();
+                for path in snapshot.membership().into_keys() {
+                    self.record_change(path);
+                }
+                // A directory write can create previously unknown members. Keep
+                // an explicit subtree intent even when the previous view was empty.
+                if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
+                    if let Ok(path) = RelPath::from_os_path(relative) {
+                        self.record_change(path);
+                    } else {
+                        let mut installed = self
+                            .installed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        installed.revision += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod integrated_plane_tests {
+    use super::super::contracts::{PlaneAdapter, PlaneLoader};
+    use super::*;
+    #[test]
+    fn acknowledged_shared_write_keeps_all_planes_unready_until_revision_install() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let absolute = root.path().join("file.rs");
+        std::fs::write(&absolute, b"fn before() {}\n").unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let owner = registry.register_view("local", root.path()).unwrap();
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let trigram = Arc::new(TrigramBridge::new(storage.path().to_path_buf(), policy));
+        let callgraph = Arc::new(CallgraphBridge::default());
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: None,
+                    callgraph: super::super::callgraph::PRODUCER.into(),
+                },
+                None,
+                Arc::new(ConfiguredMembershipWalker),
+                vec![trigram.clone(), callgraph.clone()],
+            )
+            .with_adapters(vec![trigram.adapter.clone(), callgraph.adapter.clone()]),
+        );
+        driver.register_write_intent();
+        let access = ViewAccess::Owner(owner);
+        let loader = SiblingLoader::new(
+            driver.clone(),
+            vec![trigram.adapter.clone(), callgraph.adapter.clone()],
+        );
+        let initial = loader.load(&access).unwrap();
+        assert!(initial.pending_planes.is_empty());
+        for plane in [FamilyPlane::Trigram, FamilyPlane::Callgraph] {
+            assert!(driver.installed_state(&access, plane).1.is_empty());
+        }
+        let revision = driver.revision(&access);
+        {
+            let _intent = super::super::intent::record_paths([absolute.as_path()]);
+            assert!(driver.revision(&access) > revision);
+            for plane in [FamilyPlane::Trigram, FamilyPlane::Callgraph] {
+                assert_eq!(
+                    driver.installed_state(&access, plane).1,
+                    vec![absolute.clone()]
+                );
+            }
+            std::fs::write(&absolute, b"fn after_write() {}\n").unwrap();
+        }
+        assert!(driver.revision(&access) >= revision + 2);
+        for plane in [FamilyPlane::Trigram, FamilyPlane::Callgraph] {
+            assert_eq!(
+                driver.installed_state(&access, plane).1,
+                vec![absolute.clone()]
+            );
+        }
+        let loaded = loader.load(&access).unwrap();
+        assert!(loaded.pending_planes.is_empty());
+        for plane in [FamilyPlane::Trigram, FamilyPlane::Callgraph] {
+            assert!(driver.installed_state(&access, plane).1.is_empty());
+        }
+        let index = trigram
+            .adapter
+            .resident(access.scope(), loaded.snapshot.generation().name())
+            .unwrap();
+        let answer = index.query(root.path(), &loaded.snapshot, "after_write");
+        assert_eq!(answer.matches.len(), 1);
+        assert!(answer.gaps.is_empty());
+        assert_eq!(
+            callgraph.adapter.readiness(&loaded.snapshot),
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0
+            }
+        );
     }
 }
