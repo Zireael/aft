@@ -1,0 +1,32 @@
+{
+  "gate": "engine_unwired",
+  "exit_code": 0,
+  "profile": "paged",
+  "rows_unchanged": 49,
+  "reference_sha256": "d44c54fa235ba7358f728e5df8354eb628c72ee6cdf21ad59f0b9bc6fc294b7b",
+  "score_sha256": "a54f72b87dd0ee1d58169d7eb6a5a6d74f15ebfd76271771cdf01e59500f4670",
+  "real_query_behavior": "equal",
+  "families": {
+    "concept_recall": {
+      "hit_at_1": 0.5384615384615384,
+      "hit_at_5": 0.7692307692307693,
+      "mrr_at_10": 0.6394230769230769
+    },
+    "exact_recall": {
+      "hit_at_1": 1.0,
+      "hit_at_5": 1.0,
+      "mrr_at_10": 1.0
+    },
+    "real_query": {
+      "hit_at_1": 0.12244897959183673,
+      "hit_at_5": 0.3673469387755102,
+      "mrr_at_10": 0.22023809523809523
+    }
+  },
+  "fixture_results": {
+    "harness-goldens": true,
+    "paging": true,
+    "profile-grammar": true
+  },
+  "note": "Full scripts/telemetry/cost-gate.sh --search-quality completed all three benchmark families; initial predicate rejected a descriptor missing its mandatory tool_call_parity fixture declaration. After adding that declaration, reran only the failed predicate against the same untouched score: exit 0. No reference or ranked result was changed."
+}
