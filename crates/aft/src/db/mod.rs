@@ -461,7 +461,7 @@ pub(crate) enum MaintenanceWriteError {
 /// A busy timeout alone cannot give that bound. SQLite's default busy handler
 /// counts its nominal sleeps (1, 2, 5, 10 ... ms) instead of reading the clock,
 /// so when each sleep overshoots, as on a loaded or throttled machine, a
-/// 250 ms timeout held the mutex for one to several seconds (#375).
+/// 250 ms timeout can hold the mutex for one to several seconds.
 ///
 /// `work` must be safe to repeat: a busy attempt has rolled back its
 /// transaction, and the steady busy wait is restored before every release.
