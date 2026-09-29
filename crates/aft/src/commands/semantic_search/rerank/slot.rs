@@ -242,17 +242,68 @@ pub(crate) fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBacke
     }
 }
 
-/// Builds the HTTP rerank backend from `inputs.search.rerank` (endpoint,
-/// api_key_env, model). Until that backend exists this returns an error, so a
-/// configured remote reranker is skipped with this reason.
-fn build_remote(_inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
-    Err("remote backend unavailable".to_string())
+/// Build the HTTP backend from resolved user configuration; no network request
+/// is needed until scoring. Invalid or incomplete configuration leaves NotReady.
+fn build_remote(inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
+    let config = inputs
+        .search
+        .rerank
+        .as_ref()
+        .ok_or("remote rerank configuration is missing")?;
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .ok_or("remote rerank endpoint is required")?;
+    let model = config
+        .model
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or("remote rerank model is required")?;
+    let backend = super::remote::RemoteReranker::new(
+        endpoint,
+        model.clone(),
+        config.api_key_env.clone(),
+        None,
+    )
+    .map_err(|error| error.skip_reason())?;
+    Ok(Some(SelectedBackend {
+        backend: Arc::new(backend),
+        fail_closed: false,
+    }))
 }
 
-/// Builds the Synapse rerank backend from the embedding connection settings
-/// in `inputs.semantic` when `inputs.under_subc` is set; this is where it asks
-/// Synapse which model it serves. Until that backend exists this returns an
-/// error, so a configured Synapse reranker is skipped with this reason.
-fn build_synapse(_inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
-    Err("synapse backend unavailable".to_string())
+/// Discover the served model fingerprint on the build thread and keep it fixed
+/// for the backend's lifetime, so paging never mixes orders from different models.
+/// Failed discovery leaves NotReady rather than installing an unverified model.
+fn build_synapse(inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
+    let config = inputs
+        .search
+        .rerank
+        .as_ref()
+        .ok_or("synapse rerank configuration is missing")?;
+    let model = config
+        .model
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or("synapse rerank model is required")?;
+    let timeout = RerankSettings::resolve(&inputs.search)
+        .timeout
+        .min(Duration::from_secs(5));
+    // Discover the model fingerprint before installation and keep interactive
+    // admission waits short instead of queuing behind bulk inference.
+    let required_fingerprint = None;
+    let max_queue_ms = 100;
+    let backend = super::synapse::SynapseReranker::connect(
+        &inputs.semantic,
+        model.clone(),
+        required_fingerprint,
+        max_queue_ms,
+        inputs.under_subc,
+        std::time::Instant::now() + timeout,
+    )
+    .map_err(|error| error.skip_reason())?;
+    Ok(Some(SelectedBackend {
+        backend: Arc::new(backend),
+        fail_closed: false,
+    }))
 }

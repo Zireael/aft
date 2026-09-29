@@ -239,7 +239,7 @@ fn parse_response(response: &Value, pin: &str, count: usize) -> Result<Vec<f32>,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 
@@ -260,7 +260,7 @@ mod tests {
         )
     }
 
-    fn config(connection_file: std::path::PathBuf) -> SemanticBackendConfig {
+    pub(crate) fn config(connection_file: std::path::PathBuf) -> SemanticBackendConfig {
         SemanticBackendConfig {
             backend: crate::config::SemanticBackend::Synapse,
             model: "embedding".into(),
@@ -278,7 +278,7 @@ mod tests {
         }
     }
 
-    fn fake_daemon(
+    pub(crate) fn fake_daemon(
         responses: Vec<Option<Value>>,
         registered: bool,
     ) -> (
@@ -289,7 +289,7 @@ mod tests {
         fake_daemon_gated(responses, registered, None)
     }
 
-    type ResponseGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    pub(crate) type ResponseGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
     fn connection_fixture() -> (
         tempfile::TempDir,
@@ -324,7 +324,7 @@ mod tests {
         (directory, path, listener, key, daemon_id)
     }
 
-    fn fake_daemon_gated(
+    pub(crate) fn fake_daemon_gated(
         responses: Vec<Option<Value>>,
         registered: bool,
         gate: Option<ResponseGate>,

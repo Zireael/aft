@@ -167,12 +167,12 @@ fn parse_scores(value: &Value, count: usize, tei: bool) -> Result<Vec<f32>, Rera
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    fn serve(
+    pub(crate) fn serve(
         body: &'static str,
         status: u16,
         delay: Duration,

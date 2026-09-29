@@ -18,7 +18,9 @@
 
 pub(crate) mod fixture;
 pub(crate) mod onnx;
+pub(crate) mod remote;
 pub(crate) mod slot;
+pub(crate) mod synapse;
 
 #[cfg(test)]
 mod tests;

@@ -1099,15 +1099,6 @@ mod tests {
     }
 }
 
-// Compile these backends here for standalone testing until
-// commands::semantic_search::rerank connects them to the search pipeline.
-#[path = "commands/semantic_search/rerank/remote.rs"]
-#[allow(dead_code)]
-pub(crate) mod remote;
-#[path = "commands/semantic_search/rerank/synapse.rs"]
-#[allow(dead_code)]
-pub(crate) mod synapse;
-
 /// Uses the embedding transport's daemon connection and management-route identity,
 /// but does not require embedding capabilities or retry an interactive rerank call.
 pub(crate) struct SynapseRerankTransport {

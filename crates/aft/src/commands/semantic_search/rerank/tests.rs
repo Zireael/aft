@@ -606,7 +606,7 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
 }
 
 #[test]
-fn unsupported_backend_choices_fail_their_build_with_a_reason() {
+fn invalid_backend_configuration_fails_build_with_a_reason() {
     let inputs = |rerank: RerankConfig| slot::BuildInputs {
         search: SearchConfig {
             rerank: Some(rerank),
@@ -615,8 +615,14 @@ fn unsupported_backend_choices_fail_their_build_with_a_reason() {
         under_subc: false,
     };
     for (backend, reason) in [
-        (RerankBackendKind::Remote, "remote backend unavailable"),
-        (RerankBackendKind::Synapse, "synapse backend unavailable"),
+        (
+            RerankBackendKind::Remote,
+            "remote rerank endpoint is required",
+        ),
+        (
+            RerankBackendKind::Synapse,
+            "synapse rerank model is required",
+        ),
     ] {
         let built = slot::build_backend(&inputs(RerankConfig {
             backend: Some(backend),
@@ -1143,4 +1149,167 @@ fn real_onnx_model_scores_twenty_pairs_when_available() {
         started.elapsed().as_millis()
     );
     assert_eq!(scores.len(), 20);
+}
+
+#[test]
+fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
+    let (endpoint, server) =
+        remote::tests::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
+    let inputs = slot::BuildInputs {
+        search: SearchConfig {
+            rerank: Some(RerankConfig {
+                backend: Some(RerankBackendKind::Remote),
+                model: Some("served-model".into()),
+                endpoint: Some(format!("tei+{endpoint}")),
+                ..Default::default()
+            }),
+        },
+        semantic: Default::default(),
+        under_subc: false,
+    };
+    let slot = slot::BackendSlot::default();
+    slot.reconcile(inputs.clone());
+    wait_for(|| is_ready(&slot.read(inputs.clone())));
+    let slot::Installed::Ready(selected) = slot.read(inputs.clone()) else {
+        panic!("remote build was not installed")
+    };
+    assert!(!selected.fail_closed);
+    assert_eq!(selected.backend.max_batch(), 20);
+    assert_eq!(selected.backend.fingerprint().model, "served-model");
+    assert_eq!(
+        selected
+            .backend
+            .score(
+                "q",
+                &[RerankDoc { text: "a" }],
+                Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap(),
+        vec![0.7]
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        serde_json::json!({"query":"q","texts":["a"]})
+    );
+    let mut invalid = inputs;
+    invalid.search.rerank.as_mut().unwrap().endpoint = Some("file:///tmp/model".into());
+    slot.reconcile(invalid.clone());
+    wait_for(
+        || matches!(slot.read(invalid.clone()), slot::Installed::NotReady(reason) if reason.contains("HTTP(S) base URL")),
+    );
+    // Turn reranking off after checking the failure reason, so retries for this
+    // invalid endpoint cannot install a backend in the test's slot.
+    let mut off = invalid;
+    off.search.rerank = None;
+    slot.reconcile(off);
+}
+
+#[test]
+fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
+    let (_directory, path, server) = synapse::tests::fake_daemon(
+        vec![
+            Some(
+                serde_json::json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp-slot"]}]}}),
+            ),
+            Some(serde_json::json!({"result":{"fingerprint":"fp-slot","scores":[3.0]}})),
+        ],
+        true,
+    );
+    let inputs = slot::BuildInputs {
+        search: SearchConfig {
+            rerank: Some(RerankConfig {
+                backend: Some(RerankBackendKind::Synapse),
+                model: Some("reranker".into()),
+                ..Default::default()
+            }),
+        },
+        semantic: synapse::tests::config(path),
+        under_subc: true,
+    };
+    let slot = slot::BackendSlot::default();
+    slot.reconcile(inputs.clone());
+    wait_for(|| match slot.read(inputs.clone()) {
+        slot::Installed::Ready(_) => true,
+        slot::Installed::NotReady(reason) => reason != "backend not ready",
+        slot::Installed::Off => false,
+    });
+    let slot::Installed::Ready(selected) = slot.read(inputs.clone()) else {
+        panic!("Synapse build was not installed")
+    };
+    assert!(!selected.fail_closed);
+    assert_eq!(selected.backend.fingerprint().revision, "fp-slot");
+    assert_eq!(
+        selected
+            .backend
+            .score(
+                "q",
+                &[RerankDoc { text: "a" }],
+                Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap(),
+        vec![3.0]
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["method"], "models.list");
+    assert_eq!(requests[1]["params"]["required_fingerprint"], "fp-slot");
+    let (_directory, path, server) = synapse::tests::fake_daemon(
+        vec![Some(serde_json::json!({"result":{"models":[]}}))],
+        true,
+    );
+    let mut invalid = inputs;
+    invalid.semantic = synapse::tests::config(path);
+    slot.reconcile(invalid.clone());
+    wait_for(
+        || matches!(slot.read(invalid.clone()), slot::Installed::NotReady(reason) if reason.contains("does not serve reranker")),
+    );
+    assert_eq!(server.join().unwrap().len(), 1);
+    let mut off = invalid;
+    off.search.rerank = None;
+    slot.reconcile(off);
+}
+
+#[test]
+fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
+    let (_project, ctx) = probe_project(30);
+    let fused = stream(&ctx, 100, 30);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (_directory, path, server) = synapse::tests::fake_daemon_gated(
+        vec![Some(
+            serde_json::json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp-slot"]}]}}),
+        )],
+        true,
+        Some((entered_tx, release_rx)),
+    );
+    ctx.update_config(|config| {
+        config.semantic = synapse::tests::config(path);
+        config.search.rerank = Some(RerankConfig {
+            backend: Some(RerankBackendKind::Synapse),
+            model: Some("reranker".into()),
+            timeout_ms: Some(5000),
+            ..Default::default()
+        });
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let started = Instant::now();
+    let (first, text) = page(&ctx, 10, 0);
+    let (second, _) = page(&ctx, 10, 10);
+    let elapsed = started.elapsed();
+    let pending = matches!(installed_backend(&ctx), slot::Installed::NotReady(_));
+    release_tx.send(()).unwrap();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "search waited for Synapse connect: {elapsed:?}"
+    );
+    assert!(
+        pending,
+        "search should read NotReady while models.list is blocked"
+    );
+    assert!(text.contains("rerank skipped: backend not ready"), "{text}");
+    assert_eq!(first, fused[..10]);
+    assert_eq!(second, fused[10..20]);
+    wait_for(|| is_ready(&installed_backend(&ctx)));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "models.list");
 }

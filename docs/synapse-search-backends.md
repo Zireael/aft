@@ -42,8 +42,12 @@ to use the daemon's catalog and `models.list`, not a local model-file check.
 
 ## Reranker backend integration
 
-The remote and Synapse implementations are backend building blocks; they are
-not yet wired to the search pipeline in this change. The default remains off.
+The remote and Synapse backends are selected through `search.rerank`. Each
+context builds its backend on a separate thread when configuration changes.
+Searches read the installed backend without waiting for construction; while a
+build is pending or fails, they keep the fused order and report the slot's
+reason the backend is not ready. Failed builds retry with bounded backoff.
+The default remains off.
 
 Remote accepts a base endpoint and appends `/rerank`. The default wire format
 sends `model`, `query`, `documents`, and `top_n` equal to the submitted batch
@@ -75,9 +79,12 @@ Synapse scores are finite raw logits, not probabilities. Batches above 20 are
 refused before routing. Connect, catalog, route setup, and scoring share the
 caller's total deadline, with no request retries.
 
-The backends use the shared trait in `commands::semantic_search::rerank`.
-Temporary `remote.rs` and `synapse.rs` module declarations in `synapse_embed.rs`
-compile the backends and their tests without making them selectable by search.
-The search pipeline still needs a builder that constructs backends outside
-interactive requests, using resolved user configuration and the actual
-daemon-mode flag. The config resolver is unchanged here.
+The backends use the shared trait in `commands::semantic_search::rerank` and
+its context-owned backend slot. Remote construction uses the configured endpoint,
+model, and `api_key_env`; its transport batch maximum defaults to 20. Synapse
+construction reuses resolved embedding connection settings and the actual
+daemon-mode flag, requires an explicit rerank model, and discovers the served
+model's fingerprint, which remains fixed for that backend instance.
+The discovery deadline is the configured scoring timeout capped at five seconds;
+the queue budget is 100 ms, further bounded by each scoring deadline. The config
+block has no separate batch, fingerprint, or queue keys.
