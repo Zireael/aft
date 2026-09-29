@@ -23638,6 +23638,7 @@ mod canonicalize_path_tests {
     fn missing_path_shortcut_matches_the_component_walk() {
         let (_dir, root, deep) = deep_fixture();
         std::fs::write(deep.join("file.ts"), "").expect("file");
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![
             deep.join("tsconfig.json"),
             deep.join("missing/also-missing/index.ts"),
