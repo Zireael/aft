@@ -17921,10 +17921,14 @@ fn canonicalize_path(path: &Path) -> PathBuf {
 ///
 /// It returns what that walk returns: canonicalizing an ancestor also resolves
 /// every ancestor above it, so the first ancestor that canonicalizes is the
-/// deepest one the walk would reach. `None` hands paths with `..`, prefixes or
-/// no parent to the walk.
+/// deepest one the walk would reach. `None` hands paths with `..`, relative
+/// paths or no parent to the walk. A Windows drive or verbatim prefix before
+/// the root is allowed, since `canonicalize` returns such paths there.
 fn canonicalize_missing_absolute_path(path: &Path) -> Option<PathBuf> {
-    let mut components = path.components();
+    let mut components = path.components().peekable();
+    if matches!(components.peek(), Some(std::path::Component::Prefix(_))) {
+        components.next();
+    }
     if components.next() != Some(std::path::Component::RootDir) {
         return None;
     }
