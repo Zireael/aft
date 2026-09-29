@@ -242,6 +242,9 @@ const SUBC_DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
  */
 const ROUTE_OPEN_RELOAD_WAIT_CEILING_MS = 45_000;
 
+/** Resolution of the timer a call races its route.open against when its deadline passes first. */
+const CALL_DEADLINE_EXPIRED: unique symbol = Symbol("call deadline expired");
+
 function reloadWaitExhaustedSuffix(callDeadlineMs: number): string {
   if (callDeadlineMs > ROUTE_OPEN_RELOAD_WAIT_CEILING_MS) {
     const ceilingSeconds = ROUTE_OPEN_RELOAD_WAIT_CEILING_MS / 1000;
@@ -799,7 +802,27 @@ function absentRootError(root: CanonicalRootPath): SubcError {
 
 /** Preserve the daemon's final refusal while making the reload timeout actionable. */
 function reloadWindowExhaustedError(error: unknown, callDeadlineMs: number): unknown {
-  const suffix = reloadWaitExhaustedSuffix(callDeadlineMs);
+  return withDeadlineSuffix(error, reloadWaitExhaustedSuffix(callDeadlineMs));
+}
+
+/**
+ * The error a call surfaces once its own deadline has passed before a reply.
+ * `lastError` is the most recent route refusal the call saw (it keeps its code,
+ * so a reload refusal still lets bash take its host fallback); with none, the
+ * error carries subc-client's own `request_deadline` code, the same one a
+ * route.open or request that ran out of time inside the client would carry.
+ */
+function callDeadlinePassedError(lastError: unknown, callDeadlineMs: number): unknown {
+  const seconds = Math.round(callDeadlineMs / 100) / 10;
+  const suffix = ` The AFT daemon module did not return within this call's ${seconds}s deadline.`;
+  if (lastError !== undefined) return withDeadlineSuffix(lastError, suffix);
+  return new SubcError(
+    `route to module '${AFT_MODULE_ID}' was not ready before the call ran out of time.${suffix}`,
+    REQUEST_DEADLINE_CODE,
+  );
+}
+
+function withDeadlineSuffix(error: unknown, suffix: string): unknown {
   if (error instanceof Error) {
     try {
       error.message += suffix;
@@ -1685,6 +1708,7 @@ export class SubcTransportPool implements AftTransportPool {
     expectedGeneration?: RootGeneration,
     abortSignal?: AbortSignal,
   ): Promise<unknown> {
+    const callStartedAt = performance.now();
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -1740,28 +1764,68 @@ export class SubcTransportPool implements AftTransportPool {
       // A module reload (drain, restart, warm-up) refuses route.open for as long
       // as it lasts. The call waits it out for as long as its own deadline allows,
       // but never longer than ROUTE_OPEN_RELOAD_WAIT_CEILING_MS, and then surfaces
-      // the refusal (which lets a caller such as bash fall back). Time spent
-      // waiting comes out of the request's budget, so the call never outlives the
-      // deadline it was given.
+      // the refusal (which lets a caller such as bash fall back).
+      //
+      // Everything the call does counts against its deadline: route opens
+      // (a bind relay can hold one for about 12 s), retry sleeps, and the
+      // request itself, which is sent with only the time that is left. So the
+      // call never outlives the deadline it was given, whichever path it takes.
       const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
       const reloadWaitBudgetMs = Math.min(callDeadlineMs, ROUTE_OPEN_RELOAD_WAIT_CEILING_MS);
-      let reloadWaitedMs = 0;
+      // Retry delays this call has been charged for. Spent time never counts
+      // less than these: a caller that joins a shared retry timer part-way is
+      // still charged its full delay, as it always was, and an injected test
+      // sleeper may finish a delay without real time passing.
+      let scheduledDelayMs = 0;
+      // The most recent route refusal, so a deadline that passes mid-open still
+      // names the daemon's reason instead of a bare timeout.
+      let lastRefusal: unknown;
+      const spentMs = (): number => Math.max(performance.now() - callStartedAt, scheduledDelayMs);
+      const remainingMs = (): number => callDeadlineMs - spentMs();
+
+      // subc-client's routeOpen takes no deadline of its own (only its fixed
+      // channel-0 default), so the call stops waiting for the open once its
+      // own time is up. An open that completes later still lands in the
+      // session's route entry, where the next call reuses it or teardown
+      // closes it.
+      const openRouteWithinDeadline = async (): Promise<{
+        route: RouteHandle;
+        entry: RouteEntry;
+      }> => {
+        const remaining = remainingMs();
+        if (remaining <= 0) throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const expired = new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+          timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+        });
+        try {
+          const opened = await Promise.race([openRoute(), expired]);
+          if (opened === CALL_DEADLINE_EXPIRED) {
+            throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
+          }
+          return opened;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
       const openRouteAfterReloadWindow = async (): Promise<{
         route: RouteHandle;
         entry: RouteEntry;
       }> => {
         while (true) {
           try {
-            return await openRoute();
+            return await openRouteWithinDeadline();
           } catch (error) {
             if (!isRouteOpenReloadWindowError(error)) throw error;
+            lastRefusal = error;
             // Check the budget before starting (or joining) the shared retry
             // timer, so a call that gives up leaves no orphan timer behind.
-            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
-            reloadWaitedMs += delayMs;
+            scheduledDelayMs = spentMs() + delayMs;
             await wait;
           }
         }
@@ -1803,7 +1867,11 @@ export class SubcTransportPool implements AftTransportPool {
         });
       };
 
-      const requestOnRoute = async (route: RouteHandle, entry: RouteEntry): Promise<unknown> => {
+      const requestOnRoute = async (
+        route: RouteHandle,
+        entry: RouteEntry,
+        requestTimeoutMs: number,
+      ): Promise<unknown> => {
         this.assertRecordLive(record);
         if (abortSignal?.aborted) {
           clearRouteEntry(entry);
@@ -1820,8 +1888,10 @@ export class SubcTransportPool implements AftTransportPool {
         };
         abortSignal?.addEventListener("abort", onAbort, { once: true });
         try {
-          const requestTimeoutMs = reloadWaitedMs > 0 ? callDeadlineMs - reloadWaitedMs : timeoutMs;
-          const request = client.request(route, body, { timeoutMs: requestTimeoutMs, onProgress });
+          const request = client.request(route, body, {
+            timeoutMs: Math.ceil(requestTimeoutMs),
+            onProgress,
+          });
           const reply = abortSignal ? await Promise.race([request, aborted]) : await request;
           // A legacy closeSession may intentionally let an already-delivered reply
           // settle. It must not mutate shared state or recreate a subscription.
@@ -1843,8 +1913,16 @@ export class SubcTransportPool implements AftTransportPool {
       let reopened = false;
       let retriedAbsentRoute = false;
       while (true) {
+        // Checked outside the try below so the retry branches never mistake
+        // this call's own expiry for a daemon refusal worth retrying.
+        const requestTimeoutMs = remainingMs();
+        if (requestTimeoutMs <= 0) throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
         try {
-          const reply = await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
+          const reply = await requestOnRoute(
+            routeAndEntry.route,
+            routeAndEntry.entry,
+            requestTimeoutMs,
+          );
           if (reopened) this.resetRouteReopenBackoff();
           return reply;
         } catch (error) {
@@ -1860,11 +1938,12 @@ export class SubcTransportPool implements AftTransportPool {
           // failure.
           if (ownsRoute && isRouteRequestReloadRefusal(error)) {
             clearRouteEntry(routeAndEntry.entry);
-            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            lastRefusal = error;
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
-            reloadWaitedMs += delayMs;
+            scheduledDelayMs = spentMs() + delayMs;
             await wait;
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
@@ -1873,7 +1952,15 @@ export class SubcTransportPool implements AftTransportPool {
           if (ownsRoute && !retriedAbsentRoute && isRouteProvenAbsentError(error)) {
             retriedAbsentRoute = true;
             clearRouteEntry(routeAndEntry.entry);
-            await this.waitForRouteReopenBackoff().wait;
+            // The one resend after a vanished route is still bounded by the
+            // call's deadline: its delay is charged like any other, and a
+            // delay that would run past the deadline is not taken.
+            if (spentMs() + this.nextRouteReopenDelayMs() >= callDeadlineMs) {
+              throw callDeadlinePassedError(error, callDeadlineMs);
+            }
+            const { delayMs, wait } = this.waitForRouteReopenBackoff();
+            scheduledDelayMs = spentMs() + delayMs;
+            await wait;
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
             continue;

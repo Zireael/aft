@@ -380,11 +380,17 @@ describe("SubcTransport.toolCall", () => {
         timeoutMs: 60_000,
       },
     );
-    expect(client.requests[0]?.options?.timeoutMs).toBe(905_000);
+    // The request carries what is left of that budget once the route is open,
+    // so it can be a few milliseconds short of the full amount.
+    const bashDeadline = client.requests[0]?.options?.timeoutMs ?? 0;
+    expect(bashDeadline).toBeGreaterThan(900_000);
+    expect(bashDeadline).toBeLessThanOrEqual(905_000);
 
     // Plain per-command override still applies when no orchestrated budget.
     await t.toolCall("s", "grep", { query: "x" }, { timeoutMs: 60_000 });
-    expect(client.requests[1]?.options?.timeoutMs).toBe(60_000);
+    const grepDeadline = client.requests[1]?.options?.timeoutMs ?? 0;
+    expect(grepDeadline).toBeGreaterThan(55_000);
+    expect(grepDeadline).toBeLessThanOrEqual(60_000);
   });
 
   test("caches the route per (root, harness, session) and reuses it", async () => {
@@ -583,6 +589,49 @@ describe("SubcTransport Rd reconnect", () => {
       "module_id 'aft' is reloading The AFT daemon module did not return within this call's 30s deadline.",
     );
   });
+
+  test("slow route opens during a reload cannot outlive the caller's deadline", async () => {
+    // Each route.open is held by the daemon's bind relay for 2 s. The first two
+    // are refused as reloading and the third would bind. subc-client's
+    // routeOpen takes no deadline, so this fake takes none either: the
+    // transport alone has to stop waiting once the 5 s call budget is spent.
+    const OPEN_MS = 2_000;
+    const CALL_BUDGET_MS = 5_000;
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "late" }));
+    const reloadErrors: Error[] = [
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+    ];
+    const slowOpen = client.routeOpen.bind(client);
+    client.routeOpen = async (target, identity, opts) => {
+      await new Promise((resolve) => setTimeout(resolve, OPEN_MS));
+      const refusal = reloadErrors.shift();
+      if (refusal) throw refusal;
+      return slowOpen(target, identity, opts);
+    };
+    const { pool } = poolWith(client);
+
+    const started = performance.now();
+    let surfaced: unknown;
+    try {
+      await pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .toolCall("slow-open", "read", {}, { timeoutMs: CALL_BUDGET_MS });
+    } catch (error) {
+      surfaced = error;
+    }
+    const elapsed = performance.now() - started;
+
+    // Without the whole-call deadline this resolved at about 3 x 2 s plus the
+    // 100 ms and 200 ms retry sleeps, 6.3 s, well past the caller's 5 s.
+    expect(surfaced).toBeInstanceOf(SubcError);
+    expect((surfaced as { code?: string }).code).toBe("module_reloading");
+    expect((surfaced as Error).message).toContain("within this call's 5s deadline");
+    expect(elapsed).toBeGreaterThanOrEqual(CALL_BUDGET_MS - 100);
+    expect(elapsed).toBeLessThan(CALL_BUDGET_MS + 500);
+    expect(client.routeOpens).toHaveLength(0);
+    expect(client.requests).toHaveLength(0);
+  }, 20_000);
 
   test("a dying-route GOODBYE surfaces while a fresh reload-window dispatch is absorbed", async () => {
     let releaseDying!: () => void;
