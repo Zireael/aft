@@ -102,7 +102,11 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # The identifier is pinned to the deploy name so macOS grants keyed on it
   # survive across cards; the default identifier derives from content.
   echo "==> signing ($CK_AFT_IDENTIFIER, hardened runtime, $(basename "$CK_AFT_ENTITLEMENTS"))"
-  ck_aft_sign "$TMP"
+  if ! ck_aft_sign "$TMP"; then
+    rm -f "$TMP"
+    echo "stage-card: signing failed: codesign rejected $CK_AFT_ENTITLEMENTS or the binary" >&2
+    exit 2
+  fi
   if ! ck_aft_check_signature "$TMP" stage-card; then
     rm -f "$TMP"
     exit 2
