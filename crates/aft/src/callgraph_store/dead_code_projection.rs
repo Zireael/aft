@@ -721,6 +721,25 @@ fn entry_point_symbols_from_store(
             roots.insert(row.scoped_name);
         }
     }
+    // Unknown receivers are liveness roots, not invented caller edges. Legacy
+    // databases have no such table and retain their existing projection.
+    let has_unknown: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='view_unknown_live')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_unknown {
+        let mut query = conn.prepare("SELECT DISTINCT target_file, target_symbol FROM view_unknown_live WHERE (?1 IS NULL OR target_file=?1)")?;
+        for row in query.query_map([file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (target_file, symbol) = row?;
+            by_file
+                .entry(paths.resolve(&target_file))
+                .or_default()
+                .insert(symbol);
+        }
+    }
     Ok(by_file)
 }
 
@@ -835,10 +854,11 @@ fn outbound_calls_query(
             short_name.to_string()
         };
 
-        if row
-            .full_ref
-            .as_deref()
-            .is_some_and(|full_ref| is_method_dispatch_callee(full_ref, short_name))
+        if !row.ref_id.starts_with("view:")
+            && row
+                .full_ref
+                .as_deref()
+                .is_some_and(|full_ref| is_method_dispatch_callee(full_ref, short_name))
         {
             target.push(crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR);
             target.push_str(row.full_ref.as_deref().unwrap_or_default());

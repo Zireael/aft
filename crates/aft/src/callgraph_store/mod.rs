@@ -2784,6 +2784,7 @@ impl StoreCallSite {
     pub fn supplemental_resolution(&self) -> Option<&str> {
         match self.provenance.as_str() {
             PROVENANCE_NAME_MATCH | PROVENANCE_TYPE_MATCH => Some(self.provenance.as_str()),
+            "dispatch" => Some("possible_target (dispatch)"),
             _ => None,
         }
     }
@@ -6026,6 +6027,37 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    /// Open only the selected derived database, without legacy fallback. The
+    /// caller must retain the pinned generation for the lifetime of this reader.
+    pub(crate) fn open_pinned_derived(
+        project_root: PathBuf,
+        family: String,
+        view_dir: PathBuf,
+        generation: &str,
+    ) -> Result<Self> {
+        let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
+            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
+        let conn = open_readonly_connection(&sqlite_path)?;
+        ensure_database_ready(&conn)?;
+        let mut inner = CallGraphStore::from_connection(
+            project_root,
+            family,
+            sqlite_path,
+            view_dir,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        );
+        inner.manifest_view = true;
+        inner.database_ready.store(true, AtomicOrdering::Release);
+        Ok(Self {
+            inner,
+            _view_pin: None,
+        })
+    }
+
     pub(crate) fn open_manifest_view(
         project_root: PathBuf,
         family: String,

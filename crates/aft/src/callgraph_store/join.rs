@@ -1,4 +1,4 @@
-//! Manifest-only callgraph assembly.
+//! Manifest-only callgraph joining.
 //!
 //! This module deliberately accepts a manifest plus immutable blob payloads rather
 //! than a checkout root.  Extraction is content-addressed and path-free; binding a
@@ -9,6 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+#[path = "dispatch.rs"]
+pub mod dispatch;
 
 use serde::{Deserialize, Serialize};
 use tree_sitter::Parser;
@@ -154,6 +157,8 @@ pub struct BlobImport {
 /// Path-free parse output stored for a regular source file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ParseBlob {
+    #[serde(default)]
+    pub dispatch: dispatch::DispatchFacts,
     pub extractor_version: String,
     pub language: String,
     pub ast_nodes: Vec<AstPreorderNode>,
@@ -274,7 +279,8 @@ impl CallgraphBlob {
                 && left.full_ref == right.full_ref
         });
 
-        Ok(Self::Parse(ParseBlob {
+        let mut parse = ParseBlob {
+            dispatch: dispatch::DispatchFacts::default(),
             extractor_version,
             language: language.to_string(),
             ast_nodes,
@@ -284,7 +290,9 @@ impl CallgraphBlob {
             callable_symbols,
             imports,
             refs,
-        }))
+        };
+        parse.dispatch = dispatch::extract(source, lang, &parse)?;
+        Ok(Self::Parse(parse))
     }
 
     /// Builds a manifest configuration input.  The caller must key it with
