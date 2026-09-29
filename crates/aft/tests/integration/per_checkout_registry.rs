@@ -77,7 +77,7 @@ fn publish(
 ) -> Published {
     let storage = registration.registry().storage().to_path_buf();
     let store = registration.open_store(FamilyPlane::Trigram).unwrap();
-    let mut live = LivePin::create(registration.view_dir(), FAMILY, registration.scope()).unwrap();
+    let mut live = LivePin::create(registration).unwrap();
     let keys = files
         .iter()
         .map(|(_, bytes)| trigram_key(bytes))
@@ -154,7 +154,7 @@ fn publish(
 fn put_garbage(registration: &ViewRegistration, bytes: &[u8]) -> FamilyKey {
     let store = registration.open_store(FamilyPlane::Trigram).unwrap();
     let key = trigram_key(bytes);
-    let mut live = LivePin::create(registration.view_dir(), FAMILY, registration.scope()).unwrap();
+    let mut live = LivePin::create(registration).unwrap();
     live.protect(&[key]).unwrap();
     store
         .put_or_touch(&key, &TrigramPayload::extract(bytes, &policy()).encode())
@@ -290,7 +290,7 @@ fn a_touch_needs_a_durable_protection_first() {
         .unwrap();
     let key = put_garbage(&a, b"payload");
     let store = a.open_store(FamilyPlane::Trigram).unwrap();
-    let live = LivePin::create(a.view_dir(), FAMILY, a.scope()).unwrap();
+    let live = LivePin::create(&a).unwrap();
     assert!(protect_then_touch(&live, &store, &[key]).is_err());
     let mut live = live;
     live.protect(&[key]).unwrap();
@@ -334,6 +334,116 @@ fn a_removed_root_with_a_marker_only_reader_is_kept_until_two_sweeps_after_it_le
     assert_eq!(fourth.deregistered, vec!["scope-gone".to_string()]);
     assert!(registry.member("scope-gone").unwrap().is_none());
     assert!(!view_dir.exists());
+}
+
+/// Pauses a sweep when it reaches `step`, until the test lets it go on.
+struct PauseAt {
+    step: SweepStep,
+    state: std::sync::Mutex<PauseState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PauseState {
+    reached: bool,
+    released: bool,
+}
+
+impl PauseAt {
+    fn new(step: SweepStep) -> Self {
+        Self {
+            step,
+            state: std::sync::Mutex::new(PauseState::default()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.reached {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl SweepObserver for PauseAt {
+    fn reached(&self, step: SweepStep) {
+        if step != self.step {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+}
+
+/// A live owner whose checkout root is gone pins its view after the sweep
+/// found no protection, but before the sweep removed the view. The member,
+/// its view directory and the new pin must all survive.
+#[test]
+fn an_owner_pin_taken_while_removal_is_pending_keeps_the_member() {
+    let storage = tempdir().unwrap();
+    let root = storage.path().join("root-gone");
+    fs::create_dir_all(&root).unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let view = registry.register_view("scope-gone", &root).unwrap();
+    publish(&view, &[("gone.txt", b"owner bytes")], None);
+    fs::remove_dir_all(&root).unwrap();
+
+    // The first sweep only counts the missing root.
+    let first = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+    assert!(first.deregistered.is_empty(), "{first:?}");
+
+    // The second sweep would remove the member; the owner pins meanwhile.
+    let pause = PauseAt::new(SweepStep::RemovalPending);
+    let (report, pin) = thread::scope(|scope| {
+        let sweeper = scope.spawn(|| sweep_family(&registry, None, COLLECT_ALL, Some(&pause)));
+        pause.wait_until_reached();
+        let pin = LivePin::create(&view).unwrap();
+        pause.release();
+        (sweeper.join().unwrap().unwrap(), pin)
+    });
+
+    assert!(report.deregistered.is_empty(), "{report:?}");
+    assert!(registry.member("scope-gone").unwrap().is_some());
+    assert!(pin.keys_path().is_file(), "the owner's pin was removed");
+    drop(pin);
+}
+
+/// Once a missing-root member has been removed, its old registration can no
+/// longer pin: creation is refused and does not re-create the view directory.
+#[test]
+fn a_deregistered_view_cannot_be_pinned() {
+    let storage = tempdir().unwrap();
+    let root = storage.path().join("root-gone");
+    fs::create_dir_all(&root).unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let view = registry.register_view("scope-gone", &root).unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    for _ in 0..2 {
+        sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+    }
+    assert!(registry.member("scope-gone").unwrap().is_none());
+
+    let live = LivePin::create(&view);
+    assert!(
+        matches!(live, Err(aft::pins::PinError::NotRegistered(_))),
+        "{live:?}"
+    );
+    let assembly = AssemblyPin::create_v2(&view, "late-assembly", &[]);
+    assert!(
+        matches!(assembly, Err(aft::pins::PinError::NotRegistered(_))),
+        "{assembly:?}"
+    );
+    assert!(!view.view_dir().exists());
 }
 
 /// An unreadable marker is uncertainty, and uncertainty keeps the member.
@@ -507,14 +617,8 @@ fn per_checkout_child() {
                 FamilyPlane::Trigram,
                 aft::blob_store::v2::parse_hex32(&key_hex).unwrap(),
             );
-            let _pin = AssemblyPin::create_v2(
-                registration.view_dir(),
-                FAMILY,
-                &scope,
-                "assembly-in-progress",
-                &[key],
-            )
-            .unwrap();
+            let _pin =
+                AssemblyPin::create_v2(&registration, "assembly-in-progress", &[key]).unwrap();
             let store = registration.open_store(FamilyPlane::Trigram).unwrap();
             protect_then_touch(&_pin, &store, &[key]).unwrap();
             fs::write(&ready, b"ready").unwrap();
@@ -620,7 +724,7 @@ fn a_key_reused_after_marking_survives_the_sweep() {
     let mut reuse_pin = None;
     let report = with_sweep_paused_after_marking(storage.path(), || {
         let store = a.open_store(FamilyPlane::Trigram).unwrap();
-        let mut live = LivePin::create(a.view_dir(), FAMILY, a.scope()).unwrap();
+        let mut live = LivePin::create(&a).unwrap();
         live.protect(&[reused]).unwrap();
         let touch = protect_then_touch(&live, &store, &[reused]).unwrap();
         assert!(touch.missing.is_empty());

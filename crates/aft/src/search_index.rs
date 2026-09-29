@@ -2425,6 +2425,26 @@ impl SearchIndex {
         self.snapshot().postings_for_trigram(trigram, filter)
     }
 
+    /// The `(next_mask, loc_mask)` of every not-yet-compacted posting of
+    /// `path`, by trigram, so tests elsewhere can compare against what this
+    /// index actually stored.
+    #[cfg(test)]
+    pub(crate) fn delta_posting_masks(&self, path: &Path) -> BTreeMap<u32, (u8, u8)> {
+        let Some(&file_id) = self.path_to_id.get(path) else {
+            return BTreeMap::new();
+        };
+        self.delta
+            .postings
+            .iter()
+            .filter_map(|(&trigram, postings)| {
+                postings
+                    .iter()
+                    .find(|posting| posting.file_id == file_id)
+                    .map(|posting| (trigram, (posting.next_mask, posting.loc_mask)))
+            })
+            .collect()
+    }
+
     fn update_compaction_flags(&mut self, changed_path: Option<&Path>) {
         let delta_files = self.delta_file_trigrams.len();
         let hard = delta_files >= DELTA_COMPACT_HARD_FILES
@@ -4980,6 +5000,17 @@ fn trigram_filter_map(content: &[u8], include_eof_next_char: bool) -> BTreeMap<u
         entry.loc_mask |= mask_for_position(position);
     });
     filters
+}
+
+/// The posting fold this index stores for one file's bytes: each distinct
+/// trigram in ascending order with its next-character mask (end of file
+/// included) and its position mask, as `(trigram, next_mask, loc_mask)`.
+/// Per-checkout trigram payloads are built from it so that their postings
+/// match the index's exactly.
+pub(crate) fn file_posting_fold(content: &[u8]) -> impl Iterator<Item = (u32, u8, u8)> {
+    trigram_filter_map(content, true)
+        .into_iter()
+        .map(|(trigram, filter)| (trigram, filter.next_mask, filter.loc_mask))
 }
 
 pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {

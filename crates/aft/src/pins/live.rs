@@ -6,7 +6,10 @@
 //! before its put; the pin is trimmed after each successful fold. The file
 //! uses the assembly-pin format (`pins/<label>.json` + `pins/<label>.keys`),
 //! so the family sweep reads it exactly like an assembly pin, and it is
-//! reclaimed only once its owner process is gone.
+//! reclaimed only once its owner process is gone. Like an assembly pin, it is
+//! created under the family registry's barrier: a missing-root
+//! deregistration either sees it in its final protection check, or has
+//! already deregistered the view and the creation fails.
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -19,6 +22,7 @@ use super::{
     PinMetadata, PinOwner, Protection,
 };
 use crate::blob_store::v2::{to_hex, FamilyKey};
+use crate::views::registry::ViewRegistration;
 
 /// Label prefix of live pins inside `pins/`.
 pub const LIVE_PIN_PREFIX: &str = "live-";
@@ -35,12 +39,20 @@ pub struct LivePin {
 }
 
 impl LivePin {
-    /// Creates an empty live pin for this process in `view_dir/pins/`.
-    pub fn create(
-        view_dir: &Path,
-        family: impl Into<String>,
-        view: impl Into<String>,
-    ) -> Result<Self, PinError> {
+    /// Creates an empty live pin for this process in the view's `pins/`,
+    /// under the registry barrier of `registration`. Fails with
+    /// [`PinError::NotRegistered`] once the view has been deregistered.
+    pub fn create(registration: &ViewRegistration) -> Result<Self, PinError> {
+        registration.under_pin_barrier(|view_dir| {
+            Self::create_in(
+                view_dir,
+                registration.family().to_owned(),
+                registration.scope().to_owned(),
+            )
+        })
+    }
+
+    fn create_in(view_dir: &Path, family: String, view: String) -> Result<Self, PinError> {
         let pid = std::process::id();
         let now = now_ms();
         let owner = PinOwner {
@@ -57,8 +69,8 @@ impl LivePin {
         fs::create_dir_all(view_dir.join("pins"))?;
         let (metadata_path, keys_path) = pin_paths(view_dir, &label);
         let metadata = PinMetadata {
-            family: family.into(),
-            view: view.into(),
+            family,
+            view,
             generation: label,
             owner,
             created_at: now,

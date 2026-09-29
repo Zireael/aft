@@ -15,6 +15,7 @@ use crate::blob_store::v2::{FamilyKey, FamilyStore, TouchReport};
 use crate::blob_store::FullKey;
 use crate::fs_lock;
 use crate::root_cache::{self, ReadMarker};
+use crate::views::registry::ViewRegistration;
 
 mod live;
 pub use live::LivePin;
@@ -45,6 +46,11 @@ pub enum PinError {
     Io(io::Error),
     Serialize(serde_json::Error),
     InvalidGeneration(String),
+    /// The view is no longer registered, so it may not be pinned; see
+    /// `ViewRegistration::under_pin_barrier`.
+    NotRegistered(String),
+    /// The family registry could not be read or locked.
+    Registry(String),
 }
 
 impl fmt::Display for PinError {
@@ -55,6 +61,10 @@ impl fmt::Display for PinError {
             Self::InvalidGeneration(generation) => {
                 write!(f, "invalid pin generation `{generation}`")
             }
+            Self::NotRegistered(scope) => {
+                write!(f, "view `{scope}` is not registered and cannot be pinned")
+            }
+            Self::Registry(error) => write!(f, "pin registry error: {error}"),
         }
     }
 }
@@ -64,7 +74,7 @@ impl std::error::Error for PinError {
         match self {
             Self::Io(error) => Some(error),
             Self::Serialize(error) => Some(error),
-            Self::InvalidGeneration(_) => None,
+            Self::InvalidGeneration(_) | Self::NotRegistered(_) | Self::Registry(_) => None,
         }
     }
 }
@@ -109,23 +119,27 @@ impl AssemblyPin {
         )
     }
 
-    /// Creates a pin for per-checkout (v2) work. It must list every key the
-    /// work will rely on, in every plane, including keys that are already
-    /// stored; see [`protect_then_touch`].
+    /// Creates a pin for per-checkout (v2) work, under the registry barrier of
+    /// `registration`. It must list every key the work will rely on, in every
+    /// plane, including keys that are already stored; see
+    /// [`protect_then_touch`]. Fails with [`PinError::NotRegistered`] once the
+    /// view has been deregistered.
     pub fn create_v2(
-        view_dir: &Path,
-        family: impl Into<String>,
-        view: impl Into<String>,
+        registration: &ViewRegistration,
         generation: impl Into<String>,
         keys: &[FamilyKey],
     ) -> Result<Self, PinError> {
-        Self::create_with_hex_keys(
-            view_dir,
-            family.into(),
-            view.into(),
-            generation.into(),
-            keys.iter().map(FamilyKey::to_hex).collect(),
-        )
+        let generation = generation.into();
+        let keys = keys.iter().map(FamilyKey::to_hex).collect();
+        registration.under_pin_barrier(|view_dir| {
+            Self::create_with_hex_keys(
+                view_dir,
+                registration.family().to_owned(),
+                registration.scope().to_owned(),
+                generation,
+                keys,
+            )
+        })
     }
 
     fn create_with_hex_keys(

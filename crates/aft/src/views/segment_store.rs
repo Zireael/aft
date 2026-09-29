@@ -48,7 +48,6 @@ pub const SEGMENT_MAGIC: &[u8; 8] = b"AFTSEG02";
 pub const SEGMENT_FORMAT: u32 = 1;
 pub const LOOKUP_ENTRY_BYTES: usize = 16;
 pub const POSTING_BYTES: usize = 6;
-const EOF_NEXT_CHAR: u8 = 0;
 
 #[derive(Debug)]
 pub enum SegmentError {
@@ -136,7 +135,8 @@ pub struct TrigramPayload {
 
 impl TrigramPayload {
     /// Extracts the payload from a file's bytes. It is a pure function of the
-    /// bytes and the policy, which is what lets the key omit the path.
+    /// bytes and the policy, which is what lets the key omit the path. The
+    /// records are the search index's own posting fold of the bytes.
     pub fn extract(bytes: &[u8], policy: &TrigramPolicy) -> Self {
         if bytes.len() as u64 > policy.max_file_size {
             return Self {
@@ -150,17 +150,10 @@ impl TrigramPayload {
                 records: Vec::new(),
             };
         }
-        let mut masks: BTreeMap<u32, (u8, u8)> = BTreeMap::new();
-        for (trigram, next_char, position) in crate::search_index::extract_trigrams(bytes) {
-            let entry = masks.entry(trigram).or_default();
-            entry.0 |= next_char_mask(next_char);
-            entry.1 |= 1_u8 << (position % 8);
-        }
         Self {
             flag: TrigramFlag::Indexed,
-            records: masks
-                .into_iter()
-                .map(|(trigram, (next_mask, loc_mask))| TrigramRecord {
+            records: crate::search_index::file_posting_fold(bytes)
+                .map(|(trigram, next_mask, loc_mask)| TrigramRecord {
                     trigram,
                     next_mask,
                     loc_mask,
@@ -209,17 +202,6 @@ impl TrigramPayload {
         }
         Ok(Self { flag, records })
     }
-}
-
-/// The next-character mask of the search index's posting fold: case-folded
-/// byte times 31, low three bits; end of file sets bit 0.
-fn next_char_mask(next_char: u8) -> u8 {
-    let normalized = if next_char == EOF_NEXT_CHAR {
-        EOF_NEXT_CHAR
-    } else {
-        crate::search_index::normalize_char(next_char)
-    };
-    1_u8 << (normalized.wrapping_mul(31) & 7)
 }
 
 /// One member of a segment.
@@ -734,6 +716,41 @@ mod tests {
             expected
         );
         assert_eq!(TrigramPayload::decode(&payload.encode()).unwrap(), payload);
+    }
+
+    /// A payload's next-character and position masks are exactly what the
+    /// search index stores for the same bytes, including the next-character
+    /// mask of a trigram whose only occurrence ends the file.
+    #[test]
+    fn payload_masks_match_what_the_search_index_stores() {
+        // "abc" repeats before upper- and lower-case letters and past position
+        // eight, so both masks fold several occurrences; "qz!" ends the file.
+        let bytes = b"abcXabc\nABC xabcabc qz!";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        fs::write(&path, bytes).unwrap();
+        let mut index = crate::search_index::SearchIndex::new();
+        index.index_file(&path, bytes);
+        let stored = index.delta_posting_masks(&path);
+
+        let end_of_file = crate::search_index::pack_trigram(b'q', b'z', b'!');
+        assert_eq!(
+            stored.get(&end_of_file).map(|masks| masks.0),
+            Some(1),
+            "the fixture must exercise the end-of-file next character"
+        );
+        let payload = TrigramPayload::extract(
+            bytes,
+            &TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+        );
+        let extracted = payload
+            .records
+            .iter()
+            .map(|record| (record.trigram, (record.next_mask, record.loc_mask)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(extracted, stored);
     }
 
     #[test]

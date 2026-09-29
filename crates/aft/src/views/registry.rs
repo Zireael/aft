@@ -22,7 +22,9 @@
 //!
 //! Deregistering a member whose checkout root is gone happens under the
 //! registry's write lock (the handoff barrier), and only when no protection of
-//! any class exists for it; see `gc::family`.
+//! any class exists for it; see `gc::family`. Assembly and live pins are
+//! created under that same lock (`ViewRegistration::under_pin_barrier`), so
+//! the deregistration's last protection check cannot miss one.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -37,7 +39,7 @@ use crate::blob_store::v2::{
     family_dir, FamilyPlane, FamilyStore, FamilyStoreReader, StoreError, StoreWriteAccess,
 };
 use crate::db::lifecycle::{SqliteStore, TrackedConnection};
-use crate::pins::PinOwner;
+use crate::pins::{PinError, PinOwner};
 
 /// Schema version of `members.sqlite`. A newer version is refused rather than
 /// read; extending the registry means bumping this and migrating forward.
@@ -579,6 +581,36 @@ impl ViewRegistration {
     pub fn view_store(&self) -> RegistryResult<super::ViewStore> {
         Ok(super::ViewStore::open_dir(self.view_dir.clone())?)
     }
+
+    /// Runs `create` inside the registry's handoff barrier, after confirming
+    /// that this view is still registered; assembly and live pins are created
+    /// this way. A missing-root deregistration re-checks for pins under the
+    /// same barrier immediately before it removes a view, so it either sees a
+    /// pin created here or has already removed the member. In the second case
+    /// `create` does not run, nothing re-creates the removed view directory,
+    /// and the caller gets [`PinError::NotRegistered`]; it has to register
+    /// again before doing more work.
+    pub(crate) fn under_pin_barrier<T>(
+        &self,
+        create: impl FnOnce(&Path) -> Result<T, PinError>,
+    ) -> Result<T, PinError> {
+        let outcome = self.registry.with_barrier(|tx| {
+            let registered = tx
+                .query_row(
+                    "SELECT 1 FROM members WHERE scope = ?1",
+                    params![self.scope],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            Ok(registered.then(|| create(&self.view_dir)))
+        });
+        match outcome {
+            Ok(Some(created)) => created,
+            Ok(None) => Err(PinError::NotRegistered(self.scope.clone())),
+            Err(error) => Err(PinError::Registry(error.to_string())),
+        }
+    }
 }
 
 static READER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -842,5 +874,33 @@ mod tests {
         let second = registry.begin_sweep().unwrap().unwrap();
         assert_eq!(second.epoch(), 2);
         assert_eq!(registry.gc_epoch().unwrap(), 2);
+    }
+
+    /// A pin started while another holder has the barrier waits for it. When
+    /// that holder deregisters the view before letting go, the pin is refused.
+    /// A pin that skipped the barrier would be created during the wait below.
+    #[test]
+    fn a_pin_waits_for_the_barrier_and_is_refused_after_a_removal_inside_it() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
+        let view = registry
+            .register_view("scope-a", &storage.path().join("root"))
+            .unwrap();
+        let pinning = registry
+            .with_barrier(|tx| {
+                let pinning = std::thread::spawn({
+                    let view = view.clone();
+                    move || crate::pins::LivePin::create(&view).map(drop)
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                tx.execute("DELETE FROM members WHERE scope = ?1", params!["scope-a"])?;
+                Ok(pinning)
+            })
+            .unwrap();
+        let result = pinning.join().unwrap();
+        assert!(
+            matches!(result, Err(PinError::NotRegistered(_))),
+            "{result:?}"
+        );
     }
 }

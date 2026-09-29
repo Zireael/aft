@@ -11,8 +11,10 @@
 //!    freed pages;
 //! 4. under the registry's write lock (the handoff barrier), count sweeps for
 //!    members whose checkout root is gone and that have no protection of any
-//!    class; the second such consecutive sweep removes the member and its
-//!    view directory.
+//!    class; the second such consecutive sweep re-checks every protection
+//!    under the barrier and then removes the member and its view directory.
+//!    Assembly and live pins are created under the same barrier, so a pin
+//!    cannot appear between that re-check and the removal.
 //!
 //! Why deletion is safe: any work W that relies on key K made its protection
 //! durable, then touched K. If the touch committed after the epoch bump, K's
@@ -41,7 +43,9 @@ use crate::blob_store::v2::{
     plane_path, segment_path, FamilyPlane, FamilyStore, StoreError, StoreWriteAccess,
 };
 use crate::pins::{self, PinError};
-use crate::views::registry::{FamilyRegistry, MemberRecord, RegistryError, MISSING_ROOT_SWEEPS};
+use crate::views::registry::{
+    read_members, FamilyRegistry, MemberRecord, RegistryError, MISSING_ROOT_SWEEPS,
+};
 use crate::views::ViewStore;
 
 #[derive(Debug)]
@@ -101,6 +105,10 @@ pub enum SweepStep {
     EpochRaised,
     Marked,
     Deleted,
+    /// A missing-root member is due for removal. The sweep has released the
+    /// registry barrier after counting it and has not yet taken it again to
+    /// re-check its protection and remove it.
+    RemovalPending,
 }
 
 pub trait SweepObserver {
@@ -173,7 +181,7 @@ pub fn sweep_family(
     observe(observer, SweepStep::Deleted);
 
     for member in &members {
-        deregister_if_missing(registry, member, &mut report)?;
+        deregister_if_missing(registry, member, observer, &mut report)?;
     }
     lease.release();
     Ok(report)
@@ -431,70 +439,135 @@ fn member_has_protection(view_dir: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Counts a sweep for a member whose root is gone and, on the sweep that
+/// reaches [`MISSING_ROOT_SWEEPS`], removes it with its view directory.
+///
+/// This runs in two steps under the registry barrier. The first counts the
+/// sweep and decides whether this sweep is the removing one. The second takes
+/// the barrier again and checks everything once more (the member row, its
+/// root, and every pin and marker) immediately before removing. Assembly and
+/// live pins are created under the same barrier (see
+/// `ViewRegistration::under_pin_barrier`), so a live owner either pinned
+/// before the second check, which then keeps the member, or pins after the
+/// removal and is refused because the member is no longer registered.
 fn deregister_if_missing(
     registry: &FamilyRegistry,
     member: &MemberRecord,
+    observer: Option<&dyn SweepObserver>,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
     let missing = root_is_missing(member);
-    let outcome = registry.with_barrier(|tx| {
-        let recorded: Option<i64> = tx
-            .query_row(
-                "SELECT missing_sweeps FROM members WHERE scope = ?1",
-                params![member.scope],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(recorded) = recorded else {
-            return Ok(Deregistration::Gone);
-        };
-        if !missing {
-            if recorded != 0 {
-                tx.execute(
-                    "UPDATE members SET missing_sweeps = 0 WHERE scope = ?1",
-                    params![member.scope],
-                )?;
-            }
-            return Ok(Deregistration::Present);
+    let counted = registry.with_barrier(|tx| count_missing_sweep(tx, member, missing))?;
+    let outcome = match counted {
+        Deregistration::Due { recorded } => {
+            observe(observer, SweepStep::RemovalPending);
+            registry.with_barrier(|tx| remove_if_still_due(tx, &member.scope, recorded))?
         }
-        match member_has_protection(&member.view_dir) {
-            Ok(false) => {}
-            Ok(true) => {
-                tx.execute(
-                    "UPDATE members SET missing_sweeps = 0 WHERE scope = ?1",
-                    params![member.scope],
-                )?;
-                return Ok(Deregistration::Retained);
-            }
-            // Uncertainty keeps the member and does not advance its count.
-            Err(_) => return Ok(Deregistration::Retained),
-        }
-        let count = recorded.max(0) as u32 + 1;
-        if count < MISSING_ROOT_SWEEPS {
-            tx.execute(
-                "UPDATE members SET missing_sweeps = ?2 WHERE scope = ?1",
-                params![member.scope, i64::from(count)],
-            )?;
-            return Ok(Deregistration::Retained);
-        }
-        // Remove the directory while the barrier is held, so no registration
-        // or reader confirmation can interleave with the removal.
-        match fs::remove_dir_all(&member.view_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Ok(Deregistration::Retained),
-        }
-        tx.execute(
-            "DELETE FROM members WHERE scope = ?1",
-            params![member.scope],
-        )?;
-        Ok(Deregistration::Removed)
-    })?;
+        other => other,
+    };
     match outcome {
         Deregistration::Retained => report.missing_root_retained.push(member.scope.clone()),
         Deregistration::Removed => report.deregistered.push(member.scope.clone()),
-        Deregistration::Present | Deregistration::Gone => {}
+        Deregistration::Present | Deregistration::Gone | Deregistration::Due { .. } => {}
     }
+    Ok(())
+}
+
+/// The first step, inside the barrier: resets or advances the member's count
+/// of consecutive missing-root sweeps, or reports that removal is due.
+fn count_missing_sweep(
+    tx: &rusqlite::Transaction<'_>,
+    member: &MemberRecord,
+    missing: bool,
+) -> Result<Deregistration, RegistryError> {
+    let recorded: Option<i64> = tx
+        .query_row(
+            "SELECT missing_sweeps FROM members WHERE scope = ?1",
+            params![member.scope],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(recorded) = recorded else {
+        return Ok(Deregistration::Gone);
+    };
+    if !missing {
+        if recorded != 0 {
+            reset_missing_sweeps(tx, &member.scope)?;
+        }
+        return Ok(Deregistration::Present);
+    }
+    if let Some(kept) = protection_outcome(tx, &member.scope, &member.view_dir)? {
+        return Ok(kept);
+    }
+    let count = recorded.max(0) as u32 + 1;
+    if count < MISSING_ROOT_SWEEPS {
+        tx.execute(
+            "UPDATE members SET missing_sweeps = ?2 WHERE scope = ?1",
+            params![member.scope, i64::from(count)],
+        )?;
+        return Ok(Deregistration::Retained);
+    }
+    Ok(Deregistration::Due { recorded })
+}
+
+/// The second step, inside the barrier again: re-reads the member and
+/// re-checks its root and every protection, then removes the view directory
+/// and the member row. Holding the barrier across the check and the removal
+/// is what keeps a registration or a new pin from landing in between.
+fn remove_if_still_due(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    recorded: i64,
+) -> Result<Deregistration, RegistryError> {
+    let Some(current) = read_members(tx)?
+        .into_iter()
+        .find(|candidate| candidate.scope == scope)
+    else {
+        return Ok(Deregistration::Gone);
+    };
+    // A registration in between resets the count and may name a new root.
+    if i64::from(current.missing_sweeps) != recorded {
+        return Ok(Deregistration::Retained);
+    }
+    if !root_is_missing(&current) {
+        reset_missing_sweeps(tx, scope)?;
+        return Ok(Deregistration::Present);
+    }
+    if let Some(kept) = protection_outcome(tx, scope, &current.view_dir)? {
+        return Ok(kept);
+    }
+    match fs::remove_dir_all(&current.view_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(Deregistration::Retained),
+    }
+    tx.execute("DELETE FROM members WHERE scope = ?1", params![scope])?;
+    Ok(Deregistration::Removed)
+}
+
+/// `Some(Retained)` when the member has protection of any class (which also
+/// resets its count) or its protection cannot be read (which keeps the count);
+/// `None` when it certainly has none.
+fn protection_outcome(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> Result<Option<Deregistration>, RegistryError> {
+    match member_has_protection(view_dir) {
+        Ok(false) => Ok(None),
+        Ok(true) => {
+            reset_missing_sweeps(tx, scope)?;
+            Ok(Some(Deregistration::Retained))
+        }
+        Err(_) => Ok(Some(Deregistration::Retained)),
+    }
+}
+
+fn reset_missing_sweeps(tx: &rusqlite::Transaction<'_>, scope: &str) -> Result<(), RegistryError> {
+    tx.execute(
+        "UPDATE members SET missing_sweeps = 0 WHERE scope = ?1",
+        params![scope],
+    )?;
     Ok(())
 }
 
@@ -503,4 +576,9 @@ enum Deregistration {
     Retained,
     Removed,
     Gone,
+    /// This sweep reaches the removal threshold; `recorded` is the count it
+    /// read, so the removing step can tell whether anything changed since.
+    Due {
+        recorded: i64,
+    },
 }
