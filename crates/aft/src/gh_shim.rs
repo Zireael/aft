@@ -4599,9 +4599,10 @@ fn canonicalize_pr_create_from<R: Read>(
     fields.insert("head".to_string(), Value::String(head));
     fields.insert("draft".to_string(), Value::Bool(draft));
 
-    // Same resolver as every other governed verb: a global `--repo` before the
-    // command head wins, then the command-local one, then GH_REPO and the
-    // working directory's origin.
+    // Resolve the target repository from a global `--repo` before the command
+    // head, then the command-local `--repo`, then GH_REPO, and finally the
+    // working directory's origin: the same order `TargetRepository` applies
+    // to every other governed verb.
     let target_repository = TargetRepository {
         explicit: explicit_repo(args).or(explicit_repository),
         url: None,

@@ -1170,7 +1170,7 @@ fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
         assert_eq!(text, format!("plexus refused the bot write: {code}"));
         assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
     }
-    // Plexus's own head refusals take the same path.
+    // Plexus's own `pr_head_cross_repository` refusal takes the same path.
     let harness = harness(ticket_gated(vec![plexus_refused(
         "pr_head_cross_repository",
     )]));
