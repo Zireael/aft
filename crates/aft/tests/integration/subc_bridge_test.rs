@@ -3037,19 +3037,29 @@ fn subc_bridge_repeat_breaker_uses_shared_transport_fixture() {
 }
 
 #[test]
-fn subc_bridge_repeat_breaker_steers_a_rewritten_bash_grep() {
+fn subc_bridge_repeat_breaker_steers_bash_on_every_answer_path() {
     // Production mode applies the route bind's config document, which is what
     // turns the bash rewrite on.
-    run_subc_bridge_production_test_with_dispatch(
-        "subc_bridge_repeat_breaker_steers_a_rewritten_bash_grep",
-        Duration::from_secs(90),
-        drive_rewritten_bash_repeat_breaker_daemon,
+    run_subc_bridge_test_inner(
+        "subc_bridge_repeat_breaker_steers_bash_on_every_answer_path",
+        Duration::from_secs(120),
+        || {
+            vec![set_test_foreground_wait_ms(
+                super::repeat_breaker_test::REPEAT_FOREGROUND_WAIT_MS,
+            )]
+        },
+        drive_bash_repeat_breaker_daemon,
         |_, _, _| {},
-        rewritten_bash_repeat_dispatch,
+        false,
+        None,
+        bash_repeat_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
     );
 }
 
-fn rewritten_bash_repeat_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+fn bash_repeat_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
         "bash" => aft::commands::bash::handle(&req, ctx),
@@ -3057,7 +3067,7 @@ fn rewritten_bash_repeat_dispatch(req: RawRequest, ctx: &AppContext) -> Response
         other => Response::error(
             req.id,
             "unexpected_command",
-            format!("unexpected rewritten bash repeat command: {other}"),
+            format!("unexpected bash repeat command: {other}"),
         ),
     }
 }
@@ -4162,9 +4172,11 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
 }
 
 /// Subc answers bash on its own deferred path rather than through the shared
-/// tool-call runner. A model repeating one bash grep that the rewrite answers
-/// must still be steered on the third call.
-async fn drive_rewritten_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
+/// tool-call runner. A model repeating one bash command must be steered on the
+/// third call whichever way the path answers it: at once by the rewrite, by the
+/// foreground wait when the command finishes, or by promoting a command that
+/// outlives the wait.
+async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
@@ -4184,43 +4196,75 @@ async fn drive_rewritten_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
     )
     .await;
     expect_route_bind_ack(&mut stream, 10).await;
-    let mut texts = Vec::new();
+    let mut rewritten = Vec::new();
+    let mut finished = Vec::new();
+    let mut promoted = Vec::new();
 
     for (index, description) in super::repeat_breaker_test::DESCRIPTIONS
         .into_iter()
         .enumerate()
     {
-        let corr = 900 + index as u64;
-        let response = call_tool_response(
-            &mut stream,
-            1,
-            corr,
-            "bash",
-            super::repeat_breaker_test::rewritten_bash_grep_arguments(description),
-            "repeated rewritten bash grep",
-        )
-        .await;
-        assert_tool_success(&response, "repeated rewritten bash grep");
-        let text = response["text"].as_str().unwrap_or_default().to_string();
-        super::repeat_breaker_test::assert_answered_by_rewrite(&text);
-        texts.push(text);
-        // The plugin drains completions after every agent tool call on the
-        // same route; the breaker must not count that plumbing as a call.
-        let _drain = call_tool_response(
-            &mut stream,
-            1,
-            corr + 50,
-            "bash_drain_completions",
-            json!({}),
-            "repeat breaker drain between bash calls",
-        )
-        .await;
+        for (offset, kind, arguments) in [
+            (
+                0,
+                "rewritten",
+                super::repeat_breaker_test::rewritten_bash_grep_arguments(description),
+            ),
+            (
+                10,
+                "finished",
+                super::repeat_breaker_test::finished_bash_arguments(description),
+            ),
+            (
+                20,
+                "promoted",
+                super::repeat_breaker_test::promoted_bash_arguments(description),
+            ),
+        ] {
+            let corr = 900 + offset + index as u64;
+            let response =
+                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await;
+            assert_tool_success(&response, kind);
+            let text = response["text"].as_str().unwrap_or_default().to_string();
+            match kind {
+                "rewritten" => {
+                    super::repeat_breaker_test::assert_answered_by_rewrite(&text);
+                    rewritten.push(text);
+                }
+                "finished" => {
+                    super::repeat_breaker_test::assert_finished_in_foreground(&text);
+                    finished.push(text);
+                }
+                _ => {
+                    super::repeat_breaker_test::assert_promoted(&text);
+                    promoted.push(text);
+                }
+            }
+            // The plugin drains completions after every agent tool call on the
+            // same route; the breaker must not count that plumbing as a call.
+            let _drain = call_tool_response(
+                &mut stream,
+                1,
+                corr + 50,
+                "bash_drain_completions",
+                json!({}),
+                "repeat breaker drain between bash calls",
+            )
+            .await;
+        }
         if index < 2 {
             tokio::time::sleep(Duration::from_secs(16)).await;
         }
     }
 
-    super::repeat_breaker_test::assert_transport_repeat_sequence(&texts);
+    super::repeat_breaker_test::assert_transport_repeat_sequence(&rewritten);
+    super::repeat_breaker_test::assert_third_call_steers(
+        "foreground-finished bash",
+        &finished,
+        true,
+    );
+    // Each promotion names a new task, so the output drifts.
+    super::repeat_breaker_test::assert_third_call_steers("promoted bash", &promoted, false);
     send_connection_goodbye(&mut stream).await;
 }
 

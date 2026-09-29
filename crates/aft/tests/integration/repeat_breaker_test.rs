@@ -50,6 +50,65 @@ pub(super) fn assert_answered_by_rewrite(text: &str) {
     );
 }
 
+/// Foreground wait window for the fixtures below: long enough for the quick
+/// command to finish inside it, short enough for the slow one to outlive it.
+pub(super) const REPEAT_FOREGROUND_WAIT_MS: u64 = 1_500;
+pub(super) const FINISHED_MARKER: &str = "repeat-native-finished";
+
+/// A native command that finishes inside the foreground wait, so the wait
+/// answers it with the command's result.
+pub(super) fn finished_bash_arguments(description: &str) -> Value {
+    json!({
+        "command": format!("sleep 0.2; echo {FINISHED_MARKER}"),
+        "description": description,
+    })
+}
+
+/// A native command that outlives the foreground wait, so the call is answered
+/// by promoting the command to a background task.
+pub(super) fn promoted_bash_arguments(description: &str) -> Value {
+    json!({
+        "command": "sleep 4; echo repeat-native-promoted",
+        "description": description,
+    })
+}
+
+/// Rounds 1 and 2 carry no reminder and round 3 names the 3rd call. Counting
+/// any call twice would make round 3 the 6th instead.
+pub(super) fn assert_third_call_steers(label: &str, texts: &[String], identical: bool) {
+    assert_eq!(texts.len(), 3, "{label}: {texts:?}");
+    for (index, text) in texts.iter().take(2).enumerate() {
+        assert!(
+            !text.contains("<system-reminder>"),
+            "{label} call {index} must not steer: {text:?}"
+        );
+    }
+    let expected = if identical {
+        "This is the 3rd identical call"
+    } else {
+        "This is the 3rd call with the same arguments"
+    };
+    assert!(
+        texts[2].contains(expected),
+        "{label} third call must steer with {expected:?}: {:?}",
+        texts[2]
+    );
+}
+
+pub(super) fn assert_finished_in_foreground(text: &str) {
+    assert!(
+        text.contains(FINISHED_MARKER) && !text.contains("promoted to background"),
+        "quick bash must finish inside the foreground wait: {text:?}"
+    );
+}
+
+pub(super) fn assert_promoted(text: &str) {
+    assert!(
+        text.contains("promoted to background"),
+        "slow bash must be promoted to the background: {text:?}"
+    );
+}
+
 pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
     assert_eq!(texts.len(), 3);
     assert!(
@@ -603,6 +662,95 @@ fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
     }
 
     assert_transport_repeat_sequence(&texts);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
+    // The Pi plugin and the OpenCode plugin in standalone mode send each model
+    // bash call as a top-level `bash` request, arguments nested under `params`,
+    // and show the model the response's `output`.
+    let project = tempfile::tempdir().expect("raw bash repeat project");
+    write_rewritten_grep_fixture(project.path());
+    let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_FOREGROUND_WAIT_MS",
+        std::ffi::OsStr::new(&wait_ms),
+    )]);
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "pi",
+            "project_root": project.path(),
+            "config": crate::test_helpers::user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "configure: {configured:?}");
+    let mut rewritten = Vec::new();
+    let mut finished = Vec::new();
+    let mut promoted = Vec::new();
+
+    for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
+        for (kind, arguments) in [
+            ("rewritten", rewritten_bash_grep_arguments(description)),
+            ("finished", finished_bash_arguments(description)),
+            ("promoted", promoted_bash_arguments(description)),
+        ] {
+            let mut params = arguments;
+            let object = params.as_object_mut().expect("bash arguments object");
+            object.insert("workdir".to_string(), json!(project.path()));
+            object.insert("background".to_string(), json!(false));
+            object.insert("notify_on_completion".to_string(), json!(false));
+            object.insert("pty".to_string(), json!(false));
+            object.insert("foreground_orchestrate".to_string(), json!(true));
+            object.insert("block_to_completion".to_string(), json!(false));
+            object.insert("wait".to_string(), json!(false));
+            let response = aft.send_with_timeout(
+                &serde_json::to_string(&json!({
+                    "id": format!("repeat-raw-bash-{kind}-{index}"),
+                    "command": "bash",
+                    "session_id": SESSION,
+                    "params": params,
+                }))
+                .expect("serialize raw bash request"),
+                Duration::from_secs(20),
+            );
+            assert_eq!(response["success"], true, "{kind} raw bash: {response:?}");
+            let output = response["output"]
+                .as_str()
+                .unwrap_or_else(|| panic!("raw bash response missing output: {response:?}"))
+                .to_string();
+            match kind {
+                "rewritten" => {
+                    assert_answered_by_rewrite(&output);
+                    rewritten.push(output);
+                }
+                "finished" => {
+                    assert_finished_in_foreground(&output);
+                    finished.push(output);
+                }
+                _ => {
+                    assert_promoted(&output);
+                    promoted.push(output);
+                }
+            }
+        }
+        if index < 2 {
+            std::thread::sleep(Duration::from_secs(16));
+        }
+    }
+
+    assert_third_call_steers("rewritten grep", &rewritten, true);
+    assert_third_call_steers("foreground-finished bash", &finished, true);
+    // Each promotion names a new task, so the output drifts.
+    assert_third_call_steers("promoted bash", &promoted, false);
     assert!(aft.shutdown().success());
 }
 

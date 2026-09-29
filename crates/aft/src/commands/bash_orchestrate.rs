@@ -106,6 +106,90 @@ pub fn foreground_orchestrate_enabled(req: &RawRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// The repeat breaker's capture of a `bash` or `powershell` request that a
+/// plugin sent directly over the standalone protocol, as the Pi plugin and the
+/// OpenCode plugin in standalone mode do for every model bash call.
+///
+/// Those plugins show the model the response's `output` field, so this is
+/// where the breaker's reminder goes. Only the standalone request loop may
+/// build one: the shared tool-call runner and subc reach the same bash handler
+/// internally and already observe the call, so observing there too would count
+/// every call twice.
+pub struct RawBashRepeat(Option<crate::run_tool_call::RepeatObservation>);
+
+/// Captures a top-level `bash`/`powershell` request before it runs. The plugin
+/// nests the tool arguments under `params` because `command` would otherwise
+/// collide with the request's own `command` field.
+pub fn raw_bash_repeat(req: &RawRequest) -> RawBashRepeat {
+    let arguments = req.params.get("params").unwrap_or(&req.params);
+    RawBashRepeat(crate::run_tool_call::RepeatObservation::for_agent_call(
+        req.session(),
+        &req.command,
+        arguments,
+        false,
+    ))
+}
+
+impl RawBashRepeat {
+    /// Observes the call once, on whichever response answers it: at once, or
+    /// from the deferred foreground wait when the command finishes or is
+    /// promoted to the background. A deferred call that never answers (the
+    /// connection closes or AFT shuts down) is not observed.
+    pub fn observe_outcome(self, ctx: &AppContext, outcome: DispatchOutcome) -> DispatchOutcome {
+        let Some(repeat) = self.0 else {
+            return outcome;
+        };
+        match outcome {
+            DispatchOutcome::Immediate(mut response) => {
+                observe_raw_bash_response(repeat, ctx, &mut response);
+                DispatchOutcome::Immediate(response)
+            }
+            DispatchOutcome::Deferred(mut pending) => {
+                let mut inner = pending.poll;
+                let mut repeat = Some(repeat);
+                pending.poll = Box::new(move |ctx| {
+                    let mut response = inner(ctx)?;
+                    if let Some(repeat) = repeat.take() {
+                        observe_raw_bash_response(repeat, ctx, &mut response);
+                    }
+                    Some(response)
+                });
+                DispatchOutcome::Deferred(pending)
+            }
+        }
+    }
+}
+
+/// Hashes and extends the text the plugins render: `output` on a result, or
+/// `message` on an error, which the plugins raise as the tool's error text.
+///
+/// A permission ask is not an answer. The plugin asks the user and resends the
+/// same request with the grant, still for one model call, so only the resent
+/// request's answer is observed.
+fn observe_raw_bash_response(
+    repeat: crate::run_tool_call::RepeatObservation,
+    ctx: &AppContext,
+    response: &mut Response,
+) {
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    let field = if response.success {
+        "output"
+    } else if data.get("code").and_then(Value::as_str)
+        == Some(crate::protocol::ERROR_PERMISSION_REQUIRED)
+    {
+        return;
+    } else {
+        "message"
+    };
+    let Some(mut text) = data.get(field).and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    repeat.observe(ctx, &mut text);
+    data.insert(field.to_string(), Value::String(text));
+}
+
 pub fn build_bash_outcome(
     req: &RawRequest,
     ctx: &AppContext,

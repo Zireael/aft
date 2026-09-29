@@ -1403,11 +1403,18 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
             Arc::clone(ctx),
         );
     }
-    if matches!(req.command.as_str(), "bash" | "powershell")
-        && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
-    {
-        let spawn_response = aft::commands::bash::handle(&req, ctx);
-        return aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response);
+    if matches!(req.command.as_str(), "bash" | "powershell") {
+        // A top-level bash request is a model's bash call sent straight from a
+        // plugin; the tool-call runner and subc reach the bash handler through
+        // `dispatch` and observe their own calls, so only this entry observes.
+        let repeat = aft::commands::bash_orchestrate::raw_bash_repeat(&req);
+        let outcome = if aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req) {
+            let spawn_response = aft::commands::bash::handle(&req, ctx);
+            aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response)
+        } else {
+            DispatchOutcome::Immediate(dispatch(req, ctx))
+        };
+        return repeat.observe_outcome(ctx, outcome);
     }
     if req.command == "read" {
         return aft::commands::read::build_read_outcome(req, ctx);

@@ -453,7 +453,9 @@ pub(crate) fn finish_tool_call_response(
 ///
 /// Every path that answers an agent tool call must observe it exactly once,
 /// through this type. The shared runner does so for most tools; subc answers
-/// `bash` and `powershell` on its own deferred path and observes there. A
+/// `bash` and `powershell` on its own deferred path and observes there, and the
+/// standalone request loop observes the top-level `bash`/`powershell` requests
+/// plugins send directly (`bash_orchestrate::RawBashRepeat`). A
 /// path that skips observation leaves the breaker blind to that tool: a model
 /// can then repeat one bash command indefinitely without being steered.
 #[derive(Debug, Clone)]
