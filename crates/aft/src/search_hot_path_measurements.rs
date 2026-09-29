@@ -73,12 +73,19 @@ pub(crate) fn result_digest(case: &str, value: &impl serde::Serialize) {
     fn relative_paths(value: &mut serde_json::Value, root: &str) {
         match value {
             serde_json::Value::String(text) => {
-                if let Some(relative) = text.strip_prefix(root).filter(|relative| relative.starts_with(std::path::MAIN_SEPARATOR)) {
+                if let Some(relative) = text
+                    .strip_prefix(root)
+                    .filter(|relative| relative.starts_with(std::path::MAIN_SEPARATOR))
+                {
                     *text = format!("<corpus>{relative}");
                 }
             }
-            serde_json::Value::Array(values) => values.iter_mut().for_each(|value| relative_paths(value, root)),
-            serde_json::Value::Object(values) => values.values_mut().for_each(|value| relative_paths(value, root)),
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .for_each(|value| relative_paths(value, root)),
+            serde_json::Value::Object(values) => values
+                .values_mut()
+                .for_each(|value| relative_paths(value, root)),
             _ => {}
         }
     }

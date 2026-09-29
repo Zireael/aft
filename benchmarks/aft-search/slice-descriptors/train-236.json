@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "semantic-shared-base-root-deltas",
+    "search-readiness-background-borrowed-loads",
+    "search-hot-path-work-counts",
+    "read-latency-375",
+    "zoom-parser-patch-cache-work-counts"
+  ],
+  "note": "Derived from git diff --name-only origin/main: ranking fence hits are commands/semantic_search/{anchored_lane.rs,exact_lane.rs,lexical_lane.rs,mod.rs}, lib.rs, query_shape.rs, search_index.rs and semantic_index.rs under crates/aft/src. Declared engine_unwired because these changes preserve ranking while sharing immutable semantic seeds, reconciling root-local deltas, retaining serving generations and avoiding repeated hot-path work. Ranked rows must remain byte-identical to the committed reference."
+}

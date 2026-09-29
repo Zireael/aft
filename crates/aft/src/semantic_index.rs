@@ -4906,7 +4906,9 @@ impl SemanticIndex {
         if let Some(base) = &self.shared_base {
             for entry in &base.entries {
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
                 if self.tombstones.contains(&entry.chunk.file) {
                     continue;
                 }
@@ -4915,7 +4917,9 @@ impl SemanticIndex {
                     continue;
                 }
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| counts.reused_payload_clones += 1);
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.reused_payload_clones += 1
+                });
                 reuse_map
                     .entry(path)
                     .or_default()
@@ -5931,8 +5935,10 @@ impl SemanticIndex {
             .collect::<Vec<_>>();
         let (mut chunks, mut fresh_metadata) =
             Self::collect_chunks(project_root, &indexed_paths, embed_text_caps);
-        let available =
-            max_files.saturating_sub(self.indexed_file_count().saturating_add(fresh_metadata.len()));
+        let available = max_files.saturating_sub(
+            self.indexed_file_count()
+                .saturating_add(fresh_metadata.len()),
+        );
         // Failed indexed files free capacity. Only after collecting them is it
         // safe to skip already-deferred files when no new file can be admitted.
         // Not-yet-deferred files are still collected so only successful files defer.
@@ -11486,19 +11492,35 @@ Connection: close
             });
             std::hint::black_box(update);
         }
-        let deferred = (0..100).map(|n| {
-            let file = temp.path().join(format!("deferred/file_{n}.rs"));
-            write_source(&file, &fs::read_to_string(&files[0]).unwrap());
-            file
-        }).collect::<Vec<_>>();
-        index.refresh_invalidated_files(temp.path(), &deferred, &mut |_| {
-            panic!("files beyond the cap must not embed")
-        }, 16, 200, &mut |_, _| {}).unwrap();
+        let deferred = (0..100)
+            .map(|n| {
+                let file = temp.path().join(format!("deferred/file_{n}.rs"));
+                write_source(&file, &fs::read_to_string(&files[0]).unwrap());
+                file
+            })
+            .collect::<Vec<_>>();
+        index
+            .refresh_invalidated_files(
+                temp.path(),
+                &deferred,
+                &mut |_| panic!("files beyond the cap must not embed"),
+                16,
+                200,
+                &mut |_, _| {},
+            )
+            .unwrap();
         assert_eq!(index.deferred_files.len(), 100);
         measure("semantic/refresh_full_cap_100_deferred", || {
-            index.refresh_invalidated_files(temp.path(), &files[..1], &mut |_| {
-                panic!("unchanged admitted chunks must reuse embeddings")
-            }, 16, 200, &mut |_, _| {}).unwrap()
+            index
+                .refresh_invalidated_files(
+                    temp.path(),
+                    &files[..1],
+                    &mut |_| panic!("unchanged admitted chunks must reuse embeddings"),
+                    16,
+                    200,
+                    &mut |_, _| {},
+                )
+                .unwrap()
         });
         let borrowed = SemanticIndex::from_shared_base(
             temp.path().to_path_buf(),
