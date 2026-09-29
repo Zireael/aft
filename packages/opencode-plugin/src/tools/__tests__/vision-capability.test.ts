@@ -1,7 +1,10 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { rememberReadModel, VISION_HOST_TIMEOUT_MS } from "../../shared/read-vision.js";
 import type { PluginContext } from "../../types.js";
 import { createReadTool } from "../hoisted.js";
 
@@ -25,7 +28,11 @@ function makeHarness(models: ModelConfig[], ghReadEnabled = false) {
   const bridge = {
     async toolCall(sessionID: string | undefined, name: string, args: Record<string, unknown>) {
       calls.push({ sessionID, name, args: { ...args } });
-      return { success: true, text: "read result" };
+      return {
+        success: true,
+        text: "read result",
+        attachments: [{ mime: "image/png", data: "AA==" }],
+      };
     },
   };
   const client = {
@@ -84,6 +91,7 @@ function makeHarness(models: ModelConfig[], ghReadEnabled = false) {
 
   return {
     tool,
+    client,
     context,
     calls,
     setCurrentModelID(modelID: string) {
@@ -122,7 +130,7 @@ describe("OpenCode read vision capability", () => {
     expect(harness.tool.args).not.toHaveProperty("vision_capability");
     expect(harness.tool.description).toBe(`Read file contents or list directory entries.
 
-Use either startLine/endLine OR offset/limit to read a section of a file.
+Use either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.
 
 Behavior:
 - Returns line-numbered content (e.g., "1: const x = 1")
@@ -130,7 +138,7 @@ Behavior:
 - Output capped at 50KB
 - Binary files are auto-detected and return a size-only message
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
-- Directories return sorted entries with trailing / for subdirectories
+- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.
 
 Examples:
   Read full file: { "path": "src/app.ts" }
@@ -166,17 +174,59 @@ Examples:
     expect(harness.calls[0]?.args).toEqual({ filePath: "issue://42" });
   });
 
-  test("reads the session model again on every call so a model switch takes effect", async () => {
+  test("host model switch refreshes capability without history", async () => {
     const harness = makeHarness([
       { id: "vision", modalities: { input: ["text", "image"] } },
       { id: "text", modalities: { input: ["text"] } },
     ]);
 
+    rememberReadModel(harness.client, harness.context.sessionID, {
+      providerID: "test-provider",
+      modelID: "vision",
+    });
     await read(harness.tool, harness.context);
-    harness.setCurrentModelID("text");
+    rememberReadModel(harness.client, harness.context.sessionID, {
+      providerID: "test-provider",
+      modelID: "text",
+    });
     await read(harness.tool, harness.context);
 
     expect(harness.calls.map((call) => call.args.vision_capability)).toEqual([true, false]);
-    expect(harness.lookupCounts()).toEqual({ messageLookups: 2, providerLookups: 2 });
+    expect(harness.lookupCounts()).toEqual({ messageLookups: 0, providerLookups: 2 });
   });
 });
+
+test("concurrent image reads coalesce history and catalog and reuse capability", async () => {
+  const harness = makeHarness([{ id: "vision", attachment: true }]);
+  const messages = harness.client.session.messages;
+  harness.client.session.messages = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return messages();
+  };
+  const directory = await mkdtemp(join(process.cwd(), ".vision-test-"));
+  const filePath = join(directory, "image.png");
+  try {
+    await writeFile(filePath, Buffer.from("iVBORw0KGgo=", "base64"));
+    await Promise.all(
+      Array.from({ length: 8 }, () => harness.tool.execute({ filePath }, harness.context)),
+    );
+    expect(harness.lookupCounts()).toEqual({ messageLookups: 1, providerLookups: 1 });
+    expect(harness.calls.every((call) => call.args.vision_capability === true)).toBe(true);
+    await harness.tool.execute({ filePath }, harness.context);
+    expect(harness.lookupCounts().providerLookups).toBe(1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const host of ["history", "catalog"] as const) {
+  test(`hung ${host} times out to safe unknown capability`, async () => {
+    const harness = makeHarness([{ id: "vision", attachment: true }]);
+    if (host === "history") harness.client.session.messages = () => new Promise(() => {});
+    else harness.client.provider.list = () => new Promise(() => {});
+    const start = performance.now();
+    await read(harness.tool, harness.context);
+    expect(performance.now() - start).toBeLessThan(VISION_HOST_TIMEOUT_MS + 1000);
+    expect(harness.calls[0]?.args).toEqual({ filePath: "issue://42" });
+  });
+}

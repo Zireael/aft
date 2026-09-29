@@ -62,6 +62,7 @@ import {
 import { resolvePluginVersion } from "./plugin-version.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
+import { rememberReadModel } from "./shared/read-vision.js";
 import {
   drainNotifications,
   isTuiConnected,
@@ -916,6 +917,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         });
       }
       await flushConfigureWarningsOnIdle(sessionID);
+    },
+    "chat.params": async (params: {
+      sessionID: string;
+      model: { providerID: string; id: string };
+    }) => {
+      rememberReadModel(input.client, params.sessionID, {
+        providerID: params.model.providerID,
+        modelID: params.model.id,
+      });
     },
     "chat.message": async (
       messageInput: {

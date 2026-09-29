@@ -4,7 +4,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { createReadTool } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
 
-async function readTextWithHostProbe() {
+async function readTextWithHostProbe(filePath = "README.md") {
   const events: string[] = [];
   const root = process.cwd();
   const ctx = {
@@ -46,20 +46,17 @@ async function readTextWithHostProbe() {
       events.push("permission.read");
     },
   };
-  const result = await createReadTool(ctx).execute({ filePath: "README.md" }, context);
+  const result = await createReadTool(ctx).execute({ filePath }, context);
   return { events, result };
 }
 
-test("text read currently awaits host history and catalog before bridge dispatch", async () => {
+test("text read does not fetch host history or model catalog", async () => {
   const { events, result } = await readTextWithHostProbe();
   expect(result).toMatchObject({ output: "1: plain text\n" });
-  expect(events).toEqual(["permission.read", "session.messages", "provider.list", "bridge.read"]);
+  expect(events).toEqual(["permission.read", "bridge.read"]);
 });
 
-// Opt in to the proposed latency contract without changing production behavior
-// or making the normal suite red before the operator approves a fix.
-const red = process.env.AFT_ISSUE_375_RED === "1" ? test : test.skip;
-red("text read does not fetch host history or model catalog", async () => {
-  const { events } = await readTextWithHostProbe();
+test("directory read does not fetch host history or model catalog", async () => {
+  const { events } = await readTextWithHostProbe(".");
   expect(events).toEqual(["permission.read", "bridge.read"]);
 });

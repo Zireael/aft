@@ -14,6 +14,7 @@ type ToolPerfSlot = {
   t0: number;
   bridgeStart?: number;
   bridgeEnd?: number;
+  stages?: Partial<Record<"directory" | "permission" | "capability", number>>;
 };
 
 const perfStore = new AsyncLocalStorage<ToolPerfSlot>();
@@ -38,7 +39,26 @@ export function markBridgeEnd(): void {
   }
 }
 
+export async function measurePreStage<T>(
+  stage: "directory" | "permission" | "capability",
+  operation: () => Promise<T>,
+): Promise<T> {
+  const start = performance.now();
+  try {
+    return await operation();
+  } finally {
+    const slot = perfStore.getStore();
+    if (slot) {
+      slot.stages ??= {};
+      slot.stages[stage] = (slot.stages[stage] ?? 0) + performance.now() - start;
+    }
+  }
+}
+
 function emit(slot: ToolPerfSlot): void {
+  const stages = slot.stages
+    ? ` directory=${Math.round(slot.stages.directory ?? 0)}ms permission=${Math.round(slot.stages.permission ?? 0)}ms capability=${Math.round(slot.stages.capability ?? 0)}ms`
+    : "";
   const t3 = performance.now();
   const total = Math.round(t3 - slot.t0);
   if (slot.bridgeStart !== undefined && slot.bridgeEnd !== undefined) {
@@ -47,11 +67,11 @@ function emit(slot: ToolPerfSlot): void {
     const post = Math.round(t3 - slot.bridgeEnd);
     sessionLog(
       slot.sessionID,
-      `perf tool=${slot.tool} total=${total}ms pre=${pre}ms bridge=${bridge}ms post=${post}ms`,
+      `perf tool=${slot.tool} total=${total}ms pre=${pre}ms bridge=${bridge}ms post=${post}ms${stages}`,
     );
   } else {
     // Tool returned without a bridge round-trip (pure-TS path or early error).
-    sessionLog(slot.sessionID, `perf tool=${slot.tool} total=${total}ms (no bridge call)`);
+    sessionLog(slot.sessionID, `perf tool=${slot.tool} total=${total}ms (no bridge call)${stages}`);
   }
 }
 

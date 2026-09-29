@@ -9,13 +9,15 @@
  * backup tracking, formatting, and inline diagnostics.
  */
 
+import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
-import { resolvePromptContext } from "../shared/last-assistant-model.js";
+import { currentSessionVisionCapability } from "../shared/read-vision.js";
+import { measurePreStage } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -63,71 +65,6 @@ const ISSUE_AND_PR_READ_DESCRIPTION =
 /** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {
   return enabled ? description : "";
-}
-
-type OpenCodeModelCatalogEntry = {
-  attachment?: unknown;
-  modalities?: { input?: unknown };
-};
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function visionCapabilityForOpenCodeModel(model: unknown): boolean | undefined {
-  const entry = model as OpenCodeModelCatalogEntry | undefined;
-  if (Array.isArray(entry?.modalities?.input)) {
-    return entry.modalities.input.includes("image");
-  }
-  return typeof entry?.attachment === "boolean" ? entry.attachment : undefined;
-}
-
-function modelFromOpenCodeProvider(provider: Record<string, unknown>, modelID: string): unknown {
-  const models = provider.models;
-  if (Array.isArray(models)) {
-    return models.find((model) => asRecord(model)?.id === modelID);
-  }
-  return asRecord(models)?.[modelID];
-}
-
-/**
- * Resolve the current session model for this call instead of retaining a bind-time
- * capability. A missing model catalog entry deliberately remains unspecified so
- * the server's safe text-only default applies.
- */
-async function currentSessionVisionCapability(
-  client: unknown,
-  sessionID: string | undefined,
-): Promise<boolean | undefined> {
-  if (!sessionID) return undefined;
-  const promptContext = await resolvePromptContext(client, sessionID);
-  const currentModel = promptContext?.model;
-  if (!currentModel) return undefined;
-
-  const providerApi = (client as { provider?: { list?: () => Promise<unknown> } }).provider;
-  if (typeof providerApi?.list !== "function") return undefined;
-
-  let listed: unknown;
-  try {
-    listed = await providerApi.list();
-  } catch {
-    return undefined;
-  }
-  const result = asRecord(listed);
-  const catalog = asRecord(result?.data) ?? result;
-  const providers = Array.isArray(catalog?.all)
-    ? catalog.all
-    : Array.isArray(catalog?.providers)
-      ? catalog.providers
-      : [];
-  const provider = providers.map(asRecord).find((entry) => entry?.id === currentModel.providerID);
-  if (!provider) return undefined;
-
-  return visionCapabilityForOpenCodeModel(
-    modelFromOpenCodeProvider(provider, currentModel.modelID),
-  );
 }
 
 /**
@@ -421,7 +358,9 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       },
       execute: async (args, context): Promise<ToolResult> => {
         const file = args.path as string;
-        const projectRoot = await resolveProjectRoot(ctx, context);
+        const projectRoot = await measurePreStage("directory", () =>
+          resolveProjectRoot(ctx, context),
+        );
 
         // Resolve relative paths from the same session/project root used by the bridge.
         const filePath = resolvePathFromProjectRoot(projectRoot, file);
@@ -431,27 +370,31 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         // restriction, reads continue to Rust so its session task registry can
         // distinguish exact bash artifacts from ordinary external paths.
         {
-          const denial = await assertExternalDirectoryPermission(ctx, context, filePath, {
-            serverValidatedRead: true,
-          });
+          const denial = await measurePreStage("permission", () =>
+            assertExternalDirectoryPermission(ctx, context, filePath, {
+              serverValidatedRead: true,
+            }),
+          );
           if (denial) return permissionDeniedResponse(denial);
         }
 
         // Permission check
         try {
-          await runAsk(
-            context.ask({
-              permission: "read",
-              // OpenCode states a read permission against the path relative to
-              // the project directory when the file is inside it, and only
-              // falls back to the absolute path for files outside. Sending the
-              // absolute path for a file in the project root instead made every
-              // project-relative read rule unmatchable, so such a read could
-              // never be the one the user had already permitted.
-              patterns: [permissionPath(context, filePath)],
-              always: ["*"],
-              metadata: {},
-            }),
+          await measurePreStage("permission", () =>
+            runAsk(
+              context.ask({
+                permission: "read",
+                // OpenCode states a read permission against the path relative to
+                // the project directory when the file is inside it, and only
+                // falls back to the absolute path for files outside. Sending the
+                // absolute path for a file in the project root instead made every
+                // project-relative read rule unmatchable, so such a read could
+                // never be the one the user had already permitted.
+                patterns: [permissionPath(context, filePath)],
+                always: ["*"],
+                metadata: {},
+              }),
+            ),
           );
         } catch (error) {
           const failure = classifyPermissionError(error);
@@ -486,10 +429,20 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         // Only send limit if we did NOT convert offset to startLine/endLine.
         if (rawLimit !== undefined && rawOffset === undefined) rawArgs.limit = rawLimit;
 
-        const visionCapability = await currentSessionVisionCapability(
-          ctx.client,
-          context.sessionID,
-        );
+        // GitHub resources can embed images. For local media extensions, exclude
+        // directories before negotiating capability; all other reads dispatch directly.
+        const mediaCandidate =
+          isGithubResourcePath(file) ||
+          (/\.(png|jpe?g|gif|webp|pdf)$/i.test(filePath) &&
+            (await stat(filePath).then(
+              (info) => info.isFile(),
+              () => false,
+            )));
+        const visionCapability = mediaCandidate
+          ? await measurePreStage("capability", () =>
+              currentSessionVisionCapability(ctx.client, context.sessionID),
+            )
+          : undefined;
         if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
 
         const response = await callToolCall(ctx, context, "read", rawArgs);
