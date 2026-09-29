@@ -172,6 +172,10 @@ impl WatchRegistry {
         self.watches.keys().cloned().collect()
     }
 
+    pub fn watch_specs(&self, task_id: &str) -> Vec<WatchSpec> {
+        self.watches.get(task_id).cloned().unwrap_or_default()
+    }
+
     /// Reconcile process-local watch state with the durable rows shared by actors.
     pub fn reconcile_watch_ids(
         &mut self,

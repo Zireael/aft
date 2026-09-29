@@ -241,6 +241,39 @@ fn erase_persisted_task_row(
     row
 }
 
+/// Waits for the process running a task to write the task's erased row again.
+fn wait_for_task_row(storage: &Path, harness: &str, session: &str, task_id: &str) {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
+    let started = Instant::now();
+    while aft::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
+        .expect("read persisted task row")
+        .is_none()
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "the running task's erased row was not written again"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Deletes a task's row and its watch rows.
+fn erase_persisted_task_and_watch_rows(
+    storage: &Path,
+    harness: &str,
+    session: &str,
+    task_id: &str,
+) {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
+    for table in ["bash_pattern_watches", "bash_tasks"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3"),
+            rusqlite::params![harness, session, task_id],
+        )
+        .expect("erase persisted task rows");
+    }
+}
+
 fn wait_for_process_exit(pid: u32) {
     let started = Instant::now();
     while process_is_alive(pid) {
@@ -1982,7 +2015,6 @@ fn erased_watch_is_process_local_and_never_replays_to_a_foreign_session() {
     const HARNESS: &str = "pi";
     const ORIGINATING_SESSION: &str = "session-a";
     const FOREIGN_SESSION: &str = "session-b";
-    const ERASED_TEXT: &str = "watch target erased";
 
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
@@ -2017,16 +2049,13 @@ fn erased_watch_is_process_local_and_never_replays_to_a_foreign_session() {
         .expect("running child PID") as u32;
 
     let _ = erase_persisted_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
-    let tombstone_frame = wait_for_pattern_frame(&mut session_a, &task_id);
-    assert_eq!(tombstone_frame["reason"], "task_exit");
-    assert_eq!(tombstone_frame["match_text"], ERASED_TEXT);
-    assert!(
-        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id)
-            .is_empty(),
-        "erased target must have no durable watch row"
-    );
+    // The process running the task writes its erased row again.
+    wait_for_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
 
     sigkill_aft(session_a);
+    // With the originating process gone nothing restores the rows; erase the
+    // task and its watches, the state an erased task leaves behind.
+    erase_persisted_task_and_watch_rows(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
     fs::write(&release, "release").unwrap();
     wait_for_process_exit(child_pid);
     let resolved = resolve_task_layout(
@@ -2129,8 +2158,10 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
         .as_u64()
         .expect("running child PID") as u32;
 
-    let _ = erase_persisted_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
+    // Erase the row only after the originating process is gone: while it
+    // runs, that process writes the row of its running task again.
     sigkill_aft(session_a);
+    let _ = erase_persisted_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
     fs::write(&release, "release").unwrap();
     wait_for_process_exit(child_pid);
     let resolved = resolve_task_layout(
@@ -2181,7 +2212,6 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
 
 fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
     const HARNESS: &str = "pi";
-    const ERASED_TEXT: &str = "watch target erased";
 
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
@@ -2208,13 +2238,12 @@ fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
         .expect("running child PID") as u32;
 
     let task_row = erase_persisted_task_row(storage.path(), HARNESS, SESSION, &task_id);
-    let first_frame = wait_for_pattern_frame(&mut aft, &task_id);
-    assert_eq!(first_frame["reason"], "task_exit");
-    assert_eq!(first_frame["match_text"], ERASED_TEXT);
-    assert!(
-        persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).is_empty(),
-        "live tombstone delivery must not recreate a durable watch row"
-    );
+    // The process running the task writes its erased row again.
+    wait_for_task_row(storage.path(), HARNESS, SESSION, &task_id);
+    sigkill_aft(aft);
+    // With that process gone nothing restores the rows; erase the task and
+    // its watches, the state an erased task leaves behind.
+    erase_persisted_task_and_watch_rows(storage.path(), HARNESS, SESSION, &task_id);
 
     if task_row_survives_restart {
         let conn = rusqlite::Connection::open(storage.path().join("aft.db"))
@@ -2222,7 +2251,6 @@ fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
         aft::db::bash_tasks::upsert_bash_task(&conn, &task_row)
             .expect("restore task row before restart");
     }
-    sigkill_aft(aft);
 
     if !task_row_survives_restart {
         fs::write(&release, "release").unwrap();

@@ -351,6 +351,11 @@ pub(crate) struct RegistryInner {
         Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
+    /// Harness each session's tasks were started under, recorded when a task
+    /// is registered. Row lookups for a session use it instead of
+    /// `db_harness`, which only names the harness that configured the root
+    /// most recently.
+    session_harnesses: Mutex<HashMap<String, String>>,
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
@@ -380,6 +385,11 @@ pub(crate) struct BgTask {
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// Harness namespace the task's aft.db row is keyed under: the harness of
+    /// the route that started it (or of the row it was replayed from). The
+    /// root context is shared by routes from several harnesses, so this can
+    /// differ from the registry's current `db_harness`.
+    db_harness: Option<String>,
     /// Orders this task's aft.db row writes, which happen after `state` is
     /// released; see [`DbWriteOrder`]. Shared by every `BgTask` for the same
     /// session and task id in the process.
@@ -631,6 +641,7 @@ impl BgTaskRegistry {
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
+                session_harnesses: Mutex::new(HashMap::new()),
                 compression_aggregates: Arc::new(CompressionAggregateCache::default()),
                 wake_tx,
                 wake_rx,
@@ -750,6 +761,17 @@ impl BgTaskRegistry {
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
+        // Tasks started while no handle was installed have no row yet; the
+        // in-memory task is authoritative, so write their rows now.
+        let running = self
+            .inner
+            .tasks
+            .lock()
+            .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for task in running.into_iter().filter(|task| !task.is_terminal()) {
+            self.ensure_task_row(&task);
+        }
     }
 
     pub fn clear_db_pool(&self) {
@@ -1243,6 +1265,22 @@ impl BgTaskRegistry {
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
+            // A registry without a harness belongs to an unconfigured library
+            // context, which never has a database. A configured one without a
+            // handle is missing a row it should have; a later watch
+            // registration or erased-row check writes it once the handle is
+            // installed.
+            if self
+                .inner
+                .db_harness
+                .read()
+                .is_ok_and(|slot| slot.is_some())
+            {
+                crate::slog_warn!(
+                    "dual-write bash_task to DB skipped for {}: aft.db is not attached to this registry",
+                    metadata.task_id
+                );
+            }
             return;
         };
         let harness = metadata.harness.clone().or_else(|| {
@@ -1294,12 +1332,13 @@ impl BgTaskRegistry {
         let Some(pool) = pool else {
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata.harness.clone().or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "GC bash_task DB delete skipped for {}: harness not configured",
@@ -1419,11 +1458,142 @@ impl BgTaskRegistry {
         Some((harness, pool))
     }
 
+    fn remember_session_harness(&self, task: &BgTask) {
+        let Some(harness) = task.db_harness.as_ref() else {
+            return;
+        };
+        if let Ok(mut harnesses) = self.inner.session_harnesses.lock() {
+            harnesses
+                .entry(task.session_id.clone())
+                .or_insert_with(|| harness.clone());
+        }
+    }
+
+    /// The harness namespace a session's aft.db rows are keyed under.
+    ///
+    /// One project root is shared by routes from several harnesses, and each
+    /// configure replaces `db_harness` with its own. A session's task rows are
+    /// written under the harness of the route that started them, so this
+    /// prefers the harness recorded for the session's tasks, then the calling
+    /// route's harness, and only then the harness that configured the root
+    /// last.
+    fn db_harness_for_session(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .session_harnesses
+            .lock()
+            .ok()
+            .and_then(|harnesses| harnesses.get(session_id).cloned())
+            .or_else(|| super::route_harness().map(|harness| harness.storage_segment()))
+            .or_else(|| {
+                self.inner
+                    .db_harness
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+            })
+    }
+
+    fn db_harness_for_task(&self, task: &BgTask) -> Option<String> {
+        task.db_harness
+            .clone()
+            .or_else(|| self.db_harness_for_session(&task.session_id))
+    }
+
+    fn db_harness_and_pool_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        Some((self.db_harness_for_session(session_id)?, pool))
+    }
+
+    fn db_harness_and_pool_for_task(
+        &self,
+        task: &BgTask,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        Some((self.db_harness_for_task(task)?, pool))
+    }
+
+    /// Writes the task's row from its in-memory metadata when aft.db has no
+    /// row for it, and reports whether the row exists afterwards.
+    ///
+    /// The registry's in-memory task is authoritative while it runs; its row
+    /// can be missing because the spawn-time write happened before this
+    /// registry had an aft.db handle, failed, or was deleted underneath it.
+    /// Watch rows reference the task row, so a watch is only durable once
+    /// the row exists.
+    fn ensure_task_row(&self, task: &BgTask) -> bool {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(task) else {
+            return false;
+        };
+        // Fenced so a snapshot queued before this check is written first and
+        // none captured later can be overtaken by the one written here.
+        with_task_db_fence(&task.session_id, &task.task_id, || {
+            let metadata = match task.state.lock() {
+                Ok(state) => state.metadata.clone(),
+                Err(_) => return false,
+            };
+            let row = match metadata.to_bash_task_row(&harness, &task.paths) {
+                Ok(row) => row,
+                Err(error) => {
+                    crate::slog_warn!("bash_task row rewrite failed for {}: {error}", task.task_id);
+                    return false;
+                }
+            };
+            let Ok(conn) = pool.lock() else {
+                crate::slog_warn!(
+                    "bash_task row rewrite failed for {}: db mutex poisoned",
+                    task.task_id
+                );
+                return false;
+            };
+            match crate::db::bash_tasks::get_bash_task(
+                &conn,
+                &harness,
+                &task.session_id,
+                &task.task_id,
+            ) {
+                Ok(Some(_)) => true,
+                Ok(None) => match crate::db::bash_tasks::upsert_bash_task(&conn, &row) {
+                    Ok(()) => {
+                        crate::slog_warn!(
+                            "bash_task row for {} was missing under harness {harness}; rewrote it from the live task",
+                            task.task_id
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "bash_task row rewrite failed for {}: {error}",
+                            task.task_id
+                        );
+                        false
+                    }
+                },
+                Err(error) => {
+                    crate::slog_warn!("bash_task row check failed for {}: {error}", task.task_id);
+                    false
+                }
+            }
+        })
+    }
+
     pub fn pending_pattern_matches_for_session(
         &self,
         session_id: &str,
     ) -> Vec<BashPatternMatchFrame> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
         let rows = {
@@ -1486,7 +1656,7 @@ impl BgTaskRegistry {
         task_id: &str,
         storage_dir: &Path,
     ) -> Option<BgTaskSnapshot> {
-        let (harness, pool) = self.db_harness_and_pool()?;
+        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
         let conn = pool.lock().ok()?;
         let row =
             crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id).ok()??;
@@ -1502,6 +1672,12 @@ impl BgTaskRegistry {
 
     pub fn has_erased_watch_reference(&self, task_id: &str) -> bool {
         self.evaluate_erased_watch_targets();
+        // A task this registry still runs is not erased whatever its row
+        // state: its output is still captured and its watches still scan, so
+        // reporting it as a terminal storage failure would be false.
+        if self.task(task_id).is_some_and(|task| !task.is_terminal()) {
+            return false;
+        }
         self.inner
             .watch_registry
             .lock()
@@ -1509,8 +1685,14 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
+    /// Tombstones watches whose task row is gone and whose task has ended.
+    ///
+    /// A missing row only means a terminal storage failure when no process
+    /// is left either. For a task the registry still runs, the row is written
+    /// again from the in-memory task (with the watch rows the task-row delete
+    /// cascaded away) and its watches stay armed.
     pub(crate) fn evaluate_erased_watch_targets(&self) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|slot| slot.clone()) else {
             return;
         };
         // The task deletion cascade removes durable watch rows, so only watches
@@ -1525,28 +1707,34 @@ impl BgTaskRegistry {
             return;
         }
 
+        // Liveness and harness are read before the aft.db mutex is taken, so
+        // no task state lock is ever acquired while that mutex is held.
         let candidates = watched_task_ids
             .into_iter()
             .filter_map(|task_id| {
                 let task = self.task(&task_id)?;
-                self.originating_session_has_live_route(&task.session_id)
-                    .then(|| (task.session_id.clone(), task_id))
+                if !self.originating_session_has_live_route(&task.session_id) {
+                    return None;
+                }
+                let harness = self.db_harness_for_task(&task)?;
+                let running = !task.is_terminal();
+                Some((task, harness, running))
             })
             .collect::<Vec<_>>();
+        let mut running_without_row = Vec::new();
         let erased_tasks = {
             let Ok(conn) = pool.lock() else {
                 return;
             };
             let mut erased_tasks = Vec::new();
-            for (session_id, task_id) in candidates {
-                match crate::db::bash_tasks::get_bash_task(&conn, &harness, &session_id, &task_id) {
+            for (task, harness, running) in candidates {
+                let (session_id, task_id) = (&task.session_id, &task.task_id);
+                match crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id) {
+                    Ok(None) if running => running_without_row.push(task),
                     Ok(None) => {
                         if let Err(error) =
                             crate::db::bash_watches::delete_bash_pattern_watches_for_task(
-                                &conn,
-                                &harness,
-                                &session_id,
-                                &task_id,
+                                &conn, &harness, session_id, task_id,
                             )
                         {
                             crate::slog_warn!(
@@ -1554,7 +1742,7 @@ impl BgTaskRegistry {
                                 task_id
                             );
                         }
-                        erased_tasks.push((session_id, task_id));
+                        erased_tasks.push((session_id.clone(), task_id.clone()));
                     }
                     Ok(Some(_)) => {}
                     Err(error) => {
@@ -1568,6 +1756,9 @@ impl BgTaskRegistry {
             erased_tasks
         };
 
+        for task in running_without_row {
+            self.restore_running_task_rows(&task);
+        }
         for (session_id, task_id) in erased_tasks {
             let watch_ids = self
                 .inner
@@ -1578,6 +1769,33 @@ impl BgTaskRegistry {
             for watch_id in watch_ids {
                 self.emit_bash_watch_erased(&session_id, &task_id, &watch_id);
             }
+        }
+    }
+
+    /// Rewrites a running task's missing row and the rows of the watches
+    /// still armed on it in this process.
+    fn restore_running_task_rows(&self, task: &BgTask) {
+        if !self.ensure_task_row(task) {
+            return;
+        }
+        let specs = self
+            .inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.watch_specs(&task.task_id))
+            .unwrap_or_default();
+        let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
+        for spec in specs {
+            self.persist_watch_registration(
+                &task.session_id,
+                &task.task_id,
+                &spec.watch_id,
+                &spec.pattern,
+                spec.once,
+                stdout_offset,
+                stderr_offset,
+                pty_offset,
+            );
         }
     }
 
@@ -1592,7 +1810,7 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1624,7 +1842,7 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watch(&self, session_id: &str, task_id: &str, watch_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1638,7 +1856,7 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watches_for_task(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1660,7 +1878,7 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1704,7 +1922,7 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1751,7 +1969,7 @@ impl BgTaskRegistry {
     /// Ack path for pattern watches: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -2020,6 +2238,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -2041,6 +2260,7 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
@@ -2226,6 +2446,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -2247,6 +2468,7 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
@@ -2389,6 +2611,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -2410,6 +2633,7 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
@@ -2708,7 +2932,8 @@ impl BgTaskRegistry {
         originating_session_id: &str,
         task_id: &str,
     ) {
-        if let Some((harness, pool)) = self.db_harness_and_pool() {
+        if let Some((harness, pool)) = self.db_harness_and_pool_for_session(originating_session_id)
+        {
             // Fenced so a queued row snapshot cannot re-insert the row.
             with_task_db_fence(originating_session_id, task_id, || {
                 match pool.lock() {
@@ -2949,7 +3174,9 @@ impl BgTaskRegistry {
                     );
                     continue;
                 }
-                if let Some((harness, pool)) = self.db_harness_and_pool() {
+                if let Some((harness, pool)) =
+                    self.db_harness_and_pool_for_session(&metadata.session_id)
+                {
                     let result =
                         with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
                             pool.lock()
@@ -3182,12 +3409,7 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())?;
+        let harness = self.db_harness_for_session(session_id)?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
@@ -3403,6 +3625,12 @@ impl BgTaskRegistry {
         }
 
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
+        // The watch row references the task row. A running task's row can be
+        // missing (spawned before this registry had its aft.db handle, or a
+        // failed write), so write it first rather than lose the watch row.
+        if !terminal_at_registration {
+            self.ensure_task_row(&task);
+        }
         self.persist_watch_registration(
             &task.session_id,
             &task_id,
@@ -3895,12 +4123,18 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())?;
+        // Task rows are keyed by the harness of the route that started them;
+        // the calling route's harness finds them even when another harness
+        // configured this root more recently.
+        let harness = super::route_harness()
+            .map(|harness| harness.storage_segment())
+            .or_else(|| {
+                self.inner
+                    .db_harness
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+            })?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
@@ -4418,7 +4652,11 @@ impl BgTaskRegistry {
                     .count()
             })
             .unwrap_or(1);
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let db = match session_id {
+            Some(session_id) => self.db_harness_and_pool_for_session(session_id),
+            None => self.db_harness_and_pool(),
+        };
+        let Some((harness, pool)) = db else {
             return completion_count;
         };
         let Ok(conn) = pool.lock() else {
@@ -4444,7 +4682,7 @@ impl BgTaskRegistry {
         session_id: &str,
         older_than: Duration,
     ) -> Vec<(String, String, u64)> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
         let Ok(conn) = pool.lock() else {
@@ -4492,7 +4730,11 @@ impl BgTaskRegistry {
         let mut delivered = Vec::new();
         for task_id in task_ids {
             if self.has_erased_watch_reference(task_id) {
-                if let Some((harness, pool)) = self.db_harness_and_pool() {
+                let db = match self.task(task_id) {
+                    Some(task) => self.db_harness_and_pool_for_task(&task),
+                    None => self.db_harness_and_pool(),
+                };
+                if let Some((harness, pool)) = db {
                     if let Ok(conn) = pool.lock() {
                         if let Ok(rows) =
                             crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
@@ -4570,7 +4812,7 @@ impl BgTaskRegistry {
     }
 
     fn persisted_task_is_terminal(&self, session_id: &str, task_id: &str) -> Option<bool> {
-        let (harness, pool) = self.db_harness_and_pool()?;
+        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
         let conn = pool.lock().ok()?;
         let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
             .ok()
@@ -4582,7 +4824,7 @@ impl BgTaskRegistry {
     }
 
     fn mark_persisted_completion_delivered(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         // The task may be held by another registry (this path runs when the
@@ -4605,13 +4847,13 @@ impl BgTaskRegistry {
     }
 
     fn sync_memory_watches_from_persistence(&self, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some(task) = self.task(task_id) else {
             return;
         };
-        let session_id = match self.task(task_id) {
-            Some(task) => task.session_id.clone(),
-            None => return,
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) else {
+            return;
         };
+        let session_id = task.session_id.clone();
         let Ok(conn) = pool.lock() else {
             return;
         };
@@ -4860,6 +5102,7 @@ impl BgTaskRegistry {
         let mode = metadata.mode.clone();
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -4890,6 +5133,7 @@ impl BgTaskRegistry {
             }),
         });
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
@@ -4910,7 +5154,7 @@ impl BgTaskRegistry {
     }
 
     fn rearm_persisted_watches(&self, task: &Arc<BgTask>) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(task) else {
             return;
         };
         let rows = {
@@ -5658,12 +5902,13 @@ impl BgTaskRegistry {
             );
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata.harness.clone().or_else(|| {
+            self.inner
+                .db_harness
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        });
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "compression event insert skipped for {}: harness not configured",
@@ -5830,7 +6075,7 @@ impl BgTaskRegistry {
     }
 
     fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(&frame.session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -10597,6 +10842,242 @@ mod tests {
         let shared = Arc::new(Mutex::new(conn));
         registry.set_db_pool(shared.clone());
         (registry, shared, frames)
+    }
+
+    #[cfg(unix)]
+    fn spawn_long_running_task(
+        registry: &BgTaskRegistry,
+        session: &str,
+        storage: &Path,
+        project: &Path,
+    ) -> String {
+        registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 30",
+                session.to_string(),
+                project.to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(60)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.to_path_buf()),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn task_row_exists(
+        db: &Arc<Mutex<TrackedConnection>>,
+        harness: &str,
+        session: &str,
+        task_id: &str,
+    ) -> bool {
+        let conn = db.lock().unwrap();
+        crate::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
+            .unwrap()
+            .is_some()
+    }
+
+    #[cfg(unix)]
+    fn watch_row_exists(
+        db: &Arc<Mutex<TrackedConnection>>,
+        harness: &str,
+        session: &str,
+        task_id: &str,
+        watch_id: &str,
+    ) -> bool {
+        let conn = db.lock().unwrap();
+        crate::db::bash_watches::get_bash_pattern_watch(&conn, harness, session, task_id, watch_id)
+            .unwrap()
+            .is_some()
+    }
+
+    /// One project root is shared by routes from several harnesses, and each
+    /// configure replaces the registry's harness. A task keeps the harness of
+    /// the route that started it, so its watch rows and its erased-row check
+    /// must use that harness, not whichever harness configured the root last.
+    #[cfg(unix)]
+    #[test]
+    fn watch_rows_and_erased_check_use_the_harness_that_spawned_the_task() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-harness-switch";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        assert!(task_row_exists(&db, "opencode", session, &task_id));
+
+        // A route from a second harness configures the same root.
+        registry.set_harness(Harness::Runner);
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            watch_row_exists(&db, "opencode", session, &task_id, &watch_id),
+            "the watch row must be keyed under the task's own harness"
+        );
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        assert_eq!(registry.active_watch_count(&task_id), 1);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// A task spawned before the registry had its aft.db handle has no row.
+    /// Installing the handle writes rows for running tasks, and arming a
+    /// watch writes a still-missing row first, so the watch row's foreign key
+    /// holds and the task is not reported erased.
+    #[cfg(unix)]
+    #[test]
+    fn watch_on_task_spawned_before_db_attach_writes_the_missing_task_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        registry.set_harness(Harness::Opencode);
+        let session = "ses-late-db";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).expect("open test DB"),
+        ));
+        registry.set_db_pool(Arc::clone(&db));
+        assert!(
+            task_row_exists(&db, "opencode", session, &task_id),
+            "installing the aft.db handle must write rows for running tasks"
+        );
+        {
+            let conn = db.lock().unwrap();
+            crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id).unwrap();
+        }
+
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            task_row_exists(&db, "opencode", session, &task_id),
+            "arming a watch must write the task's missing row"
+        );
+        assert!(watch_row_exists(
+            &db, "opencode", session, &task_id, &watch_id
+        ));
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// A row deleted under a running, watched task is written again from the
+    /// in-memory task, together with its watch rows; the task stays running
+    /// and its watch stays armed.
+    #[cfg(unix)]
+    #[test]
+    fn erased_row_under_a_running_task_is_rewritten_not_tombstoned() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-erased-live";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id)
+                    .unwrap(),
+                1
+            );
+        }
+
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        assert!(task_row_exists(&db, "opencode", session, &task_id));
+        assert!(watch_row_exists(
+            &db, "opencode", session, &task_id, &watch_id
+        ));
+        assert_eq!(registry.active_watch_count(&task_id), 1);
+        assert!(
+            frames.lock().unwrap().iter().all(|frame| !matches!(
+                frame,
+                PushFrame::BashPatternMatch(frame) if frame.task_id == task_id
+            )),
+            "no watch frame may fire for a running task whose row was rewritten"
+        );
+        let snapshot = registry
+            .status(&task_id, session, None, None, 0)
+            .expect("running task stays addressable");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// With no process left and no row, a watched task is still reported
+    /// erased: that is the one case where the tombstone is true.
+    #[cfg(unix)]
+    #[test]
+    fn erased_row_under_an_ended_task_still_tombstones_its_watch() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-erased-ended";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        // Killing a task retires its watches, so arm one on the ended task
+        // directly: the state a watch is left in when its task ends while
+        // the row is gone.
+        registry
+            .inner
+            .watch_registry
+            .lock()
+            .unwrap()
+            .register(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                false,
+            )
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id).unwrap();
+        }
+
+        assert!(registry.has_erased_watch_reference(&task_id));
+        assert!(!task_row_exists(&db, "opencode", session, &task_id));
+        registry.detach();
     }
 
     #[cfg(unix)]
