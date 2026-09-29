@@ -8,7 +8,9 @@ import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { loadAftConfig } from "../../config.js";
-import { createBashTool } from "../../tools/bash.js";
+import { _resetSubagentCacheForTest } from "../../shared/subagent-detect.js";
+import { createBashKillTool, createBashTool } from "../../tools/bash.js";
+import { createBashWatchTool } from "../../tools/bash_watch.js";
 import type { PluginContext } from "../../types.js";
 import { mockAsk, noopAsk } from "../test-helpers";
 import {
@@ -132,7 +134,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         await cleanup.call(h);
       },
     });
-    return { h, bash, pool, bridgeCalls };
+    return { h, bash, pool, ctx, bridgeCalls };
   }
 
   async function callPluginBash(
@@ -313,6 +315,69 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.output).toContain("Background task started:");
     expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
+  }, 30_000);
+
+  // A sync watch must report the time it really held the call. The wall clock
+  // is stepped forward 60 s shortly after the watch starts, as an NTP
+  // correction or a wake from sleep can do. A watch timed with Date.now()
+  // would end at that step and claim it waited 60 s; a monotonic watch keeps
+  // its 2 s limit and says so. The session has a parent, so the plugin treats
+  // the caller as a delegated worker.
+  test("bash_watch on a still-running task reports about 2 s elapsed and the timeout reason", async () => {
+    const { h, bash, ctx } = await pluginHarness({ experimental_bash_background: true });
+    // Earlier tests in this file reuse the session id without a parent; drop
+    // the cached classification so this one is read as a worker.
+    _resetSubagentCacheForTest();
+    ctx.client = {
+      session: {
+        get: async (input: { path: { id: string } }) => ({
+          data: { id: input.path.id, parentID: "e2e-parent-session" },
+        }),
+      },
+    } as unknown as PluginContext["client"];
+    const launched = await callPluginBash(bash, h, { command: "sleep 30", background: true });
+    const taskId = String(launched.metadata.taskId);
+    const watch = createBashWatchTool(ctx);
+    let metadata: Record<string, unknown> = {};
+    const context = {
+      sessionID: "e2e-session",
+      messageID: "e2e-message",
+      agent: "e2e-agent",
+      directory: h.tempDir,
+      worktree: h.tempDir,
+      abort: new AbortController().signal,
+      metadata: (data: Record<string, unknown>) => {
+        metadata = data;
+      },
+      ask: noopAsk,
+      callID: "call-watch",
+    } as ToolContext;
+
+    const realNow = Date.now;
+    const stepAt = realNow() + 300;
+    Date.now = () => {
+      const now = realNow();
+      return now >= stepAt ? now + 60_000 : now;
+    };
+    const started = performance.now();
+    let text: string;
+    try {
+      text = String(await watch.execute({ taskId, timeoutMs: 2_000 }, context));
+    } finally {
+      Date.now = realNow;
+    }
+    const realElapsed = performance.now() - started;
+    await createBashKillTool(ctx).execute({ taskId }, context);
+
+    const waited = metadata.waited as { reason?: string; elapsed_ms?: number } | undefined;
+    expect(waited?.reason).toBe("timeout");
+    expect(realElapsed).toBeGreaterThanOrEqual(1_900);
+    expect(realElapsed).toBeLessThan(10_000);
+    const reported = Number(/Waited (\d+)ms \(limit 2000ms\)/.exec(text)?.[1]);
+    expect(Math.abs(reported - realElapsed)).toBeLessThan(500);
+    expect(waited?.elapsed_ms).toBe(reported);
+    expect(text).toContain("timeout reached without match");
+    expect(text).toContain("timeoutMs up to 120000");
   }, 30_000);
 
   skipOnWindows("workdir is respected", async () => {

@@ -1510,6 +1510,21 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("bash_watch reply names the bash.watch_sync_max_ms cap when the wait ran at the cap", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
+      bash: { watch_sync_max_ms: 1_000 },
+    } as PluginContext["config"]);
+    ctx.client = createSubagentClient();
+    const result = await watchTool.execute(
+      { taskId: "bash-at-cap" },
+      createMockSdkContext({ sessionID: "ses_watch_at_cap" }),
+    );
+    expect(result).toMatch(
+      /Waited \d+ms \(limit 1000ms, the bash\.watch_sync_max_ms cap\); timeout reached without match/,
+    );
+  });
+
   test("bash_watch timeout gives a delegated worker only the worker steer with the resolved cap", async () => {
     _resetSubagentCacheForTest();
     const { ctx, watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
@@ -1758,6 +1773,7 @@ describe("bash_status tool", () => {
     );
     // Should contain the conversion message
     expect(result).toContain("interrupted because you sent a message");
+    expect(result).toMatch(/after \d+ms of waiting/);
     expect(result).toContain("converted to an async watch");
     expect(result).toContain("watch-aborted");
     // Should have called bash_notify to register the async watch
@@ -1783,6 +1799,7 @@ describe("bash_status tool", () => {
     );
     // Should contain the conversion message mentioning auto-reminder
     expect(result).toContain("interrupted because you sent a message");
+    expect(result).toMatch(/after \d+ms of waiting/);
     expect(result).toContain("completion reminder will be delivered automatically");
     // Should NOT have called bash_notify (no pattern = auto-reminder handles it)
     const notifyCall = calls.find((c) => c.cmd === "bash_notify");

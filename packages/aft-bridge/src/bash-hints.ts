@@ -38,6 +38,20 @@ export function resolveWatchTimeoutMs(
 }
 
 /**
+ * Opening of every sync bash_watch reply line: the real time the watch held
+ * the call, next to the limit it was allowed. Printing both lets a reader see
+ * at a glance whether the watch ran to its limit or returned early, and when
+ * the limit is the configured cap it names the knob, so a caller that wanted
+ * longer knows what bounded it. `elapsedMs` must come from a monotonic clock
+ * (see monotonicNowMs).
+ */
+export function formatWatchWaited(elapsedMs: number, limitMs: number, capMs: number): string {
+  const limit =
+    limitMs >= capMs ? `limit ${limitMs}ms, the bash.watch_sync_max_ms cap` : `limit ${limitMs}ms`;
+  return `Waited ${Math.round(elapsedMs)}ms (${limit})`;
+}
+
+/**
  * Appended to a bash_watch reply whose sync deadline passed without a match.
  * The deadline is a property of the watch, not of the command: a delegated
  * worker that read the bare "timeout reached" line as its own execution being

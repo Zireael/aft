@@ -1,8 +1,10 @@
 import {
   type BridgeRequestOptions,
   coerceBoolean,
+  formatWatchWaited,
   isBridgeTransportTimeout,
   isTerminalStatus,
+  monotonicNowMs,
   resolveWatchTimeoutMs,
   sleep,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
@@ -34,7 +36,10 @@ export type BashWaitPattern =
   | { kind: "regex"; source: string };
 export type BashStatusWaited = {
   reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable";
+  /** Real time the watch held the call, measured on a monotonic clock. */
   elapsed_ms: number;
+  /** Longest time this watch was allowed to hold the call. */
+  limit_ms: number;
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
@@ -158,6 +163,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           taskId,
           waitFor,
           coerceBoolean(args.once, true),
+          waited.elapsed_ms,
         );
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;
@@ -184,12 +190,14 @@ async function convertToAsyncWatchOnAbort(
   taskId: string,
   waitFor: BashWaitPattern | undefined,
   once: boolean,
+  elapsedMs: number,
 ): Promise<string> {
+  const interrupted = `Sync watch for task ${taskId} was interrupted because you sent a message after ${elapsedMs}ms of waiting. `;
   // No pattern: the auto-reminder system already handles exit notifications
   // for background tasks, so no explicit watch registration is needed.
   if (!waitFor) {
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      interrupted +
       `The task is still running in the background. A completion reminder will be ` +
       `delivered automatically when the task exits; don't poll bash_status.`
     );
@@ -209,14 +217,14 @@ async function convertToAsyncWatchOnAbort(
       unmarkExplicitControl(context.sessionID, taskId);
       // Registration failed — fall back to the auto-reminder path.
       return (
-        `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+        interrupted +
         `Auto-registering an async watch failed (${String(registered.message ?? "unknown error")}). ` +
         `The task is still running in the background. A completion reminder will be ` +
         `delivered automatically when the task exits.`
       );
     }
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      interrupted +
       `The wait has been converted to an async watch (${registered.watch_id}). ` +
       `A notification will fire when the pattern matches or the task exits.`
     );
@@ -224,7 +232,7 @@ async function convertToAsyncWatchOnAbort(
     unmarkExplicitControl(context.sessionID, taskId);
     // Registration failed — fall back to the auto-reminder path.
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      interrupted +
       `Auto-registering an async watch failed (${err instanceof Error ? err.message : String(err)}). ` +
       `The task is still running in the background. A completion reminder will be ` +
       `delivered automatically when the task exits.`
@@ -245,20 +253,21 @@ function formatWatchResultText(
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
   if (waited) {
+    const waitedText = formatWatchWaited(waited.elapsed_ms, waited.limit_ms, syncWaitCap);
     if (waited.reason === "matched") {
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
-      text += `\nWaited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
+      text += `\n${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
     } else if (waited.reason === "timeout") {
       // A watch deadline is not a failure of the command, and a delegated
       // worker that reads it as one declares a failed result mid-run. Tell
       // the caller what it is and the move that fits its own role.
-      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match. ${watchTimeoutSteer(role, syncWaitCap)}`;
+      text += `\n${waitedText}; timeout reached without match. ${watchTimeoutSteer(role, syncWaitCap)}`;
     } else if (waited.reason === "unavailable") {
-      text += `\nWaited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
+      text += `\n${waitedText}; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
     } else {
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
-      text += `\nWaited ${waited.elapsed_ms}ms; task exited (${stat}${e}).`;
+      text += `\n${waitedText}; task exited (${stat}${e}).`;
     }
   }
   const preview = data.output_preview as string | undefined;
@@ -301,8 +310,12 @@ export async function waitForBashStatus(
   waitFor: BashWaitPattern | undefined,
   effectiveWaitMs: number,
 ): Promise<BashStatusWithWait> {
-  const startedAt = Date.now();
+  // The deadline and the reported elapsed time both come from a monotonic
+  // clock, so a wall-clock step during the wait can neither end it early nor
+  // inflate the time the reply says it waited.
+  const startedAt = monotonicNowMs();
   const deadline = startedAt + effectiveWaitMs;
+  const elapsedMs = () => Math.round(monotonicNowMs() - startedAt);
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
   const scanState: OutputScanState = {
     output: { text: "", baseOffset: 0 },
@@ -340,16 +353,18 @@ export async function waitForBashStatus(
         if (isSyncWatchAborted(runtime.sessionID)) {
           return withWaited(lastData ?? unavailableSnapshot(), {
             reason: "user_message",
-            elapsed_ms: Date.now() - startedAt,
+            elapsed_ms: elapsedMs(),
+            limit_ms: effectiveWaitMs,
           });
         }
-        if (Date.now() >= deadline) {
+        if (monotonicNowMs() >= deadline) {
           return withWaited(lastData ?? unavailableSnapshot(), {
             reason: "unavailable",
-            elapsed_ms: Date.now() - startedAt,
+            elapsed_ms: elapsedMs(),
+            limit_ms: effectiveWaitMs,
           });
         }
-        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - monotonicNowMs())));
         continue;
       }
       lastData = data;
@@ -384,7 +399,8 @@ export async function waitForBashStatus(
                 data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
               return withWaited(data, {
                 reason: "matched",
-                elapsed_ms: Date.now() - startedAt,
+                elapsed_ms: elapsedMs(),
+                limit_ms: effectiveWaitMs,
                 match: match.text,
                 match_offset: state.baseOffset + match.byteOffset,
                 match_stream: matchStream,
@@ -405,7 +421,11 @@ export async function waitForBashStatus(
           { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
           taskId,
         );
-        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+        return withWaited(data, {
+          reason: "exited",
+          elapsed_ms: elapsedMs(),
+          limit_ms: effectiveWaitMs,
+        });
       }
       // User-message abort: if the user sent a message while we were
       // blocking, convert this sync wait to an async watch so the agent's
@@ -413,12 +433,20 @@ export async function waitForBashStatus(
       // if the task already matched or exited in this iteration, we return
       // that result instead of aborting.
       if (isSyncWatchAborted(runtime.sessionID)) {
-        return withWaited(data, { reason: "user_message", elapsed_ms: Date.now() - startedAt });
+        return withWaited(data, {
+          reason: "user_message",
+          elapsed_ms: elapsedMs(),
+          limit_ms: effectiveWaitMs,
+        });
       }
-      if (Date.now() >= deadline) {
-        return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
+      if (monotonicNowMs() >= deadline) {
+        return withWaited(data, {
+          reason: "timeout",
+          elapsed_ms: elapsedMs(),
+          limit_ms: effectiveWaitMs,
+        });
       }
-      await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+      await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - monotonicNowMs())));
     }
   } finally {
     if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);

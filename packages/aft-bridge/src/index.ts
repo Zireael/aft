@@ -14,11 +14,13 @@ export {
   formatForegroundResult,
   formatSeconds,
   isTerminalStatus,
+  monotonicNowMs,
   sleep,
 } from "./bash-format.js";
 export {
   commandInvokesCodeSearch,
   DEFAULT_PRIMARY_WATCH_TIMEOUT_MS,
+  formatWatchWaited,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,

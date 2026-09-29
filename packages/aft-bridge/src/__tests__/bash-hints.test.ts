@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   commandInvokesCodeSearch,
+  formatWatchWaited,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
 } from "../bash-hints.js";
@@ -12,6 +13,18 @@ const AFT_SEARCH_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";
 const GREP_TOOL_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked).";
+
+describe("formatWatchWaited", () => {
+  test("prints the real elapsed time next to a limit below the cap", () => {
+    expect(formatWatchWaited(2003.6, 2_000, 120_000)).toBe("Waited 2004ms (limit 2000ms)");
+  });
+
+  test("names the config knob when the limit is the cap", () => {
+    expect(formatWatchWaited(118_000, 120_000, 120_000)).toBe(
+      "Waited 118000ms (limit 120000ms, the bash.watch_sync_max_ms cap)",
+    );
+  });
+});
 
 describe("maybeAppendConflictsHint", () => {
   test("appends hint on real git-merge conflict output", () => {

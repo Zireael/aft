@@ -37,3 +37,13 @@ export function isTerminalStatus(status: unknown): boolean {
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * Milliseconds on a monotonic clock, for measuring how long a wait held a call.
+ * `Date.now()` follows the wall clock, which can step forward or back (NTP
+ * correction, wake from sleep, a manual change); a wait deadline built on it
+ * can expire early and then report the stepped distance as time waited.
+ */
+export function monotonicNowMs(): number {
+  return performance.now();
+}
