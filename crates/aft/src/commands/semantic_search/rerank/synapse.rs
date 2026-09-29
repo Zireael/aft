@@ -1,19 +1,21 @@
-//! Synapse reranking discovers its model pin only while scoring. `fingerprint()`
-//! performs no I/O and reports `undiscovered` until discovery succeeds. The search
-//! core must not freeze a rerank result under the `undiscovered` revision.
+//! Synapse reranking discovers and fixes its model pin when connecting, off the
+//! search path. `fingerprint()` is a no-I/O read and never changes for a backend
+//! instance, so paging can safely memoize outcomes under that identity.
 
 use parking_lot::Mutex;
 use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use super::remote::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
+use crate::commands::semantic_search::rerank::{
+    RerankBackend, RerankDoc, RerankError, RerankFingerprint,
+};
 use crate::config::SemanticBackendConfig;
 use crate::synapse_embed::{SynapseEmbeddingError, SynapseRerankTransport};
 
 pub(crate) struct SynapseReranker {
     model: String,
-    required_fingerprint: Mutex<Option<String>>,
+    required_fingerprint: String,
     max_queue_ms: u64,
     transport: Mutex<SynapseRerankTransport>,
 }
@@ -21,12 +23,13 @@ pub(crate) struct SynapseReranker {
 impl SynapseReranker {
     /// The embedding configuration supplies only the daemon connection and route identity.
     /// The rerank model and its pin are independent of the embedding model.
-    pub(crate) fn new(
+    pub(crate) fn connect(
         config: &SemanticBackendConfig,
         model: String,
         required_fingerprint: Option<String>,
         max_queue_ms: u64,
         under_subc: bool,
+        deadline: Instant,
     ) -> Result<Self, RerankError> {
         if !under_subc {
             return Err(RerankError::Unavailable(
@@ -40,41 +43,25 @@ impl SynapseReranker {
                 .is_some_and(|pin| pin.trim().is_empty())
         {
             return Err(RerankError::Refused(
-                "Synapse reranking requires a model and pinned required_fingerprint".into(),
+                "Synapse reranking requires a model and a non-empty explicit fingerprint when provided".into(),
             ));
         }
+        let mut transport = SynapseRerankTransport::new(config).map_err(transport_error)?;
+        let pin = match required_fingerprint {
+            Some(pin) => pin,
+            None => {
+                let response = transport
+                    .call("models.list", json!({}), deadline)
+                    .map_err(transport_error)?;
+                discover_pin(&response, &model)?
+            }
+        };
         Ok(Self {
             model,
-            required_fingerprint: Mutex::new(required_fingerprint),
+            required_fingerprint: pin,
             max_queue_ms,
-            transport: Mutex::new(SynapseRerankTransport::new(config).map_err(transport_error)?),
+            transport: Mutex::new(transport),
         })
-    }
-}
-
-impl SynapseReranker {
-    fn pin_with(
-        &self,
-        transport: &mut SynapseRerankTransport,
-        deadline: Instant,
-    ) -> Result<String, RerankError> {
-        if let Some(pin) = self
-            .required_fingerprint
-            .try_lock_until(deadline)
-            .ok_or(RerankError::Timeout)?
-            .clone()
-        {
-            return Ok(pin);
-        }
-        let response = transport
-            .call("models.list", json!({}), deadline)
-            .map_err(transport_error)?;
-        let discovered = discover_pin(&response, &self.model)?;
-        *self
-            .required_fingerprint
-            .try_lock_until(deadline)
-            .ok_or(RerankError::Timeout)? = Some(discovered.clone());
-        Ok(discovered)
     }
 }
 
@@ -116,11 +103,7 @@ impl RerankBackend for SynapseReranker {
         RerankFingerprint {
             backend: "synapse",
             model: self.model.clone(),
-            revision: self
-                .required_fingerprint
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "undiscovered".into()),
+            revision: self.required_fingerprint.clone(),
         }
     }
     fn max_batch(&self) -> usize {
@@ -145,10 +128,10 @@ impl RerankBackend for SynapseReranker {
             .transport
             .try_lock_until(deadline)
             .ok_or(RerankError::Timeout)?;
-        let pin = self.pin_with(&mut transport, deadline)?;
+        let pin = &self.required_fingerprint;
         let result = score_via(
             &self.model,
-            &pin,
+            pin,
             self.max_queue_ms,
             query,
             docs,
@@ -260,6 +243,23 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn connect(
+        config: &SemanticBackendConfig,
+        model: String,
+        pin: Option<String>,
+        queue_ms: u64,
+        under_subc: bool,
+    ) -> Result<SynapseReranker, RerankError> {
+        SynapseReranker::connect(
+            config,
+            model,
+            pin,
+            queue_ms,
+            under_subc,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
     fn config(connection_file: std::path::PathBuf) -> SemanticBackendConfig {
         SemanticBackendConfig {
             backend: crate::config::SemanticBackend::Synapse,
@@ -289,7 +289,7 @@ mod tests {
         fake_daemon_gated(responses, registered, None)
     }
 
-    type DiscoveryGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    type ResponseGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
     fn connection_fixture() -> (
         tempfile::TempDir,
@@ -327,7 +327,7 @@ mod tests {
     fn fake_daemon_gated(
         responses: Vec<Option<Value>>,
         registered: bool,
-        gate: Option<DiscoveryGate>,
+        gate: Option<ResponseGate>,
     ) -> (
         tempfile::TempDir,
         std::path::PathBuf,
@@ -398,27 +398,44 @@ mod tests {
     }
 
     #[test]
-    fn synapse_fingerprint_never_routes_and_stays_undiscovered_after_failure() {
+    fn synapse_explicit_pin_and_fingerprint_make_zero_transport_calls() {
         let (_directory, path, listener, _, _) = connection_fixture();
-        let backend =
-            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
-        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        let backend = connect(
+            &config(path),
+            "reranker".into(),
+            Some("fp".into()),
+            100,
+            true,
+        )
+        .unwrap();
+        assert_eq!(backend.fingerprint().revision, "fp");
+        assert_eq!(backend.fingerprint().revision, "fp");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+
+    #[test]
+    fn synapse_connect_refuses_failed_discovery_and_bounds_its_deadline() {
         let (_directory, path, server) =
             fake_daemon(vec![Some(json!({"result":{"models":[]}}))], true);
-        let backend =
-            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
         assert!(matches!(
-            backend.score(
-                "q",
-                &[RerankDoc { text: "a" }],
-                Instant::now() + Duration::from_secs(1)
-            ),
+            connect(&config(path), "reranker".into(), None, 100, true),
             Err(RerankError::Unavailable(_))
         ));
-        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        assert_eq!(server.join().unwrap().len(), 1);
+        let (_directory, path, server) = fake_daemon(vec![None], true);
+        assert!(matches!(
+            SynapseReranker::connect(
+                &config(path),
+                "reranker".into(),
+                None,
+                100,
+                true,
+                Instant::now() + Duration::from_millis(200)
+            ),
+            Err(RerankError::Timeout)
+        ));
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -435,12 +452,11 @@ mod tests {
     }
 
     #[test]
-    fn synapse_concurrent_scores_wait_for_discovery_and_both_succeed() {
+    fn synapse_concurrent_scores_wait_for_transport_and_both_succeed() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (_directory, path, server) = fake_daemon_gated(
             vec![
-                Some(json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp"]}]}})),
                 Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
                 Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
             ],
@@ -448,12 +464,19 @@ mod tests {
             Some((entered_tx, release_rx)),
         );
         let backend = std::sync::Arc::new(
-            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap(),
+            connect(
+                &config(path),
+                "reranker".into(),
+                Some("fp".into()),
+                100,
+                true,
+            )
+            .unwrap(),
         );
         let first = spawn_score(backend.clone());
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        // Identity remains a cheap read even while discovery is waiting on the daemon.
-        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        // Identity remains a cheap read while scoring is waiting on the daemon.
+        assert_eq!(backend.fingerprint().revision, "fp");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let second = std::thread::spawn(move || {
@@ -485,13 +508,13 @@ mod tests {
         );
         second.join().unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request["method"] == "models.list")
                 .count(),
-            1
+            0
         );
     }
 
@@ -500,15 +523,19 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (_directory, path, server) = fake_daemon_gated(
-            vec![
-                Some(json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp"]}]}})),
-                Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}})),
-            ],
+            vec![Some(json!({"result":{"fingerprint":"fp","scores":[2.0]}}))],
             true,
             Some((entered_tx, release_rx)),
         );
         let backend = std::sync::Arc::new(
-            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap(),
+            connect(
+                &config(path),
+                "reranker".into(),
+                Some("fp".into()),
+                100,
+                true,
+            )
+            .unwrap(),
         );
         let first = spawn_score(backend.clone());
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -527,7 +554,7 @@ mod tests {
             "lock wait must stay bounded"
         );
         assert_eq!(first.join().unwrap().unwrap(), vec![2.0]);
-        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]
@@ -543,9 +570,8 @@ mod tests {
             ],
             true,
         );
-        let backend =
-            SynapseReranker::new(&config(path), "reranker".into(), None, 100, true).unwrap();
-        assert_eq!(backend.fingerprint().revision, "undiscovered");
+        let backend = connect(&config(path), "reranker".into(), None, 100, true).unwrap();
+        assert_eq!(backend.fingerprint().revision, "fp-old");
         assert_eq!(
             backend
                 .score(
@@ -575,12 +601,12 @@ mod tests {
     }
 
     #[test]
-    fn synapse_backend_refuses_bulk_before_discovery() {
+    fn synapse_backend_refuses_bulk_before_scoring() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let backend = SynapseReranker::new(
+        let backend = connect(
             &config(file.path().into()),
             "reranker".into(),
-            None,
+            Some("fp".into()),
             100,
             true,
         )
@@ -599,7 +625,7 @@ mod tests {
     #[test]
     fn synapse_transport_times_out_without_retry() {
         let (_directory, path, server) = fake_daemon(vec![None], true);
-        let backend = SynapseReranker::new(
+        let backend = connect(
             &config(path),
             "reranker".into(),
             Some("fp".into()),
@@ -621,10 +647,10 @@ mod tests {
     #[test]
     fn synapse_daemon_only_and_registration_status_are_clear() {
         assert!(
-            matches!(SynapseReranker::new(&config("/missing".into()), "r".into(), None, 100, false), Err(RerankError::Unavailable(message)) if message.contains("daemon-only"))
+            matches!(connect(&config("/missing".into()), "r".into(), None, 100, false), Err(RerankError::Unavailable(message)) if message.contains("daemon-only"))
         );
         let (_directory, path, server) = fake_daemon(Vec::new(), false);
-        let backend = SynapseReranker::new(
+        let backend = connect(
             &config(path),
             "reranker".into(),
             Some("fp".into()),

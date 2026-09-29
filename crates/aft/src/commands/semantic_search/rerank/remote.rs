@@ -2,35 +2,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-// These declarations let the backends compile independently. Replace them with
-// imports from commands::semantic_search::rerank when it defines the shared trait.
-#[derive(Debug)]
-pub(crate) struct RerankDoc<'a> {
-    pub(crate) text: &'a str,
-}
-#[derive(Debug)]
-pub(crate) struct RerankFingerprint {
-    pub(crate) backend: &'static str,
-    pub(crate) model: String,
-    pub(crate) revision: String,
-}
-#[derive(Debug)]
-pub(crate) enum RerankError {
-    Unavailable(String),
-    Timeout,
-    Refused(String),
-    Failed(String),
-}
-pub(crate) trait RerankBackend: Send + Sync {
-    fn fingerprint(&self) -> RerankFingerprint;
-    fn max_batch(&self) -> usize;
-    fn score(
-        &self,
-        query: &str,
-        docs: &[RerankDoc<'_>],
-        deadline: Instant,
-    ) -> Result<Vec<f32>, RerankError>;
-}
+use crate::commands::semantic_search::rerank::{
+    RerankBackend, RerankDoc, RerankError, RerankFingerprint,
+};
 
 /// `tei+http://` and `tei+https://` select the TEI wire format without a new config key.
 pub(crate) struct RemoteReranker {

@@ -62,22 +62,22 @@ Synapse uses the same SubC connection file and management-route identity as
 embeddings, but requires `models.list` and `rerank.score`, not embedding ops.
 The caller must supply whether AFT is running under SubC. A backend constructor
 accepts a rerank model, an optional explicit fingerprint, and a queue budget.
-Without an override, the first `score()` discovers the model via `models.list`
-under that score call's deadline and pins its served fingerprint. `fingerprint()`
-never performs I/O: it returns the pin or the distinct `undiscovered` revision
-when discovery has not succeeded. The search core must not freeze a rerank result
-under `undiscovered`. Once discovered, the pin does not change until the backend
-is rebuilt. Concurrent score calls wait for the transport and discovery locks
-up to their own deadlines; an expired wait returns `Timeout`. Every
-score request sends `required_fingerprint`, refuses equivalent substitutions,
+Without an override, `SynapseReranker::connect` discovers the model via
+`models.list` under the constructor's bounded deadline, off the search path.
+It returns an error rather than installing a backend if discovery fails.
+`fingerprint()` never performs I/O and returns a pin fixed for the backend's
+entire lifetime. Concurrent score calls wait for the transport lock up to their
+own deadlines; an expired wait returns `Timeout`.
+Every score request sends `required_fingerprint`, refuses equivalent substitutions,
 and sends both `max_queue_ms` and `deadline_ms`. A refused substitution is
 reported with the old and new pins when discovery still fits the deadline.
 Synapse scores are finite raw logits, not probabilities. Batches above 20 are
 refused before routing. Connect, catalog, route setup, and scoring share the
 caller's total deadline, with no request retries.
 
-The `commands::semantic_search::rerank` module must import the backend modules
-and provide their shared trait instead of the temporary declarations in
-`remote.rs` and registration in `synapse_embed.rs`. Search orchestration must
-construct the backends from resolved user configuration and provide the actual
-daemon-mode flag. The config resolver and orchestration are unchanged here.
+The backends use the shared trait in `commands::semantic_search::rerank`.
+Temporary `remote.rs` and `synapse.rs` module declarations in `synapse_embed.rs`
+compile the backends and their tests without making them selectable by search.
+The search pipeline still needs a builder that constructs backends outside
+interactive requests, using resolved user configuration and the actual
+daemon-mode flag. The config resolver is unchanged here.
