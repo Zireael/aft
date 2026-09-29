@@ -298,6 +298,83 @@ engine replays it invariantly and it carries no flag. Rows with between about
 ten and forty matching lines were left out: on that engine they pass or fail
 page invariance from run to run, so no reference taken on it would repeat.
 
+### Split query/pattern rows
+
+The gate manifest adds 12 hand-split rows, `followup-census:910001`–`910012`,
+under the mechanism `split_query_pattern_fusion` and benchmark-only shape `split`.
+The pin is AFT commit `30d4a64f99b3`; this shape does not extend that commit's
+router enum. The R1–R7 categories describe these fusion scenarios. Counts are
+R1=2 (stale mention), R2=2 (broad Error/Result), R3=1 (moderate selectivity),
+R4=2 (one dual-answer input, definition and concept), R5=2 (empty/whitespace),
+R6=1 (semantic building), R7=2 (mixed-selectivity alternation). Each has
+`row_source`, `answer_key_basis`, and `answer_kind: concept|definition`.
+`author_split_rows.py` reproduces the hand splits of retained census queries and
+labels constructed inputs honestly rather than giving them invented telemetry.
+
+The unchanged binary runs **joined form**: `query + " " + pattern` when the
+pattern has non-whitespace content; otherwise it sends exactly `query`, with no
+trailing space. A split-capable binary sends `query` and `pattern` separately,
+including an empty pattern. Capability is probed on the actual binary with
+`pattern: "["`: `success: false, code: invalid_pattern` means supported,
+success means the legacy engine ignored the parameter, and any other error is a
+hard fault. The score records `pattern_probe`, `pattern_declared`, and each split
+row's `input_form`. A ranking evaluation refuses any joined-form candidate;
+joined references are measurement of the old engine, never split measurements.
+
+Every split row also runs **prose-only**, at the same scoring depth and page
+profile. Paged replays verify invariance for both forms. The score carries the
+prose requests, paths, metrics and `paired_mrr_delta`; the runner prints the
+per-row deltas. The ranking predicate fails if **any concept-answer row** has
+lower MRR@10 with its pattern than without it, regardless of aggregate gains.
+Definition answers are not protected by that paired rule. R1 additionally needs
+rank 1, R3 hit@5, R4 both answers hit@3, and R6 a hit with `complete: false`.
+R5 compares the actual result arrays with prose-only, not just their scores.
+The reference seeds `fixture_groups.real_query.split` and `shapes.split`.
+
+R3's anchored declaration alternation matches exactly 30 files at the pin,
+checked by a named harness test. `expected_prose_overlap: 5` is informational:
+five selected declarations concern output compression, and the other files
+concern unrelated systems. Actual prose-lane membership depends on the semantic
+index, so exact overlap is not a gate. Split scores preserve the pattern summary
+and the first eight text lines for inspection. R6 uses a separate AFT process
+whose corpus embeddings are held by an event while query embeddings remain
+available. The runner waits for lexical ready and verifies semantic building;
+it does not race a normally progressing semantic index or alter the 56 old rows.
+
+`split-tuning-manifest.json` contains **8 additional tuning-only rows**
+(`920001`–`920008`), with disjoint query/pattern pairs. Neither these rows nor
+their scores can enter the gate/reference. They are for search-engine developers to
+tune weights, damping and RRF constants, without training on the gate answers:
+
+```bash
+python3 benchmarks/aft-search/run_real_query.py --tuning-only \
+  --manifest benchmarks/aft-search/split-tuning-manifest.json --profile paged \
+  --binary target/release/aft \
+  --exact-score benchmarks/aft-search/.bench/search-quality/exact.json \
+  --concept-score benchmarks/aft-search/.bench/search-quality/concept.json \
+  --output benchmarks/aft-search/.bench/search-quality/tuning.json
+```
+
+`split-query-vectors.bin` supplements, rather than replaces, the original chunk
+and query pack. It holds real MiniLM vectors for both the joined and prose-only
+texts of gate and tuning rows. The manifest binds its digest; the loader verifies
+model/pin/template/dimension and refuses conflicting overlap with the old pack.
+The existing row bindings, original pack, and concept query pack stay untouched.
+To reproduce authoring (requires the managed model cache):
+
+```bash
+python3 benchmarks/aft-search/author_split_rows.py
+cd benchmarks/aft-search
+uv run --with onnxruntime==1.24.4 --with tokenizers==0.22.2 --with numpy \
+  python3 capture_split_query_vectors.py --allow-vector-authoring
+```
+
+Descriptor suggestion for a change adding benchmark rows and harness support: `slice_class: non_ranking`,
+`kind: harness`, `targeted_mechanism: none`, `fixtures: ["harness-goldens"]`.
+For the subsequent engine implementation change: `slice_class: ranking`, `kind: ranking`,
+`targeted_mechanism: split_query_pattern_fusion`; its MRR@10 must strictly improve,
+with exact/concept recall, shape floors, page invariance and paired checks intact.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality

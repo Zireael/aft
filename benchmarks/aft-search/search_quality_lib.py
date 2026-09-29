@@ -42,6 +42,7 @@ MECHANISMS = {
     "scope_mismatch": (475, 0.0734, (4885, 2893, 9536)),
     "other": (284, 0.0438, (17004, 10672, 18091)),
     "identifier_not_definition_first": (101, 0.0156, (14708, 17879, 20043)),
+    "split_query_pattern_fusion": (0, 0.0, ()),
 }
 FIXTURE_IDS = tuple(f"followup-census:{number}" for _, _, suffixes in MECHANISMS.values() for number in suffixes)
 EXCLUSION_REASONS = {
@@ -468,6 +469,7 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
         if any(
             request.get("includeTests") is not row.get("request", {}).get("includeTests")
             or request.get("query") != row.get("request", {}).get("query")
+            or request.get("pattern") != row.get("request", {}).get("pattern")
             for request in all_requests
         ):
             raise InputFault(f"replay_input_mismatch:{row.get('episode_id')}:request_set")
@@ -546,6 +548,8 @@ def validate_manifest_maintenance_scores(
 
 
 def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
+    if manifest.get("tuning_only"):
+        raise InputFault("tuning_only_manifest_not_gate_eligible")
     rows = manifest.get("rows")
     if not isinstance(rows, list):
         raise InputFault("malformed_schema:manifest_rows")
@@ -569,6 +573,8 @@ def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
 
 
 def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, Any]) -> None:
+    if score.get("tuning_only"):
+        raise InputFault("tuning_only_score_not_gate_eligible")
     expected = included_manifest_ids(manifest)
     score_rows = score.get("rows")
     if not isinstance(score_rows, list):
@@ -589,6 +595,25 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
                 f"replay_input_mismatch:{expected_id}:expected={manifest_row.get('include_tests')}/"
                 f"{manifest_row.get('include_tests_source')}:sent={sent}"
             )
+        if "pattern" in manifest_row:
+            form = row.get("input_form")
+            request = row.get("request", {})
+            if form == "split":
+                valid = score.get("capability", {}).get("pattern_declared") is True and request.get("query") == manifest_row["query"] and request.get("pattern") == manifest_row["pattern"]
+            elif form == "joined":
+                joined = manifest_row["query"] + (" " + manifest_row["pattern"] if manifest_row["pattern"].strip() else "")
+                valid = score.get("capability", {}).get("pattern_declared") is False and request.get("query") == joined and "pattern" not in request
+            else:
+                valid = False
+            if not valid or row.get("answer_kind") != manifest_row.get("answer_kind") or row.get("split_kind") != manifest_row.get("split_kind"):
+                raise InputFault(f"split_input_form_mismatch:{expected_id}")
+            if row.get("metrics") != row_metrics(row.get("ranked_paths", []), manifest_row["opened_file"]):
+                raise InputFault(f"split_metric_mismatch:{expected_id}")
+            paired = row.get("prose_only", {})
+            paired_requests = paired.get("requests", [])
+            expected_requests = [{key: value for key, value in item.items() if key != "pattern"} | {"query": manifest_row["query"]} for item in row.get("requests", [])]
+            if paired_requests != expected_requests or paired.get("metrics") != row_metrics(paired.get("ranked_paths", []), manifest_row["opened_file"]):
+                raise InputFault(f"split_prose_pair_mismatch:{expected_id}")
         stop = row.get("collapse_stop_reason")
         if stop not in STOP_REASONS:
             raise InputFault(f"invalid_stop_fields:{expected_id}:{stop}")
@@ -771,6 +796,30 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
     return None
 
 
+def split_paired_failures(score: Mapping[str, Any]) -> list[str]:
+    """Do not let aggregate gains hide harm to an individual concept answer."""
+    failures = []
+    for row in score.get("rows", []):
+        if "input_form" not in row:
+            continue
+        if row["input_form"] != "split":
+            raise InputFault(f"split_candidate_required:{row['episode_id']}:joined")
+        prose = _metric_block(row.get("prose_only", {}).get("metrics"), f"prose_only:{row['episode_id']}")
+        combined = _metric_block(row.get("metrics"), f"split:{row['episode_id']}")
+        if row.get("answer_kind") == "concept" and combined["mrr_at_10"] < prose["mrr_at_10"]:
+            failures.append(f"split_paired_harm:{row['episode_id']}:mrr_delta={combined['mrr_at_10'] - prose['mrr_at_10']:.6f}")
+        kind = row.get("split_kind")
+        if kind == "R1" and combined["hit_at_1"] != 1.0:
+            failures.append(f"split_rank1_required:{row['episode_id']}")
+        if kind == "R3" and combined["hit_at_5"] != 1.0:
+            failures.append(f"split_hit5_required:{row['episode_id']}")
+        if kind == "R4" and combined["mrr_at_10"] < 1.0 / 3:
+            failures.append(f"split_hit3_required:{row['episode_id']}")
+        if kind == "R6" and (row.get("envelope_complete") is not False or combined["mrr_at_10"] == 0):
+            failures.append(f"split_partial_hit_required:{row['episode_id']}")
+    return failures
+
+
 def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], descriptor: Mapping[str, Any], *, missing_ranking_descriptor: bool = False) -> list[str]:
     failures: list[str] = []
     for family in ("exact_recall", "concept_recall"):
@@ -804,6 +853,7 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
         if new["hit_at_5"] < old["hit_at_5"]:
             failures.append(f"shape {shape} hit_at_5 below reference")
     if descriptor["slice_class"] == "ranking" and not missing_ranking_descriptor:
+        failures.extend(split_paired_failures(score))
         target = descriptor["targeted_mechanism"]
         if target != "none":
             old = _metric_block(reference.get("mechanisms", {}).get(target), f"reference.mechanism.{target}")

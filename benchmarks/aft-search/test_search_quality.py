@@ -22,6 +22,8 @@ from search_quality_lib import (
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     included_manifest_ids,
+    split_paired_failures,
+    evaluate_predicate,
     mean_metrics,
     total_gate,
     validate_included_row_mechanisms,
@@ -30,6 +32,72 @@ from search_quality_lib import (
     validate_profile_score,
     validate_scored_population,
 )
+
+
+class SplitPairedTests(unittest.TestCase):
+    def candidate(self, combined: float, prose: float, form: str = "split", kind: str = "concept") -> dict:
+        return {"rows": [{"episode_id": "followup-census:910003", "input_form": form, "answer_kind": kind,
+            "metrics": {"mrr_at_10": combined, "hit_at_1": 0.0, "hit_at_5": 1.0},
+            "prose_only": {"metrics": {"mrr_at_10": prose, "hit_at_1": 0.0, "hit_at_5": 1.0}}}]}
+
+    def test_paired_check_fails_harmed_concept_row(self) -> None:
+        failures = split_paired_failures(self.candidate(0.25, 0.5))
+        self.assertEqual(failures, ["split_paired_harm:followup-census:910003:mrr_delta=-0.250000"])
+
+    def test_paired_check_passes_improved_concept_row(self) -> None:
+        self.assertEqual(split_paired_failures(self.candidate(0.5, 0.25)), [])
+
+    def test_paired_check_does_not_protect_definition_answer(self) -> None:
+        self.assertEqual(split_paired_failures(self.candidate(0.25, 0.5, kind="definition")), [])
+
+    def test_joined_form_cannot_be_evaluated_as_split(self) -> None:
+        with self.assertRaisesRegex(InputFault, "split_candidate_required.*joined"):
+            split_paired_failures(self.candidate(0.5, 0.25, form="joined"))
+
+    def test_ranking_predicate_invokes_paired_check(self) -> None:
+        _, reference, score = synthetic_documents()
+        score["rows"] = self.candidate(0.25, 0.5)["rows"]
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertIn("split_paired_harm:followup-census:910003:mrr_delta=-0.250000", evaluate_predicate(reference, score, descriptor))
+
+    def test_population_check_refuses_joined_row_relabelled_as_split(self) -> None:
+        from test_run_real_query import FakeClient, manifest
+        from run_real_query import score_manifest_rows
+        document = manifest(False)
+        document["rows"][0].update(pattern="anchor", answer_kind="concept", split_kind="R2")
+        capability = {"pattern_declared": False}
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        score = {"rows": rows, "capability": capability}
+        validate_scored_population(document, score)
+        rows[0]["input_form"] = "split"
+        with self.assertRaisesRegex(InputFault, "split_input_form_mismatch"):
+            validate_scored_population(document, score)
+
+    def test_population_check_refuses_forged_prose_pair(self) -> None:
+        from test_run_real_query import FakeClient, manifest
+        from run_real_query import score_manifest_rows
+        document = manifest(False)
+        document["rows"][0].update(pattern="anchor", answer_kind="concept", split_kind="R2")
+        capability = {"pattern_declared": True}
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        rows[0]["prose_only"]["requests"][0]["query"] += " anchor"
+        with self.assertRaisesRegex(InputFault, "split_prose_pair_mismatch"):
+            validate_scored_population(document, {"rows": rows, "capability": capability})
+
+    def test_split_kind_answer_constraints_are_enforced(self) -> None:
+        for kind, expected in (("R1", "split_rank1_required"), ("R3", "split_hit5_required"), ("R4", "split_hit3_required"), ("R6", "split_partial_hit_required")):
+            score = self.candidate(0.0, 0.0)
+            score["rows"][0]["split_kind"] = kind
+            score["rows"][0]["metrics"]["hit_at_5"] = 0.0
+            self.assertTrue(any(item.startswith(expected) for item in split_paired_failures(score)), kind)
+        partial = self.candidate(0.5, 0.25, kind="definition")
+        partial["rows"][0].update(split_kind="R6", envelope_complete=False)
+        self.assertEqual(split_paired_failures(partial), [])
+
+    def test_tuning_manifest_is_not_gate_eligible(self) -> None:
+        with self.assertRaisesRegex(InputFault, "tuning_only_manifest_not_gate_eligible"):
+            included_manifest_ids(json.loads(Path(__file__).with_name("split-tuning-manifest.json").read_text()))
 
 
 class MeanMetricsTests(unittest.TestCase):

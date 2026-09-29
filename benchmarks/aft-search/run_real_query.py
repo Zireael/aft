@@ -341,12 +341,33 @@ def _response_exhausted(response: Mapping[str, Any], result_count: int, top_k: i
     return response.get("more_available") is False and result_count < top_k
 
 
-def _request(arguments: Mapping[str, int], row: Mapping[str, Any]) -> JsonObject:
+def probe_pattern_capability(client: Any) -> JsonObject:
+    """Use an invalid regex to distinguish parsing from silently ignored input."""
+    response = client.call("tool_call", {"session_id": "aft-search-capability", "name": "search", "arguments": {
+        "query": PROBE_TEXT, "pattern": "[", "topK": 1, "includeTests": False,
+    }})
+    error = response.get("error", {})
+    code = response.get("code", response.get("error_code"))
+    if isinstance(error, Mapping):
+        code = error.get("code", code)
+    if response.get("success") is False and code == "invalid_pattern":
+        return {"pattern_declared": True, "pattern_probe": "invalid_pattern"}
+    if response.get("success") is True:
+        return {"pattern_declared": False, "pattern_probe": "ignored_pattern"}
+    raise InputFault(f"pattern_capability_probe_failed:{response}")
+
+
+def _request(arguments: Mapping[str, int], row: Mapping[str, Any], split: bool = False) -> JsonObject:
     request: JsonObject = {
         "query": row["query"],
         "topK": arguments["topK"],
         "includeTests": row["include_tests"],
     }
+    if "pattern" in row:
+        if split:
+            request["pattern"] = row["pattern"]
+        elif str(row["pattern"]).strip():
+            request["query"] = row["query"] + " " + row["pattern"]
     if "offset" in arguments:
         request["offset"] = arguments["offset"]
     return request
@@ -362,14 +383,14 @@ def _run_requests(client: Any, requests: Sequence[JsonObject], project_root: Pat
     return responses, results
 
 
-def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tuple[list[list[JsonObject]], list[str], bool]:
+def _invariance(client: Any, row: Mapping[str, Any], project_root: Path, split: bool = False) -> tuple[list[list[JsonObject]], list[str], bool]:
     """Run the invariance plans; return what was sent, the first plan's paths,
     and whether all plans collapsed to the same paths."""
     plans = invariance_requests()
     sent: list[list[JsonObject]] = []
     collapsed: list[list[str]] = []
     for plan in plans:
-        requests = [_request(item, row) for item in plan]
+        requests = [_request(item, row, split) for item in plan]
         _, results = _run_requests(client, requests, project_root)
         sent.append(requests)
         collapsed.append(collapse_paths(results[:INVARIANCE_DEPTH]))
@@ -382,6 +403,7 @@ def score_manifest_rows(
     capability: JsonObject,
     client: Any,
     project_root: Path,
+    building_client: Any = None,
 ) -> list[JsonObject]:
     included = [row for row in manifest.get("rows", []) if "excluded_reason" not in row]
     if not included:
@@ -390,8 +412,12 @@ def score_manifest_rows(
     scored: list[JsonObject] = []
     probe_pages: Optional[list[list[JsonObject]]] = None
     for row in included:
-        requests = [_request(item, row) for item in plans]
-        responses, results = _run_requests(client, requests, project_root)
+        row_client = building_client if row.get("semantic_state") == "building" else client
+        if row_client is None:
+            raise InputFault(f"building_fixture_client_missing:{row['episode_id']}")
+        split = capability.get("pattern_declared") is True
+        requests = [_request(item, row, split) for item in plans]
+        responses, results = _run_requests(row_client, requests, project_root)
         if profile == "paged" and probe_pages is None:
             probe_pages = results_by_request(responses, project_root)
         final_count = len(responses[-1].get("results", []))
@@ -409,7 +435,7 @@ def score_manifest_rows(
         invariance_sent: list[list[JsonObject]] = []
         invariance_failure: Optional[str] = None
         if profile == "paged":
-            invariance_sent, invariant_paths, invariant = _invariance(client, row, project_root)
+            invariance_sent, invariant_paths, invariant = _invariance(row_client, row, project_root, split)
             if not invariant:
                 invariance_failure = f"page_invariance_failed:{row['episode_id']}"
             elif invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
@@ -428,9 +454,32 @@ def score_manifest_rows(
             # record, and replays of it differ, so the miss keeps no paths.
             metrics = {metric: 0.0 for metric in METRICS}
             ranked_paths, retrieval_depth, page_zero_ranked_paths = [], 0, []
+        paired: JsonObject = {}
+        if "pattern" in row:
+            prose_row = {key: value for key, value in row.items() if key != "pattern"}
+            prose_requests = [_request(item, prose_row) for item in plans]
+            _, prose_results = _run_requests(row_client, prose_requests, project_root)
+            prose_paths = collapse_paths(prose_results)[:10]
+            prose_metrics = row_metrics(prose_paths, str(row["opened_file"]))
+            if split and row["split_kind"] == "R5" and results != prose_results:
+                raise InputFault(f"empty_pattern_not_identical:{row['episode_id']}")
+            paired = {
+                "input_form": "split" if split else "joined",
+                "answer_kind": row["answer_kind"],
+                "split_kind": row["split_kind"],
+                **({"pattern_summary": responses[0].get("pattern_summary"), "summary_text": str(responses[0].get("text", "")).splitlines()[:8]} if split else {}),
+                "prose_only": {"requests": prose_requests, "ranked_paths": prose_paths, "metrics": prose_metrics},
+                "paired_mrr_delta": metrics["mrr_at_10"] - prose_metrics["mrr_at_10"],
+                **({"semantic_state": "building", "envelope_complete": responses[0].get("complete")} if row.get("semantic_state") == "building" else {}),
+            }
+            if profile == "paged":
+                _, _, prose_invariant = _invariance(row_client, prose_row, project_root)
+                if not prose_invariant:
+                    raise InputFault(f"prose_page_invariance_failed:{row['episode_id']}")
         scored.append(
             {
                 "episode_id": row["episode_id"],
+                **paired,
                 "request": requests[0],
                 "requests": requests,
                 "request_count": len(requests) + sum(len(plan) for plan in invariance_sent),
@@ -533,7 +582,9 @@ def assemble_score(
             "concept_recall": concept_family,
             "real_query": real["family"],
         },
-        "fixture_groups": {"exact_recall": exact_groups, "concept_recall": concept_groups},
+        "fixture_groups": {"exact_recall": exact_groups, "concept_recall": concept_groups,
+            **({"real_query": {"split": mean_metrics([row["metrics"] for row in rows if "input_form" in row])}} if any("input_form" in row for row in rows) else {})},
+        "paired_deltas": {row["episode_id"]: row["paired_mrr_delta"] for row in rows if "input_form" in row},
         "shapes": real["shapes"],
         "mechanisms": real["mechanisms"],
         "census_weighted_mrr_report_only": real["census_weighted_mrr_report_only"],
@@ -576,6 +627,21 @@ def load_inputs(
     pack = read_pack(pack_path)
     if pack.get("pinned_sha") != EVIDENCE_SHA:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
+    supplement = manifest.get("split_query_pack")
+    if supplement:
+        supplemental_path = ROOT / supplement["path"]
+        if sha256_file(supplemental_path) != supplement["sha256"]:
+            raise InputFault("corpus_vector_model_mismatch:split_query_pack")
+        extra = read_pack(supplemental_path)
+        for field in ("pinned_sha", "model_id", "embed_template_version", "dimension"):
+            if extra.get(field) != pack.get(field):
+                raise InputFault(f"corpus_vector_model_mismatch:split_query_pack:{field}")
+        vectors = dict(pack["vectors"])
+        for key, vector in extra["vectors"].items():
+            if key in vectors and vectors[key] != vector:
+                raise InputFault("corpus_vector_model_mismatch:split_query_pack:overlap")
+            vectors[key] = vector
+        pack["vectors"] = vectors
     return manifest, tree, pack_path, pack
 
 
@@ -637,17 +703,21 @@ def copy_evidence_root_ignore(root: Path) -> Path:
 
 
 @contextmanager
-def fixture_endpoint(pack: Mapping[str, Any], log_path: Path) -> Iterator[str]:
+def fixture_endpoint(pack: Mapping[str, Any], log_path: Path, corpus_release: Optional[threading.Event] = None) -> Iterator[str]:
     vectors = pack.get("vectors")
     template = pack.get("embed_template_version")
     if not isinstance(vectors, Mapping) or not isinstance(template, str) or not vectors:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
-    server = Server(("127.0.0.1", 0), vectors, template, log_path)
+    server = Server(("127.0.0.1", 0), vectors, template, log_path, corpus_release=corpus_release)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_port}"
+        if server.refused:
+            raise InputFault(f"vector_missing:{server.refused[0]}")
     finally:
+        if corpus_release is not None:
+            corpus_release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -656,6 +726,7 @@ def fixture_endpoint(pack: Mapping[str, Any], log_path: Path) -> Iterator[str]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--manifest", default=str(HERE / "real-query-manifest.json"))
+    result.add_argument("--tuning-only", action="store_true", help="Report-only replay of the separate tuning manifest; never gate or record it.")
     result.add_argument("--profile", choices=("single_page", "paged"), default="single_page")
     result.add_argument("--binary", default=DEFAULT_BINARY)
     result.add_argument("--schema", default=str(DEFAULT_SCHEMA))
@@ -692,6 +763,8 @@ def run(args: argparse.Namespace) -> int:
     binary = Path(args.binary).resolve()
     ensure_binary(binary)
     manifest, provisioned_tree, _pack_path, pack = load_inputs(manifest_path)
+    if bool(manifest.get("tuning_only")) != bool(args.tuning_only):
+        raise InputFault("tuning_manifest_requires_tuning_only_flag")
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
@@ -714,7 +787,27 @@ def run(args: argparse.Namespace) -> int:
             try:
                 client.configure(endpoint, configured_model, args.ready_timeout)
                 client.wait_ready(args.ready_timeout)
-                rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
+                capability.update(probe_pattern_capability(client))
+                if any(row.get("semantic_state") == "building" for row in manifest["rows"]):
+                    with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
+                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
+                        try:
+                            building.configure(building_endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
+                            deadline = time.monotonic() + args.ready_timeout
+                            while time.monotonic() < deadline:
+                                status = building.call("status")
+                                if status.get("search_index", {}).get("status") == "ready":
+                                    if status.get("semantic_index", {}).get("status") != "building":
+                                        raise InputFault(f"semantic_building_fixture_not_building:{status}")
+                                    break
+                                time.sleep(0.1)
+                            else:
+                                raise InputFault("semantic_building_fixture_lexical_timeout")
+                            rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
+                        finally:
+                            building.close()
+                else:
+                    rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
             finally:
                 client.close()
     score = assemble_score(
@@ -729,11 +822,19 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
-    validate_scored_population(manifest, score)
+    if args.tuning_only:
+        score["tuning_only"] = True
+    else:
+        validate_scored_population(manifest, score)
     validate_profile_score(score)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(canonical_json(score))
+    for row in rows:
+        if "input_form" in row:
+            print(f"split_pair:{row['episode_id']} form={row['input_form']} mrr_delta={row['paired_mrr_delta']:+.6f}")
+            if row["input_form"] == "split":
+                print(f"split_summary:{row['episode_id']} {row.get('pattern_summary')} {row.get('summary_text')}")
     print(f"real_query_rows:{len(rows)}")
     print(f"real_query_score:{output}")
     print(f"real_query_score_sha256:{sha256_file(output)}")
