@@ -23,9 +23,11 @@ const STATUS_BUDGET: Duration = Duration::from_secs(1);
 /// waits while holding the connection mutex delays reads by about this much,
 /// on fast and slow machines alike.
 const MAINTENANCE_BUSY_BUDGET_MS: &str = "2000";
-/// A read must never wait out a maintenance busy budget. Half a second leaves
-/// room for a loaded machine's scheduling and stays far below the budget above.
-const READ_BUDGET: Duration = Duration::from_millis(500);
+/// A read must never wait out a maintenance busy budget. One second is half
+/// that budget, so a regression still fails by a wide margin, and it leaves a
+/// loaded CI runner room for scheduling delays that have nothing to do with
+/// the connection mutex.
+const READ_BUDGET: Duration = Duration::from_millis(1_000);
 
 struct Contended {
     _project: tempfile::TempDir,
