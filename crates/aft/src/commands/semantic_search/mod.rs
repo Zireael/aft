@@ -13,6 +13,7 @@ pub mod paging;
 pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
+mod regex_route;
 pub mod scoring;
 mod snippet_bounds;
 pub mod telemetry;
@@ -2099,17 +2100,28 @@ fn handle_grep_search(
 
     let literal = effective_mode == SearchMode::Literal;
     let fetch_limit = offset.saturating_add(top_k);
-    let scope = match grep_executor::resolve_grep_scope(ctx, None, fetch_limit, &req.id) {
-        Ok(scope) => scope,
-        Err(response) => return response,
+    // With a ready index, rank every file the trigram index admits before the
+    // page is cut. Without one, the bounded grep scan below is all there is.
+    let ranked = ranked_regex_route_result(ctx, &compiled, include_tests, query);
+    let (mut result, ranked_files, examination_note) = if let Some((ranked, note)) = ranked {
+        (ranked.summary, Some(ranked.files), note)
+    } else {
+        let scope = match grep_executor::resolve_grep_scope(ctx, None, fetch_limit, &req.id) {
+            Ok(scope) => scope,
+            Err(response) => return response,
+        };
+        let params = GrepParams {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_results: fetch_limit,
+            path_exclusion: grep_path_exclusion(include_tests),
+        };
+        (
+            grep_executor::execute(ctx, &compiled, &scope, &params),
+            None,
+            None,
+        )
     };
-    let params = GrepParams {
-        include: Vec::new(),
-        exclude: Vec::new(),
-        max_results: fetch_limit,
-        path_exclusion: grep_path_exclusion(include_tests),
-    };
-    let mut result = grep_executor::execute(ctx, &compiled, &scope, &params);
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
@@ -2136,25 +2148,50 @@ fn handle_grep_search(
     }
 
     let interval_end = offset.saturating_add(top_k);
-    let interval_has_more = result.total_matches > interval_end || result.truncated;
+    let interval_has_more = if ranked_files.is_some() {
+        // Every ranked file is already in hand, one result each; a deeper page
+        // can only show those. A bound on the examination is disclosed
+        // separately.
+        result.matches.len() > interval_end
+    } else {
+        result.total_matches > interval_end || result.truncated
+    };
     result.matches = result
         .matches
         .into_iter()
         .skip(offset)
         .take(top_k)
         .collect();
-    let result_values = result
-        .matches
-        .iter()
-        .map(|grep_match| grep_match_to_json(grep_match, result_source))
-        .collect::<Vec<_>>();
+    let ranked_page: Option<Vec<regex_route::RankedFile>> =
+        ranked_files.map(|files| files.into_iter().skip(offset).take(top_k).collect());
+    let result_values = match &ranked_page {
+        Some(page) => page
+            .iter()
+            .map(|file| ranked_file_to_json(file, result_source))
+            .collect::<Vec<_>>(),
+        None => result
+            .matches
+            .iter()
+            .map(|grep_match| grep_match_to_json(grep_match, result_source))
+            .collect::<Vec<_>>(),
+    };
     let interpreted_as = interpreted_as_label(effective_mode);
     let trigram_index_building = semantic_status == "building"
         && matches!(
             result.index_status,
             IndexStatus::Building | IndexStatus::Fallback
         );
-    let mut text = format_grep_search_text(&result, project_root, interpreted_as);
+    let mut text = match &ranked_page {
+        Some(page) => format!(
+            "{}\n[interpreted_as: {interpreted_as}]",
+            regex_route::format_ranked_page(page, &result, project_root)
+        ),
+        None => format_grep_search_text(&result, project_root, interpreted_as),
+    };
+    if let Some(note) = examination_note.as_deref() {
+        text.push('\n');
+        text.push_str(note);
+    }
     let mut extras = serde_json::Map::new();
     if trigram_index_building {
         let envelope = bounded_walk_search_envelope(
@@ -2199,6 +2236,46 @@ fn handle_grep_search(
             extras,
         },
     )
+}
+
+/// Run the regex or literal route over the ready trigram index and rank the
+/// files it finds (see [`regex_route`]).
+///
+/// Returns the ranked result and, when a bound stopped the examination before
+/// every candidate file was read, a line saying how much was covered. Returns
+/// `None` when no ready index snapshot can be read within the interactive
+/// budget; the caller then runs the bounded grep scan instead.
+fn ranked_regex_route_result(
+    ctx: &AppContext,
+    compiled: &pattern_compile::CompiledPattern,
+    include_tests: bool,
+    query: &str,
+) -> Option<(regex_route::RankedFiles, Option<String>)> {
+    let snapshot = {
+        let guard = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)?;
+        let index = guard.as_ref()?;
+        if !index.ready {
+            return None;
+        }
+        index.snapshot()
+    };
+    let scope = crate::search_index::resolve_search_scope(&grep_executor::project_root(ctx), None);
+    if !scope.use_index {
+        return None;
+    }
+    let collection = snapshot.collect_grep_matches_by_file(
+        compiled,
+        &PathFilters::default(),
+        &scope.root,
+        grep_path_exclusion(include_tests),
+        regex_route::limits(),
+        &regex_route::examine_priority,
+        &regex_route::keep_past_line_limit,
+    );
+    let note = collection.examination_capped.then(|| {
+        regex_route::examination_disclosure(collection.files_examined, collection.candidate_files)
+    });
+    Some((regex_route::rank_collection(collection, query), note))
 }
 
 fn short_regex_compile_reason(message: &str) -> Cow<'_, str> {
@@ -5946,6 +6023,35 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
     })
 }
 
+/// One ranked file as a search result: its first listed line in the
+/// `GrepLine` shape, plus every listed line and how many more the file has.
+fn ranked_file_to_json(file: &regex_route::RankedFile, source: &'static str) -> serde_json::Value {
+    let mut value = grep_match_to_json(&file.lines[0], source);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "lines".to_string(),
+            serde_json::Value::Array(
+                file.lines
+                    .iter()
+                    .map(|line| {
+                        serde_json::json!({
+                            "line": line.line,
+                            "column": line.column,
+                            "line_text": line.line_text,
+                            "match_text": line.match_text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "more_in_file".to_string(),
+            serde_json::json!(file.more_in_file),
+        );
+    }
+    value
+}
+
 fn grep_match_to_json(grep_match: &GrepMatch, source: &'static str) -> serde_json::Value {
     serde_json::json!({
         "kind": "GrepLine",
@@ -7601,6 +7707,204 @@ mod tests {
         assert_eq!(response["query_kind"], "Regex");
         assert_eq!(response["semantic_status"], "disabled");
         assert_eq!(response["results"][0]["kind"], "GrepLine");
+    }
+
+    /// Write `path` under `root` with a fixed modification time, so a test can
+    /// place a file older or newer than the others without sleeping.
+    fn write_with_age(root: &Path, path: &str, content: &str, age_secs: u64) {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("fixture parent")).expect("create dir");
+        std::fs::write(&full, content).expect("write fixture");
+        let modified = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&full)
+            .and_then(|file| file.set_modified(modified))
+            .expect("set fixture mtime");
+    }
+
+    /// An identifier alternation mentioned across many documentation files
+    /// and defined in one source file must return the defining file first,
+    /// however many other files match and however much newer they are. The
+    /// regex route used to keep only the first matches its scan met (twice
+    /// the page size) and sort them by modification time, so the definition
+    /// was at best last on the page and usually not on it at all.
+    #[test]
+    fn regex_route_ranks_the_defining_file_before_many_mentions() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let root = project.path();
+        // The definition is the oldest file; everything else is newer.
+        write_with_age(
+            root,
+            "src/hooks/useCart.js",
+            "export function useCart() {\n  const addToCart = (item) => item;\n  const updateCartWithValidatedPrices = (cart) => cart;\n  return { addToCart, updateCartWithValidatedPrices };\n}\n",
+            86_400,
+        );
+        for index in 0..4 {
+            write_with_age(
+                root,
+                &format!("src/components/Product{index}.jsx"),
+                "import { useCart } from '../hooks/useCart';\nexport const Product = () => {\n  const { addToCart } = useCart();\n  return <button onClick={() => addToCart(1)} />;\n};\n",
+                3_600,
+            );
+        }
+        for index in 0..32 {
+            write_with_age(
+                root,
+                &format!("DOCS/cart-{index:02}.md"),
+                "# Cart\n\nCall `addToCart` to add an item.\n\nThen `updateCartWithValidatedPrices` checks prices.\n",
+                60,
+            );
+        }
+        let ctx = test_context(root);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        install_ready_search_index(&ctx, root);
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("addToCart|updateCartWithValidatedPrices", 10),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "regex");
+        let files: Vec<String> = response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| {
+                result["file"]
+                    .as_str()
+                    .expect("result file")
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            files
+                .first()
+                .is_some_and(|file| file.ends_with("src/hooks/useCart.js")),
+            "the defining file must come first: {files:?}"
+        );
+        // Each file is one result that carries its matching lines: the hook
+        // leads with its declaration, then its other lines in file order.
+        let hook = &response["results"][0];
+        let hook_lines: Vec<u64> = hook["lines"]
+            .as_array()
+            .expect("hook lines")
+            .iter()
+            .map(|line| line["line"].as_u64().expect("line number"))
+            .collect();
+        assert_eq!(hook_lines, [2, 3, 4]);
+        assert_eq!(hook["more_in_file"], 0);
+        // Source that uses the identifier comes before documentation.
+        let first_doc = files.iter().position(|file| file.contains("/DOCS/"));
+        let last_component = files.iter().rposition(|file| file.contains("/components/"));
+        assert!(
+            last_component.is_some_and(|component| first_doc.is_none_or(|doc| component < doc)),
+            "components must precede docs: {files:?}"
+        );
+        // Every file was examined and every matching line counted: 3 lines in
+        // the hook, 2 in each component, 2 in each document.
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.contains("Found 75 match across 37 file") && !text.contains("(capped)"),
+            "footer must count every match exactly: {text}"
+        );
+    }
+
+    fn result_files(response: &serde_json::Value) -> Vec<String> {
+        response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| {
+                let file = result["file"]
+                    .as_str()
+                    .expect("result file")
+                    .replace('\\', "/");
+                file.rsplit('/').next().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    /// A regex pass stopped by its file bound must say so even when every
+    /// result it found fits on the page. Without the disclosure a short,
+    /// complete-looking list would read as every match in the project.
+    #[test]
+    fn bounded_regex_route_discloses_even_when_all_results_fit() {
+        let project = tempfile::tempdir().expect("create project dir");
+        for (name, content) in [("a.txt", "a to b\n"), ("b.txt", "ab\n"), ("c.txt", "a b\n")] {
+            std::fs::write(project.path().join(name), content).expect("write fixture");
+        }
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        install_ready_search_index(&ctx, project.path());
+
+        regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(Some(1)));
+        let response = response_value(handle_semantic_search(&semantic_request("a.*b", 10), &ctx));
+        regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(None));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "regex");
+        // `a.*b` has no trigram, so all three files are candidates; the file
+        // bound set to 1 above lets only the first (a.txt, by path) be read.
+        assert_eq!(result_files(&response), ["a.txt"]);
+        let text = response["text"].as_str().expect("text");
+        assert!(text.contains("examined 1 of 3 candidate files"), "{text}");
+        // The trailer is rendered from this envelope; without it a short list
+        // would read as complete.
+        let envelope = &response["results_list_envelope"];
+        assert_eq!(
+            envelope["reason"], "budget",
+            "a bounded pass needs a trailer: {response}"
+        );
+        assert_eq!(envelope["shown"], 1);
+        assert_eq!(envelope["total"]["kind"], "at_least");
+        assert!(text.contains("(capped)"), "{text}");
+    }
+
+    /// The same string read as a literal (the route's fallback when a query
+    /// does not compile, or its tokens are too short to rank) and as a regex
+    /// are different searches. The route keeps no cache, and each reading
+    /// must get its own results however the calls interleave.
+    #[test]
+    fn regex_route_keeps_literal_and_regex_readings_apart() {
+        let project = tempfile::tempdir().expect("create project dir");
+        std::fs::write(project.path().join("pipe.rs"), "let s = \"alpha|omega\";\n")
+            .expect("write pipe.rs");
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha() {}\n").expect("write alpha.rs");
+        let ctx = test_context(project.path());
+        install_ready_search_index(&ctx, project.path());
+        let compile = |literal: bool| match pattern_compile::compile(
+            "alpha|omega",
+            CompileOpts {
+                literal,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => compiled,
+            _ => panic!("pattern compiles"),
+        };
+        let files = |literal: bool| {
+            let (result, note) =
+                ranked_regex_route_result(&ctx, &compile(literal), false, "alpha|omega")
+                    .expect("ready index");
+            assert!(note.is_none());
+            result
+                .summary
+                .matches
+                .iter()
+                .map(|m| m.file.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(files(true), ["pipe.rs"]);
+        // The declaration outranks the string that mentions both names.
+        assert_eq!(files(false), ["alpha.rs", "pipe.rs"]);
+        assert_eq!(files(true), ["pipe.rs"]);
     }
 
     #[test]

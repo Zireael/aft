@@ -401,3 +401,38 @@ fn producer_bounds_resolve_to_their_real_surfaces_or_internal_exclusions() {
         "LINE_COUNT_BYTES" | "ENTRY_BUDGET" | "MAX_DIRECTORY_SCAN"
     )));
 }
+
+/// The regex route's cuts are agent-visible: the budget that stops its file
+/// examination (reported as engine_capped) and the per-result line allowance
+/// (reported as more_in_file). Both must resolve to the search surface, never
+/// to an exclusion, which would hide them from the envelope contract.
+#[test]
+fn regex_route_cuts_resolve_to_the_search_surface() {
+    let cuts = super::support::discover_list_cutting_sites();
+    for item in ["rank_collection", "from_matches"] {
+        let sites = cuts
+            .iter()
+            .filter(|site| {
+                site.file == "commands/semantic_search/regex_route.rs"
+                    && site.enclosing_item == item
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !sites.is_empty(),
+            "discovery did not attribute any cuts to regex_route.rs:{item}"
+        );
+        for site in sites {
+            assert_eq!(
+                super::support::resolve_cut(site).unwrap(),
+                "payload.results",
+                "{site:?}"
+            );
+        }
+    }
+    let unresolved = cuts
+        .iter()
+        .filter(|site| site.file == "commands/semantic_search/regex_route.rs")
+        .filter(|site| super::support::resolve_cut(site).ok() != Some("payload.results"))
+        .collect::<Vec<_>>();
+    assert!(unresolved.is_empty(), "{unresolved:?}");
+}

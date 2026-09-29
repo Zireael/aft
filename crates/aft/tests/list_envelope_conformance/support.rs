@@ -2217,6 +2217,7 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         "search" => {
             file == "commands/semantic_search/mod.rs"
                 || file == "commands/semantic_search/exact_lane.rs"
+                || file == "commands/semantic_search/regex_route.rs"
                 || file == "subc_format.rs"
         }
         "read" => file == "commands/read.rs" || file == "subc_format.rs",

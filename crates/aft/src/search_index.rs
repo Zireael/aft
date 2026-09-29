@@ -1061,6 +1061,51 @@ pub struct GrepResult {
     pub missing_on_disk: usize,
 }
 
+/// Bounds on how much work [`SearchIndexSnapshot::collect_grep_matches_by_file`]
+/// may do. They limit the files examined and the time spent, never the number
+/// of matches found, so the caller can rank every file that was examined.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GrepExaminationLimits {
+    /// Most candidate files read and verified.
+    pub max_files: usize,
+    /// Wall-clock time after which no further file is started.
+    pub budget: Duration,
+    /// Most matching lines kept per file, apart from lines the caller asks to
+    /// keep. Every matching line is still counted.
+    pub max_lines_per_file: usize,
+}
+
+/// Every matching line found in one examined file.
+#[derive(Clone, Debug)]
+pub(crate) struct GrepFileMatches {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+    /// The first `max_lines_per_file` matching lines, and any later line the
+    /// caller asked to keep, in file order.
+    pub matches: Vec<GrepMatch>,
+    /// All matching lines in the file, including the ones not kept.
+    pub matched_lines: usize,
+}
+
+/// Result of [`SearchIndexSnapshot::collect_grep_matches_by_file`].
+#[derive(Clone, Debug)]
+pub(crate) struct GrepFileCollection {
+    /// Files with at least one match, in examination order.
+    pub files: Vec<GrepFileMatches>,
+    /// Candidate files the trigram index admitted inside the search scope.
+    pub candidate_files: usize,
+    /// Candidate files actually read and verified.
+    pub files_examined: usize,
+    /// True when the file-count bound, the time budget or a cancellation left
+    /// candidate files unexamined.
+    pub examination_capped: bool,
+    /// True when the pattern yielded no trigram, so every indexed file was a
+    /// candidate.
+    pub fully_degraded: bool,
+    pub index_status: IndexStatus,
+    pub missing_on_disk: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GrepQueryPhaseTimings {
     pub trigram_lookup: Duration,
@@ -2803,6 +2848,118 @@ impl SearchIndexSnapshot {
         (result, phases)
     }
 
+    /// Find every matching line in the candidate files the trigram index admits,
+    /// grouped by file, for a caller that ranks files before cutting a page.
+    ///
+    /// Candidates come from the whole index: the trigram prefilter, with one
+    /// posting union per alternation branch, admits files; the pattern itself
+    /// decides every match, so the result has no false matches. Unlike
+    /// [`Self::search_grep`], nothing stops at a match count. The work is
+    /// bounded instead by `limits`: candidates are sorted by
+    /// `examine_priority` (lower first) and then by path, and at most
+    /// `limits.max_files` of them are read, none started after the time
+    /// budget. When a bound leaves files unexamined, `examination_capped`
+    /// reports it, so the caller can say what its ranking covered.
+    pub(crate) fn collect_grep_matches_by_file(
+        &self,
+        pattern: &CompiledPattern,
+        filters: &PathFilters,
+        search_root: &Path,
+        path_exclusion: Option<GrepPathExclusion>,
+        limits: GrepExaminationLimits,
+        examine_priority: &(dyn Fn(&Path) -> u8 + Sync),
+        keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
+    ) -> GrepFileCollection {
+        let matcher = match pattern {
+            CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
+            CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
+        };
+        let query = decompose_grep_pattern(pattern);
+        let search_root = canonicalize_for_search_membership(search_root);
+        let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
+
+        let mut candidates: Vec<(u8, &FileEntry)> = self
+            .candidates(&query)
+            .into_iter()
+            .filter_map(|file_id| self.files.get(file_id as usize))
+            .filter(|file| !file.path.as_os_str().is_empty())
+            .filter(|file| is_within_search_root(&search_root, &file.path))
+            .filter(|file| {
+                path_exclusion.is_none_or(|exclude| !exclude(&file.path, &self.project_root))
+            })
+            .filter(|file| filters.matches(&self.project_root, &file.path))
+            .map(|file| (examine_priority(&file.path), file))
+            .collect();
+        candidates.sort_by(|(left_priority, left), (right_priority, right)| {
+            left_priority
+                .cmp(right_priority)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let candidate_files = candidates.len();
+        let examined_slice = &candidates[..candidate_files.min(limits.max_files)];
+
+        let job_cancellation = crate::executor::current_job_cancellation();
+        let started = Instant::now();
+        let stopped_early = AtomicBool::new(false);
+        let files_examined = AtomicUsize::new(0);
+        let missing_on_disk = AtomicUsize::new(0);
+        let files: Vec<GrepFileMatches> = examined_slice
+            .par_iter()
+            .filter_map(|(_, file)| {
+                if started.elapsed() >= limits.budget
+                    || job_cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.cancel_requested_before_commit())
+                {
+                    stopped_early.store(true, Ordering::Relaxed);
+                    return None;
+                }
+                let content = match read_indexed_file_bytes(&file.path) {
+                    Ok(content) => content,
+                    Err(missing) => {
+                        if missing {
+                            missing_on_disk.fetch_add(1, Ordering::Relaxed);
+                        }
+                        files_examined.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                };
+                files_examined.fetch_add(1, Ordering::Relaxed);
+                if is_binary_bytes(&content) {
+                    return None;
+                }
+                let (matches, matched_lines) = matching_lines_in_content(
+                    &file.path,
+                    &content,
+                    &matcher,
+                    limits.max_lines_per_file,
+                    keep_past_limit,
+                );
+                (matched_lines > 0).then(|| GrepFileMatches {
+                    path: file.path.clone(),
+                    modified: file.modified,
+                    matches,
+                    matched_lines,
+                })
+            })
+            .collect();
+
+        GrepFileCollection {
+            files,
+            candidate_files,
+            files_examined: files_examined.load(Ordering::Relaxed),
+            examination_capped: candidate_files > examined_slice.len()
+                || stopped_early.load(Ordering::Relaxed),
+            fully_degraded,
+            index_status: if self.ready {
+                IndexStatus::Ready
+            } else {
+                IndexStatus::Building
+            },
+            missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
+        }
+    }
+
     fn empty_grep_result(&self) -> GrepResult {
         GrepResult {
             matches: Vec::new(),
@@ -3237,6 +3394,70 @@ fn search_candidate_file(
     }
 
     matches
+}
+
+/// Every line of `content` the matcher matches, in file order: the first
+/// `max_lines` of them, plus any later line `keep_past_limit` accepts, each
+/// with its first match on the line, and the count of all of them. Match
+/// positions and line numbering are the same as [`search_candidate_file`]
+/// reports, so a line found here is a line grep finds.
+fn matching_lines_in_content(
+    path: &Path,
+    content: &[u8],
+    matcher: &SearchMatcher,
+    max_lines: usize,
+    keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
+) -> (Vec<GrepMatch>, usize) {
+    let mut matches = Vec::new();
+    let mut matched_lines = 0usize;
+    let mut line_starts: Option<Vec<usize>> = None;
+    let mut last_line: Option<u32> = None;
+    let mut record = |start: usize, end: usize| {
+        let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(content));
+        let (line, column, line_text) = line_details_bytes(content, line_starts, start);
+        // Offsets arrive in increasing order, so a repeated line is always the
+        // line just recorded; only its first match is kept, as grep does.
+        if last_line == Some(line) {
+            return;
+        }
+        last_line = Some(line);
+        matched_lines += 1;
+        let grep_match = GrepMatch {
+            file: path.to_path_buf(),
+            line,
+            column,
+            line_text,
+            match_text: String::from_utf8_lossy(&content[start..end]).into_owned(),
+        };
+        if matched_lines <= max_lines || keep_past_limit(&grep_match) {
+            matches.push(grep_match);
+        }
+    };
+    match matcher {
+        SearchMatcher::Literal(literal) => {
+            let needle = &literal.needle;
+            let lowered;
+            let haystack: &[u8] = if literal.case_insensitive_ascii {
+                lowered = content.to_ascii_lowercase();
+                &lowered
+            } else {
+                content
+            };
+            let finder = memchr::memmem::Finder::new(needle);
+            let mut start = 0;
+            while let Some(position) = finder.find(&haystack[start..]) {
+                let offset = start + position;
+                start = offset + 1;
+                record(offset, offset + needle.len());
+            }
+        }
+        SearchMatcher::Regex(regex) => {
+            for matched in regex.find_iter(content) {
+                record(matched.start(), matched.end());
+            }
+        }
+    }
+    (matches, matched_lines)
 }
 
 fn should_stop_search(

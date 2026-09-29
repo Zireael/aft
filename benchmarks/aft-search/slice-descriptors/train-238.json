@@ -1,0 +1,16 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "identifier_not_definition_first",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "semantic_search::tests::regex_route_ranks_the_defining_file_before_many_mentions",
+    "semantic_search::tests::bounded_regex_route_discloses_even_when_all_results_fit",
+    "semantic_search::tests::regex_route_keeps_literal_and_regex_readings_apart",
+    "real-query-paged-regex-rows-900003-900009"
+  ],
+  "slices": [
+    "regex-route-rank-before-cut"
+  ],
+  "note": "aft_search's regex and literal route verifies every trigram candidate (bounded by files examined and time, never by matches found) and ranks whole files before the page is cut: source before other text before data, a keyword declaration of the matched name before a field line before a plain mention, then more matching lines. Each file is one result carrying its matching lines (all up to ten, else five plus a count), declaration first. A bounded pass always carries a budget envelope. Every row, including those flagged reference_not_page_invariant, must be page-invariant. grep's own path is unchanged."
+}

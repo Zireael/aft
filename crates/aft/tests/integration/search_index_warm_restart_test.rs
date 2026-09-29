@@ -281,7 +281,10 @@ fn aft_search_excludes_tests_before_the_visible_result_cap() {
         }),
     );
     assert_eq!(including_tests["success"], true);
-    assert_eq!(including_tests["engine_capped"], true);
+    // The regex route examines all 401 candidate files (well inside its file
+    // bound) and ranks them before paging, so nothing is cut by a budget; the
+    // rest are simply on later pages.
+    assert_eq!(including_tests["engine_capped"], false);
     assert_eq!(including_tests["more_available"], true);
     assert!(including_tests["results"]
         .as_array()
