@@ -610,9 +610,10 @@ fn test_read_directory_caps_entries_at_one_thousand() {
     assert_eq!(entries.len(), 1001);
     assert_eq!(entries[0], "entry_0000.txt");
     assert_eq!(entries[999], "entry_0999.txt");
+    // The directory listing now renders the shared list-envelope trailer.
     assert_eq!(
         entries[1000],
-        "\nshown 1000 of 1005 entries (display cap; examined 1005 directory entries) · narrow: subdirectory"
+        "\nshown 1000 of 1005 items (cap) · narrow: path"
     );
 
     let status = aft.shutdown();
