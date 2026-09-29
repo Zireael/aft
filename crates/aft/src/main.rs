@@ -604,6 +604,7 @@ fn main() {
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
         let runtime = Arc::clone(registry.current());
+        aft::slog_info!("shutdown phase=search_index_flush_start");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
@@ -615,7 +616,13 @@ fn main() {
             flushed.unwrap_or(false),
             shutdown_started.elapsed().as_millis()
         );
-        let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+        aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
+        let drained = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+        aft::slog_info!(
+            "shutdown phase=callgraph_refresh_flush_done drained={} elapsed_ms={}",
+            drained,
+            shutdown_started.elapsed().as_millis()
+        );
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();
