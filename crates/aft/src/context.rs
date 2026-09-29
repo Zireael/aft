@@ -2748,6 +2748,9 @@ pub struct AppContext {
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
     daemonless_query_mode: AtomicBool,
+    /// The search reranker backend, rebuilt off the search path whenever the
+    /// published config or the daemon mode changes.
+    rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
@@ -3280,6 +3283,7 @@ impl AppContext {
             git_common_dir: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
+            rerank_slot: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
@@ -5154,6 +5158,7 @@ impl AppContext {
         if replace_pin {
             replace_pinned_config(self.config_pin_key(), &next);
         }
+        self.reconcile_rerank_backend(&next);
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
@@ -5466,6 +5471,25 @@ impl AppContext {
     #[doc(hidden)]
     pub fn set_daemonless_query_mode(&self, enabled: bool) {
         self.daemonless_query_mode.store(enabled, Ordering::SeqCst);
+        self.reconcile_rerank_backend(&self.config_unpinned());
+    }
+
+    /// The search reranker's backend slot.
+    pub(crate) fn rerank_slot(
+        &self,
+    ) -> &crate::commands::semantic_search::rerank::slot::BackendSlot {
+        &self.rerank_slot
+    }
+
+    /// Start building the reranker backend for `config` in the background when
+    /// it differs from the one built or being built. Never blocks on the build.
+    fn reconcile_rerank_backend(&self, config: &Config) {
+        self.rerank_slot.reconcile(
+            crate::commands::semantic_search::rerank::slot::BuildInputs::from_config(
+                config,
+                !self.daemonless_query_mode(),
+            ),
+        );
     }
 
     pub(crate) fn daemonless_query_mode(&self) -> bool {

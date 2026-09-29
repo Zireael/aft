@@ -38,46 +38,101 @@ use tokenizers::Tokenizer;
 
 use super::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
 
+/// One file of a pinned model: its path inside the repository and the sha256
+/// of its content at the pinned commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinnedFile {
+    pub(crate) path: &'static str,
+    pub(crate) sha256: &'static str,
+}
+
 /// A reranker model the ONNX backend may load. Only these can be selected, so a
-/// config value can never point the process at an arbitrary download.
+/// config value can never point the process at an arbitrary download. Each is
+/// pinned to one Hugging Face commit and every file to its sha256, so a moved
+/// `main` branch can never change the model behind a fingerprint, a recorded
+/// fixture pack or a committed order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllowedModel {
     pub(crate) name: &'static str,
     pub(crate) repo: &'static str,
-    pub(crate) model_file: &'static str,
+    /// Hugging Face commit the files are downloaded from; also the
+    /// fingerprint revision.
+    pub(crate) commit: &'static str,
+    pub(crate) model_file: PinnedFile,
     /// Files the ONNX graph loads beside itself (external weights).
-    pub(crate) extra_files: &'static [&'static str],
-    pub(crate) tokenizer_file: &'static str,
+    pub(crate) extra_files: &'static [PinnedFile],
+    pub(crate) tokenizer_file: PinnedFile,
 }
 
 pub(crate) const DEFAULT_MODEL: &str = "bge-reranker-base";
 
+// Commits and hashes were read from the Hugging Face API
+// (`/api/models/<repo>/revision/main?blobs=true`, LFS sha256) and, for the
+// non-LFS tokenizer files, from downloads at the pinned commit.
 pub(crate) const ALLOWED_MODELS: &[AllowedModel] = &[
     AllowedModel {
         name: "bge-reranker-base",
         repo: "BAAI/bge-reranker-base",
-        model_file: "onnx/model.onnx",
+        commit: "2cfc18c9415c912f9d8155881c133215df768a70",
+        model_file: PinnedFile {
+            path: "onnx/model.onnx",
+            sha256: "15b9a8c3da82eddf263df571281166e00e9308fe19d077084b642ebfcaf06d2b",
+        },
         extra_files: &[],
-        tokenizer_file: "tokenizer.json",
+        tokenizer_file: PinnedFile {
+            path: "tokenizer.json",
+            sha256: "9eb652ac4e40cc093272bbbe0f55d521cf67570060227109b5cdc20945a4489e",
+        },
     },
     AllowedModel {
         name: "bge-reranker-v2-m3",
         repo: "rozgo/bge-reranker-v2-m3",
-        model_file: "model.onnx",
-        extra_files: &["model.onnx.data"],
-        tokenizer_file: "tokenizer.json",
+        commit: "fbd57b17b4db111a9d16813bb08b4c804fac18e9",
+        model_file: PinnedFile {
+            path: "model.onnx",
+            sha256: "3af844cd2de818a95d2b5de5893a336836312c8ade03f53b286ac6beae080321",
+        },
+        extra_files: &[PinnedFile {
+            path: "model.onnx.data",
+            sha256: "84b66c787b9b98977a16d5c993a3959210a214c98fc3466da263c949c2068945",
+        }],
+        tokenizer_file: PinnedFile {
+            path: "tokenizer.json",
+            sha256: "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3",
+        },
     },
     AllowedModel {
         name: "jina-reranker-v1-turbo",
         repo: "jinaai/jina-reranker-v1-turbo-en",
-        model_file: "onnx/model.onnx",
+        commit: "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2",
+        model_file: PinnedFile {
+            path: "onnx/model.onnx",
+            sha256: "c1296c66c119de645fa9cdee536d8637740efe85224cfa270281e50f213aa565",
+        },
         extra_files: &[],
-        tokenizer_file: "tokenizer.json",
+        tokenizer_file: PinnedFile {
+            path: "tokenizer.json",
+            sha256: "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902",
+        },
+    },
+    AllowedModel {
+        name: "gte-reranker-modernbert-base",
+        repo: "Alibaba-NLP/gte-reranker-modernbert-base",
+        commit: "f7481e6055501a30fb19d090657df9ec1f79ab2c",
+        model_file: PinnedFile {
+            path: "onnx/model.onnx",
+            sha256: "c6d3226502addbcd4d2cf273802957ebf8a2a6bf94037dcb9b1d95bfc01e5d93",
+        },
+        extra_files: &[],
+        tokenizer_file: PinnedFile {
+            path: "tokenizer.json",
+            sha256: "2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd",
+        },
     },
 ];
 
-/// Most tokens per pair (query plus candidate). All three allowed models were
-/// trained with a 512-token input; longer pairs are cut from the longer side
+/// Most tokens per pair (query plus candidate). Every allowed model accepts a
+/// 512-token input; longer pairs are cut from the longer side
 /// first.
 pub(crate) const MAX_PAIR_TOKENS: usize = 512;
 /// Largest `batch × tokens²` one inference may use. The attention tensors of a
@@ -92,6 +147,8 @@ pub(crate) const MAX_MODEL_FILE_BYTES: u64 = 2_500 * 1024 * 1024;
 pub(crate) const MAX_PAIRS_PER_CALL: usize = 64;
 /// After a failed download or load, wait this long before trying again.
 const RETRY_AFTER: Duration = Duration::from_secs(300);
+/// Longest a backend build waits for a model download and load.
+const MAX_LOAD_WAIT: Duration = Duration::from_secs(3_600);
 
 /// Intra-op threads for the reranker session, from a budget shared with the
 /// embedder. The embedder keeps the count it derives for itself (half the
@@ -193,6 +250,25 @@ impl OnnxReranker {
                 Ok(Box::new(scorer) as Box<dyn PairScorer>)
             }),
         )
+    }
+
+    /// Start the worker if needed and block until its model is loaded or has
+    /// failed to load. Only the backend slot's build thread calls this.
+    pub(crate) fn ensure_loaded(&self) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            match self.ready_sender() {
+                Ok(_) => return Ok(()),
+                Err(RerankError::Unavailable(reason)) if reason == "model loading" => {}
+                Err(RerankError::Unavailable(reason) | RerankError::Refused(reason))
+                | Err(RerankError::Failed(reason)) => return Err(reason),
+                Err(RerankError::Timeout) => return Err("timeout".to_string()),
+            }
+            if started.elapsed() > MAX_LOAD_WAIT {
+                return Err("model still loading".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// The worker's queue when it is ready; otherwise start it (once, or again
@@ -323,13 +399,14 @@ pub(crate) fn fingerprint_for(model: &AllowedModel) -> RerankFingerprint {
     RerankFingerprint {
         backend: "onnx",
         model: model.name.to_string(),
-        revision: format!("{}:{}", model.repo, model.model_file),
+        revision: model.commit.to_string(),
     }
 }
 
 /// The process-wide ONNX backend for a configured model name (default when
-/// absent). Cheap: it neither downloads nor loads anything.
-pub(crate) fn shared_backend(model: Option<&str>) -> Result<Arc<dyn RerankBackend>, String> {
+/// absent). Cheap and free of I/O: it neither reads, downloads nor loads
+/// anything; the worker does that on first use or on `ensure_loaded`.
+pub(crate) fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxReranker>, String> {
     static BACKENDS: OnceLock<Mutex<HashMap<&'static str, Arc<OnnxReranker>>>> = OnceLock::new();
     let requested = model.unwrap_or(DEFAULT_MODEL);
     let allowed = find_allowed_model(requested)
@@ -348,82 +425,139 @@ pub(crate) fn shared_backend(model: Option<&str>) -> Result<Arc<dyn RerankBacken
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelFiles {
     pub(crate) model: PathBuf,
+    /// External weight files loaded beside the graph.
+    pub(crate) extras: Vec<PathBuf>,
     pub(crate) tokenizer: PathBuf,
 }
 
 /// Find the model in the shared model cache, downloading it when absent. Runs
 /// only on the worker thread.
 fn provision_model_files(model: &AllowedModel) -> Result<ModelFiles, String> {
-    let cache_dir = crate::local_embed::embedding_cache_dir()?;
-    if let Some(found) = scan_local_snapshot(&cache_dir, model) {
-        return Ok(found);
+    provision_model_files_in(model, &crate::local_embed::embedding_cache_dir()?)
+}
+
+/// Use the pinned snapshot under `cache_dir` when every file is present and
+/// matches its pinned sha256; otherwise download the pinned commit and verify
+/// it. A file whose hash does not match is deleted and the model refused.
+pub(crate) fn provision_model_files_in(
+    model: &AllowedModel,
+    cache_dir: &Path,
+) -> Result<ModelFiles, String> {
+    super::note_io();
+    let snapshot = pinned_snapshot_dir(cache_dir, model);
+    let local = files_in_snapshot(&snapshot, model);
+    if pinned_files(model)
+        .iter()
+        .all(|file| snapshot.join(file.path).is_file())
+    {
+        // A cached file that fails its hash is removed here, then downloaded
+        // again below.
+        if verify_pinned_files(&snapshot, model).is_ok() {
+            return Ok(local);
+        }
     }
+
     use hf_hub::api::sync::ApiBuilder;
     crate::slog_info!(
-        "downloading rerank model {} ({}) to {}",
+        "downloading rerank model {} ({}@{}) to {}",
         model.name,
         model.repo,
+        model.commit,
         cache_dir.display()
     );
     let api = ApiBuilder::new()
         .with_progress(false)
-        .with_cache_dir(cache_dir.clone())
+        .with_cache_dir(cache_dir.to_path_buf())
         .build()
         .map_err(|error| format!("init model download: {error}"))?;
-    let repo = api.model(model.repo.to_string());
-    let model_path = repo
-        .get(model.model_file)
-        .map_err(|error| format!("download {}: {error}", model.model_file))?;
-    for extra in model.extra_files {
-        repo.get(extra)
-            .map_err(|error| format!("download {extra}: {error}"))?;
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        model.repo.to_string(),
+        hf_hub::RepoType::Model,
+        model.commit.to_string(),
+    ));
+    for file in pinned_files(model) {
+        repo.get(file.path)
+            .map_err(|error| format!("download {}: {error}", file.path))?;
     }
-    let tokenizer = repo
-        .get(model.tokenizer_file)
-        .map_err(|error| format!("download {}: {error}", model.tokenizer_file))?;
-    Ok(ModelFiles {
-        model: model_path,
-        tokenizer,
-    })
+    verify_pinned_files(&snapshot, model)?;
+    Ok(local)
 }
 
-/// hf-hub keeps a repo at `<cache>/models--<org>--<repo>/snapshots/<rev>/`.
-/// Take the newest snapshot holding every required file.
-fn scan_local_snapshot(cache_dir: &Path, model: &AllowedModel) -> Option<ModelFiles> {
-    let snapshots = cache_dir
+fn pinned_files(model: &AllowedModel) -> Vec<PinnedFile> {
+    let mut files = vec![model.model_file];
+    files.extend(model.extra_files.iter().copied());
+    files.push(model.tokenizer_file);
+    files
+}
+
+/// hf-hub keeps a repo at `<cache>/models--<org>--<repo>/snapshots/<commit>/`.
+pub(crate) fn pinned_snapshot_dir(cache_dir: &Path, model: &AllowedModel) -> PathBuf {
+    cache_dir
         .join(format!("models--{}", model.repo.replace('/', "--")))
-        .join("snapshots");
-    let mut candidates = std::fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::UNIX_EPOCH)
-    });
-    candidates.into_iter().rev().find_map(|snapshot| {
-        let files = ModelFiles {
-            model: snapshot.join(model.model_file),
-            tokenizer: snapshot.join(model.tokenizer_file),
-        };
-        let complete = files.model.is_file()
-            && files.tokenizer.is_file()
-            && model
-                .extra_files
-                .iter()
-                .all(|extra| snapshot.join(extra).is_file());
-        complete.then_some(files)
-    })
+        .join("snapshots")
+        .join(model.commit)
 }
 
-/// Total size of the graph file and every file beside it that it may load.
-fn model_bytes(model_path: &Path) -> u64 {
-    let graph = std::fs::metadata(model_path).map_or(0, |metadata| metadata.len());
-    let data = std::fs::metadata(model_path.with_extension("onnx.data"))
-        .map_or(0, |metadata| metadata.len());
-    graph + data
+fn files_in_snapshot(snapshot: &Path, model: &AllowedModel) -> ModelFiles {
+    ModelFiles {
+        model: snapshot.join(model.model_file.path),
+        extras: model
+            .extra_files
+            .iter()
+            .map(|file| snapshot.join(file.path))
+            .collect(),
+        tokenizer: snapshot.join(model.tokenizer_file.path),
+    }
+}
+
+/// Check every file of the snapshot against its pinned sha256. A missing or
+/// mismatching file is deleted (the snapshot entry and, when it is a link into
+/// hf-hub's blob store, the blob it points to), so no later load can use it.
+pub(crate) fn verify_pinned_files(snapshot: &Path, model: &AllowedModel) -> Result<(), String> {
+    for file in pinned_files(model) {
+        let path = snapshot.join(file.path);
+        let actual =
+            sha256_file(&path).map_err(|error| format!("hash {}: {error}", path.display()))?;
+        if actual != file.sha256 {
+            if let Ok(target) = std::fs::canonicalize(&path) {
+                let _ = std::fs::remove_file(target);
+            }
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "{} of {}@{} has sha256 {actual}, expected {}; the file was deleted",
+                file.path, model.repo, model.commit, file.sha256
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Total size of the graph file and its external weight files.
+fn model_bytes(files: &ModelFiles) -> u64 {
+    std::iter::once(&files.model)
+        .chain(&files.extras)
+        .map(|path| std::fs::metadata(path).map_or(0, |metadata| metadata.len()))
+        .sum()
 }
 
 /// A loaded cross-encoder session and its tokenizer.
@@ -437,7 +571,8 @@ pub(crate) struct OnnxPairScorer {
 
 impl OnnxPairScorer {
     pub(crate) fn load(name: &str, files: &ModelFiles, threads: usize) -> Result<Self, String> {
-        let bytes = model_bytes(&files.model);
+        super::note_io();
+        let bytes = model_bytes(files);
         if bytes > MAX_MODEL_FILE_BYTES {
             return Err(format!(
                 "model {name} is {bytes} bytes, above the {MAX_MODEL_FILE_BYTES}-byte limit"

@@ -18,6 +18,7 @@
 
 pub(crate) mod fixture;
 pub(crate) mod onnx;
+pub(crate) mod slot;
 
 #[cfg(test)]
 mod tests;
@@ -112,6 +113,14 @@ impl RerankError {
 }
 
 pub(crate) trait RerankBackend: Send + Sync {
+    /// The identity of the scoring function. It must be constant for the
+    /// lifetime of the instance and must do no I/O: it is read on the search
+    /// path and is part of the key under which a list's rerank outcome is
+    /// committed, so a value that changed mid-paging would rerank a list whose
+    /// earlier page was already served in another order. A backend that needs
+    /// I/O to learn its identity (asking a server which model it serves) must
+    /// learn it while it is being built, off the search path; until it is
+    /// built no backend is installed, which counts as reranking off.
     fn fingerprint(&self) -> RerankFingerprint;
     fn max_batch(&self) -> usize;
     /// One score per doc, same order; must return by `deadline` or Err(Timeout).
@@ -198,6 +207,8 @@ pub(crate) struct SelectedBackend {
 /// Inputs of one rerank decision, all independent of the requested page.
 pub(crate) struct RerankRequest<'a> {
     pub(crate) search: &'a SearchConfig,
+    /// The backend installed for this context when the search started.
+    pub(crate) backend: slot::Installed,
     pub(crate) project_root: &'a Path,
     /// The prose question. `None` (a pattern-only search) means no rerank.
     pub(crate) prose: Option<&'a str>,
@@ -220,15 +231,23 @@ pub(crate) enum HeadOutcome {
 /// Rerank the head of the canonical list in `reply`, then re-cut the page
 /// from the canonical list so it shows the committed order. Returns the note
 /// to show when reranking was skipped. An error is returned only for a
-/// fail-closed backend.
+/// fail-closed backend, or when the benchmark fixture pack is configured but
+/// not installed.
 pub(crate) fn rerank_canonical_head(
     reply: &mut BlockReply,
     offset: usize,
     top_k: usize,
     request: RerankRequest<'_>,
 ) -> Result<Option<String>, String> {
-    let Some(selected) = select_backend(request.search) else {
-        return Ok(None);
+    let selected = match &request.backend {
+        slot::Installed::Off => return Ok(None),
+        slot::Installed::Ready(selected) => Ok(selected.clone()),
+        slot::Installed::NotReady(reason) => {
+            if crate::environment::non_empty_os_var(FIXTURE_PACK_ENV).is_some() {
+                return Err(format!("reranker fixture not installed: {reason}"));
+            }
+            Err(reason.clone())
+        }
     };
     let settings = RerankSettings::resolve(request.search);
     match rerank_block_zero(&mut reply.canonical_list, &selected, &settings, &request)? {
@@ -264,9 +283,9 @@ pub(crate) fn rerank_block_zero(
     };
     let selected = match selected {
         Ok(selected) => selected,
-        // A backend that can never be built here (an unsupported model name,
-        // a backend kind this build does not include) fails the same way on
-        // every request, so it needs no memo to stay consistent across pages.
+        // No backend is installed yet (it is being built, or its last build
+        // failed). The skip is not committed: once a backend is installed the
+        // list is reranked.
         Err(reason) => return Ok(HeadOutcome::Skipped(short_reason(reason))),
     };
     let Some(block) = list.blocks.iter_mut().find(|block| block.tier_index == 0) else {
@@ -337,39 +356,18 @@ pub(crate) fn rerank_block_zero(
     }
 }
 
-/// Choose the backend for this request, or `None` when reranking is off.
-/// `Some(Err)` carries a reason the configured backend cannot be used.
-fn select_backend(search: &SearchConfig) -> Option<Result<SelectedBackend, String>> {
+/// The backend this search may use, read from the context's slot without I/O
+/// and without waiting. Tests may install one for their own thread instead.
+pub(crate) fn installed_backend(ctx: &crate::context::AppContext) -> slot::Installed {
     #[cfg(test)]
     if let Some(selected) = tests::test_backend_override() {
-        return Some(Ok(selected));
+        return slot::Installed::Ready(selected);
     }
-    if let Some(path) = crate::environment::non_empty_os_var(FIXTURE_PACK_ENV) {
-        return Some(
-            fixture::shared_fixture_backend(Path::new(&path)).map(|backend| SelectedBackend {
-                backend,
-                fail_closed: true,
-            }),
-        );
-    }
-    let settings = RerankSettings::resolve(search);
-    match settings.backend {
-        RerankBackendKind::Off => None,
-        RerankBackendKind::Onnx => Some(onnx::shared_backend(settings.model.as_deref()).map(
-            |backend| {
-                let backend = match crate::environment::non_empty_os_var(RECORD_PACK_ENV) {
-                    Some(path) => fixture::recording(backend, PathBuf::from(path)),
-                    None => backend,
-                };
-                SelectedBackend {
-                    backend,
-                    fail_closed: false,
-                }
-            },
-        )),
-        RerankBackendKind::Remote => Some(Err("remote backend unavailable".to_string())),
-        RerankBackendKind::Synapse => Some(Err("synapse backend unavailable".to_string())),
-    }
+    let config = ctx.config();
+    ctx.rerank_slot().read(slot::BuildInputs::from_config(
+        &config,
+        !ctx.daemonless_query_mode(),
+    ))
 }
 
 fn validate_scores(scores: &[f32], expected: usize) -> Result<(), RerankError> {
@@ -607,4 +605,13 @@ impl Memo {
 fn memo() -> &'static Memo {
     static MEMO: OnceLock<Memo> = OnceLock::new();
     MEMO.get_or_init(Memo::default)
+}
+
+/// Marks a function that reads or writes files or the network. Tests count
+/// the marks on their own thread to prove the search path's backend
+/// selection never reaches one; in normal builds it does nothing.
+#[inline]
+pub(crate) fn note_io() {
+    #[cfg(test)]
+    tests::count_io();
 }

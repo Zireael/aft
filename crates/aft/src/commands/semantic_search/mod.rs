@@ -3229,6 +3229,7 @@ fn run_engine_ranking(
         page_request.top_k(),
         rerank::RerankRequest {
             search: &ctx.config().search,
+            backend: rerank::installed_backend(ctx),
             project_root,
             prose: Some(query),
             path_scope: path_scope.as_ref(),

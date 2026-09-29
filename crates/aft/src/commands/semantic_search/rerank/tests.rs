@@ -18,6 +18,16 @@ use crate::search_index::SearchIndex;
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };
+    static IO_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a file or network access made on the calling thread.
+pub(super) fn count_io() {
+    IO_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+fn io_on_this_thread() -> usize {
+    IO_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// The backend a test installed for its own thread, if any.
@@ -439,6 +449,7 @@ fn head_request<'a>(
 ) -> RerankRequest<'a> {
     RerankRequest {
         search,
+        backend: slot::Installed::Off,
         project_root: project,
         prose,
         path_scope: scope,
@@ -595,33 +606,337 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
 }
 
 #[test]
-fn unsupported_backend_choices_skip_with_a_reason() {
+fn unsupported_backend_choices_fail_their_build_with_a_reason() {
+    let inputs = |rerank: RerankConfig| slot::BuildInputs {
+        search: SearchConfig {
+            rerank: Some(rerank),
+        },
+        semantic: Default::default(),
+        under_subc: false,
+    };
     for (backend, reason) in [
         (RerankBackendKind::Remote, "remote backend unavailable"),
         (RerankBackendKind::Synapse, "synapse backend unavailable"),
     ] {
-        let search = SearchConfig {
+        let built = slot::build_backend(&inputs(RerankConfig {
+            backend: Some(backend),
+            ..RerankConfig::default()
+        }));
+        assert_eq!(built.err().as_deref(), Some(reason));
+    }
+    let built = slot::build_backend(&inputs(RerankConfig {
+        backend: Some(RerankBackendKind::Onnx),
+        model: Some("some-other-model".to_string()),
+        ..RerankConfig::default()
+    }));
+    assert!(built.err().unwrap().contains("unsupported rerank model"));
+    assert!(slot::build_backend(&inputs(RerankConfig::default()))
+        .unwrap()
+        .is_none());
+}
+
+// ---- the backend slot ----------------------------------------------------
+
+fn onnx_inputs(model: Option<&str>) -> slot::BuildInputs {
+    slot::BuildInputs {
+        search: SearchConfig {
             rerank: Some(RerankConfig {
-                backend: Some(backend),
+                backend: Some(RerankBackendKind::Onnx),
+                model: model.map(str::to_string),
                 ..RerankConfig::default()
             }),
-        };
-        let selected = select_backend(&search).expect("a configured backend is selected");
-        assert_eq!(selected.err().as_deref(), Some(reason));
+        },
+        semantic: Default::default(),
+        under_subc: false,
     }
-    let search = SearchConfig {
-        rerank: Some(RerankConfig {
-            backend: Some(RerankBackendKind::Onnx),
-            model: Some("some-other-model".to_string()),
-            ..RerankConfig::default()
-        }),
+}
+
+fn numbered_selected() -> SelectedBackend {
+    SelectedBackend {
+        backend: NumberedBackend::new(Vec::new()),
+        fail_closed: false,
+    }
+}
+
+fn wait_for(mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "condition never held"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn is_ready(installed: &slot::Installed) -> bool {
+    matches!(installed, slot::Installed::Ready(_))
+}
+
+#[test]
+fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
+    let search_thread = std::thread::current().id();
+    let built_on_search_thread = Arc::new(AtomicUsize::new(0));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let constructor: slot::Constructor = {
+        let built_on_search_thread = built_on_search_thread.clone();
+        let builds = builds.clone();
+        Arc::new(move |inputs: &slot::BuildInputs| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            if std::thread::current().id() == search_thread {
+                built_on_search_thread.fetch_add(1, Ordering::SeqCst);
+            }
+            // Stands in for real construction, which does I/O.
+            note_io();
+            match RerankSettings::resolve(&inputs.search).backend {
+                RerankBackendKind::Off => Ok(None),
+                _ => Ok(Some(numbered_selected())),
+            }
+        })
     };
-    assert!(select_backend(&search)
-        .unwrap()
-        .err()
-        .unwrap()
-        .contains("unsupported rerank model"));
-    assert!(select_backend(&SearchConfig::default()).is_none());
+    let mut all_inputs = vec![slot::BuildInputs {
+        search: SearchConfig::default(),
+        semantic: Default::default(),
+        under_subc: false,
+    }];
+    for backend in [
+        RerankBackendKind::Off,
+        RerankBackendKind::Onnx,
+        RerankBackendKind::Remote,
+        RerankBackendKind::Synapse,
+    ] {
+        for under_subc in [false, true] {
+            all_inputs.push(slot::BuildInputs {
+                search: SearchConfig {
+                    rerank: Some(RerankConfig {
+                        backend: Some(backend),
+                        ..RerankConfig::default()
+                    }),
+                },
+                semantic: Default::default(),
+                under_subc,
+            });
+        }
+    }
+    for model in onnx::ALLOWED_MODELS.iter().map(|model| model.name) {
+        all_inputs.push(onnx_inputs(Some(model)));
+    }
+
+    let before = io_on_this_thread();
+    for inputs in all_inputs {
+        let slot = slot::BackendSlot::with_constructor(constructor.clone());
+        let off = RerankSettings::resolve(&inputs.search).backend == RerankBackendKind::Off;
+        // First read: an unseen config starts a build and reads as not ready
+        // (or off).
+        match slot.read(inputs.clone()) {
+            slot::Installed::Off => assert!(off),
+            slot::Installed::NotReady(_) => assert!(!off),
+            slot::Installed::Ready(_) => panic!("installed before any build ran"),
+        }
+        if !off {
+            wait_for(|| is_ready(&slot.read(inputs.clone())));
+            // Everything the search path asks of an installed backend.
+            let slot::Installed::Ready(selected) = slot.read(inputs.clone()) else {
+                unreachable!()
+            };
+            let first = selected.backend.fingerprint();
+            let _ = selected.backend.max_batch();
+            assert_eq!(selected.backend.fingerprint(), first);
+        }
+    }
+    assert_eq!(io_on_this_thread(), before, "the search path reached I/O");
+    assert_eq!(built_on_search_thread.load(Ordering::SeqCst), 0);
+    assert!(builds.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn a_failed_build_is_retried_with_backoff_and_a_success_installs_a_new_instance() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let constructor: slot::Constructor = {
+        let attempts = attempts.clone();
+        Arc::new(move |_: &slot::BuildInputs| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err("server not reachable".to_string())
+            } else {
+                Ok(Some(numbered_selected()))
+            }
+        })
+    };
+    let slot = slot::BackendSlot::default();
+    slot.set_constructor_for_test(constructor, Duration::from_millis(5));
+    let inputs = onnx_inputs(None);
+    slot.reconcile(inputs.clone());
+    wait_for(|| is_ready(&slot.read(inputs.clone())));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    // A constructor that always fails is tried a bounded number of times and
+    // leaves the slot not ready, with the last reason.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let constructor: slot::Constructor = {
+        let attempts = attempts.clone();
+        Arc::new(move |_: &slot::BuildInputs| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err("still down".to_string())
+        })
+    };
+    let slot = slot::BackendSlot::default();
+    slot.set_constructor_for_test(constructor, Duration::from_millis(1));
+    slot.reconcile(inputs.clone());
+    wait_for(|| attempts.load(Ordering::SeqCst) == slot::MAX_BUILD_ATTEMPTS as usize);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        slot::MAX_BUILD_ATTEMPTS as usize
+    );
+    match slot.read(inputs) {
+        slot::Installed::NotReady(reason) => assert_eq!(reason, "still down"),
+        _ => panic!("a failed build must leave the slot not ready"),
+    }
+}
+
+#[test]
+fn a_build_for_superseded_inputs_is_discarded() {
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let constructor: slot::Constructor = {
+        let gate = gate.clone();
+        Arc::new(move |inputs: &slot::BuildInputs| {
+            if RerankSettings::resolve(&inputs.search).model.as_deref() == Some("slow") {
+                let (open, changed) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+            }
+            Ok(Some(numbered_selected()))
+        })
+    };
+    let slot = slot::BackendSlot::with_constructor(constructor);
+    slot.reconcile(onnx_inputs(Some("slow")));
+    let current = onnx_inputs(Some("fast"));
+    slot.reconcile(current.clone());
+    wait_for(|| is_ready(&slot.read(current.clone())));
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    std::thread::sleep(Duration::from_millis(50));
+    // The slow build finished last but belonged to superseded inputs.
+    assert!(is_ready(&slot.read(current)));
+}
+
+#[test]
+fn a_slow_build_never_delays_a_search_and_searches_skip_until_it_is_installed() {
+    let (_project, ctx) = probe_project(30);
+    let fused = stream(&ctx, 100, 30);
+
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let backend = NumberedBackend::new(Vec::new());
+    let constructor: slot::Constructor = {
+        let gate = gate.clone();
+        let backend = backend.clone();
+        Arc::new(move |_: &slot::BuildInputs| {
+            let (open, changed) = &*gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                // Bounded so a broken test cannot hang the suite.
+                let (next, timeout) = changed.wait_timeout(open, Duration::from_secs(30)).unwrap();
+                open = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            Ok(Some(SelectedBackend {
+                backend: backend.clone(),
+                fail_closed: false,
+            }))
+        })
+    };
+    ctx.rerank_slot()
+        .set_constructor_for_test(constructor, Duration::from_millis(5));
+    ctx.update_config(|config| {
+        config.search.rerank = Some(RerankConfig {
+            backend: Some(RerankBackendKind::Onnx),
+            ..RerankConfig::default()
+        });
+    });
+
+    let started = Instant::now();
+    let (first, text) = page(&ctx, 10, 0);
+    let (second, _) = page(&ctx, 10, 10);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a search waited for the backend build"
+    );
+    assert!(text.contains("rerank skipped: backend not ready"), "{text}");
+    assert_eq!(first, fused[..10]);
+    assert_eq!(second, fused[10..20]);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    wait_for(|| is_ready(&installed_backend(&ctx)));
+    let reranked = stream(&ctx, 100, 30);
+    let mut expected_head = fused[..DEFAULT_TOP_N].to_vec();
+    expected_head.sort_by(|left, right| {
+        file_number(&format!("src/{right}")).total_cmp(&file_number(&format!("src/{left}")))
+    });
+    assert_eq!(reranked[..DEFAULT_TOP_N], expected_head[..]);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn onnx_fingerprints_carry_the_pinned_commit() {
+    let mut names = HashSet::new();
+    let is_hex = |value: &str, len: usize| {
+        value.len() == len
+            && value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    };
+    for model in onnx::ALLOWED_MODELS {
+        assert!(names.insert(model.name), "duplicate model {}", model.name);
+        assert!(is_hex(model.commit, 40), "{} commit", model.name);
+        for file in std::iter::once(&model.model_file)
+            .chain(model.extra_files)
+            .chain([&model.tokenizer_file])
+        {
+            assert!(is_hex(file.sha256, 64), "{} {}", model.name, file.path);
+        }
+        let fingerprint = onnx::shared_onnx_reranker(Some(model.name))
+            .unwrap()
+            .fingerprint();
+        assert_eq!(fingerprint.backend, "onnx");
+        assert_eq!(fingerprint.model, model.name);
+        assert_eq!(fingerprint.revision, model.commit);
+    }
+    assert!(names.contains(onnx::DEFAULT_MODEL));
+}
+
+#[test]
+fn a_cached_file_with_the_wrong_hash_is_refused_and_deleted() {
+    let cache = tempfile::tempdir().unwrap();
+    let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
+    let snapshot = onnx::pinned_snapshot_dir(cache.path(), model);
+    std::fs::create_dir_all(snapshot.join("onnx")).unwrap();
+    // hf-hub stores content in a blob store and links the snapshot to it; the
+    // blob behind a bad file must go too.
+    let blobs = cache.path().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob = blobs.join("tampered");
+    std::fs::write(&blob, b"not the pinned model").unwrap();
+    let model_path = snapshot.join("onnx/model.onnx");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&blob, &model_path).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&blob, &model_path).unwrap();
+    std::fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
+
+    let error = onnx::verify_pinned_files(&snapshot, model).expect_err("a wrong hash is refused");
+    assert!(
+        error.contains("onnx/model.onnx") && error.contains("deleted"),
+        "{error}"
+    );
+    assert!(!model_path.exists() && std::fs::symlink_metadata(&model_path).is_err());
+    #[cfg(unix)]
+    assert!(!blob.exists(), "the blob behind the bad file is deleted");
 }
 
 // ---- ONNX worker lifecycle (fake scorer) -------------------------------
@@ -741,27 +1056,33 @@ fn onnx_worker_drops_a_request_whose_deadline_passed_and_refuses_while_busy() {
     assert!(computed_before > baseline);
 }
 
-/// Loads a real cross-encoder from `AFT_RERANK_ONNX_TEST_MODEL_DIR` (a
-/// directory with `onnx/model.onnx` or `model.onnx`, and `tokenizer.json`),
-/// scores 20 query/document pairs, and prints the latency. Skipped when the
-/// variable is unset, because no reranker model ships with the repository.
+/// Provisions the pinned gte-reranker-modernbert-base into the model cache
+/// named by `AFT_RERANK_ONNX_TEST_CACHE_DIR` (downloading the pinned commit and
+/// verifying every file hash when it is not already there), loads it, scores
+/// 20 query/document pairs and prints the latency. Skipped when the variable
+/// is unset, because it needs the network or a populated cache.
 #[test]
 fn real_onnx_model_scores_twenty_pairs_when_available() {
-    let Some(dir) = std::env::var_os("AFT_RERANK_ONNX_TEST_MODEL_DIR").map(PathBuf::from) else {
-        eprintln!("skipped: AFT_RERANK_ONNX_TEST_MODEL_DIR is not set");
+    let Some(cache_dir) = std::env::var_os("AFT_RERANK_ONNX_TEST_CACHE_DIR").map(PathBuf::from)
+    else {
+        eprintln!("skipped: AFT_RERANK_ONNX_TEST_CACHE_DIR is not set");
         return;
     };
-    let model = [dir.join("onnx/model.onnx"), dir.join("model.onnx")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .expect("model.onnx under the test model directory");
-    let files = onnx::ModelFiles {
-        model,
-        tokenizer: dir.join("tokenizer.json"),
-    };
+    let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
+    let started = Instant::now();
+    let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
+    eprintln!(
+        "provisioned {}@{} in {} ms",
+        model.repo,
+        model.commit,
+        started.elapsed().as_millis()
+    );
+    assert!(files
+        .model
+        .starts_with(onnx::pinned_snapshot_dir(&cache_dir, model)));
     let threads = onnx::rerank_intra_threads();
     let mut scorer =
-        onnx::OnnxPairScorer::load("test-model", &files, threads).expect("load test model");
+        onnx::OnnxPairScorer::load(model.name, &files, threads).expect("load test model");
     let query = "where is the session cache invalidated";
     let mut docs = (0..19)
         .map(|index| {

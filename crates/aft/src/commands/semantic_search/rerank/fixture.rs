@@ -65,6 +65,7 @@ impl FixturePack {
     }
 
     pub(crate) fn load(path: &Path) -> Result<Self, String> {
+        super::note_io();
         let bytes = std::fs::read(path)
             .map_err(|error| format!("read rerank pack {}: {error}", path.display()))?;
         let pack: Self = serde_json::from_slice(&bytes)
@@ -225,6 +226,7 @@ pub(crate) fn recording(
 
 impl RecordingBackend {
     fn record(&self, query: &str, docs: &[RerankDoc<'_>], scores: &[f32]) -> Result<(), String> {
+        super::note_io();
         let _guard = self
             .write_lock
             .lock()
