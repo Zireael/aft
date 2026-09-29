@@ -477,25 +477,6 @@ pub fn list_bash_tasks_for_session(
     Ok(rows)
 }
 
-pub fn list_bash_tasks_by_id(
-    conn: &Connection,
-    harness: &str,
-    task_id: &str,
-) -> rusqlite::Result<Vec<BashTaskRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
-                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
-                compressed, timeout_ms, completion_delivered, output_bytes, metadata
-         FROM bash_tasks
-         WHERE harness = ?1 AND task_id = ?2
-         ORDER BY started_at DESC",
-    )?;
-    let rows = stmt
-        .query_map(params![harness, task_id], map_bash_task_row)?
-        .collect();
-    rows
-}
-
 /// The recorded process identity of one `bash_tasks` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashTaskProcessIds {
@@ -505,19 +486,21 @@ pub struct BashTaskProcessIds {
     pub started_at: i64,
 }
 
-/// SQLite's default host-parameter limit is 999 on older builds; stay under
-/// it with room for the harness parameter.
+/// SQLite's default host-parameter limit is 999 on older builds; stay well
+/// under it.
 const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
 
-/// Recorded pids for every row of `task_ids` under `harness`, in any session.
+/// Recorded pids for every row of `task_ids`, under any harness and session.
 ///
 /// The persisted-task GC asks this once per session directory instead of
 /// once per task, so a sweep takes the shared aft.db mutex a handful of times
 /// rather than once for every task on the machine. Only rows with a recorded
-/// pid or pgid are returned.
+/// pid or pgid are returned. Task ids are unique across harnesses, and routes
+/// from several harnesses share one project root, so a caller asking whether
+/// a task directory still belongs to a live process must not restrict the
+/// lookup to one harness.
 pub fn list_bash_task_process_ids(
     conn: &Connection,
-    harness: &str,
     task_ids: &[String],
 ) -> rusqlite::Result<Vec<BashTaskProcessIds>> {
     let mut found = Vec::new();
@@ -526,12 +509,11 @@ pub fn list_bash_task_process_ids(
         let sql = format!(
             "SELECT task_id, pid, pgid, started_at
              FROM bash_tasks
-             WHERE harness = ? AND task_id IN ({placeholders})
+             WHERE task_id IN ({placeholders})
                AND (pid IS NOT NULL OR pgid IS NOT NULL)"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params = std::iter::once(harness).chain(chunk.iter().map(String::as_str));
-        let rows = stmt.query_map(params_from_iter(params), |row| {
+        let rows = stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
             Ok(BashTaskProcessIds {
                 task_id: row.get(0)?,
                 pid: row.get(1)?,
