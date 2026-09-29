@@ -13,7 +13,7 @@
  */
 
 import { type FSWatcher, readFileSync, statSync, watch } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 
 /** How long a burst of file events must be quiet before the files are read. */
 export const CONFIG_WATCH_DEBOUNCE_MS = 150;
@@ -227,9 +227,18 @@ const CONFIG_WATCH_REJECTED_RETRIES = 3;
 /** Longest a stream of events may postpone a check. */
 const CONFIG_WATCH_MAX_DELAY_MS = 1_000;
 
-function inodeOf(dir: string): number | null {
+/**
+ * A directory's identity: device, inode and birth time. The inode alone is
+ * not enough: ext4 hands a freed inode number straight to the next directory
+ * created, so a directory deleted and recreated under the same name keeps its
+ * inode number while inotify's watch stays on the deleted one. The birth time
+ * differs; where a filesystem does not record one it is 0 and the inode
+ * decides, and the delete event (see `watchAftConfigFiles`) re-arms anyway.
+ */
+function identityOf(dir: string): string | null {
   try {
-    return statSync(dir).ino;
+    const stat = statSync(dir);
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
   } catch {
     return null;
   }
@@ -241,7 +250,7 @@ function inodeOf(dir: string): number | null {
  */
 function watchDirFor(file: string): string {
   let dir = dirname(file);
-  while (dir !== dirname(dir) && inodeOf(dir) === null) dir = dirname(dir);
+  while (dir !== dirname(dir) && identityOf(dir) === null) dir = dirname(dir);
   return dir;
 }
 
@@ -268,7 +277,10 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let firstPendingAt: number | null = null;
   let stopped = false;
-  const watchers = new Map<string, { watcher: FSWatcher; ino: number | null }>();
+  const watchers = new Map<
+    string,
+    { watcher: FSWatcher; identity: string | null; stale: boolean }
+  >();
 
   const watchImpl = options.watchImpl ?? watch;
   let rejectedRetries = 0;
@@ -323,7 +335,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     for (const [dir, entry] of watchers) {
       // A directory that is no longer wanted (its child appeared) or that was
       // replaced under the watch is dropped and, if still wanted, re-armed.
-      if (!wanted.has(dir) || inodeOf(dir) !== entry.ino) {
+      if (!wanted.has(dir) || entry.stale || identityOf(dir) !== entry.identity) {
         entry.watcher.close();
         watchers.delete(dir);
         moved = true;
@@ -335,15 +347,25 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
         // Read the identity first and confirm it after: a directory replaced
         // in between would leave the watch on the old one under the new
         // one's identity, and it would never be re-armed.
-        const ino = inodeOf(dir);
+        const identity = identityOf(dir);
         options.beforeWatchForTest?.(dir);
-        const watcher = watchImpl(dir, { persistent: false }, () => schedule());
-        if (inodeOf(dir) !== ino) {
+        const name = basename(dir);
+        const watcher = watchImpl(dir, { persistent: false }, (event, filename) => {
+          // A `rename` naming the watched directory itself means the
+          // directory was deleted or moved: the watch follows the old one,
+          // so the next check re-arms it on whatever now has this path.
+          if (event === "rename" && filename === name) {
+            const current = watchers.get(dir);
+            if (current && current.watcher === watcher) current.stale = true;
+          }
+          schedule();
+        });
+        if (identityOf(dir) !== identity) {
           watcher.close();
           moved = true;
           continue;
         }
-        const entry = { watcher, ino };
+        const entry = { watcher, identity, stale: false };
         entry.watcher.on("error", () => {
           entry.watcher.close();
           if (watchers.get(dir) === entry) watchers.delete(dir);

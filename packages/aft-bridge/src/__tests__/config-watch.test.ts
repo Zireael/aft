@@ -384,6 +384,43 @@ describe("watchAftConfigFiles registration and retries", () => {
     }
   });
 
+  test("a delete event for the watched directory re-arms its watch", async () => {
+    // ext4 reuses a freed inode number at once, so after a delete-and-recreate
+    // only the delete event tells that inotify's watch is on a dead directory.
+    // The fake watch reports that event while the directory's identity stays
+    // the same, which is what such a platform shows.
+    const dir = tempDir();
+    const configDir = join(dir, ".cortexkit");
+    const file = join(configDir, "aft.jsonc");
+    mkdirSync(configDir);
+    writeFileSync(file, "{}");
+    const listeners: Array<(event: string, filename: string | null) => void> = [];
+    const watched: string[] = [];
+    const fakeWatch = ((
+      path: string,
+      _options: unknown,
+      listener: (event: string, filename: string | null) => void,
+    ) => {
+      watched.push(path);
+      listeners.push(listener);
+      return { close: () => {}, on: () => {} };
+    }) as unknown as typeof import("node:fs").watch;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      onChange: () => undefined,
+      watchImpl: fakeWatch,
+    });
+    try {
+      expect(watched).toEqual([configDir]);
+      listeners[0]?.("rename", ".cortexkit");
+      await waitUntil(() => watched.length >= 2, "the watch was re-armed", 4_000);
+      expect(watched).toEqual([configDir, configDir]);
+    } finally {
+      stop();
+    }
+  });
+
   test("a rejected text is checked again without another event", async () => {
     const dir = tempDir();
     const file = join(dir, "aft.jsonc");
