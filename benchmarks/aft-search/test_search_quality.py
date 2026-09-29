@@ -16,7 +16,9 @@ from search_quality import (
     synthetic_documents,
 )
 from search_quality_lib import (
+    PAGE_INVARIANCE_FAILED_FIELD,
     PAGE_SIZE,
+    REFERENCE_NOT_PAGE_INVARIANT_FIELD,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     included_manifest_ids,
@@ -26,6 +28,7 @@ from search_quality_lib import (
     validate_manifest_maintenance_scores,
     validate_manifest_relabels,
     validate_profile_score,
+    validate_scored_population,
 )
 
 
@@ -377,6 +380,80 @@ class EngineUnwiredGateTests(unittest.TestCase):
     def test_task_and_train_branches_resolve_the_train_descriptor_label(self) -> None:
         self.assertIn("train-55", descriptor_labels("train/55"))
         self.assertIn("train-55", descriptor_labels("alfonso/task/r48-engine-unwired-train-55-"))
+
+
+class PageInvarianceExcuseGateTests(unittest.TestCase):
+    """A manifest's page-invariance excuse covers the reference, never a changed engine."""
+
+    RANKING = (
+        {"slice_class": "ranking", "targeted_mechanism": "none", "kind": "paging", "fixtures": ["paging"]},
+        ["crates/aft/src/commands/semantic_search/memo.rs"],
+    )
+    ENGINE_UNWIRED = (
+        {
+            "slice_class": "engine_unwired",
+            "targeted_mechanism": "none",
+            "kind": "harness",
+            "fixtures": [TOOL_CALL_PARITY_FIXTURE_SOURCE],
+        },
+        ["crates/aft/src/commands/semantic_search/memo.rs"],
+    )
+    NON_RANKING = (None, [])
+
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.manifest["rows"][0][REFERENCE_NOT_PAGE_INVARIANT_FIELD] = "defect under measurement"
+        self.episode_id = self.score["rows"][0]["episode_id"]
+        self.failure = f"page_invariance_failed:{self.episode_id}"
+
+    def record_miss(self, document: dict) -> dict:
+        changed = copy.deepcopy(document)
+        changed["rows"][0][PAGE_INVARIANCE_FAILED_FIELD] = self.failure
+        changed["rows"][0]["metrics"] = {"mrr_at_10": 0.0, "hit_at_1": 0.0, "hit_at_5": 0.0}
+        return changed
+
+    def gate(self, reference: dict, score: dict, slice_: tuple) -> tuple:
+        descriptor, paths = slice_
+        result = total_gate(reference, score, self.manifest, descriptor, paths)
+        return result.exit_code, result.reasons
+
+    def test_ranking_slice_faults_on_a_flagged_row_that_breaks_page_invariance(self) -> None:
+        reference = self.record_miss(self.reference)
+        self.assertEqual(self.gate(reference, self.score, self.RANKING)[0], 2)  # rows differ: latency-only
+        # Even a byte-exact reproduction of the reference's miss is refused.
+        self.assertEqual(
+            self.gate(reference, self.record_miss(self.score), self.RANKING),
+            (2, (f"{self.failure}:candidate",)),
+        )
+
+    def test_unchanged_engine_slice_accepts_a_reproduced_reference_miss(self) -> None:
+        reference = self.record_miss(self.reference)
+        candidate = self.record_miss(self.score)
+        self.assertEqual(self.gate(reference, candidate, self.NON_RANKING), (0, ()))
+        self.assertEqual(self.gate(reference, candidate, self.ENGINE_UNWIRED), (0, ()))
+
+    def test_unchanged_engine_slice_faults_when_the_miss_is_not_reproduced(self) -> None:
+        fault = (2, (f"page_invariance_failed:{self.episode_id}:reference_miss_not_reproduced",))
+        reference_miss = self.record_miss(self.reference)
+        candidate_miss = self.record_miss(self.score)
+        # A row the reference scored normally now fails invariance.
+        self.assertEqual(self.gate(self.reference, candidate_miss, self.NON_RANKING), fault)
+        # The reference's miss is not reproduced: the row is invariant now.
+        self.assertEqual(self.gate(reference_miss, self.score, self.NON_RANKING), fault)
+        # The failure record differs.
+        other = copy.deepcopy(candidate_miss)
+        other["rows"][0][PAGE_INVARIANCE_FAILED_FIELD] = f"{self.failure}:scoring"
+        self.assertEqual(self.gate(reference_miss, other, self.NON_RANKING), fault)
+        # A failing row that still scores is not a miss.
+        scored = copy.deepcopy(candidate_miss)
+        scored["rows"][0]["metrics"]["mrr_at_10"] = 1.0
+        self.assertEqual(self.gate(reference_miss, scored, self.NON_RANKING), fault)
+        self.assertEqual(self.gate(self.reference, candidate_miss, self.ENGINE_UNWIRED), fault)
+
+    def test_invariance_failure_on_an_unflagged_row_is_refused_by_population_check(self) -> None:
+        self.manifest["rows"][0].pop(REFERENCE_NOT_PAGE_INVARIANT_FIELD)
+        with self.assertRaisesRegex(InputFault, "not_excused_by_manifest"):
+            validate_scored_population(self.manifest, self.record_miss(self.score))
 
 
 class LatencyOnlyRankingGateTests(unittest.TestCase):

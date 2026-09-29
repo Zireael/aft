@@ -77,6 +77,24 @@ RANKING_FENCE_PREFIXES = (
 # count as parity fixture differences.
 TOOL_CALL_PARITY_FIXTURE_SOURCE = "crates/aft/tests/integration/tool_call_parity_test.rs"
 TOOL_CALL_PARITY_FIXTURE_PREFIX = "crates/aft/tests/fixtures/tool_call_parity/"
+# Manifest field excusing one row's page-invariance failure in the reference
+# only. The paged replay faults on any row whose ranking changes with page
+# size. A row carrying this field (a non-empty reason naming the engine defect)
+# is recorded instead as a miss with PAGE_INVARIANCE_FAILED_FIELD set, so a
+# reference can be taken on an engine that has the defect. It never excuses a
+# changed engine: under a ranking descriptor total_gate faults on any evaluated
+# row that failed page invariance, flagged or not. Under any other descriptor
+# the engine is unchanged, so a flagged row must reproduce the reference's
+# recorded miss exactly. Set it only on rows added to measure that defect,
+# never to quiet a row that used to pass.
+REFERENCE_NOT_PAGE_INVARIANT_FIELD = "reference_not_page_invariant"
+PAGE_INVARIANCE_FAILED_FIELD = "page_invariance_failed"
+
+
+def excused_page_invariance(row: Mapping[str, Any]) -> bool:
+    """True when a manifest row may be recorded despite failing page invariance."""
+    reason = row.get(REFERENCE_NOT_PAGE_INVARIANT_FIELD)
+    return isinstance(reason, str) and bool(reason.strip())
 
 class InputFault(ValueError):
     """An input or harness fault which must take P1/exit 2."""
@@ -574,6 +592,8 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
         stop = row.get("collapse_stop_reason")
         if stop not in STOP_REASONS:
             raise InputFault(f"invalid_stop_fields:{expected_id}:{stop}")
+        if PAGE_INVARIANCE_FAILED_FIELD in row and not excused_page_invariance(manifest_row):
+            raise InputFault(f"page_invariance_failed:{expected_id}:not_excused_by_manifest")
         if not isinstance(row.get("pages_fetched"), int) or row["pages_fetched"] < 1:
             raise InputFault(f"invalid_stop_fields:{expected_id}:pages_fetched")
 
@@ -808,9 +828,48 @@ class GateResult:
     reasons: tuple[str, ...]
 
 
+def validate_candidate_page_invariance(
+    reference: Mapping[str, Any], score: Mapping[str, Any], slice_class: str
+) -> None:
+    """Check evaluated rows that failed page invariance against the slice class.
+
+    A ranking slice changes the engine, so every row must be page-invariant,
+    whatever REFERENCE_NOT_PAGE_INVARIANT_FIELD says: the field excuses only
+    the reference. Any other slice leaves the engine alone, so a row must
+    reproduce the reference exactly: a recorded miss must fail invariance
+    with the same record and zero metrics again, and a row the reference
+    scored normally must not fail.
+    """
+    recorded = {
+        row.get("episode_id"): row
+        for row in reference.get("rows", [])
+        if isinstance(row, Mapping)
+    }
+    for row in score.get("rows", []):
+        if not isinstance(row, Mapping):
+            continue
+        failure = row.get(PAGE_INVARIANCE_FAILED_FIELD)
+        if slice_class == "ranking":
+            if failure:
+                raise InputFault(f"{failure}:candidate")
+            continue
+        reference_row = recorded.get(row.get("episode_id"), {})
+        reference_failure = reference_row.get(PAGE_INVARIANCE_FAILED_FIELD)
+        if not failure and not reference_failure:
+            continue
+        misses = all(
+            float(candidate.get("metrics", {}).get(metric, 1.0)) == 0.0
+            for candidate in (row, reference_row)
+            for metric in METRICS
+        )
+        if failure != reference_failure or not misses:
+            raise InputFault(f"page_invariance_failed:{row.get('episode_id')}:reference_miss_not_reproduced")
+
+
 def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> GateResult:
     try:
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
+        validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths)
             if difference:

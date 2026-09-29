@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "regex-identifier-rows-and-reference-miss-flag"
+  ],
+  "note": "Adds seven regex identifier real-query rows and the reference_not_page_invariant manifest field, and records the reference on the unchanged engine. No ranking-fence files. Flagged rows must reproduce the reference's recorded miss exactly under this descriptor."
+}

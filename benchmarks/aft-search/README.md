@@ -266,6 +266,38 @@ The pinned tree also carries `.alfonso/reports/search-fusion-quality.md`,
 which quotes these fixture queries. Both replays exclude it from the index;
 see the corpus hygiene section below.
 
+### Rows the reference may record as a miss
+
+The paged replay faults on any row whose ranking depends on page size (the
+`topK` 10, 25 and 50 invariance plans must agree). One manifest field relaxes
+that for the reference only: `reference_not_page_invariant`, a one-line reason
+naming the engine defect. A row carrying it that breaks page invariance is
+recorded as a miss (every metric 0) with `page_invariance_failed` on the score
+row, so a reference can be taken on an engine that still has the defect and
+the fix can be measured against it.
+
+The field never excuses a changed engine. Under a `ranking` descriptor,
+`total_gate` faults on any evaluated score row that broke page invariance,
+flagged or not, so the change that fixes the defect must make every row
+invariant. Under a `non_ranking` or `engine_unwired` descriptor the engine is
+unchanged, so a flagged row must reproduce the reference's recorded miss
+exactly (the same `page_invariance_failed` record, every metric 0), and a row
+the reference scored normally must not fail. That lets the train carrying
+the rows and their reference land before the train that fixes the engine. A row without the field faults at
+replay time exactly as before. Set the field only on rows added to measure a
+known paging defect, never on a row that used to pass: there it would turn a
+regression into a quiet miss. Remove it in its own change once the defect is
+fixed, not in the same train as a reference re-record.
+
+The field is set on six regex identifier rows,
+`followup-census:900003`-`900008` (#375): the regex route on the recording
+engine kept the first matches its scan met, in parallel scan order, and
+sorted only those, so its pages depended on page size. The seventh regex row,
+`900009`, has fewer matching lines than the smallest invariance page, so that
+engine replays it invariantly and it carries no flag. Rows with between about
+ten and forty matching lines were left out: on that engine they pass or fail
+page invariance from run to run, so no reference taken on it would repeat.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
@@ -410,6 +442,25 @@ Re-records so far:
   shows that the root `.aftignore` written into the copy did not itself
   enter the index. Exact recall is unchanged at 1.000; it scores against the
   pinned external clones, not the evidence tree.
+- 2026-09-29, when seven regex identifier rows were added
+  (`followup-census:900003`-`900009`, mechanism
+  `identifier_not_definition_first`, #375). Each query is an identifier
+  alternation an agent ran in this repository, and its answer is the file
+  that declares the identifiers; the row's `row_source` and
+  `answer_key_basis` say where it came from and where the declaration sits
+  at the pin. The engine was unchanged: one release build of the base commit
+  in a Linux aarch64 container (`aft 0.58.0`, binary sha256
+  `bdcbf20ba992...`), `paged` profile. That binary with the old manifest
+  reproduced the old reference, all 49 rows byte-equal; with the new manifest
+  the 49 rows are again byte-equal. The old regex route broke page invariance
+  on these rows, so six of them carry `reference_not_page_invariant` (see
+  Rows the reference may record as a miss) and five were recorded as misses;
+  `900008` replayed invariantly and scored rank 1, `900009` (no flag) rank 1.
+  Two recording runs gave scores that differ only in `baseline_sha256`, the
+  recorder's note of the reference file present when each ran. Real-query `paged` MRR@10
+  0.220238 -> 0.228423 (56 rows), census-weighted MRR 0.162052 -> 0.239927,
+  the new `regex` shape and `identifier_not_definition_first` mechanism both
+  MRR@10 0.285714. Exact recall (1.000) and concept recall are unchanged.
 
 ## Prefrontal search-miss rows
 

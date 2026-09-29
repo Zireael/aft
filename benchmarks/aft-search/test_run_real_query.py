@@ -21,7 +21,9 @@ from search_quality_lib import (
     D_0,
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
+    PAGE_INVARIANCE_FAILED_FIELD,
     PAGE_SIZE,
+    REFERENCE_NOT_PAGE_INVARIANT_FIELD,
     InputFault,
     canonical_json,
     choose_stop,
@@ -73,6 +75,29 @@ class CrossBoundaryDuplicateClient(FakeClient):
             "results": [{"file": path, "name": Path(path).stem} for path in selected],
             "more_available": offset + top_k < len(paths),
         }
+
+
+class PageSizeDependentClient(FakeClient):
+    """An engine whose ranking changes with the page size: a 10-result page
+    returns its files in reverse, like a result cap applied before sorting."""
+
+    def __init__(self) -> None:
+        super().__init__(total=500)
+
+    def search(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        response = super().search(arguments)
+        if int(arguments["topK"]) == 10:
+            response["results"] = list(reversed(response["results"]))
+        return response
+
+
+def paged_capability() -> dict[str, Any]:
+    return {
+        "schema_path": "fixture.json",
+        "schema_sha256": "0" * 64,
+        "offset_declared": True,
+        "offset_bounds": {"minimum": 0, "maximum": 10000},
+    }
 
 
 def manifest(include_tests: bool = True) -> dict[str, Any]:
@@ -256,6 +281,23 @@ class RealQueryRunnerTests(unittest.TestCase):
             corpus, repos = parse_corpus_toml(corpus_path)
             with self.assertRaisesRegex(CorpusMissing, r"corpus_missing:missing:run=python3 benchmarks/aft-search/provision_corpus.py"):
                 validate_corpus(corpus_path, corpus, repos)
+
+    def test_unflagged_row_breaking_page_invariance_faults(self) -> None:
+        with self.assertRaisesRegex(InputFault, r"^page_invariance_failed:followup-census:1$"):
+            score_manifest_rows(manifest(), "paged", paged_capability(), PageSizeDependentClient(), Path("."))
+
+    def test_flagged_row_breaking_page_invariance_records_a_miss(self) -> None:
+        document = manifest()
+        document["rows"][0]["opened_file"] = "src/file000.py"
+        document["rows"][0][REFERENCE_NOT_PAGE_INVARIANT_FIELD] = "defect under measurement"
+        invariant = score_manifest_rows(document, "paged", paged_capability(), FakeClient(total=500), Path("."))
+        self.assertEqual(invariant[0]["metrics"]["mrr_at_10"], 1.0)
+        self.assertNotIn(PAGE_INVARIANCE_FAILED_FIELD, invariant[0])
+        rows = score_manifest_rows(document, "paged", paged_capability(), PageSizeDependentClient(), Path("."))
+        self.assertEqual(rows[0][PAGE_INVARIANCE_FAILED_FIELD], "page_invariance_failed:followup-census:1")
+        self.assertEqual(rows[0]["metrics"], {"mrr_at_10": 0.0, "hit_at_1": 0.0, "hit_at_5": 0.0})
+        self.assertEqual((rows[0]["ranked_paths"], rows[0]["page_zero_ranked_paths"], rows[0]["retrieval_depth"]), ([], [], 0))
+        validate_profile_score({"profile": "paged", "capability": paged_capability() | {"probe_pages_differ": True}, "rows": rows})
 
     def test_recorded_include_tests_changes_ranked_paths(self) -> None:
         true_rows = score_manifest_rows(manifest(True), "single_page", {"offset_declared": False}, FakeClient(), Path("."))

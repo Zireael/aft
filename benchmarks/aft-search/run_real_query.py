@@ -25,11 +25,14 @@ from run import strip_verbatim_prefix
 from search_quality_lib import (
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
+    METRICS,
+    PAGE_INVARIANCE_FAILED_FIELD,
     InputFault,
     aggregate_real_query,
     canonical_json,
     choose_stop,
     collapse_paths,
+    excused_page_invariance,
     invariance_requests,
     mean_metrics,
     profile_requests,
@@ -359,7 +362,9 @@ def _run_requests(client: Any, requests: Sequence[JsonObject], project_root: Pat
     return responses, results
 
 
-def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tuple[list[list[JsonObject]], list[str]]:
+def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tuple[list[list[JsonObject]], list[str], bool]:
+    """Run the invariance plans; return what was sent, the first plan's paths,
+    and whether all plans collapsed to the same paths."""
     plans = invariance_requests()
     sent: list[list[JsonObject]] = []
     collapsed: list[list[str]] = []
@@ -368,9 +373,7 @@ def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tupl
         _, results = _run_requests(client, requests, project_root)
         sent.append(requests)
         collapsed.append(collapse_paths(results[:INVARIANCE_DEPTH]))
-    if not collapsed[0] == collapsed[1] == collapsed[2]:
-        raise InputFault(f"page_invariance_failed:{row['episode_id']}")
-    return sent, collapsed[0]
+    return sent, collapsed[0], collapsed[0] == collapsed[1] == collapsed[2]
 
 
 def score_manifest_rows(
@@ -404,11 +407,27 @@ def score_manifest_rows(
             page_zero_results, max_paths=len(page_zero_results)
         )
         invariance_sent: list[list[JsonObject]] = []
+        invariance_failure: Optional[str] = None
         if profile == "paged":
-            invariance_sent, invariant_paths = _invariance(client, row, project_root)
-            if invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
-                raise InputFault(f"page_invariance_failed:{row['episode_id']}:scoring")
-        metrics = row_metrics(ranked_paths, str(row["opened_file"]))
+            invariance_sent, invariant_paths, invariant = _invariance(client, row, project_root)
+            if not invariant:
+                invariance_failure = f"page_invariance_failed:{row['episode_id']}"
+            elif invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
+                invariance_failure = f"page_invariance_failed:{row['episode_id']}:scoring"
+            # A row whose manifest entry carries reference_not_page_invariant
+            # is recorded as a miss instead of raising, so a reference can be
+            # taken on an engine with the defect. validate_candidate_page_invariance
+            # in search_quality_lib still refuses that row when this score is
+            # evaluated as a candidate.
+            if invariance_failure and not excused_page_invariance(row):
+                raise InputFault(invariance_failure)
+        if invariance_failure is None:
+            metrics = row_metrics(ranked_paths, str(row["opened_file"]))
+        else:
+            # A ranking that changes with page size has no one order to
+            # record, and replays of it differ, so the miss keeps no paths.
+            metrics = {metric: 0.0 for metric in METRICS}
+            ranked_paths, retrieval_depth, page_zero_ranked_paths = [], 0, []
         scored.append(
             {
                 "episode_id": row["episode_id"],
@@ -431,6 +450,7 @@ def score_manifest_rows(
                 "mechanism": row["mechanism"],
                 "census_stratum": row["census_stratum"],
                 **({"invariance_requests": invariance_sent} if invariance_sent else {}),
+                **({PAGE_INVARIANCE_FAILED_FIELD: invariance_failure} if invariance_failure else {}),
             }
         )
     if profile == "paged":
