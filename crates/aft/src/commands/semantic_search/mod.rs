@@ -7252,7 +7252,12 @@ mod tests {
             handle_semantic_search(&semantic_request("request authentication handler", 5), &ctx);
         let text = crate::subc_format::format_response("search", &response, false);
         assert!(response.success, "{text}");
-        assert!(text.contains("src/lib.rs:1 [lexical match]"), "{text}");
+        // Paths render with the platform separator (src\lib.rs on Windows).
+        let expected = format!(
+            "{} [lexical match]",
+            std::path::Path::new("src").join("lib.rs:1").display()
+        );
+        assert!(text.contains(&expected), "{text}");
     }
 
     #[test]
