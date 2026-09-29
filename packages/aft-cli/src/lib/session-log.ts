@@ -4,6 +4,9 @@ import type { RecentSession } from "./sessions.js";
 
 const MAX_SCAN_BYTES = 64 * 1024 * 1024;
 const CHUNK_BYTES = 64 * 1024;
+// Untagged engine lines often carry `root=/path` rather than a session tag.
+// An explicit foreign path must not be attributed by timestamp alone.
+const PROJECT_PATH = /\broot\s*=|(?:^|[\s"'(=])(?:\/[^\s"'(),]+|[A-Za-z]:[\\/][^\s"'(),]+)/;
 
 export interface SessionLogResult {
   lines: string[];
@@ -39,7 +42,7 @@ export function readSessionLog(
       if (session.projectRoot) {
         // When timestamps are available, a root mention outside the session's lifetime is not enough.
         if (Number.isFinite(time) && session.startedAt !== undefined && !inWindow) return;
-        if (!line.includes(session.projectRoot) && !inWindow) return;
+        if (!line.includes(session.projectRoot) && (!inWindow || PROJECT_PATH.test(line))) return;
       } else if (!inWindow) {
         return;
       }

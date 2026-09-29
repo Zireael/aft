@@ -50,6 +50,28 @@ test("finds older selected-session lines beyond 500 newer lines without leaking 
   });
 });
 
+test("excludes interleaved foreign-root engine lines in the selected session window", () => {
+  withLog((path) => {
+    writeFileSync(
+      path,
+      [
+        "[2026-01-01T10:01:00.000Z] INFO [aft] [ses_target] selected",
+        "[2026-01-01T10:01:01.000Z] ERROR [aft] root=/projects/foreign failed: unrelated",
+        "[2026-01-01T10:01:02.000Z] INFO [aft] /projects/foreign unrelated path",
+        "[2026-01-01T10:01:03.000Z] INFO [aft] engine without project path",
+        "[2026-01-01T10:01:04.000Z] INFO [aft] root=/projects/target selected engine",
+      ].join("\n"),
+    );
+    const result = readSessionLog(path, session);
+    expect(result.lines).toEqual([
+      "[2026-01-01T10:01:00.000Z] INFO [aft] [ses_target] selected",
+      "[2026-01-01T10:01:03.000Z] INFO [aft] engine without project path",
+      "[2026-01-01T10:01:04.000Z] INFO [aft] root=/projects/target selected engine",
+    ]);
+    expect(result.errors).toEqual([]);
+  });
+});
+
 test("reports no session lines rather than using an unrelated tail", () => {
   withLog((path) => {
     writeFileSync(path, "[2026-01-01T12:00:00.000Z] INFO [aft] /projects/foreign only\n");

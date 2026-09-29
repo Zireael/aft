@@ -1987,6 +1987,29 @@ function shortSessionId(id: string): string {
   return bareId.length <= 12 ? bareId : bareId.slice(0, 12);
 }
 
+/** Select matching lines across log history; the most recent lines may belong to other sessions. */
+export function collectIssueLog(
+  path: string,
+  selectedSession: RecentSession | null,
+): {
+  logText: string;
+  errors: string;
+  notice: string;
+} {
+  if (!selectedSession) {
+    return { logText: tailLogFile(path, 200), errors: tailLogFile(path, 4000), notice: "" };
+  }
+  const scoped = readSessionLog(path, selectedSession);
+  return {
+    logText: scoped.lines.join("\n"),
+    errors: scoped.errors.join("\n"),
+    notice: [
+      ...(scoped.boundHit ? ["[scan limit reached; older session lines may be missing]"] : []),
+      ...(scoped.lines.length === 0 ? ["[no lines found for selected session]"] : []),
+    ].join("\n"),
+  };
+}
+
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
@@ -2019,19 +2042,12 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  // Session reports scan backwards within a byte budget; general reports retain
-  // their ordinary recent-log tails.
   const logResults = adapters.map((adapter) => {
     const path = adapter.getLogFile();
-    const scoped = selectedSession ? readSessionLog(path, selectedSession) : null;
-    const logText = scoped ? scoped.lines.join("\n") : tailLogFile(path, 200);
-    const notice = [
-      ...(scoped?.boundHit ? ["[scan limit reached; older session lines may be missing]"] : []),
-      ...(scoped && scoped.lines.length === 0 ? ["[no lines found for selected session]"] : []),
-    ].join("\n");
+    const { logText, errors, notice } = collectIssueLog(path, selectedSession);
     return {
       section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
-      errors: scoped ? scoped.errors.join("\n") : sanitizeContent(tailLogFile(path, 4000)),
+      errors,
     };
   });
   const logSections = logResults.map((result) => result.section).join("\n");

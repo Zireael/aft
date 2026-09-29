@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
@@ -10,6 +10,7 @@ import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import {
   buildDoctorFixPlan,
   buildDoctorProfileArgs,
+  collectIssueLog,
   type DoctorFixPlanItem,
   doctorSkewBinaryDownloadDecision,
   formatDoctorStorageStatus,
@@ -355,5 +356,38 @@ describe("doctor storage wording", () => {
 
     expect(text).toBe("/tmp/aft-test/storage (logs: 5.7 MB; no project data yet)");
     expect(text).not.toContain("empty");
+  });
+});
+
+describe("doctor --issue session logs", () => {
+  test("reports an older selected session instead of the newer 200-line tail", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-doctor-session-"));
+    try {
+      const path = join(dir, "aft-plugin.log");
+      writeFileSync(
+        path,
+        [
+          "[2026-01-01T10:01:00.000Z] INFO [aft] [ses_target] older target",
+          "[2026-01-01T10:02:00.000Z] ERROR [aft] root=/projects/target failed: target",
+          ...Array.from(
+            { length: 500 },
+            (_, i) => `[2026-01-01T12:00:00.000Z] INFO [aft] root=/projects/foreign newer ${i}`,
+          ),
+        ].join("\n"),
+      );
+      const result = collectIssueLog(path, {
+        id: "ses_target",
+        title: "target",
+        projectRoot: "/projects/target",
+        startedAt: Date.parse("2026-01-01T10:00:00.000Z"),
+        lastActivity: Date.parse("2026-01-01T10:05:00.000Z"),
+      });
+      expect(result.logText).toContain("older target");
+      expect(result.logText).toContain("failed: target");
+      expect(result.logText).not.toContain("root=/projects/foreign");
+      expect(result.errors).toContain("failed: target");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
