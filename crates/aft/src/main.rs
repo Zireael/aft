@@ -73,6 +73,11 @@ fn exit_after_log_flush(code: i32) -> i32 {
 }
 
 fn main() {
+    // Record ORT_DYLIB_PATH as the spawner passed it, before anything in this
+    // process can export its own value: only a spawn-time value is an operator
+    // override of the ONNX Runtime library pin.
+    aft::ort_pin::capture_spawn_ort_dylib_path();
+
     // `gh` is a compatibility entry point for the upstream GitHub CLI. Handle
     // it before scanning AFT's global arguments; otherwise `gh --version` would
     // be mistaken for AFT's own `--version` flag.
@@ -233,6 +238,9 @@ fn main() {
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
     if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
         aft::slog_info!("subc mode, pid {}", std::process::id());
+        // The supervised module holds a launch secret; it must never load an
+        // ONNX Runtime found by bare name on the loader search path.
+        aft::ort_pin::require_pinned_onnx_runtime();
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
         let app = App::default_shared();

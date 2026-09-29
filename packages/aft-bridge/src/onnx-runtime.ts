@@ -93,7 +93,20 @@ interface OrtPlatformInfo {
   assetName: string;
   libName: string;
   archiveType: "tgz" | "zip";
+  /**
+   * sha256 of `<assetName>/lib/<libName>` inside the release archive (symlinks
+   * followed). A download whose library hashes differently is never installed.
+   */
+  librarySha256: string;
 }
+
+// Pinned library hashes, taken from the exact assets this installer fetches:
+// https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/<asset>.{tgz,zip},
+// extracted, then `shasum -a 256 <asset>/lib/<libName>`. The Rust side refuses
+// to load any other build unless the operator names it with ORT_DYLIB_PATH, so
+// these must stay identical to `PINNED_ORT_LIBRARIES` in
+// crates/aft/src/ort_pin.rs (a Rust test checks that). Bumping ORT_VERSION
+// means re-deriving every hash in both places.
 
 const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
   darwin: {
@@ -101,6 +114,7 @@ const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
       assetName: `onnxruntime-osx-arm64-${ORT_VERSION}`,
       libName: "libonnxruntime.dylib",
       archiveType: "tgz",
+      librarySha256: "872533f130f1839a5bc01788ddb4f75c83a189763441ba1178788ed965449289",
     },
     // x64 not available from Microsoft — users need brew install onnxruntime
   },
@@ -109,11 +123,13 @@ const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
       assetName: `onnxruntime-linux-x64-${ORT_VERSION}`,
       libName: "libonnxruntime.so",
       archiveType: "tgz",
+      librarySha256: "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4",
     },
     arm64: {
       assetName: `onnxruntime-linux-aarch64-${ORT_VERSION}`,
       libName: "libonnxruntime.so",
       archiveType: "tgz",
+      librarySha256: "52b2a0e75e79468404284fec38ad5ee1a7a996232274f5e1b84f3e793fb07554",
     },
   },
   win32: {
@@ -121,11 +137,13 @@ const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
       assetName: `onnxruntime-win-x64-${ORT_VERSION}`,
       libName: "onnxruntime.dll",
       archiveType: "zip",
+      librarySha256: "b95efb2113b603bbbf3f191061c5516a871ed546893c820e4f3b7b6c358dbf2a",
     },
     arm64: {
       assetName: `onnxruntime-win-arm64-${ORT_VERSION}`,
       libName: "onnxruntime.dll",
       archiveType: "zip",
+      librarySha256: "724d81ac50b11bfaa01ab3ce01b99fb6734a4b762259a8be4395ca662ce99fe6",
     },
   },
 };
@@ -975,6 +993,14 @@ async function downloadOnnxRuntime(
     // Hash the actual main library because steady-state resolution checks it.
     const libPath = join(stagedInstallDir, info.libName);
     const libHash = sha256File(libPath);
+    // A corrupted or tampered download must never be published: AFT would
+    // refuse to load it anyway, and a published copy would shadow a retry.
+    if (libHash !== info.librarySha256) {
+      throw new Error(
+        `onnx runtime library hash mismatch at ${libPath}: sha256 ${libHash}, ` +
+          `expected the pinned ${info.librarySha256} for ${info.assetName}`,
+      );
+    }
     writeOnnxInstalledMeta(stagedInstallDir, ORT_VERSION, libHash, archiveSha256);
 
     publishOnnxRuntime(stagedInstallDir, targetDir);

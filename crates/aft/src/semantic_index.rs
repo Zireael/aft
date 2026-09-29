@@ -2895,6 +2895,10 @@ const MANAGED_ORT_MIN_MINOR: u32 = 20;
 /// dlopen and other threads reading the env. The function is idempotent: once
 /// `ORT_DYLIB_PATH` is set, subsequent calls short-circuit.
 pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
+    // Record the operator's value (if any) before this function can export its
+    // own: only a value present at spawn may bypass the library pin.
+    crate::ort_pin::capture_spawn_ort_dylib_path();
+    crate::ort_pin::register_managed_storage_dir(storage_dir);
     if onnx_runtime_override_configured_with(|name| std::env::var_os(name)) {
         return;
     }
@@ -3003,6 +3007,7 @@ pub enum LateOnnxRuntime {
 /// load attempt. An explicit `ORT_DYLIB_PATH` is the caller's choice and is
 /// never replaced.
 pub fn late_onnx_runtime(storage_dir: &Path) -> LateOnnxRuntime {
+    crate::ort_pin::register_managed_storage_dir(storage_dir);
     let explicit = onnx_runtime_override_configured_with(|name| std::env::var_os(name));
     let state = classify_late_onnx_runtime(storage_dir, explicit);
     if let LateOnnxRuntime::Published(path) = &state {
@@ -3072,9 +3077,17 @@ pub(crate) fn bind_late_onnx_runtime() -> Result<(), String> {
             // Only the library load matters here. The returned builder carries
             // default environment options, which `ort` also uses when no
             // builder is committed, so it is dropped rather than committed.
-            ort::init_from(&path)
-                .map(drop)
-                .map_err(|error| format_embedding_init_error(error.to_string()))
+            // The pin is checked again right before the load, so a library
+            // swapped after pre-validation is still refused.
+            crate::ort_pin::load_authorized_with(
+                crate::ort_pin::authorize_onnx_runtime_load,
+                &path,
+                |path| {
+                    ort::init_from(path)
+                        .map(drop)
+                        .map_err(|error| format_embedding_init_error(error.to_string()))
+                },
+            )
         })
         .clone()
 }
@@ -3155,6 +3168,9 @@ fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
 /// Also checks the runtime version via OrtGetApiBase if available.
 pub fn pre_validate_onnx_runtime() -> Result<(), String> {
     let dylib_path = effective_onnx_runtime_path();
+    // A load runs the library's initializers, so the pin must be checked
+    // before the probe below, not only before `ort` loads it.
+    crate::ort_pin::authorize_onnx_runtime_load(dylib_path.as_deref().map(std::ffi::OsStr::new))?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
