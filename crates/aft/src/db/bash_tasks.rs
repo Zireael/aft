@@ -487,8 +487,21 @@ pub struct BashTaskProcessIds {
 }
 
 /// SQLite's default host-parameter limit is 999 on older builds; stay well
-/// under it.
+/// under it with room for the harness parameter.
 const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
+
+/// Every distinct harness with a `bash_tasks` row, found by one index seek
+/// per harness rather than by reading the table.
+fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT MIN(harness) FROM bash_tasks WHERE harness > ?1")?;
+    let mut harnesses = Vec::new();
+    let mut after = String::new();
+    while let Some(next) = stmt.query_row(params![after], |row| row.get::<_, Option<String>>(0))? {
+        harnesses.push(next.clone());
+        after = next;
+    }
+    Ok(harnesses)
+}
 
 /// Recorded pids for every row of `task_ids`, under any harness and session.
 ///
@@ -499,30 +512,41 @@ const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
 /// from several harnesses share one project root, so a caller asking whether
 /// a task directory still belongs to a live process must not restrict the
 /// lookup to one harness.
+///
+/// No index leads with `task_id`, so a lookup without a harness would read
+/// the whole table. Instead each harness is queried through the
+/// harness-keyed project-lookup index, which reads that harness's index
+/// entries and fetches only the matching rows.
 pub fn list_bash_task_process_ids(
     conn: &Connection,
     task_ids: &[String],
 ) -> rusqlite::Result<Vec<BashTaskProcessIds>> {
     let mut found = Vec::new();
-    for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT task_id, pid, pgid, started_at
-             FROM bash_tasks
-             WHERE task_id IN ({placeholders})
-               AND (pid IS NOT NULL OR pgid IS NOT NULL)"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
-            Ok(BashTaskProcessIds {
-                task_id: row.get(0)?,
-                pid: row.get(1)?,
-                pgid: row.get(2)?,
-                started_at: row.get(3)?,
-            })
-        })?;
-        for row in rows {
-            found.push(row?);
+    if task_ids.is_empty() {
+        return Ok(found);
+    }
+    for harness in bash_task_harnesses(conn)? {
+        for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT task_id, pid, pgid, started_at
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_project_lookup
+                 WHERE harness = ? AND task_id IN ({placeholders})
+                   AND (pid IS NOT NULL OR pgid IS NOT NULL)"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params = std::iter::once(harness.as_str()).chain(chunk.iter().map(String::as_str));
+            let rows = stmt.query_map(params_from_iter(params), |row| {
+                Ok(BashTaskProcessIds {
+                    task_id: row.get(0)?,
+                    pid: row.get(1)?,
+                    pgid: row.get(2)?,
+                    started_at: row.get(3)?,
+                })
+            })?;
+            for row in rows {
+                found.push(row?);
+            }
         }
     }
     Ok(found)
@@ -761,6 +785,88 @@ mod tests {
         assert!(
             page_reads < 64,
             "counting two watches and three old rows read {page_reads} of {table_pages} pages"
+        );
+    }
+
+    /// The persisted-task GC asks for recorded pids once per session
+    /// directory. The lookup covers every harness but must stay on the
+    /// harness-keyed index: reading the whole task history per directory is
+    /// the cost it exists to avoid.
+    #[test]
+    fn process_id_lookup_reads_pages_for_requested_tasks_not_history() {
+        const HISTORY_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |harness: &str, task: &str, pid: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     pid, pgid, started_at)
+                 VALUES (?1, 'session', ?2, 'project', ?3, '.', 'completed', ?4, ?4, 0)",
+                params![harness, task, "x".repeat(2_000), pid],
+            )
+            .unwrap();
+        };
+        for index in 0..HISTORY_ROWS {
+            let harness = if index % 4 == 0 { "runner" } else { "opencode" };
+            insert(harness, &format!("history-{index}"), 1_000 + index);
+        }
+        insert("opencode", "wanted-opencode", 7);
+        insert("runner", "wanted-runner", 8);
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > HISTORY_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let conn = crate::db::open_readonly(&path).unwrap();
+        let cache_misses = |reset: i32| {
+            let (mut current, mut highwater) = (0, 0);
+            let status = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    &mut current,
+                    &mut highwater,
+                    reset,
+                )
+            };
+            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        cache_misses(1);
+        let mut found = list_bash_task_process_ids(
+            &conn,
+            &[
+                "wanted-opencode".to_string(),
+                "wanted-runner".to_string(),
+                "never-written".to_string(),
+            ],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.task_id, row.pid))
+        .collect::<Vec<_>>();
+        let page_reads = cache_misses(0);
+        found.sort();
+
+        assert_eq!(
+            found,
+            [
+                ("wanted-opencode".to_string(), Some(7)),
+                ("wanted-runner".to_string(), Some(8)),
+            ],
+            "the lookup must find the tasks under every harness"
+        );
+        assert!(
+            i64::from(page_reads) < table_pages / 10,
+            "looking up three task ids read {page_reads} of {table_pages} pages"
         );
     }
 }
