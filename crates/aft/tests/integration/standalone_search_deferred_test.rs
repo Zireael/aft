@@ -81,7 +81,7 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
         ("TMPDIR", transient_root.path().as_os_str()),
         (
             "AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS",
-            std::ffi::OsStr::new("750"),
+            std::ffi::OsStr::new("3000"),
         ),
     ]);
     aft.send_silent(&configure_without_indexes(project.path()));
@@ -96,8 +96,11 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
     let (ping, ping_received_at) = read_response(&mut aft, "queued-ping", Duration::from_secs(2));
     assert_eq!(ping["command"], "pong", "ping failed: {ping:?}");
     let latency = ping_received_at.duration_since(configure_received_at);
+    // The sweep is held for 3 s, so answering within 1.5 s proves the ping did
+    // not queue behind it, with room for a loaded Windows runner (568 ms was
+    // seen against the old 500 ms bound with a 750 ms sweep).
     assert!(
-        latency < Duration::from_millis(500),
+        latency < Duration::from_millis(1_500),
         "queued ping waited {latency:?} after configure acknowledgement"
     );
 
