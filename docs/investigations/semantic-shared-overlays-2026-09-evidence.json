@@ -1,0 +1,329 @@
+{
+  "before": {
+    "directory": ".malloc-experiment/before",
+    "pid": 69093,
+    "snapshots": [
+      {
+        "snapshot": "stage-0.json",
+        "time_ms": 1790638834197,
+        "serving_bytes": 0,
+        "worker_bytes": 156802769,
+        "private_bytes": 156802769,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 902186616,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "stage-1.json",
+        "time_ms": 1790638926200,
+        "serving_bytes": 157070048,
+        "worker_bytes": 313872817,
+        "private_bytes": 470942865,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 1314998192,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 1
+      },
+      {
+        "snapshot": "stage-3.json",
+        "time_ms": 1790639017243,
+        "serving_bytes": 471210144,
+        "worker_bytes": 628012913,
+        "private_bytes": 1099223057,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 2147191328,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 3
+      },
+      {
+        "snapshot": "stage-5.json",
+        "time_ms": 1790639106814,
+        "serving_bytes": 785350240,
+        "worker_bytes": 942153009,
+        "private_bytes": 1727503249,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 2979613864,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 5
+      },
+      {
+        "snapshot": "stage-10.json",
+        "time_ms": 1790639198570,
+        "serving_bytes": 1570744384,
+        "worker_bytes": 1727547153,
+        "private_bytes": 3298291537,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 5060612824,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 10
+      },
+      {
+        "snapshot": "stage-repeat.json",
+        "time_ms": 1790639461601,
+        "serving_bytes": 1570744374,
+        "worker_bytes": 1727547143,
+        "private_bytes": 3298291517,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 5062939352,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 10
+      },
+      {
+        "snapshot": "idle-10.json",
+        "time_ms": 1790639471161,
+        "serving_bytes": 1570744374,
+        "worker_bytes": 0,
+        "private_bytes": 1570744374,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 3137278680,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "idle-300.json",
+        "time_ms": 1790639860119,
+        "serving_bytes": 0,
+        "worker_bytes": 0,
+        "private_bytes": 0,
+        "shared_base_bytes": 0,
+        "footprint_bytes": 352456832,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "idle-360.json",
+        "time_ms": 1790639920407,
+        "serving_bytes": 0,
+        "worker_bytes": 0,
+        "private_bytes": 0,
+        "shared_base_bytes": 0,
+        "footprint_bytes": 354046080,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      }
+    ],
+    "wire_errors": 0,
+    "writes": 119,
+    "resident_semantic_adoptions": 10,
+    "build_ready": [
+      "2026-09-28T23:37:27Z [aft] INFO [ses_malloc-soak-1] index_event kind=build_ready plane=semantic build_id=b-69093-2 root=/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/repo key=90ff783f3f4c5cf2 elapsed_ms=71063 files=1774 chunks=38547 skipped_rows=0"
+    ],
+    "refresh_failures": [],
+    "evictions": [
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/repo: freed ~13.3 MB (semantic 0.0 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-9: freed ~149.8 MB (semantic 149.8 MB, trigram 0.0 MB, symbols 0.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-10: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-2: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-8: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-4: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-5: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-3: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-1: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-6: freed ~163.2 MB (semantic 149.8 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-28T23:56:07Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/before/worktree-7: freed ~149.8 MB (semantic 149.8 MB, trigram 0.0 MB, symbols 0.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 2457.3 MB -> 2457.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)"
+    ],
+    "finished": true,
+    "binary_sha256": "ea860d05df0d5e742c56f3d76c297326783ca73bcdbac13266ebfeaf58c71a2b",
+    "profiler_nonzero_or_timeout": [
+      {
+        "sample": 0,
+        "elapsed_s": 34.3,
+        "time": 1790638571.106905,
+        "pid": 69093,
+        "tool": "heap",
+        "status": 255,
+        "path": "sample-000-heap.txt",
+        "unbound": false
+      },
+      {
+        "sample": 0,
+        "elapsed_s": 34.4,
+        "time": 1790638571.185468,
+        "pid": 69093,
+        "tool": "history",
+        "status": 255,
+        "path": "sample-000-history.txt",
+        "unbound": false
+      }
+    ]
+  },
+  "after": {
+    "directory": ".malloc-experiment/overlay-final",
+    "pid": 40497,
+    "snapshots": [
+      {
+        "snapshot": "stage-0.json",
+        "time_ms": 1790642469801,
+        "serving_bytes": 0,
+        "worker_bytes": 0,
+        "private_bytes": 0,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 636028416,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "stage-1.json",
+        "time_ms": 1790642560341,
+        "serving_bytes": 4277,
+        "worker_bytes": 4277,
+        "private_bytes": 8554,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 636290560,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 1
+      },
+      {
+        "snapshot": "stage-3.json",
+        "time_ms": 1790642649688,
+        "serving_bytes": 12831,
+        "worker_bytes": 12831,
+        "private_bytes": 25662,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 638354968,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 3
+      },
+      {
+        "snapshot": "stage-5.json",
+        "time_ms": 1790642740507,
+        "serving_bytes": 21385,
+        "worker_bytes": 21385,
+        "private_bytes": 42770,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 639043096,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 5
+      },
+      {
+        "snapshot": "stage-10.json",
+        "time_ms": 1790642829660,
+        "serving_bytes": 42805,
+        "worker_bytes": 42805,
+        "private_bytes": 85610,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 642631192,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 10
+      },
+      {
+        "snapshot": "stage-repeat.json",
+        "time_ms": 1790643025494,
+        "serving_bytes": 42795,
+        "worker_bytes": 42795,
+        "private_bytes": 85590,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 643941912,
+        "roots": 11,
+        "bound_routes": 11,
+        "edited_borrowers_with_worker_bytes": 10
+      },
+      {
+        "snapshot": "idle-10.json",
+        "time_ms": 1790643035216,
+        "serving_bytes": 42795,
+        "worker_bytes": 0,
+        "private_bytes": 42795,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 645170712,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "idle-300.json",
+        "time_ms": 1790643326111,
+        "serving_bytes": 42795,
+        "worker_bytes": 0,
+        "private_bytes": 42795,
+        "shared_base_bytes": 151187360,
+        "footprint_bytes": 645187096,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      },
+      {
+        "snapshot": "idle-360.json",
+        "time_ms": 1790643386380,
+        "serving_bytes": 0,
+        "worker_bytes": 0,
+        "private_bytes": 0,
+        "shared_base_bytes": 0,
+        "footprint_bytes": 347457000,
+        "roots": 11,
+        "bound_routes": 0,
+        "edited_borrowers_with_worker_bytes": 0
+      }
+    ],
+    "wire_errors": 0,
+    "writes": 119,
+    "resident_semantic_adoptions": 10,
+    "build_ready": [
+      "2026-09-29T00:34:19Z [aft] INFO [ses_malloc-soak-1] index_event kind=build_ready plane=semantic build_id=b-40497-2 root=/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/repo key=90ff783f3f4c5cf2 elapsed_ms=27022 files=1774 chunks=38547 skipped_rows=0"
+    ],
+    "refresh_failures": [],
+    "evictions": [
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-1: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-2: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-3: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-5: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-7: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-4: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/repo: freed ~13.4 MB (semantic 0.0 MB, trigram 3.3 MB, symbols 10.0 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-10: freed ~13.5 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-6: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-8: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)",
+      "2026-09-29T00:55:27Z [aft] INFO evicted idle root /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/bg_71b861fe2d252049/.malloc-experiment/overlay-final/worktree-9: freed ~13.4 MB (semantic 0.0 MB, trigram 3.4 MB, symbols 10.1 MB, callgraph 0.0 MB, inspect 0.0 MB; retained: bash 0.0 MB, lsp 0.0 MB, parser_pool not estimated); allocator pressure relief: RSS 670.3 MB -> 670.3 MB (dropped 0.0 MB), phys footprint dropped 0.0 MB, in-use 0.0 MB -> 0.0 MB, allocated 0.0 MB -> 0.0 MB, address-space slack 0.0 MB -> 0.0 MB, allocator accounting 0.0 MB (malloc_zone_pressure_relief_return)"
+    ],
+    "finished": true,
+    "binary_sha256": "7bc9cdad09d07dad5e44e1ad1372836db159a71b0fa6c9558b45a18fdc8e75b0",
+    "profiler_nonzero_or_timeout": []
+  },
+  "source_refs": {
+    "before": "eae2261c4f7c9ab24567c38308414ba83841f053",
+    "after": "8a5ece72366d47767589509ae45e84976f93c09e",
+    "corpus": "eae2261c4f7c9ab24567c38308414ba83841f053"
+  },
+  "ranking": {
+    "rows": 49,
+    "canonical_rows_bytes": 274761,
+    "reference_rows_sha256": "37aaacf461fba56d0d023a5fbc7b8dc79cdc4cd09ac40306d1540b0aeadf8268",
+    "candidate_rows_sha256": "37aaacf461fba56d0d023a5fbc7b8dc79cdc4cd09ac40306d1540b0aeadf8268",
+    "ranking_binary_sha256": "bdf9c5c07802f191eaaa86f1e3fed3e89d462a17527c62d9c45f5f5ed521848c",
+    "slice_class": "engine_unwired",
+    "result": "passed",
+    "source_ref": "0ad214b4acb7c7957aa062e793722c98ff92c846",
+    "families": {
+      "concept_recall": {
+        "hit_at_1": 0.5384615384615384,
+        "hit_at_5": 0.7692307692307693,
+        "mrr_at_10": 0.6394230769230769
+      },
+      "exact_recall": {
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "mrr_at_10": 1.0
+      },
+      "real_query": {
+        "hit_at_1": 0.12244897959183673,
+        "hit_at_5": 0.3673469387755102,
+        "mrr_at_10": 0.22023809523809523
+      }
+    }
+  }
+}
