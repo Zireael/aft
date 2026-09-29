@@ -241,7 +241,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         mode: "directory",
         list_id: "payload.entries",
         unit: Unit::Items,
-        narrow: &["path"],
+        narrow: &["path", "offset", "limit"],
         reasons: WALK_CAP,
     },
     SurfaceSpec {

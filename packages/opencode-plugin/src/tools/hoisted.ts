@@ -365,7 +365,7 @@ const z = tool.schema;
 
 const READ_DESCRIPTION = `Read file contents or list directory entries.
 
-Use either startLine/endLine OR offset/limit to read a section of a file.
+Use either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.
 
 Behavior:
 - Returns line-numbered content (e.g., "1: const x = 1")
@@ -373,7 +373,7 @@ Behavior:
 - Output capped at 50KB
 - Binary files are auto-detected and return a size-only message
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
-- Directories return sorted entries with trailing / for subdirectories
+- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.
 
 Examples:
   Read full file: { "path": "src/app.ts" }
@@ -407,16 +407,16 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           .string()
           .describe("Path to file or directory (absolute or relative to project root)"),
         startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line to start reading from",
+          "1-based line or directory entry to start reading from",
         ),
         endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line to stop reading at (inclusive)",
+          "1-based line or directory entry to stop reading at (inclusive)",
         ),
         limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "Max lines to return (default: 2000)",
+          "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
         ),
         offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+          "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
         ),
       },
       execute: async (args, context): Promise<ToolResult> => {

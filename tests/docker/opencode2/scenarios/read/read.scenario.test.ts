@@ -32,7 +32,7 @@ describe("read OpenCode 2 scenarios", () => {
           fixture,
           ...(fixture === "incomplete" ? {
             triggered_reason: "cap",
-            expected_trailer: "shown 1000 of 1001 items (cap) · narrow: path",
+            expected_trailer: "shown 1000 of 1001 items (cap) · narrow: path, offset, limit",
           } : {}),
         });
       } finally {

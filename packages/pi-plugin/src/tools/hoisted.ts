@@ -116,7 +116,7 @@ export function whenGhReadEnabled(enabled: boolean, description: string): string
 }
 
 const READ_DESCRIPTION =
-  "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
+  "Read file contents with line numbers or sorted directory entries. Use startLine/endLine or 1-based offset/limit for either. Directory limit defaults to and is capped at 1000; enumeration stops at 10,000 entries and partial listings carry a shown/total trailer. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
 
 function readDescription(ghReadEnabled: boolean): string {
   const githubDescription = whenGhReadEnabled(ghReadEnabled, ISSUE_AND_PR_READ_DESCRIPTION);
@@ -282,15 +282,15 @@ export async function assertExternalDirectoryPermission(
 // to be converted while explicitly provided canonical fields remain authoritative.
 const ReadParams = Type.Object({
   path: Type.String({
-    description: "Path to the file to read (absolute or relative to project root)",
+    description: "Path to the file or directory to read (absolute or relative to project root)",
   }),
-  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line to start reading from"),
-  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line to stop reading at (inclusive)"),
-  limit: optionalInt(1, Number.MAX_SAFE_INTEGER, "Maximum number of lines to return"),
+  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line or directory entry to start reading from"),
+  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line or directory entry to stop reading at (inclusive)"),
+  limit: optionalInt(1, Number.MAX_SAFE_INTEGER, "Max lines (default: 2000) or directory entries (default and cap: 1000) to return"),
   offset: optionalInt(
     1,
     Number.MAX_SAFE_INTEGER,
-    "1-based line number to start reading from (use with limit)",
+    "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
   ),
 });
 
@@ -564,7 +564,7 @@ export function registerHoistedTools(
         name: readName,
         label: readName,
         description: readDescription(resolveGithubConfig(ctx.config).read),
-        promptSnippet: "Read file contents (supports offset/limit for large files)",
+        promptSnippet: "Read files or directories (supports offset/limit for either)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,
         async execute(

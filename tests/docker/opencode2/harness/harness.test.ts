@@ -1118,7 +1118,7 @@ describe("source-of-truth derivation", () => {
       owner: "read",
       unit: "items",
       reasons: ["walk", "cap"],
-      narrow: ["path"],
+      narrow: ["path", "offset", "limit"],
     });
     expect(
       surfaces.find((surface) => surface.id === "callgraph.trace_data.payload.hops")?.reasons,

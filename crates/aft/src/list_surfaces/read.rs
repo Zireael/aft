@@ -27,6 +27,6 @@ pub fn build_directory_envelope(
         },
         Unit::Items,
         causes,
-        &["path"],
+        &["path", "offset", "limit"],
     ))
 }

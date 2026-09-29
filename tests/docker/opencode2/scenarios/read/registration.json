@@ -198,7 +198,7 @@
           "call_id": "read-t6-read-directory-payload-entries-incomplete",
           "fixture": "incomplete",
           "triggered_reason": "cap",
-          "expected_trailer": "shown 1000 of 1001 items (cap) · narrow: path"
+          "expected_trailer": "shown 1000 of 1001 items (cap) · narrow: path, offset, limit"
         }
       }
     }

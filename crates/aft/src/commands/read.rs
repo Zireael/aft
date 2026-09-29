@@ -1801,14 +1801,40 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
     entries.sort();
 
+    // Hosts normalize ranges to snake_case; accept the public aliases too for
+    // direct protocol callers. Positions address the sorted, bounded listing.
+    let number = |key: &str| {
+        req.params.get(key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.parse::<u64>().ok())
+        })
+    };
+    let start = number("start_line")
+        .or_else(|| number("startLine"))
+        .or_else(|| number("offset"))
+        .unwrap_or(1)
+        .max(1);
+    let requested_limit = number("limit").unwrap_or(MAX_DIRECTORY_ENTRIES as u64);
+    let limit = requested_limit.min(MAX_DIRECTORY_ENTRIES as u64) as usize;
+    let end = number("end_line").or_else(|| number("endLine"));
+    let count = end
+        .map(|end| {
+            end.saturating_sub(start.saturating_sub(1))
+                .min(MAX_DIRECTORY_ENTRIES as u64) as usize
+        })
+        .unwrap_or(limit);
     let total = entries.len();
-    let truncated = enumeration_cut || total > MAX_DIRECTORY_ENTRIES;
-    if truncated {
-        entries.truncate(MAX_DIRECTORY_ENTRIES);
-    }
+    let skip = start.saturating_sub(1).min(total as u64) as usize;
+    entries = entries.into_iter().skip(skip).take(count).collect();
+    let shown = entries.len();
+    let truncated = enumeration_cut || shown < total;
     let envelope =
-        crate::list_surfaces::read::build_directory_envelope(entries.len(), total, enumeration_cut);
-    // Keep the trailer in the raw entry rendering used by existing read clients.
+        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_cut);
+    let offset_note = (start > total as u64 && !enumeration_cut && start > 1)
+        .then(|| format!("offset past end: offset {start} exceeds {total} entries"));
+    // Put the offset-past-end note before the trailer so the final line keeps its standard format.
+    let mut trailer_text = offset_note.clone().unwrap_or_default();
     if let Some(envelope) = &envelope {
         let trailer = crate::ndjson_text::build_ndjson_text(
             "",
@@ -1816,17 +1842,27 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             Some("payload.entries"),
             false,
         );
-        entries.push(format!("\n{trailer}"));
+        if !trailer_text.is_empty() {
+            trailer_text.push('\n');
+        }
+        trailer_text.push_str(&trailer);
+    }
+    if !trailer_text.is_empty() {
+        entries.push(format!("\n{trailer_text}"));
     }
     let mut data = serde_json::json!({
         "entries": entries,
         "complete": !truncated,
         "truncated": truncated,
         "total_entries": total,
+        "entries_shown": shown,
         "total_entries_exact": !enumeration_cut,
         "entries_examined": examined,
         "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
     });
+    if let Some(note) = offset_note {
+        data["offset_note"] = note.into();
+    }
     if let Some(envelope) = envelope {
         data["entries_list_envelope"] = serde_json::to_value(envelope).expect("directory envelope");
     }

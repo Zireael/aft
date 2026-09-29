@@ -230,7 +230,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         mode: "directory",
         list_id: "payload.entries",
         unit: Unit::Items,
-        narrow: &["path"],
+        narrow: &["path", "offset", "limit"],
         reasons: &[
             ReasonEntry {
                 reason: Reason::Walk,

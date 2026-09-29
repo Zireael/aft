@@ -213,3 +213,50 @@ fn requested_huge_line_is_truncated_without_hiding_later_lines() {
     assert!(text.contains("... (truncated)"));
     assert!(text.contains("2: second\n3: third\n"));
 }
+
+#[test]
+fn directory_read_honors_sorted_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    for n in (0..2620).rev() {
+        fs::write(temp.path().join(format!("entry-{n:04}")), "").unwrap();
+    }
+    for (args, first, count) in [
+        (json!({"limit": 10}), 0, 10),
+        (json!({"offset": 11, "limit": 10}), 10, 10),
+        (json!({"offset": "11", "limit": "10"}), 10, 10),
+        (json!({"startLine": "11", "endLine": "20"}), 10, 10),
+        (json!({"start_line": 11, "end_line": 20}), 10, 10),
+        (json!({"startLine": 11, "offset": 21, "limit": 10}), 10, 10),
+        (json!({}), 0, 1000),
+        (json!({"limit": 2000}), 0, 1000),
+    ] {
+        let response = read_response(temp.path(), temp.path(), args.clone());
+        let entries = response.data["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), count + 1, "window {args}");
+        for (index, entry) in entries[..count].iter().enumerate() {
+            assert_eq!(entry, &json!(format!("entry-{:04}", first + index)));
+        }
+        assert!(entries[count]
+            .as_str()
+            .unwrap()
+            .contains(&format!("shown {count} of 2620 items")));
+        assert!(entries[count]
+            .as_str()
+            .unwrap()
+            .contains("narrow: path, offset, limit"));
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["truncated"], true);
+        assert_eq!(response.data["total_entries"], 2620);
+        assert_eq!(response.data["total_entries_exact"], true);
+    }
+    let past = read_response(
+        temp.path(),
+        temp.path(),
+        json!({"offset": 2621, "limit": 10}),
+    );
+    assert_eq!(past.data["entries"].as_array().unwrap().len(), 1);
+    assert!(past.data["entries"][0]
+        .as_str()
+        .unwrap()
+        .contains("offset 2621 exceeds 2620 entries"));
+}
