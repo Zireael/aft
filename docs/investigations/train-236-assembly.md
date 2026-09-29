@@ -25,3 +25,20 @@ All Rust builds/tests used `CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER=`. Deliveri
 - Final five-delivery branch: `cargo fmt --check`, `bun run lint`, Windows `cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu`, fresh debug binary build, and full lib suite all passed. Full lib: **4,039 passed, 47 ignored, 0 failed**. Plugin unit suite rerun against that binary: **1,161 passed, 2 platform skips, 0 failed**. No baseline failure comparison was needed.
 
 Verification corrections: the initial engine commands mistakenly filtered the integration umbrella and selected zero tests; the named standalone targets above were then run. An opt-in real-corpus counter run initially lacked its required environment variable and passed after supplying it. The initial formatting check found formatting inherited from the picked commits and the semantic conflict resolution; `cargo fmt` corrected it and the final check passed. The quality harness initially reported an unprovisioned ripgrep corpus; corpora were provisioned before retrying. `bun install --frozen-lockfile` completed without manifest or lockfile changes. Native linking emitted only the macOS compact-unwind size warning.
+
+## Ranking parity and publication alignment
+
+The complete search-quality evaluation passed against `origin/main` (`9dcb4954e4256e26528d49d60e66ea70536ff87f`): 16/16 exact-recall cases, 26 concept rows, and 49 paged real-query rows. The descriptor's fence hits derive to `ranking`; its validated `engine_unwired` declaration requires unchanged behavior and `targeted_mechanism: none`.
+
+```sh
+CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
+  scripts/telemetry/cost-gate.sh --search-quality --mode evaluate \
+  --base-ref origin/main --head HEAD \
+  --descriptor benchmarks/aft-search/slice-descriptors/train-236.json \
+  --binary "$PWD/target/debug/aft" \
+  --score-output "$PWD/target/train-236-evidence/search-quality/score.json"
+```
+
+Independent canonical-byte comparison of `reference['rows']` and `candidate['rows']`, using `search_quality_lib.canonical_json`, returned equality: **49 rows, 274,761 bytes** on each side. Both SHA-256 checksums are `37aaacf461fba56d0d023a5fbc7b8dc79cdc4cd09ac40306d1540b0aeadf8268`. The freshly built debug executable SHA-256 is `5ef8577cf9be6e06b41b8a83ab23161c9d70fc493f4ddb255bff13c156bbb801`. The reference manifest, baseline and sidecar were not modified.
+
+`scripts/align-governed-docs.sh` passed after regenerating publication manifests and release evidence. Its generated commit messages were prefixed with `mason:`; the script's behavior was otherwise unchanged. Both the managed task branch and local `train/236-assembly` designate the completed assembly. Nothing was pushed.
