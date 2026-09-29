@@ -3311,3 +3311,155 @@ fn add_import_allows_named_export_for_non_json_attributed_module() {
 
     aft.shutdown();
 }
+
+fn assert_rust_library_compiles(file: &Path) {
+    let output = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(file)
+        .arg("-o")
+        .arg(file.with_extension("rlib"))
+        .output()
+        .expect("rustc is required for Rust import regressions");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rust_use_list_add_remove_organize_compiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("lib.rs");
+    let source = "use a::{x, y};\n\nmod a { pub fn x() {} pub fn y() {} pub fn z() {} }\npub fn f() { x(); y(); }\n";
+    fs::write(&file, source).unwrap();
+    assert_rust_library_compiles(&file);
+    let mut aft = AftProcess::spawn();
+    let response = send_add_import(
+        &mut aft,
+        "rust-list-duplicate",
+        file.to_str().unwrap(),
+        "a",
+        Some(&["x"]),
+        None,
+        false,
+    );
+    assert_eq!(response["already_present"], true, "{response}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), source);
+    assert_rust_library_compiles(&file);
+    let response = send_add_import(
+        &mut aft,
+        "rust-list-merge",
+        file.to_str().unwrap(),
+        "a",
+        Some(&["z"]),
+        None,
+        false,
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        source.replace("{x, y}", "{x, y, z}")
+    );
+    assert_rust_library_compiles(&file);
+    let before = fs::read_to_string(&file).unwrap();
+    let response = aft.send(
+        &serde_json::json!({"id":"rust-list-organize", "command":"organize_imports", "file":file})
+            .to_string(),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    assert_rust_library_compiles(&file);
+    // Remove the call to x too, so removing its import leaves no unresolved reference.
+    fs::write(&file, before.replace("x(); ", "")).unwrap();
+    let response = aft.send(&serde_json::json!({"id":"rust-list-remove", "command":"remove_import", "file":file, "module":"a", "name":"x"}).to_string());
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("use a::{y, z};"),
+        "{response}"
+    );
+    assert_rust_library_compiles(&file);
+    aft.shutdown();
+}
+
+#[test]
+fn rust_use_list_complex_entries_roundtrip() {
+    for (declaration, module, names) in [
+        ("use a::{b::{c, d}, e};", "a", vec!["b::{c, d}", "e"]),
+        ("use a::{self, x};", "a", vec!["self", "x"]),
+        ("pub use a::{x as y, z};", "a", vec!["x as y", "z"]),
+        ("use {a, b};", "", vec!["a", "b"]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        fs::write(&file, declaration).unwrap();
+        let (_, _, block) = parse_file_imports(&file, LangId::Rust).unwrap();
+        assert_eq!(block.imports.len(), 1);
+        let imp = &block.imports[0];
+        assert_eq!(imp.module_path, module);
+        assert_eq!(imp.names, names);
+        assert_eq!(
+            generate_import_line_with_namespace(
+                LangId::Rust,
+                &imp.module_path,
+                &imp.names,
+                imp.default_import.as_deref(),
+                None,
+                false
+            ),
+            declaration
+        );
+    }
+}
+
+#[test]
+fn rust_complex_use_lists_survive_edits_and_compile() {
+    for (declaration, module, added, removed, expected) in [
+        (
+            "use a::{b::{c, d}, e};",
+            "a",
+            "z",
+            "e",
+            "use a::{b::{c, d}, z};",
+        ),
+        ("pub use a::{x as y, z};", "a", "z", "y", "pub use a::{z};"),
+        ("use {a::x, a::z};", "", "a::e", "a::x", "use {a::e, a::z};"),
+        (
+            "use std::fmt::{self, Debug};",
+            "std::fmt",
+            "Display",
+            "Debug",
+            "use std::fmt::{Display, self};",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        let definitions = "pub mod a { pub fn x() {} pub fn e() {} pub fn z() {} pub mod b { pub fn c() {} pub fn d() {} } }\n";
+        let source = format!("{declaration}\n\n{definitions}");
+        fs::write(&file, source).unwrap();
+        assert_rust_library_compiles(&file);
+        let mut aft = AftProcess::spawn();
+        let response = send_add_import(
+            &mut aft,
+            "complex-add",
+            file.to_str().unwrap(),
+            module,
+            Some(&[added]),
+            None,
+            false,
+        );
+        assert_eq!(response["success"], true, "{response}");
+        assert_rust_library_compiles(&file);
+        let response = aft.send(&serde_json::json!({"id":"complex-remove", "command":"remove_import", "file":file, "module":module, "name":removed}).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        let output = fs::read_to_string(&file).unwrap();
+        assert!(output.contains(expected), "{output}");
+        assert_rust_library_compiles(&file);
+        let response = aft.send(&serde_json::json!({"id":"complex-organize", "command":"organize_imports", "file":file}).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        assert_rust_library_compiles(&file);
+        aft.shutdown();
+    }
+}

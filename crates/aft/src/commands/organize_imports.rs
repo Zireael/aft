@@ -960,13 +960,16 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
 
     for imp in imps {
         let visibility = imp.default_import.clone();
-        let mp = &imp.module_path;
+        // The parser separates a use-list prefix from its top-level entries.
+        // This organizer works on full use trees, unlike add/remove operations.
+        let use_tree = imports::rust_use_tree(imp);
+        let mp = &use_tree;
 
         // Check if this already has a use list (contains '{')
         if mp.contains('{') {
             // Already a tree like "serde::{Deserialize, Serialize}"
             // Extract prefix and items
-            if let Some(brace_pos) = mp.find("::{") {
+            if let Some(brace_pos) = mp.find("::{").filter(|_| !imp.module_path.is_empty()) {
                 let prefix = mp[..brace_pos].to_string();
                 let items_str = &mp[brace_pos + 3..mp.len() - 1]; // strip ::{ and }
                                                                   // Split on TOP-LEVEL commas only. A naive split(',') corrupts
@@ -1075,13 +1078,14 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             _ => ImportKind::Value,
         };
 
-        let module_path = if items.len() == 1 {
-            // Single item — no braces needed
-            format!("{}::{}", prefix, items[0])
-        } else {
-            // Multiple items — use tree
-            format!("{}::{{{}}}", prefix, items.join(", "))
-        };
+        let module_path =
+            if items.len() == 1 && items[0] != "self" && !items[0].starts_with("self as ") {
+                // Single item — no braces needed
+                format!("{}::{}", prefix, items[0])
+            } else {
+                // Multiple items — use tree
+                format!("{}::{{{}}}", prefix, items.join(", "))
+            };
 
         organized.push(OrganizedImport {
             module_path,

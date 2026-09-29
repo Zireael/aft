@@ -11603,7 +11603,11 @@ fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> boo
 }
 
 fn rust_module_alias_segments(import: &ImportStatement) -> Option<(String, Vec<String>)> {
-    let path = import.module_path.trim().trim_end_matches(';').trim();
+    let path = rust_use_body(&import.raw_text)
+        .unwrap_or(&import.module_path)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
     if path.contains("::{") || path.contains('{') || path.contains('*') {
         return None;
     }
@@ -11644,7 +11648,10 @@ fn rust_target_for_use<I: ResolverIndex>(
     import: &ImportStatement,
     short_name: &str,
 ) -> Option<(String, String)> {
-    let path = import.module_path.trim().trim_end_matches(';');
+    let path = rust_use_body(&import.raw_text)
+        .unwrap_or(&import.module_path)
+        .trim()
+        .trim_end_matches(';');
     if let Some(brace_start) = path.find("::{") {
         let prefix = &path[..brace_start];
         if import.names.iter().any(|name| name == short_name) {

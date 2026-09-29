@@ -2742,7 +2742,7 @@ fn rust_raw_import_contributions(
         .imports
         .into_iter()
         .map(|import| RawImportContribution {
-            source: import.module_path,
+            source: crate::imports::rust_use_tree(&import),
             names: import.names,
             default_import: None,
             namespace_import: None,
@@ -5779,6 +5779,26 @@ pub fn false_helper() -> String { "dead".to_string() }
 
         assert!(!aggregate_has_item(&aggregate, "src/m.rs", "helper"));
         assert!(aggregate_has_item(&aggregate, "src/m.rs", "dead"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_resolves_use_list_calls() {
+        let aggregate = rust_entry_scan(
+            &[
+                (
+                    "src/main.rs",
+                    "mod m;\nuse crate::m::{helper, other};\nfn main() { wrapper!(helper()); }\n",
+                ),
+                ("src/m.rs", "pub fn helper() {}\npub fn other() {}\n"),
+            ],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/m.rs", "helper", "function"),
+                ("src/m.rs", "other", "function"),
+            ],
+        );
+        assert!(!aggregate_has_item(&aggregate, "src/m.rs", "helper"));
+        assert!(aggregate_has_item(&aggregate, "src/m.rs", "other"));
     }
 
     #[test]

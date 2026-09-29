@@ -353,7 +353,8 @@ fn remove_name_from_imports(
                 .filter(|n| !imports::specifier_matches(n, target_name))
                 .cloned()
                 .collect();
-            let has_other = imp.default_import.is_some()
+            // Rust visibility is metadata, not a surviving import binding.
+            let has_other = (lang != LangId::Rust && imp.default_import.is_some())
                 || imp.namespace_import.is_some()
                 || !new_names.is_empty();
             if !has_other {
@@ -373,7 +374,7 @@ fn remove_name_from_imports(
                 );
                 edits.push((imp.byte_range.clone(), new_line));
             }
-        } else if imp.default_import.as_deref() == Some(target_name) {
+        } else if lang != LangId::Rust && imp.default_import.as_deref() == Some(target_name) {
             // Removing the default import
             if imp.names.is_empty() && imp.namespace_import.is_none() {
                 // Only default — remove entire statement

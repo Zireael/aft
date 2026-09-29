@@ -127,8 +127,8 @@ pub enum ImportForm {
     },
     /// Rust `use path;` / `pub use path;`. `visibility` replaces the
     /// `default_import == "pub"` overload (`Some("pub")`, `Some("pub(crate)")`,
-    /// …). The brace/use-tree text remains carried by `module_path` per the
-    /// lossless-round-trip decision; `named` holds extracted use-list names.
+    /// …). For use lists, `module_path` is the prefix (empty for a root list)
+    /// and `named` contains complete top-level entries, including nested trees.
     RustUse {
         visibility: Option<String>,
         named: Vec<String>,
@@ -386,7 +386,11 @@ impl ImportSyntax for RustSyntax {
         parse_rs_imports(source, tree)
     }
     fn generate_line(&self, req: &ImportRequest) -> String {
-        generate_rs_import_line(req.module_path, req.names, req.type_only)
+        let line = generate_rs_import_line(req.module_path, req.names, req.type_only);
+        match req.default_import {
+            Some(visibility) if !visibility.is_empty() => format!("{visibility} {line}"),
+            _ => line,
+        }
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
         classify_group_rs(module_path)
@@ -2370,10 +2374,14 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
                 }
                 "scoped_use_list" => {
                     // e.g. `serde::{Deserialize, Serialize}`
-                    use_path = source[child.byte_range()].to_string();
-                    // Also extract the individual names from the use_list
+                    use_path = child
+                        .child_by_field_name("path")
+                        .map(|path| source[path.byte_range()].to_string())
+                        .unwrap_or_default();
+                    // Keep each top-level subtree intact when merging or removing names.
                     extract_rs_use_list_names(source, &child, &mut names);
                 }
+                "use_list" => extract_rs_use_list_names(source, &child, &mut names),
                 _ => {}
             }
             if !c.goto_next_sibling() {
@@ -2382,7 +2390,7 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
         }
     }
 
-    if use_path.is_empty() {
+    if use_path.is_empty() && names.is_empty() {
         return None;
     }
 
@@ -2406,31 +2414,36 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
     })
 }
 
-/// Extract individual names from a Rust `scoped_use_list` node.
+/// Extract top-level Rust use-list entries, preserving aliases and nested trees.
 fn extract_rs_use_list_names(source: &str, node: &Node, names: &mut Vec<String>) {
-    let mut c = node.walk();
-    if c.goto_first_child() {
-        loop {
-            let child = c.node();
-            if child.kind() == "use_list" {
-                // Walk into the use_list to find identifiers
-                let mut lc = child.walk();
-                if lc.goto_first_child() {
-                    loop {
-                        let lchild = lc.node();
-                        if lchild.kind() == "identifier" || lchild.kind() == "scoped_identifier" {
-                            names.push(source[lchild.byte_range()].to_string());
-                        }
-                        if !lc.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if !c.goto_next_sibling() {
-                break;
-            }
+    let list = if node.kind() == "use_list" {
+        *node
+    } else {
+        let mut cursor = node.walk();
+        let Some(list) = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "use_list")
+        else {
+            return;
+        };
+        list
+    };
+    let mut cursor = list.walk();
+    for child in list.named_children(&mut cursor) {
+        if !matches!(child.kind(), "line_comment" | "block_comment") {
+            names.push(source[child.byte_range()].to_string());
         }
+    }
+}
+
+/// Reassemble a Rust use tree for consumers that interpret the whole path.
+pub(crate) fn rust_use_tree(import: &ImportStatement) -> String {
+    if import.names.is_empty() {
+        import.module_path.clone()
+    } else if import.module_path.is_empty() {
+        format!("{{{}}}", import.names.join(", "))
+    } else {
+        format!("{}::{{{}}}", import.module_path, import.names.join(", "))
     }
 }
 
@@ -2441,7 +2454,11 @@ fn generate_rs_import_line(module_path: &str, names: &[String], _type_only: bool
     } else {
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
-        format!("use {module_path}::{{{}}};", sorted_names.join(", "))
+        let separator = if module_path.is_empty() { "" } else { "::" };
+        format!(
+            "use {module_path}{separator}{{{}}};",
+            sorted_names.join(", ")
+        )
     }
 }
 
