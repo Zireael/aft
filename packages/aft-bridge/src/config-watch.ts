@@ -228,17 +228,26 @@ const CONFIG_WATCH_REJECTED_RETRIES = 3;
 const CONFIG_WATCH_MAX_DELAY_MS = 1_000;
 
 /**
- * A directory's identity: device, inode and birth time. The inode alone is
- * not enough: ext4 hands a freed inode number straight to the next directory
- * created, so a directory deleted and recreated under the same name keeps its
- * inode number while inotify's watch stays on the deleted one. The birth time
- * differs; where a filesystem does not record one it is 0 and the inode
- * decides, and the delete event (see `watchAftConfigFiles`) re-arms anyway.
+ * A directory's identity, which changes when the directory is replaced under
+ * the same name.
+ *
+ * - Everywhere: device and inode. On Windows Node reports the volume serial
+ *   number and the 64-bit file index there; `bigint` keeps the index exact.
+ * - Not on Windows: also the birth time, because ext4 hands a freed inode
+ *   number straight to the next directory created, so a directory deleted and
+ *   recreated keeps its inode number while inotify's watch stays on the
+ *   deleted one. On Windows the birth time is left out: NTFS file-name
+ *   tunneling gives a name reused within about 15 s the creation time of the
+ *   entry that last had it, so it carries no information there.
+ *
+ * Where a filesystem records no birth time it is 0 and the inode decides; the
+ * delete event (see `watchAftConfigFiles`) re-arms the watch in that case.
  */
 function identityOf(dir: string): string | null {
   try {
-    const stat = statSync(dir);
-    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+    const stat = statSync(dir, { bigint: true });
+    const base = `${stat.dev}:${stat.ino}`;
+    return process.platform === "win32" ? base : `${base}:${stat.birthtimeNs}`;
   } catch {
     return null;
   }
