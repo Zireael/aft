@@ -107,6 +107,54 @@ fn configure_ignore_change_purges_indexed_file_from_grep() {
 }
 
 #[test]
+fn self_matching_root_gitignore_reload_updates_search_index() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    for (label, original) in [
+        ("self-matching", "*-old*.json\n.gitignore\n"),
+        ("negated", "*-old*.json\n.gitignore\n!.gitignore\n"),
+        ("ordinary", "*-old*.json\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ignore_path = dir.path().join(".gitignore");
+        fs::write(&ignore_path, original).unwrap();
+        fs::write(dir.path().join("seed.txt"), "seed_marker\n").unwrap();
+        fs::write(dir.path().join("x-zq-0.json"), "indexed_zq_marker\n").unwrap();
+
+        let mut aft = AftProcess::spawn_with_real_watcher();
+        configure_with_search_index(&mut aft, dir.path());
+        wait_for_ready_grep(
+            &mut aft,
+            &format!("{label} initial index"),
+            "indexed_zq_marker",
+            |response| response["total_matches"] == 1,
+        );
+
+        fs::write(&ignore_path, format!("{original}*-zq*.json\n")).unwrap();
+        wait_for_ready_grep(
+            &mut aft,
+            &format!("{label} retired file"),
+            "indexed_zq_marker",
+            |response| response["total_matches"] == 0,
+        );
+
+        fs::write(dir.path().join("x-zq-1.json"), "new_zq_marker\n").unwrap();
+        fs::write(dir.path().join("visible.txt"), "visible_zq_marker\n").unwrap();
+        wait_for_ready_grep(
+            &mut aft,
+            &format!("{label} visible file"),
+            "visible_zq_marker",
+            |response| response["total_matches"] == 1,
+        );
+        let ignored = grep_marker(&mut aft, "new_zq_marker");
+        assert_eq!(ignored["success"], true, "{label}: {ignored:?}");
+        assert_eq!(ignored["total_matches"], 0, "{label}: {ignored:?}");
+
+        let shutdown = aft.shutdown();
+        assert!(shutdown.success());
+    }
+}
+
+#[test]
 fn dispatch_stays_responsive_under_ignored_event_flood() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let dir = tempfile::tempdir().unwrap();
