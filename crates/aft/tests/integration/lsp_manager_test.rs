@@ -75,6 +75,61 @@ fn inspect_deadline_does_not_kill_initializing_server() {
     manager.lock().shutdown_all();
 }
 
+#[test]
+fn inspect_initialize_timeout_releases_reservation_and_allows_retry() {
+    use aft::lsp::manager::{start_applicable_server_unlocked, walk_applicable_area};
+
+    let (temp, file, _) = rust_fixture_files();
+    let root = file.parent().unwrap().parent().unwrap();
+    let mut config = Config::default();
+    config.project_root = Some(root.to_path_buf());
+    let registry = LspChildRegistry::new();
+    let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+    manager.lock().set_child_registry(registry.clone());
+    manager
+        .lock()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    manager
+        .lock()
+        .set_extra_env("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS", "350");
+    manager.lock().set_extra_env(
+        "AFT_FAKE_LSP_INIT_NO_REPLY_ONCE",
+        &temp.path().join("init-attempted").display().to_string(),
+    );
+    let walk =
+        walk_applicable_area(root, Some(&[file.clone()]), &config, None).expect("walk source");
+    let snapshot = manager.lock().classify_applicable_servers(walk, &config);
+    let key = snapshot.server_keys[0].clone();
+    let deadline = Instant::now() + Duration::from_millis(80);
+    let outcome = start_applicable_server_unlocked(&manager, &snapshot, &key, &config, deadline);
+    assert_eq!(outcome.deadline_exceeded, Some(key.clone()));
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until
+        && (!registry.pids().is_empty() || !temp.path().join("init-attempted").exists())
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        temp.path().join("init-attempted").exists(),
+        "fake server did not receive initialize"
+    );
+    assert!(
+        registry.pids().is_empty(),
+        "timed-out server was not killed"
+    );
+
+    let retry = start_applicable_server_unlocked(
+        &manager,
+        &snapshot,
+        &key,
+        &config,
+        Instant::now() + Duration::from_secs(3),
+    );
+    assert_eq!(retry.successful, vec![key.clone()], "retry: {retry:?}");
+    assert_eq!(manager.lock().active_server_keys(), vec![key]);
+    manager.lock().shutdown_all();
+}
+
 fn rust_fixture_files() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");

@@ -10,6 +10,7 @@ use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
     handle_inspect_tier2_run, handle_inspect_tool_call, handle_inspect_warm_for_test,
 };
+use aft::commands::tool_call::handle_with_dispatch;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
@@ -3268,6 +3269,17 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     );
     write_file(&root, "src/lib.rs", "pub fn root() {}\n");
     write_file(&root, "scripts/other.sh", "echo other\n");
+    write_file(&root, "scripts/second.sh", "echo second\n");
+    write_file(
+        &root,
+        "packages/dashboard/src-tauri/Cargo.toml",
+        "[package]\nname = \"dashboard\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(
+        &root,
+        "packages/dashboard/src-tauri/src/lib.rs",
+        "pub fn dashboard() {}\n",
+    );
     write_file(
         &root,
         "packages/plugin/package.json",
@@ -3275,19 +3287,34 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     );
     write_file(
         &root,
+        "packages/plugin/tsconfig.json",
+        "{\"references\":[{\"path\":\"./scripts\"}]}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/scripts/tsconfig.json",
+        "{\"compilerOptions\":{}}\n",
+    );
+    write_file(
+        &root,
         "packages/plugin/scripts/sentinel.ts",
         "export const sentinel = 1;\n",
     );
-    write_file(
-        &root,
-        "packages/other/package.json",
-        "{\"name\":\"other\"}\n",
-    );
-    write_file(
-        &root,
-        "packages/other/src/index.ts",
-        "export const other = 2;\n",
-    );
+    for package in [
+        "cli",
+        "pi-plugin",
+        "e2e-tests",
+        "docs",
+        "retina-local-fs",
+        "dashboard",
+    ] {
+        write_file(&root, &format!("packages/{package}/package.json"), "{}\n");
+        write_file(
+            &root,
+            &format!("packages/{package}/src/index.ts"),
+            "export const other = 2;\n",
+        );
+    }
     let ctx = configured_context(&root);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
@@ -3296,21 +3323,27 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     ctx.lsp()
         .override_binary(ServerKind::Bash, fake_server_path());
 
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
+    let response = serde_json::to_value(handle_with_dispatch(
+        &request(json!({
             "id": "inspect-scoped-ts-monorepo",
-            "command": "inspect",
-            "scope": "packages/plugin/scripts/sentinel.ts",
-            "sections": "diagnostics",
-        }),
-    );
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "args": {
+                "scope": "packages/plugin/scripts/sentinel.ts",
+                "sections": "diagnostics"
+            }
+        })),
+        &ctx,
+        &|_, _| panic!("inspect tool calls use the inspect dispatcher"),
+    ))
+    .expect("inspect response serializes");
     let active = ctx.lsp().active_server_keys();
+    assert_eq!(response["scope_files"], 1, "scope was lost: {response:#}");
     assert_eq!(active.len(), 1, "response: {response:#}");
     assert_eq!(active[0].kind, ServerKind::TypeScript);
     assert_eq!(
         active[0].root,
-        crate::helpers::canonicalize_like_product(&root.join("packages/plugin"))
+        crate::helpers::canonicalize_like_product(&root.join("packages/plugin/scripts"))
     );
 }
 

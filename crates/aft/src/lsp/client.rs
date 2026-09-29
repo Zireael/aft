@@ -25,7 +25,7 @@ use crate::lsp::{transport, LspError};
 /// Default timeout for interactive LSP requests (hover, goto-def, references, rename).
 const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Longer budget for one-shot handshake requests (initialize, shutdown).
-const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STDERR_TAIL_LINES: usize = 64;

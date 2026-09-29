@@ -26,7 +26,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_with_dispatch(req, ctx, &dispatch)
 }
 
-fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>) -> Response {
+#[doc(hidden)]
+pub fn handle_with_dispatch(
+    req: &RawRequest,
+    ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+) -> Response {
     let Some(name) = req
         .params
         .get("name")
@@ -48,9 +53,19 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         );
     }
 
+    // Standalone callers historically send `args`; silently ignoring that
+    // field turns a scoped inspect into a whole-project inspect.
+    if req.params.get("args").is_some() && req.params.get("arguments").is_some() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "tool_call: pass either 'args' or 'arguments', not both",
+        );
+    }
     let arguments = req
         .params
         .get("arguments")
+        .or_else(|| req.params.get("args"))
         .cloned()
         .unwrap_or_else(|| json!({}));
     let preview = req

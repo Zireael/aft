@@ -3767,6 +3767,19 @@ enum SpawnFailure {
 }
 
 impl PreparedSpawn {
+    fn inspect_initialize_timeout(&self) -> Duration {
+        #[cfg(debug_assertions)]
+        if let Some(timeout) = self
+            .env
+            .get("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+        {
+            return Duration::from_millis(timeout);
+        }
+        super::client::HANDSHAKE_REQUEST_TIMEOUT
+    }
+
     /// Start the process and run the `initialize` handshake. Touches no
     /// manager state, so it runs without the manager lock.
     fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
@@ -3825,6 +3838,13 @@ impl PreparedSpawn {
             } else {
                 reason
             };
+            if matches!(err, LspError::Timeout(_)) {
+                slog_info!(
+                    "lsp initialize cancelled server={} root={} reason=initialize handshake timeout",
+                    self.kind.id_str(),
+                    self.root.display()
+                );
+            }
             // Dropping the client here kills a still-running server.
             return Err(SpawnFailure::Initialize {
                 reason,
@@ -3955,6 +3975,7 @@ pub fn start_applicable_server_unlocked(
                 // the reserved start alive after the caller's deadline, so a
                 // slow handshake can finish without being killed by AFT.
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let initialize_timeout = prepared.inspect_initialize_timeout();
                 let manager = Arc::clone(manager);
                 let candidate = candidate.clone();
                 std::thread::spawn(move || {
@@ -3962,7 +3983,7 @@ pub fn start_applicable_server_unlocked(
                         manager: &manager,
                         key: Some(candidate.key.clone()),
                     };
-                    let result = prepared.run(None);
+                    let result = prepared.run(Some(initialize_timeout));
                     let mut completed = ApplicableServerStartOutcomes::default();
                     manager.lock().finish_unlocked_start(
                         &candidate,
