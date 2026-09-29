@@ -833,3 +833,114 @@ fn reading_config_inside_update_config_panics_instead_of_deadlocking() {
     ctx.update_config(|config| config.format_on_edit = true);
     assert!(ctx.config().format_on_edit);
 }
+
+#[test]
+fn a_forced_reattach_watches_the_same_directory_again() {
+    // A directory deleted and recreated can get its inode back; an event
+    // naming the directory, or a backend error, forces the re-attach.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path().join(".cortexkit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut attachment = DirAttachment::new(dir.clone());
+    let mut watched = Vec::new();
+    let mut unwatched = Vec::new();
+    let mut op = |op: WatchOp<'_>| {
+        match op {
+            WatchOp::Watch(path) => watched.push(path.to_path_buf()),
+            WatchOp::Unwatch(path) => unwatched.push(path.to_path_buf()),
+        }
+        Ok(())
+    };
+    assert!(attachment.attach(&mut op));
+    assert!(!attachment.attach(&mut op));
+    assert_eq!(attachment.watched(), Some(dir.as_path()));
+
+    attachment.force_reattach();
+    assert!(
+        attachment.attach(&mut op),
+        "a forced re-attach must watch again and check the file"
+    );
+    assert!(!attachment.attach(&mut op), "and only once");
+    drop(op);
+    assert_eq!(watched, vec![dir.clone(), dir.clone()]);
+    assert_eq!(unwatched, vec![dir]);
+}
+
+#[test]
+fn publishing_inside_update_config_panics_instead_of_deadlocking() {
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_ctx = Arc::clone(&ctx);
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_ctx.update_config(|config| {
+                config.format_on_edit = true;
+                // A setter that publishes on its own.
+                worker_ctx.update_config(|inner| inner.validate_on_edit = None);
+            });
+        }));
+        let message = result.err().and_then(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        });
+        let _ = tx.send(message);
+    });
+    let message = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a nested publication hung instead of panicking")
+        .expect("a nested publication did not panic");
+    assert!(
+        message.contains("config read inside update_config closure would deadlock"),
+        "{message}"
+    );
+    ctx.update_config(|config| config.format_on_edit = true);
+    assert!(ctx.config().format_on_edit);
+}
+
+#[test]
+fn reverting_the_project_file_releases_the_hold() {
+    let fixture = Fixture::new(
+        r#"{ "sandbox": { "enabled": true, "read_deny": ["/u"] } }"#,
+        Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#),
+    );
+    let deny = |path: &str| {
+        fixture
+            .ctx
+            .config()
+            .sandbox
+            .read_deny
+            .contains(&PathBuf::from(path))
+    };
+
+    // [A] -> [B]: A is held and B is added.
+    write(
+        &fixture.project_path,
+        r#"{ "sandbox": { "read_deny": ["/b"] } }"#,
+    );
+    assert_eq!(held(&fixture.reload()), vec!["sandbox.read_deny"]);
+    assert!(deny("/a") && deny("/b"));
+
+    // Back to [A]: the held edit is gone, so the published config is the
+    // files' again and B, which only the abandoned edit added, goes.
+    write(
+        &fixture.project_path,
+        r#"{ "sandbox": { "read_deny": ["/a"] } }"#,
+    );
+    let outcome = fixture.reload();
+    assert!(held(&outcome).is_empty(), "{outcome:?}");
+    assert!(deny("/u") && deny("/a") && !deny("/b"));
+
+    // With the hold released, a user-file loosening applies live again.
+    write(
+        &fixture.user_path,
+        r#"{ "sandbox": { "enabled": false, "read_deny": ["/u"] } }"#,
+    );
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["sandbox.enabled"]);
+    assert!(!fixture.ctx.config().sandbox.enabled);
+}

@@ -224,11 +224,14 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
     if !success {
         return;
     }
-    *ctx.config_live().sources.lock() = Some(sources);
-    // A connect resolves the files afresh; nothing it applied is held.
-    ctx.config_live()
-        .project_hold_active
-        .store(false, Ordering::Release);
+    {
+        let _reload = ctx.config_live().reload_lock.lock();
+        *ctx.config_live().sources.lock() = Some(sources);
+        // A connect resolves the files afresh; nothing it applied is held.
+        ctx.config_live()
+            .project_hold_active
+            .store(false, Ordering::Release);
+    }
     sync_config_watches(ctx);
 }
 
@@ -249,6 +252,10 @@ pub struct ConfigLiveState {
     /// hardening from project texts that were never recorded (a later project
     /// edit made while an earlier one was held). Cleared by a connect.
     project_hold_active: AtomicBool,
+    /// Serializes a reload's read-resolve-publish-record sequence with
+    /// configure's recording of what it applied, so a reload in flight cannot
+    /// set `project_hold_active` after a configure cleared it.
+    reload_lock: parking_lot::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -419,6 +426,7 @@ fn tier_for(source: &TierSource) -> Option<ConfigTier> {
 
 /// Re-read the config files for `ctx` and apply the live keys that changed.
 pub fn reload_config_now(ctx: &AppContext) -> ReloadOutcome {
+    let _reload = ctx.config_live().reload_lock.lock();
     let outcome = reload_config_inner(ctx);
     *ctx.config_live().last_outcome.lock() = Some(outcome.clone());
     outcome
@@ -442,7 +450,15 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             return keep_last_good(ctx, &root_label, reason);
         }
     };
-    if user.text == sources.user.text && project.text == sources.project.text {
+    // A held loosening is released once the project file is back to the text
+    // the published values were resolved from: the edits that were held no
+    // longer exist, so the published config is resolved from the files again.
+    let was_holding = state.project_hold_active.load(Ordering::Acquire);
+    let holding = was_holding && project.text != sources.project.text;
+    if was_holding && !holding {
+        state.project_hold_active.store(false, Ordering::Release);
+    }
+    if !was_holding && user.text == sources.user.text && project.text == sources.project.text {
         // The texts match, but a tier relayed on the wire may now come from
         // its file; record that so a later deletion of the file is noticed.
         if let Some(record) = state.sources.lock().as_mut() {
@@ -492,7 +508,6 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             .iter()
             .map(|drop| format!("{} ({})", drop.key, drop.reason))
             .collect();
-        let holding = state.project_hold_active.load(Ordering::Acquire);
         let held = if project_changed || holding {
             let mut floor = published.as_ref().clone();
             let user_only_diagnostics =
@@ -614,7 +629,7 @@ fn log_reload(root: &str, applied: &[&str], deferred: &[&str], dropped: &[String
     let mut line = reload_log_line(root, applied, deferred, dropped);
     if !held.is_empty() {
         line.push_str(&format!(
-            " held=[{}] (a project edit cannot loosen these until the next connect)",
+            " held=[{}] (not loosened while a project edit is held; the next connect applies them)",
             held.join(",")
         ));
     }
@@ -1032,11 +1047,25 @@ fn run_config_file_watch(
                         (path.parent().is_some_and(is_dir) && is_config_file_name(path))
                             || is_dir(path)
                     });
+                // An event about the watched directory itself (removed,
+                // renamed, recreated) re-attaches the watch.
+                let watched = attachment.watched().map(Path::to_path_buf);
+                if let Some(watched) = watched {
+                    let resolved_watched = std::fs::canonicalize(&watched).ok();
+                    if event.paths.iter().any(|path| {
+                        *path == watched || resolved_watched.as_deref() == Some(path.as_path())
+                    }) {
+                        attachment.force_reattach();
+                    }
+                }
                 if relevant {
                     on_change();
                 }
             }
-            Ok(Err(_)) => on_change(),
+            Ok(Err(_)) => {
+                attachment.force_reattach();
+                on_change();
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -1063,6 +1092,8 @@ pub(crate) enum WatchOp<'a> {
 pub(crate) struct DirAttachment {
     dir: PathBuf,
     watching: Option<(PathBuf, Option<DirIdentity>)>,
+    /// Set by [`Self::force_reattach`]; the next attach re-watches.
+    stale: bool,
 }
 
 impl DirAttachment {
@@ -1070,7 +1101,22 @@ impl DirAttachment {
         Self {
             dir,
             watching: None,
+            stale: false,
         }
+    }
+
+    /// The directory currently watched, if any.
+    pub(crate) fn watched(&self) -> Option<&Path> {
+        self.watching.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// Make the next [`Self::attach`] watch again even if the directory's
+    /// identity looks unchanged. Used when an event names the watched
+    /// directory itself or the backend reports an error: a directory deleted
+    /// and recreated can get the same inode back (ext4 reuses them), which
+    /// the identity check alone would miss.
+    pub(crate) fn force_reattach(&mut self) {
+        self.stale = true;
     }
 
     /// Attach, move or re-attach the watch as the directories on disk
@@ -1086,13 +1132,15 @@ impl DirAttachment {
             }
         };
         let identity = dir_identity(&target);
-        if self
-            .watching
-            .as_ref()
-            .is_some_and(|(path, seen)| *path == target && *seen == identity)
+        if !self.stale
+            && self
+                .watching
+                .as_ref()
+                .is_some_and(|(path, seen)| *path == target && *seen == identity)
         {
             return false;
         }
+        self.stale = false;
         if let Some((previous, _)) = self.watching.take() {
             let _ = op(WatchOp::Unwatch(&previous));
         }
@@ -1127,7 +1175,18 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
         .map(|metadata| (metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
+/// On Windows the directory's creation time stands in for an inode: a
+/// directory recreated under the same name gets a new one. (The file index,
+/// which would be exact, is not available on stable Rust.)
+#[cfg(windows)]
+fn dir_identity(path: &Path) -> Option<DirIdentity> {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (0, metadata.creation_time()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn dir_identity(_path: &Path) -> Option<DirIdentity> {
     None
 }

@@ -62,6 +62,7 @@ export function loadPiConfigForLiveReload(directory: string): LiveConfigLoad<Aft
       config,
       sources: [...getConfigLoadSources()],
       projectText: projectTextOf(directory),
+      texts: Object.fromEntries(getConfigLoadTexts()),
     };
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) };
@@ -91,6 +92,7 @@ export function startPiLiveConfigReload(options: PiLiveConfigReloadOptions): Liv
     load: () => loadPiConfigForLiveReload(options.directory),
     initialSources: options.initialSources,
     initialProjectText: options.initialSourceTexts?.[projectConfigPath] ?? null,
+    initialTexts: options.initialSourceTexts,
     securityKeys: aftLiveSecurityKeys(PI_LIVE_CONFIG_KEYS),
     keys: PI_LIVE_CONFIG_KEYS,
     getConfig: options.getConfig,

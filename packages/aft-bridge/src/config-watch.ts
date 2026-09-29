@@ -191,10 +191,21 @@ export interface WatchAftConfigFilesOptions {
    * Called after a quiet debounce window when any file's text changed.
    * Returning `false` means the new text was not accepted (for example a
    * half-written save): it is not recorded as seen, and the files are checked
-   * again shortly even if no further event arrives.
+   * again shortly even if no further event arrives. Returning a map records
+   * the texts the callback actually accepted (path to text, `null` for an
+   * absent file) instead of the texts this check read, which may differ if a
+   * file changed in between.
    */
   onChange: () => unknown;
   debounceMs?: number;
+  /**
+   * The texts the caller already applied, keyed by path; a path that is not
+   * listed was absent. When omitted, the texts are unknown, so the first
+   * check calls `onChange`.
+   */
+  initialTexts?: Readonly<Record<string, string>>;
+  /** Check the files once as soon as the watch is attached. */
+  checkAtStart?: boolean;
   /** Test seam: replaces `fs.watch`. */
   watchImpl?: typeof watch;
   /** Test seam: runs between reading a directory's identity and watching it. */
@@ -248,8 +259,12 @@ function watchDirFor(file: string): string {
  */
 export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => void {
   const debounceMs = options.debounceMs ?? CONFIG_WATCH_DEBOUNCE_MS;
-  const lastSeen = new Map<string, string | null>();
-  for (const path of options.paths) lastSeen.set(path, readTextOrNull(path));
+  // `undefined` for a path means "not known", which differs from every text.
+  const lastSeen = new Map<string, string | null | undefined>();
+  for (const path of options.paths) {
+    if (options.initialTexts) lastSeen.set(path, options.initialTexts[path] ?? null);
+    else lastSeen.set(path, options.checkAtStart ? undefined : readTextOrNull(path));
+  }
   let timer: ReturnType<typeof setTimeout> | null = null;
   let firstPendingAt: number | null = null;
   let stopped = false;
@@ -268,7 +283,8 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
       if (text !== lastSeen.get(path)) seen.set(path, text);
     }
     if (seen.size === 0) return;
-    if (options.onChange() === false) {
+    const outcome = options.onChange();
+    if (outcome === false) {
       // Not accepted: keep the old texts as seen so the next event retries,
       // and retry on our own a few times in case no further event comes (an
       // editor that finished its save before this check read the file).
@@ -280,7 +296,11 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
       return;
     }
     rejectedRetries = 0;
-    for (const [path, text] of seen) lastSeen.set(path, text);
+    if (outcome instanceof Map) {
+      for (const path of options.paths) lastSeen.set(path, outcome.get(path) ?? null);
+    } else {
+      for (const [path, text] of seen) lastSeen.set(path, text);
+    }
   };
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   const schedule = (): void => {
@@ -340,6 +360,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     return moved;
   }
   revalidate();
+  if (options.checkAtStart) check();
   // Some platforms stop reporting on a deleted or replaced directory without
   // an error; a periodic check re-arms such a watch. Moving a watch (for
   // example once `.cortexkit/` is created) may reveal a file, so it checks.
@@ -370,6 +391,8 @@ export type LiveConfigLoad<C> =
       sources: readonly string[];
       /** The project config file's text as this load read it, or null when absent. */
       projectText?: string | null;
+      /** The text of each file this load read, keyed by path. */
+      texts?: Readonly<Record<string, string>>;
     }
   | { ok: false; message: string };
 
@@ -413,6 +436,8 @@ export interface LiveConfigReloadOptions<C> {
   initialSources: readonly string[];
   /** The project config text the startup load read, or null when absent. */
   initialProjectText?: string | null;
+  /** The text of each file the startup load read, keyed by path. */
+  initialTexts?: Readonly<Record<string, string>>;
   /** Keys a project-file edit may only tighten; see {@link aftLiveSecurityKeys}. */
   securityKeys?: readonly LiveSecurityKey<C>[];
   keys: readonly LiveConfigKey<C>[];
@@ -463,6 +488,9 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
   // that would loosen one of them is held until the next restart, and this
   // stays at the older text so later reloads keep holding it.
   let acceptedProjectText = options.initialProjectText ?? null;
+  // The texts the last accepted load read, handed to the watch so it records
+  // what was applied rather than what it happened to read.
+  let acceptedTexts: Readonly<Record<string, string>> | undefined;
   const reload = (): LiveConfigApply<C> | null => {
     let loaded = options.load();
     if (loaded.ok) {
@@ -483,6 +511,7 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
       return null;
     }
     lastError = null;
+    acceptedTexts = loaded.texts;
     const current = options.getConfig();
     let next = loaded.config;
     const held: string[] = [];
@@ -502,15 +531,19 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
     if (result.applied.length > 0 || result.deferred.length > 0 || held.length > 0) {
       let line = liveConfigReloadLogLine(result.applied, result.deferred);
       if (held.length > 0) {
-        line += ` held=[${held.join(",")}] (a project edit cannot loosen these until the next restart)`;
+        line += ` held=[${held.join(",")}] (not loosened while the project file differs from the one the published values came from; the next restart applies them)`;
       }
       options.log(line);
     }
     return { ...result, held };
   };
-  const safeReload = (): boolean => {
+  const safeReload = (): false | ReadonlyMap<string, string | null> | true => {
     try {
-      return reload() !== null;
+      acceptedTexts = undefined;
+      if (reload() === null) return false;
+      const texts = acceptedTexts;
+      if (!texts) return true;
+      return new Map(options.paths.map((path) => [path, texts[path] ?? null]));
     } catch (err) {
       options.reportError(
         `AFT config reload failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -521,11 +554,15 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
   if (options.watch === false) {
     return { reload: reload as () => LiveConfigApply<unknown> | null, stop: () => {} };
   }
+  // The first check runs as soon as the watch is attached, through the same
+  // accepted-text and retry path as every later one, so an edit made while
+  // the host was starting is applied and a transient rejection is retried.
   const stop = watchAftConfigFiles({
     paths: options.paths,
     debounceMs: options.debounceMs,
     onChange: safeReload,
+    initialTexts: options.initialTexts,
+    checkAtStart: true,
   });
-  safeReload();
   return { reload: reload as () => LiveConfigApply<unknown> | null, stop };
 }

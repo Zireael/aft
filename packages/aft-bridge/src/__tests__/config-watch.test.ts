@@ -289,6 +289,64 @@ describe("startLiveConfigReload start-up", () => {
   });
 });
 
+describe("startLiveConfigReload accepted texts", () => {
+  test("a transient rejection at start-up is retried", async () => {
+    const file = join(tempDir(), "aft.jsonc");
+    writeFileSync(file, '{ "restrict_to_project_root": true }');
+    let config: TestConfig = { restrict_to_project_root: false };
+    let loads = 0;
+    const reload = startLiveConfigReload<TestConfig>({
+      paths: [file],
+      // The first load catches the file mid-save; the next one succeeds.
+      load: () =>
+        loads++ === 0
+          ? { ok: false, message: "AFT config at x failed to parse: truncated" }
+          : { ok: true, config: { restrict_to_project_root: true }, sources: [file] },
+      initialSources: [],
+      keys: KEYS,
+      getConfig: () => config,
+      setConfig: (next) => {
+        config = next;
+      },
+      log: () => {},
+      reportError: () => {},
+    });
+    try {
+      await waitUntil(() => config.restrict_to_project_root === true, "start-up retry", 4_000);
+    } finally {
+      reload.stop();
+    }
+  });
+
+  test("the watch records the text the load accepted, not the text it read", async () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    writeFileSync(file, "{}");
+    let calls = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      initialTexts: { [file]: "{}" },
+      // The load read an older text than the check did.
+      onChange: () => {
+        calls += 1;
+        return new Map([[file, "{}"]]);
+      },
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      writeFileSync(file, '{ "restrict_to_project_root": true }');
+      await waitUntil(() => calls >= 1, "first check", 4_000);
+      // An unrelated event wakes the check again: the file still differs
+      // from what was accepted, so it is loaded again.
+      writeFileSync(join(dir, "status"), "1");
+      await waitUntil(() => calls >= 2, "the unaccepted text was checked again", 4_000);
+    } finally {
+      stop();
+    }
+  });
+});
+
 describe("watchAftConfigFiles registration and retries", () => {
   test("a directory replaced while its watch is being set up is watched again", async () => {
     const dir = tempDir();

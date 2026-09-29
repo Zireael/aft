@@ -62,6 +62,7 @@ export function loadOpenCodeConfigForLiveReload(directory: string): LiveConfigLo
       config,
       sources: [...getConfigLoadSources()],
       projectText: projectTextOf(directory),
+      texts: Object.fromEntries(getConfigLoadTexts()),
     };
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) };
@@ -93,6 +94,7 @@ export function startOpenCodeLiveConfigReload(
     load: () => loadOpenCodeConfigForLiveReload(options.directory),
     initialSources: options.initialSources,
     initialProjectText: options.initialSourceTexts?.[projectConfigPath] ?? null,
+    initialTexts: options.initialSourceTexts,
     securityKeys: aftLiveSecurityKeys(OPENCODE_LIVE_CONFIG_KEYS),
     keys: OPENCODE_LIVE_CONFIG_KEYS,
     getConfig: options.getConfig,

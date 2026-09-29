@@ -86,7 +86,7 @@ fn assert_config_write_lock_not_held() {
         panic!(
             "config read inside update_config closure would deadlock: the closure \
              receives the configuration as `&mut Config` and must not call \
-             `ctx.config()` or anything that does"
+             `ctx.config()`, publish the configuration, or call anything that does"
         );
     }
 }
@@ -5004,6 +5004,9 @@ impl AppContext {
         build: impl FnOnce(&Arc<Config>) -> Option<Config>,
         replace_pin: bool,
     ) -> bool {
+        // A publication from inside an `update_config` closure would wait on
+        // the write lock this thread already holds.
+        assert_config_write_lock_not_held();
         let (next, project_root_changed) = {
             let mut guard = self
                 .config
