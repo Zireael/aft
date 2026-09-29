@@ -798,3 +798,38 @@ fn a_directory_replaced_under_the_same_name_is_attached_again() {
     drop(op);
     assert_eq!(watched, vec![dir.clone(), dir]);
 }
+
+#[test]
+fn reading_config_inside_update_config_panics_instead_of_deadlocking() {
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_ctx = Arc::clone(&ctx);
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_ctx.update_config(|config| {
+                config.format_on_edit = worker_ctx.config().format_on_edit;
+            });
+        }));
+        let message = result.err().and_then(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        });
+        let _ = tx.send(message);
+    });
+    let message = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a config read inside update_config hung instead of panicking")
+        .expect("a config read inside update_config did not panic");
+    assert!(
+        message.contains("config read inside update_config closure would deadlock"),
+        "{message}"
+    );
+    // The lock and the flag are released: config is readable and writable.
+    ctx.update_config(|config| config.format_on_edit = true);
+    assert!(ctx.config().format_on_edit);
+}

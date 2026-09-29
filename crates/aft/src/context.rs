@@ -54,6 +54,43 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Set while this thread runs a closure under the configuration write
+    /// lock (`update_config`). Reading the configuration there would wait on
+    /// that same lock forever, so the read path panics instead.
+    static CONFIG_WRITE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the configuration write lock as held by this thread until dropped,
+/// including when the closure panics.
+struct ConfigWriteLockHeld {
+    previous: bool,
+}
+
+impl ConfigWriteLockHeld {
+    fn enter() -> Self {
+        Self {
+            previous: CONFIG_WRITE_LOCK_HELD.with(|held| held.replace(true)),
+        }
+    }
+}
+
+impl Drop for ConfigWriteLockHeld {
+    fn drop(&mut self) {
+        CONFIG_WRITE_LOCK_HELD.with(|held| held.set(self.previous));
+    }
+}
+
+fn assert_config_write_lock_not_held() {
+    if CONFIG_WRITE_LOCK_HELD.with(std::cell::Cell::get) {
+        panic!(
+            "config read inside update_config closure would deadlock: the closure \
+             receives the configuration as `&mut Config` and must not call \
+             `ctx.config()` or anything that does"
+        );
+    }
+}
+
 fn pinned_config_for(key: usize) -> Option<Arc<Config>> {
     CONFIG_PINS.with(|pins| {
         pins.borrow()
@@ -4922,6 +4959,7 @@ impl AppContext {
 
     /// Access an owned configuration snapshot.
     pub fn config(&self) -> Arc<Config> {
+        assert_config_write_lock_not_held();
         if let Some(pinned) = pinned_config_for(self.config_pin_key()) {
             return pinned;
         }
@@ -4932,6 +4970,7 @@ impl AppContext {
     /// pinned. Read-modify-write callers use this so they never republish an
     /// older snapshot over a newer one.
     pub fn config_unpinned(&self) -> Arc<Config> {
+        assert_config_write_lock_not_held();
         let guard = match self.config.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -4970,7 +5009,11 @@ impl AppContext {
                 .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(next) = build(&guard) else {
+            let built = {
+                let _held = ConfigWriteLockHeld::enter();
+                build(&guard)
+            };
+            let Some(next) = built else {
                 return false;
             };
             let next = Arc::new(next);
