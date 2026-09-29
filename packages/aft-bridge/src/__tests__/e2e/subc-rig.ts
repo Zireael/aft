@@ -307,7 +307,7 @@ async function writeBulkFixtureFiles(
 async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
   // A killed runner (test timeout, SIGKILL, worktree reclaim) runs no exit
   // handler at all, so the daemon it started is still alive and has been
-  // reparented to init. Reap those leftovers before starting another daemon,
+  // reparented to init or a subreaper. Reap leftovers before starting a daemon,
   // otherwise they accumulate one per run.
   await sweepReparentedSubcDaemons();
 
@@ -532,6 +532,12 @@ async function spawnReadyDaemon(
     trackDaemon(daemon);
 
     try {
+      if (daemon.pid && process.platform !== "win32") {
+        const recordPath = await recordSubcDaemonOwner(daemon.pid);
+        daemon.once("close", () => {
+          void rm(recordPath, { force: true }).catch(() => undefined);
+        });
+      }
       await waitForAftCatalog(dirs.connectionFile, daemon, stderrChunks, START_TIMEOUT_MS);
       return daemon;
     } catch (err) {
@@ -705,9 +711,9 @@ async function findAftModuleProcess(
  *     The name `ck-subc` is deliberately NOT part of the test: the production
  *     supervisor and other checkouts' supervisors share that name, and only the
  *     cache path distinguishes a daemon this test rig fetched and started.
- *   - its parent is pid 1, meaning the process that started it has exited and
- *     the kernel reparented it. A process with a live parent belongs to a
- *     running test run and is never touched.
+ *   - its recorded runner is gone (including reuse of the runner pid). The
+ *     parent may be a child subreaper rather than pid 1 on Linux. Only older
+ *     daemons without ownership records use parent pid 1 as a fallback.
  */
 export async function sweepReparentedSubcDaemons(
   options: SweepSubcDaemonOptions = {},
@@ -734,19 +740,86 @@ export async function sweepReparentedSubcDaemons(
   const reaped: ReapedSubcDaemon[] = [];
   for (const row of rows) {
     if (row.pid <= 1 || row.pid === process.pid) continue;
-    if (row.ppid !== 1) continue;
     const executable = commandExecutable(row.command);
     if (!isUnderAnyRoot(executable, roots)) continue;
+    const recordPath = daemonOwnerPath(cacheRoot, row.pid);
+    try {
+      const owner = JSON.parse(await readFile(recordPath, "utf8")) as DaemonOwner;
+      // A stale daemon pid or unreadable identity must never authorize a kill.
+      if (
+        !Number.isInteger(owner.runnerPid) ||
+        owner.runnerPid <= 0 ||
+        typeof owner.runnerStart !== "string" ||
+        !owner.runnerStart ||
+        typeof owner.daemonStart !== "string" ||
+        !owner.daemonStart
+      )
+        continue;
+      if ((await processStart(row.pid)) !== owner.daemonStart) continue;
+      if ((await processStart(owner.runnerPid)) === owner.runnerStart) continue;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        log(`[subc-rig] ignoring unreadable ownership for pid=${row.pid}: ${errorText(err)}`);
+        continue;
+      }
+      if (row.ppid !== 1) continue;
+    }
     log(
       `[subc-rig] reaping orphaned subc daemon pid=${row.pid} uptime=${row.elapsed} exe=${executable}`,
     );
     if (await terminatePid(row.pid, options.graceMs ?? 2_000)) {
       reaped.push({ pid: row.pid, uptime: row.elapsed, executable });
+      await rm(recordPath, { force: true });
     } else {
       log(`[subc-rig] orphaned subc daemon pid=${row.pid} did not die; leaving it to the OS`);
     }
   }
   return reaped;
+}
+
+interface DaemonOwner {
+  runnerPid: number;
+  runnerStart: string;
+  daemonStart: string;
+}
+
+function daemonOwnerPath(cacheRoot: string, pid: number): string {
+  return join(cacheRoot, ".rig-owners", `${pid}.json`);
+}
+
+/** Persist ownership before readiness so a crashed runner can be swept later. */
+export async function recordSubcDaemonOwner(
+  daemonPid: number,
+  cacheRoot = FETCHED_SUBC_CORE_CACHE_ROOT,
+  runnerPid = process.pid,
+): Promise<string> {
+  const runnerStart = await processStart(runnerPid);
+  const daemonStart = await processStart(daemonPid);
+  if (!runnerStart || !daemonStart)
+    throw new Error("Cannot record daemon ownership: process exited");
+  const path = daemonOwnerPath(cacheRoot, daemonPid);
+  await mkdir(join(cacheRoot, ".rig-owners"), { recursive: true });
+  await writeFile(path, JSON.stringify({ runnerPid, runnerStart, daemonStart }), "utf8");
+  return path;
+}
+
+async function processStart(pid: number): Promise<string | null> {
+  if (process.platform === "linux") {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      // Field 22 is start time in clock ticks; the command in parentheses can contain spaces.
+      const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19];
+      const boot = await readFile("/proc/sys/kernel/random/boot_id", "utf8");
+      return ticks ? `${boot.trim()}:${ticks}` : null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+  const result = await runProcess("ps", ["-p", String(pid), "-o", "lstart="], PROJECT_ROOT);
+  if (result.code === 1 && !result.output.trim()) return null;
+  if (result.code !== 0) throw new Error(`Cannot read process start: ${result.output}`);
+  return result.output.trim() || null;
 }
 
 async function cacheRootPrefixes(cacheRoot: string): Promise<string[]> {

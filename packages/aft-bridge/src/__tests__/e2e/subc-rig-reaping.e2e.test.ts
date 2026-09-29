@@ -3,10 +3,10 @@
 import { describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { prepareSubcLane, type ReapedSubcDaemon, sweepReparentedSubcDaemons } from "./subc-rig.js";
+import { prepareSubcLane, recordSubcDaemonOwner, sweepReparentedSubcDaemons } from "./subc-rig.js";
 
 const RIG_MODULE = resolve(import.meta.dir, "subc-rig.ts");
 const POSIX_ONLY = process.platform === "win32";
@@ -91,53 +91,89 @@ describe.skipIf(Boolean(exitSkipReason))(
 );
 
 describe.skipIf(POSIX_ONLY)("subc rig orphan daemon sweep", () => {
-  test("reaps a reparented cache-root process and leaves a live-parent one alone", async () => {
-    const sleepBinary = await resolveSleepBinary();
-    const cacheRoot = await mkdtemp(join(tmpdir(), "subc-rig-sweep-cache-"));
-    const fakeDaemon = join(cacheRoot, "subc-core-vtest", "ck-subc");
-    await mkdir(join(cacheRoot, "subc-core-vtest"), { recursive: true });
-    // A symlink, not a copy: macOS kills copies of platform binaries, while
-    // exec through a symlink reports the link path in `ps` (which is what the
-    // sweep matches on) and runs the real binary.
-    await symlink(sleepBinary, fakeDaemon);
-
-    let orphan: PlantedProcess | undefined;
-    let adopted: PlantedProcess | undefined;
-    try {
-      orphan = await plantProcess(fakeDaemon, { keepParentAlive: false });
-      adopted = await plantProcess(fakeDaemon, { keepParentAlive: true });
-
-      const lines: string[] = [];
-      let reaped: ReapedSubcDaemon[] = [];
-      reaped = await sweepReparentedSubcDaemons({
-        cacheRoot,
-        log: (line) => lines.push(line),
-      });
-
-      const orphanPid = orphan.pid;
-      const adoptedPid = adopted.pid;
-      expect(
-        reaped.map((entry) => entry.pid),
-        `sweep log:\n${lines.join("\n")}`,
-      ).toEqual([orphanPid]);
-      expect(reaped[0]?.executable).toBe(fakeDaemon);
-      expect(reaped[0]?.uptime).toMatch(/\d/);
-      expect(lines.join("\n")).toContain(`pid=${orphanPid}`);
-      expect(lines.join("\n")).toContain("uptime=");
-
-      expect(
-        await waitForDeath(orphanPid, 2_000),
-        `orphan pid ${orphanPid} survived the sweep`,
-      ).toBe(true);
-      expect(isAlive(adoptedPid), `pid ${adoptedPid} has a live parent and must not be swept`).toBe(
-        true,
-      );
-    } finally {
-      orphan?.dispose();
-      adopted?.dispose();
-      await rm(cacheRoot, { recursive: true, force: true });
-    }
-  }, 30_000);
+  for (const scenario of [
+    {
+      name: "reaps an orphan with a dead recorded runner",
+      orphan: true,
+      owner: "dead",
+      reaped: true,
+    },
+    {
+      name: "leaves a daemon with a live recorded runner alone",
+      orphan: false,
+      owner: "live",
+      reaped: false,
+    },
+    {
+      name: "reaps a daemon with a dead recorded runner despite a non-1 live parent",
+      orphan: false,
+      owner: "dead",
+      reaped: true,
+    },
+    {
+      name: "leaves an unrelated unrecorded cache-root process with a live parent alone",
+      orphan: false,
+      owner: "none",
+      reaped: false,
+    },
+    {
+      name: "reaps a daemon when the recorded runner pid has been reused",
+      orphan: false,
+      owner: "reused",
+      reaped: true,
+    },
+    { name: "leaves a reused daemon pid alone", orphan: false, owner: "stale", reaped: false },
+  ]) {
+    test(scenario.name, async () => {
+      const sleepBinary = await resolveSleepBinary();
+      const cacheRoot = await mkdtemp(join(tmpdir(), "subc-rig-sweep-cache-"));
+      const fakeDaemon = join(cacheRoot, "ck-subc");
+      // Execute a symlink so macOS preserves the platform binary's signature.
+      await symlink(sleepBinary, fakeDaemon);
+      let planted: PlantedProcess | undefined;
+      let runner: ChildProcess | undefined;
+      try {
+        planted = await plantProcess(fakeDaemon, { keepParentAlive: !scenario.orphan });
+        if (scenario.owner !== "none") {
+          runner = spawn(sleepBinary, ["300"], { stdio: "ignore" });
+          const recordPath = await recordSubcDaemonOwner(planted.pid, cacheRoot, runner.pid!);
+          if (scenario.owner === "reused" || scenario.owner === "stale") {
+            const owner = JSON.parse(await readFile(recordPath, "utf8"));
+            owner[scenario.owner === "reused" ? "runnerStart" : "daemonStart"] = "different-start";
+            await writeFile(recordPath, JSON.stringify(owner));
+          }
+          if (scenario.owner === "dead" || scenario.owner === "stale") {
+            const exited = new Promise<void>((done) => runner!.once("exit", () => done()));
+            runner.kill("SIGKILL");
+            await exited;
+            expect(isAlive(runner.pid!), "recorded runner must be gone before sweeping").toBe(
+              false,
+            );
+          }
+        }
+        const lines: string[] = [];
+        const reaped = await sweepReparentedSubcDaemons({
+          cacheRoot,
+          log: (line) => lines.push(line),
+        });
+        expect(
+          reaped.map((entry) => entry.pid),
+          `sweep log:\n${lines.join("\n")}`,
+        ).toEqual(scenario.reaped ? [planted.pid] : []);
+        if (scenario.reaped) {
+          expect(reaped[0]?.executable).toBe(fakeDaemon);
+          expect(reaped[0]?.uptime).toMatch(/\d/);
+          expect(await waitForDeath(planted.pid, 2_000)).toBe(true);
+        } else {
+          expect(isAlive(planted.pid), "protected process must survive the sweep").toBe(true);
+        }
+      } finally {
+        planted?.dispose();
+        runner?.kill("SIGKILL");
+        await rm(cacheRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+  }
 });
 
 describe("subc rig orphan daemon sweep on win32", () => {
@@ -166,8 +202,7 @@ interface PlantedProcess {
 /**
  * Start `exe` from a shell so the test controls whether its parent stays alive.
  * With `keepParentAlive: false` the shell exits immediately and the kernel
- * reparents the child to pid 1, which is the shape a killed test runner leaves
- * behind.
+ * reparents the child to pid 1 or a child subreaper, as with a killed runner.
  */
 async function plantProcess(
   exe: string,
@@ -178,13 +213,33 @@ async function plantProcess(
     : `"${exe}" 300 & echo $!`;
   const shell = spawn("sh", ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
   const pid = await firstPidLine(shell);
-  if (!options.keepParentAlive) {
-    // Wait for the shell to go away, otherwise the child still has a live
-    // parent and the sweep would correctly ignore it. "exit", not "close":
-    // the backgrounded child inherits the shell's stdout pipe, so the stdio
-    // streams stay open long after the shell itself is gone.
-    await new Promise<void>((resolveExit) => shell.once("exit", () => resolveExit()));
-    await waitUntil(() => parentOf(pid) === 1, 2_000);
+  const ready = await waitUntil(() => {
+    const parent = parentOf(pid);
+    return (
+      isAlive(pid) &&
+      parent !== null &&
+      (options.keepParentAlive
+        ? parent === shell.pid && parent !== 1
+        : parent !== shell.pid && shell.exitCode !== null)
+    );
+  }, 2_000);
+  if (!ready) {
+    const parent = parentOf(pid);
+    const command =
+      parent === null
+        ? "<missing>"
+        : new TextDecoder()
+            .decode(Bun.spawnSync(["ps", "-p", String(parent), "-o", "command="]).stdout)
+            .trim();
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    shell.kill("SIGKILL");
+    throw new Error(
+      `Planting pid ${pid} failed: expected ${options.keepParentAlive ? "live shell parent" : "reparented child"}; actual parent pid=${parent}, command=${command}`,
+    );
   }
   return {
     pid,
