@@ -917,12 +917,22 @@ mod tests {
 
         let budget = Duration::from_millis(600);
         let started = std::time::Instant::now();
+        let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer = {
             let shared = std::sync::Arc::clone(&shared);
+            let attempted = std::sync::Arc::clone(&attempted);
             std::thread::spawn(move || {
-                maintenance_write(&shared, budget, |conn| write_state(conn, "maintenance"))
+                maintenance_write(&shared, budget, |conn| {
+                    attempted.store(true, std::sync::atomic::Ordering::Release);
+                    write_state(conn, "maintenance")
+                })
             })
         };
+        // Read only once the writer has made its first attempt: a reader
+        // holding the mutex before that would make it stop as `MutexHeld`.
+        while !attempted.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut slowest_lock = Duration::ZERO;
         while !writer.is_finished() {
             let asked = std::time::Instant::now();
