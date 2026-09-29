@@ -542,9 +542,15 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
             "exit took {elapsed:?}; {}",
             log_tail(&log)
         );
+        // Draining roots may already have stopped some servers before the final
+        // sweep, so the summary's split depends on timing. What must hold is one
+        // summary, a bounded exit and no orphans.
+        let summaries: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("lsp shutdown_all: servers="))
+            .collect();
         assert_eq!(
-            log.matches("lsp shutdown_all: servers=6 graceful=0 killed=6")
-                .count(),
+            summaries.len(),
             1,
             "expected one shutdown summary; {}",
             log_tail(&log)
