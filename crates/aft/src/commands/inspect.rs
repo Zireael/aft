@@ -4521,8 +4521,12 @@ mod deferred_terminal_tests {
             });
         });
         let manager = crate::inspect::InspectManager::new();
+        // The phase wait takes half the budget left after the reserve (450 ms
+        // here), so the budget assertion below tolerates up to 450 ms of
+        // scheduling overshoot. A 120 ms budget left only 40 ms, which a loaded
+        // macOS runner exceeded.
         let deadline =
-            InspectRequestDeadline::new(Duration::from_millis(120), Duration::from_millis(40));
+            InspectRequestDeadline::new(Duration::from_millis(1_000), Duration::from_millis(100));
         let outcome = receive_tier2_completion_until(
             rx,
             &manager,
