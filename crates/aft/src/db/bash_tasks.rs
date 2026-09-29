@@ -213,14 +213,19 @@ pub fn terminal_rows_eligible_count(conn: &Connection, now_ms: i64) -> rusqlite:
         [cutoff],
         |row| row.get::<_, i64>(0),
     )?;
-    // Start from the normally tiny watch table instead of running a correlated
-    // watch lookup for every retained task row in a large backlog.
+    // Start from the normally tiny watch table instead of visiting every retained
+    // task row. A plain JOIN leaves the order to the planner, which prefers the
+    // `status` index on `bash_tasks` and then reads every terminal row's table
+    // page to test `completed_at`: on a machine with 160k retained tasks that is
+    // a read of the whole table on every health report. SQLite never reorders a
+    // CROSS JOIN, so the watch table stays the outer loop and each watch costs
+    // one primary-key lookup.
     let watched_terminal_rows = conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM (
                 SELECT task.harness, task.session_id, task.task_id
                 FROM bash_pattern_watches AS watch
-                JOIN bash_tasks AS task
+                CROSS JOIN bash_tasks AS task
                   ON task.harness = watch.harness
                  AND task.session_id = watch.session_id
                  AND task.task_id = watch.task_id
@@ -686,6 +691,94 @@ mod tests {
         assert!(
             plan.contains("idx_bash_tasks_terminal_retention"),
             "terminal retention count did not use its age index: {plan}"
+        );
+    }
+
+    /// Pages a cold connection pulls from the database file while counting.
+    fn cold_count_page_reads(path: &Path, now_ms: i64) -> (usize, i32) {
+        let conn = crate::db::open_readonly(path).unwrap();
+        let mut current = 0;
+        let mut highwater = 0;
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                1,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        let eligible = terminal_rows_eligible_count(&conn, now_ms).unwrap();
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        (eligible, current)
+    }
+
+    // Health reports call this count every few seconds. Its cost must follow
+    // the handful of watched tasks and old rows, not the whole task history:
+    // a join order that walks every terminal row reads the entire table.
+    #[test]
+    fn terminal_retention_count_reads_pages_for_watches_not_history() {
+        const RECENT_TERMINAL_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let now_ms = 100 * TERMINAL_ROW_RETENTION_AGE_MS;
+        let old = now_ms - TERMINAL_ROW_RETENTION_AGE_MS - 1;
+        let recent = now_ms - 1;
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |task: &str, completed_at: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     started_at, completed_at, completion_delivered)
+                 VALUES ('opencode', 'session', ?1, 'project', ?2, '.', 'completed', 0, ?3, 1)",
+                params![task, "x".repeat(2_000), completed_at],
+            )
+            .unwrap();
+        };
+        // Recent history: retained, so never eligible, but it dominates the table.
+        for index in 0..RECENT_TERMINAL_ROWS {
+            insert(&format!("recent-{index}"), recent);
+        }
+        for task in ["old-watched", "old-plain-1", "old-plain-2"] {
+            insert(task, old);
+        }
+        for (task, watch) in [("old-watched", "w1"), ("recent-7", "w2")] {
+            tx.execute(
+                "INSERT INTO bash_pattern_watches
+                    (harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at)
+                 VALUES ('opencode', 'session', ?1, ?2, 'literal', 'x', 0)",
+                params![task, watch],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > RECENT_TERMINAL_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let (eligible, page_reads) = cold_count_page_reads(&path, now_ms);
+
+        // The watched old row stays; the two unwatched old rows are eligible.
+        assert_eq!(eligible, 2);
+        assert!(
+            page_reads < 64,
+            "counting two watches and three old rows read {page_reads} of {table_pages} pages"
         );
     }
 }

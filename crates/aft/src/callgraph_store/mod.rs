@@ -17886,21 +17886,86 @@ fn normalize_project_file_path(project_root: &Path, path: &Path) -> Result<(Path
     Ok((abs_path, rel_path))
 }
 
+#[cfg(test)]
+thread_local! {
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `std::fs::canonicalize`, counted in tests. Each call is a `realpath`, which
+/// on macOS costs one `getattrlist` per path component.
+fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    std::fs::canonicalize(path)
+}
+
 /// Canonicalize an existing path or the deepest existing ancestor of a deleted
 /// one. This keeps watcher deletion events in the same identity domain as the
 /// files indexed before the deletion.
+///
+/// The resolver also calls this for every candidate it probes (`tsconfig.json`
+/// in each ancestor directory, `index.ts` beside each import), and most probes
+/// name a file that does not exist.
 fn canonicalize_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
+    if let Ok(canonical) = fs_canonicalize(path) {
         return canonical;
     }
+    canonicalize_missing_absolute_path(path).unwrap_or_else(|| canonicalize_missing_path(path))
+}
 
+/// The deepest-existing-ancestor form of an absolute path made only of normal
+/// components, found by walking up from the parent. A missing probe usually
+/// sits in an existing directory, so this costs one more `canonicalize`; the
+/// component-by-component walk in [`canonicalize_missing_path`] costs one per
+/// component, each of them a full `realpath` from the root.
+///
+/// It returns what that walk returns: canonicalizing an ancestor also resolves
+/// every ancestor above it, so the first ancestor that canonicalizes is the
+/// deepest one the walk would reach. `None` hands paths with `..`, prefixes or
+/// no parent to the walk.
+fn canonicalize_missing_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        return None;
+    }
+    let names = components
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (existing, canonical) =
+        path.ancestors()
+            .skip(1)
+            .enumerate()
+            .find_map(|(depth_above, ancestor)| {
+                fs_canonicalize(ancestor)
+                    .ok()
+                    .map(|canonical| (names.len() - 1 - depth_above, canonical))
+            })?;
+    // The walk checks the first missing component the same way: a name that
+    // exists but cannot be resolved (a dangling symlink, a file used as a
+    // directory) leaves the whole path as given.
+    match std::fs::symlink_metadata(canonical.join(names[existing])) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut resolved = canonical;
+            resolved.extend(&names[existing..]);
+            Some(resolved)
+        }
+        _ => Some(path.to_path_buf()),
+    }
+}
+
+/// Resolve a missing path component by component, keeping the unresolved tail
+/// and applying `..` to it lexically.
+fn canonicalize_missing_path(path: &Path) -> PathBuf {
     let mut resolved = PathBuf::new();
     let mut missing = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 resolved.push(component.as_os_str());
-                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                if let Ok(canonical) = fs_canonicalize(&resolved) {
                     resolved = canonical;
                 }
             }
@@ -17916,7 +17981,7 @@ fn canonicalize_path(path: &Path) -> PathBuf {
             std::path::Component::Normal(name) => {
                 if missing.is_empty() {
                     let candidate = resolved.join(name);
-                    match std::fs::canonicalize(&candidate) {
+                    match fs_canonicalize(&candidate) {
                         Ok(canonical) => resolved = canonical,
                         Err(_) => match std::fs::symlink_metadata(&candidate) {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -23518,6 +23583,90 @@ mod refresh_index_load_log_tests {
         assert!(!index_load_is_notable(&profile(249, 49_999)));
         assert!(index_load_is_notable(&profile(250, 0)));
         assert!(index_load_is_notable(&profile(0, 50_000)));
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_path_tests {
+    use super::*;
+
+    fn canonicalize_calls<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        let before = CANONICALIZE_CALLS.with(std::cell::Cell::get);
+        let value = run();
+        (
+            value,
+            CANONICALIZE_CALLS.with(std::cell::Cell::get) - before,
+        )
+    }
+
+    fn deep_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let deep = root.join("packages/plugin/src/features/magic-context/dreamer/nested");
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+        (dir, root, deep)
+    }
+
+    // The resolver probes a missing `tsconfig.json` in every ancestor of every
+    // importing file. Each probe must cost a fixed number of `realpath` calls,
+    // not one per path component: on a real checkout the per-component walk
+    // made a callgraph refresh issue millions of `getattrlist` calls a minute.
+    #[test]
+    fn missing_probe_canonicalizes_its_parent_not_every_ancestor() {
+        let (_dir, root, deep) = deep_fixture();
+        let probe = deep.join("tsconfig.json");
+
+        let (canonical, calls) = canonicalize_calls(|| canonicalize_path(&probe));
+        assert_eq!(canonical, probe);
+        assert!(
+            calls <= 2,
+            "one missing probe took {calls} canonicalize calls for {} components",
+            probe.components().count()
+        );
+
+        let disk = disk_facts::DiskFacts::new(&root);
+        let facts = facts::FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        let (found, calls) = canonicalize_calls(|| facts.is_file(&probe));
+        assert!(!found);
+        assert!(calls <= 2, "resolver probe took {calls} canonicalize calls");
+    }
+
+    #[test]
+    fn missing_path_shortcut_matches_the_component_walk() {
+        let (_dir, root, deep) = deep_fixture();
+        std::fs::write(deep.join("file.ts"), "").expect("file");
+        let mut cases = vec![
+            deep.join("tsconfig.json"),
+            deep.join("missing/also-missing/index.ts"),
+            root.join("missing"),
+            // A regular file used as a directory is not a missing ancestor.
+            deep.join("file.ts/index.ts"),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&deep, root.join("linked")).expect("dir link");
+            std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling"))
+                .expect("dangling link");
+            cases.push(root.join("linked/tsconfig.json"));
+            cases.push(root.join("linked/missing/index.ts"));
+            cases.push(root.join("dangling/index.ts"));
+        }
+        for case in cases {
+            assert_eq!(
+                canonicalize_path(&case),
+                canonicalize_missing_path(&case),
+                "{}",
+                case.display()
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            canonicalize_path(&root.join("linked/tsconfig.json")),
+            deep.join("tsconfig.json")
+        );
     }
 }
 
