@@ -39,6 +39,42 @@ fn fake_server_path() -> PathBuf {
         .expect("fake-lsp-server binary path not set")
 }
 
+/// A completed spawning thread must not end the server's usable lifetime.
+#[test]
+fn lsp_remains_usable_after_spawning_thread_exits() {
+    use aft::lsp::client::LspClient;
+
+    let (temp, _, _) = rust_fixture_files();
+    let root = temp.path().to_path_buf();
+    let spawn_root = root.clone();
+    let registry = LspChildRegistry::new();
+    let spawn_registry = registry.clone();
+    let (events, _receiver) = crossbeam_channel::unbounded();
+    let mut client = thread::spawn(move || {
+        LspClient::spawn(
+            ServerKind::Rust,
+            spawn_root,
+            &fake_server_path(),
+            &[],
+            &HashMap::new(),
+            events,
+            spawn_registry,
+        )
+        .expect("spawn fake LSP")
+    })
+    .join()
+    .expect("spawning thread exits");
+
+    // Joining, rather than sleeping, puts the handshake after the spawning
+    // thread has exited. Linux parent-death signals used to kill the child here.
+    client
+        .initialize(&root, None)
+        .expect("server must answer after its spawning caller exits");
+    client.shutdown().expect("server must shut down gracefully");
+    drop(client);
+    assert!(registry.pids().is_empty());
+}
+
 #[test]
 fn inspect_deadline_does_not_kill_initializing_server() {
     use aft::lsp::manager::{start_applicable_server_unlocked, walk_applicable_area};

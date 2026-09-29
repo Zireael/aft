@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +37,63 @@ const EXIT_LOG_STDERR_BYTES: usize = 2 * 1024;
 const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
+
+/// Spawn on a process-lifetime thread on Linux: PR_SET_PDEATHSIG observes the
+/// creating thread's death, even when the rest of the parent process is alive.
+/// Keep initialization outside this queue so slow handshakes do not serialize
+/// other servers' starts. Registry locking still covers spawn and registration.
+fn spawn_lsp_child(
+    mut command: Command,
+    registry: &LspChildRegistry,
+    reclaim_root: Option<&Path>,
+    root: &Path,
+    kind: &ServerKind,
+) -> io::Result<Child> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        registry.spawn_tracked_child(&mut command, reclaim_root, Some(root), Some(kind))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        type SpawnJob = Box<dyn FnOnce() + Send>;
+        static SPAWNER: std::sync::OnceLock<io::Result<std::sync::mpsc::Sender<SpawnJob>>> =
+            std::sync::OnceLock::new();
+        let spawner = SPAWNER
+            .get_or_init(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<SpawnJob>();
+                thread::Builder::new()
+                    .name("aft-lsp-spawn".into())
+                    .spawn(move || {
+                        for spawn in rx {
+                            spawn();
+                        }
+                    })?;
+                // This static sender is never dropped, retaining the spawning
+                // thread until process exit, independently of any LSP manager.
+                Ok(tx)
+            })
+            .as_ref()
+            .map_err(|err| io::Error::other(format!("cannot start LSP spawn thread: {err}")))?;
+        let registry = registry.clone();
+        let reclaim_root = reclaim_root.map(Path::to_path_buf);
+        let root = root.to_path_buf();
+        let kind = kind.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        spawner
+            .send(Box::new(move || {
+                let result = registry.spawn_tracked_child(
+                    &mut command,
+                    reclaim_root.as_deref(),
+                    Some(&root),
+                    Some(&kind),
+                );
+                let _ = tx.send(result);
+            }))
+            .map_err(|_| io::Error::other("LSP spawn thread stopped"))?;
+        rx.recv()
+            .map_err(|_| io::Error::other("LSP spawn thread dropped its result"))?
+    }
+}
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
@@ -474,11 +529,11 @@ impl LspClient {
             command.pre_exec(|| {
                 #[cfg(target_os = "linux")]
                 {
-                    // If aft is killed with SIGKILL, Rust cleanup and our
-                    // signal-handler thread never run. Ask the kernel to kill
-                    // the LSP process group as soon as the parent dies. This is
-                    // best-effort Linux coverage for the otherwise unhandleable
-                    // parent-death path.
+                    // SIGKILL bypasses Rust cleanup. Linux ties this signal to
+                    // the spawning thread, so spawn_lsp_child uses a process-
+                    // lifetime thread rather than the short-lived caller. The
+                    // kernel kills the direct child when that thread dies;
+                    // normal shutdown separately kills the whole process group.
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -501,8 +556,7 @@ impl LspClient {
                 .join(" "),
             COMMAND_DISPLAY_BYTES,
         );
-        let mut child = child_registry
-            .spawn_tracked_child(&mut command, reclaim_root, Some(&root), Some(&kind))
+        let mut child = spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind)
             .map_err(|err| {
                 // A spawn error from the OS names neither the program nor the
                 // directory; both are what a reader needs to fix it.
