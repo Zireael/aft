@@ -4424,6 +4424,96 @@ fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
 }
 
 #[test]
+fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
+    // A fresh worktree of a JavaScript project: package.json but no
+    // node_modules, so the TypeScript server binary cannot be resolved.
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "web/package.json", "{\"name\":\"rollup-web\"}\n");
+    // Keep package.json itself out of the scoped candidates: it is a JSON
+    // file with a producer of its own and would add a second cause.
+    write_file(&root, ".aftignore", "package.json\n");
+    for index in 0..7 {
+        write_file(
+            &root,
+            &format!("web/src/file_{index}.ts"),
+            &format!("export const value{index} = {index};\n"),
+        );
+    }
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    {
+        let mut lsp = ctx.lsp();
+        lsp.override_binary(
+            ServerKind::TypeScript,
+            PathBuf::from("/definitely/missing/typescript-language-server"),
+        );
+        // Keep the other JavaScript-family servers out of the picture so the
+        // test does not depend on what is installed on this machine.
+        lsp.override_binary(
+            ServerKind::Biome,
+            PathBuf::from("/definitely/missing/biome"),
+        );
+    }
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-uncovered-rollup",
+            "command": "inspect",
+            "scope": "web",
+            "topK": 3,
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["complete"], false);
+    let text = response["text"].as_str().expect("rendered text");
+    let group_lines = text
+        .lines()
+        .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+        .collect::<Vec<_>>();
+    assert_eq!(group_lines.len(), 1, "one line per cause: {text}");
+    assert!(
+        group_lines[0].starts_with(
+            "Incomplete diagnostics: no authoritative diagnostics for 7 files (typescript in web: "
+        ),
+        "{text}"
+    );
+    assert!(
+        group_lines[0].contains(
+            "no node_modules in web: the project's dependencies are not installed; \
+             run your package manager's install"
+        ),
+        "the cause must name the install remedy: {text}"
+    );
+    let listed = text
+        .lines()
+        .filter(|line| line.starts_with("  web/src/file_") && line.ends_with(".ts"))
+        .count();
+    assert_eq!(listed, 3, "at most topK paths: {text}");
+    assert!(
+        text.contains("shown 3 of 7 items (cap) · narrow: topK, scope, sections"),
+        "{text}"
+    );
+
+    // Every file keeps its structured gap row for machine consumers.
+    let uncovered = response["gaps"]
+        .as_array()
+        .expect("gaps")
+        .iter()
+        .filter(|gap| gap["kind"] == "uncovered_file")
+        .collect::<Vec<_>>();
+    assert_eq!(uncovered.len(), 7, "{response:#}");
+    assert!(uncovered
+        .iter()
+        .all(|gap| gap["cause"]["producer"] == "typescript" && gap["cause"]["root"] == "web"));
+}
+
+#[test]
 fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     let (_temp_dir, root) = fixture_project();
     write_file(

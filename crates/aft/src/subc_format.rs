@@ -2275,11 +2275,21 @@ fn render_inspect_diagnostics(data: &Value) -> String {
 pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
     let section = summary?.get("diagnostics")?.as_object()?;
     if section.get("complete").and_then(Value::as_bool) == Some(false) {
-        let gaps = section
+        let all_gaps = section
             .get("gaps")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        // Scoped files without a report are counted, not named: a scope can
+        // hold hundreds of them, and inspect lists their causes and a bounded
+        // sample of paths on separate lines.
+        let uncovered_files = all_gaps
+            .iter()
+            .filter(|gap| gap.get("kind").and_then(Value::as_str) == Some("uncovered_file"))
+            .count();
+        let mut gaps = all_gaps
+            .iter()
+            .filter(|gap| gap.get("kind").and_then(Value::as_str) != Some("uncovered_file"))
             .map(|gap| {
                 format!(
                     "{}: {}",
@@ -2293,6 +2303,16 @@ pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<Stri
                 )
             })
             .collect::<Vec<_>>();
+        if uncovered_files > 0 {
+            let files = if uncovered_files == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            gaps.push(format!(
+                "{uncovered_files} {files} without an authoritative report"
+            ));
+        }
         let mut text = "diagnostics: unknown".to_string();
         if !gaps.is_empty() {
             text.push_str(&format!(" ({})", gaps.join("; ")));

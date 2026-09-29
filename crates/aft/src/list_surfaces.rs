@@ -258,7 +258,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "details_for, generated_details_for, test_only_details_for, topk_limiting",
+            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting",
         }],
     },
     SurfaceEntry {

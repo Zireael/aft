@@ -8,6 +8,8 @@
 //! - `payload.details.<category>_test_only`
 //! - `payload.details.<category>_generated`
 //! - `payload.details.diagnostics` (auto-emitted or selected)
+//! - `payload.details.diagnostics_uncovered_files` (auto-emitted when scoped files have no
+//!   authoritative diagnostics; the per-file rows in `gaps` stay complete)
 //!
 //! Truncation causes:
 //! - `cap`: Selecting cut, per-list `topK` limiting.

@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -10,8 +10,8 @@ use crate::config::{
 };
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-use crate::lsp::manager::{ApplicableServerFailure, NotApplicableServer};
-use crate::lsp::registry::servers_for_file;
+use crate::lsp::manager::{ApplicableServerFailure, NotApplicableServer, ServerAttemptResult};
+use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
@@ -39,6 +39,30 @@ struct CollectedDiagnostic {
 struct ScopedCoverageGap {
     file: PathBuf,
     reason: &'static str,
+    cause: CoverageCause,
+}
+
+/// Why a scoped file has no authoritative report, attributed to the producer
+/// that should have analyzed it. Inspect groups files by this value so one
+/// unavailable server over hundreds of files reads as one named cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoverageCause {
+    /// Server id (for example `typescript`); `None` when no producer applies.
+    producer: Option<String>,
+    /// The producer's workspace root; `None` when no root marker was found or
+    /// no producer applies.
+    root: Option<PathBuf>,
+    reason: String,
+}
+
+impl CoverageCause {
+    fn unattributed(reason: &str) -> Self {
+        Self {
+            producer: None,
+            root: None,
+            reason: reason.to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -49,6 +73,10 @@ struct DiagnosticsCollection {
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
     producer_failures: BTreeMap<String, String>,
+    /// `producer_failures` keyed by server instance instead of server id, so a
+    /// scoped file can be attributed to the failure of the server for its own
+    /// workspace root.
+    producer_failures_by_key: HashMap<ServerKey, String>,
     producer_notes: BTreeSet<String>,
     /// Servers with a root marker but no file to analyze, keyed by server id.
     /// Informational only: an inapplicable server is neither a failure nor a
@@ -106,7 +134,7 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|(server, reason)| (server_id(server), reason.clone()))
         .collect();
-    collection.record_producer_failures(producer_failures);
+    collection.record_producer_failures(producer_failures, &snapshot.project_root);
     collection.not_applicable = not_applicable
         .iter()
         .map(|server| (server.server_id.clone(), server.reason()))
@@ -185,6 +213,9 @@ fn collect_warm_working_set(
                 collection
                     .producer_failures
                     .insert(server_id(server), reason.to_string());
+                collection
+                    .producer_failures_by_key
+                    .insert(server.clone(), reason.to_string());
             }
             if !lsp.producer_has_settled(server) {
                 collection.servers_pending.insert(server_id(server));
@@ -328,11 +359,23 @@ fn scoped_coverage_candidates(
 }
 
 impl DiagnosticsCollection {
-    fn record_producer_failures(&mut self, failures: &[ApplicableServerFailure]) {
+    fn record_producer_failures(
+        &mut self,
+        failures: &[ApplicableServerFailure],
+        project_root: &Path,
+    ) {
         for failure in failures {
+            let mut reason = failure.reason();
+            if let Some(hint) = missing_dependency_hint(failure, project_root) {
+                reason.push_str("; ");
+                reason.push_str(&hint);
+            }
+            self.producer_failures_by_key
+                .entry(failure.server_key.clone())
+                .or_insert_with(|| reason.clone());
             self.producer_failures
                 .entry(server_id(&failure.server_key))
-                .or_insert_with(|| failure.reason());
+                .or_insert(reason);
         }
     }
 
@@ -363,8 +406,13 @@ impl DiagnosticsCollection {
         let mut tsconfig_membership = TsconfigMembershipCache::new();
         let candidates =
             scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership);
+        if candidates.is_empty() {
+            return;
+        }
+        let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
         for file in candidates {
-            let reason = match scoped_file_coverage(ctx, &snapshot.config, &file) {
+            let coverage = scoped_file_coverage(ctx, &snapshot.config, &file);
+            let reason = match coverage {
                 ScopedFileCoverage::Covered => continue,
                 ScopedFileCoverage::NoProducer => {
                     "no LSP producer is registered for this file type"
@@ -376,9 +424,95 @@ impl DiagnosticsCollection {
                     "the reporting LSP server has not reached quiescence yet"
                 }
             };
-            self.scope_coverage_gaps
-                .push(ScopedCoverageGap { file, reason });
+            let cause = if coverage == ScopedFileCoverage::NoProducer {
+                CoverageCause::unattributed(reason)
+            } else {
+                self.uncovered_file_cause(ctx, snapshot, &active, &file)
+                    .unwrap_or_else(|| CoverageCause::unattributed(reason))
+            };
+            self.scope_coverage_gaps.push(ScopedCoverageGap {
+                file,
+                reason,
+                cause,
+            });
         }
+    }
+
+    /// Attribute a file with no authoritative report to the most informative
+    /// state among the producers registered for it: a recorded failure (which
+    /// names a missing binary, missing dependencies, or a crash), then an
+    /// unfinished initial analysis, then a running server that never reported
+    /// on the file, then a server that is not running, then a missing root
+    /// marker. Ties keep registry order.
+    fn uncovered_file_cause(
+        &self,
+        ctx: &AppContext,
+        snapshot: &InspectSnapshot,
+        active: &HashSet<ServerKey>,
+        file: &Path,
+    ) -> Option<CoverageCause> {
+        let config = &snapshot.config;
+        let lsp = ctx.lsp();
+        let mut best: Option<(u8, CoverageCause)> = None;
+        for def in servers_for_file(file, config) {
+            let producer = def.kind.id_str().to_string();
+            let root = def.workspace_root_for_file_with_project_root(
+                file,
+                config
+                    .project_root
+                    .as_deref()
+                    .or(Some(snapshot.project_root.as_path())),
+            );
+            let (rank, reason) = match &root {
+                None => (
+                    4,
+                    format!(
+                        "no workspace root marker found (looked for {})",
+                        def.root_markers.join(", ")
+                    ),
+                ),
+                Some(root) => {
+                    let key = ServerKey {
+                        kind: def.kind.clone(),
+                        root: root.clone(),
+                    };
+                    if let Some(failure) = self
+                        .producer_failures_by_key
+                        .get(&key)
+                        .map(String::as_str)
+                        .or_else(|| lsp.producer_failure(&key))
+                    {
+                        (0, failure.to_string())
+                    } else if lsp.server_is_warming(&key) {
+                        (
+                            1,
+                            self.indexing_gaps.get(&producer).cloned().unwrap_or_else(|| {
+                                "still indexing: the server has not finished its initial analysis"
+                                    .to_string()
+                            }),
+                        )
+                    } else if active.contains(&key) {
+                        (2, RUNNING_WITHOUT_REPORT.to_string())
+                    } else {
+                        (
+                            3,
+                            "the server is not running for this workspace root".to_string(),
+                        )
+                    }
+                }
+            };
+            if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                best = Some((
+                    rank,
+                    CoverageCause {
+                        producer: Some(producer),
+                        root,
+                        reason,
+                    },
+                ));
+            }
+        }
+        best.map(|(_, cause)| cause)
     }
 
     #[cfg(test)]
@@ -458,6 +592,11 @@ impl DiagnosticsCollection {
                 "kind": "uncovered_file",
                 "file": display_path(snapshot, &gap.file),
                 "reason": gap.reason,
+                "cause": {
+                    "producer": gap.cause.producer,
+                    "root": gap.cause.root.as_deref().map(|root| display_root(snapshot, root)),
+                    "reason": gap.cause.reason,
+                },
             })
         }));
         for producer in self.servers_pending {
@@ -581,6 +720,81 @@ fn display_path(snapshot: &InspectSnapshot, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// A workspace root relative to the project, with `.` for the project root
+/// itself so the rendered cause never shows an empty root name.
+fn display_root(snapshot: &InspectSnapshot, root: &Path) -> String {
+    let display = display_path(snapshot, root);
+    if display.is_empty() {
+        ".".to_string()
+    } else {
+        display
+    }
+}
+
+/// Why a running server has no report for a scoped file. Inspect reads only
+/// what servers have already published and never opens files, and some
+/// servers (TypeScript among them) publish only for files that were opened,
+/// so an untouched file stays unknown even when the server works.
+const RUNNING_WITHOUT_REPORT: &str = "running, but has not published diagnostics for these files; \
+     inspect does not open files, so only files a server already analyzed (for example after an \
+     edit) are covered";
+
+/// Name uninstalled project dependencies as the reason a Node-based server's
+/// binary could not be found. The binary resolver looks in
+/// `node_modules/.bin` of the server root and of the project root, so when
+/// the workspace has a `package.json` but no `node_modules` anywhere between
+/// those two directories, installing dependencies is the likely remedy. This
+/// is what a fresh git worktree looks like before its first install.
+fn missing_dependency_hint(
+    failure: &ApplicableServerFailure,
+    project_root: &Path,
+) -> Option<String> {
+    if !matches!(
+        failure.result,
+        ServerAttemptResult::BinaryNotInstalled { .. }
+    ) {
+        return None;
+    }
+    // Only servers a JavaScript project normally installs as its own
+    // dependencies; a missing rust-analyzer or bash-language-server in a
+    // directory that also has a `package.json` is not an install problem.
+    let node_package_server = matches!(
+        failure.server_key.kind,
+        ServerKind::TypeScript
+            | ServerKind::Biome
+            | ServerKind::Oxlint
+            | ServerKind::Vue
+            | ServerKind::Astro
+            | ServerKind::Svelte
+            | ServerKind::Prisma
+    );
+    if !node_package_server {
+        return None;
+    }
+    let root = &failure.server_key.root;
+    let mut has_manifest = false;
+    for dir in root.ancestors() {
+        if dir.join("node_modules").is_dir() {
+            return None;
+        }
+        has_manifest |= dir.join("package.json").is_file();
+        if dir == project_root || !dir.starts_with(project_root) {
+            break;
+        }
+    }
+    has_manifest.then(|| {
+        let display = root
+            .strip_prefix(project_root)
+            .ok()
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .filter(|relative| !relative.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        format!(
+            "no node_modules in {display}: the project's dependencies are not installed; run your package manager's install"
+        )
+    })
+}
+
 fn server_id(key: &ServerKey) -> String {
     key.kind.id_str().to_string()
 }
@@ -591,12 +805,17 @@ mod payload_count_tests {
     use std::sync::{Arc, RwLock};
 
     use super::{
-        inspect_request_timeout, CollectedDiagnostic, DiagnosticsCollection, ScopedCoverageGap,
+        inspect_request_timeout, missing_dependency_hint, CollectedDiagnostic, CoverageCause,
+        DiagnosticsCollection, ScopedCoverageGap,
     };
     use crate::config::Config;
     use crate::inspect::job::{InspectSnapshot, JobScope};
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::lsp::manager::{ApplicableServerFailure, ServerAttemptResult};
+    use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
     use crate::parser::SymbolCache;
+    use std::path::Path;
 
     fn snapshot() -> InspectSnapshot {
         InspectSnapshot::new(
@@ -791,6 +1010,11 @@ mod payload_count_tests {
         collection.scope_coverage_gaps.push(ScopedCoverageGap {
             file: PathBuf::from("/repo/src/lib.rs"),
             reason: "no LSP producer has a current diagnostic report for this file",
+            cause: CoverageCause {
+                producer: Some("rust".into()),
+                root: Some(PathBuf::from("/repo")),
+                reason: "rust-analyzer is unavailable".into(),
+            },
         });
 
         let payload = collection.into_payload(&snapshot());
@@ -803,6 +1027,69 @@ mod payload_count_tests {
         assert_eq!(
             gap["reason"],
             "no LSP producer has a current diagnostic report for this file"
+        );
+        // The cause names the producer and its root so inspect can group
+        // files that are missing diagnostics for the same reason.
+        assert_eq!(
+            gap["cause"],
+            serde_json::json!({
+                "producer": "rust",
+                "root": ".",
+                "reason": "rust-analyzer is unavailable",
+            })
+        );
+    }
+
+    fn binary_missing(kind: ServerKind, root: &Path) -> ApplicableServerFailure {
+        ApplicableServerFailure {
+            server_key: ServerKey {
+                kind,
+                root: root.to_path_buf(),
+            },
+            result: ServerAttemptResult::BinaryNotInstalled {
+                binary: "typescript-language-server".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn missing_node_modules_names_the_install_remedy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path();
+        let web = project.join("web");
+        std::fs::create_dir_all(&web).expect("web dir");
+        std::fs::write(web.join("package.json"), "{}\n").expect("package.json");
+
+        let mut collection = DiagnosticsCollection::default();
+        collection
+            .record_producer_failures(&[binary_missing(ServerKind::TypeScript, &web)], project);
+        assert_eq!(
+            collection.producer_failures["typescript"],
+            "typescript-language-server is unavailable; no node_modules in web: the project's \
+             dependencies are not installed; run your package manager's install"
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_or_non_node_servers_get_no_install_remedy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path();
+        let web = project.join("web");
+        std::fs::create_dir_all(&web).expect("web dir");
+        std::fs::write(web.join("package.json"), "{}\n").expect("package.json");
+
+        // A Rust root that happens to hold a package.json: installing Node
+        // dependencies would not provide rust-analyzer.
+        assert_eq!(
+            missing_dependency_hint(&binary_missing(ServerKind::Rust, &web), project),
+            None
+        );
+        // Dependencies installed at the project root, which the binary
+        // resolver also searches: the binary is missing for another reason.
+        std::fs::create_dir_all(project.join("node_modules")).expect("node_modules");
+        assert_eq!(
+            missing_dependency_hint(&binary_missing(ServerKind::TypeScript, &web), project),
+            None
         );
     }
 }

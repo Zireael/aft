@@ -2004,6 +2004,9 @@ fn build_inspect_payload(
                 }));
             }
         }
+        if *category == InspectCategory::Diagnostics {
+            attach_uncovered_file_rollup(&mut category_summary, &mut details, payload, top_k);
+        }
         summary.insert(category.as_str().to_string(), category_summary);
         if dead_code_unavailable {
             // No analysis ran, so there is no findings list to show; an empty
@@ -2157,7 +2160,7 @@ fn render_inspect_text(
 
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
-    render_incomplete_categories(&mut lines, summary);
+    render_incomplete_categories(&mut lines, summary, details);
     // Uncomputed categories have no counts, so the incomplete-category notice
     // is their only output.
     let available_summary = summary
@@ -2225,7 +2228,11 @@ fn render_not_applicable_producers(lines: &mut Vec<String>, summary: &Map<String
     }
 }
 
-fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+fn render_incomplete_categories(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+) {
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
             continue;
@@ -2247,13 +2254,7 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
                 continue;
             }
             if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
-                let file = gap
-                    .get("file")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown file");
-                lines.push(format!(
-                    "Incomplete {category}: no authoritative diagnostics for {file} ({reason})"
-                ));
+                // Rendered below as one line per cause, not one line per file.
                 continue;
             }
             let producer = gap
@@ -2264,6 +2265,59 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
                 "Incomplete {category}: producer {producer} failed ({reason})"
             ));
         }
+        render_uncovered_file_groups(lines, category, value, details);
+    }
+}
+
+/// Render scoped files that no producer analyzed as one line per
+/// (producer root, producer, reason) with a file count, then at most `topK`
+/// of the affected paths. A scope over a few hundred files whose producer is
+/// unavailable would otherwise print the same reason once per file and bury
+/// the one fact the agent needs: why nothing was analyzed.
+fn render_uncovered_file_groups(
+    lines: &mut Vec<String>,
+    category: &str,
+    section: &Value,
+    details: &Map<String, Value>,
+) {
+    let Some(groups) = section
+        .get("uncovered_file_groups")
+        .and_then(Value::as_array)
+        .filter(|groups| !groups.is_empty())
+    else {
+        return;
+    };
+    for group in groups {
+        let count = group.get("files").and_then(Value::as_u64).unwrap_or(0);
+        let files = if count == 1 { "file" } else { "files" };
+        let reason = group
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        let producer = group.get("producer").and_then(Value::as_str);
+        let root = group.get("root").and_then(Value::as_str);
+        let cause = match (producer, root) {
+            (Some(producer), Some(root)) => format!("{producer} in {root}: {reason}"),
+            (Some(producer), None) => format!("{producer}: {reason}"),
+            (None, _) => reason.to_string(),
+        };
+        lines.push(format!(
+            "Incomplete {category}: no authoritative diagnostics for {count} {files} ({cause})"
+        ));
+    }
+    let list_key = format!("{category}_uncovered_files");
+    lines.push("Files without authoritative diagnostics:".to_string());
+    for file in details
+        .get(&list_key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        lines.push(format!("  {file}"));
+    }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, &list_key) {
+        lines.push(trailer);
     }
 }
 
@@ -3195,6 +3249,119 @@ fn diagnostics_summary_for(payload: &Value) -> Value {
         summary["not_applicable"] = not_applicable.clone();
     }
     summary
+}
+
+/// Scoped files sharing one cause for their missing diagnostics: the
+/// producer that should have analyzed them, that producer's workspace root,
+/// and why it has no report. Both `producer` and `root` are absent when no
+/// producer applies to the files at all.
+struct UncoveredFileGroup<'a> {
+    producer: Option<&'a str>,
+    root: Option<&'a str>,
+    reason: &'a str,
+    files: Vec<&'a str>,
+}
+
+/// Group `uncovered_file` gaps by (root, producer, reason). Largest group
+/// first so a cut path list shows the dominant cause; ties and files within a
+/// group are ordered by name so the output is stable.
+fn uncovered_file_groups(gaps: &[Value]) -> Vec<UncoveredFileGroup<'_>> {
+    let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();
+    for gap in gaps {
+        if gap.get("kind").and_then(Value::as_str) != Some("uncovered_file") {
+            continue;
+        }
+        let Some(file) = gap.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        // Gaps without a `cause` still group, under their generic reason.
+        let cause = gap.get("cause");
+        let producer = cause
+            .and_then(|cause| cause.get("producer"))
+            .and_then(Value::as_str);
+        let root = cause
+            .and_then(|cause| cause.get("root"))
+            .and_then(Value::as_str);
+        let reason = cause
+            .and_then(|cause| cause.get("reason"))
+            .or_else(|| gap.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        groups
+            .entry((root, producer, reason))
+            .or_default()
+            .push(file);
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|((root, producer, reason), mut files)| {
+            files.sort_unstable();
+            UncoveredFileGroup {
+                producer,
+                root,
+                reason,
+                files,
+            }
+        })
+        .collect::<Vec<_>>();
+    // The map yields groups in (root, producer, reason) order; the stable
+    // size sort keeps that order when group sizes tie.
+    groups.sort_by(|left, right| right.files.len().cmp(&left.files.len()));
+    groups
+}
+
+/// Add the per-cause rollup of uncovered files to the diagnostics summary and
+/// the first `top_k` affected paths to `details`, with a list envelope when
+/// the path list is cut. The full per-file gap rows stay in `gaps` for
+/// machine consumers; only the rendered path list is bounded.
+fn attach_uncovered_file_rollup(
+    category_summary: &mut Value,
+    details: &mut Map<String, Value>,
+    payload: &Value,
+    top_k: usize,
+) {
+    let Some(gaps) = payload.get("gaps").and_then(Value::as_array) else {
+        return;
+    };
+    let groups = uncovered_file_groups(gaps);
+    if groups.is_empty() {
+        return;
+    }
+    category_summary["uncovered_file_groups"] = Value::Array(
+        groups
+            .iter()
+            .map(|group| {
+                serde_json::json!({
+                    "producer": group.producer,
+                    "root": group.root,
+                    "reason": group.reason,
+                    "files": group.files.len(),
+                })
+            })
+            .collect(),
+    );
+    let (listed, total) = uncovered_files_details_for(&groups, top_k);
+    let shown = listed.len();
+    let key = format!("{}_uncovered_files", InspectCategory::Diagnostics.as_str());
+    details.insert(
+        key.clone(),
+        Value::Array(listed.into_iter().map(Value::from).collect()),
+    );
+    crate::list_surfaces::inspect::attach_inspect_envelope(details, &key, shown, total);
+}
+
+/// The first `top_k` uncovered paths in group order, and the total count.
+fn uncovered_files_details_for<'a>(
+    groups: &[UncoveredFileGroup<'a>],
+    top_k: usize,
+) -> (Vec<&'a str>, usize) {
+    let total = groups.iter().map(|group| group.files.len()).sum();
+    let listed = groups
+        .iter()
+        .flat_map(|group| group.files.iter().copied())
+        .take(top_k)
+        .collect();
+    (listed, total)
 }
 
 fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Value {
@@ -4277,6 +4444,178 @@ mod fresh_payload_tests {
         assert!(text.contains(
             "diagnostics details:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections"
         ));
+    }
+
+    /// Diagnostics payload for a scoped request where no producer analyzed any
+    /// of the scoped files: eight TypeScript files whose server binary is
+    /// missing and four Biome files the running server never reported on.
+    fn uncovered_diagnostics_payload() -> Value {
+        let missing = "typescript-language-server is unavailable; no node_modules in web: \
+                       the project's dependencies are not installed; run your package \
+                       manager's install";
+        let unreported = "running, but has not reported on these files";
+        let mut gaps = vec![serde_json::json!({
+            "kind": "failed_producer",
+            "producer": "typescript",
+            "reason": missing,
+        })];
+        for index in 0..8 {
+            gaps.push(serde_json::json!({
+                "kind": "uncovered_file",
+                "file": format!("web/src/file_{index:02}.ts"),
+                "reason": "no LSP producer has a current diagnostic report for this file",
+                "cause": { "producer": "typescript", "root": "web", "reason": missing },
+            }));
+        }
+        for index in 0..4 {
+            gaps.push(serde_json::json!({
+                "kind": "uncovered_file",
+                "file": format!("tools/lint_{index}.ts"),
+                "reason": "no LSP producer has a current diagnostic report for this file",
+                "cause": { "producer": "biome", "root": "tools", "reason": unreported },
+            }));
+        }
+        serde_json::json!({
+            "errors": null,
+            "warnings": null,
+            "info": null,
+            "hints": null,
+            "items": [],
+            "by_producer": {},
+            "complete": false,
+            "gaps": gaps,
+        })
+    }
+
+    #[test]
+    fn uncovered_diagnostic_files_roll_up_by_cause_and_list_at_most_top_k_paths() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            uncovered_diagnostics_payload(),
+        );
+        let roots = [PathBuf::from("/repo/web"), PathBuf::from("/repo/tools")];
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            Some(&roots),
+        );
+        let text = payload["text"].as_str().expect("text");
+
+        // One line per (root, producer, reason), with the file count, instead
+        // of one line per file.
+        let group_lines = text
+            .lines()
+            .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            group_lines,
+            vec![
+                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install)",
+                "Incomplete diagnostics: no authoritative diagnostics for 4 files (biome in tools: running, but has not reported on these files)",
+            ],
+            "{text}"
+        );
+        // At most topK (5 here) affected paths, largest group first, then the
+        // list trailer.
+        let listed = text
+            .lines()
+            .filter(|line| line.starts_with("  web/") || line.starts_with("  tools/"))
+            .count();
+        assert_eq!(listed, 5, "{text}");
+        assert!(
+            text.contains(
+                "  web/src/file_04.ts\nshown 5 of 12 items (cap) · narrow: topK, scope, sections"
+            ),
+            "{text}"
+        );
+        // The one-line diagnostics status stays bounded too: it counts the
+        // uncovered files instead of naming each one.
+        let status = text
+            .lines()
+            .find(|line| line.starts_with("diagnostics: unknown"))
+            .expect("diagnostics status line");
+        assert!(!status.contains("file_0"), "{status}");
+        assert!(
+            status.contains("12 files without an authoritative report"),
+            "{status}"
+        );
+
+        // The payload keeps every structured gap row; the path list in
+        // `details` is the bounded one, with its truncation envelope.
+        let uncovered = payload["gaps"]
+            .as_array()
+            .expect("gaps")
+            .iter()
+            .filter(|gap| gap["kind"] == "uncovered_file")
+            .count();
+        assert_eq!(uncovered, 12);
+        assert_eq!(payload["complete"], false);
+        assert_eq!(payload["summary"]["diagnostics"]["complete"], false);
+        assert_eq!(
+            payload["details"]["diagnostics_uncovered_files"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            payload["details"]["diagnostics_uncovered_files_list_envelope"]["total"]["value"],
+            12
+        );
+        assert_eq!(
+            payload["summary"]["diagnostics"]["uncovered_file_groups"],
+            serde_json::json!([
+                {
+                    "producer": "typescript",
+                    "root": "web",
+                    "reason": "typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install",
+                    "files": 8,
+                },
+                {
+                    "producer": "biome",
+                    "root": "tools",
+                    "reason": "running, but has not reported on these files",
+                    "files": 4,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn uncovered_diagnostic_files_within_top_k_render_without_a_trailer() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            uncovered_diagnostics_payload(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            20,
+            &ctx,
+            None,
+        );
+        let text = payload["text"].as_str().expect("text");
+        assert!(!text.contains("(cap)"), "{text}");
+        assert!(
+            text.ends_with("  tools/lint_3.ts") || text.contains("  tools/lint_3.ts\n"),
+            "{text}"
+        );
+        assert!(payload["details"]
+            .get("diagnostics_uncovered_files_list_envelope")
+            .is_none());
     }
 
     #[test]
