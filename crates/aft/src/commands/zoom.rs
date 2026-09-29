@@ -72,6 +72,8 @@ pub struct ZoomResponse {
 }
 
 fn zoom_line_starts(source: &str) -> Vec<usize> {
+    #[cfg(test)]
+    ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(count.get() + source.len()));
     let mut starts = vec![0];
     for (index, byte) in source.bytes().enumerate() {
         if byte == b'\n' && index + 1 < source.len() {
@@ -96,6 +98,8 @@ fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) ->
         .strip_suffix("\r\n")
         .or_else(|| segment.strip_suffix('\n'))
         .unwrap_or(segment);
+    #[cfg(test)]
+    ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(count.get() + text.len()));
     start + (col as usize).min(text.len())
 }
 
@@ -103,6 +107,7 @@ fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) ->
 thread_local! {
     static ZOOM_BODY_JOIN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_INDEXED_OFFSET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_COORD_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1149,6 +1154,8 @@ fn zoom_one_symbol(
                 sym.range.end_col,
             );
             for call in &matching_calls {
+                #[cfg(test)]
+                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
                 if call.start_byte >= sym_byte_start && call.end_byte <= sym_byte_end {
                     called_by.push(CallRef {
                         name: sym.name.clone(),
@@ -2612,6 +2619,7 @@ function helper(value: number): number {
     #[test]
     fn indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file() {
         let source = format!("{}last é\r\n", "line\n".repeat(20_000));
+        ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(0));
         let starts = zoom_line_starts(&source);
         let mut old_prefix_bytes = 0;
         for _ in 0..80 {
@@ -2626,7 +2634,7 @@ function helper(value: number): number {
                 line_col_to_byte(&source, 20_000, 5)
             );
         }
-        let indexed_bytes = source.len();
+        let indexed_bytes = ZOOM_COORD_BYTES_SCANNED.with(|count| count.get());
         assert!(old_prefix_bytes > indexed_bytes * 70);
         eprintln!("coordinate prefix bytes: baseline {old_prefix_bytes}, indexed {indexed_bytes}");
     }
@@ -2651,6 +2659,7 @@ function helper(value: number): number {
         ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
         ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
         let mut enrichments = HashMap::new();
+        let mut shared_responses = Vec::new();
         for name in &names {
             let shared = zoom_one_symbol(
                 &req,
@@ -2664,6 +2673,21 @@ function helper(value: number): number {
                 true,
                 &mut enrichments,
             );
+            shared_responses.push(serde_json::to_value(shared).unwrap());
+        }
+        assert_eq!(enrichments.len(), 1);
+        assert_eq!(ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()), 1);
+        let actual_comparisons = ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get());
+        let enriched = &enrichments[&path];
+        let baseline_comparisons = enriched.symbols.len() * enriched.calls.len() * names.len();
+        assert!(baseline_comparisons > actual_comparisons * 20);
+        eprintln!("zoom incoming call comparisons: baseline {baseline_comparisons}, indexed {actual_comparisons}");
+        eprintln!(
+            "batch parses/extractions: baseline {}, shared {}",
+            names.len(),
+            enrichments.len()
+        );
+        for (name, shared) in names.iter().zip(shared_responses) {
             let standalone = zoom_one_symbol(
                 &req,
                 &ctx,
@@ -2676,36 +2700,13 @@ function helper(value: number): number {
                 true,
                 &mut HashMap::new(),
             );
-            assert_eq!(
-                serde_json::to_value(shared).unwrap(),
-                serde_json::to_value(standalone).unwrap()
-            );
+            assert_eq!(shared, serde_json::to_value(standalone).unwrap());
         }
-        assert_eq!(enrichments.len(), 1);
         assert_eq!(
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()),
             names.len() + 1
         );
         assert!(ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.get()) > names.len());
-        let enriched = &enrichments[&path];
-        let baseline_comparisons = enriched.symbols.len() * enriched.calls.len();
-        let target_calls = enriched
-            .calls
-            .iter()
-            .filter(|call| call.name == "f1")
-            .count();
-        let indexed_comparisons = enriched.calls.len() + enriched.symbols.len() * target_calls;
-        assert!(baseline_comparisons > indexed_comparisons * 20);
-        assert!(
-            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get())
-                <= enriched.calls.len() * names.len() * 2
-        );
-        eprintln!("zoom incoming call comparisons: baseline {baseline_comparisons}, indexed {indexed_comparisons}");
-        eprintln!(
-            "batch parses/extractions: baseline {}, shared {}",
-            names.len(),
-            enrichments.len()
-        );
     }
 
     #[test]

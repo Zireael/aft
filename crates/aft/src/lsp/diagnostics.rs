@@ -113,6 +113,7 @@ pub struct DiagnosticsStore {
 #[cfg(test)]
 thread_local! {
     static SKIP_DIAGNOSTIC_INDEX_ASSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LRU_KEY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl DiagnosticsStore {
@@ -327,6 +328,8 @@ impl DiagnosticsStore {
             .insert(key.clone(), Instant::now());
 
         if self.entries.contains_key(&key) {
+            #[cfg(test)]
+            LRU_KEY_PROBES.with(|probes| probes.set(probes.get() + 1));
             if let Some(position) = self.order_positions.remove(&key) {
                 self.order.remove(&position);
             }
@@ -1231,27 +1234,29 @@ mod tests {
         for i in 0..5_000 {
             store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
         }
-        for i in 0..5_000 {
+        super::LRU_KEY_PROBES.with(|probes| probes.set(0));
+        for i in (0..5_000).rev() {
             store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
         }
+        assert_eq!(super::LRU_KEY_PROBES.with(|probes| probes.get()), 5_000);
         assert_eq!(store.order.len(), 5_000);
         assert_eq!(store.order_positions.len(), 5_000);
         let mut vector_order = (0..5_000).collect::<Vec<_>>();
         let mut baseline_shifts = 0;
-        for i in 0..5_000 {
+        for i in (0..5_000).rev() {
             let index = vector_order.iter().position(|entry| *entry == i).unwrap();
             baseline_shifts += vector_order.len() - index - 1;
             let touched = vector_order.remove(index);
             vector_order.push(touched);
         }
         let indexed_shifts = 0usize;
-        assert_eq!(baseline_shifts, 4_999 * 5_000);
+        assert_eq!(baseline_shifts, 4_999 * 5_000 / 2);
         eprintln!("LRU shifted elements: baseline {baseline_shifts}, indexed {indexed_shifts}");
         assert!(baseline_shifts > indexed_shifts);
         store.set_capacity(1);
         super::SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.set(false));
         store.debug_assert_index_consistent();
-        assert!(store.has_report_for_server_file(&server, Path::new("/4999.rs")));
+        assert!(store.has_report_for_server_file(&server, Path::new("/0.rs")));
         assert_eq!(store.len(), 1);
     }
 

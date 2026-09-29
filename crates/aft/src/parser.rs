@@ -7659,8 +7659,20 @@ fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
         .map(|tag| node_text(source, &tag).trim().to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static HEADING_COLUMN_LINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn source_line_end_cols(source: &str) -> Vec<u32> {
-    source.lines().map(|line| line.len() as u32).collect()
+    source
+        .lines()
+        .map(|line| {
+            #[cfg(test)]
+            HEADING_COLUMN_LINE_VISITS.with(|visits| visits.set(visits.get() + 1));
+            line.len() as u32
+        })
+        .collect()
 }
 
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
@@ -10651,6 +10663,7 @@ fn body_macros_are_not_items() {
             .map(|i| format!("# Heading {i}\r\nbody é {i}\r"))
             .collect::<Vec<_>>()
             .join("\n");
+        HEADING_COLUMN_LINE_VISITS.with(|visits| visits.set(0));
         let cols = source_line_end_cols(&source);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("headings.md");
@@ -10658,11 +10671,20 @@ fn body_macros_are_not_items() {
         let mut parser = FileParser::new();
         let headings = parser.extract_symbols(&path).unwrap();
         assert_eq!(headings.len(), 5_000);
-        for heading in &headings {
+        for (i, heading) in headings.iter().enumerate() {
             let line = heading.range.end_line as usize;
+            let expected_start = i * 2;
+            let expected_end = if i + 1 == headings.len() {
+                source.lines().count() - 1
+            } else {
+                expected_start + 1
+            };
+            assert_eq!(heading.range.start_line as usize, expected_start);
+            assert_eq!(line, expected_end);
+            assert_eq!(heading.range.start_col, 0);
             assert_eq!(
                 heading.range.end_col,
-                source.lines().nth(line).unwrap_or("").len() as u32
+                source.lines().nth(expected_end).unwrap().len() as u32
             );
         }
         assert_eq!(cols.len(), source.lines().count());
@@ -10672,7 +10694,8 @@ fn body_macros_are_not_items() {
         let old_line_visits: usize = (0..5_000)
             .map(|i| source.lines().take(i * 2 + 2).count())
             .sum();
-        let indexed_visits = cols.len();
+        let indexed_visits = HEADING_COLUMN_LINE_VISITS.with(|visits| visits.get());
+        assert_eq!(indexed_visits, cols.len() * 2);
         assert!(old_line_visits > indexed_visits * 1_000);
         eprintln!("heading line visits: baseline {old_line_visits}, indexed {indexed_visits}");
     }
