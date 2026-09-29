@@ -379,11 +379,12 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             // timeout diagnostics still render before the final canonical trailer.
             foreground_snapshot.output_truncated = false;
             let mut output = format_foreground_result(&foreground_snapshot);
-            let envelope = crate::list_surfaces::bash::append_envelope_trailer(
-                &mut output,
-                envelope.total.value(),
-            );
-            (output, envelope)
+            // Formatting may add exit diagnostics, which are not command output lines.
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&trailer);
+            (output, Some(envelope.clone()))
         } else {
             (format_foreground_result(&snapshot), None)
         };

@@ -115,7 +115,7 @@ fn test_compressor_seam_returns_input_line_count_and_counts_only() {
 }
 
 #[test]
-fn test_4000_in_61_out_fixture() {
+fn test_4000_input_lines_count_only_sixty_output_lines() {
     let fixture_dir = fixtures_dir().join("capped_4000_in_61_out");
     let input_path = fixture_dir.join("input.txt");
     let reply_path = fixture_dir.join("reply.json");
@@ -145,15 +145,15 @@ fn test_4000_in_61_out_fixture() {
         .expect("output must be a string");
     let shown = count_output_lines(output_str);
 
-    // shown = 61, total = Exact(4000)
-    assert_eq!(shown, 61);
+    // shown = 60, total = Exact(4000)
+    assert_eq!(shown, 60);
     assert_eq!(input_line_count, 4000);
 
     // Built from agent-facing output text
     let envelope = build_envelope_from_output(output_str, input_line_count)
         .expect("envelope must be constructed for capped output");
 
-    assert_eq!(envelope.shown, 61);
+    assert_eq!(envelope.shown, 60);
     assert_eq!(envelope.total, Total::Exact(4000));
     assert_eq!(envelope.unit, Unit::Lines);
     assert_eq!(envelope.reason, Some(Reason::Cap));
@@ -162,16 +162,16 @@ fn test_4000_in_61_out_fixture() {
 
     // Rendered trailer grammar check
     let rendered_trailer = render_trailer(&envelope).expect("render trailer");
-    assert_eq!(rendered_trailer, "shown 61 of 4000 lines (cap)");
+    assert_eq!(rendered_trailer, "shown 60 of 4000 lines (cap)");
     assert!(
         !rendered_trailer.contains("narrow:"),
         "bash trailer must have no narrow clause"
     );
 
     // Output text contains the trailer
-    assert!(output_str.contains("shown 61 of 4000 lines (cap)"));
+    assert!(output_str.contains("shown 60 of 4000 lines (cap)"));
     assert_eq!(
-        output_str.matches("shown 61 of 4000 lines (cap)").count(),
+        output_str.matches("shown 60 of 4000 lines (cap)").count(),
         1
     );
 
@@ -199,17 +199,17 @@ fn test_mutation_sourcing_either_count_from_dropped_by_class_reds() {
     assert_eq!(dropped_by_class_sum, 0);
 
     // Expected values on fixture:
-    let expected_shown = 61;
+    let expected_shown = 60;
     let expected_total = 4000;
 
-    // Mutation 1: Sourcing shown from dropped_by_class produces 0 != 61
+    // Mutation 1: Sourcing shown from dropped_by_class produces 0 != 60
     let mutated_shown = dropped_by_class_sum;
     assert_ne!(
         mutated_shown, expected_shown,
         "mutation sourcing shown from dropped_by_class must red"
     );
 
-    // Mutation 2: Sourcing total from shown + dropped_by_class produces 61 != 4000
+    // Mutation 2: Sourcing total from shown + dropped_by_class produces 60 != 4000
     let mutated_total = expected_shown + dropped_by_class_sum;
     assert_ne!(
         mutated_total, expected_total,
@@ -264,13 +264,13 @@ fn test_subc_and_ndjson_transport_parity_on_fixture() {
     // Trailer is never rendered twice
     assert_eq!(
         subc_formatted
-            .matches("shown 61 of 4000 lines (cap)")
+            .matches("shown 60 of 4000 lines (cap)")
             .count(),
         1
     );
     assert_eq!(
         ndjson_formatted
-            .matches("shown 61 of 4000 lines (cap)")
+            .matches("shown 60 of 4000 lines (cap)")
             .count(),
         1
     );
@@ -401,14 +401,14 @@ fn test_envelope_wire_schema_and_grammar() {
 }
 
 #[test]
-fn test_append_envelope_trailer_counts_the_agent_facing_trailer_line() {
+fn test_append_envelope_trailer_excludes_metadata() {
     let mut output = "first\nsecond\n".to_string();
     let envelope = append_envelope_trailer(&mut output, 10).expect("lines were dropped");
 
-    assert_eq!(envelope.shown, 3);
+    assert_eq!(envelope.shown, 2);
     assert_eq!(envelope.total, Total::Exact(10));
-    assert_eq!(output.lines().count(), envelope.shown);
-    assert!(output.ends_with("shown 3 of 10 lines (cap)"));
+    assert_eq!(output.lines().count(), envelope.shown + 1);
+    assert!(output.ends_with("shown 2 of 10 lines (cap)"));
 
     let mut unchanged = "first\nsecond\n".to_string();
     assert_eq!(append_envelope_trailer(&mut unchanged, 2), None);
@@ -479,7 +479,7 @@ fn assert_real_bash_envelope(value: &Value, output_key: &str, total: usize) {
             .into(),
     )
     .expect("deserialize bash output envelope");
-    assert_eq!(envelope.shown, output.lines().count());
+    assert_eq!(envelope.shown, count_output_lines(output));
     assert_eq!(envelope.total, Total::Exact(total));
     let trailer = render_trailer(&envelope).expect("cap envelope trailer");
     assert!(
@@ -721,5 +721,44 @@ fn real_live_status_stays_raw_without_an_envelope() {
         .to_string(),
     );
     assert_eq!(killed["success"], true, "kill failed: {killed:?}");
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn numbered_output_counts_exclude_recovery_metadata() {
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().unwrap();
+    configure_real_bash(&mut aft, project.path());
+    for (n, width) in [(53, 320), (102, 160), (195, 80)] {
+        let command = format!(
+            "seq 1 {n} | awk 'BEGIN{{p={width}}}{{ printf \"%0\" p \"d %s\\n\", $0, $0 }}'"
+        );
+        let launch = aft.send(
+            &serde_json::json!({
+                "id": format!("numbered-{n}"), "command": "bash",
+                "params": { "command": command, "background": true }
+            })
+            .to_string(),
+        );
+        let task = launch["task_id"].as_str().unwrap();
+        wait_for_real_completion(&mut aft, task);
+        let response = aft.send(
+            &serde_json::json!({
+                "id": format!("status-{n}"), "command": "bash_status",
+                "params": { "task_id": task }
+            })
+            .to_string(),
+        );
+        let output = response["output_preview"].as_str().unwrap();
+        let numbered = output.lines().filter(|line| line.starts_with('0')).count();
+        assert_eq!(numbered, n - 2, "{response}");
+        assert_eq!(response[WIRE_KEY]["shown"], numbered, "{response}");
+        assert!(output.ends_with(&format!("shown {numbered} of {n} lines (cap)")));
+        assert_eq!(
+            build_envelope_from_output(output, n).unwrap().shown,
+            numbered
+        );
+    }
     assert!(aft.shutdown().success());
 }
