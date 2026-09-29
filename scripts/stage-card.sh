@@ -8,6 +8,21 @@
 # the SIGNED bytes, and the card's name carries the same hash so a stale
 # sidecar can never be matched to a fresh card by a glob readback.
 #
+# On macOS the card is signed here, once, with the pinned identifier ck-aft,
+# hardened runtime and scripts/ck-aft.entitlements.plist (only
+# com.apple.security.cs.disable-library-validation; never get-task-allow).
+# The signature is read back from the card and the card is refused unless it
+# matches, and the signed card must actually load ONNX Runtime (the code path
+# the exception exists for) before it is staged. --skip-build cards cut from
+# a release download go through the same signing and checks.
+#
+# Placement never re-signs: re-signing would drop hardened runtime or the
+# entitlement unless repeated exactly, and would change the bytes the sidecar
+# vouches for. Manual placement is a plain copy of the staged card, then a
+# check of the file actually placed:
+#   rm -f "$DEPLOY" && cp "$STAGING/$CARD" "$DEPLOY"
+#   scripts/verify-placed-card.sh "$DEPLOY"
+#
 # Usage: scripts/stage-card.sh [--skip-build] [discriminator ...]
 #   discriminator  a string that must be present in the new card and
 #                  absent from the running daemon image; each one is
@@ -17,6 +32,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=lib/ck-aft-signature.sh
+source "$REPO_ROOT/scripts/lib/ck-aft-signature.sh"
 
 STAGING="${CK_STAGING_DIR:-$HOME/.local/share/cortexkit/staging}"
 DEPLOY="${CK_DEPLOY_PATH:-$HOME/.local/share/cortexkit/bin/ck-aft}"
@@ -84,8 +101,17 @@ chmod 755 "$TMP"
 if [ "$(uname -s)" = "Darwin" ]; then
   # The identifier is pinned to the deploy name so macOS grants keyed on it
   # survive across cards; the default identifier derives from content.
-  codesign --force --sign - --identifier ck-aft "$TMP"
-  codesign --verify --strict "$TMP"
+  echo "==> signing ($CK_AFT_IDENTIFIER, hardened runtime, $(basename "$CK_AFT_ENTITLEMENTS"))"
+  ck_aft_sign "$TMP"
+  if ! ck_aft_check_signature "$TMP" stage-card; then
+    rm -f "$TMP"
+    exit 2
+  fi
+  echo "==> smoke: ONNX Runtime load under the signed card"
+  if ! ck_aft_smoke_onnx "$TMP" stage-card; then
+    rm -f "$TMP"
+    exit 2
+  fi
 
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"

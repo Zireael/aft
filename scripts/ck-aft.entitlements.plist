@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the supervised AFT module (ck-aft), signed with hardened
+  runtime by scripts/stage-card.sh.
+
+  Hardened runtime without get-task-allow is what stops another process of the
+  same user from attaching a debugger and reading the module's launch secret.
+  Never add com.apple.security.get-task-allow here.
+
+  disable-library-validation is the one exception: AFT loads ONNX Runtime at
+  run time from a downloaded, Team-ID-less library, which library validation
+  refuses. AFT compensates by checking the library's sha256 against a pinned
+  list before loading it (crates/aft/src/ort_pin.rs).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
