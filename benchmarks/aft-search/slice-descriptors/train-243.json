@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "split-query-benchmark-rows"
+  ],
+  "note": "Adds 12 split-query (query + pattern) gate rows across seven kinds, a separate tuning-only set, a paired prose-only harm check, and a pattern-capability probe, with the reference re-recorded on the unchanged engine (all 56 existing rows byte-identical). The engine change that uses pattern lands in a later ranking train. No ranking-fence files."
+}
