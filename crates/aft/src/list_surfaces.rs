@@ -407,6 +407,24 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::trace_to_symbol::handle_trace_to_symbol",
         reason: "trace_to_symbol reply is a single shortest path (path: Option<Vec<...>>) with no list semantics, so it carries no truncation envelope",
     },
+    ExclusionEntry {
+        file: "commands/configure.rs",
+        enclosing_item: "schedule_artifact_loads",
+        location_or_primitive: "commands::configure::schedule_artifact_loads warm_permit.take()",
+        reason: "Option::take releasing a warm-reload permit before a cold-build acquire; no list is cut",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/lexical_lane.rs",
+        enclosing_item: "reference_selected_pool",
+        location_or_primitive: "commands::semantic_search::lexical_lane::reference_selected_pool",
+        reason: "test-only reference implementation choosing the three rarest trigram postings to compare against the optimized pool; not an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "commands/zoom.rs",
+        enclosing_item: "indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file",
+        location_or_primitive: "commands::zoom indexed offset work-count test",
+        reason: "test fixture selecting sample offsets for a work-count assertion; not an agent-visible list",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.
