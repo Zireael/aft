@@ -4292,6 +4292,28 @@ fn log_borrowed_reconcile(root: &Path, summary: &crate::search_index::BorrowedRe
     );
 }
 
+// Fleet restarts can reopen dozens of owner caches at once. Four warm loads
+// bound disk parsing and verification without sharing slots with cold builds.
+const WARM_SEARCH_RELOAD_LIMIT: usize = 4;
+static WARM_SEARCH_RELOAD_LIMITER: std::sync::LazyLock<
+    Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+> = std::sync::LazyLock::new(|| {
+    crate::cold_build_limiter::isolated_limiter(WARM_SEARCH_RELOAD_LIMIT)
+});
+
+#[cfg(test)]
+thread_local! {
+    static WARM_SEARCH_RELOAD_LIMITER_FOR_TEST: std::cell::RefCell<Option<Arc<crate::cold_build_limiter::ColdBuildLimiter>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn warm_search_reload_limiter() -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
+    #[cfg(test)]
+    if let Some(limiter) = WARM_SEARCH_RELOAD_LIMITER_FOR_TEST.with(|slot| slot.borrow().clone()) {
+        return limiter;
+    }
+    Arc::clone(&WARM_SEARCH_RELOAD_LIMITER)
+}
+
 fn schedule_artifact_loads(
     ctx: &AppContext,
     load_search: bool,
@@ -4352,6 +4374,7 @@ fn schedule_artifact_loads(
             !ctx.shared_artifacts_read_only() || ctx.ram_overlay_active();
         let session_id_for_bg = log_ctx::current_session();
         let search_cold_build_limiter = ctx.cold_build_limiter();
+        let search_warm_reload_limiter = warm_search_reload_limiter();
         let search_generation = configure_generation;
         let search_generation_flag = ctx.configure_generation_flag();
         let search_content_generation = configure_content_generation;
@@ -4485,6 +4508,20 @@ fn schedule_artifact_loads(
                 if search_persist_epoch_flag.current() != search_persist_epoch {
                     return;
                 }
+                let Some(warm_permit) =
+                    crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                        &search_warm_reload_limiter,
+                        "warm search reload",
+                        &root_for_search,
+                        || {
+                            search_lifecycle
+                                .is_current(search_generation_flag.as_ref(), search_generation)
+                        },
+                    )
+                else {
+                    return;
+                };
+                let mut warm_permit = Some(warm_permit);
                 // HEAD freshness is deliberately probed after the bind ack. The
                 // helper bounds git so a wedged repository cannot pin maintenance.
                 let current_head = current_git_head(&root_for_search);
@@ -4538,6 +4575,7 @@ fn schedule_artifact_loads(
                         index
                     }
                     mut baseline => {
+                        drop(warm_permit.take());
                         // A valid same-HEAD cache only needs warm verification.
                         // Do not queue that reopen behind unrelated cold builds;
                         // absent or incompatible generations still need a permit.
@@ -11828,6 +11866,56 @@ mod tests {
             &ctx, true, false
         )));
         wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn owner_warm_search_reloads_queue_when_warm_pool_is_full() {
+        let limiter = crate::cold_build_limiter::isolated_limiter(super::WARM_SEARCH_RELOAD_LIMIT);
+        let held = (0..super::WARM_SEARCH_RELOAD_LIMIT)
+            .map(|_| limiter.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let mut roots = Vec::new();
+        let mut contexts = Vec::new();
+        for _ in 0..2 {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            persist_search_index_fixture(root.path(), storage.path());
+            let ctx = test_context();
+            ctx.update_config(|config| {
+                config.project_root = Some(root.path().to_path_buf());
+                config.storage_dir = Some(storage.path().to_path_buf());
+                config.indexes.trigram = true;
+            });
+            ctx.set_canonical_cache_root(root.path().to_path_buf());
+            ctx.set_cache_role(false, None);
+            ctx.set_cache_writer_capabilities(true, true);
+            let starts = super::WARM_SEARCH_RELOAD_LIMITER_FOR_TEST.with(|slot| {
+                *slot.borrow_mut() = Some(Arc::clone(&limiter));
+                let starts = super::schedule_artifact_loads(&ctx, true, false);
+                *slot.borrow_mut() = None;
+                starts
+            });
+            assert!(super::start_artifact_loads(starts));
+            roots.push((root, storage));
+            contexts.push(ctx);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limiter.census().queued.len() != contexts.len() {
+            assert!(Instant::now() < deadline, "warm reloads did not queue");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            limiter.census().holders.len(),
+            super::WARM_SEARCH_RELOAD_LIMIT
+        );
+        for ctx in &contexts {
+            crate::runtime_drain::drain_build_completions(ctx);
+            assert!(ctx.search_index().read().unwrap().is_none());
+        }
+        drop(held);
+        for ctx in &contexts {
+            wait_for_search_index_ready(ctx, Duration::from_secs(5));
+        }
     }
 
     #[test]

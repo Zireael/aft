@@ -165,7 +165,6 @@ pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_mil
 /// begin. Cap that parse separately so per-record path containment checks cannot
 /// occupy an interactive lane for the size of an arbitrary foreign corpus.
 pub(crate) const BORROWED_INDEX_LOAD_BUDGET: Duration = Duration::from_secs(1);
-pub(crate) const BORROWED_INDEX_LOAD_MAX_RECORDS: usize = 100_000;
 const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1657,22 +1656,6 @@ impl SearchIndex {
 
     pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_from_disk_borrow_tolerant_with_budget(
-        cache_dir: &Path,
-        current_canonical_root: &Path,
-        max_records: usize,
-        duration: Duration,
-    ) -> BorrowedIndexLoad {
-        Self::read_from_disk_borrow_tolerant_cancellable(
-            cache_dir,
-            current_canonical_root,
-            max_records,
-            duration,
-            &|| true,
-        )
     }
 
     pub(crate) fn read_from_disk_borrow_tolerant_cancellable(

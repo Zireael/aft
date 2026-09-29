@@ -36,8 +36,10 @@ The excerpt does not include an owner search-ready event or a semantic Ready
 publication timestamp, so exact first-serving latency cannot be reconstructed.
 
 The owner search loader formerly acquired a cold-build permit before reading
-any disk cache. It now reopens and verifies compatible same-HEAD caches without
-that permit; absent/incompatible generations still acquire one before rebuild.
+any disk cache. It now reopens and verifies compatible same-HEAD caches in an
+independent four-slot warm pool, so a fleet restart bounds parsing and verification
+without waiting behind cold builds. Absent/incompatible generations release their
+warm slot before acquiring a cold-build permit for rebuild.
 A saturated-limiter regression test exercises the actual configure loader with
 a persisted artifact. Semantic catch-up still uses the existing limiter; this
 change does not change embedding scheduling or duplicate semantic materialization.
@@ -52,7 +54,7 @@ The previous external generation remains available during replacement.
 
 A process-wide limit admits two borrowed search parses at once. Queuing plus
 parsing is bounded by five minutes, with cancellation checkpoints in the parser.
-The background cap is one million records, distinct from the interactive
+The background cap is one million records, replacing the former interactive
 100000-record cap. This matters because `budget_stopped` also names record-cap
 refusals, not just elapsed-time stops. Coverage checks and read-only artifact
 policy are unchanged. Cache eviction/unbind drops the external flight's strong
@@ -93,3 +95,26 @@ command timed out after 30 minutes during paged real-query replay on this loaded
 machine. No byte-identical ranking comparison is claimed. Before integration,
 finish the paged real-query search-quality gate on base and candidate binaries
 and compare their ranked rows; the partial recall results do not replace it.
+
+## Follow-up regression controls
+
+The warm pool has its own four permits and is independent of cold-build slots.
+The configure-loader tests cover both admission while every cold slot is held
+and two actual warm reloads queuing behind a full warm pool. Restoring the cold
+pool on the warm path made `owner_warm_search_load_bypasses_saturated_cold_build_limiter`
+fail waiting for readiness, and made `owner_warm_search_reloads_queue_when_warm_pool_is_full`
+fail because the reloads did not queue in their own pool.
+
+The borrowed test holds its first parser open until the zero-budget caller has
+returned, then releases it and checks both Arc reuse and exactly one load start.
+Disabling flight reuse made `borrowed_search_load_outlives_interactive_budget_and_reuses_generation`
+fail with three starts instead of one. Each control ran alone and failed only
+its named test; all mutations were restored before the final suite run.
+
+Refusal coverage now passes the response through the public tool text renderer,
+not JSON serialization. It asserts literal per-lane lines, a named unavailable
+cause, semantic build percentage, loading state, and absence of `see lanes`.
+The obsolete interactive cap constant and unused test wrapper were removed.
+The task branch was rebased onto local main before these follow-ups. The operator
+assigned the remaining paged ranking comparison to CI's search-quality gate;
+no further local replay was attempted.

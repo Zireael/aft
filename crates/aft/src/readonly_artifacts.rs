@@ -41,6 +41,18 @@ pub(crate) const BORROWED_SEMANTIC_LOAD_DEGRADATION: ReadOnlyDegradation = ReadO
 const BORROWED_SEMANTIC_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
+#[derive(Default)]
+struct BorrowedSearchLoadProbe {
+    starts: std::sync::atomic::AtomicUsize,
+    held: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+static BORROWED_SEARCH_LOAD_PROBES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<BorrowedSearchLoadProbe>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
 thread_local! {
     static BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST: std::cell::Cell<Option<(usize, Duration)>> = const { std::cell::Cell::new(None) };
 }
@@ -52,7 +64,7 @@ fn borrowed_search_load_limits() -> (usize, Duration) {
         return limits;
     }
     (
-        crate::search_index::BORROWED_INDEX_LOAD_MAX_RECORDS,
+        BORROWED_SEARCH_BACKGROUND_MAX_RECORDS,
         crate::search_index::BORROWED_INDEX_LOAD_BUDGET,
     )
 }
@@ -278,6 +290,24 @@ pub(crate) fn open_search_index_cancellable(
     duration: Duration,
     keep_going: &dyn Fn() -> bool,
 ) -> ReadOnlyArtifact<SearchIndex> {
+    #[cfg(test)]
+    let probe = BORROWED_SEARCH_LOAD_PROBES
+        .lock()
+        .unwrap()
+        .get(project_root)
+        .cloned();
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        probe
+            .starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while probe.held.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     if !cache_dir.join("cache.bin").is_file() {
         return ReadOnlyArtifact::Absent;
     }
@@ -721,8 +751,23 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         build_search_artifact(&root, storage.path());
         let ctx = borrowed_context(&root, storage.path());
+        let probe = std::sync::Arc::new(BorrowedSearchLoadProbe::default());
+        probe.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        BORROWED_SEARCH_LOAD_PROBES
+            .lock()
+            .unwrap()
+            .insert(root.clone(), probe.clone());
+        let initial = with_borrowed_search_load_limits_for_test(100_000, Duration::ZERO, || {
+            ctx.open_borrowed_search_index(&root, Some(storage.path()))
+        });
+        assert!(matches!(initial, ReadOnlyArtifact::Degraded(_)));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let first = with_borrowed_search_load_limits_for_test(100_000, Duration::ZERO, || loop {
+        while probe.starts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        probe.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        let first = loop {
             match ctx.open_borrowed_search_index(&root, Some(storage.path())) {
                 ReadOnlyArtifact::Fresh(index) => break index,
                 ReadOnlyArtifact::Degraded(_) if std::time::Instant::now() < deadline => {
@@ -730,9 +775,15 @@ mod tests {
                 }
                 other => panic!("background load did not complete: {other:?}"),
             }
-        });
+        };
         let second = cached_search_index(&ctx, &root, storage.path());
+        assert_eq!(
+            probe.starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "later calls must not restart the borrowed parse"
+        );
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+        BORROWED_SEARCH_LOAD_PROBES.lock().unwrap().remove(&root);
         assert_eq!(ctx.borrowed_index_cache_len_for_test(), 1);
         assert!(ctx.evict_idle_artifacts());
         assert_eq!(ctx.borrowed_index_cache_len_for_test(), 0);

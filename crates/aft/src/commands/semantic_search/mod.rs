@@ -876,6 +876,12 @@ impl SearchLaneStatus {
                         }) if *total > 0 && lane.effective == IndexEffective::Building => {
                             format!("building {}%", done.saturating_mul(100) / total)
                         }
+                        Some(SemanticIndexStatus::Building { stage, .. })
+                            if stage == "loading_artifacts"
+                                && lane.effective == IndexEffective::Building =>
+                        {
+                            "loading".to_string()
+                        }
                         _ => state,
                     }
                 } else {
@@ -7212,12 +7218,44 @@ mod tests {
             semantic: IndexObservation::unavailable("semantic_backend_unavailable"),
         };
         let response = lanes.refusal("lane-text", &ctx).unwrap();
-        let serialized = serde_json::to_string(&response).unwrap();
-        assert!(serialized.contains("trigram: building"), "{serialized}");
+        let rendered = crate::subc_format::format_response("search", &response, false);
         assert!(
-            serialized.contains("semantic: unavailable: semantic_backend_unavailable"),
-            "{serialized}"
+            rendered.lines().any(|line| line == "trigram: building"),
+            "{rendered}"
         );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "semantic: unavailable: semantic_backend_unavailable"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("see lanes"));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+            stage: "embedding".into(),
+            files: None,
+            entries_done: Some(3),
+            entries_total: Some(10),
+        };
+        let lanes = SearchLaneStatus {
+            trigram: IndexObservation::off(),
+            semantic: IndexObservation::building(),
+        };
+        let response = lanes.refusal("progress-text", &ctx).unwrap();
+        let rendered = crate::subc_format::format_response("search", &response, false);
+        assert!(
+            rendered.contains("trigram: unavailable: disabled"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("semantic: building 30%"), "{rendered}");
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".into(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let response = lanes.refusal("loading-text", &ctx).unwrap();
+        let rendered = crate::subc_format::format_response("search", &response, false);
+        assert!(rendered.contains("semantic: loading"), "{rendered}");
     }
 
     #[test]
