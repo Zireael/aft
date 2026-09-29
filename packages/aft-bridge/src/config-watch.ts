@@ -193,7 +193,7 @@ export interface WatchAftConfigFilesOptions {
    * half-written save): it is not recorded as seen, and the files are checked
    * again shortly even if no further event arrives.
    */
-  onChange: () => boolean | void;
+  onChange: () => unknown;
   debounceMs?: number;
   /** Test seam: replaces `fs.watch`. */
   watchImpl?: typeof watch;

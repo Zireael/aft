@@ -304,7 +304,7 @@ describe("watchAftConfigFiles registration and retries", () => {
     }) as unknown as typeof import("node:fs").watch;
     const stop = watchAftConfigFiles({
       paths: [file],
-      onChange: () => {},
+      onChange: () => undefined,
       watchImpl: fakeWatch,
       beforeWatchForTest: (target) => {
         if (replaced || target !== configDir) return;
@@ -338,6 +338,8 @@ describe("watchAftConfigFiles registration and retries", () => {
       onChange: () => results[calls++] ?? true,
     });
     try {
+      // Let the watch settle; an event right after it starts can be missed.
+      await new Promise((resolve) => setTimeout(resolve, 300));
       writeFileSync(file, '{ "restrict_to_project_root": true }');
       await waitUntil(() => calls >= 2, "the rejected text was retried", 4_000);
     } finally {
