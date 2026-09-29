@@ -33,21 +33,34 @@ pub(super) fn emit(
             })?;
         decoded.insert(path.to_string(), blob);
     }
-    let resolver = Resolver {
-        files: decoded
+    let mut resolver = Resolver::new(
+        decoded
             .iter()
             .filter_map(|(file, blob)| blob.parse().map(|p| (file.clone(), p)))
             .collect(),
-    };
+    );
+    {
+        let mut query = transaction.prepare("SELECT caller_file, module_path, target_file FROM refs WHERE kind='import' AND module_path IS NOT NULL AND target_file IS NOT NULL ORDER BY caller_file, module_path, target_file")?;
+        for row in query.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (caller, module, target) = row?;
+            resolver.import_targets.insert((caller, module), target);
+        }
+    }
     // A content-derived signature invalidates all dispatch when a receiver hint,
     // hierarchy, method set or language membership changes, not merely callers.
     let inputs = resolver
         .files
         .iter()
-        .map(|(file, parse)| (file, &parse.language, &parse.dispatch))
+        .map(|(file, parse)| (file, &parse.language, &parse.dispatch, &parse.imports))
         .collect::<Vec<_>>();
     let signature = blake3::hash(
-        &serde_json::to_vec(&inputs)
+        &serde_json::to_vec(&(inputs, &resolver.import_targets))
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?,
     )
     .to_hex()

@@ -6106,6 +6106,27 @@ impl ReadonlyCallGraphStore {
         self
     }
 
+    pub fn dispatch_site_counts(
+        &self,
+    ) -> Result<Option<BTreeMap<String, crate::views::materialization::dispatch::SiteCounts>>> {
+        let connection = self
+            .inner
+            .conn
+            .lock()
+            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='view_dispatch_sites')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(Some(crate::views::materialization::dispatch::counts(
+            &connection,
+        )?))
+    }
+
     pub fn reader_kind(&self) -> &'static str {
         if self.inner.manifest_view {
             "view"

@@ -291,6 +291,7 @@ impl CallgraphBlob {
             imports,
             refs,
         };
+        dispatch::complete_members(source, lang, &mut parse)?;
         parse.dispatch = dispatch::extract(source, lang, &parse)?;
         Ok(Self::Parse(parse))
     }
@@ -1156,6 +1157,7 @@ impl JoinResult {
             root,
             facts: facts.as_ref(),
         };
+        let mut receiver_sites = BTreeSet::new();
         let mut extracts = HashMap::new();
         let mut work = Vec::new();
         let mut unbound_non_utf8_paths = Vec::new();
@@ -1176,6 +1178,12 @@ impl JoinResult {
                 unbound_non_utf8_paths.push(path.as_bytes().to_vec());
                 continue;
             };
+            receiver_sites.extend(
+                blob.dispatch
+                    .sites
+                    .iter()
+                    .map(|site| (path.as_bytes().to_vec(), site.ordinal)),
+            );
             let extract = blob.bind(rel, &paths)?;
             for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
                 let ref_key = CallerRefKey {
@@ -1223,8 +1231,14 @@ impl JoinResult {
         };
         work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
         for (key, (kind, raw)) in work {
-            let resolved = super::resolve_ref(raw, &index)
+            let mut resolved = super::resolve_ref(raw, &index)
                 .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+            if receiver_sites.contains(&(key.caller_path.clone(), key.ref_ordinal)) {
+                // Receiver sites are resolved only by the ruled hint resolver.
+                // Ordinary name binding must not invent an object-method edge.
+                resolved.target_file = None;
+                resolved.target_symbol = None;
+            }
             result.rows.insert(DerivedRow {
                 caller_blob_key: key.caller_blob_key.clone(),
                 ref_ordinal: key.ref_ordinal,
@@ -2066,6 +2080,20 @@ fn join_manifest_with_surfaces(
             continue;
         }
         caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        let receiver_ordinals = if let Some((key, _)) = caller_work.first() {
+            decode(&key.caller_blob_key)?
+                .parse()
+                .map(|p| {
+                    p.dispatch
+                        .sites
+                        .iter()
+                        .map(|s| s.ordinal)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
         let caller_data = &extracts[&caller].data;
         let basis = &bases[&caller];
         let binding = bindings
@@ -2084,27 +2112,32 @@ fn join_manifest_with_surfaces(
                     .filter(|dependency| !basis.contains(*dependency))
                     .cloned(),
             );
-            let (target_file, target_symbol) = match resolutions.entry(memo_key) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    facts.take();
-                    facts.take_config();
-                    let resolved = super::resolve_ref(raw, &surface_index)
-                        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                    // The memo table is caller-local, so one consultation union per
-                    // binding preserves caller ownership on cache hits.
-                    binding.resolution_facts.extend(&facts.take_config());
-                    caller_queries.extend(surface_index.take());
-                    binding.resolved_dependencies.extend(
-                        resolved
-                            .dependencies
-                            .into_iter()
-                            .chain(facts.take())
-                            .filter(|dependency| !basis.contains(dependency)),
-                    );
-                    entry
-                        .insert((resolved.target_file, resolved.target_symbol))
-                        .clone()
+            let (target_file, target_symbol) = if receiver_ordinals.contains(&key.ref_ordinal) {
+                (None, None)
+            } else {
+                match resolutions.entry(memo_key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        facts.take();
+                        facts.take_config();
+                        let resolved = super::resolve_ref(raw, &surface_index)
+                            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                        // The memo table is local to each caller. Extending the
+                        // binding's facts once keeps its configuration dependencies
+                        // associated with that caller even on cache hits.
+                        binding.resolution_facts.extend(&facts.take_config());
+                        caller_queries.extend(surface_index.take());
+                        binding.resolved_dependencies.extend(
+                            resolved
+                                .dependencies
+                                .into_iter()
+                                .chain(facts.take())
+                                .filter(|dependency| !basis.contains(dependency)),
+                        );
+                        entry
+                            .insert((resolved.target_file, resolved.target_symbol))
+                            .clone()
+                    }
                 }
             };
             result.rows.insert(DerivedRow {

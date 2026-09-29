@@ -8,9 +8,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
-use crate::blob_store::{
-    BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome, CALLGRAPH_PRODUCER_VERSION,
-};
+use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
 use crate::callgraph_store::join::CallgraphBlob;
 use crate::parser::detect_language;
 use crate::path_status::PathStatusStore;
@@ -269,7 +267,12 @@ pub fn prepare_checkout(
                 let (key, payload) = language
                     .as_deref()
                     .map(|language| {
-                        let key = CallgraphKey::for_current(&source, language).full_key();
+                        let key = CallgraphKey::from_bytes(
+                            &source,
+                            language,
+                            crate::views::callgraph::PRODUCER,
+                        )
+                        .full_key();
                         let key_hex = key.to_hex();
                         let callgraph_is_current = previous_entries
                             .get(&tracked.rel_path)
@@ -1146,13 +1149,13 @@ fn missing_callgraph_payload(
         return Ok(None);
     }
     let blob = if resolution_input {
-        CallgraphBlob::config(source.to_vec(), CALLGRAPH_PRODUCER_VERSION)
+        CallgraphBlob::config(source.to_vec(), crate::views::callgraph::PRODUCER)
     } else {
         CallgraphBlob::extract(
             std::str::from_utf8(source)
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
             language,
-            CALLGRAPH_PRODUCER_VERSION,
+            crate::views::callgraph::PRODUCER,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
     };
@@ -1170,7 +1173,8 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "corrupt", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
+            .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();
@@ -1191,7 +1195,8 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "reuse", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
+            .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();

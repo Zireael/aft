@@ -1518,3 +1518,7 @@ fn ensure_manifest_path(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "materialization/dispatch_proofs.rs"]
+mod dispatch_proofs;
