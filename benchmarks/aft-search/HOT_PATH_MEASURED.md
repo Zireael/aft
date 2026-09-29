@@ -66,3 +66,20 @@ Two real corpora, isolated frozen source snapshots and empty storage. Only the h
 Ratios compare the same dev profile, query plan and corpus. They are not claims about production latency: the before and after observations experienced different host load. Work-count reductions remain the primary evidence.
 
 Exact recall: **16/16 ranked rows unchanged**, sentence rank-1 and pair recall@10 both **1.0**. Concept recall: **26/26 ranked rows unchanged**, hit@1 **0.5384615385**, hit@5 **0.7692307692**, MRR@10 **0.6394230769**. Full row evidence: `hot-path-recall-parity.json`.
+
+## Authoritative search-quality gate
+
+The optimized dev binary completed the **paged 49-row real-query replay**, exact
+recall and concept recall through `scripts/telemetry/cost-gate.sh --search-quality`.
+The `engine_unwired` predicate passes: **49/49 real-query rows unchanged**, with
+`real_query_behavior:equal`, all family scores unchanged, and paging/profile
+checks true. The first predicate invocation rejected the descriptor because it
+omitted the mandatory `tool_call_parity_test.rs` fixture declaration. Correcting
+that declaration and rerunning only the failed predicate against the exact same
+score succeeded (exit 0); neither the score nor the reference was edited.
+
+- Real-query hit@1: **0.1224489796**; hit@5: **0.3673469388**;
+  MRR@10: **0.2202380952** — unchanged.
+- Score SHA-256: `a54f72b87dd0ee1d58169d7eb6a5a6d74f15ebfd76271771cdf01e59500f4670`.
+- Reference SHA-256: `d44c54fa235ba7358f728e5df8354eb628c72ee6cdf21ad59f0b9bc6fc294b7b`.
+- Gate receipt: `hot-path-quality-parity.json`.
