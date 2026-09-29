@@ -7025,44 +7025,44 @@
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "line": 1671,
+      "line": 1678,
       "column": 59,
       "token": "filePath",
       "text": "[call({ id: \"deny-call\", name: \"read\", arguments: { filePath: \"sample.txt\" } })],",
-      "location": "line 1671, column 59",
+      "location": "line 1678, column 59",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "line": 1695,
+      "line": 1702,
       "column": 63,
       "token": "filePath",
       "text": "[call({ id: \"read-ask_deny\", name: \"read\", arguments: { filePath: \"sample.txt\" } })],",
-      "location": "line 1695, column 63",
+      "location": "line 1702, column 63",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "line": 1740,
+      "line": 1747,
       "column": 59,
       "token": "filePath",
       "text": "[call({ id: \"deny-call\", name: \"read\", arguments: { filePath: \"sample.txt\" } })],",
-      "location": "line 1740, column 59",
+      "location": "line 1747, column 59",
       "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "line": 1753,
+      "line": 1760,
       "column": 67,
       "token": "filePath",
       "text": "[call({ id: \"read-ask_deny\", name: \"read\", arguments: { filePath: \"sample.txt\" } })],",
-      "location": "line 1753, column 67",
+      "location": "line 1760, column 67",
       "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -7189,6 +7189,17 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "tests/docker/opencode2/scenarios/read/read.scenario.test.ts",
+      "line": 25,
+      "column": 60,
+      "token": "filePath",
+      "text": "const directory = turn.response.calls[0].arguments.filePath as string;",
+      "location": "line 25, column 60",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "tests/docker/opencode2/scenarios/read/registration.json",
       "line": 16,
       "column": 129,
@@ -7240,6 +7251,28 @@
       "text": "{\"label\": \"call-read\", \"response\": {\"kind\": \"tool_calls\", \"calls\": [{\"id\": \"read-config-deny\", \"name\": \"read\", \"arguments\": {\"filePath\": \"sample.txt\"}, \"non_mutating_evidence\": {\"reason\": \"configuration-denied reads do not alter the fixture\"}}]}},",
       "location": "line 97, column 135",
       "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "line": 122,
+      "column": 20,
+      "token": "filePath",
+      "text": "\"filePath\": \"entries\"",
+      "location": "line 122, column 20",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "line": 172,
+      "column": 20,
+      "token": "filePath",
+      "text": "\"filePath\": \"entries\"",
+      "location": "line 172, column 20",
+      "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
