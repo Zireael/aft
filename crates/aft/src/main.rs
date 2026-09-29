@@ -1080,6 +1080,9 @@ fn dispatch_config_probe_for_test(ctx: &AppContext) {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if ctx.claim_database_runtime_retry(&req.command) {
+        ctx.retry_database_runtime();
+    }
     if let Some(response) = ctx.database_runtime_refusal(&req.id, &req.command) {
         return response;
     }

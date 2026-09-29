@@ -348,3 +348,47 @@ fn db_set_state_legacy_write_failure_does_not_fail_db_write() {
     );
     assert!(aft.shutdown().success());
 }
+
+// An exclusive rollback-journal lock prevents the deferred opener from switching to WAL.
+// Use SQLite for the lock; touching database files directly can drop POSIX locks.
+fn journal_lock(storage: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+    conn.execute_batch("CREATE TABLE lock_fixture (id INTEGER); BEGIN EXCLUSIVE;")
+        .unwrap();
+    conn
+}
+
+#[test]
+fn deferred_database_open_retries_journal_lock_until_release() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        lock.execute_batch("ROLLBACK").unwrap();
+    });
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    release.join().unwrap();
+    assert_eq!(response["success"], true, "{response}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let start = std::time::Instant::now();
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    assert_eq!(response["success"], false, "{response}");
+    assert_eq!(response["retryable"], true, "{response}");
+    assert_eq!(response["code"], "database_unavailable", "{response}");
+    assert!(start.elapsed() >= std::time::Duration::from_secs(9));
+    assert!(start.elapsed() < std::time::Duration::from_secs(15));
+    lock.execute_batch("ROLLBACK").unwrap();
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    assert_eq!(response["success"], true, "{response}");
+    assert!(aft.shutdown().success());
+}

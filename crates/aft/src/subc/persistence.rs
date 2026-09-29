@@ -49,9 +49,37 @@ impl DatabaseWaits {
             &identity.disabled_tools,
         )
         .is_some()
-            || !ctx.database_runtime_pending(name)
-            || self.pending.len() >= MAX_WAITERS
         {
+            return Err(decoded);
+        }
+        if ctx.claim_database_runtime_retry(name) {
+            let generation = ctx.configure_generation();
+            let response = executor.submit_maintenance_async(
+                identity.root.clone(),
+                crate::executor::Lane::MaintenanceCommit,
+                format!("database-retry-{generation}"),
+                Box::new(move |ctx| {
+                    // Serialize pool installation with config-changing binds, just
+                    // like the initial deferred open. A newer bind owns its retry.
+                    if ctx.configure_generation() == generation {
+                        ctx.retry_database_runtime();
+                    }
+                    crate::protocol::Response::success("database-retry", serde_json::json!({}))
+                }),
+            );
+            let retry_ctx = ctx.clone();
+            tokio::spawn(async move {
+                if !response.await.is_ok_and(|response| response.success)
+                    && retry_ctx.configure_generation() == generation
+                {
+                    retry_ctx.finish_database_runtime_error(
+                        "Database retry admission failed".into(),
+                        true,
+                    );
+                }
+            });
+        }
+        if !ctx.database_runtime_pending(name) || self.pending.len() >= MAX_WAITERS {
             return Err(decoded);
         }
         let name = name.to_string();

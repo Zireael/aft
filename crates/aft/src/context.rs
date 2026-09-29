@@ -2846,7 +2846,8 @@ pub struct AppContext {
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
-    // 0: never configured, 1: opening, 2: ready, 3: failed. Dispatch must not
+    // 0: never configured, 1: opening, 2: ready, 3: failed,
+    // 4: busy not yet reported, 5: busy reported (next call may retry). Dispatch must not
     // run persistence-dependent tools while the root's database is opening.
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
@@ -4871,6 +4872,29 @@ impl AppContext {
         self.database_runtime_changed.notify_waiters();
     }
 
+    pub(crate) fn finish_database_runtime_error(&self, error: String, busy: bool) {
+        *self.database_runtime_error.lock() = Some(error);
+        self.database_runtime_state
+            .store(if busy { 4 } else { 3 }, Ordering::Release);
+        self.database_runtime_changed.notify_waiters();
+    }
+
+    pub fn claim_database_runtime_retry(&self, command: &str) -> bool {
+        crate::persistence_gate::requires_database(command)
+            && self
+                .database_runtime_state
+                .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub fn retry_database_runtime(&self) {
+        let root = self
+            .canonical_cache_root_opt()
+            .expect("configured database root");
+        let storage = crate::bash_background::storage_dir(self.config().storage_dir.as_deref());
+        crate::commands::configure::configure_database_runtime(self, &root, &storage);
+    }
+
     pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
         crate::persistence_gate::requires_database(command)
             && self.database_runtime_state.load(Ordering::Acquire) == 1
@@ -4896,7 +4920,10 @@ impl AppContext {
     }
 
     pub(crate) fn database_runtime_failed(&self) -> bool {
-        self.database_runtime_state.load(Ordering::Acquire) == 3
+        matches!(
+            self.database_runtime_state.load(Ordering::Acquire),
+            3 | 4 | 5
+        )
     }
 
     /// Persistence-dependent commands must not silently use a JSON fallback.
@@ -4916,6 +4943,16 @@ impl AppContext {
                 "Project persistence is still initializing after route bind; retry the tool shortly. No tool operation was performed.",
                 true,
             ),
+            4 | 5 => {
+                // Report exhaustion once before permitting another bounded attempt.
+                // Otherwise the waiter that exhausted the budget would reopen again.
+                let _ = self.database_runtime_state.compare_exchange(4, 5, Ordering::AcqRel, Ordering::Acquire);
+                failure = format!(
+                    "Project persistence is busy after bounded initialization retries: {}. Retry the tool shortly; no rebind is needed. No tool operation was performed.",
+                    self.database_runtime_error.lock().as_deref().unwrap_or("database busy")
+                );
+                ("database_unavailable", failure.as_str(), true)
+            },
             3 => {
                 failure = format!(
                     "Project persistence could not be opened: {}. Read-only tools still work. Resolve the database error and rebind to retry. No tool operation was performed.",

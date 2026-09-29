@@ -12724,6 +12724,48 @@ mod tests {
         assert!(fixture.ctx.db().is_some());
     }
 
+    #[test]
+    fn busy_database_open_retries_through_wire_admission_without_rebind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let lock = rusqlite::Connection::open(fixture.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("CREATE TABLE lock_fixture (id INTEGER); BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
+        assert!(bind.blocking_recv().unwrap().success);
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+        let refusal = fixture
+            .ctx
+            .database_runtime_refusal("busy", "db_set_host_state")
+            .unwrap();
+        let refusal = serde_json::to_value(refusal).unwrap();
+        assert_eq!(refusal["code"], "database_unavailable");
+        assert_eq!(refusal["retryable"], true);
+        lock.execute_batch("ROLLBACK").unwrap();
+        let route = route_key(42, 1);
+        let routes = HashMap::from([(route, test_support::route_identity(&fixture.root, "test"))]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut waits = persistence::DatabaseWaits::default();
+            let frame = DecodedFrame {
+                frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+                    serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            };
+            assert!(waits.defer(frame, &routes, &executor).is_ok());
+            tokio::time::timeout(Duration::from_secs(12), waits.next()).await.unwrap();
+        });
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("ready", "db_set_host_state")
+            .is_none());
+        assert!(fixture.ctx.db().is_some());
+    }
+
     /// Poll a bind's diagnostics until `accept` holds or `within` passes.
     fn wait_for_bind_blockers(
         executor: &Executor,

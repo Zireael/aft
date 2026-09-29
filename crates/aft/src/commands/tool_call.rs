@@ -84,6 +84,9 @@ pub fn handle_with_dispatch(
         }
         None => None,
     };
+    if ctx.claim_database_runtime_retry(name) {
+        ctx.retry_database_runtime();
+    }
     let report_registration_downgrade = edit_slot_survives.is_some();
     let config = ctx.config();
     let project_root = config

@@ -344,6 +344,10 @@ CREATE INDEX idx_bash_pattern_watches_task
 pub enum OpenError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
+    InitializationFailed {
+        step: &'static str,
+        error: rusqlite::Error,
+    },
     DowngradeRefused {
         db_version: u32,
         supported: u32,
@@ -360,6 +364,7 @@ impl fmt::Display for OpenError {
         match self {
             OpenError::Io(error) => write!(f, "database I/O error: {error}"),
             OpenError::Sqlite(error) => write!(f, "sqlite error: {error}"),
+            OpenError::InitializationFailed { step, error } => write!(f, "sqlite {step}: {error}"),
             OpenError::DowngradeRefused {
                 db_version,
                 supported,
@@ -374,11 +379,32 @@ impl fmt::Display for OpenError {
     }
 }
 
+impl OpenError {
+    pub(crate) fn is_busy(&self) -> bool {
+        let error = match self {
+            Self::Sqlite(error)
+            | Self::InitializationFailed { error, .. }
+            | Self::MigrationFailed { error, .. } => error,
+            _ => return false,
+        };
+        matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    }
+}
+
 impl std::error::Error for OpenError {}
 
 impl From<std::io::Error> for OpenError {
     fn from(error: std::io::Error) -> Self {
         OpenError::Io(error)
+    }
+}
+
+impl From<(&'static str, rusqlite::Error)> for OpenError {
+    fn from((step, error): (&'static str, rusqlite::Error)) -> Self {
+        Self::InitializationFailed { step, error }
     }
 }
 
@@ -400,10 +426,48 @@ pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
         }
     }
 
-    let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
-    apply_pragmas(&conn)?;
-    run_migrations(&mut conn)?;
-    Ok(conn)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut backoff = Duration::from_millis(10);
+    let mut conn = loop {
+        match TrackedConnection::open(path, SqliteStore::AftDb).map_err(OpenError::from) {
+            Ok(conn) => break conn,
+            Err(error) if error.is_busy() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    backoff.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    loop {
+        // WAL journal transitions can return BUSY without calling SQLite's busy
+        // handler. Retry initialization on the owning connection, not a second
+        // descriptor; failed migration transactions have rolled back by here.
+        let result = (|| {
+            apply_pragmas_with_timeout(
+                &conn,
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(100)),
+            )?;
+            run_migrations(&mut conn)?;
+            Ok::<(), OpenError>(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.busy_timeout(Duration::from_secs(5))?;
+                return Ok(conn);
+            }
+            Err(error) if error.is_busy() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    backoff.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Open an existing AFT database without creating, migrating, or mutating it.
@@ -422,12 +486,22 @@ pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
 
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
 pub fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    // Set the wait policy before WAL can acquire its journal lock. Otherwise a
-    // concurrently opening daemon may fail immediately instead of honoring it.
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    apply_pragmas_with_timeout(conn, Duration::from_secs(5)).map_err(|(_, error)| error)
+}
+
+fn apply_pragmas_with_timeout(
+    conn: &Connection,
+    timeout: Duration,
+) -> Result<(), (&'static str, rusqlite::Error)> {
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| ("PRAGMA foreign_keys", e))?;
+    // WAL transitions may bypass this handler; open also retries explicitly.
+    conn.busy_timeout(timeout)
+        .map_err(|e| ("busy_timeout", e))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| ("PRAGMA journal_mode=WAL", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| ("PRAGMA synchronous", e))?;
     Ok(())
 }
 
@@ -652,6 +726,50 @@ mod tests {
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
     ];
+
+    #[test]
+    fn only_sqlite_contention_is_retryable() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            let error = || rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(OpenError::Sqlite(error()).is_busy());
+            assert!(OpenError::InitializationFailed {
+                step: "PRAGMA journal_mode=WAL",
+                error: error()
+            }
+            .is_busy());
+            assert!(OpenError::MigrationFailed {
+                from: 0,
+                to: 1,
+                error: error()
+            }
+            .is_busy());
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+        ] {
+            assert!(!OpenError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None
+            ))
+            .is_busy());
+        }
+        assert!(!OpenError::DowngradeRefused {
+            db_version: 99,
+            supported: 1
+        }
+        .is_busy());
+        assert!(
+            !OpenError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).is_busy()
+        );
+    }
 
     #[test]
     fn open_fresh_db_creates_all_tables() {

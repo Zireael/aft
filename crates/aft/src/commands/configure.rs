@@ -5580,7 +5580,11 @@ pub(crate) fn note_finished_load_handoff(
     crate::context::log_discarded_finished_load(plane, Some(root), Some(bytes), reason);
 }
 
-fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, storage_root: &Path) {
+pub(crate) fn configure_database_runtime(
+    ctx: &AppContext,
+    canonical_cache_root: &Path,
+    storage_root: &Path,
+) {
     wait_on_configure_tail_stage_gate_for_test(
         canonical_cache_root,
         ConfigureMaintenanceStage::DatabaseRuntime,
@@ -5619,7 +5623,10 @@ fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, sto
             ctx.app().clear_db_for_path(&db_path);
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
-            ctx.finish_database_runtime(Err(format!("{}: {err}", db_path.display())));
+            ctx.finish_database_runtime_error(
+                format!("{}: {err}", db_path.display()),
+                err.is_busy(),
+            );
             slog_warn!(
                 "failed to open aft.db at {}: {} — tools refused with database_unavailable",
                 db_path.display(),
