@@ -63,3 +63,33 @@ pub(crate) fn callgraph_paths_match(
     }
     Ok(true)
 }
+
+/// Opens only the generation protected by the reader's verified marker.
+/// No pointer, manifest or plane artifact is created or repaired on this path.
+pub fn open_foreign_generation(
+    reader: &super::registry::ReaderRegistration,
+    scope: &str,
+    producers: &super::manifest_v2::Producers,
+) -> super::Result<Option<std::sync::Arc<super::snapshot::OpenGeneration>>> {
+    let protected = reader.protect_current(scope).map_err(|error| {
+        super::ViewError::InvalidManifest(format!("foreign view {scope} unavailable: {error}"))
+    })?;
+    let Some(protected) = protected else {
+        return Ok(None);
+    };
+    let store =
+        super::ViewStore::existing_dir(protected.view_dir().to_path_buf()).ok_or_else(|| {
+            super::ViewError::InvalidManifest(format!(
+                "foreign view {scope} unavailable: pointer missing"
+            ))
+        })?;
+    let manifest = store.load_manifest_v2(protected.generation())?;
+    manifest.ensure_producers(producers)?;
+    Ok(Some(std::sync::Arc::new(
+        super::snapshot::OpenGeneration::new(
+            protected.generation().to_owned(),
+            manifest,
+            Some(super::snapshot::Residency::Protected(protected)),
+        ),
+    )))
+}

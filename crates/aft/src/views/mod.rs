@@ -737,6 +737,22 @@ impl ViewStore {
         Ok(self.view_dir.join(format!("manifest-{generation}.json")))
     }
 
+    /// Reads a foreign pointer without creating, initializing or repairing it.
+    /// Missing or malformed pointer state is an error for named-gap reporting.
+    pub fn current_generation_read_only(&self) -> Result<Option<String>> {
+        let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+            self.pointer_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "views::ViewStore::current_generation_read_only",
+        )?;
+        let generation: String = connection.query_row(
+            "SELECT generation FROM pointer WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((!generation.is_empty()).then_some(generation))
+    }
+
     pub fn current_generation(&self) -> Result<Option<String>> {
         let connection = self.open_pointer_connection()?;
         let generation: String = connection.query_row(

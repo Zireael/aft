@@ -664,11 +664,12 @@ impl ReaderRegistration {
             let Some(store) = super::ViewStore::existing_dir(member.view_dir.clone()) else {
                 return Ok(None);
             };
-            let Some(generation) = store.current_generation()? else {
+            let Some(generation) = store.current_generation_read_only()? else {
                 return Ok(None);
             };
             let marker = crate::root_cache::ReadMarker::create(&member.view_dir, &generation)?;
-            let still_current = store.current_generation()?.as_deref() == Some(generation.as_str());
+            let still_current =
+                store.current_generation_read_only()?.as_deref() == Some(generation.as_str());
             // Confirm membership under the registry's write lock: a missing-root
             // deregistration holds that lock while it checks for markers, so
             // either it saw this marker, or this check sees the member gone.
