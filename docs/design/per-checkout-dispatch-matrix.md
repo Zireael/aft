@@ -66,6 +66,28 @@ Each row below crosses **every applicable target-set column above**, including t
 | Other supported languages | receiver method call | unknown | unknown 0/1/2 only |
 | Every supported language | any receiver form not listed above | unknown | unknown 0/1/2 only; never infer opportunistically |
 
+## Concrete lookup refinements
+
+Rust concrete lookup prefers an inherent `T.m`, then a method in `impl Trait for T`, then the trait's default method body. Two or more matching trait impls without an inherent method are ambiguous and use unknown columns, never an arbitrary exact target.
+
+| Rust concrete cell | Expected edges and liveness |
+|---|---|
+| Inherent hit | exact edge to inherent `T.m`; target live |
+| Trait-impl hit | exact edge to `m` in `impl Trait for T`; target live |
+| Trait default body | exact edge to default trait `m` body; target live |
+| Ambiguous two-trait case, no inherent hit | no edges; all same-language written-name candidates live; unresolved 1 |
+
+Go promoted methods use nearest embedding depth as the inherited lookup. An outer method shadows promoted methods. Equal-depth ambiguous promotion uses unknown columns.
+
+| Go concrete cell | Expected edges and liveness |
+|---|---|
+| Direct | exact edge to outer type's method; target live |
+| Promoted through one embedding | exact edge to embedded type's method; target live |
+| Shadowed promotion | exact edge to outer method only; target live |
+| Ambiguous equal-depth promotion | no edges; all same-language written-name candidates live; unresolved 1 |
+
+These refinements do not change the interface fan-out or unknown-candidate mutation obligations.
+
 ## Unknown candidate and dynamic-access submatrix
 
 For unknown `x.m(...)`, candidates are **all** same-language project members with written source name `m`: unrelated classes, structs, impls, interfaces, traits and Go receiver types. Never filter by arity, overload, parameter type, visibility, static/instance, inheritance, file or module. Exclude free functions, other languages and builtin/library methods. Python `__m` matches written `__m` only; JS/TS getters/setters match property name; Rust inherent and trait methods both qualify.
