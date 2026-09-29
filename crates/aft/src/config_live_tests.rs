@@ -656,6 +656,9 @@ fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
         "command": "configure",
         "project_root": root,
         "harness": "opencode",
+        // An absent user file of its own, so a user config path another test
+        // registered for the process is not read here.
+        "cortexkit_user_config_path": temp.path().join("xdg/cortexkit/aft.jsonc"),
         "config": [{ "tier": "project", "source": "wire", "doc": relayed }],
     }))
     .unwrap();
