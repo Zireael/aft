@@ -228,7 +228,10 @@ jobs:
           mkdir -p "$run_root"
           current=""
           for attempt in 1 2 3 4 5 6; do
-            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs"); then
+            # A commit carries more check runs than the API's default page of
+            # 30, and a rerun job's check run is listed last, so ask for the
+            # largest page GitHub allows.
+            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs?per_page=100"); then
               current=$(jq -c \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --arg job "OpenCode 2 (Linux Docker)" \
