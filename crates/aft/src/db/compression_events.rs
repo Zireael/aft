@@ -363,9 +363,8 @@ const RETENTION_LOCK_BUDGET_MICROS: u128 = 100_000;
 // (and under 1 ms in each count/selection lock). Allow 10 ms for that contention,
 // still well below the 100 ms maximum hold for a retention transaction.
 const RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS: u128 = 10_000;
-// The mutation holds the shared connection mutex while SQLite waits for
-// another process's write lock, so that wait stays at half the 100 ms hold
-// budget and leaves the other half for the transaction itself.
+// A retention transaction keeps retrying for this long while another process
+// holds the write lock, releasing the shared connection mutex between attempts.
 const RETENTION_MUTATION_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 // The count budget above is deliberately short, so losing the mutex to a
 // request or to the write-ledger fold (started on the same tick) is routine.
@@ -696,26 +695,27 @@ fn prune_retention_once_observed(
     crate::db::bash_tasks::cap_prepared_terminal_rows(&mut prepared, BASH_TASK_STEADY_STATE_ROWS);
     let stat_micros = stat_started.elapsed().as_micros();
 
-    let mut conn = match db.try_lock() {
-        Ok(conn) => conn,
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Poisoned(_)) => {
+    let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
+    // Time only the attempt that committed: pauses between busy attempts are
+    // spent without the mutex and do not count against its hold budget.
+    let mut mutation_lock_micros = 0;
+    let mutation = match crate::db::maintenance_write(db, budget, |conn| {
+        let attempt_started = Instant::now();
+        let mutation = apply_prepared_retention_tick_timed(conn, now_ms, prepared.clone());
+        mutation_lock_micros = attempt_started.elapsed().as_micros();
+        mutation
+    }) {
+        Ok(mutation) => mutation,
+        // Another thread holds the mutex, or another process held the write
+        // lock for the whole budget: stop this sweep and let a later one retry.
+        Err(
+            crate::db::MaintenanceWriteError::MutexHeld | crate::db::MaintenanceWriteError::Busy(_),
+        ) => return Ok(None),
+        Err(crate::db::MaintenanceWriteError::Poisoned) => {
             return Err("retention database mutex poisoned".to_string())
         }
+        Err(crate::db::MaintenanceWriteError::Failed(error)) => return Err(error.to_string()),
     };
-    let mutation_started = Instant::now();
-    let mutation =
-        match crate::db::with_busy_wait(&mut *conn, RETENTION_MUTATION_BUSY_WAIT, |conn| {
-            apply_prepared_retention_tick_timed(conn, now_ms, prepared)
-        }) {
-            Ok(mutation) => mutation,
-            // Another process holds the write lock on the shared database. Treat
-            // it like a held mutex: stop this sweep and let a later one retry.
-            Err(error) if crate::db::is_busy_error(&error) => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
-    drop(conn);
-    let mutation_lock_micros = mutation_started.elapsed().as_micros();
 
     Ok(Some(RetentionPass {
         tick: mutation.tick,

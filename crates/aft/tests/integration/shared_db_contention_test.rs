@@ -18,6 +18,14 @@ use super::helpers::AftProcess;
 /// Longer than the steady busy wait, so any maintenance still using it fails.
 const HOLD: Duration = Duration::from_secs(7);
 const STATUS_BUDGET: Duration = Duration::from_secs(1);
+/// How long the child's maintenance keeps retrying a write that meets the
+/// held write lock. Set far above [`READ_BUDGET`], so a maintenance path that
+/// waits while holding the connection mutex delays reads by about this much,
+/// on fast and slow machines alike.
+const MAINTENANCE_BUSY_BUDGET_MS: &str = "2000";
+/// A read must never wait out a maintenance busy budget. Half a second leaves
+/// room for a loaded machine's scheduling and stays far below the budget above.
+const READ_BUDGET: Duration = Duration::from_millis(500);
 
 struct Contended {
     _project: tempfile::TempDir,
@@ -38,6 +46,10 @@ impl Contended {
             (
                 "AFT_TEST_MAINTENANCE_INTERVAL_MS",
                 std::ffi::OsStr::new("300"),
+            ),
+            (
+                "AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS",
+                std::ffi::OsStr::new(MAINTENANCE_BUSY_BUDGET_MS),
             ),
             (
                 "RUST_LOG",
@@ -209,10 +221,10 @@ fn status_answers_within_a_second_while_another_process_holds_the_write_lock() {
     );
 }
 
-/// Maintenance holds this process's connection mutex while SQLite waits for
-/// another process's write lock. That wait has to stay short, or every request
-/// that reads the database queues behind it, although a read in WAL mode never
-/// needs the write lock itself.
+/// Maintenance retries a write that meets another process's write lock, but
+/// it must not hold this process's connection mutex while it waits, or every
+/// request that reads the database queues behind it, although a read in WAL
+/// mode never needs the write lock itself.
 #[test]
 fn database_reads_are_not_held_behind_maintenance_waiting_on_a_foreign_write_lock() {
     let mut contended = Contended::start();
@@ -234,13 +246,10 @@ fn database_reads_are_not_held_behind_maintenance_waiting_on_a_foreign_write_loc
     contended.finish();
 
     assert!(latencies.len() >= 5, "only {} reads ran", latencies.len());
-    let slow = latencies
-        .iter()
-        .filter(|latency| **latency >= STATUS_BUDGET)
-        .collect::<Vec<_>>();
+    let slowest = latencies.iter().max().copied().unwrap_or_default();
     assert!(
-        slow.is_empty(),
-        "reads waited {STATUS_BUDGET:?} or more behind maintenance: {slow:?} of {latencies:?}"
+        slowest < READ_BUDGET,
+        "a read waited {slowest:?}, not under {READ_BUDGET:?}, behind maintenance: {latencies:?}"
     );
 }
 

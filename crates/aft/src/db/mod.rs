@@ -434,14 +434,84 @@ pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Run background work on a shared connection with a shorter busy wait.
+/// Why a [`maintenance_write`] did not run its work to completion.
+#[derive(Debug)]
+pub(crate) enum MaintenanceWriteError {
+    /// Another thread in this process held the connection mutex at the first
+    /// attempt. Losing the mutex is routine for maintenance, which runs later.
+    MutexHeld,
+    /// Another process kept the SQLite write lock for the whole wait budget.
+    Busy(rusqlite::Error),
+    /// The connection mutex was poisoned by a panic in another thread.
+    Poisoned,
+    /// The work failed for a reason other than lock contention.
+    Failed(rusqlite::Error),
+}
+
+/// Run maintenance writes on the shared connection without ever holding the
+/// process-wide connection mutex while SQLite waits for another process's
+/// write lock.
 ///
-/// Maintenance threads hold the process-wide connection mutex while SQLite
-/// waits for another process's write lock. With the steady five-second wait,
-/// one busy `aft.db` stalled every request that needed the connection, `status`
-/// included, for five seconds. A short wait makes maintenance give up and try
-/// again later instead. The steady wait is restored before the mutex is released.
-pub(crate) fn with_busy_wait<C, T>(
+/// Each attempt takes the mutex with `try_lock` and runs `work` with SQLite's
+/// busy handler switched off, so a foreign write lock fails the attempt at
+/// once instead of sleeping inside it. Between attempts the mutex is released
+/// and this thread sleeps, so requests reading the database run meanwhile.
+/// Attempts repeat until `budget` has passed on the wall clock.
+///
+/// A busy timeout alone cannot give that bound. SQLite's default busy handler
+/// counts its nominal sleeps (1, 2, 5, 10 ... ms) instead of reading the clock,
+/// so when each sleep overshoots, as on a loaded or throttled machine, a
+/// 250 ms timeout held the mutex for one to several seconds (#375).
+///
+/// `work` must be safe to repeat: a busy attempt has rolled back its
+/// transaction, and the steady busy wait is restored before every release.
+pub(crate) fn maintenance_write<T>(
+    db: &std::sync::Mutex<TrackedConnection>,
+    budget: Duration,
+    mut work: impl FnMut(&mut TrackedConnection) -> rusqlite::Result<T>,
+) -> Result<T, MaintenanceWriteError> {
+    const FIRST_RETRY_SLEEP: Duration = Duration::from_millis(2);
+    const LONGEST_RETRY_SLEEP: Duration = Duration::from_millis(25);
+
+    let deadline = std::time::Instant::now() + budget;
+    let mut sleep = FIRST_RETRY_SLEEP;
+    let mut last_busy = None;
+    loop {
+        match db.try_lock() {
+            Ok(mut conn) => {
+                let result = with_busy_wait(&mut *conn, Duration::ZERO, &mut work);
+                drop(conn);
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(error) if is_busy_error(&error) => last_busy = Some(error),
+                    Err(error) => return Err(MaintenanceWriteError::Failed(error)),
+                }
+            }
+            // Only the first attempt treats a held mutex as a reason to stop.
+            // Once SQLite has reported the database busy, a request that took
+            // the mutex in the pause is expected and the next attempt follows.
+            Err(std::sync::TryLockError::WouldBlock) if last_busy.is_none() => {
+                return Err(MaintenanceWriteError::MutexHeld)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MaintenanceWriteError::Poisoned)
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(MaintenanceWriteError::Busy(
+                last_busy.expect("a retried attempt found the database busy"),
+            ));
+        }
+        std::thread::sleep(sleep.min(deadline - now));
+        sleep = (sleep * 2).min(LONGEST_RETRY_SLEEP);
+    }
+}
+
+/// Run `work` on a connection with a different busy wait, restoring the steady
+/// wait afterwards whether or not `work` succeeded.
+fn with_busy_wait<C, T>(
     conn: &mut C,
     wait: Duration,
     work: impl FnOnce(&mut C) -> rusqlite::Result<T>,
@@ -455,6 +525,25 @@ where
     let value = result?;
     restored?;
     Ok(value)
+}
+
+/// How long a maintenance write keeps retrying while another process holds
+/// the write lock on `aft.db`, before it defers to its next run.
+///
+/// `AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS` replaces `default` so integration
+/// tests can make the budget much longer than any request's latency budget: a
+/// maintenance path that waits while holding the connection mutex then delays
+/// reads by that whole budget, which no scheduling noise can explain away.
+pub(crate) fn maintenance_busy_budget(default: Duration) -> Duration {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+        })
+        .unwrap_or(default)
 }
 
 /// Minimum spacing between runs of the once-a-minute storage maintenance
@@ -795,6 +884,120 @@ mod tests {
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
     ];
+
+    /// Opens `aft.db` twice: the first connection plays this process's shared
+    /// one, the second plays another process that takes the write lock.
+    fn shared_and_foreign(
+        dir: &Path,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<TrackedConnection>>,
+        TrackedConnection,
+    ) {
+        let path = dir.join("aft.db");
+        let shared = open(&path).expect("open shared connection");
+        let foreign = open(&path).expect("open foreign connection");
+        (std::sync::Arc::new(std::sync::Mutex::new(shared)), foreign)
+    }
+
+    fn write_state(conn: &mut TrackedConnection, value: &str) -> rusqlite::Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO harness_state(harness, key, value, updated_at) VALUES ('h', 'k', ?1, 0)
+             ON CONFLICT(harness, key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        tx.commit()
+    }
+
+    #[test]
+    fn maintenance_write_leaves_the_mutex_free_while_another_process_holds_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let (shared, foreign) = shared_and_foreign(dir.path());
+        foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let budget = Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let writer = {
+            let shared = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || {
+                maintenance_write(&shared, budget, |conn| write_state(conn, "maintenance"))
+            })
+        };
+        let mut slowest_lock = Duration::ZERO;
+        while !writer.is_finished() {
+            let asked = std::time::Instant::now();
+            let conn = shared.lock().unwrap();
+            slowest_lock = slowest_lock.max(asked.elapsed());
+            conn.query_row("SELECT COUNT(*) FROM harness_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+            drop(conn);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let outcome = writer.join().unwrap();
+
+        assert!(
+            matches!(outcome, Err(MaintenanceWriteError::Busy(_))),
+            "expected the write to give up busy, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= budget,
+            "gave up after {:?}, before its {budget:?} budget",
+            started.elapsed()
+        );
+        // The writer's single attempts return at once, so a reader only ever
+        // waits for one of them, never for the budget.
+        assert!(
+            slowest_lock < budget / 4,
+            "a reader waited {slowest_lock:?} for the connection mutex"
+        );
+        foreign.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn maintenance_write_commits_once_the_foreign_write_lock_is_released() {
+        let dir = tempdir().unwrap();
+        let (shared, foreign) = shared_and_foreign(dir.path());
+        foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = {
+            let shared = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || {
+                maintenance_write(&shared, Duration::from_secs(30), |conn| {
+                    write_state(conn, "maintenance")
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        foreign.execute_batch("COMMIT").unwrap();
+
+        writer
+            .join()
+            .unwrap()
+            .expect("write after the lock was released");
+        let value: String = foreign
+            .query_row(
+                "SELECT value FROM harness_state WHERE key = 'k'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "maintenance");
+    }
+
+    #[test]
+    fn maintenance_write_stops_at_once_when_the_mutex_is_held() {
+        let dir = tempdir().unwrap();
+        let (shared, _foreign) = shared_and_foreign(dir.path());
+        let _held = shared.lock().unwrap();
+        let mut ran = false;
+        let outcome = maintenance_write(&shared, Duration::from_secs(30), |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(matches!(outcome, Err(MaintenanceWriteError::MutexHeld)));
+        assert!(!ran);
+    }
 
     #[test]
     fn only_sqlite_contention_is_retryable() {

@@ -39,7 +39,7 @@ pub struct TerminalRowsPrune {
     pub remaining_candidates: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TerminalPruneCandidate {
     harness: String,
     session_id: String,
@@ -59,7 +59,9 @@ pub(crate) struct TerminalPrunePlan {
     cutoff: i64,
 }
 
-#[derive(Debug)]
+/// Cloned per attempt when a retention transaction retries after finding
+/// another process's write lock, since each attempt consumes its copy.
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedTerminalPrune {
     identities: Vec<TerminalPruneCandidate>,
     probed_candidates: usize,
