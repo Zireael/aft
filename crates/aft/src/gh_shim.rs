@@ -81,6 +81,48 @@ const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
 // already wrote. They speak publicly under the bot identity and create no
 // authority, which is the same class as `issue comment` and `issue close`.
 const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
+// v16 lets a bot open a pull request. Opening one proposes a change and lands
+// nothing: merging stays on the admin `pr merge` row, so this is speech under
+// the bot identity, the same class as `issue create`. The head branch must live
+// in the target repository; a fork head (`owner:branch`) is refused.
+const V16_GOVERNED_TUPLES: &[&str] = &["pr create"];
+/// The body fields the `pr create` reader produces, in the order the manifest
+/// declares them. The reader is purpose-built for this list, so a signed
+/// declaration naming any other list is refused rather than half-honoured.
+const PR_CREATE_BODY_FIELDS: &[&str] = &["title", "body", "base", "head", "draft"];
+/// `gh pr create` flags the governed request cannot carry. Reviewers,
+/// assignees, labels, milestones and projects hand out work or triage rather
+/// than speak; `--fill*` derives text from local commits the route holder never
+/// sees; `--web`, `--editor`, `--template` and `--recover` need an interactive
+/// terminal; `--dry-run` asks upstream `gh` to print instead of create, which a
+/// governed route cannot honour; `--no-maintainer-edit` changes a permission
+/// the request has no field for. Short spellings are listed next to their long
+/// forms so each gets the same named refusal.
+const PR_CREATE_UNSUPPORTED_FLAGS: &[&str] = &[
+    "--assignee",
+    "-a",
+    "--reviewer",
+    "-r",
+    "--label",
+    "-l",
+    "--milestone",
+    "-m",
+    "--project",
+    "-p",
+    "--fill",
+    "-f",
+    "--fill-first",
+    "--fill-verbose",
+    "--web",
+    "-w",
+    "--editor",
+    "-e",
+    "--template",
+    "-T",
+    "--recover",
+    "--dry-run",
+    "--no-maintainer-edit",
+];
 // v14 also gives the operator bypass one narrow administration shape of a
 // governed verb: an `issue edit` that changes labels and nothing else. Triage
 // labels on any issue are repository administration, not bot speech, so they
@@ -3641,6 +3683,7 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
     V1_GOVERNED_TUPLES.contains(&tuple)
         || (manifest_version >= 12 && V12_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 16 && V16_GOVERNED_TUPLES.contains(&tuple))
 }
 
 /// True for a governed tuple whose label-only form the operator bypass may run
@@ -4134,6 +4177,15 @@ fn canonicalize_governed_from<R: Read>(
     } else {
         head_index + 1
     };
+    if tuple == "pr create" {
+        return canonicalize_pr_create_from(
+            args,
+            subcommand_index,
+            canonical,
+            manifest_version,
+            stdin,
+        );
+    }
     let target_and_state = is_target_and_state(canonical);
     let fields_only = is_fields_only(canonical);
     let mut positional = Vec::new();
@@ -4397,6 +4449,219 @@ fn canonicalize_governed_from<R: Read>(
         edit_last,
         author_scope: (tuple == "issue edit").then(|| "own".to_string()),
     })
+}
+
+/// Read a `gh pr create` argv into the governed request.
+///
+/// The request is fields-only: a pull request has no number until it exists.
+/// Every admitted flag maps to one body field, and anything else is refused
+/// while argv is read, before routing, because a governed route never runs
+/// upstream `gh` and silently dropping a flag would change what the caller
+/// asked for.
+///
+/// `--base`, `--head` and `--title` are required here even though upstream
+/// `gh` can default or prompt for them: the default base is the repository's
+/// default branch and the default head is the local branch, and the shim can
+/// look up neither without guessing on the caller's behalf. Whether the head
+/// branch exists is GitHub's check, reported back through the route holder.
+fn canonicalize_pr_create_from<R: Read>(
+    args: &[OsString],
+    subcommand_index: usize,
+    canonical: &Canonicalization,
+    manifest_version: u64,
+    stdin: &mut R,
+) -> Result<GovernedRequest, CanonicalizeError> {
+    if !is_fields_only(canonical)
+        || !canonical.target_fields.is_empty()
+        || canonical.body_fields != PR_CREATE_BODY_FIELDS
+    {
+        return Err(CanonicalizeError::unclassified(format!(
+            "pr create is declared as {:?} / target {:?} / body {:?}, but this shim reads only fields-only / target [] / body {PR_CREATE_BODY_FIELDS:?}",
+            canonical.argv_forms, canonical.target_fields, canonical.body_fields
+        )));
+    }
+    let mut title = None;
+    let mut body = None;
+    let mut base = None;
+    let mut head = None;
+    let mut draft = false;
+    let mut explicit_repository = None;
+    let mut index = subcommand_index + 1;
+    while index < args.len() {
+        let value = args[index].to_str().ok_or_else(|| {
+            CanonicalizeError::unclassified("non-UTF-8 governed arguments are undeclared")
+        })?;
+        if let Some(flag) = PR_CREATE_UNSUPPORTED_FLAGS
+            .iter()
+            .copied()
+            .find(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
+        {
+            return Err(CanonicalizeError::typed(
+                RefusalCode::UnsupportedFlag,
+                format!(
+                    "{flag}: pr create through the shim admits only --title, --body, --body-file, --base, --head, --draft, and --repo"
+                ),
+            ));
+        }
+        let next = args.get(index + 1);
+        let mut consumed_next = false;
+        if value == "--draft" || value == "-d" {
+            draft = true;
+        } else if value == "--repo" || value == "-R" {
+            let repository = next
+                .and_then(|arg| arg.to_str())
+                .ok_or_else(|| CanonicalizeError::unclassified("--repo requires a value"))?;
+            explicit_repository = Some(repository.to_string());
+            consumed_next = true;
+        } else if let Some(repository) = attached_repo_value(value) {
+            explicit_repository = Some(repository.to_string());
+        } else if let Some((supplied, from_next)) =
+            pr_create_flag_value(value, "--title", "-t", next)?
+        {
+            set_once(&mut title, supplied, "--title")?;
+            consumed_next = from_next;
+        } else if let Some((supplied, from_next)) =
+            pr_create_flag_value(value, "--base", "-B", next)?
+        {
+            set_once(&mut base, supplied, "--base")?;
+            consumed_next = from_next;
+        } else if let Some((supplied, from_next)) =
+            pr_create_flag_value(value, "--head", "-H", next)?
+        {
+            set_once(&mut head, supplied, "--head")?;
+            consumed_next = from_next;
+        } else if let Some((supplied, from_next)) =
+            pr_create_flag_value(value, "--body", "-b", next)?
+        {
+            set_once(&mut body, supplied, "--body/--body-file")?;
+            consumed_next = from_next;
+        } else if let Some((file, from_next)) =
+            pr_create_flag_value(value, "--body-file", "-F", next)?
+        {
+            // Read the file here and send its text: the route holder cannot
+            // see this machine's files, and stdin (`-`) belongs to this process.
+            let supplied = read_body_file_from(Path::new(&file), stdin)
+                .map_err(|error| CanonicalizeError::unclassified(format!("{value}: {error}")))?;
+            set_once(&mut body, supplied, "--body/--body-file")?;
+            consumed_next = from_next;
+        } else if value.starts_with('-') {
+            return Err(CanonicalizeError::unclassified(format!(
+                "undeclared flag {value}"
+            )));
+        } else {
+            return Err(CanonicalizeError::unclassified(format!(
+                "pr create takes no positional arguments, got {value}"
+            )));
+        }
+        index += if consumed_next { 2 } else { 1 };
+    }
+
+    let require = |field: Option<String>, flag: &str, why: &str| {
+        field.filter(|value| !value.is_empty()).ok_or_else(|| {
+            CanonicalizeError::unclassified(format!(
+                "pr create through the shim requires {flag}: {why}"
+            ))
+        })
+    };
+    let title = require(
+        title,
+        "--title",
+        "upstream gh would prompt for it, and the governed route has no terminal",
+    )?;
+    let base = require(
+        base,
+        "--base",
+        "the shim cannot look up the repository's default branch, so it does not guess one",
+    )?;
+    let head = require(
+        head,
+        "--head",
+        "the shim does not infer the head from the local checkout",
+    )?;
+    if head.contains(':') {
+        // `owner:branch` names a head in another repository (a fork). The bot
+        // speaks only for the bound repository, so a cross-repository pull
+        // request is refused here rather than left to the route holder.
+        return Err(CanonicalizeError::typed(
+            RefusalCode::UnsupportedFlag,
+            format!(
+                "--head {head}: cross-repository heads are refused; the head branch must be in the target repository, named without an owner prefix"
+            ),
+        ));
+    }
+
+    let mut fields = Map::new();
+    fields.insert("title".to_string(), Value::String(title));
+    if let Some(body) = body {
+        fields.insert("body".to_string(), Value::String(body));
+    }
+    fields.insert("base".to_string(), Value::String(base));
+    fields.insert("head".to_string(), Value::String(head));
+    fields.insert("draft".to_string(), Value::Bool(draft));
+
+    // Same resolver as every other governed verb: a global `--repo` before the
+    // command head wins, then the command-local one, then GH_REPO and the
+    // working directory's origin.
+    let target_repository = TargetRepository {
+        explicit: explicit_repo(args).or(explicit_repository),
+        url: None,
+        gh_repo: gh_repo_env(),
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repository = target_repository
+        .resolve(&cwd)
+        .map(|repository| {
+            canonical_repository_key(&repository)
+                .ok_or_else(|| format!("repository {repository} is not owner/name"))
+        })
+        .transpose()?;
+    Ok(GovernedRequest {
+        action: "pr create".to_string(),
+        target: Map::new(),
+        body: fields,
+        repository,
+        manifest_version,
+        edit_last: false,
+        author_scope: None,
+    })
+}
+
+/// The value of one `pr create` string flag in its `--long value`,
+/// `--long=value` or `-s value` spelling, and whether it consumed the next
+/// argument. The glued short form (`-tTitle`) is not read, so it refuses as an
+/// undeclared flag rather than being guessed at.
+fn pr_create_flag_value(
+    value: &str,
+    long: &str,
+    short: &str,
+    next: Option<&OsString>,
+) -> Result<Option<(String, bool)>, CanonicalizeError> {
+    if value == long || value == short {
+        let supplied = next
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| CanonicalizeError::unclassified(format!("{value} requires a value")))?;
+        return Ok(Some((supplied.to_string(), true)));
+    }
+    Ok(value
+        .strip_prefix(long)
+        .and_then(|rest| rest.strip_prefix('='))
+        .map(|supplied| (supplied.to_string(), false)))
+}
+
+/// Upstream `gh` keeps the last of a repeated flag. The shim refuses the
+/// repetition instead, so a request never carries a value the caller may not
+/// have meant to send.
+fn set_once(
+    slot: &mut Option<String>,
+    supplied: String,
+    flag: &str,
+) -> Result<(), CanonicalizeError> {
+    if slot.replace(supplied).is_some() {
+        return Err(CanonicalizeError::unclassified(format!(
+            "{flag} may be provided only once"
+        )));
+    }
+    Ok(())
 }
 
 /// Canonicalize the one governed API form: an id-addressed PATCH of an issue
@@ -9307,6 +9572,335 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn v16_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v16-manifest.json"))
+            .expect("synthetic v16 manifest fixture")
+    }
+
+    /// Classify under the v16 fixture and canonicalize, returning the request
+    /// or the refusal the argv reader produced.
+    fn canonicalize_pr_create(args: &[OsString]) -> Result<GovernedRequest, CanonicalizeError> {
+        let manifest = v16_manifest();
+        let Classification::Governed { tuple, canonical } = classify(args, &manifest, "macos")
+        else {
+            panic!("{args:?}: v16 pr create must be governed bot speech");
+        };
+        assert_eq!(tuple, "pr create");
+        canonicalize_governed(args, &tuple, &canonical, manifest.manifest_version)
+    }
+
+    #[test]
+    fn v16_pr_create_is_bot_speech_and_v15_leaves_it_undeclared() {
+        let manifest = v16_manifest();
+        manifest.validate().expect("valid v16 manifest");
+        assert!(is_reviewed_governed_tuple(16, "pr create"));
+        assert!(!is_reviewed_governed_tuple(15, "pr create"));
+        // Merging is not speech and stays on the admin row.
+        assert!(!is_reviewed_governed_tuple(16, "pr merge"));
+
+        let args = os_args(&[
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base",
+            "main",
+            "--head",
+            "feature",
+            "--title",
+            "T",
+        ]);
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
+            Classification::Governed { ref tuple, .. } if tuple == "pr create"
+        ));
+        // The deployed v15 shape does not declare the verb at all.
+        assert!(matches!(
+            classify(&args, &v15_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+        // A manifest signed below 16 that nevertheless declares the row is
+        // still refused: the version gate, not the row alone, admits it.
+        let mut early = v16_manifest();
+        early.manifest_version = 15;
+        early.validate().expect("the row itself is well-formed");
+        assert!(matches!(
+            classify(&args, &early, "macos"),
+            Classification::Unclassified
+        ));
+        assert_eq!(
+            unclassified_refusal_text(&args, 15),
+            "verb \"pr create\" is not declared in manifest 15 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+        );
+    }
+
+    #[test]
+    fn v16_pr_create_canonicalizes_to_the_declared_fields_only_request() {
+        let manifest = v16_manifest();
+        // The manifest's declaration, exactly: no target, five ordered fields.
+        let declared = &manifest.canonicalization["pr create"];
+        assert_eq!(declared.argv_forms, vec![FIELDS_ONLY_FORM.to_string()]);
+        assert!(declared.target_fields.is_empty());
+        assert_eq!(declared.body_fields, PR_CREATE_BODY_FIELDS);
+        assert_eq!(
+            PR_CREATE_BODY_FIELDS,
+            ["title", "body", "base", "head", "draft"],
+            "the field list is part of the signed row, not an implementation detail"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let body_file = directory.path().join("f");
+        fs::write(&body_file, "Line one\n\n- item\n").unwrap();
+        let args = os_args(&[
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base",
+            "main",
+            "--head",
+            "feature",
+            "--title",
+            "T",
+            "--body-file",
+            body_file.to_str().unwrap(),
+            "--draft",
+        ]);
+        let request = canonicalize_pr_create(&args).expect("pr create canonicalizes");
+        assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+        assert!(request.author_scope.is_none());
+        assert!(GithubReadMutation::from_governed_request(&request).is_none());
+
+        let determination = RungDetermination::r3(1, 16, &test_rung_provenance());
+        let mut wire = governed_wire_request(&determination.record, "alfonso-aft", request);
+        // The pid differs per test process; everything else is pinned.
+        wire["metadata"]["pid"] = json!(0);
+        // The body carries the declared fields in the manifest's order.
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            concat!(
+                r#"{"operation":"gh.route","gh_route_schema":1,"action":"pr create","target":{},"#,
+                r#""body":{"title":"T","body":"Line one\n\n- item\n","base":"main","head":"feature","draft":true},"#,
+                r#""repository":"cortexkit/aft","manifest_version":16,"rung_as_of_unix_secs":1,"#,
+                r#""metadata":{"agent_id":"alfonso-aft","pid":0}}"#,
+            )
+        );
+
+        // Without --draft the field is still sent, as false, so the holder
+        // never has to guess a default. --body, the short spellings and the
+        // attached forms reach the same fields.
+        let short = os_args(&[
+            "pr",
+            "create",
+            "--repo=cortexkit/aft",
+            "-B",
+            "main",
+            "-H",
+            "feature",
+            "-t",
+            "T",
+            "-b",
+            "B",
+        ]);
+        let request = canonicalize_pr_create(&short).expect("short spellings canonicalize");
+        assert_eq!(
+            Value::Object(request.body),
+            json!({"title": "T", "body": "B", "base": "main", "head": "feature", "draft": false})
+        );
+        let attached = os_args(&[
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base=main",
+            "--head=feature",
+            "--title=T",
+            "-d",
+        ]);
+        let request = canonicalize_pr_create(&attached).expect("attached spellings canonicalize");
+        assert_eq!(
+            Value::Object(request.body),
+            json!({"title": "T", "base": "main", "head": "feature", "draft": true})
+        );
+    }
+
+    #[test]
+    fn v16_pr_create_refuses_a_cross_repository_head_before_routing() {
+        for head in ["someone:feature", "cortexkit:feature"] {
+            let args = os_args(&[
+                "pr",
+                "create",
+                "-R",
+                "cortexkit/aft",
+                "--base",
+                "main",
+                "--head",
+                head,
+                "--title",
+                "T",
+            ]);
+            let error = canonicalize_pr_create(&args).expect_err("a fork head must refuse");
+            assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{head}");
+            assert!(
+                error.text.starts_with(&format!(
+                    "--head {head}: cross-repository heads are refused"
+                )),
+                "{}",
+                error.text
+            );
+            assert_eq!(
+                refuse_governed_canonicalization(&error),
+                REFUSAL_EXIT_STATUS
+            );
+        }
+    }
+
+    #[test]
+    fn v16_pr_create_refuses_flags_the_governed_request_cannot_carry() {
+        // Spelled out rather than read from PR_CREATE_UNSUPPORTED_FLAGS, so a
+        // flag dropped from that list turns this test red.
+        let refused = [
+            "--assignee",
+            "-a",
+            "--reviewer",
+            "-r",
+            "--label",
+            "-l",
+            "--milestone",
+            "-m",
+            "--project",
+            "-p",
+            "--fill",
+            "-f",
+            "--fill-first",
+            "--fill-verbose",
+            "--web",
+            "-w",
+            "--editor",
+            "-e",
+            "--template",
+            "-T",
+            "--recover",
+            "--dry-run",
+            "--no-maintainer-edit",
+        ];
+        assert_eq!(PR_CREATE_UNSUPPORTED_FLAGS, refused);
+        let base = [
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base",
+            "main",
+            "--head",
+            "feature",
+            "--title",
+            "T",
+        ];
+        for flag in refused {
+            let attached = format!("{flag}=x");
+            let mut spellings = vec![[&base[..], &[flag]].concat()];
+            if flag.starts_with("--") {
+                spellings.push([&base[..], &[attached.as_str()]].concat());
+            }
+            for spelling in spellings {
+                let error = canonicalize_pr_create(&os_args(&spelling))
+                    .expect_err(&format!("{flag} must refuse"));
+                assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{flag}");
+                assert!(
+                    error
+                        .text
+                        .starts_with(&format!("{flag}: pr create through the shim admits only")),
+                    "{flag}: {}",
+                    error.text
+                );
+            }
+        }
+
+        // Anything else unknown still refuses while argv is read, never
+        // reaching upstream gh.
+        for extra in [
+            &["--draft=false"][..],
+            &["--maintainer-can-modify"],
+            &["42"],
+        ] {
+            let error = canonicalize_pr_create(&os_args(&[&base[..], extra].concat()))
+                .expect_err("undeclared argv must refuse");
+            assert_eq!(error.code, RefusalCode::Unclassified, "{extra:?}");
+        }
+        // A repeated field is refused rather than resolved to the last value.
+        let error = canonicalize_pr_create(&os_args(&[&base[..], &["--title", "U"]].concat()))
+            .expect_err("repeated --title must refuse");
+        assert_eq!(error.text, "--title may be provided only once");
+    }
+
+    #[test]
+    fn v16_pr_create_requires_base_head_and_title_instead_of_guessing() {
+        let full = ["--base", "main", "--head", "feature", "--title", "T"];
+        for (missing, name) in [(0, "--base"), (2, "--head"), (4, "--title")] {
+            let mut args = vec!["pr", "create", "-R", "cortexkit/aft"];
+            for (index, pair) in full.chunks(2).enumerate() {
+                if index * 2 != missing {
+                    args.extend_from_slice(pair);
+                }
+            }
+            let error = canonicalize_pr_create(&os_args(&args))
+                .expect_err(&format!("missing {name} must refuse"));
+            assert_eq!(error.code, RefusalCode::Unclassified, "{name}");
+            assert!(
+                error
+                    .text
+                    .starts_with(&format!("pr create through the shim requires {name}:")),
+                "{}",
+                error.text
+            );
+        }
+        // An empty value is the same as a missing one.
+        let error = canonicalize_pr_create(&os_args(&[
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base=",
+            "--head",
+            "feature",
+            "--title",
+            "T",
+        ]))
+        .expect_err("an empty --base must refuse");
+        assert!(error.text.contains("requires --base"), "{}", error.text);
+    }
+
+    #[test]
+    fn v16_pr_create_refuses_a_declaration_it_cannot_read() {
+        let mut manifest = v16_manifest();
+        manifest
+            .canonicalization
+            .get_mut("pr create")
+            .unwrap()
+            .body_fields
+            .push("maintainer_can_modify".to_string());
+        let args = os_args(&[
+            "pr",
+            "create",
+            "-R",
+            "cortexkit/aft",
+            "--base",
+            "main",
+            "--head",
+            "feature",
+            "--title",
+            "T",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("still declared");
+        };
+        let error = canonicalize_governed(&args, &tuple, &canonical, 16)
+            .expect_err("a wider declaration must not be half-honoured");
+        assert_eq!(error.code, RefusalCode::Unclassified);
     }
 
     #[test]

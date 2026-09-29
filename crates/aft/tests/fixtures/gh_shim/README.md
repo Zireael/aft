@@ -13,6 +13,10 @@ operator-label rows, and v15 `run cancel`. Its only binding is the test identity
 `cortexkit/aft` → `alfonso-aft`; it is not a production signing payload. Runtime
 tests sign a fresh copy with the development test key.
 
+`v16-manifest.json` is `v15-manifest.json` run through
+`scripts/prepare-gh-shim-v16.py`: version 16, one governed `pr create` row, and
+its `fields-only` canonicalization. Same synthetic binding, same status.
+
 ## Envelope v2 shape
 
 One file on disk carries the whole artifact:

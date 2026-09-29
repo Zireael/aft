@@ -1039,3 +1039,150 @@ fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
     let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
     assert_eq!(probe.elapsed_ms, 1_000);
 }
+
+fn v16_manifest() -> Manifest {
+    serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v16-manifest.json")).unwrap()
+}
+
+/// Run a governed `gh pr create` through dispatch against the v16 fixture and
+/// report the exit status and whether upstream `gh` was reached.
+fn dispatch_pr_create(harness: &Harness, ticket: Option<&str>) -> (i32, bool) {
+    let manifest = v16_manifest();
+    let args: Vec<OsString> = [
+        "pr",
+        "create",
+        "-R",
+        "cortexkit/aft",
+        "--base",
+        "main",
+        "--head",
+        "no-such-branch",
+        "--title",
+        "T",
+        "--body",
+        "B",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let classification = classify(&args, &manifest, "macos");
+    assert!(matches!(classification, Classification::Governed { .. }));
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let mut upstream_reached = false;
+    let status = dispatch_r3_with_relay(
+        &args,
+        classification,
+        &manifest,
+        &harness.paths,
+        &rung,
+        &binding,
+        TEST_NOW,
+        |_| {
+            upstream_reached = true;
+            0
+        },
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: ticket.map(str::to_string),
+            transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
+            relay_budget: Duration::from_secs(5),
+        },
+    );
+    (status, upstream_reached)
+}
+
+/// Plexus's reply for a created pull request is `{number, url, state, draft}`.
+/// `gh pr create` prints the URL, and the shim does the same.
+#[test]
+fn a_created_pull_request_prints_its_url() {
+    let result = json!({
+        "number": 7,
+        "url": "https://github.com/cortexkit/aft/pull/7",
+        "state": "open",
+        "draft": false,
+    });
+    assert_eq!(
+        rendered(completed(Some(result))),
+        "https://github.com/cortexkit/aft/pull/7\n"
+    );
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-pr-create", "call-pc", "/p");
+    let harness = harness(ticket_gated(vec![json!({
+        "op": BOT_REQUEST_OPERATION, "status": "ok", "data": {
+            "repo_binding_generation": 1,
+            "result": {"status": "completed", "result": {
+                "number": 7, "url": "https://github.com/cortexkit/aft/pull/7", "state": "open", "draft": false,
+            }},
+        },
+    })]));
+    let (status, upstream) = dispatch_pr_create(&harness, live.value());
+    assert_eq!(status, 0);
+    assert!(!upstream);
+    let sent = harness.daemon.bot_requests();
+    assert_eq!(sent.len(), 1);
+    let request = &sent[0]["params"]["request"];
+    assert_eq!(request["action"], "pr create");
+    assert_eq!(request["target"], json!({}));
+    assert_eq!(
+        request["body"],
+        json!({"title": "T", "body": "B", "base": "main", "head": "no-such-branch", "draft": false})
+    );
+    assert_eq!(request["repository"], "cortexkit/aft");
+}
+
+/// The shim cannot know which branches exist, so a head GitHub does not have
+/// is GitHub's refusal to report. It comes back as a named seam refusal with
+/// plexus's code verbatim, including GitHub's status and message, and is
+/// neither retried nor handed to upstream `gh`.
+#[test]
+fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-pr-head", "call-ph", "/p");
+    // GitHub answers an unknown head with 422 "Validation Failed" and an
+    // error naming the `head` field as invalid. Plexus spells a vendor
+    // refusal as `vendor_rejected{...}`; both the status-only spelling it
+    // uses today and one carrying GitHub's message must pass through intact.
+    for code in [
+        "vendor_rejected{status: 422}",
+        r#"vendor_rejected{status: 422, message: "Validation Failed", errors: [{"resource": "PullRequest", "field": "head", "code": "invalid"}]}"#,
+    ] {
+        let harness = harness(ticket_gated(vec![plexus_refused(code)]));
+        let (status, upstream) = dispatch_pr_create(&harness, live.value());
+        assert_eq!(status, REFUSAL_EXIT_STATUS, "{code}");
+        assert!(!upstream, "{code} fell through to upstream gh");
+        assert_eq!(nonces(&harness).len(), 1, "{code} was retried");
+        let seam = super::super::seam_state(&harness.paths);
+        assert_eq!(seam.last_seam_refusal.unwrap().code, code);
+        // The caller-facing text is the named seam refusal carrying the code,
+        // not a paraphrase of it.
+        let text = plexus_refusal_text(code, classify_code(code));
+        assert_eq!(text, format!("plexus refused the bot write: {code}"));
+        assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
+    }
+    // Plexus's own head refusals take the same path.
+    let harness = harness(ticket_gated(vec![plexus_refused(
+        "pr_head_cross_repository",
+    )]));
+    let (status, upstream) = dispatch_pr_create(&harness, live.value());
+    assert_eq!(status, REFUSAL_EXIT_STATUS);
+    assert!(!upstream);
+    assert_eq!(nonces(&harness).len(), 1);
+    assert_eq!(
+        super::super::seam_state(&harness.paths)
+            .last_seam_refusal
+            .unwrap()
+            .code,
+        "pr_head_cross_repository"
+    );
+}

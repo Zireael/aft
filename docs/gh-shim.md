@@ -133,6 +133,7 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `issue close`, `issue reopen`, `pr close`, `pr reopen` | SPEECH-AS-BOT | v12 |
 | **`issue create`** | **SPEECH-AS-BOT** | **v14** |
 | **`api` PATCH `/repos/*/*/issues/comments/*`** | **SPEECH-AS-BOT** | **v14** |
+| **`pr create`** (same-repository head, `--base` required) | **SPEECH-AS-BOT** | **v16** |
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
@@ -209,6 +210,51 @@ dropping a flag would change what the caller asked for.
 Ownership is the route holder's check: the comment's author must be the calling
 seat's bot. PATCH on any other path — including `/repos/*/*/issues/*`, the issue
 itself — is not admitted by this row, and every other PATCH stays as v13 has it.
+
+## The v16 row: `pr create`
+
+Bots may open pull requests. Opening one proposes a change under the bot
+identity and lands nothing, so it is speech, the same class as `issue create`;
+merging stays operator-only on the admin `pr merge` row. The manifest must
+declare `pr create` at v16 or later: under v15 and earlier it refuses as
+`gh_shim_unclassified` (undeclared), even if an older manifest carries the row.
+
+Declared `fields-only` (a pull request has no number until it exists) with the
+body fields `title`, `body`, `base`, `head`, `draft`, in that order. The shim
+reads only that exact declaration; a signed row naming other fields refuses.
+The request travels in the same envelope as `issue create`:
+`{"action":"pr create","target":{},"body":{"title","body","base","head","draft"}}`
+plus the repository, which Plexus checks against the bot's binding.
+
+Admitted: `--title`/`-t`, `--body`/`-b`, `--body-file`/`-F` (read by the shim,
+including the stdin spelling `-`, and sent as text), `--base`/`-B`,
+`--head`/`-H`, `--draft`/`-d` (sent as a boolean, `false` when absent), and
+`--repo`/`-R`. Each value flag may appear once.
+
+`--base`, `--head` and `--title` are required on the governed path and refuse
+as `gh_shim_unclassified` when missing or empty. Upstream `gh` would default the
+base to the repository's default branch and the head to the local branch, or
+prompt; the shim can look up neither and does not guess.
+
+The head must be a branch of the target repository. A cross-repository head
+(`owner:branch`) refuses as `gh_shim_unsupported_flag` before anything is sent.
+Whether the head branch exists is GitHub's check: its refusal (for example a
+422 for an invalid `head`) comes back from Plexus as a `gh_shim_seam_refusal`
+carrying Plexus's code verbatim, and is not retried or handed to upstream `gh`.
+
+Refused with `gh_shim_unsupported_flag` (exit 86, nothing sent): `--assignee`,
+`--reviewer`, `--label`, `--milestone`, `--project` (and their short forms `-a`,
+`-r`, `-l`, `-m`, `-p`), `--fill`/`-f`, `--fill-first`, `--fill-verbose`,
+`--web`/`-w`, `--editor`/`-e`, `--template`/`-T`, `--recover`, `--dry-run`, and
+`--no-maintainer-edit`. Any other flag or a positional argument refuses as
+`gh_shim_unclassified`. On success the shim prints the new pull request's URL,
+as `gh pr create` does.
+
+Prepare the unsigned payload from the unsigned v15 bytes with
+`python3 scripts/prepare-gh-shim-v16.py /path/to/unsigned-v15.json`; it writes
+to `.alfonso/ceremonies/gh-routing-manifest-v16/` by default and prints the
+SHA-256. It adds the one row and its canonicalization and keeps every other
+byte of v15.
 
 ## Operator label rows (v14)
 
