@@ -15,10 +15,10 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, decompose_grep_pattern, has_any_project_file_from, read_searchable_text,
-    resolve_search_scope, sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc,
-    try_read_with_budget, GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult,
-    IndexStatus, PathFilters, RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    build_path_filters, decompose_grep_pattern, read_searchable_text, resolve_search_scope,
+    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
+    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
+    RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -161,19 +161,52 @@ pub fn compute_filter_root(
     }
 }
 
-pub fn scope_has_files(project_root: &Path, scope: &GrepScope) -> bool {
-    scope.roots.iter().any(|root| {
+pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Option<bool> {
+    let mut unknown = false;
+    for root in &scope.roots {
         // An explicitly-named existing file is always in scope (it's searched
         // directly even if gitignored / .aftignored), so don't report it as
         // "no files matched scope".
         if root.search_root.is_file() {
-            return true;
+            return Some(true);
         }
-        let catch_all =
-            build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
-        has_any_project_file_from(&root.filter_root, &root.search_root, &catch_all)
-            || has_any_project_file_from(project_root, &root.search_root, &catch_all)
-    })
+        match bounded_scope_has_files(&root.filter_root, &root.search_root, filters) {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            Some(false) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// Stop at the first eligible file; an exhausted probe cannot prove an empty scope.
+fn bounded_scope_has_files(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+) -> Option<bool> {
+    let started = Instant::now();
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let builder = fallback_project_walk_builder(search_root, Arc::clone(&skipped));
+    for (visited, entry) in builder.build().enumerate() {
+        if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
+            || started.elapsed() >= FALLBACK_WALK_BUDGET
+            || crate::executor::current_job_cancelled()
+        {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && filters.matches(filter_root, entry.path())
+        {
+            return Some(true);
+        }
+    }
+    (skipped.load(Ordering::Relaxed) == 0).then_some(false)
 }
 
 pub fn execute(
@@ -373,7 +406,9 @@ fn execute_root_profiled(
                     snapshot_acquire,
                     query_decomposition: Duration::ZERO,
                     query: query_timings,
-                    indexed_scope_has_files: Some(indexed_scope_has_files),
+                    indexed_scope_has_files: Some(
+                        snapshot.has_file_in_scope_with_filters(&root.search_root, filters),
+                    ),
                 },
             );
         }

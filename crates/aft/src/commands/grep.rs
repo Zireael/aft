@@ -128,9 +128,10 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         grep_executor::execute_profiled_with_filters(ctx, &compiled, &scope, &params, &filters);
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
-    let scope_has_files = phases
+    let scope_presence = phases
         .indexed_scope_has_files
-        .unwrap_or_else(|| grep_executor::scope_has_files(&project_root, &scope));
+        .or_else(|| grep_executor::scope_has_files(&scope, &filters));
+    let scope_has_files = scope_presence != Some(false);
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();
     let page_matches: Vec<&GrepMatch> =
@@ -154,7 +155,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let mut body = serde_json::json!({
         "text": text,
-        "complete": !result.walk_truncated
+        "complete": scope_presence.is_some() && !result.walk_truncated
             && result.skipped_foreign_mounts == 0
             && result.missing_on_disk == 0,
         "no_files_matched_scope": !scope_has_files,
@@ -177,6 +178,12 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
             text
+        ));
+    }
+    if scope_presence.is_none() {
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Scope probe reached its work bound; whether eligible files exist is unknown.)",
+            body["text"].as_str().unwrap_or_default()
         ));
     }
     if !scope_has_files {

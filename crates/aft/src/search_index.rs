@@ -696,6 +696,19 @@ impl SearchIndexSnapshot {
         })
     }
 
+    pub(crate) fn has_file_in_scope_with_filters(
+        &self,
+        search_root: &Path,
+        filters: &PathFilters,
+    ) -> bool {
+        let search_root = canonicalize_for_search_membership(search_root);
+        self.files.iter().any(|file| {
+            !file.path.as_os_str().is_empty()
+                && is_within_search_root(&search_root, &file.path)
+                && filters.matches(&self.project_root, &file.path)
+        })
+    }
+
     /// Score-rank file candidates and report whether the pre-filter step that
     /// collects candidates reached its internal size limit before ranking.
     pub fn lexical_rank_with_stats(
@@ -2794,7 +2807,6 @@ impl SearchIndexSnapshot {
             .filter(|file| !file.path.as_os_str().is_empty())
             .filter_map(|file| {
                 let root = containing_root(&file.path)?;
-                scope_has_files = true;
                 Some((file, root))
             })
             // Match the glob pattern relative to the search root, not the
@@ -2802,7 +2814,10 @@ impl SearchIndexSnapshot {
             // "a.rs"}`, the pattern must match `a.rs` (the path relative to
             // `src`), not `src/a.rs` (the path relative to the project root).
             .filter(|(file, root)| filters.matches(root, &file.path))
-            .map(|(file, _)| (file.path.clone(), file.modified))
+            .map(|(file, _)| {
+                scope_has_files = true;
+                (file.path.clone(), file.modified)
+            })
             .collect::<Vec<_>>();
 
         if sort_by_mtime {
@@ -4917,14 +4932,6 @@ pub(crate) fn walk_project_files_from(
 ) -> Vec<PathBuf> {
     walk_project_files_from_inner(filter_root, search_root, filters, None, true)
         .expect("unbounded project walk cannot exceed a file limit")
-}
-
-pub(crate) fn has_any_project_file_from(
-    filter_root: &Path,
-    search_root: &Path,
-    filters: &PathFilters,
-) -> bool {
-    walk_project_files_from_inner(filter_root, search_root, filters, Some(0), true).is_err()
 }
 
 fn walk_project_files_from_inner(

@@ -1478,3 +1478,65 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn filtered_scope_distinguishes_no_files_from_no_matches() {
+    for indexed in [false, true] {
+        let project = setup_project(&[("src/a.txt", "hello\n"), ("src/b.rs", "hello\n")]);
+        fs::create_dir(project.path().join("empty")).unwrap();
+        let mut aft = AftProcess::spawn();
+        if indexed {
+            configure_with_index(&mut aft, project.path());
+            wait_for_index_ready(
+                &mut aft,
+                || json!({"id":"ready", "command":"grep", "pattern":"hello"}),
+            );
+        } else {
+            configure(&mut aft, project.path());
+        }
+        for (extra, empty) in [
+            (json!({}), false),
+            (json!({"include":"*.nosuchext"}), true),
+            (json!({"path": project.path().join("empty")}), true),
+            (json!({"include":"*.rs"}), false),
+            (json!({"exclude":["*.rs", "*.txt"]}), true),
+        ] {
+            let mut request = json!({"id":"filtered-scope", "command":"grep", "pattern":"ZQNOPE"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response = send(&mut aft, request);
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(
+                response["no_files_matched_scope"], empty,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing was searched"),
+                empty
+            );
+        }
+        for (pattern, empty) in [("*.nosuchext", true), ("**/*.rs", false)] {
+            let response = send(
+                &mut aft,
+                json!({"id":"glob-filtered", "command":"glob", "pattern":pattern}),
+            );
+            assert_eq!(
+                response["no_files_matched_scope"], empty,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing was searched"),
+                empty
+            );
+        }
+        assert!(aft.shutdown().success());
+    }
+}
