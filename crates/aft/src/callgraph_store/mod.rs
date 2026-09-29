@@ -2441,6 +2441,7 @@ pub struct CallGraphStore {
 pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
     _view_pin: Option<Arc<crate::pins::QueryPin>>,
+    _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
 }
 
 pub trait CallGraphRead {
@@ -6055,6 +6056,7 @@ impl ReadonlyCallGraphStore {
         Ok(Self {
             inner,
             _view_pin: None,
+            _generation_pin: None,
         })
     }
 
@@ -6092,7 +6094,16 @@ impl ReadonlyCallGraphStore {
         Ok(Self {
             inner,
             _view_pin: pin,
+            _generation_pin: None,
         })
+    }
+
+    pub(crate) fn retain_generation(
+        mut self,
+        generation: Arc<crate::views::snapshot::OpenGeneration>,
+    ) -> Self {
+        self._generation_pin = Some(generation);
+        self
     }
 
     pub fn reader_kind(&self) -> &'static str {
@@ -6107,6 +6118,7 @@ impl ReadonlyCallGraphStore {
         Self {
             inner,
             _view_pin: None,
+            _generation_pin: None,
         }
     }
 

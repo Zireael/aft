@@ -193,3 +193,84 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
         "held reader keeps old generation pinned"
     );
 }
+
+#[test]
+fn store_clone_pins_old_blobs_after_swap_and_gc() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let registry = FamilyRegistry::open(storage.path(), "callgraph-pin-test").unwrap();
+    let view = registry.register_view("scope-pin", root.path()).unwrap();
+    let access = ViewAccess::Owner(view.clone());
+    let driver = Driver {
+        plane: CallgraphPlane::default(),
+        source: b"function target() {} export function caller() { target(); }".to_vec(),
+        revision: Mutex::new(1),
+        installed: Mutex::new(None),
+    };
+    let reconciled = driver.reconcile(&access).unwrap();
+    let empty = ManifestV2::new(ManifestHeader {
+        producers: driver.producers(&access),
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    let mut live = LiveDelta::new(Arc::new(OpenGeneration::new("empty", empty.clone(), None)));
+    for (path, entry) in reconciled.entries {
+        live.apply(path, entry);
+    }
+    let old = driver
+        .build_own_generation(&access, &live.snapshot(), false)
+        .unwrap();
+    let old_snapshot = LiveDelta::new(old.clone()).snapshot();
+    driver.install(&access, &old_snapshot, 1).unwrap();
+    let reader = driver.plane.reader(&access, &old_snapshot).unwrap();
+    let held_store = reader.store.clone();
+    let old_name = old.name().to_string();
+    let key_hex = old
+        .manifest()
+        .entries()
+        .find_map(|(_, e)| match e.plane_state(FamilyPlane::Callgraph) {
+            Some(PlaneState::Ready { key }) => Some(key.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let key = aft::blob_store::v2::FamilyKey::new(
+        FamilyPlane::Callgraph,
+        aft::blob_store::v2::parse_hex32(&key_hex).unwrap(),
+    );
+    let views = view.view_store().unwrap();
+    let name = GenerationName::for_manifest(&empty).unwrap();
+    let database = views.derived_path(&name.to_string()).unwrap();
+    let store = view.open_store(FamilyPlane::Callgraph).unwrap();
+    callgraph::materialize(&database, &empty, &BlobReader(store.reader())).unwrap();
+    let prepared = views
+        .prepare_v2(&name, Some(&old_name), &empty, None)
+        .unwrap();
+    views.commit_v2(prepared, None).unwrap();
+    let marker = aft::root_cache::ReadMarker::create(view.view_dir(), &name.to_string()).unwrap();
+    let successor = LiveDelta::new(Arc::new(OpenGeneration::new(
+        name.to_string(),
+        empty,
+        Some(Residency::Marker(marker)),
+    )))
+    .snapshot();
+    driver.install(&access, &successor, 1).unwrap();
+    driver.plane.release_generation(&access, &old_name);
+    drop((reader, old_snapshot, old));
+    let policy = aft::gc::family::FamilySweepPolicy { byte_budget: 0 };
+    aft::gc::family::sweep_family(&registry, None, policy, None).unwrap();
+    assert!(
+        store.contains(&key).unwrap(),
+        "a bare store clone must protect its generation blobs after cache release"
+    );
+    let callers = held_store
+        .callers_of(std::path::Path::new("fixture.ts"), "target", 1)
+        .unwrap();
+    assert_eq!(callers.callers.len(), 1);
+    drop(held_store);
+    aft::gc::family::sweep_family(&registry, None, policy, None).unwrap();
+    assert!(
+        !store.contains(&key).unwrap(),
+        "last store clone releases the old generation pin"
+    );
+}

@@ -138,7 +138,7 @@ pub fn materialize(
 
 /// Holding a reader keeps exactly its generation pinned, including after a swap.
 pub struct PinnedReader {
-    pub store: ReadonlyCallGraphStore,
+    pub store: Arc<ReadonlyCallGraphStore>,
     pub generation: Arc<OpenGeneration>,
 }
 #[derive(Default)]
@@ -214,7 +214,7 @@ impl PlaneAdapter for CallgraphPlane {
             .insert(
                 (access.scope().into(), generation.name().into()),
                 Arc::new(PinnedReader {
-                    store,
+                    store: Arc::new(store.retain_generation(generation.clone())),
                     generation: generation.clone(),
                 }),
             );
