@@ -52,7 +52,9 @@ const HEALTH_BOUND: Duration = Duration::from_millis(500 * DEBUG_BOUND_MULTIPLIE
 /// machine (isolation, 2026-08-09). The bound exists to catch pushes that do
 /// not arrive (the lossy-funnel bug class), not to police tick jitter.
 const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(1000 * DEBUG_BOUND_MULTIPLIER as u64);
-const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
+/// Mirrors the module's pending-bind deadline, which sits 1.5 s inside the
+/// daemon's 12 s bind relay so the module's named refusal arrives first.
+const ROUTE_BIND_DEADLINE: Duration = Duration::from_millis(10_500);
 const CONCURRENCY_SCENARIO_BOUND: Duration =
     Duration::from_secs(10 * DEBUG_BOUND_MULTIPLIER as u64);
 const WATCHER_SINGLE_EVENT_BOUND: Duration =

@@ -151,7 +151,24 @@ const RELIABLE_WRITER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10
 const RELIABLE_WRITER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 
 const DISPATCH_PATH_BIND_WARN_AFTER: Duration = Duration::from_secs(6);
-const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
+/// How long the subc daemon's bind relay waits for this module's RouteBind
+/// answer before it fails the route.open itself with its own timeout.
+const DAEMON_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long AFT lets a RouteBind's configure run before refusing the bind
+/// with its own named error. It must expire early enough that the refusal
+/// reaches the daemon before the daemon's relay gives up, or the caller sees
+/// the daemon's generic timeout instead of AFT's reason. The 1.5 s margin
+/// covers how the refusal travels: the overdue check runs on the
+/// `DRAIN_TICK_PERIOD` (250 ms) tick, the frame then waits in the writer
+/// queue behind frames already queued, crosses the socket, and the daemon's
+/// relay clock started when it forwarded the bind, slightly before AFT
+/// received it.
+const ROUTE_BIND_DEADLINE: Duration = Duration::from_millis(10_500);
+const _: () = assert!(
+    ROUTE_BIND_DEADLINE.as_millis() + DRAIN_TICK_PERIOD.as_millis() + 1_000
+        <= DAEMON_BIND_RELAY_TIMEOUT.as_millis(),
+    "a bind refusal must reach the daemon before its bind relay times out"
+);
 
 /// Small bounded memory of completed task ids used to suppress stale lossy
 /// long-running reminders that arrive after their reliable completion event.
@@ -5400,7 +5417,10 @@ async fn expire_overdue_route_binds(
             corr,
             flags,
             "actor_not_ready",
-            &format!("route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms)"),
+            &format!(
+                "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the root's configure did not finish, so AFT refuses the bind before the daemon's {relay_ms}ms bind relay times out",
+                relay_ms = DAEMON_BIND_RELAY_TIMEOUT.as_millis()
+            ),
             metrics,
         )
         .await?;
@@ -11997,6 +12017,68 @@ mod tests {
         assert_eq!(acks["count"], 1);
         assert_eq!(acks["slow_count"], 1, "{acks}");
         assert!(acks["worst_ms"].as_u64().is_some_and(|ms| ms >= 7_000));
+    }
+
+    /// A bind whose configure is held open is refused by AFT, with a message
+    /// naming why, while the daemon's 12 s bind relay is still waiting. An
+    /// 11 s old bind must already be refused: that leaves the refusal about
+    /// a second to reach the daemon. A 10 s old bind is left alone.
+    #[tokio::test]
+    async fn a_held_bind_is_refused_before_the_daemon_bind_relay_times_out() {
+        let (_dir, root) = test_root("route-bind-held-configure");
+        let pending_bind = |age: Duration, corr: u64| PendingBind {
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            cancelled: false,
+            configure_request_id: format!("subc-bind-held-{corr}"),
+            started_at: Instant::now()
+                .checked_sub(age)
+                .expect("monotonic clock is older than the bind age"),
+            warned_half_deadline: false,
+            deadline_reported: false,
+            corr,
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            cancellation: crate::executor::JobCancellation::new(),
+        };
+        let young = route_key(9, 1);
+        let held = route_key(10, 1);
+        let mut pending_binds = HashMap::from([
+            (young, pending_bind(Duration::from_secs(10), 93)),
+            (held, pending_bind(Duration::from_secs(11), 94)),
+        ]);
+        let mut installed_route_epochs =
+            HashMap::from([(young.channel, young.epoch), (held.channel, held.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let executor = Arc::new(Executor::new());
+
+        expire_overdue_route_binds(
+            &writer_tx,
+            &executor,
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        let refusal = writer_rx.try_recv().expect("named bind refusal");
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        assert_eq!(refusal.header.corr, 94);
+        let body: Value = serde_json::from_slice(&refusal.body).unwrap();
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("route bind deadline exceeded")
+                && message.contains("configure did not finish"),
+            "{body}"
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the 10 s bind is not refused"
+        );
+        assert!(pending_binds[&held].deadline_reported);
+        assert!(!pending_binds[&young].deadline_reported);
     }
 
     /// Restart-shaped burst: 40 git roots configured together, then their
