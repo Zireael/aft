@@ -31,6 +31,11 @@ use crate::lsp::registry::{
     servers_with_root_marker, ServerDef, ServerKind,
 };
 use crate::lsp::roots::ServerKey;
+use crate::lsp::typescript_project::{
+    find_project_typescript_package, native_server_misidentified_reason,
+    native_server_unavailable_reason, resolve_native_binary, unservable_typescript_reason,
+    ProjectTypeScript, NATIVE_SERVER_INFO_NAME,
+};
 use crate::lsp::LspError;
 use crate::slog_error;
 use crate::slog_info;
@@ -52,10 +57,17 @@ fn server_key_for_definition(
 }
 
 fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
+    // Native TypeScript servers share an id and can share a root; their
+    // TypeScript directory keeps the order stable.
+    let native_dir = |kind: &ServerKind| match kind {
+        ServerKind::TypeScriptNative(dir) => Some(Arc::clone(dir)),
+        _ => None,
+    };
     left.kind
         .id_str()
         .cmp(right.kind.id_str())
         .then(left.root.cmp(&right.root))
+        .then_with(|| native_dir(&left.kind).cmp(&native_dir(&right.kind)))
 }
 
 /// Outcome of attempting to ensure a server is running for a single matching
@@ -812,7 +824,7 @@ impl LspManager {
             candidates.push(candidate);
         }
 
-        let selected_kinds = candidates
+        let mut selected_kinds = candidates
             .iter()
             .map(|candidate| candidate.key.kind.clone())
             .chain(
@@ -821,6 +833,15 @@ impl LspManager {
                     .map(|failure| failure.server_key.kind.clone()),
             )
             .collect::<HashSet<_>>();
+        // The `typescript` server's marker (package.json, tsconfig.json) is
+        // served when its files went to the native TypeScript server instead;
+        // naming `typescript` as not applicable there would be wrong.
+        if selected_kinds
+            .iter()
+            .any(|kind| matches!(kind, ServerKind::TypeScriptNative(_)))
+        {
+            selected_kinds.insert(ServerKind::TypeScript);
+        }
         // Only a server that could actually have run is worth naming: one whose
         // binary resolves. Markers of servers the user does not have installed
         // (Astro and Prisma also use `package.json`) would otherwise add a
@@ -4047,13 +4068,38 @@ impl LspManager {
         }
         let mut initialization_options =
             initialization_options_for_spawn(def, source_file, root, &resolution_config)?;
-        let binary = self.resolve_binary(def, root, config)?;
+        let has_binary_override = self.binary_overrides.contains_key(&def.kind)
+            || env_binary_override(&def.kind).is_some();
         let mut runtime_note = None;
+        let mut project_typescript = None;
+        let binary = if let ServerKind::TypeScriptNative(package_dir) = &def.kind {
+            let project =
+                ProjectTypeScript::read(package_dir).unwrap_or_else(|| ProjectTypeScript {
+                    version: "unknown".into(),
+                    package_dir: package_dir.to_path_buf(),
+                });
+            // Start the platform binary itself, never node_modules/.bin/tsc:
+            // that is a Node wrapper script. A missing platform package is a
+            // named gap reported before anything is spawned.
+            let binary = if has_binary_override {
+                self.resolve_binary(def, root, config)?
+            } else {
+                resolve_native_binary(&project).map_err(|cause| {
+                    LspError::ServerNotReady(native_server_unavailable_reason(&project, &cause))
+                })?
+            };
+            runtime_note = Some(format!(
+                "TypeScript {}: native language server (project installation) ({})",
+                project.version,
+                binary.display()
+            ));
+            project_typescript = Some(project);
+            binary
+        } else {
+            self.resolve_binary(def, root, config)?
+        };
         // Explicit binary overrides may wrap their own SDK discovery.
-        if def.kind == ServerKind::TypeScript
-            && !self.binary_overrides.contains_key(&def.kind)
-            && env_binary_override(&def.kind).is_none()
-        {
+        if def.kind == ServerKind::TypeScript && !has_binary_override {
             let (options, note) = if def
                 .args
                 .iter()
@@ -4071,16 +4117,14 @@ impl LspManager {
             initialization_options = Some(options);
             runtime_note = Some(note);
         }
-        let project_typescript = if def.kind == ServerKind::TypeScript {
+        if def.kind == ServerKind::TypeScript {
             let boundary = config
                 .project_root
                 .as_deref()
                 .filter(|p| source_file.starts_with(p))
                 .unwrap_or(root);
-            find_project_typescript_package(source_file, boundary)
-        } else {
-            None
-        };
+            project_typescript = find_project_typescript_package(source_file, boundary);
+        }
 
         // Merge the server-defined env with our test-injected env.
         // `extra_env` is empty in production; tests use it to drive fake
@@ -4236,19 +4280,14 @@ fn typescript_runtime_options(
         .as_deref()
         .filter(|p| source_file.starts_with(p))
         .unwrap_or(server_root);
-    let local = find_project_typescript_sdk(source_file, boundary)
-        .filter(|lib| lib.join("tsserver.js").is_file());
-    let (lib, fallback) = if let Some(lib) = local {
-        (lib, false)
-    } else {
-        // A TypeScript 7+ project must not be served by the cached 5.x SDK:
-        // its diagnostics would silently follow another compiler's defaults
-        // and accept options TypeScript 7 removed. Leave SDK discovery to the
-        // server, which fails on the native compiler; the initialize failure
-        // then names the cause.
-        if let Some(project) = find_project_typescript_package(source_file, boundary)
-            .filter(ProjectTypeScript::is_native_compiler)
-        {
+    let (lib, fallback) = match find_project_typescript_package(source_file, boundary) {
+        // Reached only when the `typescript` server runs a program the user
+        // chose; the built-in one is swapped for the native language server
+        // before this point. A TypeScript 7+ project must still not be
+        // served by the cached 5.x SDK: its diagnostics would silently follow
+        // another compiler's defaults and accept options TypeScript 7
+        // removed. Leave SDK discovery to the configured server.
+        Some(project) if project.is_native_compiler() => {
             return Ok((
                 options,
                 format!(
@@ -4258,20 +4297,35 @@ fn typescript_runtime_options(
                 ),
             ));
         }
-        let Some(lib) = config
-            .lsp_paths_extra
-            .iter()
-            .filter_map(|bin| bin.parent())
-            .map(|modules| modules.join("typescript").join("lib"))
-            .find(|lib| lib.join("tsserver.js").is_file())
-        else {
-            // The server can discover global or bundled SDKs that AFT does not resolve.
-            return Ok((
-                options,
-                "TypeScript: server-managed SDK resolution (version not reported by AFT)".into(),
-            ));
-        };
-        (lib, true)
+        Some(project) if project.major().is_some() && project.has_tsserver() => {
+            (project.package_dir.join("lib"), false)
+        }
+        // An unreadable version, or TypeScript 6 or earlier without
+        // tsserver.js: typescript-language-server would fail in initialize,
+        // and serving the project with the cached SDK would report another
+        // compiler's results. Name the installation instead of spawning.
+        Some(project) => {
+            return Err(LspError::ServerNotReady(unservable_typescript_reason(
+                &project,
+            )));
+        }
+        None => {
+            let Some(lib) = config
+                .lsp_paths_extra
+                .iter()
+                .filter_map(|bin| bin.parent())
+                .map(|modules| modules.join("typescript").join("lib"))
+                .find(|lib| lib.join("tsserver.js").is_file())
+            else {
+                // The server can discover global or bundled SDKs that AFT does not resolve.
+                return Ok((
+                    options,
+                    "TypeScript: server-managed SDK resolution (version not reported by AFT)"
+                        .into(),
+                ));
+            };
+            (lib, true)
+        }
     };
     let version = std::fs::read(lib.parent().unwrap().join("package.json"))
         .ok()
@@ -4325,74 +4379,6 @@ fn typescript_initialize_failure_reason(
         return format!("TypeScript SDK unavailable: the TypeScript installation the language server found has no tsserver.js (TypeScript 7 and later, the native compiler, ship none), so typescript-language-server can't serve it. Check which TypeScript the project resolves; run the project's tsc --noEmit for type errors. {reason}");
     }
     format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}")
-}
-
-/// The TypeScript package a project has installed, read from the nearest
-/// `node_modules/typescript/package.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectTypeScript {
-    /// The package.json `version`, or "unknown" when it has none.
-    version: String,
-    /// The `node_modules/typescript` directory.
-    package_dir: PathBuf,
-}
-
-impl ProjectTypeScript {
-    /// Leading integer of the version ("7.0.2" and "7.1.0-dev.1" are both 7).
-    fn major(&self) -> Option<u64> {
-        let digits: String = self
-            .version
-            .trim()
-            .trim_start_matches('v')
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().ok()
-    }
-
-    /// TypeScript 7 and later are the native (Go) compiler, which ships no
-    /// tsserver.js for typescript-language-server to load.
-    fn is_native_compiler(&self) -> bool {
-        self.major().is_some_and(|major| major >= 7)
-    }
-}
-
-/// Find the project's own TypeScript package for `source_file`, walking up to
-/// `project_root`. It looks for `package.json` rather than `lib/*.js` because
-/// TypeScript 7 ships none of the JavaScript files the SDK probe expects.
-/// The version comes from the installed package, never from a lockfile: after
-/// a branch switch without an install, the lockfile names what should be
-/// installed while `node_modules` holds what actually runs.
-fn find_project_typescript_package(
-    source_file: &Path,
-    project_root: &Path,
-) -> Option<ProjectTypeScript> {
-    let mut directory = source_file.parent()?;
-    loop {
-        let package_dir = directory.join("node_modules").join("typescript");
-        if let Ok(bytes) = std::fs::read(package_dir.join("package.json")) {
-            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|json| {
-                    json.get("version")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "unknown".into());
-            return Some(ProjectTypeScript {
-                version,
-                package_dir,
-            });
-        }
-        if directory == project_root {
-            return None;
-        }
-        let parent = directory.parent()?;
-        if !parent.starts_with(project_root) {
-            return None;
-        }
-        directory = parent;
-    }
 }
 
 fn biome_unavailable_reason(reason: &str) -> String {
@@ -4818,7 +4804,7 @@ impl PreparedSpawn {
             }
             None => client.initialize(&self.root, self.initialization_options),
         };
-        if let Err(err) = initialize {
+        if let Err(err) = &initialize {
             let phase = client.phase();
             // A timeout means the server is alive but slow; anything else
             // (broken pipe, closed stream) means it is exiting, so wait a
@@ -4853,6 +4839,31 @@ impl PreparedSpawn {
                 reason,
                 report: Box::new(report),
             });
+        }
+        // The native server is found by package layout alone, so confirm the
+        // binary really is TypeScript's language server before trusting its
+        // diagnostics for the project.
+        if let (ServerKind::TypeScriptNative(package_dir), Ok(result)) = (&self.kind, &initialize) {
+            let reported = result.server_info.as_ref().map(|info| info.name.as_str());
+            if reported != Some(NATIVE_SERVER_INFO_NAME) {
+                let reason = native_server_misidentified_reason(
+                    self.project_typescript.as_ref(),
+                    package_dir,
+                    &self.binary,
+                    reported,
+                );
+                slog_info!(
+                    "lsp native TypeScript server rejected root={} reason={reason}",
+                    self.root.display()
+                );
+                let _ = client.shutdown();
+                let status = client.wait_for_exit(INITIALIZE_EXIT_WAIT);
+                let report = client.exit_report(ServerPhase::Initialize, status, status.is_none());
+                return Err(SpawnFailure::Initialize {
+                    reason,
+                    report: Box::new(report),
+                });
+            }
         }
         Ok(client)
     }
@@ -6428,16 +6439,30 @@ mod typescript_worktree_tests {
         );
         assert!(note.contains("AFT cache fallback not used"), "{note}");
 
-        // The same layout on TypeScript 5 (a broken install without
-        // tsserver.js) still uses the cache.
+        // The same layout on TypeScript 5 is a broken install without
+        // tsserver.js. The cached SDK would report another compiler's
+        // results for it, so the installation is named instead.
         std::fs::write(
             package_dir.join("package.json"),
             r#"{"name":"typescript","version":"5.9.3"}"#,
         )
         .unwrap();
-        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
-        assert!(options.pointer("/tsserver/path").is_some(), "{options}");
-        assert!(note.contains("AFT cache fallback"), "{note}");
+        let error = typescript_runtime_options(None, &file, &project, &config).unwrap_err();
+        let LspError::ServerNotReady(reason) = error else {
+            panic!("expected a named gap, got {error}");
+        };
+        assert!(
+            reason.contains("TypeScript 5.9.3 at ") && reason.contains("has no lib/tsserver.js"),
+            "{reason}"
+        );
+
+        // An unreadable version is named too, never guessed.
+        std::fs::write(package_dir.join("package.json"), r#"{"name":"typescript"}"#).unwrap();
+        let error = typescript_runtime_options(None, &file, &project, &config).unwrap_err();
+        assert!(
+            error.to_string().contains("reports version \"unknown\""),
+            "{error}"
+        );
     }
 
     #[test]

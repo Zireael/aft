@@ -6,6 +6,9 @@ use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
     find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
 };
+use crate::lsp::typescript_project::{
+    project_typescript_for, resolve_native_binary, ProjectTypeScript, NATIVE_SERVER_ARGS,
+};
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -132,6 +135,15 @@ fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
 pub enum ServerKind {
     // --- Built-in (existing, pre-v0.17.0) ---
     TypeScript,
+    /// TypeScript 7 and later's own language server (`tsc --lsp --stdio`),
+    /// carrying the project's `node_modules/typescript` directory. It never
+    /// appears in the static registry: [`servers_for_file`] swaps it in for
+    /// the `typescript` server when the file's installed TypeScript is the
+    /// native compiler. The directory is part of the kind, and so of the
+    /// server key, so packages with different TypeScript installations under
+    /// one root get separate servers and a TypeScript 5 server never serves a
+    /// TypeScript 7 package's files (or the reverse).
+    TypeScriptNative(Arc<Path>),
     Python, // pyright
     Rust,
     Go,
@@ -177,6 +189,7 @@ impl ServerKind {
     pub fn id_str(&self) -> &str {
         match self {
             Self::TypeScript => "typescript",
+            Self::TypeScriptNative(_) => "typescript-native",
             Self::Python => "python",
             Self::Rust => "rust",
             Self::Go => "go",
@@ -714,7 +727,57 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .filter(|server| !is_disabled(server, config))
         .filter(|server| server.matches_extension(extension))
         .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+        // The swap runs after the disabled filter, so `lsp.disabled:
+        // ["typescript"]` still turns TypeScript off for native projects;
+        // the second filter lets `typescript-native` be disabled on its own.
+        .map(|server| select_typescript_server(server, path, config))
+        .filter(|server| !is_disabled(server, config))
         .collect()
+}
+
+const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
+
+/// Serve a TypeScript 7+ file with the native compiler's own language server.
+///
+/// `typescript-language-server` needs the `lib/tsserver.js` that TypeScript 7
+/// no longer ships, so for a file whose nearest installed TypeScript is the
+/// native compiler the `typescript` definition becomes a
+/// [`ServerKind::TypeScriptNative`] one that runs `tsc --lsp --stdio`. The
+/// choice is per file because one project can mix TypeScript versions across
+/// packages. The binary shown here is the platform binary when it resolves;
+/// the manager resolves it again at spawn and reports a named gap, without
+/// spawning anything, when it does not.
+fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> ServerDef {
+    // Only the built-in program is swapped: a user who pointed the
+    // `typescript` server at another binary has chosen their own server.
+    if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
+        return server;
+    }
+    let project_root = config.project_root.as_deref();
+    let Some(root) = server.workspace_root_for_file_with_project_root(path, project_root) else {
+        return server;
+    };
+    let Some(project) = project_typescript_for(path, &root, project_root)
+        .filter(ProjectTypeScript::is_native_compiler)
+    else {
+        return server;
+    };
+    let binary = resolve_native_binary(&project)
+        .map(|binary| binary.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "tsc".into());
+    ServerDef {
+        kind: ServerKind::TypeScriptNative(Arc::from(project.package_dir.as_path())),
+        name: "TypeScript native language server".into(),
+        extensions: server.extensions,
+        binary,
+        args: NATIVE_SERVER_ARGS.map(String::from).to_vec(),
+        root_markers: server.root_markers,
+        priority_root_markers: server.priority_root_markers,
+        env: server.env,
+        // Options configured for typescript-language-server (a tsserver.path,
+        // its preferences) mean nothing to the native server.
+        initialization_options: None,
+    }
 }
 
 /// Find every enabled server definition for which `path` is a root marker that
@@ -1020,6 +1083,114 @@ mod tests {
             .into_iter()
             .map(|server| server.kind)
             .collect()
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn install_typescript(package_parent: &Path, version: &str) -> PathBuf {
+        let package_dir = package_parent.join("node_modules").join("typescript");
+        write_file(
+            &package_dir.join("package.json"),
+            &format!(r#"{{"name":"typescript","version":"{version}"}}"#),
+        );
+        package_dir
+    }
+
+    fn typescript_server(file: &Path, config: &Config) -> Option<super::ServerDef> {
+        servers_for_file(file, config).into_iter().find(|server| {
+            matches!(
+                server.kind,
+                ServerKind::TypeScript | ServerKind::TypeScriptNative(_)
+            )
+        })
+    }
+
+    /// One root can hold packages with different TypeScript installations.
+    /// The native kind carries its TypeScript directory, so the two files get
+    /// different server keys even though their workspace root is the same.
+    #[test]
+    fn typescript_7_files_get_the_native_server_keyed_by_their_typescript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("tsconfig.json"), "{}");
+        let native_dir = install_typescript(&root.join("next"), "7.0.2");
+        install_typescript(&root.join("legacy"), "5.9.3");
+        let native_file = root.join("next").join("index.ts");
+        let legacy_file = root.join("legacy").join("index.ts");
+        write_file(&native_file, "");
+        write_file(&legacy_file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+
+        let native = typescript_server(&native_file, &config).unwrap();
+        assert_eq!(
+            native.kind,
+            ServerKind::TypeScriptNative(Arc::from(native_dir.as_path()))
+        );
+        assert_eq!(native.kind.id_str(), "typescript-native");
+        assert_eq!(native.args, vec!["--lsp", "--stdio"]);
+        assert_eq!(native.initialization_options, None);
+        let legacy = typescript_server(&legacy_file, &config).unwrap();
+        assert_eq!(legacy.kind, ServerKind::TypeScript);
+        assert_eq!(legacy.binary, "typescript-language-server");
+
+        // Same workspace root, different keys.
+        let config_root = config.project_root.as_deref();
+        assert_eq!(
+            native.workspace_root_for_file_with_project_root(&native_file, config_root),
+            legacy.workspace_root_for_file_with_project_root(&legacy_file, config_root),
+        );
+        assert_ne!(native.kind, legacy.kind);
+    }
+
+    #[test]
+    fn disabling_typescript_also_disables_the_native_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        for disabled in ["typescript", "typescript-native"] {
+            let config = Config {
+                project_root: Some(root.clone()),
+                disabled_lsp: [disabled.to_string()].into_iter().collect(),
+                ..Config::default()
+            };
+            assert!(
+                typescript_server(&file, &config).is_none(),
+                "lsp.disabled [{disabled}] left a TypeScript server"
+            );
+        }
+    }
+
+    /// A user who replaced the `typescript` server's program keeps it; only
+    /// the built-in typescript-language-server is swapped.
+    #[test]
+    fn user_chosen_typescript_program_is_not_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_servers: vec![UserServerDef {
+                id: "typescript".to_string(),
+                binary: "vtsls".to_string(),
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let server = typescript_server(&file, &config).unwrap();
+        assert_eq!(server.kind, ServerKind::TypeScript);
+        assert_eq!(server.binary, "vtsls");
     }
 
     #[test]
