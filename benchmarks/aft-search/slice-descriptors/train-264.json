@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oxlint-lsp",
+    "oc2-worktree-session-root",
+    "oc2-shared-wake-routes"
+  ],
+  "note": "Oxlint LSP registry entry, OpenCode 2 plugin session-root and wake-route fixes, Docker scenario rows; no ranking-fenced files."
+}
