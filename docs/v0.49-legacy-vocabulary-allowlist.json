@@ -547,44 +547,44 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 401,
+      "line": 409,
       "column": 35,
       "token": "filePath",
       "text": ".or_else(|| file.get(\"filePath\"))",
-      "location": "line 401, column 35",
+      "location": "line 409, column 35",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 641,
+      "line": 649,
       "column": 29,
       "token": "filePath",
       "text": "// relative filePath against the project root before the undo",
-      "location": "line 641, column 29",
+      "location": "line 649, column 29",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2566,
+      "line": 2574,
       "column": 23,
       "token": "toFile",
       "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 2566, column 23",
+      "location": "line 2574, column 23",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2568,
+      "line": 2576,
       "column": 45,
       "token": "toFile",
       "text": "\"Try one of these files for toFile\"",
-      "location": "line 2568, column 45",
+      "location": "line 2576, column 45",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -1574,44 +1574,44 @@
     },
     {
       "path": "crates/aft/tests/integration/read_freshness_test.rs",
-      "line": 122,
+      "line": 134,
       "column": 18,
       "token": "filePath",
       "text": "json!({ \"filePath\": file, \"startLine\": 40, \"endLine\": 100 }),",
-      "location": "line 122, column 18",
+      "location": "line 134, column 18",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/read_freshness_test.rs",
-      "line": 132,
+      "line": 144,
       "column": 56,
       "token": "filePath",
       "text": "let response = tool_call(aft, id, \"read\", json!({ \"filePath\": file }), hashline);",
-      "location": "line 132, column 56",
+      "location": "line 144, column 56",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/read_freshness_test.rs",
-      "line": 157,
+      "line": 169,
       "column": 22,
       "token": "filePath",
       "text": "json!({ \"filePath\": file, \"content\": patched }),",
-      "location": "line 157, column 22",
+      "location": "line 169, column 22",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/read_freshness_test.rs",
-      "line": 166,
+      "line": 178,
       "column": 18,
       "token": "filePath",
       "text": "\"filePath\": file,",
-      "location": "line 166, column 18",
+      "location": "line 178, column 18",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -1629,11 +1629,11 @@
     },
     {
       "path": "crates/aft/tests/integration/standalone_search_deferred_test.rs",
-      "line": 935,
+      "line": 1030,
       "column": 14,
       "token": "filePath",
       "text": "\"filePath\": \"source.ts\",",
-      "location": "line 935, column 14",
+      "location": "line 1030, column 14",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -1827,22 +1827,22 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "line": 13799,
+      "line": 13811,
       "column": 27,
       "token": "filePath",
       "text": "let window = json!({ \"filePath\": file.to_string_lossy(), \"startLine\": 40, \"endLine\": 100 });",
-      "location": "line 13799, column 27",
+      "location": "line 13811, column 27",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "line": 13807,
+      "line": 13819,
       "column": 14,
       "token": "filePath",
       "text": "\"filePath\": file.to_string_lossy(),",
-      "location": "line 13807, column 14",
+      "location": "line 13819, column 14",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -3731,6 +3731,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/read-vision-capability.test.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/reading.test.ts",
       "token": "filePath",
       "location": "file-level",
@@ -3999,13 +4006,6 @@
       "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/opencode-plugin/src/tools/__tests__/vision-capability.test.ts",
-      "token": "filePath",
-      "location": "file-level",
-      "class": "compatibility-fixture",
-      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
@@ -5074,6 +5074,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/pi-plugin/src/__tests__/read-vision-capability.test.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/pi-plugin/src/__tests__/reading.test.ts",
       "token": "filePath",
       "location": "file-level",
@@ -5082,13 +5089,6 @@
     },
     {
       "path": "packages/pi-plugin/src/__tests__/safety.test.ts",
-      "token": "filePath",
-      "location": "file-level",
-      "class": "compatibility-fixture",
-      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
-    },
-    {
-      "path": "packages/pi-plugin/src/tools/__tests__/vision-capability.test.ts",
       "token": "filePath",
       "location": "file-level",
       "class": "compatibility-fixture",
