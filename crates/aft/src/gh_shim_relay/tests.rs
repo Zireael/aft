@@ -1004,9 +1004,14 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
 struct DaemonScript {
     /// Refuse every route.open that carries a scope with this code.
     refuse_scoped_opens: Option<String>,
-    /// Before answering the first request on a scoped route, push a
-    /// `route.closed` for plexus with this reason.
-    close_first_scoped_route: Option<String>,
+    /// After answering the first request on a scoped route, push a
+    /// `route.closed` for plexus with reason `scope_ended`, and refuse every
+    /// later scoped route.open with `scope_ended`, as the daemon does once a
+    /// scope is removed.
+    end_scope_after_first_write: bool,
+    /// Hold the reply to the first request until a second request arrives;
+    /// answer the second at once and the first 200 ms later.
+    hold_first_request: bool,
 }
 
 /// Everything the fake daemon was sent.
@@ -1049,6 +1054,13 @@ impl FakeDaemon {
     }
 
     async fn transport(&self) -> SubcRelayTransport {
+        self.transport_with_deadline(None).await
+    }
+
+    async fn transport_with_deadline(
+        &self,
+        route_open_deadline: Option<std::time::Duration>,
+    ) -> SubcRelayTransport {
         let consumer = subc_client_rs::SubcConsumer::connect(
             &self.connection_file,
             subc_client_rs::ConsumerOptions {
@@ -1058,7 +1070,7 @@ impl FakeDaemon {
         )
         .await
         .expect("the fake daemon accepts the relay's connection");
-        SubcRelayTransport::with_consumer(consumer)
+        SubcRelayTransport::with_consumer(consumer, route_open_deadline)
     }
 }
 
@@ -1096,7 +1108,9 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                 }
                 let mut next_channel: u16 = 40;
                 let mut scoped_channels = Vec::new();
-                let mut closed_one = false;
+                let mut scope_ended = false;
+                let mut held = None;
+                let mut deferred = Vec::new();
                 while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
                     let header = frame.header;
                     let mut replies = Vec::new();
@@ -1135,14 +1149,26 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                 .unwrap()
                             };
                             if header.channel != 0 {
-                                log.lock().unwrap().requests.push(body);
                                 let scoped = scoped_channels.contains(&header.channel);
-                                if let Some(reason) = script
-                                    .close_first_scoped_route
-                                    .as_deref()
-                                    .filter(|_| scoped && !closed_one)
-                                {
-                                    closed_one = true;
+                                let seen = {
+                                    let mut log = log.lock().unwrap();
+                                    log.requests.push(body);
+                                    log.requests.len()
+                                };
+                                let reply = respond(json!({
+                                    "repo_binding_generation": 1,
+                                    "result": {"status": "completed"},
+                                }));
+                                if script.hold_first_request && seen == 1 {
+                                    held = Some(reply);
+                                    continue;
+                                }
+                                replies.push(reply);
+                                if let Some(first) = held.take() {
+                                    deferred.push(first);
+                                }
+                                if script.end_scope_after_first_write && scoped && !scope_ended {
+                                    scope_ended = true;
                                     replies.push(
                                         Frame::build(
                                             FrameType::Push,
@@ -1153,7 +1179,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                             serde_json::to_vec(&json!({
                                                 "op": "route.closed",
                                                 "module_id": PLEXUS_MODULE_ID,
-                                                "reason": reason,
+                                                "reason": "scope_ended",
                                                 "drained": false,
                                                 "abandoned": 0,
                                                 "excluded_subscriptions": 0,
@@ -1163,17 +1189,17 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                         .unwrap(),
                                     );
                                 }
-                                replies.push(respond(json!({
-                                    "repo_binding_generation": 1,
-                                    "result": {"status": "completed"},
-                                })));
                             } else {
                                 match body.get("op").and_then(Value::as_str) {
                                     Some("route.open") => {
                                         log.lock().unwrap().opens.push(body.clone());
                                         let scoped =
                                             body.get("scope").is_some_and(|s| !s.is_null());
-                                        match script.refuse_scoped_opens.as_deref() {
+                                        let refusal =
+                                            script.refuse_scoped_opens.clone().or_else(|| {
+                                                scope_ended.then(|| "scope_ended".to_string())
+                                            });
+                                        match refusal.as_deref() {
                                             Some(code) if scoped => replies.push(
                                                 Frame::build(
                                                     FrameType::Error,
@@ -1219,6 +1245,17 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                         _ => {}
                     }
                     for reply in replies {
+                        if subc_transport::write_frame(&mut stream, &reply)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // A held reply goes out a little after the one that
+                    // released it, so the second call finishes first.
+                    for reply in std::mem::take(&mut deferred) {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         if subc_transport::write_frame(&mut stream, &reply)
                             .await
                             .is_err()
@@ -1360,14 +1397,48 @@ async fn a_scope_refusal_on_route_open_is_relayed_typed_and_never_reopened_unsco
     }
 }
 
-/// Once the daemon closes a scoped route because of its scope, the transport
-/// does not open a route under that scope again; the call is refused under
-/// the close reason without reaching the daemon. Other scopes and unscoped
-/// calls are unaffected.
+/// After the daemon closes a scoped route because its scope was removed, the
+/// next write for that session opens a fresh route under the same scope, and
+/// the daemon's typed refusal of that open reaches the shim as it is: no
+/// unscoped route, no assertion mint, nothing sent.
 #[tokio::test]
-async fn a_route_closed_for_its_scope_is_not_reopened_under_that_scope() {
+async fn a_write_after_a_scope_close_relays_the_daemons_typed_refusal() {
     let daemon = fake_daemon(DaemonScript {
-        close_first_scoped_route: Some("scope_ended".to_string()),
+        end_scope_after_first_write: true,
+        ..DaemonScript::default()
+    })
+    .await;
+    let transport = daemon.transport().await;
+    let (first, _) = relay_stamped(&transport, "ses-scope-closed", "nonce-closed-1").await;
+    assert!(first.ok, "{:?}", first.data);
+
+    let (again, lines) = relay_stamped(&transport, "ses-scope-closed", "nonce-closed-2").await;
+    assert!(!again.ok);
+    assert_eq!(again.data["refusal_code"], "scope_ended");
+    assert_eq!(again.data["stage"], "plexus");
+    assert!(again.data.get("retryable").is_none(), "{:?}", again.data);
+    assert!(
+        lines[0].ends_with("path=stamp outcome=scope_ended"),
+        "{}",
+        lines[0]
+    );
+    let opens = daemon.opens();
+    assert_eq!(opens.len(), 2, "one open per write: {opens:?}");
+    assert!(opens.iter().all(is_scoped_open), "{opens:?}");
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "the refused write was never sent"
+    );
+}
+
+/// Two overlapping writes for one session share the client's cached route.
+/// The one that finishes first leaves the route open for the other, and the
+/// route is closed once, after both.
+#[tokio::test]
+async fn overlapping_writes_for_one_session_keep_their_shared_route_until_both_finish() {
+    let daemon = fake_daemon(DaemonScript {
+        hold_first_request: true,
         ..DaemonScript::default()
     })
     .await;
@@ -1375,102 +1446,47 @@ async fn a_route_closed_for_its_scope_is_not_reopened_under_that_scope() {
     let selector = scope_selector(&delegating_stamp());
     let body = || json!({"name": "github", "arguments": {"op": "bot_request"}});
 
-    let first = transport
-        .plexus("/p", "ses-closed", Some(&selector), body())
-        .await;
-    assert!(first.is_ok(), "{first:?}");
-    assert_eq!(daemon.opens().len(), 1);
-
-    let again = transport
-        .plexus("/p", "ses-closed", Some(&selector), body())
-        .await;
-    assert!(
-        matches!(&again, Err(TransportError::Refused { code, .. }) if code == "scope_ended"),
-        "{again:?}"
-    );
-    assert_eq!(daemon.opens().len(), 1, "no reopen under the closed scope");
-
-    let mut next_epoch = selector.clone();
-    next_epoch.scope_epoch = Some(8);
-    let other = transport
-        .plexus("/p", "ses-closed", Some(&next_epoch), body())
-        .await;
-    assert!(other.is_ok(), "{other:?}");
-    let unscoped = transport.plexus("/p", "ses-closed", None, body()).await;
-    assert!(unscoped.is_ok(), "{unscoped:?}");
-    let opens = daemon.opens();
-    assert_eq!(opens.len(), 3);
-    assert_eq!(opens[1]["scope"]["scope_epoch"], 8);
-    assert!(!is_scoped_open(&opens[2]));
-}
-
-fn selector_for(scope_ref: &str) -> ScopeSelector {
-    let mut selector = scope_selector(&delegating_stamp());
-    selector.scope_ref = scope_ref.to_string();
-    selector
-}
-
-/// The daemon's `route.closed` push does not name its route, so a scope close
-/// that arrives while two scopes have routes open ends neither; one that
-/// arrives in the window just after its route closed still ends that route's
-/// scope.
-#[test]
-fn a_scope_close_ends_only_the_one_scope_it_can_belong_to() {
-    let (a, b) = (selector_for("ref-a"), selector_for("ref-b"));
-
-    let mut overlapping = ScopedRoutes::default();
-    overlapping.opened(&a);
-    overlapping.opened(&b);
-    overlapping.drained(vec!["scope_ended".to_string()]);
-    assert_eq!(overlapping.ended(&a), None);
-    assert_eq!(overlapping.ended(&b), None);
-
-    let mut late = ScopedRoutes::default();
-    late.opened(&a);
-    late.drained(Vec::new());
-    late.closed(&a);
-    late.drained(Vec::new());
-    late.drained(vec!["scope_carrier_removed".to_string()]);
-    assert_eq!(late.ended(&a), Some("scope_carrier_removed"));
-    assert_eq!(late.ended(&b), None);
-
-    // Two overlapping calls under the same scope still name one scope, so the
-    // close ends it.
-    let mut same_scope = ScopedRoutes::default();
-    same_scope.opened(&a);
-    same_scope.opened(&a);
-    same_scope.closed(&a);
-    same_scope.drained(vec!["scope_ended".to_string()]);
-    assert_eq!(same_scope.ended(&a), Some("scope_ended"));
-}
-
-/// Only a plexus route closed for a `scope_*` reason counts as a scope close.
-#[test]
-fn only_scope_reasons_on_plexus_routes_are_scope_closes() {
-    let push = |module_id: &str, reason: &str| subc_client_rs::ControlPush {
-        op: "route.closed".to_string(),
-        body: json!({"op": "route.closed", "module_id": module_id, "reason": reason}),
+    let first = transport.plexus("/p", "ses-overlap", Some(&selector), body());
+    let second = async {
+        while daemon.requests().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        transport
+            .plexus("/p", "ses-overlap", Some(&selector), body())
+            .await
     };
-    for reason in [
-        "scope_ended",
-        "scope_carrier_removed",
-        "scope_delegation_changed",
-        "scope_parent_ended",
-    ] {
-        assert_eq!(
-            scope_close_reason(&push(PLEXUS_MODULE_ID, reason)).as_deref(),
-            Some(reason)
+    let (first, second) = tokio::join!(first, second);
+    assert!(second.is_ok(), "{second:?}");
+    assert!(first.is_ok(), "the first write lost its route: {first:?}");
+    assert_eq!(daemon.opens().len(), 1, "both writes used one route");
+    assert_eq!(daemon.requests().len(), 2);
+    assert_eq!(daemon.closes(1).await.len(), 1);
+}
+
+/// When the daemon keeps refusing a scoped open for a reason the client
+/// retries (`scope_not_synced`, `scope_changed`) until the deadline runs out,
+/// the shim gets that code, marked retryable.
+#[tokio::test]
+async fn a_retried_scope_refusal_that_outlasts_the_deadline_keeps_its_code() {
+    for code in ["scope_not_synced", "scope_changed"] {
+        let daemon = fake_daemon(DaemonScript {
+            refuse_scoped_opens: Some(code.to_string()),
+            ..DaemonScript::default()
+        })
+        .await;
+        let transport = daemon
+            .transport_with_deadline(Some(std::time::Duration::from_millis(300)))
+            .await;
+        let (reply, _) = relay_stamped(&transport, "ses-scope-retried", "nonce-retried").await;
+        assert!(!reply.ok, "{code}");
+        assert_eq!(reply.data["refusal_code"], code, "{:?}", reply.data);
+        assert_eq!(reply.data["retryable"], true, "{code}");
+        assert_eq!(reply.data["stage"], "plexus", "{code}");
+        let opens = daemon.opens();
+        assert!(
+            !opens.is_empty() && opens.iter().all(is_scoped_open),
+            "{code}: {opens:?}"
         );
+        assert!(daemon.requests().is_empty(), "{code}: nothing was sent");
     }
-    for reason in ["reload", "restart", "crash", "disable", "capability_denied"] {
-        assert_eq!(
-            scope_close_reason(&push(PLEXUS_MODULE_ID, reason)),
-            None,
-            "{reason}"
-        );
-    }
-    assert_eq!(
-        scope_close_reason(&push(PREFRONTAL_MODULE_ID, "scope_ended")),
-        None
-    );
 }
