@@ -46,7 +46,7 @@ type ChatMessagePool = Parameters<typeof interruptBashWaitsForChatMessage>[0];
 export interface V2PromptDetachRuntime {
   /** The Location's bridge pool, where a session's waits live. */
   readonly pool: ChatMessagePool;
-  /** The directory the pool was acquired for; tried first when detaching. */
+  /** The directory the pool was acquired for; its bridge is asked to detach before any other. */
   readonly projectRoot: string;
   /**
    * Read on every prompt so a live config reload of

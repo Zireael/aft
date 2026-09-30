@@ -49,9 +49,10 @@ async function validate(context: HarnessValidationContext): Promise<void> {
 
 /**
  * A row that sends a message while a call is waiting declares which control
- * sends it, which call it must end, and how soon. The comparison alone proves
- * the result is the interrupted one; this adds that it came back promptly, so a
- * wait that ran to its natural end and only then reported cannot pass.
+ * sends it, which call it must end, and how soon. The row's result comparison
+ * alone proves the call returned the interrupted-wait text; this adds that the
+ * result came back promptly after the message, so a wait that ran to its
+ * natural end and only then reported cannot pass.
  */
 export interface MessageDetachPlan {
   control_id: string;
