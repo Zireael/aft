@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "gh-shim-pr-create-v16",
+    "hardened-signing-ort-pin"
+  ],
+  "note": "Touches fenced files only to check the ONNX Runtime library's sha256 before every load (semantic_index.rs, a new ort_pin module registered in lib.rs); the embedding model, chunking, scoring and ranking are unchanged, so every ranked row must stay byte-identical to the committed reference. Also adds the gh shim's governed `pr create` reader behind manifest v16, and signs staged cards with hardened runtime plus an ONNX Runtime load smoke."
+}
