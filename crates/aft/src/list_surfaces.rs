@@ -286,6 +286,15 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    // The unanalyzed-macro note on `callers` is one summary line, not a list
+    // the agent pages through: it states how many mentions exist (or that the
+    // count is a lower bound) and says how many of them it spells out.
+    ExclusionEntry {
+        file: "commands/callgraph_store_adapter.rs",
+        enclosing_item: "unanalyzed_macro_note",
+        location_or_primitive: "macro note site truncate",
+        reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",
+    },
     // The lexical lane's depth tiers are engine-internal cuts over a candidate
     // pool (D_k = 200..3200); the agent never sees this list. The only cut an
     // agent sees is the search surface's topK, which carries the envelope.
