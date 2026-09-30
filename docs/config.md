@@ -764,3 +764,14 @@ also stop triggering reindexing.
 Naming a file explicitly in `grep` (e.g. `path: "captures/log.txt"`) searches it
 even when it is gitignored or `.aftignore`d, matching ripgrep — an explicitly
 named file is always searched.
+
+## Oxlint language server
+
+Install Oxlint in the project with `npm install --save-dev oxlint` and add an
+`.oxlintrc.json` or `.oxlintrc` configuration file to enable its JS/TS diagnostics.
+AFT starts `node_modules/.bin/oxlint --lsp` (supported since Oxlint 1.29.0).
+If the project's `node_modules/.bin/oxc_language_server` is present, AFT prefers
+that standalone server with no arguments, including when both binaries exist.
+This supports older releases that lack `--lsp` without probing the version on
+every start. AFT does not auto-install Oxlint; the project's dependency controls
+its version. Current releases such as 1.86.0 use `oxlint --lsp` only.

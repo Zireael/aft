@@ -55,6 +55,22 @@ pub fn resolve_server_binary(
     workspace_root: Option<&Path>,
     config: &Config,
 ) -> Option<PathBuf> {
+    if server.kind == ServerKind::Oxlint && server.binary == "oxlint" {
+        // Older npm releases ship a standalone server, including versions before
+        // oxlint gained --lsp (1.29). Prefer it when present, even alongside
+        // oxlint, so those projects work without a version/help subprocess probe.
+        for root in [workspace_root, config.project_root.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(found) = probe_dir(
+                &root.join("node_modules").join(".bin"),
+                "oxc_language_server",
+            ) {
+                return Some(found);
+            }
+        }
+    }
     let python_family = matches!(server.kind, ServerKind::Python | ServerKind::Ty);
 
     if python_family {
@@ -260,6 +276,26 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// The standalone Oxlint server uses stdio without the CLI's --lsp flag.
+    pub fn spawn_args_for_binary(&self, binary: &Path) -> Vec<String> {
+        if self.kind == ServerKind::Oxlint
+            && self.binary == "oxlint"
+            && matches!(
+                binary.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "oxc_language_server"
+                        | "oxc_language_server.cmd"
+                        | "oxc_language_server.exe"
+                        | "oxc_language_server.bat"
+                )
+            )
+        {
+            Vec::new()
+        } else {
+            self.args.clone()
+        }
+    }
+
     /// Return the workspace root this server should use for a file.
     pub fn workspace_root_for_file(&self, file_path: &Path) -> Option<PathBuf> {
         self.workspace_root_for_file_with_project_root(file_path, None)
@@ -593,13 +629,13 @@ pub fn builtin_servers() -> Vec<ServerDef> {
         ),
         builtin_server(
             ServerKind::Oxlint,
-            "oxc-language-server",
+            "oxlint",
             // Same JS/TS family as TypeScript LS; coexists rather than replaces.
             &[
                 "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "vue", "astro", "svelte",
             ],
-            "oxc-language-server",
-            &[],
+            "oxlint",
+            &["--lsp"],
             // Only trigger on actual oxlint config files. We previously also
             // matched `package.json`, but that fired oxc on every JS/TS project
             // whether they used oxlint or not, producing a persistent warning
@@ -1077,7 +1113,7 @@ mod tests {
 
     use super::{
         builtin_servers, is_config_file_path, resolve_lsp_binary, resolve_server_binary,
-        servers_for_file, ServerKind,
+        servers_for_file, ServerDef, ServerKind,
     };
     use crate::config::{Config, UserServerDef};
 
@@ -1391,7 +1427,7 @@ mod tests {
 
     #[test]
     fn test_oxlint_root_markers_exclude_package_json() {
-        // Regression guard (v0.17.2): oxc-language-server previously listed
+        // Oxlint previously listed
         // `package.json` as a root marker, which fired oxc on every JS/TS
         // project — including the overwhelming majority that don't use
         // oxlint — producing a persistent "binary missing" warning whenever
@@ -1758,6 +1794,77 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    fn oxlint_def() -> ServerDef {
+        builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Oxlint)
+            .unwrap()
+    }
+
+    #[test]
+    fn oxlint_resolves_cli_with_lsp_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxlint"));
+        let server = oxlint_def();
+        assert_eq!(server.binary, "oxlint");
+        assert_eq!(server.args, ["--lsp"]);
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxlint"));
+        assert_eq!(server.spawn_args_for_binary(&binary), ["--lsp"]);
+    }
+
+    #[test]
+    fn oxlint_resolves_standalone_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxc_language_server"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
+    }
+
+    #[test]
+    fn oxlint_prefers_standalone_alongside_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxlint"));
+        touch_exe(&local_bin.join("oxc_language_server"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oxlint_standalone_npm_shim_has_no_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxc_language_server.cmd"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server.cmd"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
     }
 
     #[test]

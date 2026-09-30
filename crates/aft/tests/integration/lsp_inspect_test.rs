@@ -387,3 +387,65 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
 }
+
+/// Opt-in because this test installs a pinned npm package and requires network/cache access.
+#[test]
+#[ignore = "requires npm and oxlint@1.86.0 from the network or npm cache"]
+fn lsp_inspect_real_oxlint_reports_no_debugger() {
+    let dir = tempdir().unwrap();
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let install = std::process::Command::new(npm)
+        .args([
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--save-dev",
+            "oxlint@1.86.0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("npm is required for the real Oxlint test");
+    assert!(
+        install.status.success(),
+        "Oxlint install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    std::fs::write(
+        dir.path().join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error"}}"#,
+    )
+    .unwrap();
+    let file = dir.path().join("a.ts");
+    std::fs::write(&file, "export {};\ndebugger;\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-oxlint", "command": "configure", "harness": "opencode",
+            "project_root": dir.path(),
+            "config": user_config(json!({"lsp": {"disabled": ["typescript"]}}))
+        })
+        .to_string(),
+    );
+    assert_eq!(configure["success"], true, "{configure:?}");
+    let inspect = json!({
+        "id": "inspect-oxlint", "command": "lsp_inspect", "file": file
+    })
+    .to_string();
+    let mut response = aft.send(&inspect);
+    // Oxlint publishes diagnostics asynchronously rather than supporting pull.
+    // Give its initial didOpen report a bounded window to reach AFT's event queue.
+    for _ in 0..20 {
+        if response["diagnostics_count"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        response = aft.send(&inspect);
+    }
+    assert_eq!(response["success"], true, "{response:?}");
+    assert!(
+        response["diagnostics_count"].as_u64().unwrap_or(0) > 0,
+        "{response:?}"
+    );
+    assert!(response.to_string().contains("no-debugger"), "{response:?}");
+    assert!(aft.shutdown().success());
+}

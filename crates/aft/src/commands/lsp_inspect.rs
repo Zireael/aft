@@ -172,7 +172,7 @@ fn inspect_server(
         "binary_source": binary_source,
         "workspace_root": workspace_root.as_ref().map(|path| path.display().to_string()),
         "spawn_status": spawn_status,
-        "args": def.args,
+        "args": binary_path.as_deref().map(|path| def.spawn_args_for_binary(path)).unwrap_or_else(|| def.args.clone()),
     })
 }
 
