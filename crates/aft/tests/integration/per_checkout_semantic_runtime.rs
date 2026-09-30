@@ -210,10 +210,13 @@ fn repository() -> Repository {
     git(&main, &["add", "."]);
     git(&main, &["commit", "-q", "-m", "initial"]);
     let linked = base.join("linked");
-    git(
-        &main,
-        &["worktree", "add", "-q", linked.to_str().unwrap(), "HEAD"],
-    );
+    // `canonicalize` gives a verbatim `\\?\C:\...` path on Windows, which git
+    // rejects when creating the worktree, so git gets the plain form. The
+    // canonical form stays in `linked` for AFT, which compares it with the
+    // paths it resolves itself.
+    let linked_arg = linked.to_str().unwrap();
+    let linked_arg = linked_arg.strip_prefix(r"\\?\").unwrap_or(linked_arg);
+    git(&main, &["worktree", "add", "-q", linked_arg, "HEAD"]);
     Repository {
         _temp: temp,
         main,
