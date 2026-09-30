@@ -96,7 +96,102 @@ fn spawn_lsp_child(
 }
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
-type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
+/// Dynamic `workspace/didChangeWatchedFiles` registrations by registration
+/// id. A registration whose watchers could not be parsed still counts as a
+/// registration: the server asked for watched-file notifications, it just did
+/// not say for which files in a form this client understands.
+type WatchedFileRegistrations = Arc<Mutex<HashMap<String, Vec<RegisteredFileWatcher>>>>;
+
+/// LSP `WatchKind` bits. A watcher that omits `kind` wants all three.
+const WATCH_KIND_CREATE: u32 = 1;
+const WATCH_KIND_CHANGE: u32 = 2;
+const WATCH_KIND_DELETE: u32 = 4;
+const WATCH_KIND_ALL: u32 = WATCH_KIND_CREATE | WATCH_KIND_CHANGE | WATCH_KIND_DELETE;
+
+/// One file-system watcher a server registered through
+/// `client/registerCapability`: the glob it wants changes for, the optional
+/// base directory the glob is relative to, and which change kinds it wants.
+#[derive(Debug, Clone)]
+pub(crate) struct RegisteredFileWatcher {
+    base: Option<PathBuf>,
+    matcher: globset::GlobMatcher,
+    kind: u32,
+}
+
+impl RegisteredFileWatcher {
+    /// Parse one entry of `registerOptions.watchers`. Returns `None` for a
+    /// shape this client does not understand, such as an invalid glob.
+    fn parse(watcher: &Value) -> Option<Self> {
+        let kind = watcher
+            .get("kind")
+            .and_then(Value::as_u64)
+            .and_then(|kind| u32::try_from(kind).ok())
+            .unwrap_or(WATCH_KIND_ALL);
+        let glob_pattern = watcher.get("globPattern")?;
+        let (base, pattern) = match glob_pattern {
+            Value::String(pattern) => (None, pattern.as_str()),
+            Value::Object(relative) => {
+                // RelativePattern: `baseUri` is either a URI string or a
+                // WorkspaceFolder object carrying one.
+                let base_uri = relative.get("baseUri")?;
+                let base_uri = base_uri
+                    .as_str()
+                    .or_else(|| base_uri.get("uri").and_then(Value::as_str))?;
+                let base = url::Url::parse(base_uri).ok()?.to_file_path().ok()?;
+                (Some(base), relative.get("pattern")?.as_str()?)
+            }
+            _ => return None,
+        };
+        // Globs are matched with `/` separators. Servers on Windows build
+        // absolute globs from native paths, whose backslashes would otherwise
+        // be read as escapes or literals that never match.
+        #[cfg(windows)]
+        let pattern = pattern.replace('\\', "/");
+        let matcher = globset::GlobBuilder::new(pattern.as_ref())
+            .literal_separator(true)
+            .build()
+            .ok()?
+            .compile_matcher();
+        Some(Self {
+            base,
+            matcher,
+            kind,
+        })
+    }
+
+    fn matches(&self, path: &Path, typ: lsp_types::FileChangeType) -> bool {
+        let wanted = match typ {
+            lsp_types::FileChangeType::CREATED => WATCH_KIND_CREATE,
+            lsp_types::FileChangeType::DELETED => WATCH_KIND_DELETE,
+            _ => WATCH_KIND_CHANGE,
+        };
+        if self.kind & wanted == 0 {
+            return false;
+        }
+        match &self.base {
+            Some(base) => path
+                .strip_prefix(base)
+                .is_ok_and(|relative| self.matcher.is_match(relative)),
+            None => self.matcher.is_match(path),
+        }
+    }
+}
+
+/// A snapshot of every watcher a server has registered, for filtering a batch
+/// of file-system events without holding the registration lock per event.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegisteredFileWatchers {
+    watchers: Vec<RegisteredFileWatcher>,
+}
+
+impl RegisteredFileWatchers {
+    /// Whether any registered watcher wants this change to `path`.
+    pub(crate) fn matches(&self, path: &Path, typ: lsp_types::FileChangeType) -> bool {
+        self.watchers
+            .iter()
+            .any(|watcher| watcher.matches(path, typ))
+    }
+}
 
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,7 +715,7 @@ impl LspClient {
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
-        let watched_file_registrations = Arc::new(Mutex::new(HashSet::new()));
+        let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
         let reader_writer = Arc::clone(&writer);
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
@@ -1032,6 +1127,20 @@ impl LspClient {
             .lock()
             .map(|registrations| !registrations.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Every watcher from the server's current dynamic registrations, or
+    /// `None` when it holds none. `None` is different from an empty set: a
+    /// server that only advertised initialize-time support never said which
+    /// files it cares about, so the caller chooses a filter for it.
+    pub(crate) fn registered_file_watchers(&self) -> Option<RegisteredFileWatchers> {
+        let registrations = self.watched_file_registrations.lock().ok()?;
+        if registrations.is_empty() {
+            return None;
+        }
+        Some(RegisteredFileWatchers {
+            watchers: registrations.values().flatten().cloned().collect(),
+        })
     }
 
     /// Send a request and wait for the response.
@@ -1567,7 +1676,21 @@ fn record_watched_file_registration(
                         == Some("workspace/didChangeWatchedFiles")
                     {
                         if let Some(id) = item.get("id").and_then(Value::as_str) {
-                            guard.insert(id.to_string());
+                            let watchers = item
+                                .pointer("/registerOptions/watchers")
+                                .and_then(Value::as_array)
+                                .map(|watchers| {
+                                    watchers
+                                        .iter()
+                                        .filter_map(RegisteredFileWatcher::parse)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            log::debug!(
+                                "server registered watched files id={id} watchers={:?}",
+                                item.pointer("/registerOptions/watchers")
+                            );
+                            guard.insert(id.to_string(), watchers);
                         }
                     }
                 }

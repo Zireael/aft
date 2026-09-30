@@ -2385,6 +2385,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         ctx.reset_symbol_cache();
         let _ = ctx.mark_status_bar_tier2_stale();
         ctx.clear_tsconfig_membership_cache();
+        ctx.lsp_reload_rust_workspaces_after_lost_watcher_events();
         true
     }) else {
         return false;
@@ -2864,26 +2865,36 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 }
                 completed
             }
-            WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
-                WatcherDrainApplyPhase::LspDiagnostics,
-                &mut paths,
-                &mut remaining,
-                started,
-                WATCHER_DRAIN_SLICE_BUDGET,
-                |path| {
-                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                        if !path.exists() {
-                            status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
-                            return;
-                        }
-                        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
-                        status_changed |= stale.changed;
-                        if stale.had_entries {
-                            ctx.lsp_resync_changed_file_for_diagnostics(path);
-                        }
-                    });
-                },
-            ),
+            WatcherDrainApplyPhase::LspDiagnostics => {
+                // Collected here and forwarded once per slice, so each server
+                // gets one watched-files notification per batch, not per path.
+                let mut forwarded_paths = Vec::new();
+                let completed = apply_watcher_path_phase(
+                    WatcherDrainApplyPhase::LspDiagnostics,
+                    &mut paths,
+                    &mut remaining,
+                    started,
+                    WATCHER_DRAIN_SLICE_BUDGET,
+                    |path| {
+                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            forwarded_paths.push(path.to_path_buf());
+                            if !path.exists() {
+                                status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
+                                return;
+                            }
+                            let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                            status_changed |= stale.changed;
+                            if stale.had_entries {
+                                ctx.lsp_resync_changed_file_for_diagnostics(path);
+                            }
+                        });
+                    },
+                );
+                let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                    ctx.lsp_forward_watcher_file_events(&forwarded_paths);
+                });
+                completed
+            }
             WatcherDrainApplyPhase::Complete => true,
         };
 

@@ -27,7 +27,8 @@ use crate::lsp::pull_params::{
     AftWorkspaceDiagnosticRequest,
 };
 use crate::lsp::registry::{
-    resolve_server_binary, servers_for_file, servers_with_root_marker, ServerDef, ServerKind,
+    is_config_file_path_with_custom, resolve_server_binary, servers_for_file,
+    servers_with_root_marker, ServerDef, ServerKind,
 };
 use crate::lsp::roots::ServerKey;
 use crate::lsp::LspError;
@@ -584,6 +585,12 @@ pub struct LspManager {
     /// Server/root pairs for which we already logged that watched-file
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
+    /// rust-analyzer instances with a workspace reload running on a helper
+    /// thread because the file watcher saw a Cargo manifest change (see
+    /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
+    /// manifests of further changes seen while that reload runs, so the
+    /// thread checks them once more instead of a second thread starting.
+    watcher_rust_reloads: HashMap<ServerKey, Option<Vec<PathBuf>>>,
     /// The last watched-file routing decision, retained on Windows so a CI
     /// timeout can distinguish a skipped send from a delayed fake-server reply.
     #[cfg(windows)]
@@ -658,6 +665,7 @@ impl LspManager {
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
+            watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
                 .to_string(),
@@ -1604,6 +1612,214 @@ impl LspManager {
             self.last_watched_file_notification_trace = trace.join("\n");
         }
         Ok(())
+    }
+
+    /// Forward changes the project file watcher saw (edits made by other
+    /// programs, `cargo update`, a branch switch) to the running servers that
+    /// asked to be told about them, one `workspace/didChangeWatchedFiles` per
+    /// server per batch.
+    ///
+    /// Servers are gated exactly like [`Self::notify_files_watched_changed`]:
+    /// only one that advertised watched-file support or registered a watcher
+    /// hears anything. A server with dynamic registrations gets the events
+    /// its registered globs and change kinds select. A server with only
+    /// initialize-time support never said which files it wants, so it gets
+    /// the project configuration files (see `is_config_file_path_with_custom`),
+    /// the same set AFT's own edits forward.
+    ///
+    /// A batch selecting more than [`WATCHED_FILE_FORWARD_CAP`] events for one
+    /// server (a large checkout or generated tree) is not sent per file: the
+    /// server gets only the configuration files in it, and nothing if even
+    /// those overflow.
+    ///
+    /// Returns, per rust-analyzer instance, the Cargo manifests, lockfiles,
+    /// toolchain files or Cargo configs in the batch that it did NOT receive
+    /// through a watcher it registered (the list is empty after an overflow,
+    /// when the batch was not inspected per file). rust-analyzer 1.98 re-runs
+    /// `cargo metadata` on its own when told about a `Cargo.toml` or
+    /// `Cargo.lock` matching its registered globs, so those need nothing
+    /// more. For the rest (a file its globs do not cover, a server that
+    /// registered no globs, a batch too large to forward) the caller asks
+    /// for a manifest-gated reload instead (see
+    /// [`spawn_watcher_rust_workspace_reload`]).
+    pub fn forward_watcher_file_events(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        let mut rust_manifest_changes = Vec::new();
+        if events.is_empty() {
+            return rust_manifest_changes;
+        }
+        // A server's root and globs may spell a path either the way the
+        // watcher reported it or resolved (on macOS a temp dir is both
+        // `/var/...` and `/private/var/...`), so both spellings are matched.
+        let events: Vec<(&Path, PathBuf, FileChangeType)> = events
+            .iter()
+            .map(|(path, typ)| (path.as_path(), resolve_for_lsp_uri(path), *typ))
+            .collect();
+        let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        for key in keys {
+            let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
+                .iter()
+                .filter(|(raw, resolved, _)| {
+                    resolved.starts_with(&key.root) || raw.starts_with(&key.root)
+                })
+                .collect();
+            if in_root.is_empty() {
+                continue;
+            }
+            let mut manifests: Vec<PathBuf> = if key.kind == ServerKind::Rust {
+                in_root
+                    .iter()
+                    .filter(|(_, resolved, _)| is_rust_workspace_manifest(&key.root, resolved))
+                    .map(|(_, resolved, _)| resolved.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut overflowed = false;
+            let mut sent_to_registered_watcher: Vec<PathBuf> = Vec::new();
+
+            if let Some(client) = self.clients.get(&key) {
+                if client.supports_watched_files() || client.has_watched_file_registration() {
+                    let watchers = client.registered_file_watchers();
+                    let is_config =
+                        |raw: &Path| is_config_file_path_with_custom(raw, extra_config_markers);
+                    let wanted =
+                        |(raw, resolved, typ): &&&(&Path, PathBuf, FileChangeType)| match &watchers
+                        {
+                            Some(watchers) => {
+                                watchers.matches(raw, *typ) || watchers.matches(resolved, *typ)
+                            }
+                            None => is_config(raw),
+                        };
+                    // `take` bounds the work as well as the message: a burst of
+                    // a hundred thousand paths stops being inspected one past
+                    // the cap.
+                    let mut selected: Vec<_> = in_root
+                        .iter()
+                        .filter(wanted)
+                        .take(WATCHED_FILE_FORWARD_CAP + 1)
+                        .collect();
+                    if selected.len() > WATCHED_FILE_FORWARD_CAP {
+                        overflowed = true;
+                        selected = in_root
+                            .iter()
+                            .filter(wanted)
+                            .filter(|(raw, _, _)| is_config(raw))
+                            .take(WATCHED_FILE_FORWARD_CAP + 1)
+                            .collect();
+                        if selected.len() > WATCHED_FILE_FORWARD_CAP {
+                            selected.clear();
+                        }
+                        slog_info!(
+                            "watched-file forward for {:?} exceeded {} files; sending {} configuration file(s) only",
+                            key,
+                            WATCHED_FILE_FORWARD_CAP,
+                            selected.len()
+                        );
+                    }
+                    let changes: Vec<FileEvent> = selected
+                        .iter()
+                        .filter_map(|(_, resolved, typ)| {
+                            uri_for_path(resolved)
+                                .ok()
+                                .map(|uri| FileEvent::new(uri, *typ))
+                        })
+                        .collect();
+                    if !changes.is_empty() {
+                        let sent = self.clients.get_mut(&key).map(|client| {
+                            client.send_notification::<DidChangeWatchedFiles>(
+                                DidChangeWatchedFilesParams { changes },
+                            )
+                        });
+                        match sent {
+                            Some(Ok(())) if watchers.is_some() => {
+                                sent_to_registered_watcher = selected
+                                    .iter()
+                                    .map(|(_, resolved, _)| resolved.clone())
+                                    .collect();
+                            }
+                            Some(Err(error)) => {
+                                crate::slog_warn!(
+                                    "watched-file forward to {:?} failed: {error}",
+                                    key
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if self.watched_file_skip_logged.insert(key.clone()) {
+                    log::debug!(
+                        "skipping didChangeWatchedFiles for {:?} (not supported or registered)",
+                        key
+                    );
+                }
+            }
+
+            if key.kind != ServerKind::Rust {
+                continue;
+            }
+            manifests.retain(|manifest| {
+                !sent_to_registered_watcher.contains(manifest)
+                    || !matches!(
+                        manifest.file_name().and_then(|name| name.to_str()),
+                        Some("Cargo.toml" | "Cargo.lock")
+                    )
+            });
+            // After an overflow the batch was not inspected per file, so ask
+            // anyway; the reload is gated on manifest modification times and
+            // costs nothing when none changed.
+            if !manifests.is_empty() || overflowed {
+                rust_manifest_changes.push((key, manifests));
+            }
+        }
+        rust_manifest_changes
+    }
+
+    /// Register a watcher-started rust-analyzer reload. Returns false when
+    /// one is already running for `key`; `manifests` are then queued for
+    /// that reload's thread to check once it finishes.
+    pub(crate) fn claim_watcher_rust_reload(
+        &mut self,
+        key: &ServerKey,
+        manifests: &[PathBuf],
+    ) -> bool {
+        match self.watcher_rust_reloads.get_mut(key) {
+            Some(pending) => {
+                pending
+                    .get_or_insert_with(Vec::new)
+                    .extend(manifests.iter().cloned());
+                false
+            }
+            None => {
+                self.watcher_rust_reloads.insert(key.clone(), None);
+                true
+            }
+        }
+    }
+
+    /// Manifests queued while a watcher-started reload ran, or `None` when
+    /// nothing was queued, which also ends that reload's registration.
+    pub(crate) fn take_queued_watcher_rust_reload(
+        &mut self,
+        key: &ServerKey,
+    ) -> Option<Vec<PathBuf>> {
+        let queued = self.watcher_rust_reloads.get_mut(key)?.take();
+        if queued.is_none() {
+            self.watcher_rust_reloads.remove(key);
+        }
+        queued
+    }
+
+    /// Every running rust-analyzer instance.
+    pub(crate) fn rust_server_keys(&self) -> Vec<ServerKey> {
+        self.clients
+            .keys()
+            .filter(|key| key.kind == ServerKind::Rust)
+            .cloned()
+            .collect()
     }
 
     /// Close a document in all servers that have it open.
@@ -4893,6 +5109,93 @@ pub fn reload_rust_workspace_if_manifests_changed(
         .lock()
         .finish_rust_workspace_reload(key, &result, previous);
     accepted
+}
+
+/// Most file-system events forwarded to one server in one
+/// `workspace/didChangeWatchedFiles` notification. Past this a batch is a
+/// bulk change (a checkout, a generated tree), where per-file events cost the
+/// server more than they tell it; see
+/// [`LspManager::forward_watcher_file_events`].
+pub const WATCHED_FILE_FORWARD_CAP: usize = 512;
+
+/// How long a watcher-started rust-analyzer reload waits before checking the
+/// manifests, so the several files one `cargo` command or checkout writes
+/// lead to one reload rather than one per file.
+const WATCHER_RUST_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Whether `path` is one of the files that decide how Cargo loads the
+/// workspace at `root` (the set [`rust_workspace_manifest_paths`] checks):
+/// a `Cargo.toml`, `Cargo.lock`, toolchain file, or `.cargo/config(.toml)`.
+/// Files under a build or VCS directory never are, whatever their name.
+fn is_rust_workspace_manifest(root: &Path, path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let is_manifest = match file_name {
+        "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" => true,
+        "config" | "config.toml" => path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == ".cargo"),
+        _ => false,
+    };
+    is_manifest
+        && !path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .any(|component| {
+                let name = component.as_os_str();
+                name == "target" || name == ".git"
+            })
+}
+
+/// Reload a running rust-analyzer's workspace on a helper thread after the
+/// file watcher saw Cargo manifests, lockfiles, toolchain files or Cargo
+/// configs change without rust-analyzer being told through a watcher it
+/// registered. `manifests` lists those changed paths; it is empty when the
+/// watcher's change set was too large to inspect per file or was lost
+/// (a watcher overflow), in which case only the workspace root's files are
+/// checked.
+///
+/// rust-analyzer re-reads its Cargo manifests only when it hears about a
+/// change it registered for or is asked to reload. It registers no watcher
+/// for toolchain files or Cargo config, and none at all while no workspace
+/// is loaded. Without this, such a change made outside AFT (a `cargo`
+/// command, a branch switch) left the old workspace, and its errors, in
+/// place until the next `aft_inspect`, which runs the same reload check
+/// before collecting diagnostics.
+///
+/// The reload itself is [`reload_rust_workspace_if_manifests_changed`], so
+/// it happens only when a manifest really is newer than the server's last
+/// load. Debounced per server: one thread per server at a time, and changes
+/// seen while it runs are checked once more when it finishes. The thread
+/// waits for the manager lock and the server's answer so the watcher drain
+/// never does.
+pub fn spawn_watcher_rust_workspace_reload(
+    manager: Arc<parking_lot::Mutex<LspManager>>,
+    key: ServerKey,
+    manifests: Vec<PathBuf>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("aft-rust-reload".into())
+        .spawn(move || {
+            if !manager.lock().claim_watcher_rust_reload(&key, &manifests) {
+                return;
+            }
+            let mut scope_roots = manifests;
+            loop {
+                std::thread::sleep(WATCHER_RUST_RELOAD_DEBOUNCE);
+                reload_rust_workspace_if_manifests_changed(&manager, &key, &scope_roots);
+                match manager.lock().take_queued_watcher_rust_reload(&key) {
+                    Some(queued) => scope_roots = queued,
+                    None => return,
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        crate::slog_warn!("could not start a rust-analyzer workspace reload thread: {error}");
+    }
 }
 
 /// Walk the inspected area and record, per server key, the first file a server

@@ -495,7 +495,16 @@ fn main() -> io::Result<()> {
                                 "dynamicRegistration": true
                             }
                         });
-                        should_register_watched_files = true;
+                        // AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY=1 still
+                        // advertises `workspace.didChangeWatchedFiles` in the
+                        // initialize result but never sends
+                        // client/registerCapability, so the client may send
+                        // watched-file events yet knows no globs for them.
+                        should_register_watched_files =
+                            std::env::var("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY")
+                                .ok()
+                                .as_deref()
+                                != Some("1");
                     }
 
                     if pull_enabled {
@@ -899,6 +908,12 @@ fn main() -> io::Result<()> {
                         flycheck_running = mode != "never";
                     }
                     if should_register_watched_files {
+                        // AFT_FAKE_LSP_WATCHED_GLOBS replaces the catch-all
+                        // watcher with a JSON array of FileSystemWatcher values.
+                        let watchers = std::env::var("AFT_FAKE_LSP_WATCHED_GLOBS")
+                            .ok()
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                            .unwrap_or_else(|| json!([{ "globPattern": "**/*" }]));
                         write_request(
                             &mut writer,
                             10_000,
@@ -909,9 +924,7 @@ fn main() -> io::Result<()> {
                                         "id": "fake-lsp-watched-files",
                                         "method": "workspace/didChangeWatchedFiles",
                                         "registerOptions": {
-                                            "watchers": [
-                                                { "globPattern": "**/*" }
-                                            ]
+                                            "watchers": watchers
                                         }
                                     }
                                 ]

@@ -15,7 +15,7 @@ use aft::context::AppContext;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::{LspClient, LspEvent};
 use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-use aft::lsp::manager::LspManager;
+use aft::lsp::manager::{LspManager, WATCHED_FILE_FORWARD_CAP};
 use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, ServerKind};
 use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
@@ -832,7 +832,9 @@ fn config_file_detection_accepts_custom_root_markers_but_excludes_lockfiles() {
         &PathBuf::from("pyrightconfig-custom.json"),
         &custom_markers
     ));
-    assert!(!is_config_file_path_with_custom(
+    // Cargo.lock counts as configuration: rust-analyzer's workspace load
+    // fails on a stale one, so its changes must reach the server.
+    assert!(is_config_file_path_with_custom(
         &PathBuf::from("Cargo.lock"),
         &[]
     ));
@@ -844,11 +846,13 @@ fn config_file_detection_accepts_custom_root_markers_but_excludes_lockfiles() {
 
 #[test]
 fn lockfiles_are_not_watched_config_files() {
+    // Cargo.lock is the one lockfile that is watched: a stale Cargo.lock
+    // stops rust-analyzer from loading the workspace's dependencies, so its
+    // updates must reach the server. The others only churn on installs.
     for lockfile in [
         "package-lock.json",
         "yarn.lock",
         "pnpm-lock.yaml",
-        "Cargo.lock",
         "go.sum",
         "bun.lock",
         "bun.lockb",
@@ -2743,5 +2747,478 @@ fn server_without_server_status_keeps_authoritative_behavior() {
         manager.diagnostics_store_for_test().error_warning_counts(),
         (1, 1),
         "servers without the readiness signal retain existing behavior"
+    );
+}
+
+fn real_rust_analyzer_available() -> bool {
+    Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn configured_rust_context(root: &std::path::Path) -> AppContext {
+    crate::helpers::disable_in_process_file_watcher();
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage_dir.clone()),
+            ..Config::default()
+        },
+    );
+    let configure: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "configure",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "config": crate::helpers::user_config(serde_json::json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false
+        })),
+    }))
+    .expect("configure parses");
+    let response =
+        serde_json::to_value(aft::commands::configure::handle_configure(&configure, &ctx))
+            .expect("configure response serializes");
+    assert_eq!(response["success"], true, "configure failed: {response:#}");
+    ctx
+}
+
+fn lsp_diagnostics_for(ctx: &AppContext, id: &str, file: &std::path::Path) -> serde_json::Value {
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 5000
+    }))
+    .expect("request parses");
+    serde_json::to_value(handle_lsp_diagnostics(&req, ctx)).expect("response serializes")
+}
+
+/// The lines of `file` that `lsp_diagnostics` currently reports errors on.
+fn error_lines_for(response: &serde_json::Value) -> Vec<u64> {
+    response["diagnostics"]
+        .as_array()
+        .map(|diagnostics| {
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic["severity"] == "error")
+                .filter_map(|diagnostic| diagnostic["line"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll `lsp_diagnostics` until `done` accepts the response or `timeout`
+/// passes; returns the last response either way.
+fn poll_lsp_diagnostics(
+    ctx: &AppContext,
+    file: &std::path::Path,
+    timeout: Duration,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let response = lsp_diagnostics_for(ctx, &format!("diag-poll-{attempt}"), file);
+        if done(&response) || Instant::now() >= deadline {
+            return response;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// rust-analyzer run with `--locked` cannot read the dependencies of a
+/// workspace whose Cargo.lock is stale, so it loads the workspace without
+/// them and a call into a path dependency goes unchecked. `cargo update`,
+/// run with no AFT tool involved, fixes the lockfile; the project file
+/// watcher's event for it is then the only way rust-analyzer can learn of
+/// the change. A later `lsp_diagnostics` (no inspect, no AFT edit) must
+/// report the type error that only the full load can see.
+#[test]
+fn lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        eprintln!("SKIP lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed");
+        return;
+    }
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::create_dir_all(root.join("newdep/src")).expect("create dependency src");
+    let package = "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    fs::write(root.join("Cargo.toml"), package).expect("write manifest");
+    let lib = root.join("src/lib.rs");
+    // `newdep::other` returns a string, so line 1 is a type error, but only
+    // once rust-analyzer has loaded `newdep`; without the dependency the
+    // call's type is unknown and nothing is reported. Line 2 is wrong on its
+    // own and shows the file is being analyzed either way.
+    fs::write(
+        &lib,
+        "pub fn from_dep() -> u8 { newdep::other() }\npub fn local() -> u8 { \"text\" }\n",
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("newdep/Cargo.toml"),
+        "[package]\nname = \"newdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write dependency manifest");
+    fs::write(
+        root.join("newdep/src/lib.rs"),
+        "pub fn other() -> &'static str { \"text\" }\n",
+    )
+    .expect("write dependency lib");
+    let generated = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    // The dependency is added after the lockfile was written: stale.
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("{package}[dependencies]\nnewdep = {{ path = \"newdep\" }}\n"),
+    )
+    .expect("add dependency");
+
+    let ctx = configured_rust_context(&root);
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+
+    let stale = poll_lsp_diagnostics(&ctx, &lib, Duration::from_secs(60), |response| {
+        error_lines_for(response).contains(&2)
+    });
+    assert_eq!(
+        error_lines_for(&stale),
+        vec![2],
+        "control: the stale load analyzes the file but cannot see the dependency: {stale:#}"
+    );
+    // rust-analyzer re-fetches its workspace once on its own shortly after
+    // startup; fix the lockfile only after that, so recovery cannot come
+    // from that startup fetch.
+    thread::sleep(Duration::from_secs(3));
+    let updated = Command::new("cargo")
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("run cargo update");
+    assert!(updated.status.success(), "{updated:?}");
+
+    // What the live watcher delivers for the rewritten lockfile.
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![root.join("Cargo.lock")]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+
+    let fixed = poll_lsp_diagnostics(&ctx, &lib, Duration::from_secs(60), |response| {
+        error_lines_for(response).contains(&1)
+    });
+    let mut lines = error_lines_for(&fixed);
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        vec![1, 2],
+        "after the lockfile is fixed, lsp_diagnostics must report the full load: {fixed:#}"
+    );
+}
+
+/// A Rust workspace served by the fake language server with the environment
+/// `env` builds from the workspace root, its server started on
+/// `src/main.rs`, and a watcher channel the test feeds.
+fn fake_rust_server_with_watcher(
+    env: impl FnOnce(&std::path::Path) -> Vec<(String, String)>,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    AppContext,
+    crossbeam_channel::Sender<WatcherDispatchEvent>,
+) {
+    let (temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = files[0].clone();
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    for (key, value) in env(&root) {
+        ctx.lsp().set_extra_env(&key, &value);
+    }
+    let config = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(&file, "fn main() {}\n", &config)
+        .expect("versioned notify spawns the workspace server");
+    // The fake registers its watchers while handling `initialized`, before
+    // it sees the didOpen that this publish answers, and the client records
+    // a registration before queuing anything read after it.
+    wait_for_publish(&mut ctx.lsp());
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    (temp_dir, root, file, ctx, watcher_tx)
+}
+
+fn env_pair(key: &str, value: &str) -> Vec<(String, String)> {
+    vec![(key.to_string(), value.to_string())]
+}
+
+/// Send a didChange for the open `file` and collect everything the fake
+/// server reports until it acknowledges that change. The server handles
+/// messages in order, so any watched-file notification sent before this call
+/// is reported before the acknowledgement: an empty result proves none was.
+/// Returns the watched-file notification params and every method seen.
+fn server_reports_before_barrier(
+    ctx: &AppContext,
+    file: &std::path::Path,
+    barrier_text: &str,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let config = ctx.config();
+    ctx.lsp()
+        .notify_file_changed(file, barrier_text, &config)
+        .expect("barrier didChange");
+    let mut watched = Vec::new();
+    let mut methods = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the barrier didChange; saw {methods:?}"
+        );
+        for event in ctx.lsp().drain_events() {
+            if let LspEvent::Notification { method, params, .. } = event {
+                methods.push(method.clone());
+                if method == "custom/watchedFilesChanged" {
+                    watched.push(params.unwrap_or_default());
+                } else if method == "custom/documentChanged" {
+                    return (watched, methods);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// (path relative to `root`, change type) for each change in one
+/// watched-file notification, sorted.
+fn forwarded_changes(root: &std::path::Path, params: &serde_json::Value) -> Vec<(String, i64)> {
+    let root = fs::canonicalize(root).expect("canonical root");
+    let mut changes: Vec<(String, i64)> = params["changes"]
+        .as_array()
+        .expect("changes array")
+        .iter()
+        .map(|change| {
+            let uri = url::Url::parse(change["uri"].as_str().expect("uri")).expect("file uri");
+            let path = uri.to_file_path().expect("file path");
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (relative, change["type"].as_i64().expect("type"))
+        })
+        .collect();
+    changes.sort();
+    changes
+}
+
+#[test]
+fn watcher_drain_forwards_only_changes_matching_registered_watchers() {
+    let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|root| {
+        let base_uri = url::Url::from_file_path(root.join("sub")).expect("base uri");
+        let globs = serde_json::json!([
+            { "globPattern": "**/*.special" },
+            // WatchKind 4: deletions only.
+            { "globPattern": "**/*.only", "kind": 4 },
+            { "globPattern": { "baseUri": base_uri.as_str(), "pattern": "*.rel" } }
+        ]);
+        vec![("AFT_FAKE_LSP_WATCHED_GLOBS".to_string(), globs.to_string())]
+    });
+    fs::create_dir_all(root.join("sub")).expect("create sub");
+    for name in ["a.special", "b.txt", "kept.only", "sub/x.rel", "y.rel"] {
+        fs::write(root.join(name), "x\n").expect("write watched fixture");
+    }
+    let paths = [
+        "a.special",
+        "b.txt",
+        "kept.only",
+        "gone.only",
+        "sub/x.rel",
+        "y.rel",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .collect();
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(paths))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "one notification per batch: {watched:?}");
+    assert_eq!(
+        forwarded_changes(&root, &watched[0]),
+        vec![
+            ("a.special".to_string(), 2),
+            ("gone.only".to_string(), 3),
+            ("sub/x.rel".to_string(), 2),
+        ],
+        "only registered globs and kinds are forwarded"
+    );
+}
+
+#[test]
+fn watcher_drain_forwards_nothing_to_a_server_without_watched_file_support() {
+    let (_temp_dir, root, file, ctx, watcher_tx) =
+        fake_rust_server_with_watcher(|_| env_pair("AFT_FAKE_LSP_NO_WATCHED_FILES", "1"));
+    fs::write(root.join("src/other.rs"), "fn other() {}\n").expect("write source");
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![
+            root.join("Cargo.toml"),
+            root.join("src/other.rs"),
+        ]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert!(
+        watched.is_empty(),
+        "a server that neither advertised nor registered watched files hears nothing: {watched:?}"
+    );
+}
+
+#[test]
+fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
+    let (_temp_dir, root, file, ctx, watcher_tx) =
+        fake_rust_server_with_watcher(|_| env_pair("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY", "1"));
+    fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
+    fs::write(root.join("src/other.rs"), "fn other() {}\n").expect("write source");
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![
+            root.join("Cargo.toml"),
+            root.join("Cargo.lock"),
+            root.join("src/other.rs"),
+        ]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "{watched:?}");
+    assert_eq!(
+        forwarded_changes(&root, &watched[0]),
+        vec![("Cargo.lock".to_string(), 2), ("Cargo.toml".to_string(), 2)],
+        "without globs, only project configuration files are forwarded"
+    );
+}
+
+#[test]
+fn watcher_overflow_sends_no_per_file_flood() {
+    let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
+    // The fake's default watcher is `**/*`, so every path below matches. Missing files
+    // are forwarded as deletions, which is enough to fill the batch.
+    let mut paths: Vec<PathBuf> = (0..WATCHED_FILE_FORWARD_CAP + 10)
+        .map(|index| root.join(format!("src/generated_{index}.rs")))
+        .collect();
+    paths.push(root.join("Cargo.toml"));
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(paths))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "{} notifications", watched.len());
+    assert_eq!(
+        forwarded_changes(&root, &watched[0]),
+        vec![("Cargo.toml".to_string(), 2)],
+        "an oversized batch forwards only its configuration files"
+    );
+
+    // Lost events: the watcher asks for a rescan and names no paths.
+    watcher_tx
+        .send(WatcherDispatchEvent::RescanRequired(
+            aft::watcher_filter::RescanReason::Unknown,
+        ))
+        .expect("send rescan");
+    drain_watcher_events(&ctx);
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 2; }\n");
+    assert!(
+        watched.is_empty(),
+        "a rescan sends no per-file notifications: {watched:?}"
+    );
+}
+
+/// Wait up to `timeout` for the fake server to report that AFT asked it to
+/// reload its workspace.
+fn saw_workspace_reload(ctx: &AppContext, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in ctx.lsp().drain_events() {
+            if matches!(
+                &event,
+                LspEvent::Notification { method, .. } if method == "custom/reloadWorkspace"
+            ) {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+#[test]
+fn watcher_manifest_change_outside_registered_globs_reloads_rust_workspace() {
+    let (_temp_dir, root, _file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| {
+        env_pair(
+            "AFT_FAKE_LSP_WATCHED_GLOBS",
+            r#"[{ "globPattern": "**/*.rs" }]"#,
+        )
+    });
+    // Let file times move past the server's load time.
+    thread::sleep(Duration::from_millis(1100));
+
+    fs::write(root.join("src/other.rs"), "fn other() {}\n").expect("write source");
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![root.join("src/other.rs")]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+    assert!(
+        !saw_workspace_reload(&ctx, Duration::from_millis(1500)),
+        "control: a source change does not reload the workspace"
+    );
+
+    // The server's globs do not cover the lockfile, so it cannot hear about
+    // the change: AFT asks it to reload instead.
+    fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![root.join("Cargo.lock")]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+    assert!(
+        saw_workspace_reload(&ctx, Duration::from_secs(15)),
+        "a lockfile change the server was not told about must reload its workspace"
+    );
+}
+
+#[test]
+fn watcher_manifest_change_forwarded_to_registered_glob_does_not_reload() {
+    // The default fake registers `**/*`, which covers the lockfile.
+    let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
+    thread::sleep(Duration::from_millis(1100));
+    fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![root.join("Cargo.lock")]))
+        .expect("send watcher event");
+    drain_watcher_events(&ctx);
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "{watched:?}");
+    assert!(
+        !saw_workspace_reload(&ctx, Duration::from_millis(1500)),
+        "rust-analyzer re-reads a lockfile it registered for; a reload on top would repeat the load"
     );
 }

@@ -874,11 +874,17 @@ pub fn is_config_file_path(path: &Path) -> bool {
     // creates unnecessary churn without affecting language analysis.
     // Intentional: this list is checked BEFORE builtin_config_file_names so a
     // file that is both a root_marker and a lockfile is excluded.
+    //
+    // Cargo.lock is deliberately absent. AFT starts rust-analyzer with
+    // `--locked`, so when Cargo.toml gains or changes a dependency the old
+    // lockfile no longer matches and `cargo metadata` fails; rust-analyzer
+    // then loads the workspace without its dependencies and re-reads the
+    // lockfile only when told it changed. So a lockfile update is a
+    // project-graph change for Rust, not install churn.
     const LOCKFILE_NAMES: &[&str] = &[
         "package-lock.json",
         "yarn.lock",
         "pnpm-lock.yaml",
-        "Cargo.lock",
         "Gemfile.lock",
         "poetry.lock",
         "go.sum",
@@ -1038,6 +1044,7 @@ mod tests {
             "/repo/pyproject.toml",
             "/repo/pyrightconfig.json",
             "/repo/Cargo.toml",
+            "/repo/Cargo.lock",
             "/repo/go.mod",
             "/repo/biome.json",
         ] {
@@ -1050,9 +1057,9 @@ mod tests {
         // Lockfiles are excluded even though they appear in root_markers —
         // they change on every package install and triggering LSP re-analysis
         // on each install creates unnecessary churn. See the LOCKFILE_NAMES
-        // list in is_config_file_path().
+        // list in is_config_file_path(). Cargo.lock is the exception checked
+        // above: a stale one breaks rust-analyzer's workspace load.
         for path in [
-            "/repo/Cargo.lock",
             "/repo/go.sum",
             "/repo/bun.lock",
             "/repo/bun.lockb",

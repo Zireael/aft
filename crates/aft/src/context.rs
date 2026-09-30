@@ -9162,6 +9162,87 @@ impl AppContext {
         }
     }
 
+    /// Forward paths the project file watcher saw change to the language
+    /// servers that registered for them (see
+    /// [`LspManager::forward_watcher_file_events`]), and have rust-analyzer
+    /// reload its workspace when a Cargo manifest among them changed.
+    ///
+    /// The watcher reports paths without the kind of change, so a path that
+    /// exists is reported as changed and a missing one as deleted, as AFT's
+    /// own config-file notifications do. rust-analyzer decides between
+    /// created and modified from its own file set, whatever the event says.
+    pub fn lsp_forward_watcher_file_events(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let events: Vec<(PathBuf, FileChangeType)> = paths
+            .iter()
+            .map(|path| (path.clone(), Self::change_type_from_current_state(path)))
+            .collect();
+        let markers = self.custom_lsp_root_markers();
+        self.with_lsp_manager_off_drain("aft-lsp-watched-files", move |lsp| {
+            lsp.forward_watcher_file_events(&events, &markers)
+        });
+    }
+
+    /// After the file watcher lost events (an overflow that needs a rescan),
+    /// ask every running rust-analyzer to reload its workspace if a Cargo
+    /// manifest changed since its last load. Other servers get no per-file
+    /// events: the lost paths are unknown, and a flood of guesses would cost
+    /// them more than a missed notification for files AFT resyncs when it
+    /// next opens or edits them.
+    pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
+        self.with_lsp_manager_off_drain("aft-lsp-watcher-rescan", |lsp| {
+            lsp.rust_server_keys()
+                .into_iter()
+                .map(|key| (key, Vec::new()))
+                .collect()
+        });
+    }
+
+    /// Run `work` on the LSP manager for the watcher drain, then start the
+    /// rust-analyzer reloads it returns (see
+    /// [`crate::lsp::manager::spawn_watcher_rust_workspace_reload`]).
+    ///
+    /// The drain must not wait for the manager lock, but dropping the work
+    /// when another thread holds it would leave servers on the old files (and
+    /// rust-analyzer on the old workspace) until some later change. So an
+    /// uncontended lock runs `work` here, and a contended one hands it to a
+    /// helper thread that waits.
+    fn with_lsp_manager_off_drain<F>(&self, thread_name: &str, work: F)
+    where
+        F: FnOnce(&mut LspManager) -> Vec<(crate::lsp::roots::ServerKey, Vec<PathBuf>)>
+            + Send
+            + 'static,
+    {
+        fn run<F>(manager: &Arc<parking_lot::Mutex<LspManager>>, lsp: &mut LspManager, work: F)
+        where
+            F: FnOnce(&mut LspManager) -> Vec<(crate::lsp::roots::ServerKey, Vec<PathBuf>)>,
+        {
+            for (key, manifests) in work(lsp) {
+                crate::lsp::manager::spawn_watcher_rust_workspace_reload(
+                    Arc::clone(manager),
+                    key,
+                    manifests,
+                );
+            }
+        }
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
+            run(&self.lsp_manager, &mut lsp, work);
+            return;
+        }
+        let manager = Arc::clone(&self.lsp_manager);
+        if let Err(error) = std::thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                let mut lsp = manager.lock();
+                run(&manager, &mut lsp, work);
+            })
+        {
+            crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
+        }
+    }
+
     /// Drop cached LSP diagnostics for a deleted/renamed-away file so its
     /// errors/warnings don't linger in the warm set (no server republishes for
     /// a vanished path), keeping the status bar and `aft_inspect` honest.
