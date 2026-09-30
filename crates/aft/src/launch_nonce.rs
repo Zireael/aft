@@ -17,7 +17,7 @@
 //! and must not consume a descriptor it was not given.
 
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use subc_protocol::manifest::{build_provenance, LaunchNonceSource, ManifestProvenance};
 
@@ -139,9 +139,27 @@ pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
 /// supplied. The protocol helper reports the version of the wire crate actually
 /// linked into AFT; the nonce source remains a separate runtime fact.
 pub fn provenance() -> Option<ManifestProvenance> {
-    let declared = build_provenance(option_env!("AFT_BUILD_GIT_SHA"), None, None)
-        .expect("the build revision must be a full Git SHA");
-    Some(declared.with_launch_nonce_source(current().map(|nonce| nonce.source)))
+    static BUILD: OnceLock<ManifestProvenance> = OnceLock::new();
+    let declared = BUILD.get_or_init(|| build_facts(option_env!("AFT_BUILD_GIT_SHA")));
+    Some(
+        declared
+            .clone()
+            .with_launch_nonce_source(current().map(|nonce| nonce.source)),
+    )
+}
+
+fn build_facts(revision: Option<&str>) -> ManifestProvenance {
+    match build_provenance(revision, None, None) {
+        Ok(declared) => declared,
+        Err(error) => {
+            // A malformed build revision must not prevent module registration.
+            // The caller caches these build facts, so this warning occurs once.
+            log::warn!("subc build revision refused; declaring provenance without a SHA: {error}");
+            ManifestProvenance::new().with_wire_crate_version(Some(
+                subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string(),
+            ))
+        }
+    }
 }
 
 /// Restores the previously captured nonce when dropped.
@@ -198,6 +216,15 @@ mod tests {
         let printed = format!("{nonce:?}");
         assert!(!printed.contains("secret-launch-nonce"), "{printed}");
         assert!(printed.contains("19 bytes redacted"), "{printed}");
+    }
+
+    #[test]
+    fn refused_build_revision_preserves_wire_version_without_panicking() {
+        let declared = build_facts(Some("not-a-git-sha"))
+            .with_launch_nonce_source(Some(LaunchNonceSource::Fd));
+        assert_eq!(declared.build_git_sha, None);
+        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.27.0"));
+        assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Fd));
     }
 
     #[test]
