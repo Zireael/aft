@@ -11,7 +11,7 @@ import {
 } from "../../harness/permission-plan.js";
 import { loadScenarios, materializeParityScenarios } from "../../harness/scenario-loader.js";
 import type { RecordedMockExchange, ScenarioDefinition } from "../../harness/types.js";
-import extension from "./bash.extension.js";
+import extension, { judgeMessageDetachEvent } from "./bash.extension.js";
 
 const loaded = materializeParityScenarios(await loadScenarios(resolve(import.meta.dir)));
 const scenarios = new Map(loaded.map((scenario) => [scenario.id, scenario]));
@@ -57,7 +57,7 @@ const refusal =
 
 describe("bash OpenCode 2 scenarios", () => {
   test("load through the harness loader and satisfy the slice validator", async () => {
-    expect(loaded.length).toBe(15);
+    expect(loaded.length).toBe(17);
     await extension.validate?.({
       repo_root: resolve(import.meta.dir, "../../../../../.."),
       platform: "linux",
@@ -313,5 +313,83 @@ describe("AFT task rows say whether AFT ran the command", () => {
     for (const id of ["bash/T3/loop_ask_deny", "bash/T3/fallback_config_deny"]) {
       expect(() => assertBashAftExecutionIdentity(scenario(id), [])).not.toThrow();
     }
+  });
+});
+
+describe("a message sent mid-wait must end that wait promptly", () => {
+  const rows = ["bash/T5/message_detaches_wait", "bash/T5/message_aborts_sync_watch"];
+
+  function events(row: ScenarioDefinition) {
+    const plan = row.metadata?.message_detach as { control_id: string; call_id: string };
+    const control = row.controls?.find((candidate) => candidate.id === plan.control_id);
+    const call = row.turns
+      .flatMap((turn) => (turn.response.kind === "tool_calls" ? turn.response.calls : []))
+      .find((candidate) => candidate.id === plan.call_id);
+    if (!control || !call) throw new Error(`${row.id}: declaration names nothing`);
+    return {
+      sent: (at: number) => ({ kind: "control_started" as const, control, at }),
+      result: (at: number) => ({
+        kind: "tool_result_observed" as const,
+        call,
+        before_turn: "after",
+        at,
+      }),
+    };
+  }
+
+  test("each row sends its message through the prompt route once the task runs", () => {
+    for (const id of rows) {
+      const row = scenario(id);
+      const control = row.controls?.[0];
+      expect(control?.purpose).toBe("message");
+      expect(control?.path).toBe("/api/session/{{session_id}}/prompt");
+      expect(control?.wait_for_task).toEqual({ status: "running", timeout_ms: 10_000 });
+    }
+  });
+
+  test("a result soon after the message passes", () => {
+    for (const id of rows) {
+      const row = scenario(id);
+      const { sent, result } = events(row);
+      const sentAt = new Map<string, number>();
+      judgeMessageDetachEvent(row, sent(1_000), sentAt, "run");
+      expect(() => judgeMessageDetachEvent(row, result(2_500), sentAt, "run")).not.toThrow();
+    }
+  });
+
+  test("a result that only arrives when the command finishes fails", () => {
+    for (const id of rows) {
+      const row = scenario(id);
+      const { sent, result } = events(row);
+      const sentAt = new Map<string, number>();
+      judgeMessageDetachEvent(row, sent(1_000), sentAt, "run");
+      expect(() => judgeMessageDetachEvent(row, result(39_000), sentAt, "run")).toThrow(
+        "over the 10000ms budget",
+      );
+    }
+  });
+
+  test("a result that came back before any message was sent fails", () => {
+    for (const id of rows) {
+      const row = scenario(id);
+      const { result } = events(row);
+      expect(() => judgeMessageDetachEvent(row, result(500), new Map(), "run")).toThrow(
+        "before the message was sent",
+      );
+    }
+  });
+
+  test("rows without the declaration are not judged", () => {
+    const row = scenario("bash/T4/abort");
+    const call = row.turns[0]?.response.kind === "tool_calls" ? row.turns[0].response.calls[0] : undefined;
+    if (!call) throw new Error("bash/T4/abort has no call");
+    expect(() =>
+      judgeMessageDetachEvent(
+        row,
+        { kind: "tool_result_observed", call, before_turn: "finish", at: 99_000 },
+        new Map(),
+        "run",
+      ),
+    ).not.toThrow();
   });
 });
