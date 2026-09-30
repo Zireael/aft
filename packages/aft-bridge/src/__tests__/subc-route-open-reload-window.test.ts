@@ -48,6 +48,8 @@ interface FakeDaemon {
   refusedRequests: number;
   /** Data-plane requests the daemon answered by GOODBYE-ing their route. */
   goodbyes: number;
+  rotateKey(): void;
+  publishKey(): void;
   close(): Promise<void>;
 }
 
@@ -74,7 +76,7 @@ async function startFakeDaemon(
   reloadWindowMs: number = RELOAD_WINDOW_MS,
   lateReload?: LateReload,
 ): Promise<FakeDaemon> {
-  const key = new Uint8Array(32).fill(7);
+  let key = new Uint8Array(32).fill(7);
   const daemonId = new Uint8Array(16).fill(9);
   const sockets = new Set<Socket>();
   const state = { refusals: 0, accepted: 0, requests: 0, refusedRequests: 0, goodbyes: 0 };
@@ -228,23 +230,30 @@ async function startFakeDaemon(
 
   const dir = mkdtempSync(join(tmpdir(), "aft-fake-subc-"));
   const connectionFile = join(dir, "connection.json");
-  writeFileSync(
-    connectionFile,
-    JSON.stringify({
-      schema: 1,
-      wire_version: 2,
-      endpoints: [{ host: "127.0.0.1", port: address.port }],
-      key: Array.from(key),
-      daemon_id: Array.from(daemonId),
-      pid: process.pid,
-      daemon_ver: "fake",
-    }),
-  );
+  const publishKey = (): void =>
+    writeFileSync(
+      connectionFile,
+      JSON.stringify({
+        schema: 1,
+        wire_version: 2,
+        endpoints: [{ host: "127.0.0.1", port: address.port }],
+        key: Array.from(key),
+        daemon_id: Array.from(daemonId),
+        pid: process.pid,
+        daemon_ver: "fake",
+      }),
+    );
+  publishKey();
   // subc-client refuses a connection file other users could read.
   chmodSync(connectionFile, 0o600);
 
   return {
     connectionFile,
+    rotateKey() {
+      key = new Uint8Array(32).fill(8);
+      for (const socket of sockets) socket.destroy();
+    },
+    publishKey,
     get refusals() {
       return state.refusals;
     },
@@ -272,6 +281,109 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
   const cleanups: Array<() => Promise<void> | void> = [];
   afterEach(async () => {
     while (cleanups.length > 0) await cleanups.pop()?.();
+  });
+
+  for (const tool of ["send", "bash_watch", "bash_status", "read"]) {
+    test(`reconnect re-reads a rotated key after a stale-key proof mismatch (${tool})`, async () => {
+      const daemon = await startFakeDaemon(
+        () => 0,
+        () => ({ structuredContent: { success: true, text: "live" } }),
+        0,
+      );
+      cleanups.push(() => daemon.close());
+      let client: SubcClient | undefined;
+      let attempts = 0;
+      const pool = new SubcTransportPool({
+        connectionFile: daemon.connectionFile,
+        harness: "opencode",
+        consumerIdentity: null,
+        connect: async (opts) => {
+          attempts += 1;
+          client = await SubcClient.connect(opts);
+          return client;
+        },
+        routeRetrySleep: async () => daemon.publishKey(),
+      });
+      cleanups.push(() => pool.shutdown());
+      const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+      await bridge.send("ping", {}, { session: "rotation" });
+      daemon.rotateKey();
+      client?.close();
+      // The old route must first report its dead socket before the pool reconnects.
+      await expect(bridge.send("ping", {}, { session: "rotation" })).rejects.toThrow();
+      const reply =
+        tool === "send"
+          ? await bridge.send("ping", {}, { session: "rotation" })
+          : await bridge.toolCall("rotation", tool, {});
+      expect(JSON.stringify(reply)).toContain("live");
+      expect(attempts).toBe(3);
+    });
+  }
+
+  for (const stall of ["key", "connect", "backoff"]) {
+    test(`rotated-key reconnect respects the request deadline (${stall})`, async () => {
+      const daemon = await startFakeDaemon(
+        () => 0,
+        () => ({ structuredContent: { success: true, text: "live" } }),
+        0,
+      );
+      cleanups.push(() => daemon.close());
+      let client: SubcClient | undefined;
+      let attempts = 0;
+      const pool = new SubcTransportPool({
+        connectionFile: daemon.connectionFile,
+        harness: "opencode",
+        consumerIdentity: null,
+        connect: async (opts) => {
+          attempts += 1;
+          if (stall === "connect" && attempts > 2) return new Promise<SubcClient>(() => {});
+          client = await SubcClient.connect(opts);
+          return client;
+        },
+        routeRetrySleep: async () => {
+          if (stall === "backoff") await new Promise<void>(() => {});
+        },
+      });
+      cleanups.push(() => pool.shutdown());
+      const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+      await bridge.send("ping", {}, { session: "rotation" });
+      daemon.rotateKey();
+      client?.close();
+      await expect(bridge.send("ping", {}, { session: "rotation" })).rejects.toThrow();
+      const started = performance.now();
+      await expect(
+        bridge.toolCall("rotation", "bash_watch", {}, { timeoutMs: 350 }),
+      ).rejects.toThrow(
+        "the subc daemon restarted and its connection key changed; the reconnect did not complete within the deadline, retry",
+      );
+      expect(performance.now() - started).toBeLessThan(1_500);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+    });
+  }
+
+  test("first-connect proof mismatch remains permanent", async () => {
+    const daemon = await startFakeDaemon(
+      () => 0,
+      () => ({ structuredContent: { success: true, text: "live" } }),
+      0,
+    );
+    cleanups.push(() => daemon.close());
+    daemon.rotateKey();
+    let attempts = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: daemon.connectionFile,
+      harness: "opencode",
+      consumerIdentity: null,
+      connect: (opts) => {
+        attempts += 1;
+        return SubcClient.connect(opts);
+      },
+    });
+    cleanups.push(() => pool.shutdown());
+    await expect(
+      pool.getBridge(TEST_PROJECT_ROOT).send("ping", {}, { session: "rotation" }),
+    ).rejects.toThrow("server proof mismatch — wrong key or impostor daemon");
+    expect(attempts).toBe(1);
   });
 
   test("subc-client's managed call keeps retrying module_reloading until the module is back", async () => {

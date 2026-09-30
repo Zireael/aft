@@ -21,6 +21,7 @@ import { existsSync, statSync } from "node:fs";
 
 import type { RouteHandle } from "@cortexkit/subc-client";
 import {
+  AuthError,
   type BindIdentity,
   type ConsumerIdentity,
   connectionFileExists,
@@ -62,6 +63,15 @@ export class SubcTransportShuttingDownError extends SubcCallError {
   constructor() {
     super("terminal", "subc transport is shutting down", "transport_shutting_down");
     this.name = "SubcTransportShuttingDownError";
+  }
+}
+
+class ReconnectKeyChangedError extends Error {
+  constructor() {
+    super(
+      "the subc daemon restarted and its connection key changed; the reconnect did not complete within the deadline, retry",
+    );
+    this.name = "ReconnectKeyChangedError";
   }
 }
 
@@ -1111,6 +1121,7 @@ export class SubcTransportPool implements AftTransportPool {
   private outerFacadeEvictor: (root: CanonicalRootPath, generation: RootGeneration) => void;
 
   private client: SubcClientLike | null = null;
+  private hadWorkingClient = false;
   /** Single-flight guard so concurrent first calls share one connect. */
   private connecting: Promise<SubcClientLike> | null = null;
   /** The growing delay for a safe, once-only route resend after route closure. */
@@ -1709,6 +1720,11 @@ export class SubcTransportPool implements AftTransportPool {
     abortSignal?: AbortSignal,
   ): Promise<unknown> {
     const callStartedAt = performance.now();
+    const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+    // Charge shared backoff delays even when an injected sleeper advances no real time.
+    let scheduledDelayMs = 0;
+    const spentMs = (): number => Math.max(performance.now() - callStartedAt, scheduledDelayMs);
+    const remainingMs = (): number => callDeadlineMs - spentMs();
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -1724,7 +1740,51 @@ export class SubcTransportPool implements AftTransportPool {
     try {
       let client: SubcClientLike;
       try {
-        client = await this.ensureClient();
+        let keyChanged: ReconnectKeyChangedError | undefined;
+        while (true) {
+          const remaining = remainingMs();
+          if (remaining <= 0)
+            throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            // Each attempt calls SubcClient.connect anew, which re-reads the connection file.
+            const acquired = await Promise.race([
+              this.ensureClient(),
+              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+              }),
+            ]);
+            if (acquired === CALL_DEADLINE_EXPIRED) {
+              throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
+            }
+            client = acquired;
+            break;
+          } catch (error) {
+            if (!(error instanceof ReconnectKeyChangedError)) throw error;
+            keyChanged = error;
+            if (spentMs() + this.nextRouteReopenDelayMs() >= callDeadlineMs) throw error;
+          } finally {
+            clearTimeout(timer);
+          }
+          const { delayMs, wait } = this.waitForRouteReopenBackoff();
+          scheduledDelayMs = spentMs() + delayMs;
+          // A shared retry sleeper may outlive this caller's remaining budget.
+          let retryTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const waited = await Promise.race([
+              wait,
+              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                retryTimer = setTimeout(
+                  () => resolve(CALL_DEADLINE_EXPIRED),
+                  callDeadlineMs - (performance.now() - callStartedAt),
+                );
+              }),
+            ]);
+            if (waited === CALL_DEADLINE_EXPIRED) throw keyChanged;
+          } finally {
+            clearTimeout(retryTimer);
+          }
+        }
         this.assertRecordLive(record);
       } catch (error) {
         throw this.annotateReapError(error, record);
@@ -1770,18 +1830,10 @@ export class SubcTransportPool implements AftTransportPool {
       // (a bind relay can hold one for about 12 s), retry sleeps, and the
       // request itself, which is sent with only the time that is left. So the
       // call never outlives the deadline it was given, whichever path it takes.
-      const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
       const reloadWaitBudgetMs = Math.min(callDeadlineMs, ROUTE_OPEN_RELOAD_WAIT_CEILING_MS);
-      // Retry delays this call has been charged for. Spent time never counts
-      // less than these: a caller that joins a shared retry timer part-way is
-      // still charged its full delay, as it always was, and an injected test
-      // sleeper may finish a delay without real time passing.
-      let scheduledDelayMs = 0;
       // The most recent route refusal, so a deadline that passes mid-open still
       // names the daemon's reason instead of a bare timeout.
       let lastRefusal: unknown;
-      const spentMs = (): number => Math.max(performance.now() - callStartedAt, scheduledDelayMs);
-      const remainingMs = (): number => callDeadlineMs - spentMs();
 
       // subc-client's routeOpen takes no deadline of its own (only its fixed
       // channel-0 default), so the call stops waiting for the open once its
@@ -2033,11 +2085,18 @@ export class SubcTransportPool implements AftTransportPool {
           throw new SubcTransportShuttingDownError();
         }
         this.client = client;
+        this.hadWorkingClient = true;
         this.transportFailures = 0;
         return client;
       })
       .catch((error) => {
         this.connecting = null;
+        // A previously authenticated transport can race the daemon's key rotation.
+        // Without a prior authenticated client, a proof mismatch can mean an impostor
+        // or misconfiguration, so preserve the SDK's permanent authentication error.
+        if (this.hadWorkingClient && error instanceof AuthError) {
+          throw new ReconnectKeyChangedError();
+        }
         throw error;
       });
     return this.connecting;
