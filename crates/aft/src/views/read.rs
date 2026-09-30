@@ -21,17 +21,17 @@ pub(crate) fn open_published_callgraph(
 
 /// Watcher edits do not change HEAD. Refuse to project an older published plane
 /// when any requested tracked source still has a different content key.
+///
+/// Checkout assembly keys every published callgraph plane with the ruled
+/// producer, so the current source must be keyed the same way. Keying it with
+/// the legacy producer would never match and would leave every published
+/// generation looking stale to inspect.
 pub(crate) fn callgraph_paths_match(
     manifest: &super::Manifest,
     root: &std::path::Path,
     paths: &[PathBuf],
 ) -> super::Result<bool> {
-    callgraph_paths_match_with_producer(
-        manifest,
-        root,
-        paths,
-        crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
-    )
+    callgraph_paths_match_with_producer(manifest, root, paths, super::callgraph::PRODUCER)
 }
 
 /// Content verification for an opted-in ruled callgraph generation. Legacy
