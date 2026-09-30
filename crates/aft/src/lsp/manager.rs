@@ -57,8 +57,8 @@ fn server_key_for_definition(
 }
 
 fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
-    // Native TypeScript servers share an id and can share a root; their
-    // TypeScript directory keeps the order stable.
+    // Native TypeScript servers share an id and can share a root, so the last
+    // comparison orders them by their TypeScript directory.
     let native_dir = |kind: &ServerKind| match kind {
         ServerKind::TypeScriptNative(dir) => Some(Arc::clone(dir)),
         _ => None,
@@ -4317,7 +4317,8 @@ fn typescript_runtime_options(
                 .map(|modules| modules.join("typescript").join("lib"))
                 .find(|lib| lib.join("tsserver.js").is_file())
             else {
-                // The server can discover global or bundled SDKs that AFT does not resolve.
+                // typescript-language-server can still find a global or
+                // bundled SDK that AFT does not resolve, so let it try.
                 return Ok((
                     options,
                     "TypeScript: server-managed SDK resolution (version not reported by AFT)"
@@ -6456,7 +6457,7 @@ mod typescript_worktree_tests {
             "{reason}"
         );
 
-        // An unreadable version is named too, never guessed.
+        // An unreadable version is reported as a named gap, never guessed.
         std::fs::write(package_dir.join("package.json"), r#"{"name":"typescript"}"#).unwrap();
         let error = typescript_runtime_options(None, &file, &project, &config).unwrap_err();
         assert!(

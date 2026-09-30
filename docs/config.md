@@ -606,6 +606,19 @@ only if their binary can be resolved from project `node_modules/.bin`, AFT's man
 | bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
 | yaml-language-server | `.yaml .yml` | `yaml-language-server` |
 
+**TypeScript 7 and later** ship no `tsserver.js`, so `typescript-language-server` cannot
+serve them. When the nearest installed `node_modules/typescript/package.json` reports version
+7 or later, AFT starts the compiler's own language server instead: the platform package's
+`@typescript/typescript-<os>-<cpu>/lib/tsc --lsp --stdio`, run directly rather than through the
+Node wrapper in `node_modules/.bin`. Its id is `typescript-native`. Each TypeScript 7
+installation gets its own server, separate from `typescript-language-server`, so a monorepo that
+mixes TypeScript 5 and 7 packages runs
+both. The choice follows what is installed, never the lockfile. `lsp.disabled: ["typescript"]`
+turns both off; `typescript-native` turns off only the native server. If the platform package is
+missing, or the installed version is unreadable, AFT reports a named gap and starts nothing.
+The built-in `typescript-language-server` is only swapped when you have not pointed the
+`typescript` server at another binary.
+
 **Experimental:** `ty` (Astral's Python type checker) — gated behind
 `experimental.lsp_ty: true` or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright
 unless you also disable Pyright via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"`
@@ -625,7 +638,7 @@ configuration above shows registering `tinymist` for Typst files. Required field
 `args`, `root_markers` (defaults to `[".git"]`), `disabled`.
 
 **Disabling a built-in:** add the server's id to `lsp.disabled`. Built-in ids are
-`typescript`, `python` (Pyright), `rust` (rust-analyzer), `go` (gopls), `bash`,
+`typescript`, `typescript-native` (TypeScript 7+), `python` (Pyright), `rust` (rust-analyzer), `go` (gopls), `bash`,
 `yaml`, and `ty`. Custom servers use the key you registered them under in
 `lsp.servers`. IDs are case-insensitive.
 
