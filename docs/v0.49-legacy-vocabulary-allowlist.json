@@ -162,22 +162,22 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "line": 152,
+      "line": 158,
       "column": 21,
       "token": "filePath",
       "text": "/// Params: `file`/`filePath` (string, optional) — when provided, previews that per-file stack;",
-      "location": "line 152, column 21",
+      "location": "line 158, column 21",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "line": 161,
+      "line": 167,
       "column": 37,
       "token": "filePath",
       "text": ".or_else(|| req.params.get(\"filePath\"))",
-      "location": "line 161, column 37",
+      "location": "line 167, column 37",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -569,22 +569,22 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2574,
+      "line": 2589,
       "column": 23,
       "token": "toFile",
       "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 2574, column 23",
+      "location": "line 2589, column 23",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 2576,
+      "line": 2591,
       "column": 45,
       "token": "toFile",
       "text": "\"Try one of these files for toFile\"",
-      "location": "line 2576, column 45",
+      "location": "line 2591, column 45",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
