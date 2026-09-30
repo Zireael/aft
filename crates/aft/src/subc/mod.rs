@@ -3131,10 +3131,67 @@ fn run_subc_mode_inner(
         exit_started.elapsed().as_millis()
     );
 
+    // Dropping a tokio runtime waits, without limit, for every blocking-pool
+    // thread to finish, idle ones included, and on a loaded machine each of
+    // those threads has to be scheduled before it can be joined. Nothing on
+    // the pool matters once the connection is gone, so the wait is capped
+    // and any thread still running is left to process exit.
+    runtime.shutdown_timeout(EXIT_RUNTIME_SHUTDOWN_WAIT);
+    log::info!(
+        "subc exit phase=runtime_shutdown elapsed_ms={}",
+        exit_started.elapsed().as_millis()
+    );
+    // Only the first exit in a process records its clocks; `main` reads them
+    // for the phases it runs after this function returns.
+    let _ = EXIT_STARTED.set(exit_started);
+    let _ = EXIT_TAIL_DEADLINE.set(Instant::now() + EXIT_TAIL_BUDGET);
+
     match loop_result {
         Ok(exit) => module_loop_exit_result(exit),
         Err(error) => Err(error),
     }
+}
+
+/// Cap on stopping the async runtime once LSP shutdown is done (see the call
+/// site in `run_subc_mode_inner`).
+const EXIT_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
+
+/// How long the process may take, after the async runtime has stopped, to
+/// flush its durable log, settle native ONNX Runtime work and exit. The drain
+/// exit budget is spent almost entirely on index flushes and LSP shutdown, so
+/// this tail must stay short and must not depend on how busy the machine is.
+pub const EXIT_TAIL_BUDGET: Duration = Duration::from_millis(250);
+
+/// Least time the final durable-log flush gets even when the tail budget is
+/// already spent: the lines explaining the exit are worth a short wait.
+const EXIT_LOG_FLUSH_FLOOR: Duration = Duration::from_millis(50);
+
+static EXIT_STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static EXIT_TAIL_DEADLINE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Time since the module loop ended, for the `subc exit phase=` lines that
+/// `main` writes after [`run_subc_mode`] returns. Zero before the exit starts.
+pub fn exit_elapsed() -> Duration {
+    EXIT_STARTED
+        .get()
+        .map(Instant::elapsed)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// What remains of [`EXIT_TAIL_BUDGET`] for a step of the process exit.
+/// Zero when the budget is spent; the full budget if the exit tail has not
+/// started (a caller outside the subc exit path).
+pub fn exit_tail_remaining() -> Duration {
+    EXIT_TAIL_DEADLINE
+        .get()
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(EXIT_TAIL_BUDGET)
+}
+
+/// How long the final durable-log flush of a subc exit may wait: what is left
+/// of the tail budget, but never less than a short floor.
+pub fn exit_log_flush_wait() -> Duration {
+    exit_tail_remaining().max(EXIT_LOG_FLUSH_FLOOR)
 }
 
 /// Starts the readiness sequence (query live roots, warm, flip ready) beside
@@ -4763,6 +4820,9 @@ where
         }
     };
 
+    // The exit budget runs from the drain, so the teardown between the loop
+    // ending and the index flush is timed and logged as its own exit phase.
+    let teardown_started = Instant::now();
     // The loop no longer promises drain ticks; teardown below may legitimately
     // take longer than a tick and must not read as a stalled frame loop.
     dispatch_path_metrics.clear_frame_loop_wake_deadline();
@@ -4867,6 +4927,10 @@ where
     reader_task.abort();
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
+    log::info!(
+        "subc exit phase=loop_teardown elapsed_ms={}",
+        teardown_started.elapsed().as_millis()
+    );
     classify_connection_end(loop_result, writer_result, drain_progress.is_some())
 }
 

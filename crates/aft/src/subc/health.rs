@@ -1440,13 +1440,36 @@ impl HealthRollupWorker {
         let _ = self.wake_tx.try_send(true);
     }
 
-    pub(super) fn shutdown(mut self) {
-        let _ = self.wake_tx.send(false);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+    /// Stop the worker. The wait is capped: the worker may be in the middle of
+    /// a rollup, which probes every root and language server, and this runs
+    /// on the exit path, where each unbounded wait eats into the time the
+    /// daemon allows a draining module to exit. Dropping the sender ends the
+    /// worker at its next wait even if the stop message does not fit in the
+    /// one-slot channel, so a worker that outlives the cap still stops.
+    pub(super) fn shutdown(self) {
+        let Self { wake_tx, join } = self;
+        let _ = wake_tx.try_send(false);
+        drop(wake_tx);
+        let Some(join) = join else {
+            return;
+        };
+        let deadline = Instant::now() + HEALTH_ROLLUP_SHUTDOWN_WAIT;
+        while !join.is_finished() {
+            if Instant::now() >= deadline {
+                log::info!(
+                    "subc attach: health rollup still running after {} ms; not waiting for it",
+                    HEALTH_ROLLUP_SHUTDOWN_WAIT.as_millis()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let _ = join.join();
     }
 }
+
+/// Cap on waiting for the health rollup worker to stop at connection end.
+const HEALTH_ROLLUP_SHUTDOWN_WAIT: Duration = Duration::from_millis(200);
 
 /// Tag for `allocator_slack_bytes` in the health rollup: the figure is
 /// allocator address space (mapped minus in-use), not resident memory. It kept

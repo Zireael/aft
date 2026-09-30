@@ -294,6 +294,16 @@ fn delay_changed_diagnostics_if_requested() {
 }
 
 fn main() -> io::Result<()> {
+    // AFT_FAKE_LSP_IGNORE_SIGTERM=1: keep running through SIGTERM, like a
+    // server with its own handler that is busy or wedged, so only a kill that
+    // cannot be ignored stops it.
+    #[cfg(unix)]
+    if std::env::var("AFT_FAKE_LSP_IGNORE_SIGTERM").ok().as_deref() == Some("1") {
+        // SAFETY: installing SIG_IGN runs no handler code.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+    }
     if let Some(pid_dir) = std::env::var_os("AFT_FAKE_LSP_PID_DIR") {
         std::fs::write(
             std::path::Path::new(&pid_dir).join(std::process::id().to_string()),
@@ -1065,6 +1075,16 @@ fn main() -> io::Result<()> {
             },
             ServerMessage::Response(_) => {}
         }
+    }
+
+    // AFT_FAKE_LSP_EXIT_DELAY_MS=<ms>: linger after the client goes away
+    // before exiting, like a server that finishes its own work first. Only a
+    // kill ends such a server promptly.
+    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_EXIT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
 
     Ok(())

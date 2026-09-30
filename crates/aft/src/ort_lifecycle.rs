@@ -117,10 +117,17 @@ pub const EXIT_WAIT: Duration = Duration::from_secs(10);
 /// with `code`, skipping native teardown; otherwise return so ordinary Rust
 /// cleanup runs.
 pub fn quiesce_before_return(code: i32) {
-    if close_and_wait(EXIT_WAIT) {
+    quiesce_before_return_within(code, EXIT_WAIT)
+}
+
+/// [`quiesce_before_return`] with a caller-chosen wait, for exits that run
+/// against a deadline. Ending without native teardown is always safe here;
+/// only the wait for in-flight sections is traded away.
+pub fn quiesce_before_return_within(code: i32, timeout: Duration) {
+    if close_and_wait(timeout) {
         return;
     }
-    skip_native_teardown(code)
+    skip_native_teardown_after(code, timeout)
 }
 
 /// End the process with `code` without letting ORT's static destructors run
@@ -137,9 +144,13 @@ pub fn exit_process(code: i32) -> ! {
 }
 
 fn skip_native_teardown(code: i32) -> ! {
+    skip_native_teardown_after(code, EXIT_WAIT)
+}
+
+fn skip_native_teardown_after(code: i32, waited: Duration) -> ! {
     crate::slog_warn!(
-        "ONNX Runtime work still in flight after {}s; exiting without native teardown",
-        EXIT_WAIT.as_secs()
+        "ONNX Runtime work still in flight after {} ms; exiting without native teardown",
+        waited.as_millis()
     );
     crate::logging::flush_durable_log(Duration::from_millis(500));
     immediate_exit(code)

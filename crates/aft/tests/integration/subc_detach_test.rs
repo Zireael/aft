@@ -535,6 +535,28 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
 
 #[test]
 fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
+    drain_with_six_live_lsp_servers("", false);
+}
+
+/// Servers that ignore the Shutdown request and SIGTERM, and linger after
+/// their client leaves, stop only for a forced kill. With every CPU busy, as
+/// on a loaded CI runner, the LSP phase (kill and reap included) must still
+/// end within its ceiling, the whole exit within the drain budget, and no
+/// server may outlive the module.
+#[test]
+fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
+    drain_with_six_live_lsp_servers(
+        "AFT_FAKE_LSP_IGNORE_SIGTERM=1 AFT_FAKE_LSP_EXIT_DELAY_MS=30000",
+        true,
+    );
+}
+
+/// Binds six roots that each start a fake rust-analyzer which never answers
+/// Shutdown, drains the module and checks that it exits within the drain
+/// budget with no language server left behind. `server_env` holds extra
+/// `NAME=value` assignments for the fake servers; `under_load` keeps every
+/// CPU busy from the drain until the module has exited.
+fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -565,7 +587,7 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
+                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
                 pids.path().display(),
                 fake.display()
             ),
@@ -628,16 +650,26 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
             })
             .collect::<Vec<_>>();
         assert_eq!(children.len(), 6, "six roots must each own a live server");
+        let hog = under_load.then(super::helpers::CpuHog::start);
         send_module_draining(&mut stream).await;
         let drained = Instant::now();
         send_connection_goodbye(&mut stream).await;
         let exit = module.wait_for_exit("drained module with live LSP servers");
         let elapsed = drained.elapsed();
+        drop(hog);
         eprintln!(
             "drain completion to process exit: {} ms",
             elapsed.as_millis()
         );
         let log = std::fs::read_to_string(&stderr_path).unwrap();
+        // Print the `subc exit phase=` and LSP shutdown summary lines, so a run
+        // near the 2 s limit shows how long each exit phase took.
+        for line in log
+            .lines()
+            .filter(|line| line.contains("subc exit phase=") || line.contains("lsp shutdown_all:"))
+        {
+            eprintln!("{line}");
+        }
         assert!(exit.success(), "{exit}; {}", log_tail(&log));
         assert!(
             elapsed < Duration::from_secs(2),
@@ -657,7 +689,25 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
             "expected one shutdown summary; {}",
             log_tail(&log)
         );
+        let lsp_elapsed_ms = summaries[0]
+            .rsplit("elapsed_ms=")
+            .next()
+            .and_then(|value| value.trim().parse::<u128>().ok())
+            .expect("shutdown summary reports elapsed_ms");
+        let lsp_ceiling = aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150);
+        assert!(
+            lsp_elapsed_ms <= lsp_ceiling.as_millis(),
+            "the LSP phase took {lsp_elapsed_ms} ms, past its ceiling; {}",
+            log_tail(&log)
+        );
+        // A server killed too late to be reaped before the module exited is
+        // reaped by the system right after, so allow that a moment.
+        let deadline = Instant::now() + Duration::from_secs(2);
         for pid in children {
+            while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             assert!(
                 !aft::bash_background::process::is_process_alive(pid),
                 "orphaned LSP pid {pid}"

@@ -266,6 +266,23 @@ impl LspChildRegistry {
         reaped
     }
 
+    /// Force-kill the process groups of the given PIDs and untrack them,
+    /// without waiting for any of them to exit. Exit-time LSP shutdown uses
+    /// this once its graceful window has passed: the caller's deadline has to
+    /// cover both these kills and the wait for them to take effect, so a slow
+    /// termination of one server must not delay the kill of the next.
+    /// Returns how many groups were sent the kill (or were already gone).
+    pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
+        let mut killed = 0;
+        for pid in pids {
+            if force_kill_child_process_group_nowait(*pid) {
+                self.untrack(*pid);
+                killed += 1;
+            }
+        }
+        killed
+    }
+
     /// Snapshot tracked children without holding the registry lock across CWD
     /// and RSS probes. The health rollup worker calls this off the reply path.
     pub fn health_snapshot(&self) -> LspChildHealth {
@@ -745,6 +762,40 @@ fn kill_child_process_group(pid: u32) -> bool {
     // SAFETY: killpg does not dereference pointers and SIGTERM needs no handler.
     let result = unsafe { libc::killpg(pgid, libc::SIGTERM) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// SIGKILL a child's process group. Unlike the maintenance sweep's SIGTERM,
+/// this cannot be ignored: it is only used at the end of a shutdown whose
+/// graceful request the server already failed to honour. `killpg` returns
+/// without waiting for the processes to die, so killing several groups in a
+/// row costs no more than a few system calls.
+#[cfg(unix)]
+fn force_kill_child_process_group_nowait(pid: u32) -> bool {
+    let Ok(pgid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: killpg does not dereference pointers.
+    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Windows has no process groups to signal; `taskkill /F /T` forcibly ends
+/// the process tree instead. It is a separate program that can take a while
+/// to start and finish, so each one runs on its own detached thread: every
+/// kill starts at once and none of them holds up the caller's deadline.
+#[cfg(not(unix))]
+fn force_kill_child_process_group_nowait(pid: u32) -> bool {
+    std::thread::Builder::new()
+        .name("aft-lsp-force-kill".to_string())
+        .spawn(move || {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        })
+        .is_ok()
 }
 
 #[cfg(not(unix))]

@@ -574,6 +574,55 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
     );
 }
 
+/// A server that ignores both the Shutdown request and SIGTERM, and lingers
+/// after its client goes away, stops only for a kill that cannot be ignored.
+/// The shutdown must deliver that kill and wait for it inside its budget,
+/// with every CPU busy as on a loaded CI runner, and leave no server alive.
+#[cfg(unix)]
+#[test]
+fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_under_load() {
+    use super::helpers::CpuHog;
+    use aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET;
+
+    let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let registry = LspChildRegistry::new();
+    let mut manager = LspManager::new();
+    manager.set_child_registry(registry.clone());
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
+    manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SIGTERM", "1");
+    manager.set_extra_env("AFT_FAKE_LSP_EXIT_DELAY_MS", "30000");
+    for (_, main_rs, _) in &fixtures {
+        manager.ensure_server_for_file_default(main_rs);
+    }
+    let pids = registry.pids();
+    assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
+
+    let hog = CpuHog::start();
+    let outcome = manager.shutdown_all();
+    drop(hog);
+    assert!(
+        outcome.elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
+        "LSP shutdown ran past its {LSP_SHUTDOWN_ALL_BUDGET:?} ceiling: {outcome:?}"
+    );
+    assert_eq!(outcome.graceful, 0, "{outcome:?}");
+    assert_eq!(outcome.forced, 6, "{outcome:?}");
+    assert!(registry.pids().is_empty(), "killed pids must be untracked");
+
+    // A server the shutdown could not reap in time was still sent the kill,
+    // so every one is gone shortly after, long before its 30 s linger ends.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for pid in pids {
+        while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !aft::bash_background::process::is_process_alive(pid),
+            "LSP pid {pid} ignored SIGTERM and survived the shutdown ({outcome:?})"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn shutdown_all_reports_graceful_servers_within_the_budget() {

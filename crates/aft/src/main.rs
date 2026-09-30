@@ -282,8 +282,21 @@ fn main() {
         {
             Ok(()) => {
                 aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
-                aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
-                aft::ort_lifecycle::quiesce_before_return(0);
+                // Everything left of the exit shares one short tail budget
+                // (see `aft::subc::EXIT_TAIL_BUDGET`): the daemon's restart
+                // clock started at the drain, and the index flushes and LSP
+                // shutdown already used most of it. An ONNX Runtime section
+                // still running when the budget is spent makes the process
+                // end without native teardown instead of waiting for it.
+                aft::ort_lifecycle::quiesce_before_return_within(
+                    0,
+                    aft::subc::exit_tail_remaining(),
+                );
+                aft::slog_info!(
+                    "subc exit phase=process_exit elapsed_ms={}",
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                aft::logging::flush_durable_log(aft::subc::exit_log_flush_wait());
                 return;
             }
             // A lost connection is a restart request, not a failure to attach:

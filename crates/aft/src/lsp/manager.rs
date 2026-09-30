@@ -47,7 +47,16 @@ use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 /// The total grace period for draining every LSP client during process shutdown.
+/// It is a hard ceiling: forced termination of servers that ignore the
+/// graceful handshake happens inside it, not after it.
 pub const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The tail of [`LSP_SHUTDOWN_ALL_BUDGET`] reserved for forced termination.
+/// Servers still running when only this much of the budget is left are
+/// killed, and the rest of the budget is the only time spent waiting for
+/// those kills to be reaped. Killing at the end of the budget instead let
+/// the kill and reap run past it on a loaded machine.
+pub const LSP_FORCED_TERMINATION_RESERVE: Duration = Duration::from_millis(300);
 
 fn server_key_for_definition(
     def: &ServerDef,
@@ -603,6 +612,10 @@ impl IntoIterator for DrainedLspEvents {
 pub struct LspShutdownAllOutcome {
     pub graceful: usize,
     pub forced: usize,
+    /// Forcibly killed servers whose exit was not observed before the budget
+    /// ran out. Their process groups were sent a kill that cannot be ignored;
+    /// if this process exits first, the system reaps them.
+    pub unreaped: usize,
     pub elapsed: Duration,
 }
 
@@ -3335,17 +3348,23 @@ impl LspManager {
                 let result = client.shutdown();
                 // Do the drop before reporting completion so the registry cannot
                 // briefly report a reaped client as still live after this method
-                // has returned its shutdown summary.
+                // has returned its shutdown summary. The drop also waits for the
+                // child, so a report means the process has been reaped.
                 drop(client);
                 let _ = result_tx.send((key, pid, result));
             });
         }
         drop(result_tx);
 
+        // Graceful handshakes get the budget minus the forced-termination
+        // reserve; whatever is still running then is killed, and the reserve
+        // is the only wait for those kills to take effect. Either way the
+        // phase ends by `deadline`.
         let deadline = started + budget;
+        let force_at = deadline - LSP_FORCED_TERMINATION_RESERVE.min(budget / 2);
         let mut outcome = LspShutdownAllOutcome::default();
         while !pending_pids.is_empty() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = force_at.saturating_duration_since(Instant::now());
             match result_rx.recv_timeout(remaining) {
                 Ok((key, pid, result)) => {
                     if !pending_pids.remove(&pid) {
@@ -3366,18 +3385,37 @@ impl LspManager {
         if !pending_pids.is_empty() {
             let pids = pending_pids.into_iter().collect::<Vec<_>>();
             outcome.forced += pids.len();
-            // The shared registry owns process-group termination, so timed-out
-            // clients are reaped even though their graceful worker is still
-            // blocked in its per-client Shutdown request.
-            child_registry.reap_pids(&pids);
+            // The graceful workers are still blocked in their per-client
+            // Shutdown request, so the shared registry kills the process
+            // groups directly. The kill cannot be ignored and does not wait;
+            // a killed server closes its pipes, which unblocks its worker,
+            // and the worker then reaps it and reports in.
+            child_registry.force_kill_pids(&pids);
+            let mut unreaped = pids.into_iter().collect::<HashSet<_>>();
+            while !unreaped.is_empty() {
+                // A zero timeout still takes a report that is already queued,
+                // so a late wake-up counts every server reaped in the meantime.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match result_rx.recv_timeout(remaining) {
+                    Ok((_, pid, _)) => {
+                        unreaped.remove(&pid);
+                    }
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            // Waiting longer would break the ceiling. Each of these was sent a
+            // kill for its whole process group; its worker thread reaps it if
+            // this process keeps running, and the system does if it exits.
+            outcome.unreaped = unreaped.len();
         }
 
         outcome.elapsed = started.elapsed();
         slog_info!(
-            "lsp shutdown_all: servers={} graceful={} killed={} elapsed_ms={}",
+            "lsp shutdown_all: servers={} graceful={} killed={} unreaped={} elapsed_ms={}",
             servers,
             outcome.graceful,
             outcome.forced,
+            outcome.unreaped,
             outcome.elapsed.as_millis()
         );
         outcome
