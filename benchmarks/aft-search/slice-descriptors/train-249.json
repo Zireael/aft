@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "typescript-sdk-cap",
+    "subc-build-provenance"
+  ],
+  "note": "The auto-installed TypeScript SDK is capped to 5.x in both plugins, typescript-language-server 6.x's missing-tsserver error and TypeScript 7 projects get named messages, and TS7 projects never fall back to the cached 5.x SDK. AFT's HELLO declares wire_crate_version and build_git_sha. No ranking-fence files."
+}
