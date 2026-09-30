@@ -198,6 +198,9 @@ fn subc_undo_and_background_task_survive_restart_after_mixed_harness_binds() {
     runtime.block_on(async {
         // Undo snapshots skip files under the system temp directory, so the
         // edited project lives under the target directory instead.
+        // CI runs this binary from a nextest archive on another runner, where
+        // the compile-time CARGO_TARGET_TMPDIR path has not been created.
+        std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let storage = tempfile::tempdir().unwrap();
         let conn_dir = tempfile::tempdir().unwrap();
