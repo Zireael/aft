@@ -2865,36 +2865,26 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 }
                 completed
             }
-            WatcherDrainApplyPhase::LspDiagnostics => {
-                // Collected here and forwarded once per slice, so each server
-                // gets one watched-files notification per batch, not per path.
-                let mut forwarded_paths = Vec::new();
-                let completed = apply_watcher_path_phase(
-                    WatcherDrainApplyPhase::LspDiagnostics,
-                    &mut paths,
-                    &mut remaining,
-                    started,
-                    WATCHER_DRAIN_SLICE_BUDGET,
-                    |path| {
-                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                            forwarded_paths.push(path.to_path_buf());
-                            if !path.exists() {
-                                status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
-                                return;
-                            }
-                            let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
-                            status_changed |= stale.changed;
-                            if stale.had_entries {
-                                ctx.lsp_resync_changed_file_for_diagnostics(path);
-                            }
-                        });
-                    },
-                );
-                let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                    ctx.lsp_forward_watcher_file_events(&forwarded_paths);
-                });
-                completed
-            }
+            WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::LspDiagnostics,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
+                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        if !path.exists() {
+                            status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
+                            return;
+                        }
+                        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                        status_changed |= stale.changed;
+                        if stale.had_entries {
+                            ctx.lsp_resync_changed_file_for_diagnostics(path);
+                        }
+                    });
+                },
+            ),
             WatcherDrainApplyPhase::Complete => true,
         };
 
@@ -2933,6 +2923,29 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
             return;
         }
 
+        if stage == WatcherDrainApplyPhase::LspDiagnostics {
+            // Diagnostics work can yield across many slices, but the forwarding
+            // cap must see the whole batch. Sending each slice independently
+            // lets a large generated tree evade the cap and floods the server.
+            // No paths have been forwarded before this point, so a lifecycle
+            // rewind cannot replay an already-sent partial notification.
+            if ctx
+                .run_if_subc_bound_generation(lifecycle_generation, || {
+                    ctx.lsp_forward_watcher_file_events(paths.make_contiguous());
+                })
+                .is_none()
+            {
+                state.status_changed = status_changed;
+                state.semantic_refresh_paths = semantic_refresh_paths;
+                state.phase = WatcherDrainPhase::Apply {
+                    stage,
+                    paths,
+                    remaining,
+                    oversized_inline_batch,
+                };
+                return;
+            }
+        }
         if stage == WatcherDrainApplyPhase::Complete {
             break;
         }
@@ -6740,6 +6753,43 @@ mod watcher_slice_tests {
 
     fn clear_watcher_unit_test_seam() {
         set_watcher_unit_test_seam(Duration::ZERO, None);
+    }
+
+    #[test]
+    fn lsp_watcher_phase_defers_forwarding_until_all_slices_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        let paths: VecDeque<_> = (0..crate::lsp::manager::WATCHED_FILE_FORWARD_CAP + 10)
+            .map(|index| temp.path().join(format!("generated_{index}.rs")))
+            .chain(std::iter::once(temp.path().join("Cargo.toml")))
+            .collect();
+        let count = paths.len();
+        let mut state = WatcherDrainSliceState::new(ctx.configure_generation(), 0);
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::LspDiagnostics,
+            paths,
+            remaining: count,
+            oversized_inline_batch: false,
+        };
+        // An expired budget processes exactly one path per slice. A busy
+        // manager forces forwarding to spawn a queue-serving helper thread,
+        // whose counter reveals a send before the whole batch is processed.
+        let held = ctx.lsp();
+        for _ in 0..count {
+            apply_watcher_slice(
+                &ctx,
+                &mut state,
+                Instant::now() - WATCHER_DRAIN_SLICE_BUDGET,
+            );
+            assert_eq!(
+                ctx.lsp_watcher_forward_helpers_spawned_for_test(),
+                0,
+                "a partial diagnostics slice must not forward a partial watcher batch"
+            );
+        }
+        apply_watcher_slice(&ctx, &mut state, Instant::now());
+        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
+        drop(held);
     }
 
     #[test]

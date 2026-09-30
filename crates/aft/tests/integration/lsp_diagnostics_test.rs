@@ -3163,6 +3163,34 @@ fn watcher_overflow_sends_no_per_file_flood() {
     );
 }
 
+#[test]
+fn watcher_overflow_under_manager_contention_sends_one_config_notification() {
+    let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
+    let mut paths: Vec<_> = (0..WATCHED_FILE_FORWARD_CAP + 10)
+        .map(|index| root.join(format!("src/generated_{index}.rs")))
+        .collect();
+    paths.push(root.join("Cargo.toml"));
+    {
+        // Keep the manager unavailable throughout the drain, not just while
+        // calling the forwarding API, to exercise the actual queued path.
+        let _held = ctx.lsp();
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(paths))
+            .expect("send watcher event");
+        drain_watcher_events(&ctx);
+        assert!(ctx.lsp_watcher_forward_pending_for_test());
+        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
+    }
+    wait_for_watcher_forward_helper(&ctx);
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "one capped forward: {watched:?}");
+    assert_eq!(
+        forwarded_changes(&root, &watched[0]),
+        vec![("Cargo.toml".to_string(), 2)],
+        "contention must not bypass the cap or duplicate the configuration change"
+    );
+}
+
 /// Wait up to `timeout` for the fake server to report that AFT asked it to
 /// reload its workspace.
 fn saw_workspace_reload(ctx: &AppContext, timeout: Duration) -> bool {
