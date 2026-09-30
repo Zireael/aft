@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "inspect-rust-workspace-reload"
+  ],
+  "note": "A blocking aft_inspect asks rust-analyzer to reload its workspace when Cargo.toml, Cargo.lock, the toolchain file or .cargo config changed since the last load, so a fixed lockfile is picked up; a failed producer's error prints once and coverage counts only authoritative files. No ranking-fence files."
+}
