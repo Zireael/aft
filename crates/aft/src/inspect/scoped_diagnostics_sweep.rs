@@ -112,6 +112,29 @@ fn cancellation_requested() -> bool {
         .is_some_and(|token| token.cancel_requested_before_commit())
 }
 
+/// Pull one server's diagnostics for an open document. The manager lock is
+/// held only to send the request and to store the reply, never while the
+/// server works on it, which can take seconds. Returns the outcome and, when
+/// a report was stored, that server's diagnostics for the file.
+fn pull_unlocked(
+    ctx: &AppContext,
+    key: &ServerKey,
+    file: &Path,
+    deadline: Instant,
+) -> Result<(PullFileOutcome, Option<Vec<StoredDiagnostic>>), crate::lsp::LspError> {
+    let pull = ctx.lsp().begin_document_pull(key, file, deadline)?;
+    let pull = pull.wait();
+    let mut lsp = ctx.lsp();
+    let outcome = lsp.finish_document_pull(pull);
+    let diagnostics = matches!(
+        outcome,
+        PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged
+    )
+    .then(|| lsp.server_file_diagnostics(key, file))
+    .flatten();
+    Ok((outcome, diagnostics))
+}
+
 /// Ask the running `producers` to analyze the scoped `candidates` and wait,
 /// until `deadline`, for their reports. Only servers in `producers` are
 /// used; none is started here.
@@ -153,8 +176,9 @@ pub(crate) fn sweep_scoped_files(
     sweep.examined = selected.len();
     sweep.eligible = selected.len() + sweep.not_examined.len();
 
-    // Open (and pull where supported) one file at a time, taking the manager
-    // lock per file so other requests are not held off for the whole loop.
+    // Open (and pull where supported) one file at a time. The manager lock is
+    // taken per step and never held while a server works on a pull, so other
+    // requests (a concurrent `read`, another tool call) are not held off.
     let mut waiting: Vec<(PathBuf, ServerKey, Option<u64>)> = Vec::new();
     let mut pulled: Vec<(PathBuf, ServerKey, Vec<StoredDiagnostic>)> = Vec::new();
     let mut retry_pulls: Vec<(PathBuf, ServerKey, Option<u64>, String)> = Vec::new();
@@ -167,77 +191,87 @@ pub(crate) fn sweep_scoped_files(
             }
             continue;
         }
-        let mut lsp = ctx.lsp();
-        let before = keys
-            .iter()
-            .map(|key| {
-                (
-                    key.clone(),
-                    lsp.diagnostic_epoch(key, file),
-                    lsp.document_is_open_in(key, file),
-                )
-            })
-            .collect::<Vec<_>>();
-        let opened = match lsp.open_document_for_servers(file, keys) {
-            Ok(opened) => opened,
-            Err(err) => {
-                for key in keys {
-                    sweep.unanswered.insert(
-                        file.clone(),
-                        (
-                            key.clone(),
-                            format!("could not open the file for analysis: {err}"),
-                        ),
-                    );
+        let mut to_pull: Vec<(ServerKey, Option<u64>)> = Vec::new();
+        {
+            let mut lsp = ctx.lsp();
+            let before = keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        lsp.diagnostic_epoch(key, file),
+                        lsp.document_is_open_in(key, file),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let opened = match lsp.open_document_for_servers(file, keys) {
+                Ok(opened) => opened,
+                Err(err) => {
+                    for key in keys {
+                        sweep.unanswered.insert(
+                            file.clone(),
+                            (
+                                key.clone(),
+                                format!("could not open the file for analysis: {err}"),
+                            ),
+                        );
+                    }
+                    continue;
                 }
-                continue;
+            };
+            if !opened.is_empty() {
+                sweep.opened.push((file.clone(), opened));
             }
-        };
-        if !opened.is_empty() {
-            sweep.opened.push((file.clone(), opened));
+            for (key, epoch_before, was_open) in before {
+                if !lsp.has_client(&key) {
+                    continue;
+                }
+                // A document that was already open is analyzed continuously
+                // (an edit opened it, for example); its current report is live
+                // and is read as it stands. A document opened now needs a
+                // report newer than whatever was stored before (a `cargo check`
+                // result, or an older analysis).
+                if was_open && lsp.has_diagnostic_report_for_server_file(&key, file) {
+                    continue;
+                }
+                if lsp.server_supports_pull(&key) {
+                    to_pull.push((key, epoch_before));
+                } else {
+                    waiting.push((file.clone(), key, epoch_before));
+                }
+            }
         }
-        for (key, epoch_before, was_open) in before {
-            if !lsp.has_client(&key) {
-                continue;
-            }
-            // A document that was already open is analyzed continuously (an
-            // edit opened it, for example); its current report is live and
-            // is read as it stands. A document opened now needs a report newer
-            // than whatever was stored before (a `cargo check` result, or an
-            // older analysis).
-            if was_open && lsp.has_diagnostic_report_for_server_file(&key, file) {
-                continue;
-            }
-            if lsp.server_supports_pull(&key) {
-                match lsp.pull_document_for_server(&key, file, deadline) {
-                    Ok(PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged) => {
-                        if let Some(diagnostics) = lsp.server_file_diagnostics(&key, file) {
-                            pulled.push((file.clone(), key, diagnostics));
-                        }
-                        continue;
-                    }
-                    // The server declined the pull for this file; it pushes
-                    // instead, which the wait below collects.
-                    Ok(
-                        PullFileOutcome::PullNotSupported | PullFileOutcome::PartialNotSupported,
-                    ) => {}
-                    Ok(PullFileOutcome::RequestFailed { reason })
-                        if reason.starts_with("pull_rejected_push_fallback") => {}
-                    // Usually a timeout while the server is busy (for example
-                    // compiling for `cargo check`). A server that answers pulls
-                    // may push nothing for the file, so waiting for a push is
-                    // not enough: ask again once the wait below is over.
-                    Ok(PullFileOutcome::RequestFailed { reason }) => {
-                        retry_pulls.push((file.clone(), key, epoch_before, reason));
-                        continue;
-                    }
-                    Err(err) => {
-                        retry_pulls.push((file.clone(), key, epoch_before, err.to_string()));
-                        continue;
+        for (key, epoch_before) in to_pull {
+            match pull_unlocked(ctx, &key, file, deadline) {
+                Ok((PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics)) => {
+                    if let Some(diagnostics) = diagnostics {
+                        pulled.push((file.clone(), key, diagnostics));
                     }
                 }
+                // The server declined the pull for this file; it pushes
+                // instead, which the wait below collects.
+                Ok((
+                    PullFileOutcome::PullNotSupported | PullFileOutcome::PartialNotSupported,
+                    _,
+                )) => {
+                    waiting.push((file.clone(), key, epoch_before));
+                }
+                Ok((PullFileOutcome::RequestFailed { reason }, _))
+                    if reason.starts_with("pull_rejected_push_fallback") =>
+                {
+                    waiting.push((file.clone(), key, epoch_before));
+                }
+                // Usually a timeout while the server is busy (for example
+                // compiling for `cargo check`). A server that answers pulls
+                // may push nothing for the file, so waiting for a push is not
+                // enough: ask again once the wait below is over.
+                Ok((PullFileOutcome::RequestFailed { reason }, _)) => {
+                    retry_pulls.push((file.clone(), key, epoch_before, reason));
+                }
+                Err(err) => {
+                    retry_pulls.push((file.clone(), key, epoch_before, err.to_string()));
+                }
             }
-            waiting.push((file.clone(), key, epoch_before));
         }
     }
 
@@ -282,27 +316,29 @@ pub(crate) fn sweep_scoped_files(
     // Ask again for the pulls that failed, with whatever budget is left. A
     // push that arrived for the file in the meantime also answers it.
     for (file, key, epoch_before, first_failure) in retry_pulls {
-        let mut lsp = ctx.lsp();
-        lsp.drain_events();
-        if !lsp.has_client(&key) {
-            continue;
-        }
-        let pushed_since = lsp
-            .diagnostic_epoch(&key, &file)
-            .is_some_and(|epoch| epoch_before.is_none_or(|before| epoch > before));
-        if pushed_since {
-            continue;
+        {
+            let mut lsp = ctx.lsp();
+            lsp.drain_events();
+            if !lsp.has_client(&key) {
+                continue;
+            }
+            let pushed_since = lsp
+                .diagnostic_epoch(&key, &file)
+                .is_some_and(|epoch| epoch_before.is_none_or(|before| epoch > before));
+            if pushed_since {
+                continue;
+            }
         }
         let failure = if Instant::now() < deadline && !cancellation_requested() {
-            match lsp.pull_document_for_server(&key, &file, deadline) {
-                Ok(PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged) => {
-                    if let Some(diagnostics) = lsp.server_file_diagnostics(&key, &file) {
+            match pull_unlocked(ctx, &key, &file, deadline) {
+                Ok((PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics)) => {
+                    if let Some(diagnostics) = diagnostics {
                         pulled.push((file, key, diagnostics));
                     }
                     continue;
                 }
-                Ok(PullFileOutcome::RequestFailed { reason }) => reason,
-                Ok(other) => format!("{other:?}"),
+                Ok((PullFileOutcome::RequestFailed { reason }, _)) => reason,
+                Ok((other, _)) => format!("{other:?}"),
                 Err(err) => err.to_string(),
             }
         } else {

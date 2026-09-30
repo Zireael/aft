@@ -172,10 +172,16 @@ fn handle_file_mode(
     };
 
     // Step 3: pull diagnostics from every server that supports it. Track
-    // which servers we got a fresh result for.
+    // which servers we got a fresh result for. The manager lock is released
+    // while servers work on the requests.
     let pull_results = {
-        let mut lsp = ctx.lsp();
-        match lsp.pull_file_diagnostics(&canonical, &ctx.config()) {
+        let config = ctx.config();
+        match crate::lsp::manager::pull_file_diagnostics_unlocked(
+            || ctx.lsp(),
+            &canonical,
+            &config,
+            None,
+        ) {
             Ok(results) => results,
             Err(err) => {
                 crate::slog_warn!("[lsp_diagnostics] pull_file_diagnostics failed: {err}");
@@ -301,10 +307,8 @@ fn handle_directory_mode(
     };
 
     for key in &server_keys_to_pull {
-        let pull_result = {
-            let mut lsp = ctx.lsp();
-            lsp.pull_workspace_diagnostics(key, None)
-        };
+        let pull_result =
+            crate::lsp::manager::pull_workspace_diagnostics_unlocked(|| ctx.lsp(), key, None);
         match pull_result {
             Ok(result) => {
                 let status = if !result.supports_workspace {

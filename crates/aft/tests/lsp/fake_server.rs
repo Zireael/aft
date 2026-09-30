@@ -535,6 +535,9 @@ fn main() -> io::Result<()> {
                     // LSP 3.17 pull diagnostics. Honor previousResultId for
                     // unchanged-state replies. Fail-mode is controlled by
                     // env var so tests can drive each branch.
+                    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_PULL_DELAY_SIGNAL") {
+                        let _ = std::fs::write(signal_path, b"pulling");
+                    }
                     if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_PULL_DELAY_MS")
                         .ok()
                         .and_then(|value| value.parse::<u64>().ok())
@@ -891,7 +894,25 @@ fn main() -> io::Result<()> {
                         uri.clone(),
                         Value::Null,
                     )?;
-                    write_publish_diagnostics(&mut writer, uri, json!([]))?;
+                    // AFT_FAKE_LSP_CLOSE_DELAY_MS=<ms>: answer the close late.
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_CLOSE_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    // AFT_FAKE_LSP_CLOSE_PUBLISHES=1: answer the close with real
+                    // diagnostics instead of the usual clearing empty list.
+                    let close_diagnostics = if std::env::var("AFT_FAKE_LSP_CLOSE_PUBLISHES")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        changed_diagnostics()
+                    } else {
+                        json!([])
+                    };
+                    write_publish_diagnostics(&mut writer, uri, close_diagnostics)?;
                 }
                 "exit" => break,
                 _ => {}

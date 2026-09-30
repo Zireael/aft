@@ -285,6 +285,14 @@ pub fn format_response_with_context(
     response: &Response,
     ctx: &FormatContext,
 ) -> String {
+    // The inspect tool is registered as `aft_inspect`; standalone tool calls
+    // keep that spelling while subc hoists it to `inspect`. Both must reach
+    // the inspect renderer rather than the raw-JSON fallback for tools the
+    // formatter does not know.
+    let bare_name = match bare_name {
+        "aft_inspect" => "inspect",
+        other => other,
+    };
     if !is_core_agent_tool(bare_name) {
         return serialized_text_or_failure(
             serde_json::to_string(response),

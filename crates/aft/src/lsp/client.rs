@@ -1021,6 +1021,32 @@ impl LspClient {
     where
         P: serde::Serialize,
     {
+        self.start_request_value(method, params)?.wait(timeout)
+    }
+
+    /// Write a request to the server and return a handle for its response.
+    /// Waiting on the handle needs no access to the client, so a caller that
+    /// reached the client through the language-server manager lock can
+    /// release that lock while the server works on the request.
+    pub(crate) fn start_request<R>(
+        &mut self,
+        params: R::Params,
+    ) -> Result<PendingLspRequest, LspError>
+    where
+        R: lsp_types::request::Request,
+        R::Params: serde::Serialize,
+    {
+        self.start_request_value(R::METHOD, params)
+    }
+
+    fn start_request_value<P>(
+        &mut self,
+        method: &'static str,
+        params: P,
+    ) -> Result<PendingLspRequest, LspError>
+    where
+        P: serde::Serialize,
+    {
         self.ensure_can_send()?;
 
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -1041,34 +1067,14 @@ impl LspClient {
                 return Err(err.into());
             }
         }
-
-        let response = match rx.recv_timeout(timeout) {
-            Ok(response) => response,
-            Err(RecvTimeoutError::Timeout) => {
-                self.remove_pending(&id);
-                self.send_cancel_request(&id)?;
-                return Err(LspError::Timeout(format!(
-                    "timed out waiting for '{}' response from {:?}",
-                    method, self.kind
-                )));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.remove_pending(&id);
-                return Err(LspError::ServerNotReady(format!(
-                    "language server {:?} disconnected while waiting for '{}'",
-                    self.kind, method
-                )));
-            }
-        };
-
-        if let Some(error) = response.error {
-            return Err(LspError::ServerError {
-                code: error.code,
-                message: error.message,
-            });
-        }
-
-        Ok(response.result.unwrap_or(Value::Null))
+        Ok(PendingLspRequest {
+            id,
+            method,
+            kind: self.kind.clone(),
+            rx,
+            pending: Arc::clone(&self.pending),
+            writer: Arc::clone(&self.writer),
+        })
     }
 
     /// Send a notification (fire-and-forget).
@@ -1326,15 +1332,63 @@ impl LspClient {
             pending.remove(id);
         }
     }
+}
 
-    fn send_cancel_request(&mut self, id: &RequestId) -> Result<(), LspError> {
-        let notification = Notification::new("$/cancelRequest", Some(json!({ "id": id })));
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-        transport::write_notification(&mut *writer, &notification)?;
-        Ok(())
+/// A request written to a language server whose response has not been read
+/// yet (see [`LspClient::start_request`]).
+pub(crate) struct PendingLspRequest {
+    id: RequestId,
+    method: &'static str,
+    kind: ServerKind,
+    rx: crossbeam_channel::Receiver<JsonRpcResponse>,
+    pending: Arc<Mutex<PendingMap>>,
+    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+}
+
+impl PendingLspRequest {
+    /// Wait up to `timeout` for the response. If the local deadline expires,
+    /// remove the pending response handler and notify the server with
+    /// `$/cancelRequest` so it can stop work.
+    pub(crate) fn wait(self, timeout: Duration) -> Result<Value, LspError> {
+        let response = match self.rx.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                self.remove_pending();
+                let notification =
+                    Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
+                let mut writer = self
+                    .writer
+                    .lock()
+                    .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
+                transport::write_notification(&mut *writer, &notification)?;
+                return Err(LspError::Timeout(format!(
+                    "timed out waiting for '{}' response from {:?}",
+                    self.method, self.kind
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.remove_pending();
+                return Err(LspError::ServerNotReady(format!(
+                    "language server {:?} disconnected while waiting for '{}'",
+                    self.kind, self.method
+                )));
+            }
+        };
+
+        if let Some(error) = response.error {
+            return Err(LspError::ServerError {
+                code: error.code,
+                message: error.message,
+            });
+        }
+
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    fn remove_pending(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
     }
 }
 

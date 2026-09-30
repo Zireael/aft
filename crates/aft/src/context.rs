@@ -9110,14 +9110,24 @@ impl AppContext {
         // Some LSP 3.17 servers disable publishDiagnostics as soon as the client
         // advertises pull support. Pull before parking so edits work for those
         // servers while push-only servers still use the event-driven wait below.
+        // The manager lock is released while servers work on the pull; the
+        // wait registered below re-checks the store, so a publish another
+        // drain consumed in the meantime is not missed.
         let diagnostics_deadline = Instant::now() + timeout;
-        if let Err(err) = lsp.pull_file_diagnostics_with_timeout(file_path, &config, timeout) {
+        drop(lsp);
+        if let Err(err) = crate::lsp::manager::pull_file_diagnostics_unlocked(
+            || self.lsp_manager.lock(),
+            file_path,
+            &config,
+            Some(timeout),
+        ) {
             crate::slog_warn!(
                 "post-edit LSP diagnostic pull failed for {}: {}",
                 file_path.display(),
                 err
             );
         }
+        let mut lsp = self.lsp_manager.lock();
         let remaining = diagnostics_deadline.saturating_duration_since(Instant::now());
 
         // Register the wake receiver while the manager is still locked. Events

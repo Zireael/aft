@@ -3481,6 +3481,36 @@ fn failed_producers(response: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Standalone OpenCode and Pi call inspect through `tool_call` with the
+/// registered name `aft_inspect`. The agent-visible text must be the rendered
+/// inspect text, as for `read` and `grep`, not the response serialized as JSON.
+#[test]
+fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/main.rs", "fn main() {}\n// TODO: tidy\n");
+    let ctx = configured_context(&root);
+
+    let response = serde_json::to_value(handle_with_dispatch(
+        &request(json!({
+            "id": "tool-call-inspect-text",
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "arguments": {"scope": "src", "sections": "todos"}
+        })),
+        &ctx,
+        &|_, _| panic!("inspect tool calls use the inspect dispatcher"),
+    ))
+    .expect("inspect response serializes");
+
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "text is serialized JSON: {text}"
+    );
+    assert!(text.starts_with("scope: 1 root"), "{text}");
+    assert!(text.contains("TODOs: 1"), "{text}");
+}
+
 /// A scoped inspect selects producers from the files inside the scope only.
 /// A JavaScript file elsewhere in the project (a checked-in `.mjs` test stub)
 /// must not start TypeScript for a scope that contains only Rust.
@@ -3603,21 +3633,88 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     // The fake answers the close with an empty publish, as TypeScript does.
     // That reply describes the closed document, not the file, and must not
     // replace the diagnostics inspect collected.
-    let hang_deadline = Instant::now() + Duration::from_secs(30);
-    let mut saw_close = false;
-    while !saw_close {
-        assert!(Instant::now() < hang_deadline, "fake never saw didClose");
-        saw_close = ctx.lsp().drain_events().events.iter().any(|event| {
-            matches!(event, LspEvent::Notification { method, .. } if method == "custom/documentClosed")
-        });
-        thread::sleep(Duration::from_millis(10));
-    }
-    thread::sleep(Duration::from_millis(200));
-    ctx.lsp().drain_events();
+    wait_for_close_reply(&ctx);
     assert_eq!(
         ctx.lsp().get_diagnostics_for_file(&lib).len(),
         2,
         "the close reply erased the collected diagnostics"
+    );
+}
+
+/// Drain events until the fake reports the `didClose` and then sends the
+/// publish that follows it.
+fn wait_for_close_reply(ctx: &AppContext) {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_close = false;
+    loop {
+        assert!(
+            Instant::now() < hang_deadline,
+            "fake never answered didClose"
+        );
+        for event in ctx.lsp().drain_events().events {
+            if let LspEvent::Notification { method, .. } = event {
+                if method == "custom/documentClosed" {
+                    saw_close = true;
+                } else if saw_close && method == "textDocument/publishDiagnostics" {
+                    return;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The empty publish that clears a closed document is ignored however late
+/// it arrives; there is no time window after which it would be stored.
+#[test]
+fn scoped_blocking_inspect_ignores_a_late_clearing_publish_after_its_close() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-close-late");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "2500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-close-late", "src");
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+
+    wait_for_close_reply(&ctx);
+    assert_eq!(
+        ctx.lsp().get_diagnostics_for_file(&lib).len(),
+        2,
+        "a late clearing publish erased the collected diagnostics"
+    );
+}
+
+/// Only an empty publish after inspect's close is ignored. A publish with
+/// diagnostics that arrives right after the close is real news about the file
+/// and is stored.
+#[test]
+fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-close-news");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CLOSE_PUBLISHES", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-close-news", "src");
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+
+    wait_for_close_reply(&ctx);
+    let stored = ctx
+        .lsp()
+        .get_diagnostics_for_file(&lib)
+        .into_iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored,
+        vec!["test diagnostic after change".to_string()],
+        "the publish after the close was not stored"
     );
 }
 

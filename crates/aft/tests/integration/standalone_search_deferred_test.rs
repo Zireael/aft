@@ -529,22 +529,23 @@ fn wait_for_signal_file(path: &Path, what: &str) {
     }
 }
 
-/// Send an unscoped `aft_inspect`, wait until `signal` shows it is inside the
-/// stretched language-server work, then require a sibling `read` of
-/// `read_path` to answer within the liveness bound and before the inspect.
+/// Send an `aft_inspect` with `arguments`, wait until `signal` shows it is
+/// inside the stretched language-server work, then require a sibling `read`
+/// of `read_path` to answer within the liveness bound and before the inspect.
 /// Cancels the inspect afterwards.
 fn assert_read_answers_during_inspect_lsp_work(
     aft: &mut AftProcess,
     signal: &Path,
     what: &str,
     read_path: &str,
+    arguments: serde_json::Value,
 ) {
     aft.send_silent(
         &serde_json::to_string(&json!({
             "id": "inspect-in-lsp-work",
             "command": "tool_call",
             "name": "aft_inspect",
-            "arguments": {"sections": ["diagnostics"]}
+            "arguments": arguments
         }))
         .expect("serialize inspect tool call"),
     );
@@ -580,6 +581,39 @@ fn assert_read_answers_during_inspect_lsp_work(
         }
     };
     assert_eq!(read["success"], true, "read failed: {read:#}");
+
+    // A request that needs the language-server manager itself must not wait
+    // behind the inspect's language-server work either.
+    let lsp_request_sent = Instant::now();
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "lsp-request-during-lsp-work",
+            "command": "lsp_diagnostics"
+        }))
+        .expect("serialize lsp_diagnostics request"),
+    );
+    let lsp_response = loop {
+        let remaining = (lsp_request_sent + liveness).saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "lsp_diagnostics did not answer within {liveness:?} while the inspect was in {what}"
+        );
+        let Some(frame) = aft.try_read_next_timeout(remaining.min(Duration::from_millis(100)))
+        else {
+            continue;
+        };
+        assert_ne!(
+            frame["id"], "inspect-in-lsp-work",
+            "inspect answered before the sibling lsp_diagnostics: {frame:#}"
+        );
+        if frame["id"] == "lsp-request-during-lsp-work" {
+            break frame;
+        }
+    };
+    assert_eq!(
+        lsp_response["success"], true,
+        "lsp_diagnostics failed: {lsp_response:#}"
+    );
 
     let cancel = aft.send_with_timeout(
         &serde_json::to_string(&json!({
@@ -630,6 +664,7 @@ fn standalone_read_answers_while_inspect_walks_for_language_servers() {
         &signal,
         "the applicability walk",
         "src/main.rs",
+        json!({"sections": ["diagnostics"]}),
     );
     assert!(aft.shutdown().success());
 }
@@ -720,6 +755,66 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
         &signal,
         "a language server's initialize handshake",
         "notes.txt",
+        json!({"sections": ["diagnostics"]}),
+    );
+    assert!(aft.shutdown().success());
+}
+
+/// A scoped inspect asks the language server for each scoped file's
+/// diagnostics, and a server can take seconds to answer. The request used to
+/// be waited for under the language-server manager lock, so a sibling read
+/// or language-server request sent meanwhile waited for the answer.
+#[test]
+fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
+    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let project = temp_dir.path().join("project");
+    fs::create_dir_all(project.join("src")).expect("create project");
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"pull-liveness\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write manifest");
+    fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").expect("write source");
+    fs::write(project.join("notes.txt"), "notes\n").expect("write read target");
+
+    let signal = temp_dir.path().join("pull-started");
+    let delay_ms = SLOW_LSP_WORK.as_millis().to_string();
+    let fake_server = fake_lsp_server_path();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_LSP_RUST_BINARY", fake_server.as_os_str()),
+        ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),
+        (
+            "AFT_FAKE_LSP_PULL_DELAY_MS",
+            std::ffi::OsStr::new(&delay_ms),
+        ),
+        ("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.as_os_str()),
+    ]);
+    let configure = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "configure-slow-pull",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.display().to_string(),
+            "config": user_config(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "inspect": {"diagnostics_timeout_ms": 30000}
+            }))
+        }))
+        .expect("serialize configure request"),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    assert_read_answers_during_inspect_lsp_work(
+        &mut aft,
+        &signal,
+        "a diagnostics pull",
+        "notes.txt",
+        json!({"sections": ["diagnostics"], "scope": "src"}),
     );
     assert!(aft.shutdown().success());
 }

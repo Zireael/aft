@@ -58,8 +58,12 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         .collect::<Vec<_>>();
     if !outcomes.successful.is_empty() {
         let pull_results = {
-            let mut lsp = ctx.lsp();
-            match lsp.pull_file_diagnostics(&canonical, &config) {
+            match crate::lsp::manager::pull_file_diagnostics_unlocked(
+                || ctx.lsp(),
+                &canonical,
+                &config,
+                None,
+            ) {
                 Ok(results) => results,
                 Err(err) => {
                     crate::slog_warn!("[lsp_inspect] pull_file_diagnostics failed: {err}");
