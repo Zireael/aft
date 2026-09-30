@@ -1853,6 +1853,11 @@ impl InspectManager {
         filter_outcome_for_scope(self.completion_outcome(result), &scope)
     }
 
+    /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
+    ///
+    /// The blocking inspect path must not turn an unfinished reuse job into a
+    /// partial response. A caller either receives the completed aggregate or a
+    /// failure from the worker; it never receives a timeout-shaped `Pending`.
     pub fn tier2_run_with_reuse_blocking(
         self: &Arc<Self>,
         snapshot: InspectSnapshot,
