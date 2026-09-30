@@ -925,17 +925,17 @@ fn a_stamp_naming_another_agent_is_refused_before_any_call() {
     assert!(lines[0].contains(" path=stamp "), "{}", lines[0]);
 }
 
-/// The production transport cannot open a scoped route yet, so a delegating
-/// stamp still goes the assertion path there: the relay asks prefrontal for a
-/// mint (which fails here, with no subc connection) and never sends plexus a
-/// write without an assertion. A fake with the same limitation shows the full
-/// assertion path.
+/// The production transport opens scoped routes, so a delegating stamp takes
+/// the stamp path there: with no subc connection the plexus call fails, and
+/// prefrontal is never asked for a mint. A transport that cannot open a scoped
+/// route still sends the same session down the assertion path, since plexus
+/// would refuse a write with neither a stamp nor an assertion.
 #[test]
-fn production_transport_keeps_a_delegating_stamp_on_the_assertion_path() {
+fn production_transport_takes_the_stamp_path_for_a_delegating_stamp() {
     let production = SubcRelayTransport::new(std::path::PathBuf::from(
         "/nonexistent/aft-gh-relay-test/connection.json",
     ));
-    assert!(!production.opens_scoped_routes());
+    assert!(production.opens_scoped_routes());
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-prod", "call-prod", "/p");
     let scopes = scopes_for("ses-prod", Some(delegating_stamp()));
     let (reply, lines) = run_with_scopes(
@@ -947,8 +947,8 @@ fn production_transport_keeps_a_delegating_stamp_on_the_assertion_path() {
         &scopes,
     );
     assert!(!reply.ok);
-    assert_eq!(reply.data["stage"], "mint", "{:?}", reply.data);
-    assert!(lines[0].contains(" path=assertion "), "{}", lines[0]);
+    assert_eq!(reply.data["stage"], "plexus", "{:?}", reply.data);
+    assert!(lines[0].contains(" path=stamp "), "{}", lines[0]);
 
     let unscoped = FakeTransport::default();
     let (reply, lines) = run_with_scopes(
@@ -993,4 +993,484 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
     disagreeing.push("ses-d", Some(delegating_stamp()));
     disagreeing.push("ses-d", Some(newer_epoch));
     assert_eq!(disagreeing.for_session("ses-d"), None);
+}
+
+// ---------------------------------------------------------------------------
+// The production transport against a fake subc daemon, over real subc framing.
+
+/// What the fake daemon does beyond opening routes and echoing a completed
+/// reply to every request.
+#[derive(Clone, Default)]
+struct DaemonScript {
+    /// Refuse every route.open that carries a scope with this code.
+    refuse_scoped_opens: Option<String>,
+    /// Before answering the first request on a scoped route, push a
+    /// `route.closed` for plexus with this reason.
+    close_first_scoped_route: Option<String>,
+}
+
+/// Everything the fake daemon was sent.
+#[derive(Default)]
+struct DaemonLog {
+    /// Every route.open body, refused ones included.
+    opens: Vec<Value>,
+    /// The channel of every route the client closed.
+    closes: Vec<Value>,
+    /// Every request body sent on an open route.
+    requests: Vec<Value>,
+}
+
+struct FakeDaemon {
+    log: Arc<Mutex<DaemonLog>>,
+    connection_file: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl FakeDaemon {
+    fn opens(&self) -> Vec<Value> {
+        self.log.lock().unwrap().opens.clone()
+    }
+
+    /// The routes closed so far, waiting briefly for the client's GOODBYE,
+    /// which it sends without waiting for an answer.
+    async fn closes(&self, expected: usize) -> Vec<Value> {
+        for _ in 0..200 {
+            let closes = self.log.lock().unwrap().closes.clone();
+            if closes.len() >= expected {
+                return closes;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.log.lock().unwrap().closes.clone()
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.log.lock().unwrap().requests.clone()
+    }
+
+    async fn transport(&self) -> SubcRelayTransport {
+        let consumer = subc_client_rs::SubcConsumer::connect(
+            &self.connection_file,
+            subc_client_rs::ConsumerOptions {
+                call_timeout: std::time::Duration::from_secs(5),
+                ..subc_client_rs::ConsumerOptions::default()
+            },
+        )
+        .await
+        .expect("the fake daemon accepts the relay's connection");
+        SubcRelayTransport::with_consumer(consumer)
+    }
+}
+
+/// Serve one subc connection per accept on the current runtime, as `script`
+/// says, recording what arrives.
+async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
+    use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
+    use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    let log = Arc::new(Mutex::new(DaemonLog::default()));
+    let server_log = Arc::clone(&log);
+    let server_key = key.clone();
+    tokio::spawn(async move {
+        let flags = Flags::new(false, Priority::Passive, false);
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let key = server_key.clone();
+            let log = Arc::clone(&server_log);
+            let script = script.clone();
+            tokio::spawn(async move {
+                if subc_transport::authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "subc-test",
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                let mut next_channel: u16 = 40;
+                let mut scoped_channels = Vec::new();
+                let mut closed_one = false;
+                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                    let header = frame.header;
+                    let mut replies = Vec::new();
+                    match header.ty {
+                        FrameType::Hello => replies.push(
+                            Frame::build(
+                                FrameType::HelloAck,
+                                flags,
+                                0,
+                                0,
+                                header.corr,
+                                serde_json::to_vec(&ModuleHelloAckBody {
+                                    negotiated_ver: PROTOCOL_VERSION,
+                                    subc_ops: Vec::new(),
+                                    subc_capabilities: Vec::new(),
+                                    storage: None,
+                                    machine_id: None,
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        ),
+                        FrameType::Request => {
+                            let body: Value =
+                                serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+                            let respond = |response: Value| {
+                                Frame::build_with_version(
+                                    header.ver,
+                                    FrameType::Response,
+                                    header.flags,
+                                    header.channel,
+                                    header.epoch,
+                                    header.corr,
+                                    serde_json::to_vec(&response).unwrap(),
+                                )
+                                .unwrap()
+                            };
+                            if header.channel != 0 {
+                                log.lock().unwrap().requests.push(body);
+                                let scoped = scoped_channels.contains(&header.channel);
+                                if let Some(reason) = script
+                                    .close_first_scoped_route
+                                    .as_deref()
+                                    .filter(|_| scoped && !closed_one)
+                                {
+                                    closed_one = true;
+                                    replies.push(
+                                        Frame::build(
+                                            FrameType::Push,
+                                            flags,
+                                            0,
+                                            0,
+                                            0,
+                                            serde_json::to_vec(&json!({
+                                                "op": "route.closed",
+                                                "module_id": PLEXUS_MODULE_ID,
+                                                "reason": reason,
+                                                "drained": false,
+                                                "abandoned": 0,
+                                                "excluded_subscriptions": 0,
+                                            }))
+                                            .unwrap(),
+                                        )
+                                        .unwrap(),
+                                    );
+                                }
+                                replies.push(respond(json!({
+                                    "repo_binding_generation": 1,
+                                    "result": {"status": "completed"},
+                                })));
+                            } else {
+                                match body.get("op").and_then(Value::as_str) {
+                                    Some("route.open") => {
+                                        log.lock().unwrap().opens.push(body.clone());
+                                        let scoped =
+                                            body.get("scope").is_some_and(|s| !s.is_null());
+                                        match script.refuse_scoped_opens.as_deref() {
+                                            Some(code) if scoped => replies.push(
+                                                Frame::build(
+                                                    FrameType::Error,
+                                                    flags,
+                                                    0,
+                                                    0,
+                                                    header.corr,
+                                                    serde_json::to_vec(
+                                                        &subc_protocol::ErrorBody::new(
+                                                            code,
+                                                            "refused by the fake daemon",
+                                                        ),
+                                                    )
+                                                    .unwrap(),
+                                                )
+                                                .unwrap(),
+                                            ),
+                                            _ => {
+                                                next_channel += 1;
+                                                if scoped {
+                                                    scoped_channels.push(next_channel);
+                                                }
+                                                replies.push(respond(json!({
+                                                    "op": "route.open",
+                                                    "route_channel": next_channel,
+                                                    "route_epoch": 1,
+                                                })));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // The client closes a route by sending a GOODBYE frame on the route's own
+                        // channel.
+                        FrameType::Goodbye if header.channel != 0 => {
+                            log.lock()
+                                .unwrap()
+                                .closes
+                                .push(json!({"channel": header.channel}));
+                        }
+                        _ => {}
+                    }
+                    for reply in replies {
+                        if subc_transport::write_frame(&mut stream, &reply)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let connection_file = dir.path().join("connection.json");
+    connection_file::write_atomic(
+        &connection_file,
+        &ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            key,
+            daemon_id,
+            pid: std::process::id(),
+            daemon_ver: "gh-shim-relay-scope-test".to_string(),
+        },
+    )
+    .unwrap();
+    FakeDaemon {
+        log,
+        connection_file,
+        _dir: dir,
+    }
+}
+
+fn is_scoped_open(open: &Value) -> bool {
+    open.get("scope").is_some_and(|scope| !scope.is_null())
+}
+
+async fn relay_stamped(
+    transport: &SubcRelayTransport,
+    session: &str,
+    nonce: &str,
+) -> (RelayReply, Vec<String>) {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue(session, "call-scoped", "/p");
+    let params = bot_params(live.value().unwrap(), nonce);
+    let scopes = scopes_for(session, Some(delegating_stamp()));
+    let lines = Mutex::new(Vec::new());
+    let reply = relay(
+        transport,
+        &TokenCache::default(),
+        RelayCall {
+            operation: BOT_REQUEST_OPERATION,
+            params: &params,
+            first_party: true,
+            now: NOW,
+            route_scopes: &scopes,
+        },
+        &|line| lines.lock().unwrap().push(line.to_string()),
+    )
+    .await;
+    (reply, lines.into_inner().unwrap())
+}
+
+/// A delegating stamp on the production transport opens plexus's route under
+/// the stamp's scope, pinned to its epoch, sends the write with no assertion,
+/// mints nothing, and closes the route through its handle.
+#[tokio::test]
+async fn production_transport_opens_a_delegating_stamps_route_under_its_scope() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let transport = daemon.transport().await;
+    let (reply, lines) = relay_stamped(&transport, "ses-scoped-open", "nonce-scoped-open").await;
+    assert!(reply.ok, "{:?}", reply.data);
+    assert!(lines[0].contains(" path=stamp "), "{}", lines[0]);
+
+    let opens = daemon.opens();
+    assert_eq!(
+        opens.len(),
+        1,
+        "one route, to plexus, and no mint: {opens:?}"
+    );
+    assert_eq!(
+        opens[0]["scope"],
+        serde_json::to_value(scope_selector(&delegating_stamp())).unwrap()
+    );
+    assert_eq!(opens[0]["scope"]["scope_epoch"], 7);
+    assert!(
+        opens[0].to_string().contains(PLEXUS_MODULE_ID),
+        "{}",
+        opens[0]
+    );
+    let requests = daemon.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]["arguments"].get("assertion").is_none());
+    let closes = daemon.closes(1).await;
+    assert_eq!(
+        closes.len(),
+        1,
+        "the scoped route is closed after the write"
+    );
+    assert_eq!(
+        closes[0]["channel"], 41,
+        "closed through its handle, on its own channel"
+    );
+}
+
+/// Each terminal scope refusal of the route open reaches the shim under its
+/// own code. Nothing else is opened afterwards: no unscoped route to plexus,
+/// and no route to prefrontal for an assertion.
+#[tokio::test]
+async fn a_scope_refusal_on_route_open_is_relayed_typed_and_never_reopened_unscoped() {
+    for code in [
+        "scope_not_live",
+        "scope_ended",
+        "scope_epoch_required",
+        "scope_not_carrier",
+    ] {
+        let daemon = fake_daemon(DaemonScript {
+            refuse_scoped_opens: Some(code.to_string()),
+            ..DaemonScript::default()
+        })
+        .await;
+        let transport = daemon.transport().await;
+        let (reply, lines) = relay_stamped(&transport, "ses-scope-refused", "nonce-refused").await;
+        assert!(!reply.ok, "{code}");
+        assert_eq!(reply.data["refusal_code"], code);
+        assert_eq!(reply.data["stage"], "plexus", "{code}");
+        assert!(
+            lines[0].ends_with(&format!("path=stamp outcome={code}")),
+            "{}",
+            lines[0]
+        );
+        let opens = daemon.opens();
+        assert_eq!(opens.len(), 1, "{code}: exactly one route.open: {opens:?}");
+        assert!(is_scoped_open(&opens[0]), "{code}");
+        assert!(daemon.requests().is_empty(), "{code}: nothing was sent");
+    }
+}
+
+/// Once the daemon closes a scoped route because of its scope, the transport
+/// does not open a route under that scope again; the call is refused under
+/// the close reason without reaching the daemon. Other scopes and unscoped
+/// calls are unaffected.
+#[tokio::test]
+async fn a_route_closed_for_its_scope_is_not_reopened_under_that_scope() {
+    let daemon = fake_daemon(DaemonScript {
+        close_first_scoped_route: Some("scope_ended".to_string()),
+        ..DaemonScript::default()
+    })
+    .await;
+    let transport = daemon.transport().await;
+    let selector = scope_selector(&delegating_stamp());
+    let body = || json!({"name": "github", "arguments": {"op": "bot_request"}});
+
+    let first = transport
+        .plexus("/p", "ses-closed", Some(&selector), body())
+        .await;
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(daemon.opens().len(), 1);
+
+    let again = transport
+        .plexus("/p", "ses-closed", Some(&selector), body())
+        .await;
+    assert!(
+        matches!(&again, Err(TransportError::Refused { code, .. }) if code == "scope_ended"),
+        "{again:?}"
+    );
+    assert_eq!(daemon.opens().len(), 1, "no reopen under the closed scope");
+
+    let mut next_epoch = selector.clone();
+    next_epoch.scope_epoch = Some(8);
+    let other = transport
+        .plexus("/p", "ses-closed", Some(&next_epoch), body())
+        .await;
+    assert!(other.is_ok(), "{other:?}");
+    let unscoped = transport.plexus("/p", "ses-closed", None, body()).await;
+    assert!(unscoped.is_ok(), "{unscoped:?}");
+    let opens = daemon.opens();
+    assert_eq!(opens.len(), 3);
+    assert_eq!(opens[1]["scope"]["scope_epoch"], 8);
+    assert!(!is_scoped_open(&opens[2]));
+}
+
+fn selector_for(scope_ref: &str) -> ScopeSelector {
+    let mut selector = scope_selector(&delegating_stamp());
+    selector.scope_ref = scope_ref.to_string();
+    selector
+}
+
+/// The daemon's `route.closed` push does not name its route, so a scope close
+/// that arrives while two scopes have routes open ends neither; one that
+/// arrives in the window just after its route closed still ends that route's
+/// scope.
+#[test]
+fn a_scope_close_ends_only_the_one_scope_it_can_belong_to() {
+    let (a, b) = (selector_for("ref-a"), selector_for("ref-b"));
+
+    let mut overlapping = ScopedRoutes::default();
+    overlapping.opened(&a);
+    overlapping.opened(&b);
+    overlapping.drained(vec!["scope_ended".to_string()]);
+    assert_eq!(overlapping.ended(&a), None);
+    assert_eq!(overlapping.ended(&b), None);
+
+    let mut late = ScopedRoutes::default();
+    late.opened(&a);
+    late.drained(Vec::new());
+    late.closed(&a);
+    late.drained(Vec::new());
+    late.drained(vec!["scope_carrier_removed".to_string()]);
+    assert_eq!(late.ended(&a), Some("scope_carrier_removed"));
+    assert_eq!(late.ended(&b), None);
+
+    // Two overlapping calls under the same scope still name one scope, so the
+    // close ends it.
+    let mut same_scope = ScopedRoutes::default();
+    same_scope.opened(&a);
+    same_scope.opened(&a);
+    same_scope.closed(&a);
+    same_scope.drained(vec!["scope_ended".to_string()]);
+    assert_eq!(same_scope.ended(&a), Some("scope_ended"));
+}
+
+/// Only a plexus route closed for a `scope_*` reason counts as a scope close.
+#[test]
+fn only_scope_reasons_on_plexus_routes_are_scope_closes() {
+    let push = |module_id: &str, reason: &str| subc_client_rs::ControlPush {
+        op: "route.closed".to_string(),
+        body: json!({"op": "route.closed", "module_id": module_id, "reason": reason}),
+    };
+    for reason in [
+        "scope_ended",
+        "scope_carrier_removed",
+        "scope_delegation_changed",
+        "scope_parent_ended",
+    ] {
+        assert_eq!(
+            scope_close_reason(&push(PLEXUS_MODULE_ID, reason)).as_deref(),
+            Some(reason)
+        );
+    }
+    for reason in ["reload", "restart", "crash", "disable", "capability_denied"] {
+        assert_eq!(
+            scope_close_reason(&push(PLEXUS_MODULE_ID, reason)),
+            None,
+            "{reason}"
+        );
+    }
+    assert_eq!(
+        scope_close_reason(&push(PREFRONTAL_MODULE_ID, "scope_ended")),
+        None
+    );
 }

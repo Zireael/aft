@@ -24,8 +24,9 @@
 //!   prefrontal and sends it with the write on an unscoped route.
 //!
 //! The stamp path needs a transport that can open a scoped route
-//! ([`RelayTransport::opens_scoped_routes`]); the production transport cannot
-//! yet, so production bot writes use the assertion path until it can.
+//! ([`RelayTransport::opens_scoped_routes`]). The production transport can:
+//! it opens the route with the subc client's scoped open, and never falls back
+//! to an unscoped route when that open is refused.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -618,11 +619,254 @@ impl GhRelay {
     }
 }
 
+/// Route-open refusals of a scoped route that end the call at once. The subc
+/// client retries the transient ones (`scope_not_synced`, `scope_changed`)
+/// inside the call's deadline and returns these four without retrying. Each
+/// goes back to the shim under its own code, the way plexus's own scope
+/// refusals do, and the write is never retried on the assertion path: the
+/// daemon refused because of the scope, and an assertion would get the write
+/// past that decision.
+const TERMINAL_SCOPE_OPEN_REFUSALS: [&str; 4] = [
+    subc_protocol::error_codes::SCOPE_NOT_LIVE,
+    subc_protocol::error_codes::SCOPE_ENDED,
+    subc_protocol::error_codes::SCOPE_EPOCH_REQUIRED,
+    subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+];
+
+/// The typed refusal for a failed route open, when the daemon refused it for
+/// one of the scope reasons above.
+fn scope_open_refusal(error: &subc_client_rs::CallError) -> Option<TransportError> {
+    let body = error.route_open_refusal()?;
+    TERMINAL_SCOPE_OPEN_REFUSALS
+        .contains(&body.code.as_str())
+        .then(|| TransportError::Refused {
+            code: body.code.clone(),
+            message: body.message.clone(),
+        })
+}
+
+/// The reason, when `push` says the daemon closed a route to plexus because of
+/// its scope and the route must not be reopened under that scope.
+///
+/// The daemon closes a scoped route with a `scope_*` reason when the scope
+/// ends or the opener's standing under it changes, and the subc client classes
+/// every such close as `MustNotReopen`. Closes for other reasons (a plexus
+/// reload, crash or disable) say nothing about the scope, so they do not stop
+/// a later route under it.
+fn scope_close_reason(push: &subc_client_rs::ControlPush) -> Option<String> {
+    if push.body.get("module_id").and_then(Value::as_str) != Some(PLEXUS_MODULE_ID) {
+        return None;
+    }
+    let must_not_reopen = push.route_close_reason()?.disposition()
+        == subc_client_rs::RouteCloseDisposition::MustNotReopen;
+    let reason = push.body.get("reason").and_then(Value::as_str)?;
+    (must_not_reopen && reason.starts_with("scope_")).then(|| reason.to_string())
+}
+
+/// How many ended scopes the relay remembers. There is one entry per session
+/// epoch whose route the daemon closed for good, so the cap only bounds a very
+/// long-lived daemon; the oldest entry is forgotten first.
+const ENDED_SCOPES_CAP: usize = 1024;
+
+fn push_distinct(scopes: &mut Vec<ScopeSelector>, scope: &ScopeSelector) {
+    if !scopes.contains(scope) {
+        scopes.push(scope.clone());
+    }
+}
+
+/// The scoped routes to plexus the relay has open, and the scopes it must not
+/// open a route under again.
+///
+/// The daemon's `route.closed` push names the module and the reason but not
+/// the route, so a scope close is recorded as ending a scope only when it can
+/// belong to no other: exactly one scope had a route to plexus open during the
+/// current and the previous drain window. A drain window runs from one read of
+/// the pending pushes to the next; the relay reads them before each scoped call
+/// and again when that call's request returns. Looking back one extra window
+/// covers a push that arrives just after the route it closed. When scopes
+/// overlap the close is not recorded, and nothing unsafe follows: the daemon
+/// itself refuses a reopen under a scope that ended (`scope_not_live`) or that
+/// the relay may no longer carry (`scope_not_carrier`), and that refusal goes
+/// back to the shim typed.
+#[derive(Default)]
+struct ScopedRoutes {
+    /// One entry per scoped route open now; a scope repeats when two calls
+    /// under it overlap.
+    open: Vec<ScopeSelector>,
+    /// Distinct scopes with a route open at any time in the current window.
+    window: Vec<ScopeSelector>,
+    /// The same, for the window before it.
+    previous_window: Vec<ScopeSelector>,
+    /// Scopes whose route the daemon closed for good, with the close reason.
+    ended: std::collections::VecDeque<(ScopeSelector, String)>,
+}
+
+impl ScopedRoutes {
+    /// The close reason, when the daemon closed this scope's route for good.
+    fn ended(&self, scope: &ScopeSelector) -> Option<&str> {
+        self.ended
+            .iter()
+            .find(|(ended, _)| ended == scope)
+            .map(|(_, reason)| reason.as_str())
+    }
+
+    fn opened(&mut self, scope: &ScopeSelector) {
+        self.open.push(scope.clone());
+        push_distinct(&mut self.window, scope);
+    }
+
+    fn closed(&mut self, scope: &ScopeSelector) {
+        if let Some(index) = self.open.iter().position(|open| open == scope) {
+            self.open.swap_remove(index);
+        }
+    }
+
+    /// Take the scope-close reasons read from the pushes since the last drain,
+    /// then start a new window with the routes still open.
+    fn drained(&mut self, reasons: Vec<String>) {
+        if let Some(reason) = reasons.into_iter().next() {
+            let mut candidates = self.window.clone();
+            for scope in &self.previous_window {
+                push_distinct(&mut candidates, scope);
+            }
+            if let [only] = candidates.as_slice() {
+                if self.ended(only).is_none() {
+                    self.ended.push_back((only.clone(), reason));
+                    if self.ended.len() > ENDED_SCOPES_CAP {
+                        self.ended.pop_front();
+                    }
+                }
+            }
+        }
+        self.previous_window = std::mem::take(&mut self.window);
+        for scope in &self.open {
+            push_distinct(&mut self.window, scope);
+        }
+    }
+}
+
+/// What the transport tracks about scoped routes, and the receiver the daemon's
+/// control pushes arrive on for the current connection.
+#[derive(Default)]
+struct ScopeState {
+    routes: ScopedRoutes,
+    pushes: Option<tokio::sync::mpsc::Receiver<subc_client_rs::ControlPush>>,
+}
+
+impl ScopeState {
+    /// Read every pending control push and hand the scope closes among them to
+    /// the route ledger.
+    fn drain(&mut self) {
+        let mut reasons = Vec::new();
+        if let Some(pushes) = self.pushes.as_mut() {
+            while let Ok(push) = pushes.try_recv() {
+                reasons.extend(scope_close_reason(&push));
+            }
+        }
+        self.routes.drained(reasons);
+    }
+}
+
+/// Room for control pushes between two drains. A push that finds the receiver
+/// full is dropped by the subc client, which only costs the ledger a record:
+/// the daemon still refuses a reopen under an ended scope.
+const CONTROL_PUSH_CAPACITY: usize = 64;
+
+/// A failed outbound call, and whether the connection should be reopened
+/// before the next one.
+struct CallFailure {
+    error: TransportError,
+    reconnect: bool,
+}
+
+/// Open a route to `target`, send `body` on it, and close the route again.
+///
+/// With `scope`, the route is opened under that scope with the subc client's
+/// scoped open. A refused scoped open is returned as it is and never retried
+/// as an unscoped open: that would send the write without the stamp that
+/// stands in for its assertion. The route is closed through its handle,
+/// because the client's close by route key only finds unscoped routes.
+async fn route_request(
+    consumer: &subc_client_rs::SubcConsumer,
+    target: subc_protocol::RouteTarget,
+    identity: subc_protocol::BindIdentity,
+    scope: Option<&ScopeSelector>,
+    options: subc_client_rs::CallOptions,
+    body: &Value,
+) -> Result<Value, CallFailure> {
+    use subc_client_rs::{CallError, CallOptions, CloseRouteOptions};
+    let bytes = serde_json::to_vec(body).map_err(|error| CallFailure {
+        error: TransportError::Unavailable(error.to_string()),
+        reconnect: false,
+    })?;
+    let opened = match scope {
+        Some(scope) => {
+            consumer
+                .open_route_scoped(target, identity, scope.clone(), options)
+                .await
+        }
+        None => consumer.open_route(target, identity, options).await,
+    };
+    let route = match opened {
+        Ok(route) => route,
+        Err(error) => {
+            if let Some(refusal) = scope.and_then(|_| scope_open_refusal(&error)) {
+                return Err(CallFailure {
+                    error: refusal,
+                    reconnect: false,
+                });
+            }
+            return Err(match error {
+                CallError::Module(body) => CallFailure {
+                    error: TransportError::Refused {
+                        code: body.code,
+                        message: body.message,
+                    },
+                    reconnect: false,
+                },
+                // A broken connection is reopened on the next relay.
+                error => CallFailure {
+                    error: TransportError::Unavailable(error.to_string()),
+                    reconnect: true,
+                },
+            });
+        }
+    };
+    let response = consumer
+        .request(&route, bytes, CallOptions::default())
+        .await;
+    let _ = consumer
+        .close_handle(&route, CloseRouteOptions::default())
+        .await;
+    match response {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| CallFailure {
+            error: TransportError::OutcomeUnknown("the reply was not JSON".to_string()),
+            reconnect: false,
+        }),
+        Err(CallError::Module(body)) => Err(CallFailure {
+            error: TransportError::Refused {
+                code: body.code,
+                message: body.message,
+            },
+            reconnect: false,
+        }),
+        Err(CallError::NotSent(error)) => Err(CallFailure {
+            error: TransportError::Unavailable(error.to_string()),
+            reconnect: true,
+        }),
+        Err(error) => Err(CallFailure {
+            error: TransportError::OutcomeUnknown(error.to_string()),
+            reconnect: true,
+        }),
+    }
+}
+
 /// Outbound calls over the daemon's own authenticated subc connection. The
 /// connection is opened lazily on first use and reopened after a failure.
 pub struct SubcRelayTransport {
     connection_file: PathBuf,
     consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
+    scopes: Mutex<ScopeState>,
 }
 
 impl SubcRelayTransport {
@@ -630,22 +874,52 @@ impl SubcRelayTransport {
         Self {
             connection_file,
             consumer: tokio::sync::Mutex::new(None),
+            scopes: Mutex::new(ScopeState::default()),
         }
+    }
+
+    /// A transport already holding `consumer`, for tests that serve it from a
+    /// fake daemon without a module identity.
+    #[cfg(test)]
+    fn with_consumer(consumer: subc_client_rs::SubcConsumer) -> Self {
+        let transport = Self::new(PathBuf::from("/nonexistent/aft-gh-relay-test"));
+        let consumer = transport.adopt(consumer);
+        *transport
+            .consumer
+            .try_lock()
+            .expect("a new transport's consumer slot is free") = Some(consumer);
+        transport
     }
 
     fn identity_available() -> bool {
         crate::launch_nonce::consumer_identity().is_some()
     }
 
+    fn lock_scopes(&self) -> std::sync::MutexGuard<'_, ScopeState> {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Start reading a new connection's control pushes, so scope closes on it
+    /// reach the route ledger.
+    fn adopt(&self, consumer: subc_client_rs::SubcConsumer) -> Arc<subc_client_rs::SubcConsumer> {
+        let pushes = consumer.control_pushes(CONTROL_PUSH_CAPACITY);
+        self.lock_scopes().pushes = Some(pushes);
+        Arc::new(consumer)
+    }
+
     async fn consumer(&self) -> Result<Arc<subc_client_rs::SubcConsumer>, TransportError> {
+        let mut slot = self.consumer.lock().await;
+        if let Some(consumer) = slot.as_ref() {
+            return Ok(Arc::clone(consumer));
+        }
+        // The identity is fixed for the life of the process, so checking it
+        // before each new connection is the same as checking it on every call.
         if !Self::identity_available() {
             return Err(TransportError::Unavailable(
                 "the daemon has no subc module identity to relay with".to_string(),
             ));
-        }
-        let mut slot = self.consumer.lock().await;
-        if let Some(consumer) = slot.as_ref() {
-            return Ok(Arc::clone(consumer));
         }
         let options = subc_client_rs::ConsumerOptions {
             call_timeout: RELAY_CALL_TIMEOUT,
@@ -654,7 +928,7 @@ impl SubcRelayTransport {
         let consumer = crate::fleet_status::connect_subc_consumer(&self.connection_file, options)
             .await
             .map_err(|error| TransportError::Unavailable(error.to_string()))?;
-        let consumer = Arc::new(consumer);
+        let consumer = self.adopt(consumer);
         *slot = Some(Arc::clone(&consumer));
         Ok(consumer)
     }
@@ -664,9 +938,24 @@ impl SubcRelayTransport {
         target: subc_protocol::RouteTarget,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> Result<Value, TransportError> {
-        use subc_client_rs::{CallError, CallOptions, CloseRouteOptions};
+        if let Some(scope) = scope {
+            let ended = {
+                let mut state = self.lock_scopes();
+                state.drain();
+                state.routes.ended(scope).map(str::to_string)
+            };
+            if let Some(reason) = ended {
+                return Err(TransportError::Refused {
+                    message: format!(
+                        "the daemon closed this session's scoped route to plexus ({reason}); a route closed that way is not reopened under the same scope"
+                    ),
+                    code: reason,
+                });
+            }
+        }
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new(
             if project_root.is_empty() {
@@ -678,52 +967,26 @@ impl SubcRelayTransport {
             "aft-gh-relay",
             session.to_string(),
         );
-        let route = match consumer
-            .open_route(
-                target,
-                identity,
-                CallOptions {
-                    consumer_identity: crate::launch_nonce::consumer_identity(),
-                    ..CallOptions::default()
-                },
-            )
-            .await
-        {
-            Ok(route) => route,
-            Err(CallError::Module(body)) => {
-                return Err(TransportError::Refused {
-                    code: body.code,
-                    message: body.message,
-                })
-            }
-            Err(error) => {
-                // A broken connection is reopened on the next relay.
-                *self.consumer.lock().await = None;
-                return Err(TransportError::Unavailable(error.to_string()));
-            }
+        let options = subc_client_rs::CallOptions {
+            consumer_identity: crate::launch_nonce::consumer_identity(),
+            ..subc_client_rs::CallOptions::default()
         };
-        let bytes = serde_json::to_vec(&body)
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
-        let response = consumer
-            .request(&route, bytes, CallOptions::default())
-            .await;
-        let _ = consumer
-            .close_handle(&route, CloseRouteOptions::default())
-            .await;
-        match response {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|_| TransportError::OutcomeUnknown("the reply was not JSON".to_string())),
-            Err(CallError::Module(body)) => Err(TransportError::Refused {
-                code: body.code,
-                message: body.message,
-            }),
-            Err(CallError::NotSent(error)) => {
-                *self.consumer.lock().await = None;
-                Err(TransportError::Unavailable(error.to_string()))
-            }
-            Err(error) => {
-                *self.consumer.lock().await = None;
-                Err(TransportError::OutcomeUnknown(error.to_string()))
+        if let Some(scope) = scope {
+            self.lock_scopes().routes.opened(scope);
+        }
+        let outcome = route_request(&consumer, target, identity, scope, options, &body).await;
+        if let Some(scope) = scope {
+            let mut state = self.lock_scopes();
+            state.drain();
+            state.routes.closed(scope);
+        }
+        match outcome {
+            Ok(reply) => Ok(reply),
+            Err(failure) => {
+                if failure.reconnect {
+                    *self.consumer.lock().await = None;
+                }
+                Err(failure.error)
             }
         }
     }
@@ -742,6 +1005,7 @@ impl RelayTransport for SubcRelayTransport {
             },
             project_root,
             session,
+            None,
             body,
         )
         .await
@@ -754,38 +1018,23 @@ impl RelayTransport for SubcRelayTransport {
         scope: Option<&ScopeSelector>,
         body: Value,
     ) -> Result<Value, TransportError> {
-        // Opening the route unscoped instead would send the write without the
-        // stamp that stands in for its assertion, so a scoped call fails here
-        // before anything is sent. The relay never asks for one while
-        // `opens_scoped_routes` is false.
-        if scope.is_some() && !self.opens_scoped_routes() {
-            return Err(TransportError::Refused {
-                code: subc_protocol::error_codes::SCOPE_UNSUPPORTED.to_string(),
-                message: "the daemon's subc client cannot open a route under a scope".to_string(),
-            });
-        }
         self.call(
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: PLEXUS_MODULE_ID.to_string(),
             },
             project_root,
             session,
+            scope,
             body,
         )
         .await
     }
 
-    /// Always false for now, which keeps every production bot write on the
-    /// assertion path.
-    ///
-    /// The stamp path needs the route to plexus opened as a carrier under the
-    /// session's scope, and the subc client SDK cannot do that yet:
-    /// subc-client-rs 0.23.1 hardcodes `scope: None` in the `RouteOpen` it
-    /// sends (`consumer.rs:997` and `consumer.rs:2741`) and no public
-    /// `open_route` variant takes a scope. When the SDK can open a scoped
-    /// route, pass the selector through `call` to it and return true here.
+    /// True: the subc client opens a route to plexus under the session's scope
+    /// (`SubcConsumer::open_route_scoped`, since subc-client-rs 0.23.2), so a
+    /// session whose scope delegates to its agent takes the stamp path.
     fn opens_scoped_routes(&self) -> bool {
-        false
+        true
     }
 }
 
