@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "typescript-7-native-lsp"
+  ],
+  "note": "TypeScript 7 projects start the native tsc --lsp server; LSP server selection and CI provisioning only. No aft_search ranking file is touched."
+}
