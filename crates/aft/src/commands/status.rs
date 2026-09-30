@@ -231,6 +231,29 @@ impl AppContext {
             }
         };
 
+        // An index whose artifact a newer build wrote is refused, not rebuilt:
+        // report it as unavailable with the refusal instead of the loading or
+        // failed state the refused load left behind.
+        let refused_info = |plane| {
+            crate::feature_status::storage_refusal(self, plane).map(|refusal| {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "state": "unavailable",
+                    "reason": refusal.to_string(),
+                })
+            })
+        };
+        let search_index_info = if config.indexes.trigram {
+            refused_info(crate::feature_status::IndexPlane::Trigram).unwrap_or(search_index_info)
+        } else {
+            search_index_info
+        };
+        let semantic_index_info = if config.indexes.semantic {
+            refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
+        } else {
+            semantic_index_info
+        };
+
         // Disk cache sizes — scoped to the **current project** only.
         //
         // Both trigram (`<storage_dir>/index/<key>/`) and semantic
@@ -331,6 +354,29 @@ impl AppContext {
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
         let mut degraded_reasons = self.degraded_reasons();
+        // Everything under the storage root that this build refused because a
+        // newer build wrote it (or the reader floor requires a newer reader).
+        let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
+        for refusal in &storage_refusals {
+            let reason = refusal.reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        let storage_refusals = storage_refusals
+            .iter()
+            .map(|refusal| {
+                serde_json::json!({
+                    "code": crate::persisted_format::CODE,
+                    "store": refusal.store.name(),
+                    "path": refusal.path.display().to_string(),
+                    "found": refusal.found,
+                    "supported": refusal.supported,
+                    "message": refusal.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
         // Git being off is a machine-wide, per-process fact rather than a
         // property of this root, so it is added here instead of being
         // recorded by configure. Status renderers print each reason as-is.
@@ -439,6 +485,7 @@ impl AppContext {
             "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
+            "storage_refusals": storage_refusals,
             "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,

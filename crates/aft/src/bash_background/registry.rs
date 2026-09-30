@@ -11504,6 +11504,59 @@ mod tests {
         );
     }
 
+    /// Task metadata written by a newer build is refused by name. Neither
+    /// replay nor GC moves it to the invalid-task quarantine: it stays under
+    /// its original path, byte for byte.
+    #[test]
+    fn replay_and_gc_leave_future_schema_task_metadata_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let registry = BgTaskRegistry::default();
+        let session_dir = session_tasks_dir(storage, "session");
+        let task_id = "bash-0000000000000401";
+        let control = session_dir.join(task_id).join("control");
+        fs::create_dir_all(&control).unwrap();
+        let metadata_path = control.join("metadata.json");
+        let metadata = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 99,
+            "task_id": task_id,
+            "shape": "written-by-a-newer-build",
+        }))
+        .unwrap();
+        fs::write(&metadata_path, &metadata).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60 * 60);
+        for path in [&metadata_path, &control, &session_dir.join(task_id)] {
+            filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old)).unwrap();
+        }
+
+        let _ = registry.replay_session(storage, "session");
+        let _ = registry.maybe_gc_persisted(storage);
+
+        assert_eq!(
+            fs::read(&metadata_path).unwrap(),
+            metadata,
+            "metadata changed or moved"
+        );
+        let quarantined = fs::read_dir(storage.join("bash-tasks-quarantine"))
+            .map(|sessions| {
+                sessions
+                    .flatten()
+                    .map(|session| fs::read_dir(session.path()).map_or(0, |e| e.count()))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        assert_eq!(quarantined, 0, "a newer task was quarantined as invalid");
+        let refusal = crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::BashTask,
+            &metadata_path,
+        )
+        .expect("refusal recorded for the status surface");
+        assert_eq!(refusal.found, 99);
+        assert!(refusal
+            .to_string()
+            .starts_with(crate::persisted_format::CODE));
+    }
+
     #[test]
     fn pending_pattern_match_is_returned_by_drain_contract_until_ack() {
         let storage = tempfile::tempdir().unwrap();

@@ -38,6 +38,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tree_sitter::{Node, Parser};
 
 const SCHEMA_VERSION: i64 = 1;
+/// Highest callgraph generation schema this build reads (and writes).
+pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
 pub(crate) const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
 const PROVENANCE_NAME_MATCH: &str = "name_match";
@@ -3540,6 +3542,7 @@ impl CallGraphStore {
                 "writer capability denied; use the read-only callgraph opener".to_string(),
             ));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
@@ -3574,6 +3577,10 @@ impl CallGraphStore {
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
+        // A generation written by a newer build is refused by name rather than
+        // reported as not built (which would send callers to a cold build) or
+        // served from an older legacy partition.
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         {
             let conn = open_readonly_connection(&sqlite_path)?;
@@ -3664,6 +3671,7 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -3755,6 +3763,7 @@ impl CallGraphStore {
                 "{operation} could not acquire writer capability"
             )));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
@@ -3795,6 +3804,7 @@ impl CallGraphStore {
                 "callgraph ensure could not acquire writer capability".to_string(),
             ));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
@@ -3881,6 +3891,7 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
 
@@ -3938,6 +3949,7 @@ impl CallGraphStore {
         chunk_size: usize,
         writer_lease: Arc<crate::root_cache::WriterLease>,
     ) -> Result<(ColdBuildStats, String)> {
+        refuse_newer_published_format(callgraph_dir, project_key)?;
         if let Some((previous_root, remaining)) =
             rebuild_cooldown_denial(callgraph_dir, project_key, project_root, Instant::now())
         {
@@ -9519,10 +9531,62 @@ fn resolve_ready_target(
     None
 }
 
+/// Schema version recorded in the published generation (or, with no pointer,
+/// the legacy single-file database), read through a read-only connection.
+/// `None` when nothing is published or its version cannot be read; those are
+/// ordinary "not built" cases handled by readiness checks.
+fn published_schema_version(callgraph_dir: &Path, project_key: &str) -> Option<(PathBuf, u64)> {
+    let target = match read_pointer(callgraph_dir, project_key) {
+        Some(generation) => callgraph_dir.join(generation),
+        None => legacy_sqlite_path(callgraph_dir, project_key),
+    };
+    if !target.is_file() {
+        return None;
+    }
+    let conn = open_readonly_connection(&target).ok()?;
+    let raw: String = conn
+        .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .ok()??;
+    let version = raw.trim().parse::<u64>().ok()?;
+    Some((target, version))
+}
+
+/// Refuse, by name, a published generation whose schema version is above
+/// [`STORE_FORMAT_VERSION`] (or any store while the storage root's reader
+/// floor is above it). The refusal covers the whole `callgraph_dir`, so no
+/// cold build, migration or pointer flip replaces the newer generation.
+pub(crate) fn check_published_format(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> std::result::Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+    let published = published_schema_version(callgraph_dir, project_key);
+    let path = published
+        .as_ref()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| callgraph_dir.to_path_buf());
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::CallgraphStore,
+        &path,
+        callgraph_dir,
+        published.map(|(_, version)| version),
+    )
+}
+
+fn refuse_newer_published_format(callgraph_dir: &Path, project_key: &str) -> Result<()> {
+    check_published_format(callgraph_dir, project_key)
+        .map_err(|refusal| CallGraphStoreError::Unavailable(refusal.to_string()))
+}
+
 /// Atomically publish `generation` as the current store by flipping the pointer
 /// file. Writes a temp file, fsyncs, then renames over the pointer — never
 /// replacing an open DB file, so it succeeds cross-platform.
 fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) -> Result<()> {
+    // Last line of defence: never move the pointer away from a generation
+    // written by a newer build, whichever path got here.
+    refuse_newer_published_format(callgraph_dir, project_key)?;
     let pointer = pointer_path(callgraph_dir, project_key);
     let tmp = callgraph_dir.join(format!(
         "{project_key}.current.tmp.{}.{}",

@@ -130,6 +130,15 @@ fn main() {
         }
     }
 
+    // `--formats` reports the highest on-disk format version of every store
+    // this build reads. Placement compares it with the storage root's reader
+    // floor, so it must stay side-effect free: no storage, no logging, no
+    // PATH probe.
+    if std::env::args().nth(1).as_deref() == Some("--formats") {
+        println!("{}", aft::persisted_format::formats_json());
+        return;
+    }
+
     // Handle --version before starting the normal application.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("aft {}", env!("CARGO_PKG_VERSION"));

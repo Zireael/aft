@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs_lock;
 
-const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ArtifactOwnerManifest {
@@ -189,6 +189,22 @@ pub fn claim_or_open_read_only(
                 let _ = fs::remove_file(&path);
                 continue;
             }
+            // A manifest written by a newer build is left exactly as it is.
+            // Without a claim this root cannot own the shared artifacts, so it
+            // borrows them read-only and names the refusal as the reason.
+            Err(ReadManifestError::Newer(refusal)) => {
+                return Ok(ArtifactOwnerClaim {
+                    status: ArtifactOwnerStatus {
+                        mode: ArtifactOwnerMode::ReadOnly,
+                        project_key: project_key.to_string(),
+                        manifest_path: path.display().to_string(),
+                        owner_project_scope_key: project_scope_key.to_string(),
+                        owner_checkout_path: checkout_path,
+                        note: Some(refusal.to_string()),
+                    },
+                    lease: None,
+                });
+            }
             Err(ReadManifestError::Io(error)) => return Err(error),
         }
     }
@@ -227,6 +243,11 @@ pub fn open_read_only_borrow(
             format!(
                 "sharing the repo index family; failed to inspect owner manifest: {error}"
             ),
+        ),
+        Err(ReadManifestError::Newer(refusal)) => (
+            project_scope_key.to_string(),
+            fallback_checkout.clone(),
+            refusal.to_string(),
         ),
     };
 
@@ -569,7 +590,10 @@ fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) ->
             sync_parent(path);
             Ok(true)
         }
-        Ok(_) | Err(ReadManifestError::NotFound) | Err(ReadManifestError::Malformed) => Ok(false),
+        Ok(_)
+        | Err(ReadManifestError::NotFound)
+        | Err(ReadManifestError::Malformed)
+        | Err(ReadManifestError::Newer(_)) => Ok(false),
         Err(ReadManifestError::Io(error)) => Err(error),
     }
 }
@@ -579,20 +603,60 @@ enum ReadManifestError {
     NotFound,
     Io(io::Error),
     Malformed,
+    /// Written by a newer build (or refused by the storage root's reader
+    /// floor). Never removed, rewritten or reclaimed.
+    Newer(crate::persisted_format::UnsupportedPersistedFormat),
 }
 
 /// Parse an owner manifest. An empty or partial file (for example one left by
 /// a crash after an unsynced heartbeat rename) is `Malformed`: the claim path
 /// removes it and claims afresh, it never reads as a live owner.
 fn read_manifest(path: &Path) -> Result<ArtifactOwnerManifest, ReadManifestError> {
-    let bytes = fs_lock::read_lease_settled(path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            ReadManifestError::NotFound
-        } else {
-            ReadManifestError::Io(error)
+    let bytes = match fs_lock::read_lease_settled(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A reader floor above this build refuses the store even before a
+            // newer manifest exists, so no claim creates one.
+            crate::persisted_format::gate(
+                crate::persisted_format::PersistedStore::ArtifactOwner,
+                path,
+                path,
+                None,
+            )
+            .map_err(ReadManifestError::Newer)?;
+            return Err(ReadManifestError::NotFound);
         }
-    })?;
+        Err(error) => return Err(ReadManifestError::Io(error)),
+    };
+    // Only the version is read before the full shape, so a newer manifest
+    // whose fields changed is refused by name instead of deleted as malformed.
+    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_u64());
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::ArtifactOwner,
+        path,
+        path,
+        version,
+    )
+    .map_err(ReadManifestError::Newer)?;
     serde_json::from_slice(&bytes).map_err(|_| ReadManifestError::Malformed)
+}
+
+/// Refuse, by name, this project's owner manifest when a newer build wrote it.
+/// Reads the manifest without changing it; an absent or malformed manifest
+/// passes (the claim path handles those).
+pub(crate) fn check_manifest_format(
+    storage_root: &Path,
+    project_key: &str,
+) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+    let path = owner_manifests_root(storage_root)
+        .join(project_key)
+        .join("owner.json");
+    match read_manifest(&path) {
+        Err(ReadManifestError::Newer(refusal)) => Err(refusal),
+        _ => Ok(()),
+    }
 }
 
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {

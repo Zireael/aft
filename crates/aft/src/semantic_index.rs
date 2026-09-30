@@ -612,6 +612,35 @@ const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
 /// The base stays independently readable, so an incomplete final frame can be discarded.
 const SEMANTIC_SEGMENT_MAGIC: &[u8; 8] = b"AFTSEG01";
 const SEMANTIC_SEGMENT_VERSION: u8 = 1;
+/// Error text prefix for a delta segment newer than
+/// [`SEMANTIC_SEGMENT_VERSION`]; the found version follows it. Segment decoding
+/// reports errors as strings, and this prefix lets the artifact-level reader
+/// and writer turn that one case into a named refusal instead of treating the
+/// file as corrupt.
+const SEMANTIC_SEGMENT_NEWER_PREFIX: &str = "semantic segment written by a newer build, version ";
+
+/// The named refusal carried by a segment decoding error, if the error is the
+/// newer-segment case (possibly wrapped in context by the caller).
+fn semantic_segment_refusal(
+    data_path: &Path,
+    error: &str,
+) -> Option<crate::persisted_format::UnsupportedPersistedFormat> {
+    let (_, tail) = error.split_once(SEMANTIC_SEGMENT_NEWER_PREFIX)?;
+    let digits = tail
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let found = digits.parse::<u64>().ok()?;
+    crate::persisted_format::UnsupportedPersistedFormat::check(
+        crate::persisted_format::PersistedStore::SemanticSegment,
+        data_path,
+        found,
+    )
+}
+/// Highest semantic base snapshot format this build reads (and writes).
+pub const SEMANTIC_BASE_FORMAT_VERSION: u32 = SEMANTIC_INDEX_VERSION_V7 as u32;
+/// Highest semantic delta segment format this build reads (and writes).
+pub const SEMANTIC_SEGMENT_FORMAT_VERSION: u32 = SEMANTIC_SEGMENT_VERSION as u32;
 const SEMANTIC_SEGMENT_FRAME_HEADER_BYTES: usize = 8 + 8 + 32;
 const SEMANTIC_COMPACT_SEGMENT_LIMIT: usize = 64;
 const SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR: u64 = 4;
@@ -6899,6 +6928,17 @@ impl SemanticIndex {
         if !access.allows_write(project_key, &data_path) {
             return false;
         }
+        // Never append to, compact or replace a snapshot written by a newer
+        // build; its refusal was recorded when it was read or peeked.
+        if Self::check_disk_format_at(&data_path).is_err()
+            || crate::persisted_format::refusal_covering(
+                crate::persisted_format::PersistedStore::SemanticSegment,
+                &data_path,
+            )
+            .is_some()
+        {
+            return false;
+        }
         if let Err(error) = fs::create_dir_all(&dir) {
             slog_warn!("failed to create semantic cache dir: {}", error);
             return false;
@@ -6992,6 +7032,10 @@ impl SemanticIndex {
                             });
                     }
                     Err(error) => {
+                        if let Some(refusal) = semantic_segment_refusal(&data_path, &error) {
+                            crate::persisted_format::refuse(refusal);
+                            return false;
+                        }
                         slog_warn!(
                             "semantic index delta baseline unavailable ({}); replacing base snapshot",
                             error
@@ -7208,6 +7252,9 @@ impl SemanticIndex {
     ) -> Result<(BTreeSet<PathBuf>, Self), String> {
         let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
         let segment_version = read_u8_stream(&mut reader, "semantic segment is empty")?;
+        if segment_version > SEMANTIC_SEGMENT_VERSION {
+            return Err(format!("{SEMANTIC_SEGMENT_NEWER_PREFIX}{segment_version}"));
+        }
         if segment_version != SEMANTIC_SEGMENT_VERSION {
             return Err(format!(
                 "unsupported semantic segment version: {segment_version}"
@@ -7429,6 +7476,18 @@ impl SemanticIndex {
             .join(project_key)
             .join("semantic.bin");
         let file_len = usize::try_from(data_path.metadata().ok()?.len()).ok()?;
+        // A snapshot (or one of its delta segments) written by a newer build is
+        // refused by name before anything else looks at it: it is neither
+        // removed as too small or corrupt nor replaced by a rebuild.
+        if Self::check_disk_format_at(&data_path).is_err()
+            || crate::persisted_format::refusal_covering(
+                crate::persisted_format::PersistedStore::SemanticSegment,
+                &data_path,
+            )
+            .is_some()
+        {
+            return None;
+        }
         if file_len < HEADER_BYTES_V1 {
             slog_warn!(
                 "corrupt semantic index (too small: {} bytes), removing",
@@ -7493,6 +7552,10 @@ impl SemanticIndex {
                 Some(loaded.index)
             }
             Err(error) => {
+                if let Some(refusal) = semantic_segment_refusal(&data_path, &error) {
+                    crate::persisted_format::refuse(refusal);
+                    return None;
+                }
                 slog_warn!("corrupt semantic index, rebuilding: {}", error);
                 if !is_worktree_bridge {
                     let _ = fs::remove_file(&data_path);
@@ -7500,6 +7563,49 @@ impl SemanticIndex {
                 None
             }
         }
+    }
+
+    /// Refuse, by name, a `semantic.bin` whose base snapshot version byte is
+    /// above [`SEMANTIC_BASE_FORMAT_VERSION`] (or any snapshot while the
+    /// storage root's reader floor is above it). Reads one byte. Delta segments
+    /// carry their own version, checked as they are decoded.
+    pub(crate) fn check_disk_format(
+        storage_dir: &Path,
+        project_key: &str,
+    ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+        Self::check_disk_format_at(
+            &storage_dir
+                .join("semantic")
+                .join(project_key)
+                .join("semantic.bin"),
+        )
+    }
+
+    fn check_disk_format_at(
+        data_path: &Path,
+    ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+        let version = (|| {
+            let mut version_buf = [0_u8; 1];
+            fs::File::open(data_path)
+                .ok()?
+                .read_exact(&mut version_buf)
+                .ok()?;
+            Some(u64::from(version_buf[0]))
+        })();
+        crate::persisted_format::gate(
+            crate::persisted_format::PersistedStore::SemanticIndex,
+            data_path,
+            data_path,
+            version,
+        )?;
+        // The segment store has no header of its own to peek, but a floor
+        // above this build's segment version still refuses the file.
+        crate::persisted_format::gate(
+            crate::persisted_format::PersistedStore::SemanticSegment,
+            data_path,
+            data_path,
+            None,
+        )
     }
 
     pub(crate) fn read_from_disk_borrow_tolerant(
@@ -7551,6 +7657,9 @@ impl SemanticIndex {
             .join("semantic")
             .join(project_key)
             .join("semantic.bin");
+        if Self::check_disk_format_at(&data_path).is_err() {
+            return None;
+        }
         let (fingerprint, artifact_content_hash) = match borrowed_artifact_identity(&data_path) {
             Ok(identity) => identity,
             Err(error) => {

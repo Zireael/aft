@@ -574,6 +574,18 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
             fs::create_dir_all(parent)?;
         }
     }
+    // Refuse a newer schema before the PRAGMAs below, which would otherwise
+    // switch journal modes and create tables on a database this build cannot
+    // read. `run_migrations` repeats the check for databases this peek cannot
+    // open read-only.
+    if let Some(db_version) = peek_schema_version(path) {
+        if db_version > CURRENT_SCHEMA_VERSION {
+            return Err(OpenError::DowngradeRefused {
+                db_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+    }
 
     if mode == OpenMode::SingleAttempt {
         // Request-path retries must not repeat the deferred ten-second wait.
@@ -640,6 +652,27 @@ pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
     )?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// Schema version of an existing AFT database, read through a read-only
+/// connection so nothing about the file changes. `None` when the file is
+/// absent, cannot be opened read-only, or has no schema table yet.
+pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn = open_readonly(path).ok()?;
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if !has_table {
+        return None;
+    }
+    current_schema_version(&conn).ok()
 }
 
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.

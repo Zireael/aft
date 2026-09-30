@@ -107,7 +107,7 @@ fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 /// unknown kind as content and then requires its content file, fails closed
 /// on them; the new fields are optional, and readers treat them as unset when
 /// absent, so version-4 stacks load unchanged.
-const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -2761,6 +2761,11 @@ impl BackupStore {
             return;
         }
         let marker = session_dir.join("session.json");
+        // The session marker carries the same schema version as the stack
+        // metadata; a newer build's marker is not rewritten at this version.
+        if check_backup_meta_format(&marker, None).is_err() {
+            return;
+        }
         let json = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "session_id": session,
@@ -2962,6 +2967,9 @@ impl BackupStore {
             Ok(v) => v,
             Err(_) => return,
         };
+        if check_backup_meta_format(meta_path, Some(&parsed)).is_err() {
+            return;
+        }
         if let Some(obj) = parsed.as_object_mut() {
             let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
             obj.insert(
@@ -3395,6 +3403,12 @@ impl BackupStore {
                     message: error.to_string(),
                 }
             })?;
+            check_backup_meta_format(&meta_path, Some(&meta)).map_err(|refusal| {
+                AftError::IoError {
+                    path: meta_path.display().to_string(),
+                    message: refusal.to_string(),
+                }
+            })?;
             let path_str = meta
                 .get("path")
                 .and_then(|value| value.as_str())
@@ -3557,6 +3571,7 @@ impl BackupStore {
             .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
         let meta = serde_json::from_str::<serde_json::Value>(&content)
             .map_err(|error| format!("failed to parse {}: {}", meta_path.display(), error))?;
+        check_backup_meta_format(&meta_path, Some(&meta)).map_err(|refusal| refusal.to_string())?;
         let path_str = meta
             .get("path")
             .and_then(|value| value.as_str())
@@ -3688,6 +3703,14 @@ impl BackupStore {
 
         let hash = Self::path_hash(key);
         let dir = session_dir.join(&hash);
+        // Never overwrite (or prune content referenced by) a stack whose
+        // metadata a newer build wrote, and never write one while the storage
+        // root's reader floor is above this build.
+        let meta_path = dir.join("meta.json");
+        check_backup_meta_format(&meta_path, None).map_err(|refusal| AftError::IoError {
+            path: meta_path.display().to_string(),
+            message: refusal.to_string(),
+        })?;
         create_private_dir_all(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
@@ -4112,6 +4135,30 @@ struct BackupEntryDiskMetadata {
     external_change_checkpoint: Option<String>,
     link_to: Option<PathBuf>,
     hardlink_detached: bool,
+}
+
+/// Refuse, by name, backup metadata (`meta.json` or the session marker) whose
+/// `schema_version` is above [`SCHEMA_VERSION`], or any of it while the storage
+/// root's reader floor is above this build. Only the version field is looked
+/// at, so a newer layout is never misread as an older one. `meta` is the
+/// already-parsed document when the caller has it; otherwise the file is read.
+fn check_backup_meta_format(
+    meta_path: &Path,
+    meta: Option<&serde_json::Value>,
+) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+    let version = match meta {
+        Some(meta) => meta.get("schema_version").and_then(|value| value.as_u64()),
+        None => std::fs::read(meta_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|meta| meta.get("schema_version")?.as_u64()),
+    };
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::BackupMeta,
+        meta_path,
+        meta_path,
+        version,
+    )
 }
 
 fn restore_metadata_json(entry: &BackupEntry) -> String {
@@ -6923,6 +6970,79 @@ mod tests {
         assert_eq!(written["entries"][0]["op_id"], serde_json::Value::Null);
         assert_eq!(written["entries"][1]["op_id"], "op-v3");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Metadata written by a newer build is refused by name on read and on the
+    /// next pre-write backup, and neither the stack metadata, the session
+    /// marker nor the stored content changes.
+    #[test]
+    fn future_schema_meta_is_refused_by_name_and_never_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_path_buf();
+        let file_path = temp_file("future_schema_meta.txt", "original");
+        let key = canonicalize_key(&file_path);
+        let session_dir = dir
+            .join("backups")
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let path_dir = session_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(path_dir.join("0.bak"), "original").unwrap();
+        let marker = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 99,
+            "session_id": DEFAULT_SESSION_ID,
+            "last_accessed": current_timestamp(),
+        }))
+        .unwrap();
+        fs::write(session_dir.join("session.json"), &marker).unwrap();
+        let meta_path = path_dir.join("meta.json");
+        let meta = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 99,
+            "format_version": "v9",
+            "session_id": DEFAULT_SESSION_ID,
+            "path": key.display().to_string(),
+            "count": 1,
+            "entries": [{ "kind": "written-by-a-newer-build" }],
+        }))
+        .unwrap();
+        fs::write(&meta_path, &meta).unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 72);
+        let read = store
+            .load_from_disk_if_needed(DEFAULT_SESSION_ID, &key)
+            .expect_err("newer metadata must be refused on read");
+        assert!(
+            read.to_string().contains(crate::persisted_format::CODE),
+            "{read}"
+        );
+        assert!(read.to_string().contains("backup_meta"), "{read}");
+
+        fs::write(&file_path, "second").unwrap();
+        let write = store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &file_path, "second", Some("op-new"))
+            .expect_err("a pre-write backup must not rewrite newer metadata");
+        assert!(
+            write.to_string().contains(crate::persisted_format::CODE),
+            "{write}"
+        );
+
+        assert_eq!(
+            fs::read(&meta_path).unwrap(),
+            meta,
+            "meta.json was rewritten"
+        );
+        assert_eq!(fs::read(session_dir.join("session.json")).unwrap(), marker);
+        assert_eq!(
+            fs::read_to_string(path_dir.join("0.bak")).unwrap(),
+            "original"
+        );
+        let refusal = crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::BackupMeta,
+            &meta_path,
+        )
+        .expect("refusal recorded for the status surface");
+        assert_eq!(refusal.found, 99);
+        assert!(crate::persisted_format::refusals_under(&dir).contains(&refusal));
     }
 
     #[test]

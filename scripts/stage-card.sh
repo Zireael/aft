@@ -16,6 +16,14 @@
 # the exception exists for) before it is staged. --skip-build cards cut from
 # a release download go through the same signing and checks.
 #
+# Before the card is staged, it must be able to read the live storage root:
+# scripts/lib/storage-floor-check.sh asks the card for its on-disk formats
+# (`aft --formats`) and refuses it when any store is below the root's reader
+# floor (<storage root>/reader-floor.json), when the card cannot report its
+# formats, or when the floor cannot be read. This holds for --skip-build cards
+# too, so a rollback image goes through the same gate. CK_AFT_STORAGE_DIR
+# names the storage root when it is not the default one.
+#
 # Placement never re-signs: re-signing would drop hardened runtime or the
 # entitlement unless repeated exactly, and would change the bytes the sidecar
 # vouches for. Manual placement is a plain copy of the staged card, then a
@@ -34,6 +42,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=lib/ck-aft-signature.sh
 source "$REPO_ROOT/scripts/lib/ck-aft-signature.sh"
+# shellcheck source=lib/storage-floor-check.sh
+source "$REPO_ROOT/scripts/lib/storage-floor-check.sh"
 
 STAGING="${CK_STAGING_DIR:-$HOME/.local/share/cortexkit/staging}"
 DEPLOY="${CK_DEPLOY_PATH:-$HOME/.local/share/cortexkit/bin/ck-aft}"
@@ -142,6 +152,14 @@ if [ "$(uname -s)" = "Darwin" ]; then
   rm -rf "$DSYM_DEST"
   mv "$DSYM_TMP" "$DSYM_DEST"
   echo "    dSYM: $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
+fi
+# Checked on the exact (signed) bytes that would be staged, before anything
+# names this card as current.
+STORAGE_ROOT="$(ck_aft_default_storage_root)"
+echo "==> storage floor: $STORAGE_ROOT"
+if ! ck_aft_check_storage_floor "$TMP" "$STORAGE_ROOT"; then
+  rm -f "$TMP"
+  exit 2
 fi
 HASH="$(shasum -a 256 "$TMP" | awk '{print $1}')"
 CARD="ck-aft.${HASH:0:16}"

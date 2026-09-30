@@ -6520,6 +6520,25 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
 
+        // A published generation written by a newer build (or a reader floor
+        // above this build) is refused by name; no cold build is started to
+        // replace it.
+        if let Some(refusal) = crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::CallgraphStore,
+            &callgraph_dir,
+        )
+        .or_else(|| {
+            crate::callgraph_store::check_published_format(
+                &callgraph_dir,
+                &self.memoized_artifact_cache_key(&project_root),
+            )
+            .err()
+        }) {
+            return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                refusal.to_string(),
+            ));
+        }
+
         if !build_in_flight {
             match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
                 Ok(Some(suspension)) => return CallgraphStoreAccess::Suspended(suspension),

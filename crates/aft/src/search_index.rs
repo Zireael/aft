@@ -40,6 +40,8 @@ const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
 const SPILL_MAGIC: &[u8; 8] = b"AFTSPI01";
 const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
 const INDEX_VERSION: u32 = 4;
+/// Highest trigram cache format this build reads (and the one it writes).
+pub const INDEX_FORMAT_VERSION: u32 = INDEX_VERSION;
 const PREVIEW_BYTES: usize = 8 * 1024;
 const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const SPIMI_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
@@ -343,6 +345,9 @@ fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Pa
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     crate::root_cache::ArtifactAccess::for_root(project_root).allows_write(artifact_key, write_path)
+        // A cache written by a newer build is never replaced (and no build or
+        // lock is started for it): that build's data outlives a rollback.
+        && SearchIndex::check_disk_cache_format(cache_dir).is_ok()
 }
 
 #[derive(Clone, Debug)]
@@ -1755,6 +1760,30 @@ impl SearchIndex {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 
+    /// Refuse, by name, a `cache.bin` whose outer header carries a format
+    /// version above [`INDEX_FORMAT_VERSION`] (or any cache while the storage
+    /// root's reader floor is above it). Reads only the 8-byte header. An
+    /// absent file, or one that is not a trigram cache at all, passes: those
+    /// are ordinary misses and rebuilds.
+    pub(crate) fn check_disk_cache_format(
+        cache_dir: &Path,
+    ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+        let cache_path = cache_dir.join("cache.bin");
+        let version = (|| {
+            let mut reader = BufReader::new(open_cache_file_read(&cache_path).ok()?);
+            if read_u32(&mut reader).ok()? != CACHE_MAGIC {
+                return None;
+            }
+            read_u32(&mut reader).ok().map(u64::from)
+        })();
+        crate::persisted_format::gate(
+            crate::persisted_format::PersistedStore::SearchIndex,
+            &cache_path,
+            &cache_path,
+            version,
+        )
+    }
+
     pub(crate) fn read_from_disk_borrow_tolerant_cancellable(
         cache_dir: &Path,
         current_canonical_root: &Path,
@@ -1842,6 +1871,11 @@ impl SearchIndex {
         borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
     ) -> Option<(Self, bool)> {
         debug_assert!(current_canonical_root.is_absolute());
+        // A newer build's cache is refused by name before its payload is read;
+        // callers see a miss, and every write path refuses to replace it.
+        if Self::check_disk_cache_format(cache_dir).is_err() {
+            return None;
+        }
         let cache_path = cache_dir.join("cache.bin");
         let cache_file = open_cache_file_read(&cache_path).ok()?;
         let file_len = cache_file.metadata().ok()?.len();
@@ -6260,6 +6294,12 @@ pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
         };
         if crate::root_cache::sweep_all_read_markers(&cache_dir).protected {
             summary.skipped_live += 1;
+            continue;
+        }
+        // An orphaned cache in a newer build's format still belongs to that
+        // build; only it may decide to discard it.
+        if SearchIndex::check_disk_cache_format(&cache_dir).is_err() {
+            summary.skipped_unreadable += 1;
             continue;
         }
         match fs::remove_dir_all(&cache_dir) {

@@ -2923,6 +2923,10 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // gives every artifact lane one concrete absolute root.
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    // Check the reader floor (and write today's formats as its baseline)
+    // before this configure reads or writes anything under the storage root,
+    // so a build below the floor refuses the affected components by name.
+    crate::reader_floor::prepare(&resolved_storage_dir);
     next_config.storage_dir = Some(resolved_storage_dir);
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
@@ -3408,6 +3412,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    if let Some(project_key) = project_key.as_ref() {
+        // Read only the version headers of this project's shared artifacts
+        // before any loader, builder or owner claim touches them, so a format
+        // written by a newer build is refused by name from the start instead
+        // of being discovered halfway through a rebuild.
+        crate::persisted_format::preflight_project_artifacts(&storage_root, project_key);
+    }
     ctx.begin_configure_ack_phase("artifact_owner_claim");
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -4916,6 +4927,15 @@ fn schedule_artifact_loads(
                 }
 
                 let build_once = || -> Result<SemanticBuildReady, String> {
+                    // A snapshot written by a newer build (or a reader floor
+                    // above this build) is refused by name before the
+                    // embedding backend is even contacted: no cold build runs
+                    // over it, and the refusal becomes the semantic index's
+                    // failure reason on every status surface.
+                    if let Some(dir) = semantic_storage.as_ref() {
+                        SemanticIndex::check_disk_format(dir, &semantic_project_key)
+                            .map_err(|refusal| refusal.to_string())?;
+                    }
                     let _ = tx_progress.send(SemanticIndexEvent::Progress {
                         stage: "initializing_embedding_model".to_string(),
                         files: None,
@@ -5205,6 +5225,19 @@ fn schedule_artifact_loads(
                                 }
                             }
                         }
+                    }
+
+                    // A delta segment found newer while reading the snapshot
+                    // above is refused the same way: no cold build over it.
+                    if let Some(refusal) = semantic_storage.as_ref().and_then(|dir| {
+                        crate::persisted_format::refusal_covering(
+                            crate::persisted_format::PersistedStore::SemanticSegment,
+                            &dir.join("semantic")
+                                .join(&semantic_project_key)
+                                .join("semantic.bin"),
+                        )
+                    }) {
+                        return Err(refusal.to_string());
                     }
 
                     let Some(_cold_build_permit) =
@@ -5742,6 +5775,22 @@ pub(crate) fn configure_database_runtime_with_mode(
             db_path.display()
         );
         thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
+    }
+    // A database whose schema a newer build wrote (or any database while the
+    // storage root's reader floor is above this build) is refused by name
+    // before a read-write connection, PRAGMA or migration touches it.
+    if let Err(refusal) = crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::AftDb,
+        &db_path,
+        &db_path,
+        crate::db::peek_schema_version(&db_path).map(u64::from),
+    ) {
+        ctx.app().clear_db_for_path(&db_path);
+        ctx.backup().lock().clear_db_pool();
+        ctx.bash_background().clear_db_pool();
+        ctx.finish_database_runtime_error(refusal.to_string(), false);
+        slog_warn!("aft.db not opened: {refusal} — tools refused with database_unavailable");
+        return;
     }
     match ctx.app().open_db_with_mode(&db_path, mode) {
         Ok(shared) => {

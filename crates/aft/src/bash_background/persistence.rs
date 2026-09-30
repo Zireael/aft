@@ -1043,6 +1043,7 @@ pub fn quarantine_task_layout(
                         .is_some_and(|name| name.starts_with(&flat_prefix))
             })
             .collect::<Vec<_>>();
+        refuse_quarantine_of_newer_task(session_dir, &selected)?;
         quarantine_names(storage_dir, session_dir, &session, selected, reason)
     })();
     result.map_err(|error| {
@@ -1063,6 +1064,7 @@ pub fn quarantine_invalid_entry(
 ) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         let session = PinnedDir::open(session_dir)?;
+        refuse_quarantine_of_newer_task(session_dir, &[entry.to_os_string()])?;
         quarantine_names(
             storage_dir,
             session_dir,
@@ -1080,6 +1082,40 @@ pub fn quarantine_invalid_entry(
             ),
         )
     })
+}
+
+/// Task metadata written by a newer build is not invalid; it is unreadable by
+/// this build only. Replay, relaxed lookup and GC all quarantine through the
+/// two functions above, so refusing here keeps such a task in place under its
+/// original path whichever of them got here. Each entry is either a task
+/// directory (`<id>/control/metadata.json`) or a flat-layout file
+/// (`<id>.json`).
+fn refuse_quarantine_of_newer_task(session_dir: &Path, names: &[OsString]) -> io::Result<()> {
+    for name in names {
+        let entry = session_dir.join(name);
+        let metadata_path = if entry.is_dir() {
+            entry.join(CONTROL_DIR).join(METADATA_FILE)
+        } else if entry.extension() == Some(OsStr::new("json")) {
+            entry
+        } else {
+            continue;
+        };
+        let version = fs::read(&metadata_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("schema_version")?.as_u64());
+        let Some(version) = version else {
+            continue;
+        };
+        if let Some(refusal) = crate::persisted_format::UnsupportedPersistedFormat::check(
+            crate::persisted_format::PersistedStore::BashTask,
+            &metadata_path,
+            version,
+        ) {
+            return Err(crate::persisted_format::refuse(refusal).into_io_error());
+        }
+    }
+    Ok(())
 }
 
 fn quarantine_names(
@@ -1172,7 +1208,7 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let mut file = open_validated_path(path, false)?;
-    read_task_file(&mut file)
+    read_task_file(&mut file, path)
 }
 
 pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
@@ -1181,7 +1217,7 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
         TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
     };
     let mut file = open_metadata_through_replacement(&task.dirs.control, &name)?;
-    let metadata = read_task_file(&mut file)?;
+    let metadata = read_task_file(&mut file, &task.dirs.control.path().join(&name))?;
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1191,10 +1227,23 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
     Ok(metadata)
 }
 
-fn read_task_file(file: &mut File) -> io::Result<PersistedTask> {
+fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
+    // The version is read before the full shape, so metadata written by a
+    // newer build is refused by name (and kept out of quarantine) instead of
+    // failing as an unparseable task.
+    let version = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_u64());
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::BashTask,
+        path,
+        path,
+        version,
+    )
+    .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
     let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
         return Err(io::Error::new(

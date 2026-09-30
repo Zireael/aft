@@ -14,7 +14,7 @@ use crate::slog_warn;
 use crate::symbols::Symbol;
 
 const MAGIC: &[u8; 8] = b"AFTSYM1\0";
-const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Version of the symbol extraction schema stored in the disk cache.
 ///
@@ -131,6 +131,11 @@ pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbo
     if !data_path.exists() {
         return None;
     }
+    // A cache written by a newer build is refused by name, not called
+    // corrupt, and `write_to_disk` will not replace it.
+    if check_disk_format(storage_dir, project_key).is_err() {
+        return None;
+    }
 
     match read_cache_file(&data_path) {
         Ok(cache) => Some(cache),
@@ -160,9 +165,12 @@ pub fn write_to_disk(
     if !access.allows_write(project_key, &data_path) {
         return Ok(());
     }
+    check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
     #[cfg(test)]
     note_cache_write(&data_path);
     let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
+    // Checked again under the lock: a newer build may have published between.
+    check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
     fs::create_dir_all(&dir)?;
     let tmp_path = dir.join(format!(
         "symbols.bin.tmp.{}.{}.{}",
@@ -196,6 +204,41 @@ pub fn write_to_disk(
     }
 
     write_result
+}
+
+/// Refuse, by name, a `symbols.bin` whose file format or extraction schema is
+/// above what this build reads (or any cache while the storage root's reader
+/// floor is above it). Reads only the 16-byte header; an absent file or one
+/// that is not a symbol cache passes.
+pub(crate) fn check_disk_format(
+    storage_dir: &Path,
+    project_key: &str,
+) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+    use crate::persisted_format::{gate, PersistedStore};
+    let data_path = cache_path(storage_dir, project_key);
+    let header = (|| {
+        let mut reader = BufReader::new(File::open(&data_path).ok()?);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).ok()?;
+        if &magic != MAGIC {
+            return None;
+        }
+        let format_version = read_u32(&mut reader).ok()?;
+        let schema_version = read_u32(&mut reader).ok();
+        Some((format_version, schema_version))
+    })();
+    gate(
+        PersistedStore::SymbolCache,
+        &data_path,
+        &data_path,
+        header.map(|(format, _)| u64::from(format)),
+    )?;
+    gate(
+        PersistedStore::SymbolExtraction,
+        &data_path,
+        &data_path,
+        header.and_then(|(_, schema)| schema).map(u64::from),
+    )
 }
 
 fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
