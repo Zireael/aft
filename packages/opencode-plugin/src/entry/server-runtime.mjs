@@ -129,7 +129,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload, toolContext, canonicalDirectory };
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory };
 }
 
 /**
@@ -211,9 +211,13 @@ export function makeServerEffect(overrides = {}) {
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.
+      // The bridge asked first is the one this Location's tools run on, the
+      // Location's own directory; for a Location in a linked git worktree that
+      // is the worktree, not the canonical main checkout the pool was acquired
+      // for (issue #387). Other bridges are still tried after it.
       yield* dependencies.registerPromptHook(context, {
         pool: runtime.pool,
-        projectRoot: runtime.canonicalDirectory,
+        projectRoot: runtime.directory,
         getConfig: () => runtime.toolContext.config,
       });
       yield* dependencies.registerTools(

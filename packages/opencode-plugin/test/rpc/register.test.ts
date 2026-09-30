@@ -12,6 +12,8 @@ import {
   __resetRpcNotificationsForTest,
   pushNotification,
 } from "../../src/shared/rpc-notifications.js";
+import type { AftStatusSnapshot } from "../../src/shared/status.js";
+import { formatAftStatusSegment } from "../../src/tui/v2-status.js";
 
 type RpcEvent = { name: string; payload: Record<string, unknown> };
 type GetStatus = (
@@ -231,6 +233,54 @@ describe("registerAftRpc", () => {
         },
       });
     }
+    await registered.dispose();
+  });
+
+  test("a Location in a linked worktree reads status and footer counts from the worktree's bridge", async () => {
+    // The host hands a Location its own directory plus the project's canonical
+    // directory, which for a linked git worktree is the main checkout. Tools
+    // in that Location run on the worktree's bridge, so status must too.
+    const withCounts = (sessionID: string, errors: number) => ({
+      ...statusSnapshot(sessionID),
+      cache_role: "main",
+      status_bar: {
+        errors,
+        warnings: 0,
+        dead_code: 0,
+        unused_exports: 0,
+        duplicates: 0,
+        todos: 0,
+      },
+    });
+    const worktreeBridge = new StatusBridge(withCounts("ses_wt", 1));
+    const mainBridge = new StatusBridge(withCounts("ses_wt", 9));
+    const bridges = new Map([
+      ["/work/linked", worktreeBridge],
+      ["/work/main", mainBridge],
+    ]);
+    const askedRoots: string[] = [];
+    const pool = {
+      ...poolHarness(null),
+      getActiveBridgeForRoot: (root: string) => {
+        askedRoots.push(root);
+        return bridges.get(root) ?? null;
+      },
+      activeBridges: () => [...bridges.values()],
+    } as AftTransportPool;
+    const location = {
+      directory: "/work/linked",
+      project: { directory: "/work/linked", canonical: "/work/main" },
+    };
+    const host = hostHarness();
+    const registered = await Effect.runPromise(
+      Effect.scoped(registerAftRpc(host.context, location, pool)),
+    );
+
+    const status = await host.getStatus()({ sessionID: "ses_wt" });
+    expect(status).toMatchObject({ status_bar: { errors: 1 } });
+    // The V2 footer renders its counts from this same status response.
+    expect(formatAftStatusSegment(status as AftStatusSnapshot)).toBe("AFT E1 W0 | D0 U0 C0 | T0");
+    expect(askedRoots).not.toContain("/work/main");
     await registered.dispose();
   });
 

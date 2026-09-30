@@ -415,6 +415,11 @@ describe("V2 server effect", () => {
     await settle();
     expect(detached).toEqual(["s1"]);
     expect(event.prompt.text).toBe("still there? ");
-    expect(events).toContain("active-root:/canonical/a");
+    // The first bridge asked is the one the Location's tools run on, keyed by
+    // the Location's own directory rather than the canonical main checkout the
+    // pool was acquired for, so a Location in a linked worktree detaches its
+    // own wait first.
+    expect(events).toContain("active-root:/work/a");
+    expect(events).not.toContain("active-root:/canonical/a");
   });
 });

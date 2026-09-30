@@ -36,10 +36,6 @@ export type AftRpcContext = {
 
 export type AftRpcLocation = {
   directory: string;
-  project?: {
-    directory?: string;
-    canonical?: string;
-  };
 };
 
 export type RegisteredAftRpc = {
@@ -107,8 +103,17 @@ function isStatusSubscribable(bridge: AftProjectTransport): bridge is StatusSubs
   return typeof (bridge as Partial<StatusSubscribableTransport>).subscribeStatus === "function";
 }
 
+/**
+ * The root whose bridge answers status for this Location: the Location's own
+ * directory, which is the root its tools resolve to (see `projectRootFor`,
+ * which uses an OpenCode 2 runtime's `directory`). For a Location in a linked
+ * git worktree that is the worktree. The project's canonical directory is the
+ * main checkout, whose bridge (if any) holds another checkout's state, so
+ * reading it would show the sidebar and footer "not initialized" or the wrong
+ * project's counts (issue #387).
+ */
 function locationRoot(location: AftRpcLocation): string {
-  return location.project?.canonical ?? location.project?.directory ?? location.directory;
+  return location.directory;
 }
 
 function placeholderStatus(): Record<string, unknown> {
