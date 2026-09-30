@@ -7,6 +7,16 @@
 
 use super::diagnostics::StoredDiagnostic;
 
+/// typescript-language-server 5.x: no usable TypeScript SDK was found.
+pub(crate) const TS_LS5_NO_INSTALLATION: &str = "Could not find a valid TypeScript installation";
+/// typescript-language-server 6.x: the TypeScript it found ships no
+/// `lib/tsserver.js` (TypeScript 7 and later are the native compiler and
+/// ship none), and nothing else was usable.
+pub(crate) const TS_LS6_NO_TSSERVER: &str = "provides no tsserver.js";
+/// AFT's own wording when the project's TypeScript is the native compiler.
+pub(crate) const TS_NATIVE_NO_TSSERVER: &str =
+    "which has no tsserver; typescript-language-server can't serve it";
+
 /// True when this diagnostic reflects the tooling/environment, not project source.
 pub fn is_environmental_diagnostic(diagnostic: &StoredDiagnostic) -> bool {
     let message = diagnostic.message.as_str();
@@ -17,8 +27,16 @@ pub fn is_environmental_diagnostic(diagnostic: &StoredDiagnostic) -> bool {
 fn is_environmental_message(message: &str, code: &str) -> bool {
     let lower = message.to_ascii_lowercase();
 
-    // TypeScript language service / tsserver environment failures.
-    if lower.contains("could not find a valid typescript installation") {
+    // TypeScript language service / tsserver environment failures, in both
+    // typescript-language-server wordings and AFT's native-compiler rewrite.
+    if [
+        TS_LS5_NO_INSTALLATION,
+        TS_LS6_NO_TSSERVER,
+        TS_NATIVE_NO_TSSERVER,
+    ]
+    .iter()
+    .any(|phrase| lower.contains(&phrase.to_ascii_lowercase()))
+    {
         return true;
     }
 
@@ -87,6 +105,33 @@ mod tests {
         assert!(is_environmental_diagnostic(&stored(
             "Could not find a valid TypeScript installation. Try `npm i typescript`.",
             None,
+            Some("typescript"),
+        )));
+    }
+
+    #[test]
+    fn typescript_language_server_6_missing_tsserver_is_environmental() {
+        assert!(is_environmental_diagnostic(&stored(
+            "Request initialize failed with message: The TypeScript of the workspace (TypeScript 7.0.2 at \"/repo/node_modules/typescript/lib\") provides no tsserver.js. No other valid TypeScript installation was found. Exiting.",
+            None,
+            Some("typescript"),
+        )));
+    }
+
+    #[test]
+    fn typescript_native_compiler_rewrite_is_environmental() {
+        assert!(is_environmental_diagnostic(&stored(
+            "TypeScript unavailable: this project uses TypeScript 7.0.2 (native compiler) at /repo/node_modules/typescript, which has no tsserver; typescript-language-server can't serve it.",
+            None,
+            Some("typescript"),
+        )));
+    }
+
+    #[test]
+    fn real_error_mentioning_tsserver_is_not_environmental() {
+        assert!(!is_environmental_diagnostic(&stored(
+            "Cannot find module './tsserver' or its corresponding type declarations.",
+            Some("TS2307"),
             Some("typescript"),
         )));
     }

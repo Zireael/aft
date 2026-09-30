@@ -3745,6 +3745,16 @@ impl LspManager {
             initialization_options = Some(options);
             runtime_note = Some(note);
         }
+        let project_typescript = if def.kind == ServerKind::TypeScript {
+            let boundary = config
+                .project_root
+                .as_deref()
+                .filter(|p| source_file.starts_with(p))
+                .unwrap_or(root);
+            find_project_typescript_package(source_file, boundary)
+        } else {
+            None
+        };
 
         // Merge the server-defined env with our test-injected env.
         // `extra_env` is empty in production; tests use it to drive fake
@@ -3777,6 +3787,7 @@ impl LspManager {
             reclaim_root,
             initialization_options,
             runtime_note,
+            project_typescript,
         })
     }
 
@@ -3944,11 +3955,96 @@ fn typescript_runtime_options(
     ))
 }
 
-fn typescript_initialize_failure_reason(reason: String) -> String {
-    if reason.contains("Could not find a valid TypeScript installation") {
-        format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}")
-    } else {
-        reason
+fn typescript_initialize_failure_reason(
+    reason: String,
+    project_typescript: Option<&ProjectTypeScript>,
+) -> String {
+    use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER, TS_NATIVE_NO_TSSERVER};
+
+    let no_usable_sdk =
+        reason.contains(TS_LS5_NO_INSTALLATION) || reason.contains(TS_LS6_NO_TSSERVER);
+    if !no_usable_sdk {
+        return reason;
+    }
+    // Installing dependencies cannot help a TypeScript 7 project: the native
+    // compiler never ships the tsserver.js typescript-language-server loads.
+    if let Some(project) =
+        project_typescript.filter(|ts| ts.major().is_some_and(|major| major >= 7))
+    {
+        return format!(
+            "TypeScript unavailable: this project uses TypeScript {} (native compiler) at {}, {TS_NATIVE_NO_TSSERVER}. Run the project's tsc --noEmit for type errors. {reason}",
+            project.version,
+            project.package_dir.display(),
+        );
+    }
+    if reason.contains(TS_LS6_NO_TSSERVER) {
+        // The server found a TypeScript package without tsserver.js. That is
+        // TypeScript 7 or later somewhere AFT did not look, or a broken
+        // install; either way running an install is not the fix.
+        return format!("TypeScript SDK unavailable: the TypeScript installation the language server found has no tsserver.js (TypeScript 7 and later, the native compiler, ship none), so typescript-language-server can't serve it. Check which TypeScript the project resolves; run the project's tsc --noEmit for type errors. {reason}");
+    }
+    format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}")
+}
+
+/// The TypeScript package a project has installed, read from the nearest
+/// `node_modules/typescript/package.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectTypeScript {
+    /// The package.json `version`, or "unknown" when it has none.
+    version: String,
+    /// The `node_modules/typescript` directory.
+    package_dir: PathBuf,
+}
+
+impl ProjectTypeScript {
+    /// Leading integer of the version ("7.0.2" and "7.1.0-dev.1" are both 7).
+    fn major(&self) -> Option<u64> {
+        let digits: String = self
+            .version
+            .trim()
+            .trim_start_matches('v')
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+}
+
+/// Find the project's own TypeScript package for `source_file`, walking up to
+/// `project_root`. It looks for `package.json` rather than `lib/*.js` because
+/// TypeScript 7 ships none of the JavaScript files the SDK probe expects.
+/// The version comes from the installed package, never from a lockfile: after
+/// a branch switch without an install, the lockfile names what should be
+/// installed while `node_modules` holds what actually runs.
+fn find_project_typescript_package(
+    source_file: &Path,
+    project_root: &Path,
+) -> Option<ProjectTypeScript> {
+    let mut directory = source_file.parent()?;
+    loop {
+        let package_dir = directory.join("node_modules").join("typescript");
+        if let Ok(bytes) = std::fs::read(package_dir.join("package.json")) {
+            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|json| {
+                    json.get("version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "unknown".into());
+            return Some(ProjectTypeScript {
+                version,
+                package_dir,
+            });
+        }
+        if directory == project_root {
+            return None;
+        }
+        let parent = directory.parent()?;
+        if !parent.starts_with(project_root) {
+            return None;
+        }
+        directory = parent;
     }
 }
 
@@ -4306,6 +4402,9 @@ struct PreparedSpawn {
     reclaim_root: PathBuf,
     initialization_options: Option<serde_json::Value>,
     runtime_note: Option<String>,
+    /// For the TypeScript server, the project's own TypeScript package, used
+    /// to explain an initialize failure.
+    project_typescript: Option<ProjectTypeScript>,
 }
 
 /// Why a prepared spawn produced no client. The manager records the details
@@ -4391,7 +4490,7 @@ impl PreparedSpawn {
             let reason = if self.kind == ServerKind::Biome {
                 biome_unavailable_reason(&reason)
             } else if self.kind == ServerKind::TypeScript {
-                typescript_initialize_failure_reason(reason)
+                typescript_initialize_failure_reason(reason, self.project_typescript.as_ref())
             } else {
                 reason
             };
@@ -5502,14 +5601,99 @@ mod typescript_worktree_tests {
 
     #[test]
     fn typescript_sdk_unavailable_requires_actual_server_error() {
-        let missing = typescript_initialize_failure_reason("initialize failed: Could not find a valid TypeScript installation. Please ensure that the typescript dependency is installed".into());
+        let missing = typescript_initialize_failure_reason("initialize failed: Could not find a valid TypeScript installation. Please ensure that the typescript dependency is installed".into(), None);
         assert!(missing.starts_with("TypeScript SDK unavailable:"));
         assert!(missing.contains("run bun install"));
         let unrelated = "initialize failed: connection closed";
         assert_eq!(
-            typescript_initialize_failure_reason(unrelated.into()),
+            typescript_initialize_failure_reason(unrelated.into(), None),
             unrelated
         );
+    }
+
+    const LS6_NO_TSSERVER: &str = "server failed during initialize: server error -32603: Request initialize failed with message: The TypeScript of the workspace (TypeScript 7.0.2 at \"/repo/node_modules/typescript/lib\") provides no tsserver.js. No other valid TypeScript installation was found. Exiting.";
+    const LS5_NO_INSTALLATION: &str = "server failed during initialize: server error -32603: Request initialize failed with message: Could not find a valid TypeScript installation. Please ensure that the \"typescript\" dependency is installed in the workspace or that a valid `tsserver.path` is specified. Exiting.";
+
+    fn project_ts(version: &str) -> ProjectTypeScript {
+        ProjectTypeScript {
+            version: version.into(),
+            package_dir: PathBuf::from("/repo/node_modules/typescript"),
+        }
+    }
+
+    #[test]
+    fn typescript_language_server_6_wording_is_explained_without_install_advice() {
+        let reason = typescript_initialize_failure_reason(LS6_NO_TSSERVER.into(), None);
+        assert!(
+            reason.starts_with("TypeScript SDK unavailable:"),
+            "{reason}"
+        );
+        assert!(reason.contains("has no tsserver.js"), "{reason}");
+        assert!(!reason.contains("run bun install"), "{reason}");
+        assert!(reason.ends_with(LS6_NO_TSSERVER), "{reason}");
+    }
+
+    #[test]
+    fn typescript_7_project_is_named_for_both_server_wordings() {
+        let ts7 = project_ts("7.0.2");
+        for raw in [LS5_NO_INSTALLATION, LS6_NO_TSSERVER] {
+            let reason = typescript_initialize_failure_reason(raw.into(), Some(&ts7));
+            assert!(
+                reason.starts_with("TypeScript unavailable: this project uses TypeScript 7.0.2 (native compiler) at /repo/node_modules/typescript, which has no tsserver; typescript-language-server can't serve it."),
+                "{reason}"
+            );
+            assert!(!reason.contains("run bun install"), "{reason}");
+            assert!(!reason.contains("auto-install"), "{reason}");
+            assert!(reason.ends_with(raw), "{reason}");
+        }
+        // Development builds of the native compiler count too.
+        let dev = typescript_initialize_failure_reason(
+            LS6_NO_TSSERVER.into(),
+            Some(&project_ts("7.1.0-dev.20260929.1")),
+        );
+        assert!(dev.contains("(native compiler)"), "{dev}");
+    }
+
+    #[test]
+    fn typescript_5_project_keeps_the_install_advice() {
+        let reason = typescript_initialize_failure_reason(
+            LS5_NO_INSTALLATION.into(),
+            Some(&project_ts("5.9.3")),
+        );
+        assert!(
+            reason.starts_with("TypeScript SDK unavailable:"),
+            "{reason}"
+        );
+        assert!(reason.contains("run bun install"), "{reason}");
+    }
+
+    #[test]
+    fn project_typescript_package_is_read_from_node_modules_not_the_lockfile() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let file = project.join("src").join("index.ts");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        // A lockfile alone is not an installation.
+        std::fs::write(
+            project.join("bun.lock"),
+            r#"{"packages":{"typescript":["typescript@7.0.2"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(find_project_typescript_package(&file, &project), None);
+
+        // TypeScript 7 ships no lib/*.js the SDK probe needs, only package.json.
+        let package_dir = project.join("node_modules").join("typescript");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2"}"#,
+        )
+        .unwrap();
+        let found = find_project_typescript_package(&file, &project).unwrap();
+        assert_eq!(found.version, "7.0.2");
+        assert_eq!(found.major(), Some(7));
+        assert_eq!(found.package_dir, package_dir);
     }
 
     fn sdk(root: &Path, version: &str) -> PathBuf {
