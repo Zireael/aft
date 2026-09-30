@@ -1146,6 +1146,8 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
+        "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
+        "batch" => aft::commands::batch::handle_batch(&req, ctx),
         "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
         "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
         "move_file" => aft::commands::move_file::handle_move_file(&req, ctx),
@@ -13748,6 +13750,114 @@ async fn drive_preview_write_daemon(input: FakeDaemonInput) {
     assert_eq!(
         std::fs::read_to_string(&target).expect("apply write exists"),
         "hello preview\n"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// `read` through the subc tool-call path must return the bytes on disk at the
+/// moment of the call. The file is edited through AFT, restored behind AFT's
+/// back with `git checkout --`, then rewritten with the same size and the same
+/// modification time; every read must show the current bytes. The fixture
+/// daemon has no file watcher, so no change event can explain a correct read.
+#[test]
+fn subc_bridge_read_returns_current_bytes_after_external_restore() {
+    run_subc_bridge_production_test(
+        "subc_bridge_read_returns_current_bytes_after_external_restore",
+        Duration::from_secs(60),
+        drive_read_after_external_restore_daemon,
+        |_, _, _| {},
+    );
+}
+
+fn read_freshness_git(root: &std::path::Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+    let output = command.args(args).output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    const MARKER: &str = "TUNING-ONLY PATCH";
+    let original: String = (1..=120).map(|n| format!("fn line_{n}() {{}}\n")).collect();
+    let repo = root1.join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("create repo");
+    let file = repo.join("src/lib.rs");
+    std::fs::write(&file, &original).expect("write fixture");
+    read_freshness_git(&repo, &["init", "-q"]);
+    read_freshness_git(&repo, &["add", "."]);
+    read_freshness_git(&repo, &["commit", "-qm", "fixture"]);
+    let window = json!({ "filePath": file.to_string_lossy(), "startLine": 40, "endLine": 100 });
+
+    let edit = call_tool_frame(
+        &mut stream,
+        1,
+        201,
+        "edit",
+        json!({
+            "filePath": file.to_string_lossy(),
+            "edits": [{
+                "oldString": "fn line_98() {}",
+                "newString": format!("fn tuned() {{}} // {MARKER}")
+            }]
+        }),
+        "freshness edit",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&edit),
+        "edit should succeed: {}",
+        tool_result_text(&edit)
+    );
+    let edited = call_tool_frame(&mut stream, 1, 202, "read", window.clone(), "read edited").await;
+    assert!(
+        tool_result_text(&edited).contains(MARKER),
+        "the edit must be visible before the restore: {}",
+        tool_result_text(&edited)
+    );
+
+    read_freshness_git(&repo, &["checkout", "--", "src/lib.rs"]);
+    let restored =
+        call_tool_frame(&mut stream, 1, 203, "read", window.clone(), "read restored").await;
+    let restored_text = tool_result_text(&restored);
+    assert!(
+        !restored_text.contains(MARKER) && restored_text.contains("fn line_98() {}"),
+        "read returned content that is no longer on disk after git checkout: {restored_text}"
+    );
+
+    let before = std::fs::metadata(&file).expect("stat before rewrite");
+    let rewritten = original.replace("fn line_50() {}", "fn LINE_50() {}");
+    std::fs::write(&file, &rewritten).expect("same-size rewrite");
+    filetime::set_file_mtime(
+        &file,
+        filetime::FileTime::from_last_modification_time(&before),
+    )
+    .expect("restore mtime");
+    let after = std::fs::metadata(&file).expect("stat after rewrite");
+    assert_eq!(after.len(), before.len(), "rewrite must keep the size");
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    let same_stat = call_tool_frame(
+        &mut stream,
+        1,
+        204,
+        "read",
+        window,
+        "read same-stat rewrite",
+    )
+    .await;
+    let same_stat_text = tool_result_text(&same_stat);
+    assert!(
+        same_stat_text.contains("fn LINE_50() {}") && !same_stat_text.contains("fn line_50() {}"),
+        "read served the previous version of a same-size, same-mtime file: {same_stat_text}"
     );
 
     send_connection_goodbye(&mut stream).await;

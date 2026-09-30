@@ -127,6 +127,7 @@ mod publication_cas_test;
 mod quarto_test;
 mod query_shape_test;
 mod r_test;
+mod read_freshness_test;
 mod refresh_watcher_path_status_test;
 mod rename_delete_migration_test;
 mod repeat_breaker_test;
