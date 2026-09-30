@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "subc-027-launch-nonce-pipe-call-key",
+    "read-freshness-regression-tests"
+  ],
+  "note": "The only fenced file is lib.rs, which registers the new launch_nonce module; no search, ranking or embedding code changes, so every ranked row must stay byte-identical to the committed reference. Moves to subc-protocol 0.27.0: the daemon launch nonce is read once through subc_os::launch_nonce() before anything spawns and removed from AFT's environment, call_key and schema_pin are decoded and validated on tool calls, and bash tasks record their call key. Adds regression tests pinning read to the current on-disk bytes."
+}
