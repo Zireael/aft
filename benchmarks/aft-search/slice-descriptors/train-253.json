@@ -8,7 +8,8 @@
     "paging"
   ],
   "slices": [
-    "callgraph-macro-callers"
+    "callgraph-macro-callers",
+    "lsp-forward-watched-files"
   ],
-  "note": "Callgraph only: Rust macro_rules! template calls, via-macro caller entries and the unanalyzed-macro-mention note. No aft_search ranking file is touched."
+  "note": "Callgraph Rust macro_rules! template calls and macro notes, plus forwarding watcher file changes to LSP servers. No aft_search ranking file is touched."
 }
