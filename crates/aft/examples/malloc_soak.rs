@@ -182,7 +182,7 @@ fn main() {
         let hello = read_frame(&mut stream).await.unwrap().unwrap();
         assert_eq!(hello.header.ty, FrameType::Hello);
         write_frame(&mut stream, &Frame::build(FrameType::HelloAck, Flags::new(false, Priority::Passive, false), 0, 0, hello.header.corr,
-            serde_json::to_vec(&ModuleHelloAckBody {negotiated_ver:PROTOCOL_VERSION, subc_ops:vec![], subc_capabilities:vec![], storage:None}).unwrap()).unwrap()).await.unwrap();
+            serde_json::to_vec(&ModuleHelloAckBody {negotiated_ver:PROTOCOL_VERSION, subc_ops:vec![], subc_capabilities:vec![], storage:None, machine_id:None}).unwrap()).unwrap()).await.unwrap();
         let mut corr = 100;
         bind(&mut stream, 100, &root, RouteTarget::ManagementSurface {module_id:"aft".into()}, &mut corr, &out).await;
         request(&mut stream, 100, &mut corr, json!({"op":"memory.census"}), &out).await;
